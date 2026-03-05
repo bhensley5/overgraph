@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "description": "Cross-language benchmark scenario contract for parity validation.",
+  "effective_config": {
+    "nodes_divisor": 50,
+    "nodes_min": 1000,
+    "edges_divisor": 50,
+    "edges_min": 5000,
+    "fanout_min": 25,
+    "fanout_max": 500,
+    "fanout_degree_multiplier": 20,
+    "batch_nodes_min": 50,
+    "batch_edges_min": 50,
+    "two_hop_mid_min": 50,
+    "two_hop_leaves_per_mid": 8,
+    "top_k_candidates_min": 500,
+    "top_k_candidates_divisor": 2,
+    "ppr_nodes_min": 500,
+    "ppr_nodes_divisor": 2,
+    "time_range_nodes_cap": 5000,
+    "export_nodes_cap": 5000,
+    "export_edges_cap": 20000,
+    "flush_node_batch_cap": 200,
+    "flush_edge_chain_cap": 50,
+    "ppr_max_iterations": 20,
+    "ppr_max_results": 50,
+    "ppr_seed_count": 1,
+    "ppr_edge_offsets": [1, 7],
+    "top_k_limit": 20,
+    "time_range_from_ms": 0,
+    "time_range_window_ms": 60000,
+    "include_weights_on_export": true
+  },
+  "scenario_iteration_policy": {
+    "default": {
+      "warmup_divisor": 1,
+      "warmup_min": 1,
+      "iters_divisor": 1,
+      "iters_min": 1
+    },
+    "S-BATCH-001": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    },
+    "S-BATCH-002": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    },
+    "S-ADV-004": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    },
+    "S-ADV-005": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    },
+    "S-MAIN-001": {
+      "warmup_divisor": 3,
+      "warmup_min": 3,
+      "iters_divisor": 4,
+      "iters_min": 10
+    },
+    "S-CRUD-001": {},
+    "S-CRUD-002": {},
+    "S-CRUD-003": {}
+  },
+  "comparability": {
+    "S-CRUD-001": {
+      "status": "comparable"
+    },
+    "S-CRUD-002": {
+      "status": "comparable"
+    },
+    "S-CRUD-003": {
+      "status": "comparable"
+    },
+    "S-BATCH-001": {
+      "status": "comparable"
+    },
+    "S-BATCH-002": {
+      "status": "non_comparable",
+      "reason": "Binary batch path is connector-specific and has no direct Rust-core API equivalent."
+    },
+    "S-TRAV-001": {
+      "status": "comparable"
+    },
+    "S-TRAV-002": {
+      "status": "comparable"
+    },
+    "S-ADV-001": {
+      "status": "comparable"
+    },
+    "S-ADV-003": {
+      "status": "comparable"
+    },
+    "S-ADV-004": {
+      "status": "comparable"
+    },
+    "S-CRUD-004": {
+      "status": "comparable"
+    },
+    "S-CRUD-005": {
+      "status": "comparable"
+    },
+    "S-ADV-005": {
+      "status": "comparable"
+    },
+    "S-MAIN-001": {
+      "status": "comparable"
+    }
+  },
+  "percentile_method": {
+    "name": "nearest_rank",
+    "index_formula": "ceil((p / 100) * n) - 1",
+    "interpolation": "none",
+    "sorted_order": "ascending",
+    "sample_unit": "microseconds"
+  }
+}

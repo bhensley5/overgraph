@@ -1,0 +1,291 @@
+{
+  "durability_mode_disclosure": {
+    "node_connector_default": "group-commit",
+    "python_connector_default": "group_commit",
+    "rust_core_ops_default": "group-commit",
+    "rust_durability_microbench": {
+      "group_commit": "upsert_node_group_commit + batch_100_nodes_group_commit scenarios",
+      "immediate": "upsert_node_immediate + batch_100_nodes_immediate scenarios"
+    }
+  },
+  "languages": {
+    "node": {
+      "harness_stage": "connector-benchmark-v2",
+      "scenario_snapshot": [
+        {
+          "category": "crud",
+          "name": "upsert_node",
+          "notes": null,
+          "p50_us": 1.7079999999936035,
+          "p95_us": 3.9169999999870697,
+          "p99_us": 7.584000000008473,
+          "scenario_id": "S-CRUD-001",
+          "throughput_ops_per_sec": 486564.7313553703
+        },
+        {
+          "category": "crud",
+          "name": "get_node",
+          "notes": null,
+          "p50_us": 2.0839999999680003,
+          "p95_us": 2.208999999993466,
+          "p99_us": 2.375000000029104,
+          "scenario_id": "S-CRUD-003",
+          "throughput_ops_per_sec": 474543.69657752564
+        },
+        {
+          "category": "traversal",
+          "name": "neighbors_2hop",
+          "notes": null,
+          "p50_us": 309.9170000000413,
+          "p95_us": 396.3330000000269,
+          "p99_us": 425.7920000000013,
+          "scenario_id": "S-TRAV-002",
+          "throughput_ops_per_sec": 3175.8582687499033
+        },
+        {
+          "category": "advanced",
+          "name": "top_k_neighbors",
+          "notes": null,
+          "p50_us": 21.041000000082022,
+          "p95_us": 23.541000000022905,
+          "p99_us": 30.624999999986358,
+          "scenario_id": "S-ADV-001",
+          "throughput_ops_per_sec": 46760.84690908867
+        },
+        {
+          "category": "advanced",
+          "name": "find_nodes_by_time_range",
+          "notes": null,
+          "p50_us": 159.99999999996817,
+          "p95_us": 181.7079999999578,
+          "p99_us": 189.54099999996288,
+          "scenario_id": "S-ADV-003",
+          "throughput_ops_per_sec": 6098.840244539304
+        },
+        {
+          "category": "advanced",
+          "name": "personalized_pagerank",
+          "notes": null,
+          "p50_us": 297.50000000001364,
+          "p95_us": 319.87500000002456,
+          "p99_us": 323.41699999994944,
+          "scenario_id": "S-ADV-004",
+          "throughput_ops_per_sec": 3350.93804484158
+        },
+        {
+          "category": "advanced",
+          "name": "export_adjacency",
+          "notes": null,
+          "p50_us": 1035.9999999999445,
+          "p95_us": 1090.832999999975,
+          "p99_us": 1110.708000000045,
+          "scenario_id": "S-ADV-005",
+          "throughput_ops_per_sec": 958.9605864561856
+        },
+        {
+          "category": "maintenance",
+          "name": "flush",
+          "notes": null,
+          "p50_us": 192254.6249999996,
+          "p95_us": 274416.6249999998,
+          "p99_us": 285743.1250000004,
+          "scenario_id": "S-MAIN-001",
+          "throughput_ops_per_sec": 4.792507537873916
+        }
+      ]
+    },
+    "python": {
+      "harness_stage": "connector-benchmark-v1",
+      "scenario_snapshot": [
+        {
+          "category": "crud",
+          "name": "upsert_node",
+          "notes": null,
+          "p50_us": 1.292,
+          "p95_us": 2.292,
+          "p99_us": 6.458,
+          "scenario_id": "S-CRUD-001",
+          "throughput_ops_per_sec": 691897.8758735211
+        },
+        {
+          "category": "crud",
+          "name": "get_node",
+          "notes": null,
+          "p50_us": 0.542,
+          "p95_us": 0.709,
+          "p99_us": 0.958,
+          "scenario_id": "S-CRUD-003",
+          "throughput_ops_per_sec": 1717106.6752521992
+        },
+        {
+          "category": "traversal",
+          "name": "neighbors_2hop",
+          "notes": null,
+          "p50_us": 207.916,
+          "p95_us": 254.792,
+          "p99_us": 269.417,
+          "scenario_id": "S-TRAV-002",
+          "throughput_ops_per_sec": 4718.883988655569
+        },
+        {
+          "category": "advanced",
+          "name": "top_k_neighbors",
+          "notes": null,
+          "p50_us": 13.834,
+          "p95_us": 14.084,
+          "p99_us": 14.25,
+          "scenario_id": "S-ADV-001",
+          "throughput_ops_per_sec": 72183.20820073428
+        },
+        {
+          "category": "advanced",
+          "name": "find_nodes_by_time_range",
+          "notes": null,
+          "p50_us": 222.834,
+          "p95_us": 242.125,
+          "p99_us": 268.917,
+          "scenario_id": "S-ADV-003",
+          "throughput_ops_per_sec": 4430.004598344772
+        },
+        {
+          "category": "advanced",
+          "name": "personalized_pagerank",
+          "notes": null,
+          "p50_us": 350.375,
+          "p95_us": 380.834,
+          "p99_us": 384.125,
+          "scenario_id": "S-ADV-004",
+          "throughput_ops_per_sec": 2872.841086856113
+        },
+        {
+          "category": "advanced",
+          "name": "export_adjacency",
+          "notes": null,
+          "p50_us": 528.333,
+          "p95_us": 561.25,
+          "p99_us": 569.5,
+          "scenario_id": "S-ADV-005",
+          "throughput_ops_per_sec": 1897.604231961054
+        },
+        {
+          "category": "maintenance",
+          "name": "flush",
+          "notes": null,
+          "p50_us": 196133.958,
+          "p95_us": 256041.166,
+          "p99_us": 265086.625,
+          "scenario_id": "S-MAIN-001",
+          "throughput_ops_per_sec": 4.80152813472828
+        }
+      ]
+    },
+    "rust": {
+      "harness_stage": "criterion-quick-core-advanced-maintenance-recovery",
+      "scenario_snapshot": [
+        {
+          "category": "core",
+          "name": "upsert_node",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 1.1297,
+          "p95_us": 1.1335,
+          "p99_us": 1.1335,
+          "scenario_id": "RUST-UPSERT-NODE",
+          "throughput_ops_per_sec": null
+        },
+        {
+          "category": "core",
+          "name": "get_node",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 0.070306,
+          "p95_us": 0.07290600000000001,
+          "p99_us": 0.07290600000000001,
+          "scenario_id": "RUST-GET-NODE",
+          "throughput_ops_per_sec": null
+        },
+        {
+          "category": "advanced_queries",
+          "name": "neighbors_2hop_100x10",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 116.27,
+          "p95_us": 120.82,
+          "p99_us": 120.82,
+          "scenario_id": "RUST-ADVANCED-QUERIES-NEIGHBORS-2HOP-100X10",
+          "throughput_ops_per_sec": null
+        },
+        {
+          "category": "advanced_queries",
+          "name": "top_k_neighbors_weight_k20_1000",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 16.565,
+          "p95_us": 16.917,
+          "p99_us": 16.917,
+          "scenario_id": "RUST-ADVANCED-QUERIES-TOP-K-NEIGHBORS-WEIGHT-K20-1000",
+          "throughput_ops_per_sec": null
+        },
+        {
+          "category": "advanced_queries",
+          "name": "find_nodes_by_time_range_10000",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 481.55,
+          "p95_us": 485.79,
+          "p99_us": 485.79,
+          "scenario_id": "RUST-ADVANCED-QUERIES-FIND-NODES-BY-TIME-RANGE-10000",
+          "throughput_ops_per_sec": null
+        },
+        {
+          "category": "advanced_queries",
+          "name": "personalized_pagerank_2000_nodes",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 896.48,
+          "p95_us": 904.35,
+          "p99_us": 904.35,
+          "scenario_id": "RUST-ADVANCED-QUERIES-PERSONALIZED-PAGERANK-2000-NODES",
+          "throughput_ops_per_sec": null
+        },
+        {
+          "category": "advanced_queries",
+          "name": "export_adjacency_5000n_20000e",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 1381.6999999999998,
+          "p95_us": 1390.9,
+          "p99_us": 1390.9,
+          "scenario_id": "RUST-ADVANCED-QUERIES-EXPORT-ADJACENCY-5000N-20000E",
+          "throughput_ops_per_sec": null
+        },
+        {
+          "category": "flush",
+          "name": "flush_100_nodes_20_edges",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 106730.0,
+          "p95_us": 107520.0,
+          "p99_us": 107520.0,
+          "scenario_id": "RUST-FLUSH-FLUSH-100-NODES-20-EDGES",
+          "throughput_ops_per_sec": null
+        },
+        {
+          "category": "group_commit",
+          "name": "upsert_node_immediate",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 4506.9,
+          "p95_us": 4508.9,
+          "p99_us": 4508.9,
+          "scenario_id": "RUST-GROUP-COMMIT-UPSERT-NODE-IMMEDIATE",
+          "throughput_ops_per_sec": null
+        },
+        {
+          "category": "group_commit",
+          "name": "upsert_node_group_commit",
+          "notes": "criterion quick estimate from [low median high] interval",
+          "p50_us": 140.71,
+          "p95_us": 156.59,
+          "p99_us": 156.59,
+          "scenario_id": "RUST-GROUP-COMMIT-UPSERT-NODE-GROUP-COMMIT",
+          "throughput_ops_per_sec": null
+        }
+      ]
+    }
+  },
+  "profile_name": "small",
+  "report_id": "2026-03-04-launch-pack-small-group-commit",
+  "schema_version": 1
+}

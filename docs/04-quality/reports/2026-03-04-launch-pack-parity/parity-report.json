@@ -1,0 +1,37 @@
+{
+  "comparable_scenarios": [
+    "S-ADV-001",
+    "S-ADV-003",
+    "S-ADV-004",
+    "S-ADV-005",
+    "S-BATCH-001",
+    "S-CRUD-001",
+    "S-CRUD-002",
+    "S-CRUD-003",
+    "S-MAIN-001",
+    "S-TRAV-001",
+    "S-TRAV-002"
+  ],
+  "errors": [],
+  "info": [
+    "profile=small",
+    "comparable_scenarios=11",
+    "non_comparable_scenarios=1"
+  ],
+  "non_comparable_scenarios": {
+    "S-BATCH-002": {
+      "present_languages": [
+        "node",
+        "python"
+      ],
+      "reasons": {
+        "node": "Binary batch path is connector-specific and has no direct Rust-core API equivalent.",
+        "python": "Binary batch path is connector-specific and has no direct Rust-core API equivalent."
+      }
+    }
+  },
+  "profile_name": "small",
+  "schema_version": 1,
+  "status": "pass",
+  "warnings": []
+}

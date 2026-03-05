@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "scenario_id": "S-MAIN-001",
+      "language": "*",
+      "profile_name": "*",
+      "harness_stage": "*",
+      "max_regression_pct": 40,
+      "reason": "flush latency is sensitive to shared-runner disk contention, but bound tighter for earlier signal"
+    }
+  ]
+}

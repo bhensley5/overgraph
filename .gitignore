@@ -1,0 +1,42 @@
+# Build artifacts
+/target
+*.so
+*.dylib
+*.dSYM/
+
+# Node.js
+node_modules/
+*.node
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Claude Code
+.claude/
+CLAUDE.md
+AGENTS.md
+
+# Internal development docs (not public-facing)
+docs/internal/
+
+# Research notes
+research-docs/

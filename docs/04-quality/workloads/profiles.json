@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "determinism": {
+    "seed": 1729,
+    "node_key_template": "node:{i}",
+    "edge_key_templates": {
+      "chain": "edge:chain:{i}",
+      "hub": "edge:hub:{i}",
+      "powerlaw": "edge:powerlaw:{i}",
+      "temporal": "edge:temporal:{i}"
+    },
+    "generator_rules": {
+      "type_id_cycle": [1, 2, 3, 4, 5],
+      "weight_base": 0.5,
+      "weight_modulus": 500,
+      "weight_formula": "weight = weight_base + ((i mod weight_modulus) / 1000.0)",
+      "temporal_valid_from_base_ms": 1700000000000,
+      "temporal_valid_to_delta_ms": 604800000
+    }
+  },
+  "profiles": {
+    "small": {
+      "description": "CI smoke and local quick checks",
+      "nodes": 10000,
+      "edges": 50000,
+      "average_degree_target": 5,
+      "property_payload": "light",
+      "shape_mix": {
+        "chain_pct": 40,
+        "hub_pct": 20,
+        "powerlaw_pct": 30,
+        "temporal_pct": 10
+      },
+      "batch_sizes": {
+        "nodes": 100,
+        "edges": 100
+      }
+    },
+    "medium": {
+      "description": "Default baseline profile",
+      "nodes": 100000,
+      "edges": 500000,
+      "average_degree_target": 5,
+      "property_payload": "mixed",
+      "shape_mix": {
+        "chain_pct": 35,
+        "hub_pct": 20,
+        "powerlaw_pct": 35,
+        "temporal_pct": 10
+      },
+      "batch_sizes": {
+        "nodes": 500,
+        "edges": 500
+      }
+    },
+    "large": {
+      "description": "Full benchmark profile for release comparisons",
+      "nodes": 1000000,
+      "edges": 5000000,
+      "average_degree_target": 5,
+      "property_payload": "mixed-heavy",
+      "shape_mix": {
+        "chain_pct": 30,
+        "hub_pct": 20,
+        "powerlaw_pct": 40,
+        "temporal_pct": 10
+      },
+      "batch_sizes": {
+        "nodes": 1000,
+        "edges": 1000
+      }
+    },
+    "xlarge": {
+      "description": "Optional nightly stress profile",
+      "nodes": 3000000,
+      "edges": 15000000,
+      "average_degree_target": 5,
+      "property_payload": "heavy",
+      "shape_mix": {
+        "chain_pct": 25,
+        "hub_pct": 20,
+        "powerlaw_pct": 45,
+        "temporal_pct": 10
+      },
+      "batch_sizes": {
+        "nodes": 2000,
+        "edges": 2000
+      }
+    }
+  }
+}

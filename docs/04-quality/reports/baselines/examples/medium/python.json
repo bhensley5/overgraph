@@ -1,0 +1,478 @@
+{
+  "schema_version": 1,
+  "language": "python",
+  "harness_stage": "connector-benchmark-v2-parity",
+  "profile_name": "medium",
+  "generated_at_utc": "2026-03-05T00:20:44Z",
+  "profile_source": "docs/04-quality/workloads/profiles.json",
+  "scenario_contract_source": "docs/04-quality/workloads/scenario-contract.json",
+  "percentile_method": {
+    "name": "nearest_rank",
+    "index_formula": "ceil((p / 100) * n) - 1",
+    "interpolation": "none",
+    "sorted_order": "ascending",
+    "sample_unit": "microseconds"
+  },
+  "profile_contract": {
+    "determinism": {
+      "seed": 1729,
+      "node_key_template": "node:{i}",
+      "edge_key_templates": {
+        "chain": "edge:chain:{i}",
+        "hub": "edge:hub:{i}",
+        "powerlaw": "edge:powerlaw:{i}",
+        "temporal": "edge:temporal:{i}"
+      },
+      "generator_rules": {
+        "type_id_cycle": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "weight_base": 0.5,
+        "weight_modulus": 500,
+        "weight_formula": "weight = weight_base + ((i mod weight_modulus) / 1000.0)",
+        "temporal_valid_from_base_ms": 1700000000000,
+        "temporal_valid_to_delta_ms": 604800000
+      }
+    },
+    "profile": {
+      "description": "Default baseline profile",
+      "nodes": 100000,
+      "edges": 500000,
+      "average_degree_target": 5,
+      "property_payload": "mixed",
+      "shape_mix": {
+        "chain_pct": 35,
+        "hub_pct": 20,
+        "powerlaw_pct": 35,
+        "temporal_pct": 10
+      },
+      "batch_sizes": {
+        "nodes": 500,
+        "edges": 500
+      }
+    },
+    "effective_config": {
+      "nodes": 2000,
+      "edges": 10000,
+      "fanout": 100,
+      "batch_nodes": 500,
+      "batch_edges": 500,
+      "two_hop_mid": 100,
+      "two_hop_leaves_per_mid": 8,
+      "top_k_candidates": 1000,
+      "ppr_nodes": 1000,
+      "get_node_nodes": 2000,
+      "time_range_nodes": 2000,
+      "export_nodes": 2000,
+      "export_edges": 10000,
+      "flush_nodes_per_iter": 200,
+      "flush_edges_per_iter_cap": 50,
+      "ppr_max_iterations": 20,
+      "ppr_max_results": 50,
+      "ppr_seed_count": 1,
+      "ppr_edge_offsets": [
+        1,
+        7
+      ],
+      "top_k_limit": 20,
+      "time_range_from_ms": 0,
+      "time_range_window_ms": 60000,
+      "include_weights_on_export": true
+    },
+    "scenario_contract_schema_version": 1
+  },
+  "scenarios": [
+    {
+      "scenario_id": "S-CRUD-001",
+      "name": "upsert_node",
+      "category": "crud",
+      "warmup_iterations": 20,
+      "benchmark_iterations": 80,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 639146.1008093187,
+      "stats": {
+        "p50_us": 1.25,
+        "p95_us": 2.583,
+        "p99_us": 10.791,
+        "min_us": 1.041,
+        "max_us": 10.791,
+        "mean_us": 1.5645875,
+        "early_p95_us": 3.166,
+        "late_p95_us": 2.208,
+        "drift_ratio": 0.6974099810486419
+      },
+      "scenario_params": {
+        "type_id": 1,
+        "with_props": true,
+        "weight": 1.0
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-CRUD-002",
+      "name": "upsert_edge",
+      "category": "crud",
+      "warmup_iterations": 20,
+      "benchmark_iterations": 80,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 686424.2445043158,
+      "stats": {
+        "p50_us": 1.125,
+        "p95_us": 1.416,
+        "p99_us": 20.166,
+        "min_us": 0.834,
+        "max_us": 20.166,
+        "mean_us": 1.4568250000000003,
+        "early_p95_us": 2.875,
+        "late_p95_us": 1.292,
+        "drift_ratio": 0.4493913043478261
+      },
+      "scenario_params": {
+        "edge_type_id": 1,
+        "weight": 1.0
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-BATCH-001",
+      "name": "batch_upsert_nodes_json",
+      "category": "batch",
+      "warmup_iterations": 10,
+      "benchmark_iterations": 40,
+      "ops_per_iteration": 500,
+      "throughput_ops_per_sec": 524780.0069732766,
+      "stats": {
+        "p50_us": 701.333,
+        "p95_us": 1895.333,
+        "p99_us": 5136.75,
+        "min_us": 626.625,
+        "max_us": 5136.75,
+        "mean_us": 952.7802000000001
+      },
+      "scenario_params": {
+        "batch_nodes": 500,
+        "type_id": 1,
+        "with_props": true
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-BATCH-002",
+      "name": "batch_upsert_nodes_binary",
+      "category": "batch",
+      "warmup_iterations": 10,
+      "benchmark_iterations": 40,
+      "ops_per_iteration": 500,
+      "throughput_ops_per_sec": 300503.9120050021,
+      "stats": {
+        "p50_us": 1182.916,
+        "p95_us": 5350.375,
+        "p99_us": 5490.958,
+        "min_us": 1077.5,
+        "max_us": 5490.958,
+        "mean_us": 1663.87185
+      },
+      "scenario_params": {
+        "batch_nodes": 500,
+        "encoding": "binary-pack-node-batch"
+      },
+      "comparability": {
+        "status": "non_comparable",
+        "reason": "Binary batch path is connector-specific and has no direct Rust-core API equivalent."
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-CRUD-003",
+      "name": "get_node",
+      "category": "crud",
+      "warmup_iterations": 20,
+      "benchmark_iterations": 80,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 2865329.512893982,
+      "stats": {
+        "p50_us": 0.333,
+        "p95_us": 0.5,
+        "p99_us": 0.583,
+        "min_us": 0.25,
+        "max_us": 0.583,
+        "mean_us": 0.3490000000000001
+      },
+      "scenario_params": {
+        "preload_nodes": 2000
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-CRUD-004",
+      "name": "upsert_node_fixed_key",
+      "category": "crud",
+      "warmup_iterations": 20,
+      "benchmark_iterations": 80,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 774833.4108166745,
+      "stats": {
+        "p50_us": 1.25,
+        "p95_us": 1.417,
+        "p99_us": 1.625,
+        "min_us": 1.208,
+        "max_us": 1.625,
+        "mean_us": 1.2906
+      },
+      "scenario_params": {
+        "type_id": 1,
+        "with_props": true,
+        "weight": 1.0,
+        "fixed_key": true
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-CRUD-005",
+      "name": "upsert_edge_fixed_triple",
+      "category": "crud",
+      "warmup_iterations": 20,
+      "benchmark_iterations": 80,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 2102828.304068973,
+      "stats": {
+        "p50_us": 0.459,
+        "p95_us": 0.542,
+        "p99_us": 0.792,
+        "min_us": 0.416,
+        "max_us": 0.792,
+        "mean_us": 0.47555
+      },
+      "scenario_params": {
+        "edge_type_id": 1,
+        "weight": 1.0,
+        "edge_uniqueness": true,
+        "fixed_triple": true
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-TRAV-001",
+      "name": "neighbors",
+      "category": "traversal",
+      "warmup_iterations": 20,
+      "benchmark_iterations": 80,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 225406.7182472374,
+      "stats": {
+        "p50_us": 4.417,
+        "p95_us": 4.75,
+        "p99_us": 5.0,
+        "min_us": 4.208,
+        "max_us": 5.0,
+        "mean_us": 4.436424999999999
+      },
+      "scenario_params": {
+        "fanout": 100,
+        "direction": "outgoing"
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-TRAV-002",
+      "name": "neighbors_2hop",
+      "category": "traversal",
+      "warmup_iterations": 20,
+      "benchmark_iterations": 80,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 6645.964487288763,
+      "stats": {
+        "p50_us": 147.75,
+        "p95_us": 176.208,
+        "p99_us": 205.0,
+        "min_us": 125.917,
+        "max_us": 205.0,
+        "mean_us": 150.46724999999998
+      },
+      "scenario_params": {
+        "direction": "outgoing",
+        "mid_nodes": 100,
+        "leaves_per_mid": 8
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-ADV-001",
+      "name": "top_k_neighbors",
+      "category": "advanced",
+      "warmup_iterations": 20,
+      "benchmark_iterations": 80,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 45141.40262237694,
+      "stats": {
+        "p50_us": 20.583,
+        "p95_us": 24.75,
+        "p99_us": 112.042,
+        "min_us": 20.083,
+        "max_us": 112.042,
+        "mean_us": 22.152612499999996
+      },
+      "scenario_params": {
+        "direction": "outgoing",
+        "k": 20,
+        "scoring": "weight",
+        "candidate_nodes": 1000
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-ADV-003",
+      "name": "find_nodes_by_time_range",
+      "category": "advanced",
+      "warmup_iterations": 20,
+      "benchmark_iterations": 80,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 2795.4519255125288,
+      "stats": {
+        "p50_us": 355.25,
+        "p95_us": 378.125,
+        "p99_us": 396.875,
+        "min_us": 334.959,
+        "max_us": 396.875,
+        "mean_us": 357.72391249999987
+      },
+      "scenario_params": {
+        "type_id": 1,
+        "preload_nodes": 2000,
+        "from_ms": 0,
+        "to_ms_window": 60000
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-ADV-004",
+      "name": "personalized_pagerank",
+      "category": "advanced",
+      "warmup_iterations": 10,
+      "benchmark_iterations": 40,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 1975.6663107503807,
+      "stats": {
+        "p50_us": 504.625,
+        "p95_us": 537.542,
+        "p99_us": 567.084,
+        "min_us": 467.25,
+        "max_us": 567.084,
+        "mean_us": 506.15835000000004
+      },
+      "scenario_params": {
+        "ppr_nodes": 1000,
+        "seed_strategy": "first_node_id",
+        "seed_count": 1,
+        "edge_offsets": [
+          1,
+          7
+        ],
+        "max_iterations": 20,
+        "max_results": 50
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-ADV-005",
+      "name": "export_adjacency",
+      "category": "advanced",
+      "warmup_iterations": 10,
+      "benchmark_iterations": 40,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 1023.3920821792032,
+      "stats": {
+        "p50_us": 966.167,
+        "p95_us": 1040.166,
+        "p99_us": 1123.042,
+        "min_us": 903.291,
+        "max_us": 1123.042,
+        "mean_us": 977.1425999999998
+      },
+      "scenario_params": {
+        "preload_nodes": 2000,
+        "preload_edges": 10000,
+        "include_weights": true
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    },
+    {
+      "scenario_id": "S-MAIN-001",
+      "name": "flush",
+      "category": "maintenance",
+      "warmup_iterations": 6,
+      "benchmark_iterations": 20,
+      "ops_per_iteration": 1,
+      "throughput_ops_per_sec": 9.104980776619943,
+      "stats": {
+        "p50_us": 97099.292,
+        "p95_us": 161597.041,
+        "p99_us": 172906.833,
+        "min_us": 89967.0,
+        "max_us": 172906.833,
+        "mean_us": 109829.99575
+      },
+      "scenario_params": {
+        "nodes_per_iter": 200,
+        "edge_chain_cap": 50
+      },
+      "comparability": {
+        "status": "comparable",
+        "reason": null
+      },
+      "notes": null
+    }
+  ]
+}

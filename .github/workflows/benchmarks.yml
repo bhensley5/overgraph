@@ -1,0 +1,250 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Benchmark profile"
+        required: false
+        default: small
+        type: choice
+        options:
+          - small
+          - medium
+          - large
+      baseline_root:
+        description: "Optional baseline root dir (defaults to docs/04-quality/reports/baselines/gha-ubuntu-22.04/<profile>)"
+        required: false
+        type: string
+      fail_on_warning:
+        description: "Fail workflow when only warning-threshold regressions are found"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 7 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve benchmark config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            PROFILE="${{ inputs.profile }}"
+            BASELINE_ROOT_INPUT="${{ inputs.baseline_root }}"
+            FAIL_ON_WARNING="${{ inputs.fail_on_warning }}"
+          else
+            PROFILE="medium"
+            BASELINE_ROOT_INPUT=""
+            FAIL_ON_WARNING="false"
+          fi
+
+          if [[ -n "${BASELINE_ROOT_INPUT}" ]]; then
+            BASELINE_ROOT="${BASELINE_ROOT_INPUT}"
+          else
+            BASELINE_ROOT="docs/04-quality/reports/baselines/gha-ubuntu-22.04/${PROFILE}"
+          fi
+
+          case "${PROFILE}" in
+            small)
+              WARMUP=10
+              ITERS=30
+              ;;
+            medium)
+              WARMUP=20
+              ITERS=80
+              ;;
+            large)
+              WARMUP=20
+              ITERS=80
+              ;;
+            *)
+              echo "Unsupported profile: ${PROFILE}" >&2
+              exit 1
+              ;;
+          esac
+
+          RUN_TAG="ci-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          {
+            echo "PROFILE=${PROFILE}"
+            echo "BASELINE_ROOT=${BASELINE_ROOT}"
+            echo "WARMUP=${WARMUP}"
+            echo "ITERS=${ITERS}"
+            echo "RUN_TAG=${RUN_TAG}"
+            echo "FAIL_ON_WARNING=${FAIL_ON_WARNING}"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Install Node deps + build connector
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix overgraph-node
+          npm --prefix overgraph-node run build
+
+      - name: Install Python deps + build connector
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install maturin==1.7.8
+          python3 -m pip install -e overgraph-python
+
+      - name: Run benchmark suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bench-artifacts/runs/rust
+          mkdir -p bench-artifacts/runs/node
+          mkdir -p bench-artifacts/runs/python
+
+          scripts/bench/run-rust.sh \
+            --profile "${PROFILE}" \
+            --warmup "${WARMUP}" \
+            --iters "${ITERS}" \
+            --output-root bench-artifacts/runs/rust \
+            --run-id "${RUN_TAG}-rust-${PROFILE}"
+
+          scripts/bench/run-node.sh \
+            --profile "${PROFILE}" \
+            --warmup "${WARMUP}" \
+            --iters "${ITERS}" \
+            --output-root bench-artifacts/runs/node \
+            --run-id "${RUN_TAG}-node-${PROFILE}"
+
+          scripts/bench/run-python.sh \
+            --profile "${PROFILE}" \
+            --warmup "${WARMUP}" \
+            --iters "${ITERS}" \
+            --output-root bench-artifacts/runs/python \
+            --run-id "${RUN_TAG}-python-${PROFILE}"
+
+      - name: Validate cross-language parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bench-artifacts/parity
+
+          python3 tools/bench/validate_parity.py \
+            --rust "bench-artifacts/runs/rust/${RUN_TAG}-rust-${PROFILE}/rust.json" \
+            --node "bench-artifacts/runs/node/${RUN_TAG}-node-${PROFILE}/node.json" \
+            --python "bench-artifacts/runs/python/${RUN_TAG}-python-${PROFILE}/python.json" \
+            --report-json bench-artifacts/parity/parity-report.json \
+            --report-md bench-artifacts/parity/parity-report.md
+
+      - name: Compare to baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bench-artifacts/compare
+
+          status=0
+          for lang in rust node python; do
+            candidate_json="bench-artifacts/runs/${lang}/${RUN_TAG}-${lang}-${PROFILE}/${lang}.json"
+            baseline_json="${BASELINE_ROOT}/${lang}.json"
+            report_md="bench-artifacts/compare/${lang}-compare.md"
+            report_json="bench-artifacts/compare/${lang}-compare.json"
+
+            if [[ ! -f "${candidate_json}" ]]; then
+              echo "Missing candidate file: ${candidate_json}" >&2
+              status=2
+              continue
+            fi
+
+            if [[ -f "${baseline_json}" ]]; then
+              args=(
+                python3 tools/bench/compare_baseline.py
+                --baseline "${baseline_json}"
+                --candidate "${candidate_json}"
+                --allowlist docs/04-quality/regression-allowlist.json
+                --warn-threshold-pct 10
+                --fail-threshold-pct 20
+                --report-md "${report_md}"
+                --report-json "${report_json}"
+              )
+              if [[ "${FAIL_ON_WARNING}" == "true" ]]; then
+                args+=(--fail-on-warning)
+              fi
+
+              set +e
+              "${args[@]}"
+              rc=$?
+              set -e
+
+              if (( rc > status )); then
+                status=$rc
+              fi
+            else
+              {
+                echo "# Benchmark Baseline Comparison"
+                echo
+                echo "- Language: \`${lang}\`"
+                echo "- Status: \`error\`"
+                echo "- Reason: required baseline file not found at \`${baseline_json}\`"
+              } > "${report_md}"
+              status=2
+            fi
+          done
+
+          exit "${status}"
+
+      - name: Publish comparison summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "bench-artifacts/parity/parity-report.md" ]]; then
+            echo "## parity-report.md" >> "$GITHUB_STEP_SUMMARY"
+            cat "bench-artifacts/parity/parity-report.md" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if compgen -G "bench-artifacts/compare/*.md" > /dev/null; then
+            for file in bench-artifacts/compare/*.md; do
+              echo "## $(basename "${file}")" >> "$GITHUB_STEP_SUMMARY"
+              cat "${file}" >> "$GITHUB_STEP_SUMMARY"
+              echo >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ env.RUN_TAG }}-${{ env.PROFILE }}
+          path: bench-artifacts
+          if-no-files-found: error
+          retention-days: 30

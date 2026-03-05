@@ -1,0 +1,17 @@
+[package]
+name = "overgraph-node"
+version = "0.1.0"
+edition = "2021"
+description = "Node.js native addon for OverGraph"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+overgraph = { path = ".." }
+napi = { version = "3", features = ["napi6", "serde-json"] }
+napi-derive = "3"
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"

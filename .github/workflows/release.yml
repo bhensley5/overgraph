@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Rust: publish to crates.io
+  # ──────────────────────────────────────────────
+  # TODO: Switch to Trusted Publishing (crates-io-auth-action) after repo is public
+  publish-rust:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo publish -p overgraph
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # ──────────────────────────────────────────────
+  # Node.js: build native binaries for each platform
+  # ──────────────────────────────────────────────
+  build-node:
+    name: Build Node.js (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        working-directory: overgraph-node
+        run: npm install
+      - name: Build native module
+        working-directory: overgraph-node
+        run: npx napi build --platform --release --target ${{ matrix.target }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.target }}
+          path: overgraph-node/*.node
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────
+  # Node.js: publish to npm
+  # ──────────────────────────────────────────────
+  # TODO: Switch to Trusted Publishing (OIDC) after repo is public
+  publish-node:
+    name: Publish to npm
+    needs: build-node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: overgraph-node/artifacts
+          pattern: node-*
+      - name: Move binaries and README into place
+        working-directory: overgraph-node
+        run: |
+          for dir in artifacts/node-*/; do
+            cp "$dir"*.node .
+          done
+          cp ../README.md .
+          ls -la *.node README.md
+      - name: Publish
+        working-directory: overgraph-node
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ──────────────────────────────────────────────
+  # Python: build wheels for each platform
+  # ──────────────────────────────────────────────
+  build-python:
+    name: Build Python (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Copy README into package
+        run: cp README.md overgraph-python/README.md
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: overgraph-python
+          target: ${{ matrix.target }}
+          args: --release --out ../dist
+          manylinux: auto
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-python-sdist:
+    name: Build Python sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy README into package
+        run: cp README.md overgraph-python/README.md
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: overgraph-python
+          command: sdist
+          args: --out ../dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────
+  # Python: publish to PyPI (Trusted Publishing)
+  # ──────────────────────────────────────────────
+  publish-python:
+    name: Publish to PyPI
+    needs: [build-python, build-python-sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: python-*
+          merge-multiple: true
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
