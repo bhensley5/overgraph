@@ -19,10 +19,7 @@ pub(crate) struct WalSyncState {
 }
 
 /// Background sync thread loop. Wakes on timer, soft trigger, or shutdown.
-pub(crate) fn sync_thread_loop(
-    wal_state: Arc<(Mutex<WalSyncState>, Condvar)>,
-    interval: Duration,
-) {
+pub(crate) fn sync_thread_loop(wal_state: Arc<(Mutex<WalSyncState>, Condvar)>, interval: Duration) {
     let (lock, cvar) = &*wal_state;
     loop {
         let mut state = lock.lock().unwrap();
@@ -213,10 +210,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut writer = WalWriter::open(dir.path()).unwrap();
 
-        let ops = vec![
-            make_test_node(1, "a"),
-            make_test_node(2, "b"),
-        ];
+        let ops = vec![make_test_node(1, "a"), make_test_node(2, "b")];
         let total = writer.append_batch(&ops).unwrap();
         // Each record has: 4 (len) + 4 (crc) + payload
         assert!(total > 0);
@@ -333,7 +327,10 @@ mod tests {
         for i in 0..3 {
             let (lock, cvar) = &*wal_state;
             let mut s = lock.lock().unwrap();
-            let bytes = s.wal_writer.append(&make_test_node(i + 1, &format!("n{}", i))).unwrap();
+            let bytes = s
+                .wal_writer
+                .append(&make_test_node(i + 1, &format!("n{}", i)))
+                .unwrap();
             s.buffered_bytes += bytes;
             cvar.notify_all();
             drop(s);

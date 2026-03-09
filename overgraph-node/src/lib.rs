@@ -1,20 +1,26 @@
-use overgraph::{
-    AdjacencyExport, CompactionPhase, CompactionStats, DatabaseEngine, DbOptions, DbStats,
-    Direction, EdgeInput, EdgeRecord, EngineError, ExportOptions, GraphPatch, NeighborEntry,
-    NodeInput, NodeRecord, PageRequest, PageResult, PprOptions, PprResult, PropValue, PrunePolicy,
-    PruneResult, ScoringMode, Subgraph, WalSyncMode,
-};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi_derive::napi;
+use overgraph::{
+    AdjacencyExport, CompactionPhase, CompactionStats, DatabaseEngine, DbOptions, DbStats,
+    Direction, EdgeInput, EdgeRecord, EngineError, ExportOptions, GraphPatch, NeighborEntry,
+    NodeIdMap, NodeInput, NodeRecord, PageRequest, PageResult, PprOptions, PprResult, PropValue,
+    PrunePolicy, PruneResult, ScoringMode, ShortestPath, Subgraph, TraversalCursor, TraversalHit,
+    TraversalPageResult, WalSyncMode,
+};
 
 /// ThreadsafeFunction with `CalleeHandled = false` so the JS callback
 /// receives `(progress)` directly, not error-first `(null, progress)`.
-type ProgressTsfn =
-    napi::threadsafe_function::ThreadsafeFunction<JsCompactionProgress, Unknown<'static>, JsCompactionProgress, Status, false>;
+type ProgressTsfn = napi::threadsafe_function::ThreadsafeFunction<
+    JsCompactionProgress,
+    Unknown<'static>,
+    JsCompactionProgress,
+    Status,
+    false,
+>;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 // ============================================================
 // Core wrapper
@@ -26,7 +32,7 @@ struct InnerDb {
 
 #[napi]
 pub struct OverGraph {
-    inner: Arc<Mutex<Option<InnerDb>>>,
+    inner: Arc<RwLock<Option<InnerDb>>>,
 }
 
 #[napi]
@@ -39,7 +45,7 @@ impl OverGraph {
         let engine = DatabaseEngine::open(Path::new(&path), &opts)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         Ok(OverGraph {
-            inner: Arc::new(Mutex::new(Some(InnerDb { engine }))),
+            inner: Arc::new(RwLock::new(Some(InnerDb { engine }))),
         })
     }
 
@@ -48,7 +54,7 @@ impl OverGraph {
         let force = options.as_ref().and_then(|o| o.force).unwrap_or(false);
         let mut guard = self
             .inner
-            .lock()
+            .write()
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         if let Some(db) = guard.take() {
             if force {
@@ -95,7 +101,9 @@ impl OverGraph {
         let to = f64_to_u64(to)?;
         let props = convert_js_props(props);
         let w = weight.unwrap_or(1.0) as f32;
-        let id = with_engine(self, |eng| eng.upsert_edge(from, to, type_id, props, w, valid_from, valid_to))?;
+        let id = with_engine(self, |eng| {
+            eng.upsert_edge(from, to, type_id, props, w, valid_from, valid_to)
+        })?;
         Ok(u64_to_f64(id))
     }
 
@@ -164,21 +172,33 @@ impl OverGraph {
 
     #[napi]
     pub fn get_node_by_key(&self, type_id: u32, key: String) -> Result<Option<JsNodeRecord>> {
-        with_engine_ref(self, |eng| Ok(eng.get_node_by_key(type_id, &key)?.map(|n| n.into())))
+        with_engine_ref(self, |eng| {
+            Ok(eng.get_node_by_key(type_id, &key)?.map(|n| n.into()))
+        })
     }
 
     #[napi]
-    pub fn get_edge_by_triple(&self, from: f64, to: f64, type_id: u32) -> Result<Option<JsEdgeRecord>> {
+    pub fn get_edge_by_triple(
+        &self,
+        from: f64,
+        to: f64,
+        type_id: u32,
+    ) -> Result<Option<JsEdgeRecord>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        with_engine_ref(self, |eng| Ok(eng.get_edge_by_triple(from, to, type_id)?.map(|e| e.into())))
+        with_engine_ref(self, |eng| {
+            Ok(eng.get_edge_by_triple(from, to, type_id)?.map(|e| e.into()))
+        })
     }
 
     // --- Bulk reads ---
 
     #[napi]
     pub fn get_nodes(&self, ids: Vec<f64>) -> Result<Vec<Option<JsNodeRecord>>> {
-        let ids: Vec<u64> = ids.into_iter().map(f64_to_u64).collect::<Result<Vec<_>>>()?;
+        let ids: Vec<u64> = ids
+            .into_iter()
+            .map(f64_to_u64)
+            .collect::<Result<Vec<_>>>()?;
         with_engine_ref(self, |eng| {
             let results = eng.get_nodes(&ids)?;
             Ok(results.into_iter().map(|r| r.map(|n| n.into())).collect())
@@ -187,7 +207,10 @@ impl OverGraph {
 
     #[napi]
     pub fn get_edges(&self, ids: Vec<f64>) -> Result<Vec<Option<JsEdgeRecord>>> {
-        let ids: Vec<u64> = ids.into_iter().map(f64_to_u64).collect::<Result<Vec<_>>>()?;
+        let ids: Vec<u64> = ids
+            .into_iter()
+            .map(f64_to_u64)
+            .collect::<Result<Vec<_>>>()?;
         with_engine_ref(self, |eng| {
             let results = eng.get_edges(&ids)?;
             Ok(results.into_iter().map(|r| r.map(|e| e.into())).collect())
@@ -213,7 +236,9 @@ impl OverGraph {
     #[napi]
     pub fn invalidate_edge(&self, id: f64, valid_to: i64) -> Result<Option<JsEdgeRecord>> {
         let id = f64_to_u64(id)?;
-        with_engine(self, |eng| Ok(eng.invalidate_edge(id, valid_to)?.map(|e| e.into())))
+        with_engine(self, |eng| {
+            Ok(eng.invalidate_edge(id, valid_to)?.map(|e| e.into()))
+        })
     }
 
     #[napi]
@@ -320,8 +345,8 @@ impl OverGraph {
     #[napi(ts_return_type = "Promise<Array<JsNamedPrunePolicy>>")]
     pub fn list_prune_policies_async(
         &self,
-    ) -> Result<AsyncTask<EngineOp<Vec<(String, PrunePolicy)>, Vec<JsNamedPrunePolicy>>>> {
-        Ok(AsyncTask::new(EngineOp::new(
+    ) -> Result<AsyncTask<EngineReadOp<Vec<(String, PrunePolicy)>, Vec<JsNamedPrunePolicy>>>> {
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| Ok(eng.list_prune_policies()),
             |policies| {
@@ -357,58 +382,44 @@ impl OverGraph {
         let lim = limit.unwrap_or(0) as usize;
         let decay = decay_lambda.map(|v| v as f32); // JS f64 → Rust f32 (sufficient precision for λ)
         with_engine_ref(self, |eng| {
-            let entries = eng.neighbors(node_id, dir, type_filter.as_deref(), lim, at_epoch, decay)?;
+            let entries =
+                eng.neighbors(node_id, dir, type_filter.as_deref(), lim, at_epoch, decay)?;
             Ok(neighbor_entries_to_js(entries))
         })
     }
 
     #[napi]
-    pub fn neighbors_2hop(
+    pub fn traverse(
         &self,
-        node_id: f64,
+        start_node_id: f64,
+        min_depth: u32,
+        max_depth: u32,
         direction: Option<String>,
-        type_filter: Option<Vec<u32>>,
-        limit: Option<u32>,
+        edge_type_filter: Option<Vec<u32>>,
+        node_type_filter: Option<Vec<u32>>,
         at_epoch: Option<i64>,
         decay_lambda: Option<f64>,
-    ) -> Result<JsNeighborList> {
-        let node_id = f64_to_u64(node_id)?;
-        let dir = parse_direction(direction.as_deref())?;
-        let lim = limit.unwrap_or(0) as usize;
-        let decay = decay_lambda.map(|v| v as f32); // JS f64 → Rust f32 (sufficient precision for λ)
-        with_engine_ref(self, |eng| {
-            let entries = eng.neighbors_2hop(node_id, dir, type_filter.as_deref(), lim, at_epoch, decay)?;
-            Ok(neighbor_entries_to_js(entries))
-        })
-    }
-
-    #[napi]
-    pub fn neighbors_2hop_constrained(
-        &self,
-        node_id: f64,
-        direction: Option<String>,
-        traverse_edge_types: Option<Vec<u32>>,
-        target_node_types: Option<Vec<u32>>,
         limit: Option<u32>,
-        at_epoch: Option<i64>,
-        decay_lambda: Option<f64>,
-    ) -> Result<JsNeighborList> {
-        let node_id = f64_to_u64(node_id)?;
+        cursor: Option<JsTraversalCursor>,
+    ) -> Result<JsTraversalPageResult> {
+        let start_node_id = f64_to_u64(start_node_id)?;
         let dir = parse_direction(direction.as_deref())?;
-        let lim = limit.unwrap_or(0) as usize;
-        let decay = decay_lambda.map(|v| v as f32);
-        with_engine_ref(self, |eng| {
-            let entries = eng.neighbors_2hop_constrained(
-                node_id,
+        let cursor = cursor.map(js_traversal_cursor_to_rust).transpose()?;
+        let page = with_engine_ref(self, |eng| {
+            eng.traverse(
+                start_node_id,
+                min_depth,
+                max_depth,
                 dir,
-                traverse_edge_types.as_deref(),
-                target_node_types.as_deref(),
-                lim,
+                edge_type_filter.as_deref(),
+                node_type_filter.as_deref(),
                 at_epoch,
-                decay,
-            )?;
-            Ok(neighbor_entries_to_js(entries))
-        })
+                decay_lambda,
+                limit.map(|v| v as usize),
+                cursor.as_ref(),
+            )
+        })?;
+        traversal_page_to_js(page)
     }
 
     #[napi]
@@ -450,7 +461,8 @@ impl OverGraph {
         let start = f64_to_u64(start_node_id)?;
         let dir = parse_direction(direction.as_deref())?;
         with_engine_ref(self, |eng| {
-            let sg = eng.extract_subgraph(start, max_depth, dir, edge_type_filter.as_deref(), at_epoch)?;
+            let sg =
+                eng.extract_subgraph(start, max_depth, dir, edge_type_filter.as_deref(), at_epoch)?;
             Ok(subgraph_to_js(sg))
         })
     }
@@ -466,13 +478,175 @@ impl OverGraph {
         at_epoch: Option<i64>,
         decay_lambda: Option<f64>,
     ) -> Result<Vec<JsNeighborBatchEntry>> {
-        let ids: Vec<u64> = node_ids.into_iter().map(f64_to_u64).collect::<Result<Vec<_>>>()?;
+        let ids: Vec<u64> = node_ids
+            .into_iter()
+            .map(f64_to_u64)
+            .collect::<Result<Vec<_>>>()?;
         let dir = parse_direction(direction.as_deref())?;
         let decay = decay_lambda.map(|v| v as f32);
         with_engine_ref(self, |eng| {
             let map = eng.neighbors_batch(&ids, dir, type_filter.as_deref(), at_epoch, decay)?;
             Ok(convert_batch_result(map))
         })
+    }
+
+    // --- Degree counts + aggregations (Phase 18a) ---
+
+    #[napi]
+    pub fn degree(
+        &self,
+        node_id: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<i64> {
+        let node_id = f64_to_u64(node_id)?;
+        let dir = parse_direction(direction.as_deref())?;
+        let count: u64 = with_engine_ref(self, |eng| {
+            eng.degree(node_id, dir, type_filter.as_deref(), at_epoch)
+        })?;
+        u64_to_safe_i64(count)
+    }
+
+    #[napi]
+    pub fn sum_edge_weights(
+        &self,
+        node_id: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<f64> {
+        let node_id = f64_to_u64(node_id)?;
+        let dir = parse_direction(direction.as_deref())?;
+        with_engine_ref(self, |eng| {
+            eng.sum_edge_weights(node_id, dir, type_filter.as_deref(), at_epoch)
+        })
+    }
+
+    #[napi]
+    pub fn avg_edge_weight(
+        &self,
+        node_id: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<Option<f64>> {
+        let node_id = f64_to_u64(node_id)?;
+        let dir = parse_direction(direction.as_deref())?;
+        with_engine_ref(self, |eng| {
+            eng.avg_edge_weight(node_id, dir, type_filter.as_deref(), at_epoch)
+        })
+    }
+
+    #[napi]
+    pub fn degrees(
+        &self,
+        node_ids: Vec<f64>,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<Vec<JsDegreeBatchEntry>> {
+        let ids: Vec<u64> = node_ids
+            .into_iter()
+            .map(f64_to_u64)
+            .collect::<Result<Vec<_>>>()?;
+        let dir = parse_direction(direction.as_deref())?;
+        let map = with_engine_ref(self, |eng| {
+            eng.degrees(&ids, dir, type_filter.as_deref(), at_epoch)
+        })?;
+        let mut entries: Vec<JsDegreeBatchEntry> = map
+            .into_iter()
+            .map(|(node_id, degree)| {
+                Ok(JsDegreeBatchEntry {
+                    node_id: u64_to_safe_f64(node_id)?,
+                    degree: u64_to_safe_i64(degree)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        entries.sort_by(|a, b| a.node_id.total_cmp(&b.node_id));
+        Ok(entries)
+    }
+
+    // --- Shortest path (Phase 18b) ---
+
+    #[napi]
+    pub fn shortest_path(
+        &self,
+        from: f64,
+        to: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        weight_field: Option<String>,
+        at_epoch: Option<i64>,
+        max_depth: Option<u32>,
+        max_cost: Option<f64>,
+    ) -> Result<Option<JsShortestPath>> {
+        let from = f64_to_u64(from)?;
+        let to = f64_to_u64(to)?;
+        let dir = parse_direction(direction.as_deref())?;
+        let result: Option<ShortestPath> = with_engine_ref(self, |eng| {
+            eng.shortest_path(
+                from,
+                to,
+                dir,
+                type_filter.as_deref(),
+                weight_field.as_deref(),
+                at_epoch,
+                max_depth,
+                max_cost,
+            )
+        })?;
+        result.map(shortest_path_to_js).transpose()
+    }
+
+    #[napi]
+    pub fn is_connected(
+        &self,
+        from: f64,
+        to: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+        max_depth: Option<u32>,
+    ) -> Result<bool> {
+        let from = f64_to_u64(from)?;
+        let to = f64_to_u64(to)?;
+        let dir = parse_direction(direction.as_deref())?;
+        with_engine_ref(self, |eng| {
+            eng.is_connected(from, to, dir, type_filter.as_deref(), at_epoch, max_depth)
+        })
+    }
+
+    #[napi]
+    pub fn all_shortest_paths(
+        &self,
+        from: f64,
+        to: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        weight_field: Option<String>,
+        at_epoch: Option<i64>,
+        max_depth: Option<u32>,
+        max_cost: Option<f64>,
+        max_paths: Option<u32>,
+    ) -> Result<Vec<JsShortestPath>> {
+        let from = f64_to_u64(from)?;
+        let to = f64_to_u64(to)?;
+        let dir = parse_direction(direction.as_deref())?;
+        let paths: Vec<ShortestPath> = with_engine_ref(self, |eng| {
+            eng.all_shortest_paths(
+                from,
+                to,
+                dir,
+                type_filter.as_deref(),
+                weight_field.as_deref(),
+                at_epoch,
+                max_depth,
+                max_cost,
+                max_paths.map(|n| n as usize),
+            )
+        })?;
+        paths.into_iter().map(shortest_path_to_js).collect()
     }
 
     #[napi]
@@ -525,16 +699,12 @@ impl OverGraph {
 
     #[napi]
     pub fn count_nodes_by_type(&self, type_id: u32) -> Result<i64> {
-        with_engine_ref(self, |eng| {
-            Ok(eng.count_nodes_by_type(type_id)? as i64)
-        })
+        with_engine_ref(self, |eng| Ok(eng.count_nodes_by_type(type_id)? as i64))
     }
 
     #[napi]
     pub fn count_edges_by_type(&self, type_id: u32) -> Result<i64> {
-        with_engine_ref(self, |eng| {
-            Ok(eng.count_edges_by_type(type_id)? as i64)
-        })
+        with_engine_ref(self, |eng| Ok(eng.count_edges_by_type(type_id)? as i64))
     }
 
     // --- Paginated queries (sync) ---
@@ -574,7 +744,9 @@ impl OverGraph {
     ) -> Result<JsNodePageResult> {
         let page = make_page_request(limit, after)?;
         with_engine_ref(self, |eng| {
-            Ok(node_page_to_js(eng.get_nodes_by_type_paged(type_id, &page)?))
+            Ok(node_page_to_js(
+                eng.get_nodes_by_type_paged(type_id, &page)?,
+            ))
         })
     }
 
@@ -587,7 +759,9 @@ impl OverGraph {
     ) -> Result<JsEdgePageResult> {
         let page = make_page_request(limit, after)?;
         with_engine_ref(self, |eng| {
-            Ok(edge_page_to_js(eng.get_edges_by_type_paged(type_id, &page)?))
+            Ok(edge_page_to_js(
+                eng.get_edges_by_type_paged(type_id, &page)?,
+            ))
         })
     }
 
@@ -603,7 +777,9 @@ impl OverGraph {
         let pv = json_to_prop_value(&prop_value);
         let page = make_page_request(limit, after)?;
         with_engine_ref(self, |eng| {
-            Ok(id_page_to_js(eng.find_nodes_paged(type_id, &prop_key, &pv, &page)?))
+            Ok(id_page_to_js(
+                eng.find_nodes_paged(type_id, &prop_key, &pv, &page)?,
+            ))
         })
     }
 
@@ -631,7 +807,9 @@ impl OverGraph {
     ) -> Result<JsIdPageResult> {
         let page = make_page_request(limit, after)?;
         with_engine_ref(self, |eng| {
-            Ok(id_page_to_js(eng.find_nodes_by_time_range_paged(type_id, from_ms, to_ms, &page)?))
+            Ok(id_page_to_js(eng.find_nodes_by_time_range_paged(
+                type_id, from_ms, to_ms, &page,
+            )?))
         })
     }
 
@@ -641,7 +819,10 @@ impl OverGraph {
         seed_node_ids: Float64Array,
         options: Option<JsPprOptions>,
     ) -> Result<JsPprResult> {
-        let seeds: Vec<u64> = seed_node_ids.iter().map(|v| f64_to_u64(*v)).collect::<Result<Vec<_>>>()?;
+        let seeds: Vec<u64> = seed_node_ids
+            .iter()
+            .map(|v| f64_to_u64(*v))
+            .collect::<Result<Vec<_>>>()?;
         let opts = js_ppr_options_to_rust(options);
         with_engine_ref(self, |eng| {
             let result = eng.personalized_pagerank(&seeds, &opts)?;
@@ -650,11 +831,11 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn export_adjacency(
-        &self,
-        options: Option<JsExportOptions>,
-    ) -> Result<JsAdjacencyExport> {
-        let include_weights = options.as_ref().and_then(|o| o.include_weights).unwrap_or(true);
+    pub fn export_adjacency(&self, options: Option<JsExportOptions>) -> Result<JsAdjacencyExport> {
+        let include_weights = options
+            .as_ref()
+            .and_then(|o| o.include_weights)
+            .unwrap_or(true);
         with_engine_ref(self, |eng| {
             let opts = js_export_options_to_rust(options);
             let result = eng.export_adjacency(&opts)?;
@@ -679,54 +860,62 @@ impl OverGraph {
         let decay = decay_lambda.map(|v| v as f32);
         with_engine_ref(self, |eng| {
             Ok(neighbor_page_to_js(eng.neighbors_paged(
-                node_id, dir, type_filter.as_deref(), &page, at_epoch, decay,
+                node_id,
+                dir,
+                type_filter.as_deref(),
+                &page,
+                at_epoch,
+                decay,
             )?))
         })
     }
 
+    // --- Connected Components (Phase 18d) ---
+
     #[napi]
-    pub fn neighbors_2hop_paged(
+    pub fn connected_components(
         &self,
-        node_id: f64,
-        direction: Option<String>,
-        type_filter: Option<Vec<u32>>,
-        limit: Option<u32>,
-        after: Option<f64>,
+        edge_type_filter: Option<Vec<u32>>,
+        node_type_filter: Option<Vec<u32>>,
         at_epoch: Option<i64>,
-        decay_lambda: Option<f64>,
-    ) -> Result<JsNeighborPageResult> {
-        let node_id = f64_to_u64(node_id)?;
-        let dir = parse_direction(direction.as_deref())?;
-        let page = make_page_request(limit, after)?;
-        let decay = decay_lambda.map(|v| v as f32);
-        with_engine_ref(self, |eng| {
-            Ok(neighbor_page_to_js(eng.neighbors_2hop_paged(
-                node_id, dir, type_filter.as_deref(), &page, at_epoch, decay,
-            )?))
-        })
+    ) -> Result<Vec<JsComponentEntry>> {
+        let map = with_engine_ref(self, |eng| {
+            eng.connected_components(
+                edge_type_filter.as_deref(),
+                node_type_filter.as_deref(),
+                at_epoch,
+            )
+        })?;
+        let mut entries: Vec<JsComponentEntry> = map
+            .into_iter()
+            .map(|(node_id, component_id)| {
+                Ok(JsComponentEntry {
+                    node_id: u64_to_safe_f64(node_id)?,
+                    component_id: u64_to_safe_f64(component_id)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        entries.sort_by(|a, b| a.node_id.total_cmp(&b.node_id));
+        Ok(entries)
     }
 
     #[napi]
-    pub fn neighbors_2hop_constrained_paged(
+    pub fn component_of(
         &self,
         node_id: f64,
-        direction: Option<String>,
-        traverse_edge_types: Option<Vec<u32>>,
-        target_node_types: Option<Vec<u32>>,
-        limit: Option<u32>,
-        after: Option<f64>,
+        edge_type_filter: Option<Vec<u32>>,
+        node_type_filter: Option<Vec<u32>>,
         at_epoch: Option<i64>,
-        decay_lambda: Option<f64>,
-    ) -> Result<JsNeighborPageResult> {
+    ) -> Result<Float64Array> {
         let node_id = f64_to_u64(node_id)?;
-        let dir = parse_direction(direction.as_deref())?;
-        let page = make_page_request(limit, after)?;
-        let decay = decay_lambda.map(|v| v as f32);
         with_engine_ref(self, |eng| {
-            Ok(neighbor_page_to_js(eng.neighbors_2hop_constrained_paged(
-                node_id, dir, traverse_edge_types.as_deref(),
-                target_node_types.as_deref(), &page, at_epoch, decay,
-            )?))
+            let members = eng.component_of(
+                node_id,
+                edge_type_filter.as_deref(),
+                node_type_filter.as_deref(),
+                at_epoch,
+            )?;
+            Ok(ids_to_float64_array(&members))
         })
     }
 
@@ -751,10 +940,21 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn compact(&self) -> Result<Option<JsCompactionStats>> {
+    pub fn ingest_mode(&self) -> Result<()> {
         with_engine(self, |eng| {
-            Ok(eng.compact()?.map(|s| s.into()))
+            eng.ingest_mode();
+            Ok(())
         })
+    }
+
+    #[napi]
+    pub fn end_ingest(&self) -> Result<Option<JsCompactionStats>> {
+        with_engine(self, |eng| Ok(eng.end_ingest()?.map(|s| s.into())))
+    }
+
+    #[napi]
+    pub fn compact(&self) -> Result<Option<JsCompactionStats>> {
+        with_engine(self, |eng| Ok(eng.compact()?.map(|s| s.into())))
     }
 
     /// Compact with a progress callback. The callback receives a progress object
@@ -814,8 +1014,8 @@ impl OverGraph {
     }
 
     #[napi(ts_return_type = "Promise<JsDbStats>")]
-    pub fn stats_async(&self) -> AsyncTask<EngineOp<DbStats, JsDbStats>> {
-        AsyncTask::new(EngineOp::new(
+    pub fn stats_async(&self) -> AsyncTask<EngineReadOp<DbStats, JsDbStats>> {
+        AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             |eng| Ok(eng.stats()),
             |s| Ok(s.into()),
@@ -919,9 +1119,9 @@ impl OverGraph {
     pub fn get_node_async(
         &self,
         id: f64,
-    ) -> Result<AsyncTask<EngineOp<Option<NodeRecord>, Option<JsNodeRecord>>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Option<NodeRecord>, Option<JsNodeRecord>>>> {
         let id = f64_to_u64(id)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_node(id),
             |n| Ok(n.map(|n| n.into())),
@@ -932,9 +1132,9 @@ impl OverGraph {
     pub fn get_edge_async(
         &self,
         id: f64,
-    ) -> Result<AsyncTask<EngineOp<Option<EdgeRecord>, Option<JsEdgeRecord>>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Option<EdgeRecord>, Option<JsEdgeRecord>>>> {
         let id = f64_to_u64(id)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_edge(id),
             |e| Ok(e.map(|e| e.into())),
@@ -946,8 +1146,8 @@ impl OverGraph {
         &self,
         type_id: u32,
         key: String,
-    ) -> AsyncTask<EngineOp<Option<NodeRecord>, Option<JsNodeRecord>>> {
-        AsyncTask::new(EngineOp::new(
+    ) -> AsyncTask<EngineReadOp<Option<NodeRecord>, Option<JsNodeRecord>>> {
+        AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_node_by_key(type_id, &key),
             |n| Ok(n.map(|n| n.into())),
@@ -960,10 +1160,10 @@ impl OverGraph {
         from: f64,
         to: f64,
         type_id: u32,
-    ) -> Result<AsyncTask<EngineOp<Option<EdgeRecord>, Option<JsEdgeRecord>>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Option<EdgeRecord>, Option<JsEdgeRecord>>>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_edge_by_triple(from, to, type_id),
             |e| Ok(e.map(|e| e.into())),
@@ -974,9 +1174,12 @@ impl OverGraph {
     pub fn get_nodes_async(
         &self,
         ids: Vec<f64>,
-    ) -> Result<AsyncTask<EngineOp<Vec<Option<NodeRecord>>, Vec<Option<JsNodeRecord>>>>> {
-        let ids: Vec<u64> = ids.into_iter().map(f64_to_u64).collect::<Result<Vec<_>>>()?;
-        Ok(AsyncTask::new(EngineOp::new(
+    ) -> Result<AsyncTask<EngineReadOp<Vec<Option<NodeRecord>>, Vec<Option<JsNodeRecord>>>>> {
+        let ids: Vec<u64> = ids
+            .into_iter()
+            .map(f64_to_u64)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_nodes(&ids),
             |results| Ok(results.into_iter().map(|r| r.map(|n| n.into())).collect()),
@@ -987,9 +1190,12 @@ impl OverGraph {
     pub fn get_edges_async(
         &self,
         ids: Vec<f64>,
-    ) -> Result<AsyncTask<EngineOp<Vec<Option<EdgeRecord>>, Vec<Option<JsEdgeRecord>>>>> {
-        let ids: Vec<u64> = ids.into_iter().map(f64_to_u64).collect::<Result<Vec<_>>>()?;
-        Ok(AsyncTask::new(EngineOp::new(
+    ) -> Result<AsyncTask<EngineReadOp<Vec<Option<EdgeRecord>>, Vec<Option<JsEdgeRecord>>>>> {
+        let ids: Vec<u64> = ids
+            .into_iter()
+            .map(f64_to_u64)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_edges(&ids),
             |results| Ok(results.into_iter().map(|r| r.map(|e| e.into())).collect()),
@@ -1079,68 +1285,52 @@ impl OverGraph {
         limit: Option<u32>,
         at_epoch: Option<i64>,
         decay_lambda: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<Vec<NeighborEntry>, JsNeighborList>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Vec<NeighborEntry>, JsNeighborList>>> {
         let node_id = f64_to_u64(node_id)?;
         let dir = parse_direction(direction.as_deref())?;
         let lim = limit.unwrap_or(0) as usize;
         let decay = decay_lambda.map(|v| v as f32); // JS f64 → Rust f32 (sufficient precision for λ)
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.neighbors(node_id, dir, type_filter.as_deref(), lim, at_epoch, decay),
             |entries| Ok(neighbor_entries_to_js(entries)),
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsNeighborList>")]
-    pub fn neighbors_2hop_async(
+    #[napi(ts_return_type = "Promise<JsTraversalPageResult>")]
+    pub fn traverse_async(
         &self,
-        node_id: f64,
+        start_node_id: f64,
+        min_depth: u32,
+        max_depth: u32,
         direction: Option<String>,
-        type_filter: Option<Vec<u32>>,
-        limit: Option<u32>,
+        edge_type_filter: Option<Vec<u32>>,
+        node_type_filter: Option<Vec<u32>>,
         at_epoch: Option<i64>,
         decay_lambda: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<Vec<NeighborEntry>, JsNeighborList>>> {
-        let node_id = f64_to_u64(node_id)?;
-        let dir = parse_direction(direction.as_deref())?;
-        let lim = limit.unwrap_or(0) as usize;
-        let decay = decay_lambda.map(|v| v as f32); // JS f64 → Rust f32 (sufficient precision for λ)
-        Ok(AsyncTask::new(EngineOp::new(
-            self.inner.clone(),
-            move |eng| eng.neighbors_2hop(node_id, dir, type_filter.as_deref(), lim, at_epoch, decay),
-            |entries| Ok(neighbor_entries_to_js(entries)),
-        )))
-    }
-
-    #[napi(ts_return_type = "Promise<JsNeighborList>")]
-    pub fn neighbors_2hop_constrained_async(
-        &self,
-        node_id: f64,
-        direction: Option<String>,
-        traverse_edge_types: Option<Vec<u32>>,
-        target_node_types: Option<Vec<u32>>,
         limit: Option<u32>,
-        at_epoch: Option<i64>,
-        decay_lambda: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<Vec<NeighborEntry>, JsNeighborList>>> {
-        let node_id = f64_to_u64(node_id)?;
+        cursor: Option<JsTraversalCursor>,
+    ) -> Result<AsyncTask<EngineReadOp<TraversalPageResult, JsTraversalPageResult>>> {
+        let start_node_id = f64_to_u64(start_node_id)?;
         let dir = parse_direction(direction.as_deref())?;
-        let lim = limit.unwrap_or(0) as usize;
-        let decay = decay_lambda.map(|v| v as f32);
-        Ok(AsyncTask::new(EngineOp::new(
+        let cursor = cursor.map(js_traversal_cursor_to_rust).transpose()?;
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| {
-                eng.neighbors_2hop_constrained(
-                    node_id,
+                eng.traverse(
+                    start_node_id,
+                    min_depth,
+                    max_depth,
                     dir,
-                    traverse_edge_types.as_deref(),
-                    target_node_types.as_deref(),
-                    lim,
+                    edge_type_filter.as_deref(),
+                    node_type_filter.as_deref(),
                     at_epoch,
-                    decay,
+                    decay_lambda,
+                    limit.map(|v| v as usize),
+                    cursor.as_ref(),
                 )
             },
-            |entries| Ok(neighbor_entries_to_js(entries)),
+            traversal_page_to_js,
         )))
     }
 
@@ -1154,11 +1344,11 @@ impl OverGraph {
         scoring: Option<String>,
         decay_lambda: Option<f64>,
         at_epoch: Option<i64>,
-    ) -> Result<AsyncTask<EngineOp<Vec<NeighborEntry>, JsNeighborList>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Vec<NeighborEntry>, JsNeighborList>>> {
         let node_id = f64_to_u64(node_id)?;
         let dir = parse_direction(direction.as_deref())?;
         let scoring_mode = parse_scoring_mode(scoring.as_deref(), decay_lambda)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| {
                 eng.top_k_neighbors(
@@ -1182,12 +1372,14 @@ impl OverGraph {
         direction: Option<String>,
         edge_type_filter: Option<Vec<u32>>,
         at_epoch: Option<i64>,
-    ) -> Result<AsyncTask<EngineOp<Subgraph, JsSubgraphResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Subgraph, JsSubgraphResult>>> {
         let start = f64_to_u64(start_node_id)?;
         let dir = parse_direction(direction.as_deref())?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.extract_subgraph(start, max_depth, dir, edge_type_filter.as_deref(), at_epoch),
+            move |eng| {
+                eng.extract_subgraph(start, max_depth, dir, edge_type_filter.as_deref(), at_epoch)
+            },
             |sg| Ok(subgraph_to_js(sg)),
         )))
     }
@@ -1198,9 +1390,9 @@ impl OverGraph {
         type_id: u32,
         prop_key: String,
         prop_value: serde_json::Value,
-    ) -> AsyncTask<EngineOp<Vec<u64>, Float64Array>> {
+    ) -> AsyncTask<EngineReadOp<Vec<u64>, Float64Array>> {
         let pv = json_to_prop_value(&prop_value);
-        AsyncTask::new(EngineOp::new(
+        AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.find_nodes(type_id, &prop_key, &pv),
             |ids| Ok(ids_to_float64_array(&ids)),
@@ -1211,8 +1403,8 @@ impl OverGraph {
     pub fn get_nodes_by_type_async(
         &self,
         type_id: u32,
-    ) -> AsyncTask<EngineOp<Vec<NodeRecord>, Vec<JsNodeRecord>>> {
-        AsyncTask::new(EngineOp::new(
+    ) -> AsyncTask<EngineReadOp<Vec<NodeRecord>, Vec<JsNodeRecord>>> {
+        AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_nodes_by_type(type_id),
             |records| Ok(records.into_iter().map(|n| n.into()).collect()),
@@ -1223,8 +1415,8 @@ impl OverGraph {
     pub fn get_edges_by_type_async(
         &self,
         type_id: u32,
-    ) -> AsyncTask<EngineOp<Vec<EdgeRecord>, Vec<JsEdgeRecord>>> {
-        AsyncTask::new(EngineOp::new(
+    ) -> AsyncTask<EngineReadOp<Vec<EdgeRecord>, Vec<JsEdgeRecord>>> {
+        AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_edges_by_type(type_id),
             |records| Ok(records.into_iter().map(|e| e.into()).collect()),
@@ -1232,11 +1424,8 @@ impl OverGraph {
     }
 
     #[napi(ts_return_type = "Promise<number>")]
-    pub fn count_nodes_by_type_async(
-        &self,
-        type_id: u32,
-    ) -> AsyncTask<EngineOp<u64, i64>> {
-        AsyncTask::new(EngineOp::new(
+    pub fn count_nodes_by_type_async(&self, type_id: u32) -> AsyncTask<EngineReadOp<u64, i64>> {
+        AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.count_nodes_by_type(type_id),
             |count| Ok(count as i64),
@@ -1244,11 +1433,8 @@ impl OverGraph {
     }
 
     #[napi(ts_return_type = "Promise<number>")]
-    pub fn count_edges_by_type_async(
-        &self,
-        type_id: u32,
-    ) -> AsyncTask<EngineOp<u64, i64>> {
-        AsyncTask::new(EngineOp::new(
+    pub fn count_edges_by_type_async(&self, type_id: u32) -> AsyncTask<EngineReadOp<u64, i64>> {
+        AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.count_edges_by_type(type_id),
             |count| Ok(count as i64),
@@ -1259,8 +1445,8 @@ impl OverGraph {
     pub fn nodes_by_type_async(
         &self,
         type_id: u32,
-    ) -> AsyncTask<EngineOp<Vec<u64>, Float64Array>> {
-        AsyncTask::new(EngineOp::new(
+    ) -> AsyncTask<EngineReadOp<Vec<u64>, Float64Array>> {
+        AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.nodes_by_type(type_id),
             |ids| Ok(ids_to_float64_array(&ids)),
@@ -1271,8 +1457,8 @@ impl OverGraph {
     pub fn edges_by_type_async(
         &self,
         type_id: u32,
-    ) -> AsyncTask<EngineOp<Vec<u64>, Float64Array>> {
-        AsyncTask::new(EngineOp::new(
+    ) -> AsyncTask<EngineReadOp<Vec<u64>, Float64Array>> {
+        AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.edges_by_type(type_id),
             |ids| Ok(ids_to_float64_array(&ids)),
@@ -1287,14 +1473,193 @@ impl OverGraph {
         type_filter: Option<Vec<u32>>,
         at_epoch: Option<i64>,
         decay_lambda: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<HashMap<u64, Vec<NeighborEntry>>, Vec<JsNeighborBatchEntry>>>> {
-        let ids: Vec<u64> = node_ids.into_iter().map(f64_to_u64).collect::<Result<Vec<_>>>()?;
+    ) -> Result<AsyncTask<EngineReadOp<NodeIdMap<Vec<NeighborEntry>>, Vec<JsNeighborBatchEntry>>>>
+    {
+        let ids: Vec<u64> = node_ids
+            .into_iter()
+            .map(f64_to_u64)
+            .collect::<Result<Vec<_>>>()?;
         let dir = parse_direction(direction.as_deref())?;
         let decay = decay_lambda.map(|v| v as f32);
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.neighbors_batch(&ids, dir, type_filter.as_deref(), at_epoch, decay),
             |map| Ok(convert_batch_result(map)),
+        )))
+    }
+
+    // --- Degree counts + aggregations (async, Phase 18a) ---
+
+    #[napi(ts_return_type = "Promise<number>")]
+    pub fn degree_async(
+        &self,
+        node_id: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<AsyncTask<EngineReadOp<u64, i64>>> {
+        let node_id = f64_to_u64(node_id)?;
+        let dir = parse_direction(direction.as_deref())?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.degree(node_id, dir, type_filter.as_deref(), at_epoch),
+            u64_to_safe_i64,
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<number>")]
+    pub fn sum_edge_weights_async(
+        &self,
+        node_id: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<AsyncTask<EngineReadOp<f64, f64>>> {
+        let node_id = f64_to_u64(node_id)?;
+        let dir = parse_direction(direction.as_deref())?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.sum_edge_weights(node_id, dir, type_filter.as_deref(), at_epoch),
+            |sum| Ok(sum),
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<number | null>")]
+    pub fn avg_edge_weight_async(
+        &self,
+        node_id: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<AsyncTask<EngineReadOp<Option<f64>, Option<f64>>>> {
+        let node_id = f64_to_u64(node_id)?;
+        let dir = parse_direction(direction.as_deref())?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.avg_edge_weight(node_id, dir, type_filter.as_deref(), at_epoch),
+            |avg| Ok(avg),
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<Array<JsDegreeBatchEntry>>")]
+    pub fn degrees_async(
+        &self,
+        node_ids: Vec<f64>,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<AsyncTask<EngineReadOp<NodeIdMap<u64>, Vec<JsDegreeBatchEntry>>>> {
+        let ids: Vec<u64> = node_ids
+            .into_iter()
+            .map(f64_to_u64)
+            .collect::<Result<Vec<_>>>()?;
+        let dir = parse_direction(direction.as_deref())?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.degrees(&ids, dir, type_filter.as_deref(), at_epoch),
+            |map| {
+                let mut entries: Vec<JsDegreeBatchEntry> = map
+                    .into_iter()
+                    .map(|(node_id, degree)| {
+                        Ok(JsDegreeBatchEntry {
+                            node_id: u64_to_safe_f64(node_id)?,
+                            degree: u64_to_safe_i64(degree)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                entries.sort_by(|a, b| a.node_id.total_cmp(&b.node_id));
+                Ok(entries)
+            },
+        )))
+    }
+
+    // --- Shortest path (async, Phase 18b) ---
+
+    #[napi(ts_return_type = "Promise<JsShortestPath | null>")]
+    pub fn shortest_path_async(
+        &self,
+        from: f64,
+        to: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        weight_field: Option<String>,
+        at_epoch: Option<i64>,
+        max_depth: Option<u32>,
+        max_cost: Option<f64>,
+    ) -> Result<AsyncTask<EngineReadOp<Option<ShortestPath>, Option<JsShortestPath>>>> {
+        let from = f64_to_u64(from)?;
+        let to = f64_to_u64(to)?;
+        let dir = parse_direction(direction.as_deref())?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| {
+                eng.shortest_path(
+                    from,
+                    to,
+                    dir,
+                    type_filter.as_deref(),
+                    weight_field.as_deref(),
+                    at_epoch,
+                    max_depth,
+                    max_cost,
+                )
+            },
+            |opt| opt.map(shortest_path_to_js).transpose(),
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn is_connected_async(
+        &self,
+        from: f64,
+        to: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+        max_depth: Option<u32>,
+    ) -> Result<AsyncTask<EngineReadOp<bool, bool>>> {
+        let from = f64_to_u64(from)?;
+        let to = f64_to_u64(to)?;
+        let dir = parse_direction(direction.as_deref())?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.is_connected(from, to, dir, type_filter.as_deref(), at_epoch, max_depth),
+            |b| Ok(b),
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<Array<JsShortestPath>>")]
+    pub fn all_shortest_paths_async(
+        &self,
+        from: f64,
+        to: f64,
+        direction: Option<String>,
+        type_filter: Option<Vec<u32>>,
+        weight_field: Option<String>,
+        at_epoch: Option<i64>,
+        max_depth: Option<u32>,
+        max_cost: Option<f64>,
+        max_paths: Option<u32>,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<ShortestPath>, Vec<JsShortestPath>>>> {
+        let from = f64_to_u64(from)?;
+        let to = f64_to_u64(to)?;
+        let dir = parse_direction(direction.as_deref())?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| {
+                eng.all_shortest_paths(
+                    from,
+                    to,
+                    dir,
+                    type_filter.as_deref(),
+                    weight_field.as_deref(),
+                    at_epoch,
+                    max_depth,
+                    max_cost,
+                    max_paths.map(|n| n as usize),
+                )
+            },
+            |paths| paths.into_iter().map(shortest_path_to_js).collect(),
         )))
     }
 
@@ -1306,9 +1671,9 @@ impl OverGraph {
         type_id: u32,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<PageResult<u64>, JsIdPageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, JsIdPageResult>>> {
         let page = make_page_request(limit, after)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.nodes_by_type_paged(type_id, &page),
             |pr| Ok(id_page_to_js(pr)),
@@ -1321,9 +1686,9 @@ impl OverGraph {
         type_id: u32,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<PageResult<u64>, JsIdPageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, JsIdPageResult>>> {
         let page = make_page_request(limit, after)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.edges_by_type_paged(type_id, &page),
             |pr| Ok(id_page_to_js(pr)),
@@ -1336,9 +1701,9 @@ impl OverGraph {
         type_id: u32,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<PageResult<NodeRecord>, JsNodePageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<NodeRecord>, JsNodePageResult>>> {
         let page = make_page_request(limit, after)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_nodes_by_type_paged(type_id, &page),
             |pr| Ok(node_page_to_js(pr)),
@@ -1351,9 +1716,9 @@ impl OverGraph {
         type_id: u32,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<PageResult<EdgeRecord>, JsEdgePageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<EdgeRecord>, JsEdgePageResult>>> {
         let page = make_page_request(limit, after)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_edges_by_type_paged(type_id, &page),
             |pr| Ok(edge_page_to_js(pr)),
@@ -1368,10 +1733,10 @@ impl OverGraph {
         prop_value: serde_json::Value,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<PageResult<u64>, JsIdPageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, JsIdPageResult>>> {
         let pv = json_to_prop_value(&prop_value);
         let page = make_page_request(limit, after)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.find_nodes_paged(type_id, &prop_key, &pv, &page),
             |pr| Ok(id_page_to_js(pr)),
@@ -1384,8 +1749,8 @@ impl OverGraph {
         type_id: u32,
         from_ms: i64,
         to_ms: i64,
-    ) -> Result<AsyncTask<EngineOp<Vec<u64>, Float64Array>>> {
-        Ok(AsyncTask::new(EngineOp::new(
+    ) -> Result<AsyncTask<EngineReadOp<Vec<u64>, Float64Array>>> {
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.find_nodes_by_time_range(type_id, from_ms, to_ms),
             |ids| Ok(ids_to_float64_array(&ids)),
@@ -1400,9 +1765,9 @@ impl OverGraph {
         to_ms: i64,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<PageResult<u64>, JsIdPageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, JsIdPageResult>>> {
         let page = make_page_request(limit, after)?;
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.find_nodes_by_time_range_paged(type_id, from_ms, to_ms, &page),
             |pr| Ok(id_page_to_js(pr)),
@@ -1414,10 +1779,13 @@ impl OverGraph {
         &self,
         seed_node_ids: Float64Array,
         options: Option<JsPprOptions>,
-    ) -> Result<AsyncTask<EngineOp<PprResult, JsPprResult>>> {
-        let seeds: Vec<u64> = seed_node_ids.iter().map(|v| f64_to_u64(*v)).collect::<Result<Vec<_>>>()?;
+    ) -> Result<AsyncTask<EngineReadOp<PprResult, JsPprResult>>> {
+        let seeds: Vec<u64> = seed_node_ids
+            .iter()
+            .map(|v| f64_to_u64(*v))
+            .collect::<Result<Vec<_>>>()?;
         let opts = js_ppr_options_to_rust(options);
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.personalized_pagerank(&seeds, &opts),
             |r| Ok(ppr_result_to_js(r)),
@@ -1428,10 +1796,13 @@ impl OverGraph {
     pub fn export_adjacency_async(
         &self,
         options: Option<JsExportOptions>,
-    ) -> Result<AsyncTask<EngineOp<(AdjacencyExport, bool), JsAdjacencyExport>>> {
-        let include_weights = options.as_ref().and_then(|o| o.include_weights).unwrap_or(true);
+    ) -> Result<AsyncTask<EngineReadOp<(AdjacencyExport, bool), JsAdjacencyExport>>> {
+        let include_weights = options
+            .as_ref()
+            .and_then(|o| o.include_weights)
+            .unwrap_or(true);
         let opts = js_export_options_to_rust(options);
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| Ok((eng.export_adjacency(&opts)?, include_weights)),
             |pair| Ok(adjacency_export_to_js(pair.0, pair.1)),
@@ -1448,65 +1819,74 @@ impl OverGraph {
         after: Option<f64>,
         at_epoch: Option<i64>,
         decay_lambda: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<PageResult<NeighborEntry>, JsNeighborPageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<NeighborEntry>, JsNeighborPageResult>>> {
         let node_id = f64_to_u64(node_id)?;
         let dir = parse_direction(direction.as_deref())?;
         let page = make_page_request(limit, after)?;
         let decay = decay_lambda.map(|v| v as f32);
-        Ok(AsyncTask::new(EngineOp::new(
-            self.inner.clone(),
-            move |eng| eng.neighbors_paged(node_id, dir, type_filter.as_deref(), &page, at_epoch, decay),
-            |pr| Ok(neighbor_page_to_js(pr)),
-        )))
-    }
-
-    #[napi(ts_return_type = "Promise<JsNeighborPageResult>")]
-    pub fn neighbors_2hop_paged_async(
-        &self,
-        node_id: f64,
-        direction: Option<String>,
-        type_filter: Option<Vec<u32>>,
-        limit: Option<u32>,
-        after: Option<f64>,
-        at_epoch: Option<i64>,
-        decay_lambda: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<PageResult<NeighborEntry>, JsNeighborPageResult>>> {
-        let node_id = f64_to_u64(node_id)?;
-        let dir = parse_direction(direction.as_deref())?;
-        let page = make_page_request(limit, after)?;
-        let decay = decay_lambda.map(|v| v as f32);
-        Ok(AsyncTask::new(EngineOp::new(
-            self.inner.clone(),
-            move |eng| eng.neighbors_2hop_paged(node_id, dir, type_filter.as_deref(), &page, at_epoch, decay),
-            |pr| Ok(neighbor_page_to_js(pr)),
-        )))
-    }
-
-    #[napi(ts_return_type = "Promise<JsNeighborPageResult>")]
-    pub fn neighbors_2hop_constrained_paged_async(
-        &self,
-        node_id: f64,
-        direction: Option<String>,
-        traverse_edge_types: Option<Vec<u32>>,
-        target_node_types: Option<Vec<u32>>,
-        limit: Option<u32>,
-        after: Option<f64>,
-        at_epoch: Option<i64>,
-        decay_lambda: Option<f64>,
-    ) -> Result<AsyncTask<EngineOp<PageResult<NeighborEntry>, JsNeighborPageResult>>> {
-        let node_id = f64_to_u64(node_id)?;
-        let dir = parse_direction(direction.as_deref())?;
-        let page = make_page_request(limit, after)?;
-        let decay = decay_lambda.map(|v| v as f32);
-        Ok(AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| {
-                eng.neighbors_2hop_constrained_paged(
-                    node_id, dir, traverse_edge_types.as_deref(),
-                    target_node_types.as_deref(), &page, at_epoch, decay,
-                )
+                eng.neighbors_paged(node_id, dir, type_filter.as_deref(), &page, at_epoch, decay)
             },
             |pr| Ok(neighbor_page_to_js(pr)),
+        )))
+    }
+
+    // --- Connected Components (async, Phase 18d) ---
+
+    #[napi(ts_return_type = "Promise<Array<JsComponentEntry>>")]
+    pub fn connected_components_async(
+        &self,
+        edge_type_filter: Option<Vec<u32>>,
+        node_type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<AsyncTask<EngineReadOp<NodeIdMap<u64>, Vec<JsComponentEntry>>>> {
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| {
+                eng.connected_components(
+                    edge_type_filter.as_deref(),
+                    node_type_filter.as_deref(),
+                    at_epoch,
+                )
+            },
+            |map| {
+                let mut entries: Vec<JsComponentEntry> = map
+                    .into_iter()
+                    .map(|(node_id, component_id)| {
+                        Ok(JsComponentEntry {
+                            node_id: u64_to_safe_f64(node_id)?,
+                            component_id: u64_to_safe_f64(component_id)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                entries.sort_by(|a, b| a.node_id.total_cmp(&b.node_id));
+                Ok(entries)
+            },
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<Float64Array>")]
+    pub fn component_of_async(
+        &self,
+        node_id: f64,
+        edge_type_filter: Option<Vec<u32>>,
+        node_type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<u64>, Float64Array>>> {
+        let node_id = f64_to_u64(node_id)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| {
+                eng.component_of(
+                    node_id,
+                    edge_type_filter.as_deref(),
+                    node_type_filter.as_deref(),
+                    at_epoch,
+                )
+            },
+            |members| Ok(ids_to_float64_array(&members)),
         )))
     }
 
@@ -1534,6 +1914,29 @@ impl OverGraph {
         ))
     }
 
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn ingest_mode_async(&self) -> AsyncTask<EngineOp<(), ()>> {
+        AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            |eng| {
+                eng.ingest_mode();
+                Ok(())
+            },
+            |_| Ok(()),
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<JsCompactionStats | null>")]
+    pub fn end_ingest_async(
+        &self,
+    ) -> AsyncTask<EngineOp<Option<CompactionStats>, Option<JsCompactionStats>>> {
+        AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            |eng| eng.end_ingest(),
+            |s| Ok(s.map(|s| s.into())),
+        ))
+    }
+
     #[napi(ts_return_type = "Promise<JsCompactionStats | null>")]
     pub fn compact_async(
         &self,
@@ -1547,7 +1950,7 @@ impl OverGraph {
 
     /// Async compaction with a fire-and-forget progress callback.
     /// The callback receives progress updates but cannot cancel compaction (unlike the sync version).
-    /// Note: the database mutex is held for the entire compaction, so other operations on this
+    /// Note: the database write lock is held for the entire compaction, so other operations on this
     /// instance will block until compaction completes. The JS event loop remains responsive.
     #[napi(
         ts_args_type = "callback: (progress: JsCompactionProgress) => void",
@@ -1914,15 +2317,13 @@ impl JsNeighborList {
 
 impl JsNeighborList {
     fn entry_at(&self, index: u32) -> Result<&NeighborEntry> {
-        self.entries
-            .get(index as usize)
-            .ok_or_else(|| {
-                napi::Error::from_reason(format!(
-                    "Index {} out of bounds (length {})",
-                    index,
-                    self.entries.len()
-                ))
-            })
+        self.entries.get(index as usize).ok_or_else(|| {
+            napi::Error::from_reason(format!(
+                "Index {} out of bounds (length {})",
+                index,
+                self.entries.len()
+            ))
+        })
     }
 }
 
@@ -1959,6 +2360,95 @@ impl JsNeighborBatchEntry {
     }
 }
 
+#[napi(object)]
+pub struct JsDegreeBatchEntry {
+    pub node_id: f64,
+    pub degree: i64,
+}
+
+#[napi(object)]
+pub struct JsComponentEntry {
+    pub node_id: f64,
+    pub component_id: f64,
+}
+
+#[napi(object)]
+pub struct JsShortestPath {
+    pub nodes: Vec<f64>,
+    pub edges: Vec<f64>,
+    pub total_cost: f64,
+}
+
+fn shortest_path_to_js(sp: ShortestPath) -> Result<JsShortestPath> {
+    Ok(JsShortestPath {
+        nodes: sp
+            .nodes
+            .into_iter()
+            .map(u64_to_safe_f64)
+            .collect::<Result<Vec<_>>>()?,
+        edges: sp
+            .edges
+            .into_iter()
+            .map(u64_to_safe_f64)
+            .collect::<Result<Vec<_>>>()?,
+        total_cost: sp.total_cost,
+    })
+}
+
+#[napi(object)]
+pub struct JsTraversalHit {
+    pub node_id: f64,
+    pub depth: u32,
+    pub via_edge_id: Option<f64>,
+    pub score: Option<f64>,
+}
+
+#[napi(object)]
+pub struct JsTraversalCursor {
+    pub depth: u32,
+    pub last_node_id: f64,
+}
+
+#[napi(object)]
+pub struct JsTraversalPageResult {
+    pub items: Vec<JsTraversalHit>,
+    pub next_cursor: Option<JsTraversalCursor>,
+}
+
+fn traversal_hit_to_js(hit: TraversalHit) -> Result<JsTraversalHit> {
+    Ok(JsTraversalHit {
+        node_id: u64_to_safe_f64(hit.node_id)?,
+        depth: hit.depth,
+        via_edge_id: hit.via_edge_id.map(u64_to_safe_f64).transpose()?,
+        score: hit.score,
+    })
+}
+
+fn traversal_cursor_to_js(cursor: TraversalCursor) -> Result<JsTraversalCursor> {
+    Ok(JsTraversalCursor {
+        depth: cursor.depth,
+        last_node_id: u64_to_safe_f64(cursor.last_node_id)?,
+    })
+}
+
+fn js_traversal_cursor_to_rust(cursor: JsTraversalCursor) -> Result<TraversalCursor> {
+    Ok(TraversalCursor {
+        depth: cursor.depth,
+        last_node_id: f64_to_u64(cursor.last_node_id)?,
+    })
+}
+
+fn traversal_page_to_js(page: TraversalPageResult) -> Result<JsTraversalPageResult> {
+    Ok(JsTraversalPageResult {
+        items: page
+            .items
+            .into_iter()
+            .map(traversal_hit_to_js)
+            .collect::<Result<Vec<_>>>()?,
+        next_cursor: page.next_cursor.map(traversal_cursor_to_js).transpose()?,
+    })
+}
+
 #[napi]
 pub struct JsSubgraphResult {
     nodes_vec: Vec<JsNodeRecord>,
@@ -1969,30 +2459,36 @@ pub struct JsSubgraphResult {
 impl JsSubgraphResult {
     #[napi(getter)]
     pub fn nodes(&self) -> Vec<JsNodeRecord> {
-        self.nodes_vec.iter().map(|n| JsNodeRecord {
-            id_val: n.id_val,
-            type_id_val: n.type_id_val,
-            key_val: n.key_val.clone(),
-            created_at_val: n.created_at_val,
-            updated_at_val: n.updated_at_val,
-            weight_val: n.weight_val,
-            props_raw: Arc::clone(&n.props_raw),
-        }).collect()
+        self.nodes_vec
+            .iter()
+            .map(|n| JsNodeRecord {
+                id_val: n.id_val,
+                type_id_val: n.type_id_val,
+                key_val: n.key_val.clone(),
+                created_at_val: n.created_at_val,
+                updated_at_val: n.updated_at_val,
+                weight_val: n.weight_val,
+                props_raw: Arc::clone(&n.props_raw),
+            })
+            .collect()
     }
     #[napi(getter)]
     pub fn edges(&self) -> Vec<JsEdgeRecord> {
-        self.edges_vec.iter().map(|e| JsEdgeRecord {
-            id_val: e.id_val,
-            from_val: e.from_val,
-            to_val: e.to_val,
-            type_id_val: e.type_id_val,
-            created_at_val: e.created_at_val,
-            updated_at_val: e.updated_at_val,
-            weight_val: e.weight_val,
-            valid_from_val: e.valid_from_val,
-            valid_to_val: e.valid_to_val,
-            props_raw: Arc::clone(&e.props_raw),
-        }).collect()
+        self.edges_vec
+            .iter()
+            .map(|e| JsEdgeRecord {
+                id_val: e.id_val,
+                from_val: e.from_val,
+                to_val: e.to_val,
+                type_id_val: e.type_id_val,
+                created_at_val: e.created_at_val,
+                updated_at_val: e.updated_at_val,
+                weight_val: e.weight_val,
+                valid_from_val: e.valid_from_val,
+                valid_to_val: e.valid_to_val,
+                props_raw: Arc::clone(&e.props_raw),
+            })
+            .collect()
     }
 }
 
@@ -2021,15 +2517,18 @@ pub struct JsNodePageResult {
 impl JsNodePageResult {
     #[napi(getter)]
     pub fn items(&self) -> Vec<JsNodeRecord> {
-        self.items_vec.iter().map(|n| JsNodeRecord {
-            id_val: n.id_val,
-            type_id_val: n.type_id_val,
-            key_val: n.key_val.clone(),
-            created_at_val: n.created_at_val,
-            updated_at_val: n.updated_at_val,
-            weight_val: n.weight_val,
-            props_raw: Arc::clone(&n.props_raw),
-        }).collect()
+        self.items_vec
+            .iter()
+            .map(|n| JsNodeRecord {
+                id_val: n.id_val,
+                type_id_val: n.type_id_val,
+                key_val: n.key_val.clone(),
+                created_at_val: n.created_at_val,
+                updated_at_val: n.updated_at_val,
+                weight_val: n.weight_val,
+                props_raw: Arc::clone(&n.props_raw),
+            })
+            .collect()
     }
     #[napi(getter)]
     pub fn next_cursor(&self) -> Option<f64> {
@@ -2047,18 +2546,21 @@ pub struct JsEdgePageResult {
 impl JsEdgePageResult {
     #[napi(getter)]
     pub fn items(&self) -> Vec<JsEdgeRecord> {
-        self.items_vec.iter().map(|e| JsEdgeRecord {
-            id_val: e.id_val,
-            from_val: e.from_val,
-            to_val: e.to_val,
-            type_id_val: e.type_id_val,
-            created_at_val: e.created_at_val,
-            updated_at_val: e.updated_at_val,
-            weight_val: e.weight_val,
-            valid_from_val: e.valid_from_val,
-            valid_to_val: e.valid_to_val,
-            props_raw: Arc::clone(&e.props_raw),
-        }).collect()
+        self.items_vec
+            .iter()
+            .map(|e| JsEdgeRecord {
+                id_val: e.id_val,
+                from_val: e.from_val,
+                to_val: e.to_val,
+                type_id_val: e.type_id_val,
+                created_at_val: e.created_at_val,
+                updated_at_val: e.updated_at_val,
+                weight_val: e.weight_val,
+                valid_from_val: e.valid_from_val,
+                valid_to_val: e.valid_to_val,
+                props_raw: Arc::clone(&e.props_raw),
+            })
+            .collect()
     }
     #[napi(getter)]
     pub fn next_cursor(&self) -> Option<f64> {
@@ -2300,7 +2802,11 @@ fn adjacency_export_to_js(r: AdjacencyExport, include_weights: bool) -> JsAdjace
         edge_from: Float64Array::new(from_raw),
         edge_to: Float64Array::new(to_raw),
         edge_type_ids: Uint32Array::new(type_ids),
-        edge_weights: if include_weights { Some(Float64Array::new(weights)) } else { None },
+        edge_weights: if include_weights {
+            Some(Float64Array::new(weights))
+        } else {
+            None
+        },
     }
 }
 
@@ -2364,16 +2870,17 @@ fn js_patch_to_rust(patch: JsGraphPatch) -> napi::Result<GraphPatch> {
 // Async task types
 // ============================================================
 
-/// Generic async task: runs an engine operation on the libuv thread pool.
+/// Generic async task for write operations: runs on the libuv thread pool
+/// with an exclusive (write) lock on the engine.
 pub struct EngineOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
-    db: Arc<Mutex<Option<InnerDb>>>,
+    db: Arc<RwLock<Option<InnerDb>>>,
     op: Option<Box<dyn FnOnce(&mut DatabaseEngine) -> std::result::Result<T, EngineError> + Send>>,
     convert: fn(T) -> napi::Result<J>,
 }
 
 impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> EngineOp<T, J> {
     fn new(
-        db: Arc<Mutex<Option<InnerDb>>>,
+        db: Arc<RwLock<Option<InnerDb>>>,
         op: impl FnOnce(&mut DatabaseEngine) -> std::result::Result<T, EngineError> + Send + 'static,
         convert: fn(T) -> napi::Result<J>,
     ) -> Self {
@@ -2390,13 +2897,12 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for EngineOp<T
     type JsValue = J;
 
     fn compute(&mut self) -> napi::Result<T> {
-        let op = self
-            .op
-            .take()
-            .ok_or_else(|| napi::Error::from_reason("EngineOp::compute called twice".to_string()))?;
+        let op = self.op.take().ok_or_else(|| {
+            napi::Error::from_reason("EngineOp::compute called twice".to_string())
+        })?;
         let mut guard = self
             .db
-            .lock()
+            .write()
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let inner = guard
             .as_mut()
@@ -2409,9 +2915,54 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for EngineOp<T
     }
 }
 
+/// Generic async task for read-only operations: runs on the libuv thread pool
+/// with a shared (read) lock on the engine, allowing concurrent reads.
+pub struct EngineReadOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
+    db: Arc<RwLock<Option<InnerDb>>>,
+    op: Option<Box<dyn FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError> + Send>>,
+    convert: fn(T) -> napi::Result<J>,
+}
+
+impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> EngineReadOp<T, J> {
+    fn new(
+        db: Arc<RwLock<Option<InnerDb>>>,
+        op: impl FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError> + Send + 'static,
+        convert: fn(T) -> napi::Result<J>,
+    ) -> Self {
+        Self {
+            db,
+            op: Some(Box::new(op)),
+            convert,
+        }
+    }
+}
+
+impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for EngineReadOp<T, J> {
+    type Output = T;
+    type JsValue = J;
+
+    fn compute(&mut self) -> napi::Result<T> {
+        let op = self.op.take().ok_or_else(|| {
+            napi::Error::from_reason("EngineReadOp::compute called twice".to_string())
+        })?;
+        let guard = self
+            .db
+            .read()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("Database is closed".to_string()))?;
+        op(&inner.engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: T) -> napi::Result<J> {
+        (self.convert)(output)
+    }
+}
+
 /// Close task: takes ownership of the engine to call close(self) or close_fast(self).
 pub struct CloseOp {
-    db: Arc<Mutex<Option<InnerDb>>>,
+    db: Arc<RwLock<Option<InnerDb>>>,
     force: bool,
 }
 
@@ -2422,7 +2973,7 @@ impl Task for CloseOp {
     fn compute(&mut self) -> napi::Result<()> {
         let mut guard = self
             .db
-            .lock()
+            .write()
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         if let Some(db) = guard.take() {
             let result = if self.force {
@@ -2444,7 +2995,7 @@ impl Task for CloseOp {
 /// sends progress updates to the JS main thread via ThreadsafeFunction.
 /// Progress callback is fire-and-forget (void return, no cancellation).
 pub struct CompactProgressOp {
-    db: Arc<Mutex<Option<InnerDb>>>,
+    db: Arc<RwLock<Option<InnerDb>>>,
     tsfn: ProgressTsfn,
 }
 
@@ -2455,7 +3006,7 @@ impl Task for CompactProgressOp {
     fn compute(&mut self) -> napi::Result<Self::Output> {
         let mut guard = self
             .db
-            .lock()
+            .write()
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let inner = guard
             .as_mut()
@@ -2465,9 +3016,7 @@ impl Task for CompactProgressOp {
         let result = inner.engine.compact_with_progress(|progress| {
             let js_progress = JsCompactionProgress {
                 phase: match progress.phase {
-                    CompactionPhase::CollectingTombstones => {
-                        "collecting_tombstones".to_string()
-                    }
+                    CompactionPhase::CollectingTombstones => "collecting_tombstones".to_string(),
                     CompactionPhase::MergingNodes => "merging_nodes".to_string(),
                     CompactionPhase::MergingEdges => "merging_edges".to_string(),
                     CompactionPhase::WritingOutput => "writing_output".to_string(),
@@ -2500,7 +3049,7 @@ where
 {
     let mut guard = db
         .inner
-        .lock()
+        .write()
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
     let inner = guard
         .as_mut()
@@ -2514,7 +3063,7 @@ where
 {
     let guard = db
         .inner
-        .lock()
+        .read()
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
     let inner = guard
         .as_ref()
@@ -2531,6 +3080,26 @@ fn f64_to_u64(v: f64) -> Result<u64> {
         ));
     }
     Ok(v as u64)
+}
+
+const MAX_SAFE_U64: u64 = 9_007_199_254_740_991; // 2^53 - 1
+
+fn u64_to_safe_i64(v: u64) -> Result<i64> {
+    if v > MAX_SAFE_U64 {
+        return Err(napi::Error::from_reason(
+            "Value exceeds JavaScript safe integer range".to_string(),
+        ));
+    }
+    Ok(v as i64)
+}
+
+fn u64_to_safe_f64(v: u64) -> Result<f64> {
+    if v > MAX_SAFE_U64 {
+        return Err(napi::Error::from_reason(
+            "Value exceeds JavaScript safe integer range".to_string(),
+        ));
+    }
+    Ok(v as f64)
 }
 
 fn parse_direction(s: Option<&str>) -> Result<Direction> {
@@ -2596,9 +3165,11 @@ fn json_to_prop_value(v: &serde_json::Value) -> PropValue {
         serde_json::Value::Array(arr) => {
             PropValue::Array(arr.iter().map(json_to_prop_value).collect())
         }
-        serde_json::Value::Object(map) => {
-            PropValue::Map(map.iter().map(|(k, v)| (k.clone(), json_to_prop_value(v))).collect())
-        }
+        serde_json::Value::Object(map) => PropValue::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_prop_value(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -2614,17 +3185,15 @@ fn prop_value_to_json(v: PropValue) -> serde_json::Value {
         PropValue::Array(arr) => {
             serde_json::Value::Array(arr.into_iter().map(prop_value_to_json).collect())
         }
-        PropValue::Map(map) => {
-            serde_json::Value::Object(
-                map.into_iter().map(|(k, v)| (k, prop_value_to_json(v))).collect(),
-            )
-        }
+        PropValue::Map(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, prop_value_to_json(v)))
+                .collect(),
+        ),
     }
 }
 
-fn props_to_json(
-    props: BTreeMap<String, PropValue>,
-) -> HashMap<String, serde_json::Value> {
+fn props_to_json(props: BTreeMap<String, PropValue>) -> HashMap<String, serde_json::Value> {
     props
         .into_iter()
         .map(|(k, v)| (k, prop_value_to_json(v)))
@@ -2732,12 +3301,10 @@ fn decode_props_json(reader: &mut BinaryReader) -> napi::Result<BTreeMap<String,
     let json: serde_json::Value = serde_json::from_slice(props_bytes)
         .map_err(|e| napi::Error::from_reason(format!("Invalid props JSON: {}", e)))?;
     match json {
-        serde_json::Value::Object(map) => {
-            Ok(map
-                .into_iter()
-                .map(|(k, v)| (k, json_to_prop_value(&v)))
-                .collect())
-        }
+        serde_json::Value::Object(map) => Ok(map
+            .into_iter()
+            .map(|(k, v)| (k, json_to_prop_value(&v)))
+            .collect()),
         _ => Err(napi::Error::from_reason(
             "Props must be a JSON object".to_string(),
         )),
@@ -2813,8 +3380,16 @@ fn decode_edge_batch(buf: &[u8]) -> napi::Result<Vec<EdgeInput>> {
             type_id,
             props,
             weight,
-            valid_from: if valid_from_raw == 0 { None } else { Some(valid_from_raw) },
-            valid_to: if valid_to_raw == 0 { None } else { Some(valid_to_raw) },
+            valid_from: if valid_from_raw == 0 {
+                None
+            } else {
+                Some(valid_from_raw)
+            },
+            valid_to: if valid_to_raw == 0 {
+                None
+            } else {
+                Some(valid_to_raw)
+            },
         });
     }
 
@@ -2830,10 +3405,14 @@ fn decode_edge_batch(buf: &[u8]) -> napi::Result<Vec<EdgeInput>> {
 }
 
 fn neighbor_entries_to_js(entries: Vec<NeighborEntry>) -> JsNeighborList {
-    JsNeighborList { entries: Arc::new(entries) }
+    JsNeighborList {
+        entries: Arc::new(entries),
+    }
 }
 
-fn convert_batch_result(map: HashMap<u64, Vec<NeighborEntry>>) -> Vec<JsNeighborBatchEntry> {
+fn convert_batch_result(
+    map: impl IntoIterator<Item = (u64, Vec<NeighborEntry>)>,
+) -> Vec<JsNeighborBatchEntry> {
     let mut entries: Vec<JsNeighborBatchEntry> = map
         .into_iter()
         .map(|(query_id, neighbors)| JsNeighborBatchEntry {

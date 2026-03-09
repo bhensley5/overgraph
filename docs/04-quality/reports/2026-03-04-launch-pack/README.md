@@ -1,6 +1,9 @@
 # Launch Benchmark Pack (2026-03-04)
 
 > Superseded by the parity-hardened pack: `docs/04-quality/reports/2026-03-04-launch-pack-parity/README.md`
+>
+> Historical naming note: this pack predates the API rename. `traverse_depth_2`
+> was previously labeled `neighbors_2hop` (`traverse(start, min_depth=2, max_depth=2, ...)`).
 
 ## Scope
 - Profile: `small`
@@ -22,7 +25,7 @@
 |---|---:|
 | upsert_node | 1.133 |
 | get_node | 0.073 |
-| neighbors_2hop_100x10 | 120.820 |
+| traverse_depth_2_100x10 | 120.820 |
 | top_k_neighbors_weight_k20_1000 | 16.917 |
 | find_nodes_by_time_range_10000 | 485.790 |
 | personalized_pagerank_2000_nodes | 904.350 |
@@ -34,7 +37,7 @@
 |---|---:|---:|
 | upsert_node | 3.917 | 486564.73 |
 | get_node | 2.209 | 474543.70 |
-| neighbors_2hop | 396.333 | 3175.86 |
+| traverse_depth_2 | 396.333 | 3175.86 |
 | top_k_neighbors | 23.541 | 46760.85 |
 | find_nodes_by_time_range | 181.708 | 6098.84 |
 | personalized_pagerank | 319.875 | 3350.94 |
@@ -46,7 +49,7 @@
 |---|---:|---:|
 | upsert_node | 2.292 | 691897.88 |
 | get_node | 0.709 | 1717106.68 |
-| neighbors_2hop | 254.792 | 4718.88 |
+| traverse_depth_2 | 254.792 | 4718.88 |
 | top_k_neighbors | 14.084 | 72183.21 |
 | find_nodes_by_time_range | 242.125 | 4430.00 |
 | personalized_pagerank | 380.834 | 2872.84 |

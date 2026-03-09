@@ -1,7 +1,7 @@
 /**
  * P6-009: Full lifecycle integration test.
  *
- * open → batch insert 500 nodes + 1000 edges → neighbors → neighbors_2hop
+ * open → batch insert 500 nodes + 1000 edges → neighbors → traverse
  * → find_nodes → delete → compact → close → reopen → verify
  */
 import { describe, it, before, after } from 'node:test';
@@ -114,17 +114,16 @@ describe('Full lifecycle integration', () => {
     db.close();
   });
 
-  it('Step 5: neighbors_2hop reaches 2nd-hop nodes', async () => {
+  it('Step 5: traverse reaches exact 2nd-hop nodes', async () => {
     const db = OverGraph.open(dbPath);
 
-    const hop2 = await db.neighbors2HopAsync(nodeIds[0], 'outgoing');
-    // With 1000 edges across 500 nodes, 2-hop should find additional nodes
-    // beyond the 1-hop set
+    const hop2 = await db.traverseAsync(nodeIds[0], 2, 2, 'outgoing');
     const hop1 = await db.neighborsAsync(nodeIds[0], 'outgoing');
-    // 2-hop results should not include 1-hop nodes (by design)
     const hop1Set = new Set(hop1.toArray().map(e => e.nodeId));
-    for (let i = 0; i < hop2.length; i++) {
-      assert.ok(!hop1Set.has(hop2.nodeId(i)), '2-hop should not include 1-hop nodes');
+    assert.ok(hop2.items.length > 0, 'depth-2 traversal should emit at least one hit');
+    for (const hit of hop2.items) {
+      assert.equal(hit.depth, 2);
+      assert.ok(!hop1Set.has(hit.nodeId), 'depth-2 traversal should not include 1-hop nodes');
     }
 
     db.close();

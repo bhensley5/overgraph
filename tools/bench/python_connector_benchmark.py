@@ -193,7 +193,65 @@ def effective_config(profile: dict[str, Any], scenario_contract: dict[str, Any])
         "time_range_from_ms": int(cfg["time_range_from_ms"]),
         "time_range_window_ms": int(cfg["time_range_window_ms"]),
         "include_weights_on_export": bool(cfg["include_weights_on_export"]),
+        "shortest_path_nodes": max(int(cfg["shortest_path_nodes_min"]), nodes // int(cfg["shortest_path_nodes_divisor"])),
+        "shortest_path_edge_offsets": [int(v) for v in cfg["shortest_path_edge_offsets"]],
     }
+
+
+def traverse_deep_branching(fanout: int) -> tuple[int, int, int]:
+    return (max(8, min(24, fanout // 4)), 4, 4)
+
+
+def build_depth_two_traversal_graph(db: OverGraph, cfg: dict[str, Any]) -> int:
+    two_hop_nodes = [{"type_id": 1, "key": "root"}]
+    for i in range(cfg["two_hop_mid"]):
+        two_hop_nodes.append({"type_id": 1, "key": f"m-{i}"})
+        for j in range(cfg["two_hop_leaves_per_mid"]):
+            two_hop_nodes.append({"type_id": 1, "key": f"l-{i}-{j}"})
+    two_hop_ids = db.batch_upsert_nodes(two_hop_nodes)
+    root = two_hop_ids[0]
+    mid_stride = 1 + cfg["two_hop_leaves_per_mid"]
+    two_hop_edges = []
+    for i in range(cfg["two_hop_mid"]):
+        mid_id = two_hop_ids[1 + i * mid_stride]
+        two_hop_edges.append({"from_id": root, "to_id": mid_id, "type_id": 1, "weight": 1.0})
+        for j in range(cfg["two_hop_leaves_per_mid"]):
+            leaf_id = two_hop_ids[1 + i * mid_stride + 1 + j]
+            two_hop_edges.append({"from_id": mid_id, "to_id": leaf_id, "type_id": 1, "weight": 1.0})
+    db.batch_upsert_edges(two_hop_edges)
+    return root
+
+
+def build_deep_traversal_graph(db: OverGraph, fanout: int) -> tuple[int, tuple[int, int, int]]:
+    level1, level2, level3 = traverse_deep_branching(fanout)
+    nodes = [{"type_id": 1, "key": "root"}]
+    for i in range(level1):
+        nodes.append({"type_id": 11, "key": f"lvl1-{i}"})
+    for i in range(level1):
+        for j in range(level2):
+            nodes.append({"type_id": 2 if (i + j) % 2 == 0 else 3, "key": f"lvl2-{i}-{j}"})
+    for i in range(level1):
+        for j in range(level2):
+            for k in range(level3):
+                nodes.append({"type_id": 2 if (i + j + k) % 2 == 0 else 3, "key": f"lvl3-{i}-{j}-{k}"})
+    ids = db.batch_upsert_nodes(nodes)
+    root = ids[0]
+    level1_offset = 1
+    level2_offset = level1_offset + level1
+    level3_offset = level2_offset + level1 * level2
+    edges = []
+    for i in range(level1):
+        lvl1_id = ids[level1_offset + i]
+        edges.append({"from_id": root, "to_id": lvl1_id, "type_id": 1, "weight": 1.0})
+        for j in range(level2):
+            lvl2_idx = i * level2 + j
+            lvl2_id = ids[level2_offset + lvl2_idx]
+            edges.append({"from_id": lvl1_id, "to_id": lvl2_id, "type_id": 1, "weight": 1.0})
+            for k in range(level3):
+                lvl3_idx = lvl2_idx * level3 + k
+                edges.append({"from_id": lvl2_id, "to_id": ids[level3_offset + lvl3_idx], "type_id": 1, "weight": 1.0})
+    db.batch_upsert_edges(edges)
+    return root, (level1, level2, level3)
 
 
 def pack_node_batch(nodes: list[dict[str, Any]]) -> bytes:
@@ -396,10 +454,15 @@ def main() -> int:
         scenario_id = "S-TRAV-001"
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "trav-neighbors"))
-        hub = db.upsert_node(1, "hub")
-        for i in range(cfg["fanout"]):
-            n = db.upsert_node(1, f"n-{i}")
-            db.upsert_edge(hub, n, 1, None, 1.0)
+        nb_node_ids = db.batch_upsert_nodes(
+            [{"type_id": 1, "key": "hub"}]
+            + [{"type_id": 1, "key": f"n-{i}"} for i in range(cfg["fanout"])]
+        )
+        hub = nb_node_ids[0]
+        db.batch_upsert_edges([
+            {"from_id": hub, "to_id": nb_node_ids[1 + i], "type_id": 1, "weight": 1.0}
+            for i in range(cfg["fanout"])
+        ])
         s = run_bench(lambda _i: db.neighbors(hub, "outgoing"), iter_cfg["warmup"], iter_cfg["iters"])
         scenarios.append(
             scenario(
@@ -418,25 +481,310 @@ def main() -> int:
         scenario_id = "S-TRAV-002"
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "trav-neighbors-2hop"))
-        root = db.upsert_node(1, "root")
-        for i in range(cfg["two_hop_mid"]):
-            mid = db.upsert_node(1, f"m-{i}")
-            db.upsert_edge(root, mid, 1, None, 1.0)
-            for j in range(cfg["two_hop_leaves_per_mid"]):
-                leaf = db.upsert_node(1, f"l-{i}-{j}")
-                db.upsert_edge(mid, leaf, 1, None, 1.0)
-        s = run_bench(lambda _i: db.neighbors_2hop(root, "outgoing"), iter_cfg["warmup"], iter_cfg["iters"])
+        root = build_depth_two_traversal_graph(db, cfg)
+        s = run_bench(
+            lambda _i: db.traverse(root, min_depth=2, max_depth=2, direction="outgoing"),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
         scenarios.append(
             scenario(
                 scenario_id,
-                "neighbors_2hop",
+                "traverse_depth_2",
                 "traversal",
                 s,
                 iter_cfg,
                 {
                     "direction": "outgoing",
+                    "min_depth": 2,
+                    "max_depth": 2,
                     "mid_nodes": cfg["two_hop_mid"],
                     "leaves_per_mid": cfg["two_hop_leaves_per_mid"],
+                },
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+        db.close()
+
+        # S-TRAV-007
+        scenario_id = "S-TRAV-007"
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "trav-depth13-memtable"))
+        root, branching = build_deep_traversal_graph(db, cfg["fanout"])
+        s = run_bench(
+            lambda _i: db.traverse(root, min_depth=1, max_depth=3, direction="outgoing"),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "traverse_depth_1_to_3",
+                "traversal",
+                s,
+                iter_cfg,
+                {
+                    "direction": "outgoing",
+                    "layout": "memtable",
+                    "min_depth": 1,
+                    "max_depth": 3,
+                    "node_type_filter": None,
+                    "branching": list(branching),
+                },
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+        db.close()
+
+        # S-TRAV-008
+        scenario_id = "S-TRAV-008"
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "trav-depth13-segment"))
+        root, branching = build_deep_traversal_graph(db, cfg["fanout"])
+        db.flush()
+        s = run_bench(
+            lambda _i: db.traverse(root, min_depth=1, max_depth=3, direction="outgoing"),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "traverse_depth_1_to_3_segment",
+                "traversal",
+                s,
+                iter_cfg,
+                {
+                    "direction": "outgoing",
+                    "layout": "segment",
+                    "min_depth": 1,
+                    "max_depth": 3,
+                    "node_type_filter": None,
+                    "branching": list(branching),
+                },
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+        db.close()
+
+        # S-TRAV-009: deeper traverse, memtable, emission-filtered path
+        scenario_id = "S-TRAV-009"
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "trav-depth13-filtered-memtable"))
+        root, branching = build_deep_traversal_graph(db, cfg["fanout"])
+        s = run_bench(
+            lambda _i: db.traverse(
+                root,
+                min_depth=1,
+                max_depth=3,
+                direction="outgoing",
+                node_type_filter=[2],
+            ),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "traverse_depth_1_to_3_filtered",
+                "traversal",
+                s,
+                iter_cfg,
+                {
+                    "direction": "outgoing",
+                    "layout": "memtable",
+                    "min_depth": 1,
+                    "max_depth": 3,
+                    "node_type_filter": [2],
+                    "branching": list(branching),
+                },
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+        db.close()
+
+        # S-TRAV-010: deeper traverse, segmented, emission-filtered path
+        scenario_id = "S-TRAV-010"
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "trav-depth13-filtered-segment"))
+        root, branching = build_deep_traversal_graph(db, cfg["fanout"])
+        db.flush()
+        s = run_bench(
+            lambda _i: db.traverse(
+                root,
+                min_depth=1,
+                max_depth=3,
+                direction="outgoing",
+                node_type_filter=[2],
+            ),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "traverse_depth_1_to_3_filtered_segment",
+                "traversal",
+                s,
+                iter_cfg,
+                {
+                    "direction": "outgoing",
+                    "layout": "segment",
+                    "min_depth": 1,
+                    "max_depth": 3,
+                    "node_type_filter": [2],
+                    "branching": list(branching),
+                },
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+        db.close()
+
+        # S-TRAV-003: degree (scalar)
+        scenario_id = "S-TRAV-003"
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "trav-degree"))
+        deg_node_ids = db.batch_upsert_nodes(
+            [{"type_id": 1, "key": "hub"}]
+            + [{"type_id": 1, "key": f"d-{i}"} for i in range(cfg["fanout"])]
+        )
+        hub = deg_node_ids[0]
+        db.batch_upsert_edges([
+            {"from_id": hub, "to_id": deg_node_ids[1 + i], "type_id": 1, "weight": 1.0}
+            for i in range(cfg["fanout"])
+        ])
+        s = run_bench(lambda _i: db.degree(hub, "outgoing"), iter_cfg["warmup"], iter_cfg["iters"])
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "degree",
+                "traversal",
+                s,
+                iter_cfg,
+                {"fanout": cfg["fanout"], "direction": "outgoing"},
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+        db.close()
+
+        # S-TRAV-004: degrees (batch)
+        scenario_id = "S-TRAV-004"
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "trav-degrees"))
+        # Batch all nodes: hubs first, then fanout nodes for each hub
+        all_degree_nodes = [{"type_id": 1, "key": f"hub-{h}"} for h in range(cfg["batch_nodes"])]
+        for h in range(cfg["batch_nodes"]):
+            for i in range(cfg["fanout"]):
+                all_degree_nodes.append({"type_id": 1, "key": f"dt-{h}-{i}"})
+        all_degree_ids = db.batch_upsert_nodes(all_degree_nodes)
+        hub_ids = all_degree_ids[: cfg["batch_nodes"]]
+        # Batch all edges: each hub connects to its fanout nodes
+        degree_edges = []
+        for h in range(cfg["batch_nodes"]):
+            hub_id = hub_ids[h]
+            fanout_start = cfg["batch_nodes"] + h * cfg["fanout"]
+            for i in range(cfg["fanout"]):
+                degree_edges.append({
+                    "from_id": hub_id,
+                    "to_id": all_degree_ids[fanout_start + i],
+                    "type_id": 1,
+                    "weight": 1.0,
+                })
+        db.batch_upsert_edges(degree_edges)
+        s = run_bench(
+            lambda _i: db.degrees(hub_ids, "outgoing"), iter_cfg["warmup"], iter_cfg["iters"]
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "degrees",
+                "traversal",
+                s,
+                iter_cfg,
+                {"batch_nodes": cfg["batch_nodes"], "fanout": cfg["fanout"], "direction": "outgoing"},
+                scenario_comparability(scenario_contract, scenario_id),
+                cfg["batch_nodes"],
+            )
+        )
+        db.close()
+
+        # S-TRAV-005: shortest_path (BFS)
+        scenario_id = "S-TRAV-005"
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "trav-shortest-path"))
+        sp_nodes = [
+            {"type_id": 1, "key": f"sp-{i}", "weight": 1.0} for i in range(cfg["shortest_path_nodes"])
+        ]
+        sp_ids = db.batch_upsert_nodes(sp_nodes)
+        offsets = cfg["shortest_path_edge_offsets"]
+        sp_edges = []
+        for i in range(len(sp_ids)):
+            from_id = sp_ids[i]
+            to1 = sp_ids[(i + offsets[0]) % len(sp_ids)]
+            to2 = sp_ids[(i + offsets[1]) % len(sp_ids)]
+            sp_edges.append({"from_id": from_id, "to_id": to1, "type_id": 1, "weight": 1.0})
+            sp_edges.append({"from_id": from_id, "to_id": to2, "type_id": 1, "weight": 1.0})
+        db.batch_upsert_edges(sp_edges)
+        sp_from = sp_ids[0]
+        sp_to = sp_ids[len(sp_ids) // 2]
+        s = run_bench(
+            lambda _i: db.shortest_path(sp_from, sp_to, "outgoing"),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "shortest_path",
+                "traversal",
+                s,
+                iter_cfg,
+                {
+                    "shortest_path_nodes": cfg["shortest_path_nodes"],
+                    "edge_offsets": cfg["shortest_path_edge_offsets"],
+                    "direction": "outgoing",
+                    "weight_field": None,
+                },
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+        db.close()
+
+        # S-TRAV-006: is_connected
+        scenario_id = "S-TRAV-006"
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "trav-is-connected"))
+        ic_nodes = [
+            {"type_id": 1, "key": f"ic-{i}", "weight": 1.0} for i in range(cfg["shortest_path_nodes"])
+        ]
+        ic_ids = db.batch_upsert_nodes(ic_nodes)
+        offsets = cfg["shortest_path_edge_offsets"]
+        ic_edges = []
+        for i in range(len(ic_ids)):
+            from_id = ic_ids[i]
+            to1 = ic_ids[(i + offsets[0]) % len(ic_ids)]
+            to2 = ic_ids[(i + offsets[1]) % len(ic_ids)]
+            ic_edges.append({"from_id": from_id, "to_id": to1, "type_id": 1, "weight": 1.0})
+            ic_edges.append({"from_id": from_id, "to_id": to2, "type_id": 1, "weight": 1.0})
+        db.batch_upsert_edges(ic_edges)
+        ic_from = ic_ids[0]
+        ic_to = ic_ids[len(ic_ids) // 2]
+        s = run_bench(
+            lambda _i: db.is_connected(ic_from, ic_to, "outgoing"),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "is_connected",
+                "traversal",
+                s,
+                iter_cfg,
+                {
+                    "shortest_path_nodes": cfg["shortest_path_nodes"],
+                    "edge_offsets": cfg["shortest_path_edge_offsets"],
+                    "direction": "outgoing",
                 },
                 scenario_comparability(scenario_contract, scenario_id),
             )
@@ -447,10 +795,16 @@ def main() -> int:
         scenario_id = "S-ADV-001"
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "adv-top-k"))
-        hub = db.upsert_node(1, "hub")
-        for i in range(cfg["top_k_candidates"]):
-            n = db.upsert_node(1, f"tk-{i}")
-            db.upsert_edge(hub, n, 1, None, 1.0 + ((i % 100) / 10.0))
+        tk_node_ids = db.batch_upsert_nodes(
+            [{"type_id": 1, "key": "hub"}]
+            + [{"type_id": 1, "key": f"tk-{i}"} for i in range(cfg["top_k_candidates"])]
+        )
+        hub = tk_node_ids[0]
+        tk_candidate_ids = tk_node_ids[1:]
+        db.batch_upsert_edges([
+            {"from_id": hub, "to_id": tk_candidate_ids[i], "type_id": 1, "weight": 1.0 + ((i % 100) / 10.0)}
+            for i in range(cfg["top_k_candidates"])
+        ])
         s = run_bench(
             lambda _i: db.top_k_neighbors(hub, cfg["top_k_limit"], direction="outgoing", scoring="weight"),
             iter_cfg["warmup"],
@@ -478,8 +832,10 @@ def main() -> int:
         scenario_id = "S-ADV-003"
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "adv-time-range"))
-        for i in range(cfg["time_range_nodes"]):
-            db.upsert_node(1, f"tr-{i}", {"idx": i}, 1.0)
+        db.batch_upsert_nodes([
+            {"type_id": 1, "key": f"tr-{i}", "props": {"idx": i}, "weight": 1.0}
+            for i in range(cfg["time_range_nodes"])
+        ])
         from_ms = cfg["time_range_from_ms"]
         to_ms = int(time.time() * 1000) + cfg["time_range_window_ms"]
         s = run_bench(
@@ -510,11 +866,13 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "adv-ppr"))
         ids = db.batch_upsert_nodes([{"type_id": 1, "key": f"ppr-{i}"} for i in range(cfg["ppr_nodes"])])
+        ppr_edges = []
         for i, from_id in enumerate(ids):
             to1 = ids[(i + cfg["ppr_edge_offsets"][0]) % len(ids)]
             to2 = ids[(i + cfg["ppr_edge_offsets"][1]) % len(ids)]
-            db.upsert_edge(from_id, to1, 1, None, 1.0)
-            db.upsert_edge(from_id, to2, 1, None, 0.7)
+            ppr_edges.append({"from_id": from_id, "to_id": to1, "type_id": 1, "weight": 1.0})
+            ppr_edges.append({"from_id": from_id, "to_id": to2, "type_id": 1, "weight": 0.7})
+        db.batch_upsert_edges(ppr_edges)
         seed = ids[0]
         s = run_bench(
             lambda _i: db.personalized_pagerank(
@@ -552,11 +910,13 @@ def main() -> int:
         ids = db.batch_upsert_nodes(
             [{"type_id": 1, "key": f"ex-{i}"} for i in range(cfg["export_nodes"])]
         )
+        export_edges = []
         for i in range(cfg["export_edges"]):
             from_id = ids[i % len(ids)]
             to_id = ids[(i * 13 + 7) % len(ids)]
             if from_id != to_id:
-                db.upsert_edge(from_id, to_id, 1, None, 1.0)
+                export_edges.append({"from_id": from_id, "to_id": to_id, "type_id": 1, "weight": 1.0})
+        db.batch_upsert_edges(export_edges)
         s = run_bench(
             lambda _i: db.export_adjacency(include_weights=cfg["include_weights_on_export"]),
             iter_cfg["warmup"],

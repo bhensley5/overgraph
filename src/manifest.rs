@@ -84,11 +84,7 @@ fn try_load_manifest_file(path: &Path) -> Result<Option<ManifestState>, EngineEr
     match serde_json::from_str::<ManifestState>(&content) {
         Ok(state) => Ok(Some(state)),
         Err(e) => {
-            eprintln!(
-                "warning: corrupt manifest at {}: {}",
-                path.display(),
-                e
-            );
+            eprintln!("warning: corrupt manifest at {}: {}", path.display(), e);
             Ok(None)
         }
     }

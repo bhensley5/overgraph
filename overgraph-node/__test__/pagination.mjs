@@ -222,7 +222,7 @@ describe('neighborsPaged', () => {
   });
 });
 
-describe('neighbors2HopPaged', () => {
+describe('traverse pagination', () => {
   let tmpDir, db, a;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
@@ -240,38 +240,44 @@ describe('neighbors2HopPaged', () => {
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('paginates 2-hop results', () => {
-    const p1 = db.neighbors2HopPaged(a, 'outgoing', null, 2);
+  it('paginates exact-depth traversal results with traversal cursor objects', () => {
+    const p1 = db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 2);
     assert.equal(p1.items.length, 2);
     assert.ok(p1.nextCursor != null);
+    assert.equal(typeof p1.nextCursor.depth, 'number');
+    assert.equal(typeof p1.nextCursor.lastNodeId, 'number');
 
-    const p2 = db.neighbors2HopPaged(a, 'outgoing', null, 2, p1.nextCursor);
+    const p2 = db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 2, p1.nextCursor);
     assert.equal(p2.items.length, 2);
     assert.ok(p2.nextCursor != null);
 
-    const p3 = db.neighbors2HopPaged(a, 'outgoing', null, 2, p2.nextCursor);
+    const p3 = db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 2, p2.nextCursor);
     assert.equal(p3.items.length, 2);
-    assert.equal(p3.nextCursor, null);
+    assert.equal(p3.nextCursor, undefined);
   });
 
-  it('round-trip collects all 2-hop targets', () => {
+  it('round-trip collects all exact-depth traversal hits in deterministic order', () => {
     const allNodeIds = [];
     let cursor = null;
     for (;;) {
-      const page = db.neighbors2HopPaged(a, 'outgoing', null, 3, cursor);
-      for (let i = 0; i < page.items.length; i++) {
-        allNodeIds.push(page.items.nodeId(i));
-      }
+      const page = db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 3, cursor);
+      allNodeIds.push(...page.items.map(hit => hit.nodeId));
       cursor = page.nextCursor ?? null;
       if (cursor === null || cursor === undefined) break;
     }
     assert.equal(allNodeIds.length, 6);
-    // All should be unique
     assert.equal(new Set(allNodeIds.map(id => id.toString())).size, 6);
+    assert.deepEqual([...allNodeIds], [...allNodeIds].sort((lhs, rhs) => lhs - rhs));
+  });
+
+  it('rejects raw ID cursors for traversal', () => {
+    assert.throws(
+      () => db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 2, 123),
+    );
   });
 });
 
-describe('neighbors2HopConstrainedPaged', () => {
+describe('traverse node-type filtering', () => {
   let tmpDir, db, a;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
@@ -295,12 +301,10 @@ describe('neighbors2HopConstrainedPaged', () => {
     const allNodeIds = [];
     let cursor = null;
     for (;;) {
-      const page = db.neighbors2HopConstrainedPaged(
-        a, 'outgoing', null, [2], 2, cursor
+      const page = db.traverse(
+        a, 2, 2, 'outgoing', null, [2], null, null, 2, cursor
       );
-      for (let i = 0; i < page.items.length; i++) {
-        allNodeIds.push(page.items.nodeId(i));
-      }
+      allNodeIds.push(...page.items.map(hit => hit.nodeId));
       cursor = page.nextCursor ?? null;
       if (cursor === null || cursor === undefined) break;
     }
@@ -395,14 +399,14 @@ describe('pagination async variants', () => {
     assert.equal(page.nextCursor, null);
   });
 
-  it('neighbors2HopPagedAsync resolves', async () => {
-    const page = await db.neighbors2HopPagedAsync(db.findNodes(1, 'tag', 'a')[0], 'outgoing', null, 10);
+  it('traverseAsync paginates exact-depth traversal hits', async () => {
+    const page = await db.traverseAsync(db.findNodes(1, 'tag', 'a')[0], 1, 2, 'outgoing', null, null, null, null, 10);
     assert.equal(typeof page.items.length, 'number');
   });
 
-  it('neighbors2HopConstrainedPagedAsync resolves', async () => {
-    const page = await db.neighbors2HopConstrainedPagedAsync(
-      db.findNodes(1, 'tag', 'a')[0], 'outgoing', null, null, 10
+  it('traverseAsync accepts node type filters and traversal cursor args', async () => {
+    const page = await db.traverseAsync(
+      db.findNodes(1, 'tag', 'a')[0], 1, 2, 'outgoing', null, [1], null, null, 10
     );
     assert.equal(typeof page.items.length, 'number');
   });

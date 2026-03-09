@@ -138,7 +138,10 @@ fn inspect_text(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if !manifest.segments.is_empty() {
         println!("  {:>6}  {:>8}  {:>8}", "ID", "Nodes", "Edges");
         for seg in &manifest.segments {
-            println!("  {:>6}  {:>8}  {:>8}", seg.id, seg.node_count, seg.edge_count);
+            println!(
+                "  {:>6}  {:>8}  {:>8}",
+                seg.id, seg.node_count, seg.edge_count
+            );
         }
         println!("  {:>6}  {:>8}  {:>8}", "Total", total_nodes, total_edges);
     }

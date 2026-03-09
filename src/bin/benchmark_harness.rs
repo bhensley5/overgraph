@@ -70,6 +70,9 @@ struct EffectiveConfigContract {
     time_range_from_ms: i64,
     time_range_window_ms: i64,
     include_weights_on_export: bool,
+    shortest_path_nodes_min: usize,
+    shortest_path_nodes_divisor: usize,
+    shortest_path_edge_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -122,6 +125,8 @@ struct EffectiveConfigResolved {
     time_range_from_ms: i64,
     time_range_window_ms: i64,
     include_weights_on_export: bool,
+    shortest_path_nodes: usize,
+    shortest_path_edge_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -443,17 +448,37 @@ fn main() -> Result<(), String> {
         let scenario_id = "S-TRAV-001";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let mut engine = open_db(&tmp_root.db_path("trav-neighbors"))?;
-        let hub = engine
-            .upsert_node(1, "hub", BTreeMap::new(), 1.0)
+        let mut node_inputs = vec![NodeInput {
+            type_id: 1,
+            key: "hub".to_string(),
+            props: BTreeMap::new(),
+            weight: 1.0,
+        }];
+        node_inputs.extend((0..cfg.fanout).map(|i| NodeInput {
+            type_id: 1,
+            key: format!("n-{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+        }));
+        let ids = engine
+            .batch_upsert_nodes(&node_inputs)
             .map_err(|e| e.to_string())?;
-        for i in 0..cfg.fanout {
-            let n = engine
-                .upsert_node(1, &format!("n-{i}"), BTreeMap::new(), 1.0)
-                .map_err(|e| e.to_string())?;
-            engine
-                .upsert_edge(hub, n, 1, BTreeMap::new(), 1.0, None, None)
-                .map_err(|e| e.to_string())?;
-        }
+        let hub = ids[0];
+        let edge_inputs: Vec<EdgeInput> = ids[1..]
+            .iter()
+            .map(|&n| EdgeInput {
+                from: hub,
+                to: n,
+                type_id: 1,
+                props: BTreeMap::new(),
+                weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+            })
+            .collect();
+        engine
+            .batch_upsert_edges(&edge_inputs)
+            .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
             engine
                 .neighbors(hub, Direction::Outgoing, None, 0, None, None)
@@ -473,49 +498,515 @@ fn main() -> Result<(), String> {
         ));
     }
 
-    // S-TRAV-002: neighbors_2hop
+    // S-TRAV-002: traverse depth-2 slice
     {
         let scenario_id = "S-TRAV-002";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let mut engine = open_db(&tmp_root.db_path("trav-neighbors-2hop"))?;
-        let root = engine
-            .upsert_node(1, "root", BTreeMap::new(), 1.0)
-            .map_err(|e| e.to_string())?;
-        for i in 0..cfg.two_hop_mid {
-            let mid = engine
-                .upsert_node(1, &format!("m-{i}"), BTreeMap::new(), 1.0)
-                .map_err(|e| e.to_string())?;
-            engine
-                .upsert_edge(root, mid, 1, BTreeMap::new(), 1.0, None, None)
-                .map_err(|e| e.to_string())?;
-            for j in 0..cfg.two_hop_leaves_per_mid {
-                let leaf = engine
-                    .upsert_node(1, &format!("l-{i}-{j}"), BTreeMap::new(), 1.0)
-                    .map_err(|e| e.to_string())?;
-                engine
-                    .upsert_edge(mid, leaf, 1, BTreeMap::new(), 1.0, None, None)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        let root = build_depth_two_traversal_graph(&mut engine, &cfg)?;
 
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .neighbors_2hop(root, Direction::Outgoing, None, 0, None, None)
+                .traverse(
+                    root,
+                    2,
+                    2,
+                    Direction::Outgoing,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
 
         scenarios.push(make_scenario(
             scenario_id,
-            "neighbors_2hop",
+            "traverse_depth_2",
             "traversal",
             iter_cfg,
             1,
             stats,
             json!({
                 "direction": "outgoing",
+                "min_depth": 2,
+                "max_depth": 2,
                 "mid_nodes": cfg.two_hop_mid,
                 "leaves_per_mid": cfg.two_hop_leaves_per_mid
+            }),
+            scenario_comparability(&scenario_contract, scenario_id),
+        ));
+    }
+
+    // S-TRAV-007: deeper traverse, memtable, fast path
+    {
+        let scenario_id = "S-TRAV-007";
+        let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
+        let mut engine = open_db(&tmp_root.db_path("trav-depth13-memtable"))?;
+        let (root, level1, level2, level3) = build_deep_traversal_graph(&mut engine, cfg.fanout)?;
+        let stats = run_bench(iter_cfg, |_i| {
+            engine
+                .traverse(
+                    root,
+                    1,
+                    3,
+                    Direction::Outgoing,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map(|_| ())
+        })?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "traverse_depth_1_to_3",
+            "traversal",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "direction": "outgoing",
+                "layout": "memtable",
+                "min_depth": 1,
+                "max_depth": 3,
+                "node_type_filter": null,
+                "branching": [level1, level2, level3]
+            }),
+            scenario_comparability(&scenario_contract, scenario_id),
+        ));
+    }
+
+    // S-TRAV-008: deeper traverse, segmented, fast path
+    {
+        let scenario_id = "S-TRAV-008";
+        let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
+        let mut engine = open_db(&tmp_root.db_path("trav-depth13-segment"))?;
+        let (root, level1, level2, level3) = build_deep_traversal_graph(&mut engine, cfg.fanout)?;
+        engine.flush().map_err(|e| e.to_string())?;
+        let stats = run_bench(iter_cfg, |_i| {
+            engine
+                .traverse(
+                    root,
+                    1,
+                    3,
+                    Direction::Outgoing,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map(|_| ())
+        })?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "traverse_depth_1_to_3_segment",
+            "traversal",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "direction": "outgoing",
+                "layout": "segment",
+                "min_depth": 1,
+                "max_depth": 3,
+                "node_type_filter": null,
+                "branching": [level1, level2, level3]
+            }),
+            scenario_comparability(&scenario_contract, scenario_id),
+        ));
+    }
+
+    // S-TRAV-009: deeper traverse, memtable, emission-filtered path
+    {
+        let scenario_id = "S-TRAV-009";
+        let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
+        let mut engine = open_db(&tmp_root.db_path("trav-depth13-filtered-memtable"))?;
+        let (root, level1, level2, level3) = build_deep_traversal_graph(&mut engine, cfg.fanout)?;
+        let node_type_filter = [2u32];
+        let stats = run_bench(iter_cfg, |_i| {
+            engine
+                .traverse(
+                    root,
+                    1,
+                    3,
+                    Direction::Outgoing,
+                    None,
+                    Some(&node_type_filter),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map(|_| ())
+        })?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "traverse_depth_1_to_3_filtered",
+            "traversal",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "direction": "outgoing",
+                "layout": "memtable",
+                "min_depth": 1,
+                "max_depth": 3,
+                "node_type_filter": [2],
+                "branching": [level1, level2, level3]
+            }),
+            scenario_comparability(&scenario_contract, scenario_id),
+        ));
+    }
+
+    // S-TRAV-010: deeper traverse, segmented, emission-filtered path
+    {
+        let scenario_id = "S-TRAV-010";
+        let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
+        let mut engine = open_db(&tmp_root.db_path("trav-depth13-filtered-segment"))?;
+        let (root, level1, level2, level3) = build_deep_traversal_graph(&mut engine, cfg.fanout)?;
+        engine.flush().map_err(|e| e.to_string())?;
+        let node_type_filter = [2u32];
+        let stats = run_bench(iter_cfg, |_i| {
+            engine
+                .traverse(
+                    root,
+                    1,
+                    3,
+                    Direction::Outgoing,
+                    None,
+                    Some(&node_type_filter),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map(|_| ())
+        })?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "traverse_depth_1_to_3_filtered_segment",
+            "traversal",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "direction": "outgoing",
+                "layout": "segment",
+                "min_depth": 1,
+                "max_depth": 3,
+                "node_type_filter": [2],
+                "branching": [level1, level2, level3]
+            }),
+            scenario_comparability(&scenario_contract, scenario_id),
+        ));
+    }
+
+    // S-TRAV-003: degree (scalar)
+    {
+        let scenario_id = "S-TRAV-003";
+        let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
+        let mut engine = open_db(&tmp_root.db_path("trav-degree"))?;
+        let mut node_inputs = vec![NodeInput {
+            type_id: 1,
+            key: "hub".to_string(),
+            props: BTreeMap::new(),
+            weight: 1.0,
+        }];
+        node_inputs.extend((0..cfg.fanout).map(|i| NodeInput {
+            type_id: 1,
+            key: format!("d-{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+        }));
+        let ids = engine
+            .batch_upsert_nodes(&node_inputs)
+            .map_err(|e| e.to_string())?;
+        let hub = ids[0];
+        let edge_inputs: Vec<EdgeInput> = ids[1..]
+            .iter()
+            .map(|&n| EdgeInput {
+                from: hub,
+                to: n,
+                type_id: 1,
+                props: BTreeMap::new(),
+                weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+            })
+            .collect();
+        engine
+            .batch_upsert_edges(&edge_inputs)
+            .map_err(|e| e.to_string())?;
+        let stats = run_bench(iter_cfg, |_i| {
+            engine
+                .degree(hub, Direction::Outgoing, None, None)
+                .map(|_| ())
+        })?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "degree",
+            "traversal",
+            iter_cfg,
+            1,
+            stats,
+            json!({"fanout": cfg.fanout, "direction": "outgoing"}),
+            scenario_comparability(&scenario_contract, scenario_id),
+        ));
+    }
+
+    // S-TRAV-004: degrees (batch)
+    {
+        let scenario_id = "S-TRAV-004";
+        let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
+        let mut engine = open_db(&tmp_root.db_path("trav-degrees"))?;
+        let mut node_inputs: Vec<NodeInput> =
+            Vec::with_capacity(cfg.batch_nodes * (1 + cfg.fanout));
+        for h in 0..cfg.batch_nodes {
+            node_inputs.push(NodeInput {
+                type_id: 1,
+                key: format!("hub-{h}"),
+                props: BTreeMap::new(),
+                weight: 1.0,
+            });
+            for i in 0..cfg.fanout {
+                node_inputs.push(NodeInput {
+                    type_id: 1,
+                    key: format!("dt-{h}-{i}"),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                });
+            }
+        }
+        let all_ids = engine
+            .batch_upsert_nodes(&node_inputs)
+            .map_err(|e| e.to_string())?;
+        let stride = 1 + cfg.fanout;
+        let hub_ids: Vec<u64> = (0..cfg.batch_nodes).map(|h| all_ids[h * stride]).collect();
+        let mut edge_inputs = Vec::with_capacity(cfg.batch_nodes * cfg.fanout);
+        for h in 0..cfg.batch_nodes {
+            let hub = all_ids[h * stride];
+            for i in 0..cfg.fanout {
+                let spoke = all_ids[h * stride + 1 + i];
+                edge_inputs.push(EdgeInput {
+                    from: hub,
+                    to: spoke,
+                    type_id: 1,
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                });
+            }
+        }
+        engine
+            .batch_upsert_edges(&edge_inputs)
+            .map_err(|e| e.to_string())?;
+        let stats = run_bench(iter_cfg, |_i| {
+            engine
+                .degrees(&hub_ids, Direction::Outgoing, None, None)
+                .map(|_| ())
+        })?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "degrees",
+            "traversal",
+            iter_cfg,
+            cfg.batch_nodes,
+            stats,
+            json!({"batch_nodes": cfg.batch_nodes, "fanout": cfg.fanout, "direction": "outgoing"}),
+            scenario_comparability(&scenario_contract, scenario_id),
+        ));
+    }
+
+    // S-TRAV-005: shortest_path (BFS)
+    {
+        let scenario_id = "S-TRAV-005";
+        let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
+        let mut engine = open_db(&tmp_root.db_path("trav-shortest-path"))?;
+
+        let node_inputs: Vec<NodeInput> = (0..cfg.shortest_path_nodes)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("sp-{i}"),
+                props: BTreeMap::new(),
+                weight: 1.0,
+            })
+            .collect();
+        let node_ids = engine
+            .batch_upsert_nodes(&node_inputs)
+            .map_err(|e| e.to_string())?;
+
+        let offset_a = *cfg
+            .shortest_path_edge_offsets
+            .first()
+            .ok_or_else(|| "shortest_path_edge_offsets missing first value".to_string())?;
+        let offset_b = *cfg
+            .shortest_path_edge_offsets
+            .get(1)
+            .ok_or_else(|| "shortest_path_edge_offsets missing second value".to_string())?;
+        let edge_inputs: Vec<EdgeInput> = (0..node_ids.len())
+            .flat_map(|i| {
+                let from = node_ids[i];
+                let to1 = node_ids[(i + offset_a) % node_ids.len()];
+                let to2 = node_ids[(i + offset_b) % node_ids.len()];
+                [
+                    EdgeInput {
+                        from,
+                        to: to1,
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                    EdgeInput {
+                        from,
+                        to: to2,
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                ]
+            })
+            .collect();
+        engine
+            .batch_upsert_edges(&edge_inputs)
+            .map_err(|e| e.to_string())?;
+
+        let sp_from = node_ids[0];
+        let sp_to = node_ids[node_ids.len() / 2];
+        let stats = run_bench(iter_cfg, |_i| {
+            engine
+                .shortest_path(
+                    sp_from,
+                    sp_to,
+                    Direction::Outgoing,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map(|_| ())
+        })?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "shortest_path",
+            "traversal",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "shortest_path_nodes": cfg.shortest_path_nodes,
+                "edge_offsets": cfg.shortest_path_edge_offsets,
+                "direction": "outgoing",
+                "weight_field": null
+            }),
+            scenario_comparability(&scenario_contract, scenario_id),
+        ));
+    }
+
+    // S-TRAV-006: is_connected
+    {
+        let scenario_id = "S-TRAV-006";
+        let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
+        let mut engine = open_db(&tmp_root.db_path("trav-is-connected"))?;
+
+        let node_inputs: Vec<NodeInput> = (0..cfg.shortest_path_nodes)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("ic-{i}"),
+                props: BTreeMap::new(),
+                weight: 1.0,
+            })
+            .collect();
+        let node_ids = engine
+            .batch_upsert_nodes(&node_inputs)
+            .map_err(|e| e.to_string())?;
+
+        let offset_a = *cfg
+            .shortest_path_edge_offsets
+            .first()
+            .ok_or_else(|| "shortest_path_edge_offsets missing first value".to_string())?;
+        let offset_b = *cfg
+            .shortest_path_edge_offsets
+            .get(1)
+            .ok_or_else(|| "shortest_path_edge_offsets missing second value".to_string())?;
+        let edge_inputs: Vec<EdgeInput> = (0..node_ids.len())
+            .flat_map(|i| {
+                let from = node_ids[i];
+                let to1 = node_ids[(i + offset_a) % node_ids.len()];
+                let to2 = node_ids[(i + offset_b) % node_ids.len()];
+                [
+                    EdgeInput {
+                        from,
+                        to: to1,
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                    EdgeInput {
+                        from,
+                        to: to2,
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                ]
+            })
+            .collect();
+        engine
+            .batch_upsert_edges(&edge_inputs)
+            .map_err(|e| e.to_string())?;
+
+        let sp_from = node_ids[0];
+        let sp_to = node_ids[node_ids.len() / 2];
+        let stats = run_bench(iter_cfg, |_i| {
+            engine
+                .is_connected(sp_from, sp_to, Direction::Outgoing, None, None, None)
+                .map(|_| ())
+        })?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "is_connected",
+            "traversal",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "shortest_path_nodes": cfg.shortest_path_nodes,
+                "edge_offsets": cfg.shortest_path_edge_offsets,
+                "direction": "outgoing"
             }),
             scenario_comparability(&scenario_contract, scenario_id),
         ));
@@ -526,18 +1017,41 @@ fn main() -> Result<(), String> {
         let scenario_id = "S-ADV-001";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let mut engine = open_db(&tmp_root.db_path("adv-top-k"))?;
-        let hub = engine
-            .upsert_node(1, "hub", BTreeMap::new(), 1.0)
+        let mut node_inputs = vec![NodeInput {
+            type_id: 1,
+            key: "hub".to_string(),
+            props: BTreeMap::new(),
+            weight: 1.0,
+        }];
+        node_inputs.extend((0..cfg.top_k_candidates).map(|i| NodeInput {
+            type_id: 1,
+            key: format!("tk-{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+        }));
+        let ids = engine
+            .batch_upsert_nodes(&node_inputs)
             .map_err(|e| e.to_string())?;
-        for i in 0..cfg.top_k_candidates {
-            let n = engine
-                .upsert_node(1, &format!("tk-{i}"), BTreeMap::new(), 1.0)
-                .map_err(|e| e.to_string())?;
-            let weight = 1.0 + ((i % 100) as f32 / 10.0);
-            engine
-                .upsert_edge(hub, n, 1, BTreeMap::new(), weight, None, None)
-                .map_err(|e| e.to_string())?;
-        }
+        let hub = ids[0];
+        let edge_inputs: Vec<EdgeInput> = ids[1..]
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let weight = 1.0 + ((i % 100) as f32 / 10.0);
+                EdgeInput {
+                    from: hub,
+                    to: n,
+                    type_id: 1,
+                    props: BTreeMap::new(),
+                    weight,
+                    valid_from: None,
+                    valid_to: None,
+                }
+            })
+            .collect();
+        engine
+            .batch_upsert_edges(&edge_inputs)
+            .map_err(|e| e.to_string())?;
 
         let stats = run_bench(iter_cfg, |_i| {
             engine
@@ -575,11 +1089,17 @@ fn main() -> Result<(), String> {
         let scenario_id = "S-ADV-003";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let mut engine = open_db(&tmp_root.db_path("adv-time-range"))?;
-        for i in 0..cfg.time_range_nodes {
-            engine
-                .upsert_node(1, &format!("tr-{i}"), idx_props(i), 1.0)
-                .map_err(|e| e.to_string())?;
-        }
+        let node_inputs: Vec<NodeInput> = (0..cfg.time_range_nodes)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("tr-{i}"),
+                props: idx_props(i),
+                weight: 1.0,
+            })
+            .collect();
+        engine
+            .batch_upsert_nodes(&node_inputs)
+            .map_err(|e| e.to_string())?;
 
         let to_ms = now_millis() + cfg.time_range_window_ms;
         let stats = run_bench(iter_cfg, |_i| {
@@ -632,17 +1152,36 @@ fn main() -> Result<(), String> {
             .ppr_edge_offsets
             .get(1)
             .ok_or_else(|| "ppr_edge_offsets missing second value".to_string())?;
-        for i in 0..node_ids.len() {
-            let from = node_ids[i];
-            let to1 = node_ids[(i + offset_a) % node_ids.len()];
-            let to2 = node_ids[(i + offset_b) % node_ids.len()];
-            engine
-                .upsert_edge(from, to1, 1, BTreeMap::new(), 1.0, None, None)
-                .map_err(|e| e.to_string())?;
-            engine
-                .upsert_edge(from, to2, 1, BTreeMap::new(), 0.7, None, None)
-                .map_err(|e| e.to_string())?;
-        }
+        let edge_inputs: Vec<EdgeInput> = (0..node_ids.len())
+            .flat_map(|i| {
+                let from = node_ids[i];
+                let to1 = node_ids[(i + offset_a) % node_ids.len()];
+                let to2 = node_ids[(i + offset_b) % node_ids.len()];
+                [
+                    EdgeInput {
+                        from,
+                        to: to1,
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                    EdgeInput {
+                        from,
+                        to: to2,
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 0.7,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                ]
+            })
+            .collect();
+        engine
+            .batch_upsert_edges(&edge_inputs)
+            .map_err(|e| e.to_string())?;
 
         let seeds: Vec<u64> = node_ids
             .iter()
@@ -697,15 +1236,28 @@ fn main() -> Result<(), String> {
             .batch_upsert_nodes(&node_inputs)
             .map_err(|e| e.to_string())?;
 
-        for i in 0..cfg.export_edges {
-            let from = node_ids[i % node_ids.len()];
-            let to = node_ids[(i * 13 + 7) % node_ids.len()];
-            if from != to {
-                engine
-                    .upsert_edge(from, to, 1, BTreeMap::new(), 1.0, None, None)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        let edge_inputs: Vec<EdgeInput> = (0..cfg.export_edges)
+            .filter_map(|i| {
+                let from = node_ids[i % node_ids.len()];
+                let to = node_ids[(i * 13 + 7) % node_ids.len()];
+                if from != to {
+                    Some(EdgeInput {
+                        from,
+                        to,
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        engine
+            .batch_upsert_edges(&edge_inputs)
+            .map_err(|e| e.to_string())?;
 
         let export_opts = ExportOptions {
             include_weights: cfg.include_weights_on_export,
@@ -906,7 +1458,169 @@ fn effective_config(
         time_range_from_ms: cfg.time_range_from_ms,
         time_range_window_ms: cfg.time_range_window_ms,
         include_weights_on_export: cfg.include_weights_on_export,
+        shortest_path_nodes: cfg
+            .shortest_path_nodes_min
+            .max(nodes / cfg.shortest_path_nodes_divisor.max(1)),
+        shortest_path_edge_offsets: cfg.shortest_path_edge_offsets.clone(),
     }
+}
+
+fn traverse_deep_branching(fanout: usize) -> (usize, usize, usize) {
+    ((fanout / 4).clamp(8, 24), 4, 4)
+}
+
+fn build_depth_two_traversal_graph(
+    engine: &mut DatabaseEngine,
+    cfg: &EffectiveConfigResolved,
+) -> Result<u64, String> {
+    let mut node_inputs = vec![NodeInput {
+        type_id: 1,
+        key: "root".to_string(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+    }];
+    for i in 0..cfg.two_hop_mid {
+        node_inputs.push(NodeInput {
+            type_id: 1,
+            key: format!("m-{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+        });
+        for j in 0..cfg.two_hop_leaves_per_mid {
+            node_inputs.push(NodeInput {
+                type_id: 1,
+                key: format!("l-{i}-{j}"),
+                props: BTreeMap::new(),
+                weight: 1.0,
+            });
+        }
+    }
+    let all_ids = engine
+        .batch_upsert_nodes(&node_inputs)
+        .map_err(|e| e.to_string())?;
+    let root = all_ids[0];
+    let mid_stride = 1 + cfg.two_hop_leaves_per_mid;
+    let mut edge_inputs = Vec::new();
+    for i in 0..cfg.two_hop_mid {
+        let mid = all_ids[1 + i * mid_stride];
+        edge_inputs.push(EdgeInput {
+            from: root,
+            to: mid,
+            type_id: 1,
+            props: BTreeMap::new(),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        });
+        for j in 0..cfg.two_hop_leaves_per_mid {
+            let leaf = all_ids[1 + i * mid_stride + 1 + j];
+            edge_inputs.push(EdgeInput {
+                from: mid,
+                to: leaf,
+                type_id: 1,
+                props: BTreeMap::new(),
+                weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+            });
+        }
+    }
+    engine
+        .batch_upsert_edges(&edge_inputs)
+        .map_err(|e| e.to_string())?;
+    Ok(root)
+}
+
+fn build_deep_traversal_graph(
+    engine: &mut DatabaseEngine,
+    fanout: usize,
+) -> Result<(u64, usize, usize, usize), String> {
+    let (level1, level2, level3) = traverse_deep_branching(fanout);
+    let mut node_inputs = vec![NodeInput {
+        type_id: 1,
+        key: "root".to_string(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+    }];
+    for i in 0..level1 {
+        node_inputs.push(NodeInput {
+            type_id: 11,
+            key: format!("lvl1-{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+        });
+    }
+    for i in 0..level1 {
+        for j in 0..level2 {
+            node_inputs.push(NodeInput {
+                type_id: if (i + j) % 2 == 0 { 2 } else { 3 },
+                key: format!("lvl2-{i}-{j}"),
+                props: BTreeMap::new(),
+                weight: 1.0,
+            });
+        }
+    }
+    for i in 0..level1 {
+        for j in 0..level2 {
+            for k in 0..level3 {
+                node_inputs.push(NodeInput {
+                    type_id: if (i + j + k) % 2 == 0 { 2 } else { 3 },
+                    key: format!("lvl3-{i}-{j}-{k}"),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                });
+            }
+        }
+    }
+    let ids = engine
+        .batch_upsert_nodes(&node_inputs)
+        .map_err(|e| e.to_string())?;
+    let root = ids[0];
+    let level1_offset = 1usize;
+    let level2_offset = level1_offset + level1;
+    let level3_offset = level2_offset + level1 * level2;
+    let mut edge_inputs = Vec::new();
+    for i in 0..level1 {
+        let lvl1 = ids[level1_offset + i];
+        edge_inputs.push(EdgeInput {
+            from: root,
+            to: lvl1,
+            type_id: 1,
+            props: BTreeMap::new(),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        });
+        for j in 0..level2 {
+            let lvl2_idx = i * level2 + j;
+            let lvl2 = ids[level2_offset + lvl2_idx];
+            edge_inputs.push(EdgeInput {
+                from: lvl1,
+                to: lvl2,
+                type_id: 1,
+                props: BTreeMap::new(),
+                weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+            });
+            for k in 0..level3 {
+                let lvl3_idx = lvl2_idx * level3 + k;
+                edge_inputs.push(EdgeInput {
+                    from: lvl2,
+                    to: ids[level3_offset + lvl3_idx],
+                    type_id: 1,
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                });
+            }
+        }
+    }
+    engine
+        .batch_upsert_edges(&edge_inputs)
+        .map_err(|e| e.to_string())?;
+    Ok((root, level1, level2, level3))
 }
 
 fn scenario_iterations(
@@ -1131,9 +1845,7 @@ fn format_unix_seconds_utc(secs: i64) -> String {
     let minute = (sod % 3_600) / 60;
     let second = sod % 60;
 
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
@@ -1163,6 +1875,9 @@ mod timestamp_tests {
 
     #[test]
     fn formats_known_timestamp() {
-        assert_eq!(format_unix_seconds_utc(1_709_510_400), "2024-03-04T00:00:00Z");
+        assert_eq!(
+            format_unix_seconds_utc(1_709_510_400),
+            "2024-03-04T00:00:00Z"
+        );
     }
 }

@@ -16,7 +16,6 @@ const MAX_WAL_RECORD_SIZE: usize = 64 * 1024 * 1024;
 /// - len: byte length of payload (not including len or crc fields)
 /// - crc32: CRC-32 of payload bytes
 /// - payload: encoded WalOp
-
 fn write_wal_header(writer: &mut impl Write) -> Result<(), EngineError> {
     writer.write_all(&WAL_MAGIC)?;
     writer.write_all(&WAL_VERSION.to_le_bytes())?;
@@ -165,7 +164,6 @@ impl WalWriter {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
-            .write(true)
             .append(true)
             .open(&self.path)?;
         self.writer = BufWriter::new(file);
@@ -488,8 +486,7 @@ mod tests {
         let mut data = std::fs::read(&wal_path).unwrap();
 
         // First record starts after the 8-byte header
-        let first_len =
-            u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        let first_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
         let second_record_start = WAL_HEADER_SIZE + 4 + 4 + first_len;
 
         // Corrupt the CRC of the second record (4 bytes after the length field)
@@ -720,7 +717,7 @@ mod tests {
         let fake_crc: u32 = 0;
         file.write_all(&fake_len.to_le_bytes()).unwrap();
         file.write_all(&fake_crc.to_le_bytes()).unwrap();
-        file.write_all(&vec![0u8; 19]).unwrap(); // 1 byte short
+        file.write_all(&[0u8; 19]).unwrap(); // 1 byte short
         file.flush().unwrap();
         drop(file);
 

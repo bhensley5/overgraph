@@ -183,25 +183,36 @@ for n in results:
     print(f"neighbor node={n.node_id} weight={n.weight}")
 ```
 
-### 2-hop traversal
+### Traverse Exactly 2 Hops
 
 ```python
-# Find all nodes within 2 hops of alice
-results = db.neighbors_2hop(alice_id, "outgoing", limit=100)
+# Find nodes exactly 2 hops from alice
+page = db.traverse(
+    alice_id,
+    min_depth=2,
+    max_depth=2,
+    direction="outgoing",
+    limit=100,
+)
+results = page.items
 ```
 
-### Constrained 2-hop
+### Constrained Traversal
 
-This is the "find all X related to Y through Z" pattern. Traverse specific edge types in the first hop, then filter by target node types in the second hop.
+This is the "find all X related to Y through Z" pattern. Traverse specific edge types, then emit only matching node types.
 
 ```python
 # Find all projects (type 2) connected to alice through "works_on" edges (type 10)
-results = db.neighbors_2hop_constrained(
-    alice_id, "outgoing",
-    traverse_edge_types=[10],
-    target_node_types=[2],
+page = db.traverse(
+    alice_id,
+    min_depth=2,
+    max_depth=2,
+    direction="outgoing",
+    edge_type_filter=[10],
+    node_type_filter=[2],
     limit=50,
 )
+results = page.items
 ```
 
 ### Top-K neighbors
@@ -211,6 +222,167 @@ Get the K highest-scoring neighbors. Scoring can be by `weight`, `recency`, or d
 ```python
 top = db.top_k_neighbors(alice_id, k=10, direction="outgoing", scoring="weight")
 ```
+
+## Degree counts and weight aggregations
+
+Sometimes you just need the count or total weight without materializing the full neighbor list. These methods are O(postings) with no allocation beyond edge dedup.
+
+**Rust**
+```rust
+// Outgoing degree
+let count = db.degree(alice_id, Direction::Outgoing, None, None)?;
+
+// Sum of outgoing edge weights
+let total = db.sum_edge_weights(alice_id, Direction::Outgoing, None, None)?;
+
+// Average outgoing edge weight (None if zero edges)
+let avg = db.avg_edge_weight(alice_id, Direction::Outgoing, None, None)?;
+
+// Batch: degrees for many nodes at once (sorted cursor walk)
+let degrees = db.degrees(&[alice_id, bob_id], Direction::Outgoing, None, None)?;
+// degrees: HashMap<u64, u64>
+```
+
+**Node.js**
+```javascript
+const count = db.degree(aliceId);
+const total = db.sumEdgeWeights(aliceId);
+const avg = db.avgEdgeWeight(aliceId);
+
+// With options
+const filtered = db.degree(aliceId, 'outgoing', [10, 20]);
+const atTime = db.degree(aliceId, 'outgoing', null, 1706745600000);
+
+// Batch
+const results = db.degrees([aliceId, bobId]);
+// results: [{ nodeId, degree }, ...]
+```
+
+**Python**
+```python
+count = db.degree(alice_id)
+total = db.sum_edge_weights(alice_id)
+avg = db.avg_edge_weight(alice_id)  # None if no edges
+
+# With options
+filtered = db.degree(alice_id, "outgoing", type_filter=[10, 20])
+at_time = db.degree(alice_id, "outgoing", at_epoch=1706745600000)
+
+# Batch
+degrees = db.degrees([alice_id, bob_id])
+# degrees: {node_id: count, ...}
+```
+
+All degree/weight methods support the same `direction`, `type_filter`, and `at_epoch` parameters as `neighbors()`. Temporal filtering works the same way: expired and future edges are excluded.
+
+## Shortest path and connectivity
+
+Find the shortest path between two nodes, check reachability, or enumerate all shortest paths when there are ties.
+
+**Rust**
+```rust
+use overgraph::Direction;
+
+// BFS shortest path (unweighted, counts hops)
+let path = db.shortest_path(alice_id, project_id, Direction::Outgoing,
+    None, None, None, None, None)?;
+if let Some(p) = path {
+    println!("Path: {:?}, cost: {}", p.nodes, p.total_cost);
+}
+
+// Dijkstra shortest path (weighted by edge weight)
+let path = db.shortest_path(alice_id, project_id, Direction::Outgoing,
+    None, Some("weight"), None, None, None)?;
+
+// Fast reachability check (no path tracking, just true/false)
+let connected = db.is_connected(alice_id, project_id,
+    Direction::Outgoing, None, None, None)?;
+
+// All shortest paths (when there are ties)
+let paths = db.all_shortest_paths(alice_id, project_id,
+    Direction::Outgoing, None, None, None, None, None, Some(10))?;
+println!("Found {} equal-cost paths", paths.len());
+```
+
+**Node.js**
+```javascript
+// BFS shortest path
+const path = db.shortestPath(aliceId, projectId, 'outgoing');
+if (path) {
+  console.log(`Path: ${path.nodes}, cost: ${path.totalCost}`);
+}
+
+// Dijkstra shortest path
+const weighted = db.shortestPath(aliceId, projectId, 'outgoing', null, 'weight');
+
+// Reachability check
+const connected = db.isConnected(aliceId, projectId, 'outgoing');
+
+// All shortest paths
+const paths = db.allShortestPaths(aliceId, projectId, 'outgoing',
+    null, null, null, null, null, 10);
+```
+
+**Python**
+```python
+# BFS shortest path
+path = db.shortest_path(alice_id, project_id, "outgoing")
+if path:
+    print(f"Path: {path.nodes}, cost: {path.total_cost}")
+
+# Dijkstra shortest path
+weighted = db.shortest_path(alice_id, project_id, "outgoing", weight_field="weight")
+
+# Reachability check
+connected = db.is_connected(alice_id, project_id, "outgoing")
+
+# All shortest paths
+paths = db.all_shortest_paths(alice_id, project_id, "outgoing", max_paths=10)
+print(f"Found {len(paths)} equal-cost paths")
+```
+
+Algorithm selection is automatic: pass `weight_field=None` (default) for BFS, `"weight"` to use edge weights from the adjacency index, or any other field name to read weights from edge properties. Both BFS and Dijkstra use bidirectional search for optimal performance. Use `max_depth` to limit hop count and `max_cost` to cap total path cost (Dijkstra only).
+
+## Connected components
+
+Find weakly connected components or look up which component a specific node belongs to. WCC treats all edges as undirected. Edge direction is ignored for component membership.
+
+```rust
+// All components: returns NodeIdMap<u64> (node_id → component_id).
+// NodeIdMap is a HashMap with fast identity hashing for numeric IDs.
+// Component ID = minimum node ID in the component (deterministic).
+let comps = db.connected_components(None, None, None)?;
+
+// Look up a single node's component (targeted BFS, no full-graph scan)
+let members = db.component_of(some_node_id, None, None, None)?;
+// members: sorted Vec<u64> of all nodes in the same component
+```
+
+```javascript
+// All components: [{nodeId, componentId}, ...] sorted by nodeId
+const comps = db.connectedComponents();
+
+// Single node's component: Float64Array of member node IDs
+const members = db.componentOf(someNodeId);
+
+// Async variants
+const compsAsync = await db.connectedComponentsAsync();
+const membersAsync = await db.componentOfAsync(someNodeId);
+```
+
+```python
+# All components: {node_id: component_id}
+comps = db.connected_components()
+
+# Single node's component: sorted list of node IDs
+members = db.component_of(some_node_id)
+
+# Filter by edge/node types
+comps = db.connected_components(edge_type_filter=[10], node_type_filter=[1])
+members = db.component_of(node_id, edge_type_filter=[10])
+```
+
+Isolated nodes (no edges) become singleton components. Deleted, tombstoned, and prune-policy-hidden nodes are excluded. Use `at_epoch` for temporal edge visibility. Strongly connected components (SCC) for directed graphs are planned for a future release.
 
 ## Temporal edges
 
@@ -301,7 +473,7 @@ while page.next_cursor is not None:
     process(page.items)
 ```
 
-This works on all query types: `find_nodes_paged`, `get_nodes_by_type_paged`, `neighbors_paged`, `neighbors_2hop_paged`, and more.
+This works on ID-keyed paged query types like `find_nodes_paged`, `get_nodes_by_type_paged`, and `neighbors_paged`. `traverse()` also paginates, but it uses a traversal-specific cursor instead of raw ID pagination.
 
 ## Retention policies
 

@@ -27,20 +27,44 @@ fn test_full_graph_query_patterns() {
     let mut edge_ids = Vec::new();
     for i in 0..19 {
         let eid = engine
-            .upsert_edge(node_ids[i], node_ids[i + 1], 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(
+                node_ids[i],
+                node_ids[i + 1],
+                10,
+                BTreeMap::new(),
+                1.0,
+                None,
+                None,
+            )
             .unwrap();
         edge_ids.push(eid);
     }
     for i in 0..17 {
         let eid = engine
-            .upsert_edge(node_ids[i], node_ids[i + 3], 20, BTreeMap::new(), 0.8, None, None)
+            .upsert_edge(
+                node_ids[i],
+                node_ids[i + 3],
+                20,
+                BTreeMap::new(),
+                0.8,
+                None,
+                None,
+            )
             .unwrap();
         edge_ids.push(eid);
     }
     // Fill remaining edges: hub pattern from node 0
     for i in 5..19 {
         let eid = engine
-            .upsert_edge(node_ids[0], node_ids[i], 20, BTreeMap::new(), 0.5, None, None)
+            .upsert_edge(
+                node_ids[0],
+                node_ids[i],
+                20,
+                BTreeMap::new(),
+                0.5,
+                None,
+                None,
+            )
             .unwrap();
         edge_ids.push(eid);
     }
@@ -56,31 +80,43 @@ fn test_full_graph_query_patterns() {
 
     // --- Verify outgoing neighbors ---
     // Node 0 has: 1 "knows" (→1) + 1 "references" (→3) + 14 hub edges = 16 outgoing
-    let out_0 = engine.neighbors(node_ids[0], Direction::Outgoing, None, 0, None, None).unwrap();
+    let out_0 = engine
+        .neighbors(node_ids[0], Direction::Outgoing, None, 0, None, None)
+        .unwrap();
     assert_eq!(out_0.len(), 16);
 
     // Filter by type 10 ("knows"), node 0 has exactly 1 (→1)
-    let knows_0 = engine.neighbors(node_ids[0], Direction::Outgoing, Some(&[10]), 0, None, None).unwrap();
+    let knows_0 = engine
+        .neighbors(node_ids[0], Direction::Outgoing, Some(&[10]), 0, None, None)
+        .unwrap();
     assert_eq!(knows_0.len(), 1);
     assert_eq!(knows_0[0].node_id, node_ids[1]);
 
     // Node 5: knows →6, references →8, and is a hub target (incoming only for hub)
-    let out_5 = engine.neighbors(node_ids[5], Direction::Outgoing, Some(&[10]), 0, None, None).unwrap();
+    let out_5 = engine
+        .neighbors(node_ids[5], Direction::Outgoing, Some(&[10]), 0, None, None)
+        .unwrap();
     assert_eq!(out_5.len(), 1);
     assert_eq!(out_5[0].node_id, node_ids[6]);
 
     // --- Verify incoming neighbors ---
     // Node 19: knows ←18, references ←16
-    let inc_19 = engine.neighbors(node_ids[19], Direction::Incoming, None, 0, None, None).unwrap();
+    let inc_19 = engine
+        .neighbors(node_ids[19], Direction::Incoming, None, 0, None, None)
+        .unwrap();
     assert_eq!(inc_19.len(), 2);
 
     // --- Verify limit ---
-    let limited = engine.neighbors(node_ids[0], Direction::Outgoing, None, 5, None, None).unwrap();
+    let limited = engine
+        .neighbors(node_ids[0], Direction::Outgoing, None, 5, None, None)
+        .unwrap();
     assert_eq!(limited.len(), 5);
 
     // --- Verify both direction ---
     // Node 10: outgoing knows→11, references→13; incoming knows←9, references←7, hub←0
-    let both_10 = engine.neighbors(node_ids[10], Direction::Both, None, 0, None, None).unwrap();
+    let both_10 = engine
+        .neighbors(node_ids[10], Direction::Both, None, 0, None, None)
+        .unwrap();
     assert!(both_10.len() >= 4); // at least 4 connections
 
     // --- Delete a node and verify cascade ---
@@ -96,7 +132,9 @@ fn test_full_graph_query_patterns() {
     assert_eq!(engine.edge_count(), edge_count_before - 3); // 3 incident edges gone
 
     // Node 0's "knows" neighbor (node 1) should be gone from results
-    let knows_after = engine.neighbors(node_ids[0], Direction::Outgoing, Some(&[10]), 0, None, None).unwrap();
+    let knows_after = engine
+        .neighbors(node_ids[0], Direction::Outgoing, Some(&[10]), 0, None, None)
+        .unwrap();
     assert!(knows_after.is_empty());
 
     // --- Delete an edge directly ---
@@ -126,10 +164,18 @@ fn test_graph_state_survives_restart() {
         node_c = engine.upsert_node(2, "c", BTreeMap::new(), 0.7).unwrap();
         node_d = engine.upsert_node(2, "d", BTreeMap::new(), 0.8).unwrap();
 
-        edge_ab = engine.upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        edge_ac = engine.upsert_edge(node_a, node_c, 10, BTreeMap::new(), 0.9, None, None).unwrap();
-        edge_bc = engine.upsert_edge(node_b, node_c, 20, BTreeMap::new(), 0.8, None, None).unwrap();
-        engine.upsert_edge(node_c, node_d, 10, BTreeMap::new(), 0.7, None, None).unwrap();
+        edge_ab = engine
+            .upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None)
+            .unwrap();
+        edge_ac = engine
+            .upsert_edge(node_a, node_c, 10, BTreeMap::new(), 0.9, None, None)
+            .unwrap();
+        edge_bc = engine
+            .upsert_edge(node_b, node_c, 20, BTreeMap::new(), 0.8, None, None)
+            .unwrap();
+        engine
+            .upsert_edge(node_c, node_d, 10, BTreeMap::new(), 0.7, None, None)
+            .unwrap();
 
         // Delete node d and edge b→c
         engine.delete_node(node_d).unwrap();
@@ -157,27 +203,37 @@ fn test_graph_state_survives_restart() {
         assert!(engine.get_edge(edge_bc).unwrap().is_none()); // deleted
 
         // Adjacency: a has outgoing to b and c
-        let out_a = engine.neighbors(node_a, Direction::Outgoing, None, 0, None, None).unwrap();
+        let out_a = engine
+            .neighbors(node_a, Direction::Outgoing, None, 0, None, None)
+            .unwrap();
         assert_eq!(out_a.len(), 2);
         let out_a_ids: Vec<u64> = out_a.iter().map(|e| e.node_id).collect();
         assert!(out_a_ids.contains(&node_b));
         assert!(out_a_ids.contains(&node_c));
 
         // b has no outgoing (b→c was deleted)
-        let out_b = engine.neighbors(node_b, Direction::Outgoing, None, 0, None, None).unwrap();
+        let out_b = engine
+            .neighbors(node_b, Direction::Outgoing, None, 0, None, None)
+            .unwrap();
         assert!(out_b.is_empty());
 
         // c has outgoing c→d, but d is deleted so excluded from neighbors
-        let out_c = engine.neighbors(node_c, Direction::Outgoing, None, 0, None, None).unwrap();
+        let out_c = engine
+            .neighbors(node_c, Direction::Outgoing, None, 0, None, None)
+            .unwrap();
         assert!(out_c.is_empty());
 
         // c has incoming from a (edges ab goes to b not c, ac goes to c)
-        let inc_c = engine.neighbors(node_c, Direction::Incoming, None, 0, None, None).unwrap();
+        let inc_c = engine
+            .neighbors(node_c, Direction::Incoming, None, 0, None, None)
+            .unwrap();
         assert_eq!(inc_c.len(), 1);
         assert_eq!(inc_c[0].node_id, node_a);
 
         // Type filter works after replay
-        let typed = engine.neighbors(node_a, Direction::Outgoing, Some(&[10]), 0, None, None).unwrap();
+        let typed = engine
+            .neighbors(node_a, Direction::Outgoing, Some(&[10]), 0, None, None)
+            .unwrap();
         assert_eq!(typed.len(), 2); // both ab and ac are type 10
 
         // Upsert dedup still works after replay

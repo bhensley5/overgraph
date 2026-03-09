@@ -258,7 +258,7 @@ describe('delete_node / delete_edge', () => {
   });
 });
 
-describe('neighbors / neighbors_2hop', () => {
+describe('neighbors / traverse', () => {
   let tmpDir, db, center, n1, n2, n3;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-nbr-'));
@@ -306,23 +306,30 @@ describe('neighbors / neighbors_2hop', () => {
     assert.equal(result.length, 2);
   });
 
-  it('neighbors_2hop returns only 2nd-hop nodes', () => {
+  it('traverse can return only 2nd-hop nodes', () => {
     // From center: 1-hop = {n1, n2}, 2nd-hop-only = {n3}
-    const result = db.neighbors2Hop(center, 'outgoing');
-    const nodeSet = new Set(result.toArray().map(e => e.nodeId));
-    // n3 is the only node exactly 2 hops from center
+    const page = db.traverse(center, 2, 2, 'outgoing');
+    const nodeSet = new Set(page.items.map(hit => hit.nodeId));
     assert.ok(nodeSet.has(n3));
-    // 1-hop nodes are excluded
     assert.ok(!nodeSet.has(n1));
     assert.ok(!nodeSet.has(n2));
+    assert.deepEqual(page.items.map(hit => hit.depth), [2]);
   });
 
-  it('neighbors_2hop with type filter', () => {
-    const result = db.neighbors2Hop(center, 'outgoing', [10]);
-    const nodeSet = new Set(result.toArray().map(e => e.nodeId));
-    // Only type-10 edges: center->n1->n3, so n3 is the 2nd-hop result
+  it('traverse supports edge filters and deterministic hit fields', () => {
+    const page = db.traverse(center, 2, 2, 'outgoing', [10]);
+    const nodeSet = new Set(page.items.map(hit => hit.nodeId));
     assert.ok(nodeSet.has(n3));
-    assert.equal(result.length, 1);
+    assert.equal(page.items.length, 1);
+    assert.equal(page.items[0].depth, 2);
+    assert.equal(typeof page.items[0].viaEdgeId, 'number');
+  });
+
+  it('removed neighbors2Hop APIs stay absent', () => {
+    assert.equal(typeof db.neighbors2Hop, 'undefined');
+    assert.equal(typeof db.neighbors2HopPaged, 'undefined');
+    assert.equal(typeof db.neighbors2HopConstrained, 'undefined');
+    assert.equal(typeof db.neighbors2HopConstrainedPaged, 'undefined');
   });
 
   it('neighbor weights are returned', () => {
@@ -391,22 +398,33 @@ describe('flush / compact', () => {
   });
 
   it('compact returns stats when there are segments to merge', () => {
-    // Create enough data to flush twice
-    for (let i = 0; i < 50; i++) {
-      db.upsertNode(1, `node-${i}`, { idx: i });
-    }
-    db.flush();
-    for (let i = 50; i < 100; i++) {
-      db.upsertNode(1, `node-${i}`, { idx: i });
-    }
-    db.flush();
+    const testDir = mkdtempSync(join(tmpdir(), 'overgraph-compact-'));
+    const testDb = OverGraph.open(join(testDir, 'db'), {
+      walSyncMode: 'immediate',
+      compactAfterNFlushes: 0,
+    });
 
-    const stats = db.compact();
-    assert.ok(stats);
-    assert.equal(typeof stats.segmentsMerged, 'number');
-    assert.ok(stats.segmentsMerged >= 2);
-    assert.equal(typeof stats.nodesKept, 'number');
-    assert.equal(typeof stats.edgesKept, 'number');
+    try {
+      for (let i = 0; i < 50; i++) {
+        testDb.upsertNode(1, `node-${i}`, { idx: i });
+      }
+      testDb.flush();
+      for (let i = 50; i < 100; i++) {
+        testDb.upsertNode(1, `node-${i}`, { idx: i });
+      }
+      testDb.flush();
+
+      assert.ok(testDb.stats().segmentCount >= 2);
+      const stats = testDb.compact();
+      assert.ok(stats);
+      assert.equal(typeof stats.segmentsMerged, 'number');
+      assert.ok(stats.segmentsMerged >= 2);
+      assert.equal(typeof stats.nodesKept, 'number');
+      assert.equal(typeof stats.edgesKept, 'number');
+    } finally {
+      testDb.close();
+      rmSync(testDir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -123,8 +123,7 @@ export declare class OverGraph {
   removePrunePolicyAsync(name: string): Promise<boolean>
   listPrunePoliciesAsync(): Promise<Array<JsNamedPrunePolicy>>
   neighbors(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): JsNeighborList
-  neighbors2Hop(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): JsNeighborList
-  neighbors2HopConstrained(nodeId: number, direction?: string | undefined | null, traverseEdgeTypes?: Array<number> | undefined | null, targetNodeTypes?: Array<number> | undefined | null, limit?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): JsNeighborList
+  traverse(startNodeId: number, minDepth: number, maxDepth: number, direction?: string | undefined | null, edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null, limit?: number | undefined | null, cursor?: JsTraversalCursor | undefined | null): JsTraversalPageResult
   topKNeighbors(nodeId: number, direction: string | undefined | null, typeFilter: Array<number> | undefined | null, k: number, scoring?: string | undefined | null, decayLambda?: number | undefined | null, atEpoch?: number | undefined | null): JsNeighborList
   extractSubgraph(startNodeId: number, maxDepth: number, direction?: string | undefined | null, edgeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): JsSubgraphResult
   /**
@@ -132,6 +131,13 @@ export declare class OverGraph {
    * Returns an array of entries, each mapping a query node to its neighbors.
    */
   neighborsBatch(nodeIds: Array<number>, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Array<JsNeighborBatchEntry>
+  degree(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): number
+  sumEdgeWeights(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): number
+  avgEdgeWeight(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): number | null
+  degrees(nodeIds: Array<number>, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Array<JsDegreeBatchEntry>
+  shortestPath(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, weightField?: string | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null, maxCost?: number | undefined | null): JsShortestPath | null
+  isConnected(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null): boolean
+  allShortestPaths(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, weightField?: string | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null, maxCost?: number | undefined | null, maxPaths?: number | undefined | null): Array<JsShortestPath>
   findNodes(typeId: number, propKey: string, propValue: any): Float64Array
   /** Return all node IDs of a given type (unpaged). */
   nodesByType(typeId: number): Float64Array
@@ -151,14 +157,16 @@ export declare class OverGraph {
   personalizedPagerank(seedNodeIds: Float64Array, options?: JsPprOptions | undefined | null): JsPprResult
   exportAdjacency(options?: JsExportOptions | undefined | null): JsAdjacencyExport
   neighborsPaged(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, after?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): JsNeighborPageResult
-  neighbors2HopPaged(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, after?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): JsNeighborPageResult
-  neighbors2HopConstrainedPaged(nodeId: number, direction?: string | undefined | null, traverseEdgeTypes?: Array<number> | undefined | null, targetNodeTypes?: Array<number> | undefined | null, limit?: number | undefined | null, after?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): JsNeighborPageResult
+  connectedComponents(edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Array<JsComponentEntry>
+  componentOf(nodeId: number, edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Float64Array
   /**
    * Force an immediate WAL fsync. In GroupCommit mode, blocks until all
    * buffered data is durable. In Immediate mode, this is a no-op.
    */
   sync(): void
   flush(): void
+  ingestMode(): void
+  endIngest(): JsCompactionStats | null
   compact(): JsCompactionStats | null
   /**
    * Compact with a progress callback. The callback receives a progress object
@@ -187,8 +195,7 @@ export declare class OverGraph {
   graphPatchAsync(patch: JsGraphPatch): Promise<JsPatchResult>
   pruneAsync(policy: JsPrunePolicy): Promise<JsPruneResult>
   neighborsAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<JsNeighborList>
-  neighbors2HopAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<JsNeighborList>
-  neighbors2HopConstrainedAsync(nodeId: number, direction?: string | undefined | null, traverseEdgeTypes?: Array<number> | undefined | null, targetNodeTypes?: Array<number> | undefined | null, limit?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<JsNeighborList>
+  traverseAsync(startNodeId: number, minDepth: number, maxDepth: number, direction?: string | undefined | null, edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null, limit?: number | undefined | null, cursor?: JsTraversalCursor | undefined | null): Promise<JsTraversalPageResult>
   topKNeighborsAsync(nodeId: number, direction: string | undefined | null, typeFilter: Array<number> | undefined | null, k: number, scoring?: string | undefined | null, decayLambda?: number | undefined | null, atEpoch?: number | undefined | null): Promise<JsNeighborList>
   extractSubgraphAsync(startNodeId: number, maxDepth: number, direction?: string | undefined | null, edgeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<JsSubgraphResult>
   findNodesAsync(typeId: number, propKey: string, propValue: any): Promise<Float64Array>
@@ -199,6 +206,13 @@ export declare class OverGraph {
   nodesByTypeAsync(typeId: number): Promise<Float64Array>
   edgesByTypeAsync(typeId: number): Promise<Float64Array>
   neighborsBatchAsync(nodeIds: Array<number>, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<Array<JsNeighborBatchEntry>>
+  degreeAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<number>
+  sumEdgeWeightsAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<number>
+  avgEdgeWeightAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<number | null>
+  degreesAsync(nodeIds: Array<number>, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<Array<JsDegreeBatchEntry>>
+  shortestPathAsync(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, weightField?: string | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null, maxCost?: number | undefined | null): Promise<JsShortestPath | null>
+  isConnectedAsync(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null): Promise<boolean>
+  allShortestPathsAsync(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, weightField?: string | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null, maxCost?: number | undefined | null, maxPaths?: number | undefined | null): Promise<Array<JsShortestPath>>
   nodesByTypePagedAsync(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): Promise<JsIdPageResult>
   edgesByTypePagedAsync(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): Promise<JsIdPageResult>
   getNodesByTypePagedAsync(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): Promise<JsNodePageResult>
@@ -209,15 +223,17 @@ export declare class OverGraph {
   personalizedPagerankAsync(seedNodeIds: Float64Array, options?: JsPprOptions | undefined | null): Promise<JsPprResult>
   exportAdjacencyAsync(options?: JsExportOptions | undefined | null): Promise<JsAdjacencyExport>
   neighborsPagedAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, after?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<JsNeighborPageResult>
-  neighbors2HopPagedAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, after?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<JsNeighborPageResult>
-  neighbors2HopConstrainedPagedAsync(nodeId: number, direction?: string | undefined | null, traverseEdgeTypes?: Array<number> | undefined | null, targetNodeTypes?: Array<number> | undefined | null, limit?: number | undefined | null, after?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<JsNeighborPageResult>
+  connectedComponentsAsync(edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<Array<JsComponentEntry>>
+  componentOfAsync(nodeId: number, edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<Float64Array>
   syncAsync(): Promise<void>
   flushAsync(): Promise<void>
+  ingestModeAsync(): Promise<void>
+  endIngestAsync(): Promise<JsCompactionStats | null>
   compactAsync(): Promise<JsCompactionStats | null>
   /**
    * Async compaction with a fire-and-forget progress callback.
    * The callback receives progress updates but cannot cancel compaction (unlike the sync version).
-   * Note: the database mutex is held for the entire compaction, so other operations on this
+   * Note: the database write lock is held for the entire compaction, so other operations on this
    * instance will block until compaction completes. The JS event loop remains responsive.
    */
   compactWithProgressAsync(callback: (progress: JsCompactionProgress) => void): Promise<JsCompactionStats | null>
@@ -258,6 +274,11 @@ export interface JsCompactionStats {
   edgesAutoPruned: number
 }
 
+export interface JsComponentEntry {
+  nodeId: number
+  componentId: number
+}
+
 export interface JsDbOptions {
   createIfMissing?: boolean
   edgeUniqueness?: boolean
@@ -285,6 +306,11 @@ export interface JsDbStats {
   lastCompactionMs?: number
   /** WAL sync mode: "immediate" or "group-commit". */
   walSyncMode: string
+}
+
+export interface JsDegreeBatchEntry {
+  nodeId: number
+  degree: number
 }
 
 export interface JsEdgeInput {
@@ -380,4 +406,27 @@ export interface JsPruneResult {
   nodesPruned: number
   /** Number of edges cascade-deleted. */
   edgesPruned: number
+}
+
+export interface JsShortestPath {
+  nodes: Array<number>
+  edges: Array<number>
+  totalCost: number
+}
+
+export interface JsTraversalCursor {
+  depth: number
+  lastNodeId: number
+}
+
+export interface JsTraversalHit {
+  nodeId: number
+  depth: number
+  viaEdgeId?: number
+  score?: number
+}
+
+export interface JsTraversalPageResult {
+  items: Array<JsTraversalHit>
+  nextCursor?: JsTraversalCursor
 }

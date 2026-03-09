@@ -1,15 +1,16 @@
 use eg::{
     AdjacencyExport, CompactionPhase, CompactionProgress, CompactionStats, DatabaseEngine,
-    DbOptions, DbStats, Direction, EdgeInput, ExportOptions, GraphPatch, NeighborEntry, NodeInput,
-    NodeRecord, EdgeRecord, EngineError, PageRequest, PprOptions, PprResult, PropValue,
-    PrunePolicy, PruneResult, ScoringMode, Subgraph, WalSyncMode,
+    DbOptions, DbStats, Direction, EdgeInput, EdgeRecord, EngineError, ExportOptions, GraphPatch,
+    NeighborEntry, NodeIdMap, NodeInput, NodeRecord, PageRequest, PprOptions, PprResult, PropValue,
+    PrunePolicy, PruneResult, ScoringMode, ShortestPath, Subgraph, TraversalCursor, TraversalHit,
+    TraversalPageResult, WalSyncMode,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 // ============================================================
 // Error type
@@ -39,7 +40,7 @@ struct InnerDb {
 
 #[pyclass]
 pub struct OverGraph {
-    inner: Arc<Mutex<Option<InnerDb>>>,
+    inner: Arc<RwLock<Option<InnerDb>>>,
 }
 
 /// Execute a closure with mutable engine access, releasing the GIL.
@@ -50,7 +51,7 @@ where
 {
     let inner = db.inner.clone();
     py.allow_threads(move || {
-        let mut guard = inner.lock().map_err(lock_err)?;
+        let mut guard = inner.write().map_err(lock_err)?;
         let db = guard.as_mut().ok_or_else(closed_err)?;
         f(&mut db.engine).map_err(to_py_err)
     })
@@ -64,7 +65,7 @@ where
 {
     let inner = db.inner.clone();
     py.allow_threads(move || {
-        let guard = inner.lock().map_err(lock_err)?;
+        let guard = inner.read().map_err(lock_err)?;
         let db = guard.as_ref().ok_or_else(closed_err)?;
         f(&db.engine).map_err(to_py_err)
     })
@@ -81,10 +82,9 @@ impl OverGraph {
             Some(d) => parse_db_options(d)?,
             None => DbOptions::default(),
         };
-        let engine =
-            DatabaseEngine::open(Path::new(path), &opts).map_err(to_py_err)?;
+        let engine = DatabaseEngine::open(Path::new(path), &opts).map_err(to_py_err)?;
         Ok(OverGraph {
-            inner: Arc::new(Mutex::new(Some(InnerDb { engine }))),
+            inner: Arc::new(RwLock::new(Some(InnerDb { engine }))),
         })
     }
 
@@ -92,7 +92,7 @@ impl OverGraph {
     fn close(&self, py: Python<'_>, force: bool) -> PyResult<()> {
         let inner = self.inner.clone();
         py.allow_threads(move || {
-            let mut guard = inner.lock().map_err(lock_err)?;
+            let mut guard = inner.write().map_err(lock_err)?;
             if let Some(db) = guard.take() {
                 if force {
                     db.engine.close_fast().map_err(to_py_err)?;
@@ -137,7 +137,9 @@ impl OverGraph {
     ) -> PyResult<u64> {
         let props = convert_py_props(py, props)?;
         let w = weight as f32;
-        with_engine(self, py, move |eng| eng.upsert_node(type_id, &key, props, w))
+        with_engine(self, py, move |eng| {
+            eng.upsert_node(type_id, &key, props, w)
+        })
     }
 
     #[pyo3(signature = (from_id, to_id, type_id, props=None, weight=1.0, valid_from=None, valid_to=None))]
@@ -160,11 +162,15 @@ impl OverGraph {
     }
 
     fn get_node(&self, py: Python<'_>, id: u64) -> PyResult<Option<PyNodeRecord>> {
-        with_engine_ref(self, py, |eng| Ok(eng.get_node(id)?.map(PyNodeRecord::from)))
+        with_engine_ref(self, py, |eng| {
+            Ok(eng.get_node(id)?.map(PyNodeRecord::from))
+        })
     }
 
     fn get_edge(&self, py: Python<'_>, id: u64) -> PyResult<Option<PyEdgeRecord>> {
-        with_engine_ref(self, py, |eng| Ok(eng.get_edge(id)?.map(PyEdgeRecord::from)))
+        with_engine_ref(self, py, |eng| {
+            Ok(eng.get_edge(id)?.map(PyEdgeRecord::from))
+        })
     }
 
     fn get_node_by_key(
@@ -213,29 +219,17 @@ impl OverGraph {
 
     // --- Batch ops ---
 
-    fn batch_upsert_nodes(
-        &self,
-        py: Python<'_>,
-        nodes: &Bound<'_, PyList>,
-    ) -> PyResult<Vec<u64>> {
+    fn batch_upsert_nodes(&self, py: Python<'_>, nodes: &Bound<'_, PyList>) -> PyResult<Vec<u64>> {
         let inputs = parse_node_inputs(py, nodes)?;
         with_engine(self, py, move |eng| eng.batch_upsert_nodes(&inputs))
     }
 
-    fn batch_upsert_edges(
-        &self,
-        py: Python<'_>,
-        edges: &Bound<'_, PyList>,
-    ) -> PyResult<Vec<u64>> {
+    fn batch_upsert_edges(&self, py: Python<'_>, edges: &Bound<'_, PyList>) -> PyResult<Vec<u64>> {
         let inputs = parse_edge_inputs(py, edges)?;
         with_engine(self, py, move |eng| eng.batch_upsert_edges(&inputs))
     }
 
-    fn get_nodes(
-        &self,
-        py: Python<'_>,
-        ids: Vec<u64>,
-    ) -> PyResult<Vec<Option<PyNodeRecord>>> {
+    fn get_nodes(&self, py: Python<'_>, ids: Vec<u64>) -> PyResult<Vec<Option<PyNodeRecord>>> {
         with_engine_ref(self, py, move |eng| {
             let results = eng.get_nodes(&ids)?;
             Ok(results
@@ -245,11 +239,7 @@ impl OverGraph {
         })
     }
 
-    fn get_edges(
-        &self,
-        py: Python<'_>,
-        ids: Vec<u64>,
-    ) -> PyResult<Vec<Option<PyEdgeRecord>>> {
+    fn get_edges(&self, py: Python<'_>, ids: Vec<u64>) -> PyResult<Vec<Option<PyEdgeRecord>>> {
         with_engine_ref(self, py, move |eng| {
             let results = eng.get_edges(&ids)?;
             Ok(results
@@ -259,11 +249,7 @@ impl OverGraph {
         })
     }
 
-    fn graph_patch(
-        &self,
-        py: Python<'_>,
-        patch: &Bound<'_, PyDict>,
-    ) -> PyResult<PyPatchResult> {
+    fn graph_patch(&self, py: Python<'_>, patch: &Bound<'_, PyDict>) -> PyResult<PyPatchResult> {
         let rust_patch = parse_graph_patch(py, patch)?;
         with_engine(self, py, move |eng| {
             let result = eng.graph_patch(&rust_patch)?;
@@ -285,21 +271,21 @@ impl OverGraph {
     ) -> PyResult<IdArray> {
         let pv = py_to_prop_value(py, prop_value)?;
         with_engine_ref(self, py, move |eng| {
-            Ok(IdArray { ids: Arc::new(eng.find_nodes(type_id, &prop_key, &pv)?) })
+            Ok(IdArray {
+                ids: Arc::new(eng.find_nodes(type_id, &prop_key, &pv)?),
+            })
         })
     }
 
     fn nodes_by_type(&self, py: Python<'_>, type_id: u32) -> PyResult<IdArray> {
         with_engine_ref(self, py, move |eng| {
-            Ok(IdArray { ids: Arc::new(eng.nodes_by_type(type_id)?) })
+            Ok(IdArray {
+                ids: Arc::new(eng.nodes_by_type(type_id)?),
+            })
         })
     }
 
-    fn get_nodes_by_type(
-        &self,
-        py: Python<'_>,
-        type_id: u32,
-    ) -> PyResult<Vec<PyNodeRecord>> {
+    fn get_nodes_by_type(&self, py: Python<'_>, type_id: u32) -> PyResult<Vec<PyNodeRecord>> {
         with_engine_ref(self, py, move |eng| {
             Ok(eng
                 .get_nodes_by_type(type_id)?
@@ -311,15 +297,13 @@ impl OverGraph {
 
     fn edges_by_type(&self, py: Python<'_>, type_id: u32) -> PyResult<IdArray> {
         with_engine_ref(self, py, move |eng| {
-            Ok(IdArray { ids: Arc::new(eng.edges_by_type(type_id)?) })
+            Ok(IdArray {
+                ids: Arc::new(eng.edges_by_type(type_id)?),
+            })
         })
     }
 
-    fn get_edges_by_type(
-        &self,
-        py: Python<'_>,
-        type_id: u32,
-    ) -> PyResult<Vec<PyEdgeRecord>> {
+    fn get_edges_by_type(&self, py: Python<'_>, type_id: u32) -> PyResult<Vec<PyEdgeRecord>> {
         with_engine_ref(self, py, move |eng| {
             Ok(eng
                 .get_edges_by_type(type_id)?
@@ -345,7 +329,9 @@ impl OverGraph {
         to_ms: i64,
     ) -> PyResult<IdArray> {
         with_engine_ref(self, py, move |eng| {
-            Ok(IdArray { ids: Arc::new(eng.find_nodes_by_time_range(type_id, from_ms, to_ms)?) })
+            Ok(IdArray {
+                ids: Arc::new(eng.find_nodes_by_time_range(type_id, from_ms, to_ms)?),
+            })
         })
     }
 
@@ -380,63 +366,36 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, limit=None, at_epoch=None, decay_lambda=None))]
-    fn neighbors_2hop(
+    #[pyo3(signature = (start, min_depth=0, max_depth=2, direction="outgoing", edge_type_filter=None, node_type_filter=None, at_epoch=None, decay_lambda=None, limit=None, cursor=None))]
+    fn traverse(
         &self,
         py: Python<'_>,
-        node_id: u64,
+        start: u64,
+        min_depth: u32,
+        max_depth: u32,
         direction: &str,
-        type_filter: Option<Vec<u32>>,
-        limit: Option<usize>,
+        edge_type_filter: Option<Vec<u32>>,
+        node_type_filter: Option<Vec<u32>>,
         at_epoch: Option<i64>,
         decay_lambda: Option<f64>,
-    ) -> PyResult<Vec<PyNeighborEntry>> {
-        let dir = parse_direction(direction)?;
-        let dl = decay_lambda.map(|v| v as f32);
-        with_engine_ref(self, py, move |eng| {
-            Ok(eng
-                .neighbors_2hop(
-                    node_id,
-                    dir,
-                    type_filter.as_deref(),
-                    limit.unwrap_or(0),
-                    at_epoch,
-                    dl,
-                )?
-                .into_iter()
-                .map(PyNeighborEntry::from)
-                .collect())
-        })
-    }
-
-    #[pyo3(signature = (node_id, direction="outgoing", traverse_edge_types=None, target_node_types=None, limit=None, at_epoch=None, decay_lambda=None))]
-    fn neighbors_2hop_constrained(
-        &self,
-        py: Python<'_>,
-        node_id: u64,
-        direction: &str,
-        traverse_edge_types: Option<Vec<u32>>,
-        target_node_types: Option<Vec<u32>>,
         limit: Option<usize>,
-        at_epoch: Option<i64>,
-        decay_lambda: Option<f64>,
-    ) -> PyResult<Vec<PyNeighborEntry>> {
+        cursor: Option<PyTraversalCursor>,
+    ) -> PyResult<PyTraversalPageResult> {
         let dir = parse_direction(direction)?;
-        let dl = decay_lambda.map(|v| v as f32);
+        let cursor = cursor.map(TraversalCursor::from);
         with_engine_ref(self, py, move |eng| {
-            Ok(eng
-                .neighbors_2hop_constrained(
-                    node_id,
-                    dir,
-                    traverse_edge_types.as_deref(),
-                    target_node_types.as_deref(),
-                    limit.unwrap_or(0),
-                    at_epoch,
-                    dl,
-                )?
-                .into_iter()
-                .map(PyNeighborEntry::from)
-                .collect())
+            Ok(PyTraversalPageResult::from(eng.traverse(
+                start,
+                min_depth,
+                max_depth,
+                dir,
+                edge_type_filter.as_deref(),
+                node_type_filter.as_deref(),
+                at_epoch,
+                decay_lambda,
+                limit,
+                cursor.as_ref(),
+            )?))
         })
     }
 
@@ -509,6 +468,158 @@ impl OverGraph {
         })
     }
 
+    // --- Degree counts + aggregations (Phase 18a) ---
+
+    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, at_epoch=None))]
+    fn degree(
+        &self,
+        py: Python<'_>,
+        node_id: u64,
+        direction: &str,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> PyResult<u64> {
+        let dir = parse_direction(direction)?;
+        with_engine_ref(self, py, move |eng| {
+            eng.degree(node_id, dir, type_filter.as_deref(), at_epoch)
+        })
+    }
+
+    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, at_epoch=None))]
+    fn sum_edge_weights(
+        &self,
+        py: Python<'_>,
+        node_id: u64,
+        direction: &str,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> PyResult<f64> {
+        let dir = parse_direction(direction)?;
+        with_engine_ref(self, py, move |eng| {
+            eng.sum_edge_weights(node_id, dir, type_filter.as_deref(), at_epoch)
+        })
+    }
+
+    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, at_epoch=None))]
+    fn avg_edge_weight(
+        &self,
+        py: Python<'_>,
+        node_id: u64,
+        direction: &str,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> PyResult<Option<f64>> {
+        let dir = parse_direction(direction)?;
+        with_engine_ref(self, py, move |eng| {
+            eng.avg_edge_weight(node_id, dir, type_filter.as_deref(), at_epoch)
+        })
+    }
+
+    #[pyo3(signature = (node_ids, direction="outgoing", type_filter=None, at_epoch=None))]
+    fn degrees(
+        &self,
+        py: Python<'_>,
+        node_ids: Vec<u64>,
+        direction: &str,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> PyResult<NodeIdMap<u64>> {
+        let dir = parse_direction(direction)?;
+        with_engine_ref(self, py, move |eng| {
+            eng.degrees(&node_ids, dir, type_filter.as_deref(), at_epoch)
+        })
+    }
+
+    // --- Shortest path (Phase 18b) ---
+
+    #[pyo3(signature = (from_id, to_id, direction="outgoing", type_filter=None, weight_field=None, at_epoch=None, max_depth=None, max_cost=None))]
+    fn shortest_path(
+        &self,
+        py: Python<'_>,
+        from_id: u64,
+        to_id: u64,
+        direction: &str,
+        type_filter: Option<Vec<u32>>,
+        weight_field: Option<&str>,
+        at_epoch: Option<i64>,
+        max_depth: Option<u32>,
+        max_cost: Option<f64>,
+    ) -> PyResult<Option<PyShortestPath>> {
+        let dir = parse_direction(direction)?;
+        with_engine_ref(self, py, move |eng| {
+            Ok(eng
+                .shortest_path(
+                    from_id,
+                    to_id,
+                    dir,
+                    type_filter.as_deref(),
+                    weight_field,
+                    at_epoch,
+                    max_depth,
+                    max_cost,
+                )?
+                .map(PyShortestPath::from))
+        })
+    }
+
+    #[pyo3(signature = (from_id, to_id, direction="outgoing", type_filter=None, at_epoch=None, max_depth=None))]
+    fn is_connected(
+        &self,
+        py: Python<'_>,
+        from_id: u64,
+        to_id: u64,
+        direction: &str,
+        type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+        max_depth: Option<u32>,
+    ) -> PyResult<bool> {
+        let dir = parse_direction(direction)?;
+        with_engine_ref(self, py, move |eng| {
+            eng.is_connected(
+                from_id,
+                to_id,
+                dir,
+                type_filter.as_deref(),
+                at_epoch,
+                max_depth,
+            )
+        })
+    }
+
+    #[pyo3(signature = (from_id, to_id, direction="outgoing", type_filter=None, weight_field=None, at_epoch=None, max_depth=None, max_cost=None, max_paths=None))]
+    fn all_shortest_paths(
+        &self,
+        py: Python<'_>,
+        from_id: u64,
+        to_id: u64,
+        direction: &str,
+        type_filter: Option<Vec<u32>>,
+        weight_field: Option<&str>,
+        at_epoch: Option<i64>,
+        max_depth: Option<u32>,
+        max_cost: Option<f64>,
+        max_paths: Option<usize>,
+    ) -> PyResult<Vec<PyShortestPath>> {
+        let dir = parse_direction(direction)?;
+        with_engine_ref(self, py, move |eng| {
+            Ok(eng
+                .all_shortest_paths(
+                    from_id,
+                    to_id,
+                    dir,
+                    type_filter.as_deref(),
+                    weight_field,
+                    at_epoch,
+                    max_depth,
+                    max_cost,
+                    max_paths,
+                )?
+                .into_iter()
+                .map(PyShortestPath::from)
+                .collect())
+        })
+    }
+
     // --- Binary batch upserts ---
 
     /// Batch upsert nodes from a packed binary buffer.
@@ -517,11 +628,7 @@ impl OverGraph {
     ///   [count: u32]
     ///   per node:
     ///     [type_id: u32][weight: f32][key_len: u16][key: utf8][props_len: u32][props: json utf8]
-    fn batch_upsert_nodes_binary(
-        &self,
-        py: Python<'_>,
-        buffer: &[u8],
-    ) -> PyResult<Vec<u64>> {
+    fn batch_upsert_nodes_binary(&self, py: Python<'_>, buffer: &[u8]) -> PyResult<Vec<u64>> {
         let inputs = decode_node_batch_py(buffer)?;
         with_engine(self, py, move |eng| eng.batch_upsert_nodes(&inputs))
     }
@@ -533,11 +640,7 @@ impl OverGraph {
     ///   per edge:
     ///     [from: u64][to: u64][type_id: u32][weight: f32]
     ///     [valid_from: i64][valid_to: i64][props_len: u32][props: json utf8]
-    fn batch_upsert_edges_binary(
-        &self,
-        py: Python<'_>,
-        buffer: &[u8],
-    ) -> PyResult<Vec<u64>> {
+    fn batch_upsert_edges_binary(&self, py: Python<'_>, buffer: &[u8]) -> PyResult<Vec<u64>> {
         let inputs = decode_edge_batch_py(buffer)?;
         with_engine(self, py, move |eng| eng.batch_upsert_edges(&inputs))
     }
@@ -614,6 +717,19 @@ impl OverGraph {
         })
     }
 
+    fn ingest_mode(&self, py: Python<'_>) -> PyResult<()> {
+        with_engine(self, py, |eng| {
+            eng.ingest_mode();
+            Ok(())
+        })
+    }
+
+    fn end_ingest(&self, py: Python<'_>) -> PyResult<Option<PyCompactionStats>> {
+        with_engine(self, py, |eng| {
+            Ok(eng.end_ingest()?.map(PyCompactionStats::from))
+        })
+    }
+
     fn compact(&self, py: Python<'_>) -> PyResult<Option<PyCompactionStats>> {
         with_engine(self, py, |eng| {
             Ok(eng.compact()?.map(PyCompactionStats::from))
@@ -633,7 +749,7 @@ impl OverGraph {
         // for callback invocations. Use a closure that acquires the GIL
         // only when calling the Python callback.
         let engine_result = py.allow_threads(move || {
-            let mut guard = inner.lock().map_err(lock_err)?;
+            let mut guard = inner.write().map_err(lock_err)?;
             let db = guard.as_mut().ok_or_else(closed_err)?;
             let result = db
                 .engine
@@ -671,7 +787,9 @@ impl OverGraph {
     ) -> PyResult<PyIdPageResult> {
         let page = PageRequest { limit, after };
         with_engine_ref(self, py, move |eng| {
-            Ok(PyIdPageResult::from(eng.nodes_by_type_paged(type_id, &page)?))
+            Ok(PyIdPageResult::from(
+                eng.nodes_by_type_paged(type_id, &page)?,
+            ))
         })
     }
 
@@ -685,7 +803,9 @@ impl OverGraph {
     ) -> PyResult<PyIdPageResult> {
         let page = PageRequest { limit, after };
         with_engine_ref(self, py, move |eng| {
-            Ok(PyIdPageResult::from(eng.edges_by_type_paged(type_id, &page)?))
+            Ok(PyIdPageResult::from(
+                eng.edges_by_type_paged(type_id, &page)?,
+            ))
         })
     }
 
@@ -756,9 +876,9 @@ impl OverGraph {
     ) -> PyResult<PyIdPageResult> {
         let page = PageRequest { limit, after };
         with_engine_ref(self, py, move |eng| {
-            Ok(PyIdPageResult::from(
-                eng.find_nodes_by_time_range_paged(type_id, from_ms, to_ms, &page)?,
-            ))
+            Ok(PyIdPageResult::from(eng.find_nodes_by_time_range_paged(
+                type_id, from_ms, to_ms, &page,
+            )?))
         })
     }
 
@@ -781,71 +901,11 @@ impl OverGraph {
             let result =
                 eng.neighbors_paged(node_id, dir, type_filter.as_deref(), &page, at_epoch, dl)?;
             Ok(PyNeighborPageResult {
-                items: result.items.into_iter().map(PyNeighborEntry::from).collect(),
-                next_cursor: result.next_cursor,
-            })
-        })
-    }
-
-    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, limit=None, after=None, at_epoch=None, decay_lambda=None))]
-    fn neighbors_2hop_paged(
-        &self,
-        py: Python<'_>,
-        node_id: u64,
-        direction: &str,
-        type_filter: Option<Vec<u32>>,
-        limit: Option<usize>,
-        after: Option<u64>,
-        at_epoch: Option<i64>,
-        decay_lambda: Option<f64>,
-    ) -> PyResult<PyNeighborPageResult> {
-        let dir = parse_direction(direction)?;
-        let dl = decay_lambda.map(|v| v as f32);
-        let page = PageRequest { limit, after };
-        with_engine_ref(self, py, move |eng| {
-            let result = eng.neighbors_2hop_paged(
-                node_id,
-                dir,
-                type_filter.as_deref(),
-                &page,
-                at_epoch,
-                dl,
-            )?;
-            Ok(PyNeighborPageResult {
-                items: result.items.into_iter().map(PyNeighborEntry::from).collect(),
-                next_cursor: result.next_cursor,
-            })
-        })
-    }
-
-    #[pyo3(signature = (node_id, direction="outgoing", traverse_edge_types=None, target_node_types=None, limit=None, after=None, at_epoch=None, decay_lambda=None))]
-    fn neighbors_2hop_constrained_paged(
-        &self,
-        py: Python<'_>,
-        node_id: u64,
-        direction: &str,
-        traverse_edge_types: Option<Vec<u32>>,
-        target_node_types: Option<Vec<u32>>,
-        limit: Option<usize>,
-        after: Option<u64>,
-        at_epoch: Option<i64>,
-        decay_lambda: Option<f64>,
-    ) -> PyResult<PyNeighborPageResult> {
-        let dir = parse_direction(direction)?;
-        let dl = decay_lambda.map(|v| v as f32);
-        let page = PageRequest { limit, after };
-        with_engine_ref(self, py, move |eng| {
-            let result = eng.neighbors_2hop_constrained_paged(
-                node_id,
-                dir,
-                traverse_edge_types.as_deref(),
-                target_node_types.as_deref(),
-                &page,
-                at_epoch,
-                dl,
-            )?;
-            Ok(PyNeighborPageResult {
-                items: result.items.into_iter().map(PyNeighborEntry::from).collect(),
+                items: result
+                    .items
+                    .into_iter()
+                    .map(PyNeighborEntry::from)
+                    .collect(),
                 next_cursor: result.next_cursor,
             })
         })
@@ -894,6 +954,52 @@ impl OverGraph {
         };
         with_engine_ref(self, py, move |eng| {
             Ok(PyAdjacencyExport::from(eng.export_adjacency(&options)?))
+        })
+    }
+
+    // --- Connected Components (Phase 18d) ---
+
+    /// Weakly connected components over the visible graph.
+    ///
+    /// Returns a dict mapping each visible node ID to its component ID
+    /// (the minimum node ID in that component). WCC treats all edges as
+    /// undirected. Isolated nodes become singleton components.
+    #[pyo3(signature = (edge_type_filter=None, node_type_filter=None, at_epoch=None))]
+    fn connected_components(
+        &self,
+        py: Python<'_>,
+        edge_type_filter: Option<Vec<u32>>,
+        node_type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> PyResult<NodeIdMap<u64>> {
+        with_engine_ref(self, py, move |eng| {
+            eng.connected_components(
+                edge_type_filter.as_deref(),
+                node_type_filter.as_deref(),
+                at_epoch,
+            )
+        })
+    }
+
+    /// Returns the sorted list of node IDs in the same weakly connected
+    /// component as the given node. Returns an empty list if the node
+    /// doesn't exist, is deleted, or is hidden by prune policy.
+    #[pyo3(signature = (node_id, edge_type_filter=None, node_type_filter=None, at_epoch=None))]
+    fn component_of(
+        &self,
+        py: Python<'_>,
+        node_id: u64,
+        edge_type_filter: Option<Vec<u32>>,
+        node_type_filter: Option<Vec<u32>>,
+        at_epoch: Option<i64>,
+    ) -> PyResult<Vec<u64>> {
+        with_engine_ref(self, py, move |eng| {
+            eng.component_of(
+                node_id,
+                edge_type_filter.as_deref(),
+                node_type_filter.as_deref(),
+                at_epoch,
+            )
         })
     }
 }
@@ -1107,6 +1213,118 @@ impl PyNeighborEntry {
         format!(
             "NeighborEntry(node_id={}, edge_id={}, type={})",
             self.node_id, self.edge_id, self.edge_type_id
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyTraversalHit {
+    #[pyo3(get)]
+    pub node_id: u64,
+    #[pyo3(get)]
+    pub depth: u32,
+    #[pyo3(get)]
+    pub via_edge_id: Option<u64>,
+    #[pyo3(get)]
+    pub score: Option<f64>,
+}
+
+impl From<TraversalHit> for PyTraversalHit {
+    fn from(hit: TraversalHit) -> Self {
+        PyTraversalHit {
+            node_id: hit.node_id,
+            depth: hit.depth,
+            via_edge_id: hit.via_edge_id,
+            score: hit.score,
+        }
+    }
+}
+
+#[pymethods]
+impl PyTraversalHit {
+    fn __repr__(&self) -> String {
+        format!(
+            "TraversalHit(node_id={}, depth={}, via_edge_id={:?})",
+            self.node_id, self.depth, self.via_edge_id
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyTraversalCursor {
+    #[pyo3(get)]
+    pub depth: u32,
+    #[pyo3(get)]
+    pub last_node_id: u64,
+}
+
+impl From<TraversalCursor> for PyTraversalCursor {
+    fn from(cursor: TraversalCursor) -> Self {
+        PyTraversalCursor {
+            depth: cursor.depth,
+            last_node_id: cursor.last_node_id,
+        }
+    }
+}
+
+impl From<PyTraversalCursor> for TraversalCursor {
+    fn from(cursor: PyTraversalCursor) -> Self {
+        TraversalCursor {
+            depth: cursor.depth,
+            last_node_id: cursor.last_node_id,
+        }
+    }
+}
+
+#[pymethods]
+impl PyTraversalCursor {
+    #[new]
+    fn new(depth: u32, last_node_id: u64) -> Self {
+        PyTraversalCursor {
+            depth,
+            last_node_id,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TraversalCursor(depth={}, last_node_id={})",
+            self.depth, self.last_node_id
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyShortestPath {
+    #[pyo3(get)]
+    pub nodes: Vec<u64>,
+    #[pyo3(get)]
+    pub edges: Vec<u64>,
+    #[pyo3(get)]
+    pub total_cost: f64,
+}
+
+impl From<ShortestPath> for PyShortestPath {
+    fn from(sp: ShortestPath) -> Self {
+        PyShortestPath {
+            nodes: sp.nodes,
+            edges: sp.edges,
+            total_cost: sp.total_cost,
+        }
+    }
+}
+
+#[pymethods]
+impl PyShortestPath {
+    fn __repr__(&self) -> String {
+        format!(
+            "ShortestPath(nodes={}, edges={}, cost={:.4})",
+            self.nodes.len(),
+            self.edges.len(),
+            self.total_cost
         )
     }
 }
@@ -1339,7 +1557,9 @@ impl IdArray {
         let len = self.ids.len() as isize;
         let i = if index < 0 { len + index } else { index };
         if i < 0 || i >= len {
-            Err(pyo3::exceptions::PyIndexError::new_err("index out of range"))
+            Err(pyo3::exceptions::PyIndexError::new_err(
+                "index out of range",
+            ))
         } else {
             Ok(self.ids[i as usize])
         }
@@ -1419,7 +1639,9 @@ pub struct PyIdPageResult {
 impl From<eg::PageResult<u64>> for PyIdPageResult {
     fn from(r: eg::PageResult<u64>) -> Self {
         PyIdPageResult {
-            items: IdArray { ids: Arc::new(r.items) },
+            items: IdArray {
+                ids: Arc::new(r.items),
+            },
             next_cursor: r.next_cursor,
         }
     }
@@ -1434,8 +1656,12 @@ impl PyIdPageResult {
             self.next_cursor.is_some()
         )
     }
-    fn __len__(&self) -> usize { self.items.ids.len() }
-    fn __bool__(&self) -> bool { !self.items.ids.is_empty() }
+    fn __len__(&self) -> usize {
+        self.items.ids.len()
+    }
+    fn __bool__(&self) -> bool {
+        !self.items.ids.is_empty()
+    }
 }
 
 #[pyclass]
@@ -1459,8 +1685,12 @@ impl PyNodePageResult {
             self.next_cursor.is_some()
         )
     }
-    fn __len__(&self) -> usize { self.items.len() }
-    fn __bool__(&self) -> bool { !self.items.is_empty() }
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+    fn __bool__(&self) -> bool {
+        !self.items.is_empty()
+    }
 }
 
 #[pyclass]
@@ -1484,8 +1714,12 @@ impl PyEdgePageResult {
             self.next_cursor.is_some()
         )
     }
-    fn __len__(&self) -> usize { self.items.len() }
-    fn __bool__(&self) -> bool { !self.items.is_empty() }
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+    fn __bool__(&self) -> bool {
+        !self.items.is_empty()
+    }
 }
 
 #[pyclass]
@@ -1509,8 +1743,57 @@ impl PyNeighborPageResult {
             self.next_cursor.is_some()
         )
     }
-    fn __len__(&self) -> usize { self.items.len() }
-    fn __bool__(&self) -> bool { !self.items.is_empty() }
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+    fn __bool__(&self) -> bool {
+        !self.items.is_empty()
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyTraversalPageResult {
+    items: Vec<PyTraversalHit>,
+    next_cursor: Option<PyTraversalCursor>,
+}
+
+impl From<TraversalPageResult> for PyTraversalPageResult {
+    fn from(result: TraversalPageResult) -> Self {
+        PyTraversalPageResult {
+            items: result.items.into_iter().map(PyTraversalHit::from).collect(),
+            next_cursor: result.next_cursor.map(PyTraversalCursor::from),
+        }
+    }
+}
+
+#[pymethods]
+impl PyTraversalPageResult {
+    #[getter]
+    fn items(&self) -> Vec<PyTraversalHit> {
+        self.items.clone()
+    }
+
+    #[getter]
+    fn next_cursor(&self) -> Option<PyTraversalCursor> {
+        self.next_cursor.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TraversalPageResult(count={}, has_next={})",
+            self.items.len(),
+            self.next_cursor.is_some()
+        )
+    }
+
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+
+    fn __bool__(&self) -> bool {
+        !self.items.is_empty()
+    }
 }
 
 // ============================================================
@@ -1666,8 +1949,10 @@ fn prop_value_to_py_obj(py: Python<'_>, v: &PropValue) -> PyResult<PyObject> {
         PropValue::String(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
         PropValue::Bytes(b) => Ok(PyBytes::new(py, b).into_any().unbind()),
         PropValue::Array(arr) => {
-            let items: PyResult<Vec<PyObject>> =
-                arr.iter().map(|item| prop_value_to_py_obj(py, item)).collect();
+            let items: PyResult<Vec<PyObject>> = arr
+                .iter()
+                .map(|item| prop_value_to_py_obj(py, item))
+                .collect();
             Ok(PyList::new(py, items?)?.into_any().unbind())
         }
         PropValue::Map(map) => {
@@ -2055,9 +2340,11 @@ fn json_to_prop_value(v: &serde_json::Value) -> eg::PropValue {
         serde_json::Value::Array(arr) => {
             eg::PropValue::Array(arr.iter().map(json_to_prop_value).collect())
         }
-        serde_json::Value::Object(map) => {
-            eg::PropValue::Map(map.iter().map(|(k, v)| (k.clone(), json_to_prop_value(v))).collect())
-        }
+        serde_json::Value::Object(map) => eg::PropValue::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_prop_value(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -2083,13 +2370,19 @@ fn decode_node_batch_py(buf: &[u8]) -> PyResult<Vec<NodeInput>> {
             let json: serde_json::Value = serde_json::from_slice(props_bytes)
                 .map_err(|e| PyValueError::new_err(format!("Invalid JSON in node props: {}", e)))?;
             match json {
-                serde_json::Value::Object(map) => {
-                    map.into_iter().map(|(k, v)| (k, json_to_prop_value(&v))).collect()
-                }
+                serde_json::Value::Object(map) => map
+                    .into_iter()
+                    .map(|(k, v)| (k, json_to_prop_value(&v)))
+                    .collect(),
                 _ => return Err(PyValueError::new_err("Node props must be a JSON object")),
             }
         };
-        inputs.push(NodeInput { type_id, key, props, weight });
+        inputs.push(NodeInput {
+            type_id,
+            key,
+            props,
+            weight,
+        });
     }
     if r.pos != buf.len() {
         return Err(PyValueError::new_err(format!(
@@ -2114,8 +2407,16 @@ fn decode_edge_batch_py(buf: &[u8]) -> PyResult<Vec<EdgeInput>> {
         let weight = r.read_f32_le()?;
         let valid_from_raw = r.read_i64_le()?;
         let valid_to_raw = r.read_i64_le()?;
-        let valid_from = if valid_from_raw == 0 { None } else { Some(valid_from_raw) };
-        let valid_to = if valid_to_raw == 0 { None } else { Some(valid_to_raw) };
+        let valid_from = if valid_from_raw == 0 {
+            None
+        } else {
+            Some(valid_from_raw)
+        };
+        let valid_to = if valid_to_raw == 0 {
+            None
+        } else {
+            Some(valid_to_raw)
+        };
         let props_len = r.read_u32_le()? as usize;
         let props = if props_len == 0 {
             BTreeMap::new()
@@ -2124,13 +2425,22 @@ fn decode_edge_batch_py(buf: &[u8]) -> PyResult<Vec<EdgeInput>> {
             let json: serde_json::Value = serde_json::from_slice(props_bytes)
                 .map_err(|e| PyValueError::new_err(format!("Invalid JSON in edge props: {}", e)))?;
             match json {
-                serde_json::Value::Object(map) => {
-                    map.into_iter().map(|(k, v)| (k, json_to_prop_value(&v))).collect()
-                }
+                serde_json::Value::Object(map) => map
+                    .into_iter()
+                    .map(|(k, v)| (k, json_to_prop_value(&v)))
+                    .collect(),
                 _ => return Err(PyValueError::new_err("Edge props must be a JSON object")),
             }
         };
-        inputs.push(EdgeInput { from, to, type_id, props, weight, valid_from, valid_to });
+        inputs.push(EdgeInput {
+            from,
+            to,
+            type_id,
+            props,
+            weight,
+            valid_from,
+            valid_to,
+        });
     }
     if r.pos != buf.len() {
         return Err(PyValueError::new_err(format!(
@@ -2154,6 +2464,9 @@ fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEdgeRecord>()?;
     m.add_class::<PyPatchResult>()?;
     m.add_class::<PyNeighborEntry>()?;
+    m.add_class::<PyTraversalHit>()?;
+    m.add_class::<PyTraversalCursor>()?;
+    m.add_class::<PyShortestPath>()?;
     m.add_class::<PySubgraph>()?;
     m.add_class::<PyPruneResult>()?;
     m.add_class::<PyNamedPrunePolicy>()?;
@@ -2164,6 +2477,7 @@ fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNodePageResult>()?;
     m.add_class::<PyEdgePageResult>()?;
     m.add_class::<PyNeighborPageResult>()?;
+    m.add_class::<PyTraversalPageResult>()?;
     m.add_class::<PyPprResult>()?;
     m.add_class::<PyExportEdge>()?;
     m.add_class::<PyAdjacencyExport>()?;

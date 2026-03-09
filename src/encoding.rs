@@ -129,8 +129,7 @@ fn read_str(cursor: &mut Cursor<&[u8]>) -> Result<String, EngineError> {
     cursor
         .read_exact(&mut buf)
         .map_err(|_| EngineError::CorruptRecord("unexpected EOF reading string".into()))?;
-    String::from_utf8(buf)
-        .map_err(|_| EngineError::CorruptRecord("invalid UTF-8 in string".into()))
+    String::from_utf8(buf).map_err(|_| EngineError::CorruptRecord("invalid UTF-8 in string".into()))
 }
 
 // --- Public API ---
@@ -406,6 +405,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_roundtrip_all_prop_types() {
         let mut props = BTreeMap::new();
         props.insert("null_val".to_string(), PropValue::Null);
@@ -535,13 +535,19 @@ mod tests {
     fn test_encode_wal_op_into_reuses_buffer() {
         let mut buf = Vec::new();
 
-        let op1 = WalOp::DeleteNode { id: 1, deleted_at: 1000 };
+        let op1 = WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 1000,
+        };
         encode_wal_op_into(&op1, &mut buf).unwrap();
         let ptr1 = buf.as_ptr();
         let cap1 = buf.capacity();
 
         // Second encode should reuse the same allocation
-        let op2 = WalOp::DeleteNode { id: 2, deleted_at: 2000 };
+        let op2 = WalOp::DeleteNode {
+            id: 2,
+            deleted_at: 2000,
+        };
         encode_wal_op_into(&op2, &mut buf).unwrap();
 
         // If capacity was sufficient, pointer should be the same (allocation reused)

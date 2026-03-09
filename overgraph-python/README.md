@@ -2,13 +2,8 @@
   <h1 align="center">OverGraph</h1>
   <p align="center">
     An absurdly fast embedded graph database.<br>
-    Pure Rust. Sub-microsecond reads. Native connectors for Node.js and Python.<br>
-    Built for AI agent memory, knowledge graphs, and analytics.
+    Pure Rust. Sub-microsecond reads. Native connectors for Node.js and Python.
   </p>
-</p>
-
-<p align="center">
-  <a href="https://overgraph.io">overgraph.io</a>
 </p>
 
 <p align="center">
@@ -181,7 +176,6 @@ async with await AsyncOverGraph.open("./my-graph") as db:
 - **Personalized PageRank.** Run PPR from seed nodes to find the most relevant nodes in the graph. Useful for context retrieval in RAG pipelines.
 - **Subgraph extraction.** Pull out a connected subgraph up to N hops deep. Good for building local context windows.
 - **Shortest path.** BFS (unweighted) or bidirectional Dijkstra (weighted). `is_connected` for fast reachability checks. `all_shortest_paths` when there are ties.
-- **Connected components.** `connected_components()` returns a global WCC labelling (union-find, near-linear). `component_of(node)` returns the members of a single node's component via BFS. Both support edge-type, node-type, and temporal filters.
 - **Degree counts.** Count edges, sum weights, and compute averages without materializing neighbor lists. Batch `degrees` for bulk analysis.
 - **Property search.** Find nodes by `type_id` + property equality. Hash-indexed for O(1) lookup.
 - **Time-range queries.** Find nodes created or updated within a time window. Sorted timestamp index for efficient range scans.

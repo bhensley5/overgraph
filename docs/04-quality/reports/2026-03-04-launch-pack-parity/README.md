@@ -1,5 +1,8 @@
 # Launch Benchmark Pack (2026-03-04)
 
+Historical naming note: this pack predates the API rename. `traverse_depth_2`
+was previously labeled `neighbors_2hop` (`traverse(start, min_depth=2, max_depth=2, ...)`).
+
 ## Scope
 - Profiles: `small` (10K nodes / 50K edges), `medium` (100K / 500K), `large` (1M / 5M)
 - Languages: Rust core, Node connector, Python connector
@@ -30,7 +33,7 @@
 | S-CRUD-005 | upsert_edge_fixed_triple | 0.625 | 2,310,670 |
 | S-MAIN-001 | flush | 183,861.625 | 9 |
 | S-TRAV-001 | neighbors | 2.125 | 541,287 |
-| S-TRAV-002 | neighbors_2hop | 175.958 | 6,885 |
+| S-TRAV-002 | traverse_depth_2 | 175.958 | 6,885 |
 
 ### Node (`connector-benchmark-v3-parity`)
 | Scenario ID | Scenario | p95 (us) | Throughput (ops/s) |
@@ -47,7 +50,7 @@
 | S-CRUD-005 | upsert_edge_fixed_triple | 0.709 | 1,549,607 |
 | S-MAIN-001 | flush | 164,769.458 | 9 |
 | S-TRAV-001 | neighbors | 5.667 | 324,488 |
-| S-TRAV-002 | neighbors_2hop | 153.458 | 7,121 |
+| S-TRAV-002 | traverse_depth_2 | 153.458 | 7,121 |
 
 ### Python (`connector-benchmark-v2-parity`)
 | Scenario ID | Scenario | p95 (us) | Throughput (ops/s) |
@@ -64,7 +67,7 @@
 | S-CRUD-005 | upsert_edge_fixed_triple | 0.667 | 1,477,023 |
 | S-MAIN-001 | flush | 162,101.791 | 9 |
 | S-TRAV-001 | neighbors | 6.042 | 204,515 |
-| S-TRAV-002 | neighbors_2hop | 167.917 | 6,767 |
+| S-TRAV-002 | traverse_depth_2 | 167.917 | 6,767 |
 
 ### Connector Overhead (small)
 | Scenario | Rust p95 (us) | Node p95 (us) | Node/Rust | Python p95 (us) | Py/Rust |
@@ -75,7 +78,7 @@
 | upsert_node | 2.209 | 3.375 | 1.53x | 2.458 | 1.11x |
 | upsert_edge | 2.583 | 2.584 | 1.00x | 2.667 | 1.03x |
 | neighbors | 2.125 | 5.667 | 2.67x | 6.042 | 2.84x |
-| neighbors_2hop | 175.958 | 153.458 | 0.87x | 167.917 | 0.95x |
+| traverse_depth_2 | 175.958 | 153.458 | 0.87x | 167.917 | 0.95x |
 | top_k_neighbors | 17.541 | 18.542 | 1.06x | 11.584 | 0.66x |
 | find_nodes_by_time_range | 134.667 | 141.416 | 1.05x | 187.792 | 1.39x |
 | personalized_pagerank | 254.500 | 250.042 | 0.98x | 301.584 | 1.19x |
@@ -102,7 +105,7 @@
 | S-CRUD-005 | upsert_edge_fixed_triple | 0.375 | 2,857,449 |
 | S-MAIN-001 | flush | 176,218.875 | 9 |
 | S-TRAV-001 | neighbors | 3.667 | 313,567 |
-| S-TRAV-002 | neighbors_2hop | 151.042 | 7,513 |
+| S-TRAV-002 | traverse_depth_2 | 151.042 | 7,513 |
 
 ### Node (`connector-benchmark-v3-parity`)
 | Scenario ID | Scenario | p95 (us) | Throughput (ops/s) |
@@ -119,7 +122,7 @@
 | S-CRUD-005 | upsert_edge_fixed_triple | 0.584 | 1,797,268 |
 | S-MAIN-001 | flush | 167,777.625 | 9 |
 | S-TRAV-001 | neighbors | 5.375 | 283,397 |
-| S-TRAV-002 | neighbors_2hop | 144.792 | 7,659 |
+| S-TRAV-002 | traverse_depth_2 | 144.792 | 7,659 |
 
 ### Python (`connector-benchmark-v2-parity`)
 | Scenario ID | Scenario | p95 (us) | Throughput (ops/s) |
@@ -136,7 +139,7 @@
 | S-CRUD-005 | upsert_edge_fixed_triple | 0.542 | 2,102,828 |
 | S-MAIN-001 | flush | 161,597.041 | 9 |
 | S-TRAV-001 | neighbors | 4.750 | 225,407 |
-| S-TRAV-002 | neighbors_2hop | 176.208 | 6,646 |
+| S-TRAV-002 | traverse_depth_2 | 176.208 | 6,646 |
 
 ### Connector Overhead (medium)
 | Scenario | Rust p95 (us) | Node p95 (us) | Node/Rust | Python p95 (us) | Py/Rust |
@@ -147,7 +150,7 @@
 | upsert_node | 2.250 | 3.458 | 1.54x | 2.583 | 1.15x |
 | upsert_edge | 2.791 | 2.666 | 0.96x | 1.416 | 0.51x |
 | neighbors | 3.667 | 5.375 | 1.47x | 4.750 | 1.30x |
-| neighbors_2hop | 151.042 | 144.792 | 0.96x | 176.208 | 1.17x |
+| traverse_depth_2 | 151.042 | 144.792 | 0.96x | 176.208 | 1.17x |
 | top_k_neighbors | 35.208 | 32.541 | 0.92x | 24.750 | 0.70x |
 | find_nodes_by_time_range | 257.250 | 257.250 | 1.00x | 378.125 | 1.47x |
 | personalized_pagerank | 420.333 | 432.041 | 1.03x | 537.542 | 1.28x |
@@ -174,7 +177,7 @@
 | S-CRUD-005 | upsert_edge_fixed_triple | 0.417 | 2,659,840 |
 | S-MAIN-001 | flush | 175,853.541 | 9 |
 | S-TRAV-001 | neighbors | 2.458 | 465,918 |
-| S-TRAV-002 | neighbors_2hop | 141.625 | 7,879 |
+| S-TRAV-002 | traverse_depth_2 | 141.625 | 7,879 |
 
 ### Node (`connector-benchmark-v3-parity`)
 | Scenario ID | Scenario | p95 (us) | Throughput (ops/s) |
@@ -191,7 +194,7 @@
 | S-CRUD-005 | upsert_edge_fixed_triple | 0.542 | 1,889,823 |
 | S-MAIN-001 | flush | 179,141.042 | 9 |
 | S-TRAV-001 | neighbors | 4.542 | 297,121 |
-| S-TRAV-002 | neighbors_2hop | 150.125 | 7,463 |
+| S-TRAV-002 | traverse_depth_2 | 150.125 | 7,463 |
 
 ### Python (`connector-benchmark-v2-parity`)
 | Scenario ID | Scenario | p95 (us) | Throughput (ops/s) |
@@ -208,7 +211,7 @@
 | S-CRUD-005 | upsert_edge_fixed_triple | 0.500 | 2,261,740 |
 | S-MAIN-001 | flush | 162,210.750 | 9 |
 | S-TRAV-001 | neighbors | 4.584 | 230,934 |
-| S-TRAV-002 | neighbors_2hop | 152.417 | 7,207 |
+| S-TRAV-002 | traverse_depth_2 | 152.417 | 7,207 |
 
 ### Connector Overhead (large)
 | Scenario | Rust p95 (us) | Node p95 (us) | Node/Rust | Python p95 (us) | Py/Rust |
@@ -219,7 +222,7 @@
 | upsert_node | 2.000 | 4.000 | 2.00x | 2.583 | 1.29x |
 | upsert_edge | 2.125 | 3.000 | 1.41x | 1.333 | 0.63x |
 | neighbors | 2.458 | 4.542 | 1.85x | 4.584 | 1.86x |
-| neighbors_2hop | 141.625 | 150.125 | 1.06x | 152.417 | 1.08x |
+| traverse_depth_2 | 141.625 | 150.125 | 1.06x | 152.417 | 1.08x |
 | top_k_neighbors | 265.333 | 263.334 | 0.99x | 237.666 | 0.90x |
 | find_nodes_by_time_range | 608.834 | 630.667 | 1.04x | 1,234.792 | 2.03x |
 | personalized_pagerank | 4,321.250 | 3,987.208 | 0.92x | 5,472.542 | 1.27x |

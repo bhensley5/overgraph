@@ -100,25 +100,42 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
     assert_eq!(node_new.key, "node:10000");
 
     // 3. Neighbors from segment: node[500] should have chain + cross-link edges
-    let out_500 = engine.neighbors(node_ids[500], Direction::Outgoing, None, 0, None, None).unwrap();
+    let out_500 = engine
+        .neighbors(node_ids[500], Direction::Outgoing, None, 0, None, None)
+        .unwrap();
     assert!(out_500.len() >= 2); // at least chain(→501) + cross-link(→600)
 
     // 4. Type-filtered neighbors from segment
-    let chain_only = engine.neighbors(node_ids[500], Direction::Outgoing, Some(&[10]), 0, None, None).unwrap();
+    let chain_only = engine
+        .neighbors(
+            node_ids[500],
+            Direction::Outgoing,
+            Some(&[10]),
+            0,
+            None,
+            None,
+        )
+        .unwrap();
     assert_eq!(chain_only.len(), 1); // only the chain edge
 
     // 5. Cross-source neighbors: new node → old node (memtable edge, segment target)
-    let cross = engine.neighbors(new_ids[0], Direction::Outgoing, None, 0, None, None).unwrap();
+    let cross = engine
+        .neighbors(new_ids[0], Direction::Outgoing, None, 0, None, None)
+        .unwrap();
     assert!(!cross.is_empty());
     // The target node should be from the segment
     assert!(engine.get_node(cross[0].node_id).unwrap().is_some());
 
     // 6. Incoming neighbors on a segment node that has cross-source incoming edges
-    let inc = engine.neighbors(node_ids[0], Direction::Incoming, None, 0, None, None).unwrap();
+    let inc = engine
+        .neighbors(node_ids[0], Direction::Incoming, None, 0, None, None)
+        .unwrap();
     assert!(!inc.is_empty()); // has chain from node[9999]→node[0] or cross-links
 
     // 7. Limit works across sources
-    let limited = engine.neighbors(node_ids[0], Direction::Outgoing, None, 1, None, None).unwrap();
+    let limited = engine
+        .neighbors(node_ids[0], Direction::Outgoing, None, 1, None, None)
+        .unwrap();
     assert_eq!(limited.len(), 1);
 
     engine.close().unwrap();
@@ -139,17 +156,30 @@ fn test_flush_close_reopen_reads_from_segments() {
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Build a small graph
-        node_a = engine.upsert_node(1, "alice", {
-            let mut p = BTreeMap::new();
-            p.insert("role".to_string(), PropValue::String("admin".to_string()));
-            p
-        }, 0.9).unwrap();
+        node_a = engine
+            .upsert_node(
+                1,
+                "alice",
+                {
+                    let mut p = BTreeMap::new();
+                    p.insert("role".to_string(), PropValue::String("admin".to_string()));
+                    p
+                },
+                0.9,
+            )
+            .unwrap();
 
         node_b = engine.upsert_node(1, "bob", BTreeMap::new(), 0.5).unwrap();
-        node_c = engine.upsert_node(2, "charlie", BTreeMap::new(), 0.6).unwrap();
+        node_c = engine
+            .upsert_node(2, "charlie", BTreeMap::new(), 0.6)
+            .unwrap();
 
-        edge_ab = engine.upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        edge_bc = engine.upsert_edge(node_b, node_c, 10, BTreeMap::new(), 0.8, None, None).unwrap();
+        edge_ab = engine
+            .upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None)
+            .unwrap();
+        edge_bc = engine
+            .upsert_edge(node_b, node_c, 10, BTreeMap::new(), 0.8, None, None)
+            .unwrap();
 
         // Delete charlie and his edge
         engine.delete_node(node_c).unwrap();
@@ -172,7 +202,10 @@ fn test_flush_close_reopen_reads_from_segments() {
         // Segment data accessible
         let alice = engine.get_node(node_a).unwrap().unwrap();
         assert_eq!(alice.key, "alice");
-        assert_eq!(alice.props.get("role"), Some(&PropValue::String("admin".to_string())));
+        assert_eq!(
+            alice.props.get("role"),
+            Some(&PropValue::String("admin".to_string()))
+        );
 
         let bob = engine.get_node(node_b).unwrap().unwrap();
         assert_eq!(bob.key, "bob");
@@ -186,17 +219,23 @@ fn test_flush_close_reopen_reads_from_segments() {
         assert!(engine.get_edge(edge_bc).unwrap().is_none());
 
         // Neighbors work from segment
-        let out_a = engine.neighbors(node_a, Direction::Outgoing, None, 0, None, None).unwrap();
+        let out_a = engine
+            .neighbors(node_a, Direction::Outgoing, None, 0, None, None)
+            .unwrap();
         assert_eq!(out_a.len(), 1);
         assert_eq!(out_a[0].node_id, node_b);
 
         // Deleted node excluded from incoming
-        let inc_b = engine.neighbors(node_b, Direction::Incoming, None, 0, None, None).unwrap();
+        let inc_b = engine
+            .neighbors(node_b, Direction::Incoming, None, 0, None, None)
+            .unwrap();
         assert_eq!(inc_b.len(), 1);
         assert_eq!(inc_b[0].node_id, node_a);
 
         // Post-flush WAL data recovered via WAL replay
-        let dave = engine.get_node(node_a + 3).unwrap()
+        let dave = engine
+            .get_node(node_a + 3)
+            .unwrap()
             .expect("dave not found, WAL replay after flush failed");
         assert_eq!(dave.key, "dave");
 
@@ -217,18 +256,28 @@ fn test_multi_segment_survives_reopen() {
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Segment 1
-        id_a = engine.upsert_node(1, "alpha", BTreeMap::new(), 0.5).unwrap();
-        engine.upsert_edge(id_a, id_a, 10, BTreeMap::new(), 1.0, None, None).unwrap(); // self-loop
+        id_a = engine
+            .upsert_node(1, "alpha", BTreeMap::new(), 0.5)
+            .unwrap();
+        engine
+            .upsert_edge(id_a, id_a, 10, BTreeMap::new(), 1.0, None, None)
+            .unwrap(); // self-loop
         engine.flush().unwrap();
 
         // Segment 2
         id_b = engine.upsert_node(1, "beta", BTreeMap::new(), 0.6).unwrap();
-        engine.upsert_edge(id_a, id_b, 10, BTreeMap::new(), 0.9, None, None).unwrap();
+        engine
+            .upsert_edge(id_a, id_b, 10, BTreeMap::new(), 0.9, None, None)
+            .unwrap();
         engine.flush().unwrap();
 
         // Memtable (will be WAL on reopen)
-        id_c = engine.upsert_node(1, "gamma", BTreeMap::new(), 0.7).unwrap();
-        engine.upsert_edge(id_b, id_c, 20, BTreeMap::new(), 0.8, None, None).unwrap();
+        id_c = engine
+            .upsert_node(1, "gamma", BTreeMap::new(), 0.7)
+            .unwrap();
+        engine
+            .upsert_edge(id_b, id_c, 20, BTreeMap::new(), 0.8, None, None)
+            .unwrap();
 
         assert_eq!(engine.segment_count(), 2);
         engine.close().unwrap();
@@ -240,14 +289,18 @@ fn test_multi_segment_survives_reopen() {
 
         // All three nodes from different sources
         assert_eq!(engine.get_node(id_a).unwrap().unwrap().key, "alpha"); // seg 1
-        assert_eq!(engine.get_node(id_b).unwrap().unwrap().key, "beta");  // seg 2
+        assert_eq!(engine.get_node(id_b).unwrap().unwrap().key, "beta"); // seg 2
         assert_eq!(engine.get_node(id_c).unwrap().unwrap().key, "gamma"); // WAL replay
 
         // Neighbors merge across all three sources
-        let out_a = engine.neighbors(id_a, Direction::Outgoing, None, 0, None, None).unwrap();
+        let out_a = engine
+            .neighbors(id_a, Direction::Outgoing, None, 0, None, None)
+            .unwrap();
         assert_eq!(out_a.len(), 2); // self-loop (seg1) + a→b (seg2)
 
-        let out_b = engine.neighbors(id_b, Direction::Outgoing, None, 0, None, None).unwrap();
+        let out_b = engine
+            .neighbors(id_b, Direction::Outgoing, None, 0, None, None)
+            .unwrap();
         assert_eq!(out_b.len(), 1); // b→c (WAL)
         assert_eq!(out_b[0].node_id, id_c);
 

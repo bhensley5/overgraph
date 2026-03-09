@@ -1,5 +1,68 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
+
+// ---------------------------------------------------------------------------
+// Identity hasher for engine-generated u64 IDs (node IDs, edge IDs).
+//
+// Engine IDs are monotonically assigned u64 values — they are never
+// adversarial, never strings, and never externally controlled. An identity
+// hash (hash(x) = x) eliminates the ~12ns-per-key SipHash overhead that
+// the default HashMap hasher imposes, giving 10-20x faster lookups and
+// inserts on ID-keyed maps.
+//
+// `NodeIdMap<V>` is the public type alias users see in return positions.
+// Internally the engine also uses `IdMap<V>` / `IdSet` (private aliases
+// over the same hasher) for transient working sets.
+// ---------------------------------------------------------------------------
+
+/// Identity hasher for engine-generated numeric IDs. Use [`NodeIdMap<V>`]
+/// instead of referencing this type directly.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct NodeIdHasher(u64);
+
+impl Hasher for NodeIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut value = 0u64;
+        for (index, byte) in bytes.iter().take(8).enumerate() {
+            value |= (*byte as u64) << (index * 8);
+        }
+        self.0 = value;
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = i as u64;
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = i as u64;
+    }
+}
+
+/// Build-hasher for [`NodeIdHasher`]. Use [`NodeIdMap<V>`] instead.
+#[doc(hidden)]
+pub type NodeIdBuildHasher = BuildHasherDefault<NodeIdHasher>;
+
+/// A `HashMap` keyed by node or edge ID with identity hashing.
+///
+/// Returned by graph APIs that produce per-node result maps
+/// (`connected_components`, `degrees`, `neighbors_batch`). Supports all
+/// normal `HashMap` operations — iteration, indexing, `get`, `contains_key`,
+/// etc.
+pub type NodeIdMap<V> = HashMap<u64, V, NodeIdBuildHasher>;
 
 /// Property value types supported in node/edge properties.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -308,6 +371,39 @@ pub struct NeighborEntry {
     pub valid_to: i64,
 }
 
+/// A single BFS traversal hit emitted by `traverse()`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraversalHit {
+    /// The discovered node ID.
+    pub node_id: u64,
+    /// Minimum hop distance from the start node.
+    pub depth: u32,
+    /// The deterministically chosen edge for this node's minimum-hop layer, or
+    /// `None` for the start node. When multiple same-depth candidates exist,
+    /// traversal breaks ties by `(source_node_id, edge_id)`.
+    pub via_edge_id: Option<u64>,
+    /// Optional decay-derived score for the hit.
+    pub score: Option<f64>,
+}
+
+/// Cursor for `traverse()` pagination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraversalCursor {
+    /// Depth of the last emitted hit.
+    pub depth: u32,
+    /// Node ID of the last emitted hit.
+    pub last_node_id: u64,
+}
+
+/// Result page for traversal queries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraversalPageResult {
+    /// The items for this page.
+    pub items: Vec<TraversalHit>,
+    /// Cursor for the next page, or `None` if this is the last page.
+    pub next_cursor: Option<TraversalCursor>,
+}
+
 /// Scoring mode for top-k neighbor queries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScoringMode {
@@ -318,6 +414,18 @@ pub enum ScoringMode {
     /// Decay-adjusted: `weight * exp(-lambda * age_hours)` where
     /// `age_hours = (reference_time - valid_from) / 3_600_000`.
     DecayAdjusted { lambda: f32 },
+}
+
+/// A shortest path result: ordered sequence of nodes and edges with total cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShortestPath {
+    /// Ordered node IDs along the path: `[from, ..., to]`.
+    pub nodes: Vec<u64>,
+    /// Edge IDs connecting consecutive nodes. `edges.len() == nodes.len() - 1`
+    /// (empty when `from == to`).
+    pub edges: Vec<u64>,
+    /// Total path cost: hop count for BFS, sum of weights for Dijkstra.
+    pub total_cost: f64,
 }
 
 /// An extracted subgraph: all nodes and edges reachable within N hops of a starting node.
@@ -425,8 +533,8 @@ impl Default for WalSyncMode {
     fn default() -> Self {
         WalSyncMode::GroupCommit {
             interval_ms: 10,
-            soft_trigger_bytes: 4 * 1024 * 1024,   // 4 MB
-            hard_cap_bytes: 16 * 1024 * 1024,       // 16 MB
+            soft_trigger_bytes: 4 * 1024 * 1024, // 4 MB
+            hard_cap_bytes: 16 * 1024 * 1024,    // 16 MB
         }
     }
 }
@@ -453,11 +561,11 @@ impl Default for DbOptions {
     fn default() -> Self {
         DbOptions {
             create_if_missing: true,
-            memtable_flush_threshold: 32 * 1024 * 1024, // 32MB
+            memtable_flush_threshold: 64 * 1024 * 1024, // 64MB
             edge_uniqueness: false,
-            compact_after_n_flushes: 5,
+            compact_after_n_flushes: 3,
             wal_sync_mode: WalSyncMode::default(),
-            memtable_hard_cap_bytes: 64 * 1024 * 1024, // 64MB (2x flush threshold)
+            memtable_hard_cap_bytes: 128 * 1024 * 1024, // 128MB (2x flush threshold)
         }
     }
 }
@@ -469,15 +577,18 @@ mod tests {
     fn test_default_db_options() {
         let opts = DbOptions::default();
         assert!(opts.create_if_missing);
-        assert_eq!(opts.memtable_flush_threshold, 32 * 1024 * 1024);
+        assert_eq!(opts.memtable_flush_threshold, 64 * 1024 * 1024);
         assert!(!opts.edge_uniqueness);
-        assert_eq!(opts.compact_after_n_flushes, 5);
-        assert!(matches!(opts.wal_sync_mode, WalSyncMode::GroupCommit {
-            interval_ms: 10,
-            soft_trigger_bytes: 4194304,
-            hard_cap_bytes: 16777216,
-        }));
-        assert_eq!(opts.memtable_hard_cap_bytes, 64 * 1024 * 1024);
+        assert_eq!(opts.compact_after_n_flushes, 3);
+        assert!(matches!(
+            opts.wal_sync_mode,
+            WalSyncMode::GroupCommit {
+                interval_ms: 10,
+                soft_trigger_bytes: 4194304,
+                hard_cap_bytes: 16777216,
+            }
+        ));
+        assert_eq!(opts.memtable_hard_cap_bytes, 128 * 1024 * 1024);
     }
 
     #[test]
@@ -505,11 +616,15 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_prop_value_map_msgpack_roundtrip() {
         let mut inner = BTreeMap::new();
         inner.insert("x".to_string(), PropValue::Float(3.14));
         inner.insert("label".to_string(), PropValue::String("hello".into()));
-        inner.insert("items".to_string(), PropValue::Array(vec![PropValue::Int(1), PropValue::Int(2)]));
+        inner.insert(
+            "items".to_string(),
+            PropValue::Array(vec![PropValue::Int(1), PropValue::Int(2)]),
+        );
         let mut nested = BTreeMap::new();
         nested.insert("deep".to_string(), PropValue::Bool(false));
         inner.insert("child".to_string(), PropValue::Map(nested));
@@ -560,8 +675,16 @@ mod tests {
         let state = ManifestState {
             version: 1,
             segments: vec![
-                SegmentInfo { id: 1, node_count: 100, edge_count: 200 },
-                SegmentInfo { id: 2, node_count: 50, edge_count: 75 },
+                SegmentInfo {
+                    id: 1,
+                    node_count: 100,
+                    edge_count: 200,
+                },
+                SegmentInfo {
+                    id: 2,
+                    node_count: 50,
+                    edge_count: 75,
+                },
             ],
             next_node_id: 151,
             next_edge_id: 276,

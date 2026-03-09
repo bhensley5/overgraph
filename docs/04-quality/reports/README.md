@@ -21,6 +21,10 @@ Additional report assets:
 - `2026-03-04-launch-pack-parity/`: parity-hardened refresh with cross-language comparability validation.
 - `baselines/`: accepted baseline JSON files for regression checks.
 
+Historical naming note:
+- Pre-Phase 18c benchmark artifacts may label `S-TRAV-002` as `neighbors_2hop`.
+- That scenario now maps to `traverse_depth_2`, meaning `traverse(start, min_depth=2, max_depth=2, ...)`.
+
 Regression comparison outputs are typically stored alongside runs or under:
 
 `docs/04-quality/reports/<pack-or-run>/compare*/`

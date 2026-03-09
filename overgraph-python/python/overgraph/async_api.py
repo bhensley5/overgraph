@@ -24,7 +24,11 @@ from .overgraph import (
     PyPprResult,
     PyPruneResult,
     PySegmentInfo,
+    PyShortestPath,
     PySubgraph,
+    PyTraversalCursor,
+    PyTraversalHit,
+    PyTraversalPageResult,
 )
 
 
@@ -169,33 +173,31 @@ class AsyncOverGraph:
             self._db.neighbors, node_id, direction, type_filter, limit, at_epoch, decay_lambda
         )
 
-    async def neighbors_2hop(
+    async def traverse(
         self,
-        node_id: int,
+        start: int,
+        min_depth: int = 0,
+        max_depth: int = 2,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
-        limit: int | None = None,
+        edge_type_filter: list[int] | None = None,
+        node_type_filter: list[int] | None = None,
         at_epoch: int | None = None,
         decay_lambda: float | None = None,
-    ) -> list[PyNeighborEntry]:
-        return await asyncio.to_thread(
-            self._db.neighbors_2hop, node_id, direction, type_filter, limit, at_epoch, decay_lambda
-        )
-
-    async def neighbors_2hop_constrained(
-        self,
-        node_id: int,
-        direction: str = "outgoing",
-        traverse_edge_types: list[int] | None = None,
-        target_node_types: list[int] | None = None,
         limit: int | None = None,
-        at_epoch: int | None = None,
-        decay_lambda: float | None = None,
-    ) -> list[PyNeighborEntry]:
+        cursor: PyTraversalCursor | None = None,
+    ) -> PyTraversalPageResult:
         return await asyncio.to_thread(
-            self._db.neighbors_2hop_constrained,
-            node_id, direction, traverse_edge_types, target_node_types,
-            limit, at_epoch, decay_lambda,
+            self._db.traverse,
+            start,
+            min_depth,
+            max_depth,
+            direction,
+            edge_type_filter,
+            node_type_filter,
+            at_epoch,
+            decay_lambda,
+            limit,
+            cursor,
         )
 
     async def neighbors_batch(
@@ -208,6 +210,99 @@ class AsyncOverGraph:
     ) -> dict[int, list[PyNeighborEntry]]:
         return await asyncio.to_thread(
             self._db.neighbors_batch, node_ids, direction, type_filter, at_epoch, decay_lambda
+        )
+
+    async def degree(
+        self,
+        node_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> int:
+        return await asyncio.to_thread(
+            self._db.degree, node_id, direction, type_filter, at_epoch
+        )
+
+    async def sum_edge_weights(
+        self,
+        node_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> float:
+        return await asyncio.to_thread(
+            self._db.sum_edge_weights, node_id, direction, type_filter, at_epoch
+        )
+
+    async def avg_edge_weight(
+        self,
+        node_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> float | None:
+        return await asyncio.to_thread(
+            self._db.avg_edge_weight, node_id, direction, type_filter, at_epoch
+        )
+
+    async def degrees(
+        self,
+        node_ids: list[int],
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> dict[int, int]:
+        return await asyncio.to_thread(
+            self._db.degrees, node_ids, direction, type_filter, at_epoch
+        )
+
+    async def shortest_path(
+        self,
+        from_id: int,
+        to_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        weight_field: str | None = None,
+        at_epoch: int | None = None,
+        max_depth: int | None = None,
+        max_cost: float | None = None,
+    ) -> PyShortestPath | None:
+        return await asyncio.to_thread(
+            self._db.shortest_path,
+            from_id, to_id, direction, type_filter, weight_field,
+            at_epoch, max_depth, max_cost,
+        )
+
+    async def is_connected(
+        self,
+        from_id: int,
+        to_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+        max_depth: int | None = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._db.is_connected,
+            from_id, to_id, direction, type_filter, at_epoch, max_depth,
+        )
+
+    async def all_shortest_paths(
+        self,
+        from_id: int,
+        to_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        weight_field: str | None = None,
+        at_epoch: int | None = None,
+        max_depth: int | None = None,
+        max_cost: float | None = None,
+        max_paths: int | None = None,
+    ) -> list[PyShortestPath]:
+        return await asyncio.to_thread(
+            self._db.all_shortest_paths,
+            from_id, to_id, direction, type_filter, weight_field,
+            at_epoch, max_depth, max_cost, max_paths,
         )
 
     async def batch_upsert_nodes_binary(self, buffer: bytes) -> list[int]:
@@ -276,6 +371,12 @@ class AsyncOverGraph:
 
     async def flush(self) -> PySegmentInfo | None:
         return await asyncio.to_thread(self._db.flush)
+
+    async def ingest_mode(self) -> None:
+        return await asyncio.to_thread(self._db.ingest_mode)
+
+    async def end_ingest(self) -> PyCompactionStats | None:
+        return await asyncio.to_thread(self._db.end_ingest)
 
     async def compact(self) -> PyCompactionStats | None:
         return await asyncio.to_thread(self._db.compact)
@@ -346,38 +447,6 @@ class AsyncOverGraph:
             node_id, direction, type_filter, limit, after, at_epoch, decay_lambda,
         )
 
-    async def neighbors_2hop_paged(
-        self,
-        node_id: int,
-        direction: str = "outgoing",
-        type_filter: list[int] | None = None,
-        limit: int | None = None,
-        after: int | None = None,
-        at_epoch: int | None = None,
-        decay_lambda: float | None = None,
-    ) -> PyNeighborPageResult:
-        return await asyncio.to_thread(
-            self._db.neighbors_2hop_paged,
-            node_id, direction, type_filter, limit, after, at_epoch, decay_lambda,
-        )
-
-    async def neighbors_2hop_constrained_paged(
-        self,
-        node_id: int,
-        direction: str = "outgoing",
-        traverse_edge_types: list[int] | None = None,
-        target_node_types: list[int] | None = None,
-        limit: int | None = None,
-        after: int | None = None,
-        at_epoch: int | None = None,
-        decay_lambda: float | None = None,
-    ) -> PyNeighborPageResult:
-        return await asyncio.to_thread(
-            self._db.neighbors_2hop_constrained_paged,
-            node_id, direction, traverse_edge_types, target_node_types,
-            limit, after, at_epoch, decay_lambda,
-        )
-
     # --- Analytics ---
 
     async def personalized_pagerank(
@@ -403,4 +472,25 @@ class AsyncOverGraph:
     ) -> PyAdjacencyExport:
         return await asyncio.to_thread(
             self._db.export_adjacency, node_type_filter, edge_type_filter, include_weights
+        )
+
+    async def connected_components(
+        self,
+        edge_type_filter: list[int] | None = None,
+        node_type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> dict[int, int]:
+        return await asyncio.to_thread(
+            self._db.connected_components, edge_type_filter, node_type_filter, at_epoch
+        )
+
+    async def component_of(
+        self,
+        node_id: int,
+        edge_type_filter: list[int] | None = None,
+        node_type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> list[int]:
+        return await asyncio.to_thread(
+            self._db.component_of, node_id, edge_type_filter, node_type_filter, at_epoch
         )
