@@ -11,7 +11,11 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     let db_path = dir.path().join("testdb");
 
     // ---- Step 1: Build initial data, flush to segment 1 ----
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let opts = DbOptions {
+        compact_after_n_flushes: 0,
+        ..DbOptions::default()
+    };
+    let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let mut all_node_ids = Vec::new();
 
@@ -22,10 +26,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
             let type_id = (i % 5) as u32 + 1;
             let cat = categories[i % 5];
             let mut props = BTreeMap::new();
-            props.insert(
-                "category".to_string(),
-                PropValue::String(cat.to_string()),
-            );
+            props.insert("category".to_string(), PropValue::String(cat.to_string()));
             props.insert("index".to_string(), PropValue::Int(i as i64));
             NodeInput {
                 type_id,
@@ -42,7 +43,15 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     for i in 0..499 {
         if batch1[i].type_id == batch1[i + 1].type_id {
             engine
-                .upsert_edge(ids1[i], ids1[i + 1], batch1[i].type_id, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(
+                    ids1[i],
+                    ids1[i + 1],
+                    batch1[i].type_id,
+                    BTreeMap::new(),
+                    1.0,
+                    None,
+                    None,
+                )
                 .unwrap();
         }
     }
@@ -57,10 +66,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
             let type_id = (i % 5) as u32 + 1;
             let cat = categories[i % 5];
             let mut props = BTreeMap::new();
-            props.insert(
-                "category".to_string(),
-                PropValue::String(cat.to_string()),
-            );
+            props.insert("category".to_string(), PropValue::String(cat.to_string()));
             props.insert("index".to_string(), PropValue::Int(i as i64));
             // Add a "status" property to even-indexed nodes
             if i % 2 == 0 {
@@ -102,11 +108,9 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     // Type 1 has category="alpha", type 2 has "beta", etc.
     for (idx, cat) in categories.iter().enumerate() {
         let type_id = idx as u32 + 1;
-        let found = engine.find_nodes(
-            type_id,
-            "category",
-            &PropValue::String(cat.to_string()),
-        ).unwrap();
+        let found = engine
+            .find_nodes(type_id, "category", &PropValue::String(cat.to_string()))
+            .unwrap();
         assert_eq!(
             found.len(),
             200,
@@ -120,11 +124,9 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     // find_nodes with status=active: 250 nodes (500..1000 step 2 = 250),
     // distributed across 5 types = 50 per type
     for type_id in 1..=5u32 {
-        let active = engine.find_nodes(
-            type_id,
-            "status",
-            &PropValue::String("active".to_string()),
-        ).unwrap();
+        let active = engine
+            .find_nodes(type_id, "status", &PropValue::String("active".to_string()))
+            .unwrap();
         assert_eq!(
             active.len(),
             50,
@@ -168,11 +170,9 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     // find_nodes by category after compaction
     for (idx, cat) in categories.iter().enumerate() {
         let type_id = idx as u32 + 1;
-        let found = engine.find_nodes(
-            type_id,
-            "category",
-            &PropValue::String(cat.to_string()),
-        ).unwrap();
+        let found = engine
+            .find_nodes(type_id, "category", &PropValue::String(cat.to_string()))
+            .unwrap();
         assert_eq!(
             found.len(),
             180,
@@ -186,11 +186,9 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     // Active status nodes: the first 100 deleted were all from batch1 (0..500),
     // which had no "status" property. So all 250 active nodes should survive.
     for type_id in 1..=5u32 {
-        let active = engine.find_nodes(
-            type_id,
-            "status",
-            &PropValue::String("active".to_string()),
-        ).unwrap();
+        let active = engine
+            .find_nodes(type_id, "status", &PropValue::String("active".to_string()))
+            .unwrap();
         assert_eq!(
             active.len(),
             50,
@@ -217,11 +215,9 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
 
     for (idx, cat) in categories.iter().enumerate() {
         let type_id = idx as u32 + 1;
-        let found = engine.find_nodes(
-            type_id,
-            "category",
-            &PropValue::String(cat.to_string()),
-        ).unwrap();
+        let found = engine
+            .find_nodes(type_id, "category", &PropValue::String(cat.to_string()))
+            .unwrap();
         assert_eq!(
             found.len(),
             180,

@@ -57,7 +57,7 @@ Reads check multiple sources and merge them:
 1. **Memtable** (freshest data, always checked first)
 2. **Immutable segments** (scanned newest to oldest)
 
-For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we stop at the first source that has the record. For collection queries (`neighbors`, `find_nodes`, `nodes_by_type`), we merge results from all sources using a K-way merge with a min-heap.
+For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we stop at the first source that has the record. For collection queries (`neighbors`, `find_nodes`, `nodes_by_type`), we merge results from all sources using a K-way merge with a min-heap. For aggregation queries (`degree`, `sum_edge_weights`, `avg_edge_weight`), we walk adjacency postings with a callback instead of materializing results, counting and accumulating in-place.
 
 Tombstones (from `delete_node` / `delete_edge`) are applied during the merge. Prune policies are also evaluated at read time, so a registered policy takes effect immediately without waiting for compaction.
 
@@ -102,9 +102,32 @@ The adjacency index is the core structure that makes graph traversal fast. For e
 
 Looking up neighbors is a binary search in the index followed by a sequential scan of the postings. This is why neighbor lookups are ~2μs even with thousands of edges per node.
 
+### Degree counts and aggregations
+
+Sometimes you just need "how many edges does this node have?" or "what's the total weight?" without materializing the full neighbor list. The `degree()`, `sum_edge_weights()`, and `avg_edge_weight()` methods use a callback-based iteration over adjacency postings: they decode each posting to extract the edge ID (for dedup across sources) and weight (for aggregation), but never allocate a `Vec<NeighborEntry>`. The only allocation is a `HashSet<u64>` for edge dedup.
+
+This means `degree()` costs O(postings) time with O(unique edges) memory, regardless of how many neighbors a node has. Weight is embedded directly in the adjacency postings (as f32), so aggregations come free during the same decode pass without edge record hydration.
+
+When prune policies are active, the degree methods track per-neighbor-id stats during the walk, then batch-check neighbor IDs against policies and subtract excluded neighbors. Same pattern as `neighbors()`, same consistency guarantees.
+
+### Shortest path algorithms
+
+`shortest_path()`, `is_connected()`, and `all_shortest_paths()` use bidirectional search to minimize the explored frontier. Both endpoints are known, so expanding from both sides cuts the search space from O(b^d) to O(b^(d/2)).
+
+- **BFS** (when `weight_field` is `None`): Two frontiers expand alternately, always picking the smaller one. Each step uses `for_each_adj_posting_batch` with inline visited checks and no intermediate `Vec<NeighborEntry>` allocation. `is_connected` is a specialized variant that skips parent tracking for even less overhead.
+- **Dijkstra** (when `weight_field` is set): Two min-heaps with distance maps. Termination when `fwd_min + bwd_min >= mu` (best known path cost through any meeting node). When `weight_field = "weight"`, weights come directly from `NeighborEntry.weight` in the adjacency postings without edge hydration. Other field names trigger per-edge hydration via `get_edge_raw()`.
+
+### Connected components
+
+`connected_components()` computes a global weakly-connected-component (WCC) labelling using union-find with path compression and union by rank for near-linear O(N·α(N)) time. The algorithm collects all visible nodes via `nodes_by_type()`, then performs a single outgoing `neighbors_batch()` scan to union endpoints. A final pass normalizes each component ID to the minimum node ID in the component for deterministic output.
+
+`component_of(node_id)` answers the targeted question "which nodes are in this node's component?" via BFS using `neighbors_batch()` with `Direction::Both` per frontier layer. This avoids scanning the entire graph when only one component is needed.
+
+Both methods support edge-type, node-type, and temporal filtering, and respect active prune policies (pruned nodes are invisible to the algorithm).
+
 ### Batch adjacency
 
-For operations that need to traverse from many nodes at once (PPR, subgraph extraction, graph export), OverGraph uses a sorted cursor walk. All source node IDs are sorted, and the adjacency index is walked once with a single cursor. This avoids repeated binary searches and is significantly faster than individual lookups when the source set is large.
+For operations that need to traverse from many nodes at once (PPR, subgraph extraction, graph export, batch degree queries), OverGraph uses a sorted cursor walk. All source node IDs are sorted, and the adjacency index is walked once with a single cursor. This avoids repeated binary searches and is significantly faster than individual lookups when the source set is large.
 
 ## Compaction
 

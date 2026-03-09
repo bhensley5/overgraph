@@ -30,13 +30,15 @@ Thumbs.db
 .env
 .env.local
 
-# Claude Code
+# Claude Code — tracked on working branches, excluded from main.
 .claude/
-CLAUDE.md
-AGENTS.md
+# CLAUDE.md
+# AGENTS.md
 
-# Internal development docs (not public-facing)
-docs/internal/
+# Internal development docs — tracked on working branches, excluded from main.
+# To publish to main: squash merge, then restore this gitignore line and
+# `git rm --cached -r docs/internal/` before committing.
+# docs/internal/
 
 # Research notes
 research-docs/

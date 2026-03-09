@@ -4,6 +4,7 @@ use crate::types::*;
 use memmap2::Mmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
+use std::ops::ControlFlow;
 use std::ops::Deref;
 use std::path::Path;
 
@@ -28,46 +29,76 @@ impl Deref for MappedData {
 // --- Binary read helpers (little-endian, from byte slices) ---
 
 fn read_u16_at(data: &[u8], offset: usize) -> Result<u16, EngineError> {
-    let end = offset.checked_add(2).ok_or_else(|| EngineError::CorruptRecord("u16 offset overflow".into()))?;
-    let slice = data.get(offset..end).ok_or_else(|| EngineError::CorruptRecord(
-        format!("u16 read at offset {} exceeds data length {}", offset, data.len())
-    ))?;
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| EngineError::CorruptRecord("u16 offset overflow".into()))?;
+    let slice = data.get(offset..end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "u16 read at offset {} exceeds data length {}",
+            offset,
+            data.len()
+        ))
+    })?;
     // unwrap safe: slice is exactly 2 bytes, guaranteed by get() above
     Ok(u16::from_le_bytes(slice.try_into().unwrap()))
 }
 
 fn read_u32_at(data: &[u8], offset: usize) -> Result<u32, EngineError> {
-    let end = offset.checked_add(4).ok_or_else(|| EngineError::CorruptRecord("u32 offset overflow".into()))?;
-    let slice = data.get(offset..end).ok_or_else(|| EngineError::CorruptRecord(
-        format!("u32 read at offset {} exceeds data length {}", offset, data.len())
-    ))?;
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| EngineError::CorruptRecord("u32 offset overflow".into()))?;
+    let slice = data.get(offset..end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "u32 read at offset {} exceeds data length {}",
+            offset,
+            data.len()
+        ))
+    })?;
     // unwrap safe: slice is exactly 4 bytes, guaranteed by get() above
     Ok(u32::from_le_bytes(slice.try_into().unwrap()))
 }
 
 fn read_u64_at(data: &[u8], offset: usize) -> Result<u64, EngineError> {
-    let end = offset.checked_add(8).ok_or_else(|| EngineError::CorruptRecord("u64 offset overflow".into()))?;
-    let slice = data.get(offset..end).ok_or_else(|| EngineError::CorruptRecord(
-        format!("u64 read at offset {} exceeds data length {}", offset, data.len())
-    ))?;
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| EngineError::CorruptRecord("u64 offset overflow".into()))?;
+    let slice = data.get(offset..end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "u64 read at offset {} exceeds data length {}",
+            offset,
+            data.len()
+        ))
+    })?;
     // unwrap safe: slice is exactly 8 bytes, guaranteed by get() above
     Ok(u64::from_le_bytes(slice.try_into().unwrap()))
 }
 
 fn read_i64_at(data: &[u8], offset: usize) -> Result<i64, EngineError> {
-    let end = offset.checked_add(8).ok_or_else(|| EngineError::CorruptRecord("i64 offset overflow".into()))?;
-    let slice = data.get(offset..end).ok_or_else(|| EngineError::CorruptRecord(
-        format!("i64 read at offset {} exceeds data length {}", offset, data.len())
-    ))?;
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| EngineError::CorruptRecord("i64 offset overflow".into()))?;
+    let slice = data.get(offset..end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "i64 read at offset {} exceeds data length {}",
+            offset,
+            data.len()
+        ))
+    })?;
     // unwrap safe: slice is exactly 8 bytes, guaranteed by get() above
     Ok(i64::from_le_bytes(slice.try_into().unwrap()))
 }
 
 fn read_f32_at(data: &[u8], offset: usize) -> Result<f32, EngineError> {
-    let end = offset.checked_add(4).ok_or_else(|| EngineError::CorruptRecord("f32 offset overflow".into()))?;
-    let slice = data.get(offset..end).ok_or_else(|| EngineError::CorruptRecord(
-        format!("f32 read at offset {} exceeds data length {}", offset, data.len())
-    ))?;
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| EngineError::CorruptRecord("f32 offset overflow".into()))?;
+    let slice = data.get(offset..end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "f32 read at offset {} exceeds data length {}",
+            offset,
+            data.len()
+        ))
+    })?;
     // unwrap safe: slice is exactly 4 bytes, guaranteed by get() above
     Ok(f32::from_le_bytes(slice.try_into().unwrap()))
 }
@@ -81,7 +112,9 @@ fn read_varint_at(data: &[u8], offset: usize) -> Result<(u64, usize), EngineErro
     loop {
         if pos >= data.len() {
             return Err(EngineError::CorruptRecord(format!(
-                "varint read at offset {} exceeds data length {}", offset, data.len()
+                "varint read at offset {} exceeds data length {}",
+                offset,
+                data.len()
             )));
         }
         let byte = data[pos];
@@ -99,10 +132,17 @@ fn read_varint_at(data: &[u8], offset: usize) -> Result<(u64, usize), EngineErro
 
 /// Safe byte slice extraction with bounds checking.
 fn read_bytes_at(data: &[u8], offset: usize, len: usize) -> Result<&[u8], EngineError> {
-    let end = offset.checked_add(len).ok_or_else(|| EngineError::CorruptRecord("byte slice offset overflow".into()))?;
-    data.get(offset..end).ok_or_else(|| EngineError::CorruptRecord(
-        format!("byte slice [{}, {}) exceeds data length {}", offset, end, data.len())
-    ))
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| EngineError::CorruptRecord("byte slice offset overflow".into()))?;
+    data.get(offset..end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "byte slice [{}, {}) exceeds data length {}",
+            offset,
+            end,
+            data.len()
+        ))
+    })
 }
 
 // Cost model constants for adaptive batch strategy selection.
@@ -116,7 +156,7 @@ const BATCH_RANDOM_ACCESS_PENALTY: usize = 4;
 const NODE_INDEX_ENTRY_SIZE: usize = 16; // node_id (8) + offset (8)
 const EDGE_INDEX_ENTRY_SIZE: usize = 16; // edge_id (8) + offset (8)
 const ADJ_INDEX_ENTRY_SIZE: usize = 24; // node_id (8) + type_id (4) + offset (8) + count (4)
-// ADJ_POSTING_SIZE removed. Postings are now variable-length (delta + varint encoded)
+                                        // ADJ_POSTING_SIZE removed. Postings are now variable-length (delta + varint encoded)
 const TOMBSTONE_ENTRY_SIZE: usize = 17; // kind (1) + id (8) + deleted_at (8)
 const TYPE_INDEX_ENTRY_SIZE: usize = 16; // type_id (4) + offset (8) + count (4)
 const PROP_INDEX_ENTRY_SIZE: usize = 32; // type_id (4) + key_hash (8) + value_hash (8) + offset (8) + count (4)
@@ -240,8 +280,6 @@ fn choose_batch_read_strategy(
 const NODE_META_ENTRY_SIZE: usize = 52;
 /// Size of an edge metadata entry in edge_meta.dat (72 bytes).
 const EDGE_META_ENTRY_SIZE: usize = 72;
-/// Size of a property hash pair in node_prop_hashes.dat (16 bytes).
-const PROP_HASH_PAIR_SIZE: usize = 16;
 
 pub struct SegmentReader {
     pub segment_id: u64,
@@ -354,6 +392,31 @@ impl SegmentReader {
             None => return Ok(None),
         };
         Ok(Some(decode_edge_at(&self.edges_mmap, offset, id)?))
+    }
+
+    /// Get the fixed-width edge fields needed for engine-side cache updates
+    /// without decoding properties.
+    /// Returns (from, to, created_at, weight, valid_from, valid_to).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn get_edge_core(
+        &self,
+        id: u64,
+    ) -> Result<Option<(u64, u64, i64, f32, i64, i64)>, EngineError> {
+        if self.deleted_edges.contains(&id) {
+            return Ok(None);
+        }
+        let offset = match self.binary_search_edge_index(id)? {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        let data = &self.edges_mmap[..];
+        let from = read_u64_at(data, offset)?;
+        let to = read_u64_at(data, offset + 8)?;
+        let created_at = read_i64_at(data, offset + 20)?;
+        let weight = read_f32_at(data, offset + 36)?;
+        let valid_from = read_i64_at(data, offset + 40)?;
+        let valid_to = read_i64_at(data, offset + 48)?;
+        Ok(Some((from, to, created_at, weight, valid_from, valid_to)))
     }
 
     /// Look up a node by (type_id, key). Returns None if not found or tombstoned.
@@ -634,6 +697,44 @@ impl SegmentReader {
         &self.deleted_edges
     }
 
+    /// Enumerate unique node IDs that appear in this segment's adjacency indexes.
+    /// Scans both adj_out and adj_in index files and returns the union of node IDs.
+    /// Used by degree cache rebuild to find adjacency-bearing nodes without
+    /// enumerating all visible node records.
+    pub fn adj_node_ids(&self) -> Result<HashSet<u64>, EngineError> {
+        let mut ids = HashSet::new();
+        Self::collect_adj_index_node_ids(&self.adj_out_idx, &mut ids)?;
+        Self::collect_adj_index_node_ids(&self.adj_in_idx, &mut ids)?;
+        Ok(ids)
+    }
+
+    /// Extract unique node IDs from a single adjacency index file.
+    /// Index format: [count: u64] then count entries of ADJ_INDEX_ENTRY_SIZE,
+    /// each starting with [node_id: u64]. Entries are sorted by node_id so
+    /// consecutive duplicates (same node, different type_id) are common.
+    fn collect_adj_index_node_ids(
+        idx_mmap: &MappedData,
+        out: &mut HashSet<u64>,
+    ) -> Result<(), EngineError> {
+        let idx_data = &idx_mmap[..];
+        if idx_data.len() < 8 {
+            return Ok(());
+        }
+        let count = read_u64_at(idx_data, 0)? as usize;
+        let idx_start = 8;
+        let mut prev_node: u64 = u64::MAX;
+        for i in 0..count {
+            let entry_off = idx_start + i * ADJ_INDEX_ENTRY_SIZE;
+            let node_id = read_u64_at(idx_data, entry_off)?;
+            // Index is sorted by node_id; skip consecutive duplicates
+            if node_id != prev_node {
+                out.insert(node_id);
+                prev_node = node_id;
+            }
+        }
+        Ok(())
+    }
+
     pub fn node_count(&self) -> u64 {
         self.node_count
     }
@@ -704,6 +805,7 @@ impl SegmentReader {
     /// Read a node metadata entry by index (0-based).
     /// Returns (node_id, data_offset, data_len, type_id, updated_at, weight, key_len,
     ///          prop_hash_offset, prop_hash_count).
+    #[allow(clippy::type_complexity)]
     pub(crate) fn node_meta_at(
         &self,
         index: usize,
@@ -744,6 +846,7 @@ impl SegmentReader {
     /// Read an edge metadata entry by index (0-based).
     /// Returns (edge_id, data_offset, data_len, from, to, type_id, updated_at,
     ///          weight, valid_from, valid_to).
+    #[allow(clippy::type_complexity)]
     pub(crate) fn edge_meta_at(
         &self,
         index: usize,
@@ -761,22 +864,17 @@ impl SegmentReader {
         let valid_from = read_i64_at(data, off + 52)?;
         let valid_to = read_i64_at(data, off + 60)?;
         Ok((
-            edge_id, data_offset, data_len, from, to, type_id, updated_at, weight, valid_from,
+            edge_id,
+            data_offset,
+            data_len,
+            from,
+            to,
+            type_id,
+            updated_at,
+            weight,
+            valid_from,
             valid_to,
         ))
-    }
-
-    /// Read a property hash pair from node_prop_hashes.dat.
-    /// `byte_offset` is the absolute byte offset into the file.
-    /// Returns (key_hash, value_hash).
-    pub(crate) fn prop_hash_at(
-        &self,
-        byte_offset: usize,
-    ) -> Result<(u64, u64), EngineError> {
-        let data = &self.node_prop_hashes_mmap[..];
-        let key_hash = read_u64_at(data, byte_offset)?;
-        let value_hash = read_u64_at(data, byte_offset + 8)?;
-        Ok((key_hash, value_hash))
     }
 
     /// Raw mmap bytes for node_prop_hashes.dat (used by V3 compaction).
@@ -983,7 +1081,12 @@ impl SegmentReader {
 
     /// Look up an edge by (from, to, type_id) triple. Returns the edge record
     /// if found and not tombstoned, or None.
-    pub fn edge_by_triple(&self, from: u64, to: u64, type_id: u32) -> Result<Option<EdgeRecord>, EngineError> {
+    pub fn edge_by_triple(
+        &self,
+        from: u64,
+        to: u64,
+        type_id: u32,
+    ) -> Result<Option<EdgeRecord>, EngineError> {
         let data = &self.edge_triple_index_mmap[..];
         if data.len() < 8 {
             return Ok(None);
@@ -1154,7 +1257,11 @@ impl SegmentReader {
 
     /// Binary search the key index for a (type_id, key) pair.
     /// Returns the node_id if found, or None.
-    fn binary_search_key_index(&self, target_type: u32, target_key: &str) -> Result<Option<u64>, EngineError> {
+    fn binary_search_key_index(
+        &self,
+        target_type: u32,
+        target_key: &str,
+    ) -> Result<Option<u64>, EngineError> {
         let data = &self.key_index_mmap[..];
         if data.len() < 8 {
             return Ok(None);
@@ -1178,10 +1285,12 @@ impl SegmentReader {
             let entry_type = read_u32_at(data, entry_offset)?;
             let key_len = read_u16_at(data, entry_offset + 12)? as usize;
             let key_bytes = read_bytes_at(data, entry_offset + 14, key_len)?;
-            let entry_key = std::str::from_utf8(key_bytes)
-                .map_err(|_| EngineError::CorruptRecord(format!(
-                    "invalid UTF-8 in key index at offset {}", entry_offset + 14
-                )))?;
+            let entry_key = std::str::from_utf8(key_bytes).map_err(|_| {
+                EngineError::CorruptRecord(format!(
+                    "invalid UTF-8 in key index at offset {}",
+                    entry_offset + 14
+                ))
+            })?;
 
             match entry_type.cmp(&target_type) {
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -1201,7 +1310,11 @@ impl SegmentReader {
 
     /// Find the first adjacency index entry for a given node_id using binary search.
     /// Returns the index of the first entry, or None if the node has no adjacency.
-    fn find_first_adj_entry(&self, idx_data: &[u8], target_node_id: u64) -> Result<Option<usize>, EngineError> {
+    fn find_first_adj_entry(
+        &self,
+        idx_data: &[u8],
+        target_node_id: u64,
+    ) -> Result<Option<usize>, EngineError> {
         if idx_data.len() < 8 {
             return Ok(None);
         }
@@ -1306,7 +1419,11 @@ impl SegmentReader {
 
                 let (vt_enc, n) = read_varint_at(dat_data, cur_off)?;
                 cur_off += n;
-                let valid_to = if vt_enc == 0 { i64::MAX } else { (vt_enc - 1) as i64 };
+                let valid_to = if vt_enc == 0 {
+                    i64::MAX
+                } else {
+                    (vt_enc - 1) as i64
+                };
 
                 if self.deleted_edges.contains(&edge_id) {
                     continue;
@@ -1327,6 +1444,153 @@ impl SegmentReader {
         }
 
         Ok(())
+    }
+
+    /// Iterate adjacency postings for a node, calling the callback for each valid
+    /// (non-tombstoned, type-matching) posting. Used by degree/weight aggregation
+    /// to avoid materializing `Vec<NeighborEntry>`.
+    ///
+    /// Callback receives `(edge_id, neighbor_id, weight, valid_from, valid_to)`.
+    /// For `Direction::Both`, self-loops may invoke the callback twice — caller
+    /// handles dedup.
+    pub fn for_each_adj_posting<F>(
+        &self,
+        node_id: u64,
+        direction: Direction,
+        type_filter: Option<&[u32]>,
+        callback: &mut F,
+    ) -> Result<ControlFlow<()>, EngineError>
+    where
+        F: FnMut(u64, u64, f32, i64, i64) -> ControlFlow<()>,
+    {
+        match direction {
+            Direction::Outgoing => self.decode_adj_postings_cb(
+                &self.adj_out_idx,
+                &self.adj_out_dat,
+                node_id,
+                type_filter,
+                callback,
+            ),
+            Direction::Incoming => self.decode_adj_postings_cb(
+                &self.adj_in_idx,
+                &self.adj_in_dat,
+                node_id,
+                type_filter,
+                callback,
+            ),
+            Direction::Both => {
+                if self
+                    .decode_adj_postings_cb(
+                        &self.adj_out_idx,
+                        &self.adj_out_dat,
+                        node_id,
+                        type_filter,
+                        callback,
+                    )?
+                    .is_break()
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+                self.decode_adj_postings_cb(
+                    &self.adj_in_idx,
+                    &self.adj_in_dat,
+                    node_id,
+                    type_filter,
+                    callback,
+                )
+            }
+        }
+    }
+
+    /// Decode adjacency postings from one index+data file pair, invoking the
+    /// callback for each non-tombstoned posting. Passes valid_from/valid_to
+    /// through for caller-side temporal filtering.
+    fn decode_adj_postings_cb<F>(
+        &self,
+        idx_mmap: &MappedData,
+        dat_mmap: &MappedData,
+        node_id: u64,
+        type_filter: Option<&[u32]>,
+        callback: &mut F,
+    ) -> Result<ControlFlow<()>, EngineError>
+    where
+        F: FnMut(u64, u64, f32, i64, i64) -> ControlFlow<()>,
+    {
+        let idx_data = &idx_mmap[..];
+        let dat_data = &dat_mmap[..];
+
+        let first = match self.find_first_adj_entry(idx_data, node_id)? {
+            Some(i) => i,
+            None => return Ok(ControlFlow::Continue(())),
+        };
+
+        let count = read_u64_at(idx_data, 0)? as usize;
+        let idx_start = 8;
+
+        for i in first..count {
+            let entry_off = idx_start + i * ADJ_INDEX_ENTRY_SIZE;
+            let entry_node = read_u64_at(idx_data, entry_off)?;
+            if entry_node != node_id {
+                break;
+            }
+
+            let entry_type = read_u32_at(idx_data, entry_off + 8)?;
+            let posting_offset = read_u64_at(idx_data, entry_off + 12)? as usize;
+            let posting_count = read_u32_at(idx_data, entry_off + 20)? as usize;
+
+            if let Some(types) = type_filter {
+                if !types.contains(&entry_type) {
+                    continue;
+                }
+            }
+
+            let mut cur_off = posting_offset;
+            let mut prev_edge_id: u64 = 0;
+
+            for _ in 0..posting_count {
+                let (delta, n) = read_varint_at(dat_data, cur_off)?;
+                cur_off += n;
+                let edge_id = prev_edge_id + delta;
+                prev_edge_id = edge_id;
+
+                let (neighbor_id, n) = read_varint_at(dat_data, cur_off)?;
+                cur_off += n;
+
+                let weight = read_f32_at(dat_data, cur_off)?;
+                cur_off += 4;
+
+                let (valid_from_raw, n) = read_varint_at(dat_data, cur_off)?;
+                cur_off += n;
+                let (vt_enc, n) = read_varint_at(dat_data, cur_off)?;
+                cur_off += n;
+                let valid_to = if vt_enc == 0 {
+                    i64::MAX
+                } else {
+                    (vt_enc - 1) as i64
+                };
+
+                if self.deleted_edges.contains(&edge_id) {
+                    continue;
+                }
+                if self.deleted_nodes.contains(&neighbor_id) {
+                    continue;
+                }
+
+                if callback(
+                    edge_id,
+                    neighbor_id,
+                    weight,
+                    valid_from_raw as i64,
+                    valid_to,
+                )
+                .is_break()
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Batch neighbor query: collect neighbors for multiple node IDs in a single
@@ -1496,7 +1760,11 @@ impl SegmentReader {
 
                     let (vt_enc, n) = read_varint_at(dat_data, cur_off)?;
                     cur_off += n;
-                    let valid_to = if vt_enc == 0 { i64::MAX } else { (vt_enc - 1) as i64 };
+                    let valid_to = if vt_enc == 0 {
+                        i64::MAX
+                    } else {
+                        (vt_enc - 1) as i64
+                    };
 
                     if self.deleted_edges.contains(&edge_id) {
                         continue;
@@ -1519,6 +1787,190 @@ impl SegmentReader {
 
         Ok(())
     }
+
+    /// Batch callback-based adjacency posting iteration. Same adaptive cost model
+    /// as `collect_adj_neighbors_batch` (SeekPerKey vs MergeWalk) but invokes a
+    /// callback instead of building `Vec<NeighborEntry>`.
+    ///
+    /// `node_ids` must be sorted and deduplicated. For `Direction::Both`, self-loops
+    /// may invoke the callback twice per edge — caller handles dedup.
+    ///
+    /// Callback receives `(queried_node_id, edge_id, neighbor_id, weight, valid_from, valid_to)`.
+    pub fn for_each_adj_posting_batch<F>(
+        &self,
+        node_ids: &[u64],
+        direction: Direction,
+        type_filter: Option<&[u32]>,
+        callback: &mut F,
+    ) -> Result<ControlFlow<()>, EngineError>
+    where
+        F: FnMut(u64, u64, u64, f32, i64, i64) -> ControlFlow<()>,
+    {
+        match direction {
+            Direction::Outgoing => self.decode_adj_postings_batch_cb(
+                &self.adj_out_idx,
+                &self.adj_out_dat,
+                node_ids,
+                type_filter,
+                callback,
+            ),
+            Direction::Incoming => self.decode_adj_postings_batch_cb(
+                &self.adj_in_idx,
+                &self.adj_in_dat,
+                node_ids,
+                type_filter,
+                callback,
+            ),
+            Direction::Both => {
+                if self
+                    .decode_adj_postings_batch_cb(
+                        &self.adj_out_idx,
+                        &self.adj_out_dat,
+                        node_ids,
+                        type_filter,
+                        callback,
+                    )?
+                    .is_break()
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+                self.decode_adj_postings_batch_cb(
+                    &self.adj_in_idx,
+                    &self.adj_in_dat,
+                    node_ids,
+                    type_filter,
+                    callback,
+                )
+            }
+        }
+    }
+
+    /// Batch decode adjacency postings from one index+data file pair using the
+    /// adaptive cost model. Invokes the callback for each non-tombstoned posting.
+    fn decode_adj_postings_batch_cb<F>(
+        &self,
+        idx_mmap: &MappedData,
+        dat_mmap: &MappedData,
+        node_ids: &[u64],
+        type_filter: Option<&[u32]>,
+        callback: &mut F,
+    ) -> Result<ControlFlow<()>, EngineError>
+    where
+        F: FnMut(u64, u64, u64, f32, i64, i64) -> ControlFlow<()>,
+    {
+        let idx_data = &idx_mmap[..];
+        let dat_data = &dat_mmap[..];
+
+        if idx_data.len() < 8 {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let count = read_u64_at(idx_data, 0)? as usize;
+        if count == 0 {
+            return Ok(ControlFlow::Continue(()));
+        }
+
+        let idx_start = 8;
+        let min_key = node_ids.first().copied().unwrap_or(0);
+        let max_key = node_ids.last().copied().unwrap_or(0);
+        // node_ids is pre-sorted and deduped, so len() == unique count
+        let use_seek = choose_batch_read_strategy(
+            idx_data,
+            count,
+            ADJ_INDEX_ENTRY_SIZE,
+            0,
+            node_ids.len(),
+            min_key,
+            max_key,
+        )? == BatchReadStrategy::SeekPerKey;
+        let mut idx_pos = 0usize;
+
+        for &target_id in node_ids {
+            if use_seek {
+                idx_pos = match self.find_first_adj_entry(idx_data, target_id)? {
+                    Some(pos) => pos,
+                    None => continue,
+                };
+            } else {
+                while idx_pos < count {
+                    let entry_off = idx_start + idx_pos * ADJ_INDEX_ENTRY_SIZE;
+                    let entry_node = read_u64_at(idx_data, entry_off)?;
+                    if entry_node < target_id {
+                        idx_pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            while idx_pos < count {
+                let entry_off = idx_start + idx_pos * ADJ_INDEX_ENTRY_SIZE;
+                let entry_node = read_u64_at(idx_data, entry_off)?;
+                if entry_node != target_id {
+                    break;
+                }
+
+                let entry_type = read_u32_at(idx_data, entry_off + 8)?;
+                let posting_offset = read_u64_at(idx_data, entry_off + 12)? as usize;
+                let posting_count = read_u32_at(idx_data, entry_off + 20)? as usize;
+
+                idx_pos += 1;
+
+                if let Some(types) = type_filter {
+                    if !types.contains(&entry_type) {
+                        continue;
+                    }
+                }
+
+                let mut cur_off = posting_offset;
+                let mut prev_edge_id: u64 = 0;
+
+                for _ in 0..posting_count {
+                    let (delta, n) = read_varint_at(dat_data, cur_off)?;
+                    cur_off += n;
+                    let edge_id = prev_edge_id + delta;
+                    prev_edge_id = edge_id;
+
+                    let (neighbor_id, n) = read_varint_at(dat_data, cur_off)?;
+                    cur_off += n;
+
+                    let weight = read_f32_at(dat_data, cur_off)?;
+                    cur_off += 4;
+
+                    let (valid_from_raw, n) = read_varint_at(dat_data, cur_off)?;
+                    cur_off += n;
+                    let (vt_enc, n) = read_varint_at(dat_data, cur_off)?;
+                    cur_off += n;
+                    let valid_to = if vt_enc == 0 {
+                        i64::MAX
+                    } else {
+                        (vt_enc - 1) as i64
+                    };
+
+                    if self.deleted_edges.contains(&edge_id) {
+                        continue;
+                    }
+                    if self.deleted_nodes.contains(&neighbor_id) {
+                        continue;
+                    }
+
+                    if callback(
+                        target_id,
+                        edge_id,
+                        neighbor_id,
+                        weight,
+                        valid_from_raw as i64,
+                        valid_to,
+                    )
+                    .is_break()
+                    {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+
+        Ok(ControlFlow::Continue(()))
+    }
 }
 
 // --- Helpers ---
@@ -1537,18 +1989,22 @@ fn read_format_version(seg_dir: &Path) -> Result<u32, EngineError> {
     let data = std::fs::read(&path)?;
     if data.len() != 8 {
         return Err(EngineError::CorruptRecord(format!(
-            "format.ver has invalid size {} (expected 8)", data.len()
+            "format.ver has invalid size {} (expected 8)",
+            data.len()
         )));
     }
     if data[..4] != SEGMENT_MAGIC {
         return Err(EngineError::CorruptRecord(format!(
-            "format.ver has invalid magic {:?} (expected {:?})", &data[..4], SEGMENT_MAGIC
+            "format.ver has invalid magic {:?} (expected {:?})",
+            &data[..4],
+            SEGMENT_MAGIC
         )));
     }
     let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
     if version < 5 {
         return Err(EngineError::CorruptRecord(format!(
-            "segment format version {} is too old (minimum supported: 5)", version
+            "segment format version {} is too old (minimum supported: 5)",
+            version
         )));
     }
     if version > SEGMENT_FORMAT_VERSION {
@@ -1589,9 +2045,12 @@ fn decode_node_at(data: &[u8], offset: usize, id: u64) -> Result<NodeRecord, Eng
     let key_len = read_u16_at(data, offset + 4)? as usize;
     let key_bytes = read_bytes_at(data, offset + 6, key_len)?;
     let key = std::str::from_utf8(key_bytes)
-        .map_err(|_| EngineError::CorruptRecord(format!(
-            "invalid UTF-8 in node key at offset {}", offset + 6
-        )))?
+        .map_err(|_| {
+            EngineError::CorruptRecord(format!(
+                "invalid UTF-8 in node key at offset {}",
+                offset + 6
+            ))
+        })?
         .to_string();
 
     let pos = offset + 6 + key_len;
@@ -1600,11 +2059,9 @@ fn decode_node_at(data: &[u8], offset: usize, id: u64) -> Result<NodeRecord, Eng
     let weight = read_f32_at(data, pos + 16)?;
     let props_len = read_u32_at(data, pos + 20)? as usize;
     let props_bytes = read_bytes_at(data, pos + 24, props_len)?;
-    let props: BTreeMap<String, PropValue> =
-        rmp_serde::from_slice(props_bytes)
-            .map_err(|e| EngineError::CorruptRecord(format!(
-                "node props decode at offset {}: {}", pos + 24, e
-            )))?;
+    let props: BTreeMap<String, PropValue> = rmp_serde::from_slice(props_bytes).map_err(|e| {
+        EngineError::CorruptRecord(format!("node props decode at offset {}: {}", pos + 24, e))
+    })?;
 
     Ok(NodeRecord {
         id,
@@ -1632,11 +2089,13 @@ fn decode_edge_at(data: &[u8], offset: usize, id: u64) -> Result<EdgeRecord, Eng
 
     let props_len = read_u32_at(data, offset + 56)? as usize;
     let props_bytes = read_bytes_at(data, offset + 60, props_len)?;
-    let props: BTreeMap<String, PropValue> =
-        rmp_serde::from_slice(props_bytes)
-            .map_err(|e| EngineError::CorruptRecord(format!(
-                "edge props decode at offset {}: {}", offset + 60, e
-            )))?;
+    let props: BTreeMap<String, PropValue> = rmp_serde::from_slice(props_bytes).map_err(|e| {
+        EngineError::CorruptRecord(format!(
+            "edge props decode at offset {}: {}",
+            offset + 60,
+            e
+        ))
+    })?;
 
     Ok(EdgeRecord {
         id,
@@ -1667,7 +2126,10 @@ fn load_tombstones(path: &Path) -> Result<(HashSet<u64>, HashSet<u64>), EngineEr
         let off = 8 + i * TOMBSTONE_ENTRY_SIZE;
         if off + TOMBSTONE_ENTRY_SIZE > data.len() {
             return Err(EngineError::CorruptRecord(format!(
-                "tombstone entry {} at offset {} exceeds file length {}", i, off, data.len()
+                "tombstone entry {} at offset {} exceeds file length {}",
+                i,
+                off,
+                data.len()
             )));
         }
         let kind = data[off];
@@ -1700,7 +2162,7 @@ pub(crate) mod tests {
 
     /// Write a valid format.ver file for tests that build manual segment dirs.
     fn write_format_ver(seg_dir: &std::path::Path) {
-        use crate::segment_writer::{SEGMENT_MAGIC, SEGMENT_FORMAT_VERSION};
+        use crate::segment_writer::{SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
         let mut data = Vec::new();
         data.extend_from_slice(&SEGMENT_MAGIC);
         data.extend_from_slice(&SEGMENT_FORMAT_VERSION.to_le_bytes());
@@ -1772,16 +2234,9 @@ pub(crate) mod tests {
     fn test_batch_strategy_prefers_seek_for_tiny_key_count() {
         let keys: Vec<u64> = (1..=10_000).collect();
         let idx = build_u64_key_index(&keys, NODE_INDEX_ENTRY_SIZE, 0);
-        let strategy = choose_batch_read_strategy(
-            &idx,
-            keys.len(),
-            NODE_INDEX_ENTRY_SIZE,
-            0,
-            2,
-            500,
-            501,
-        )
-        .unwrap();
+        let strategy =
+            choose_batch_read_strategy(&idx, keys.len(), NODE_INDEX_ENTRY_SIZE, 0, 2, 500, 501)
+                .unwrap();
         assert_eq!(strategy, BatchReadStrategy::SeekPerKey);
     }
 
@@ -1806,16 +2261,9 @@ pub(crate) mod tests {
     fn test_batch_strategy_prefers_seek_for_sparse_range() {
         let keys: Vec<u64> = (1..=10_000).collect();
         let idx = build_u64_key_index(&keys, NODE_INDEX_ENTRY_SIZE, 0);
-        let strategy = choose_batch_read_strategy(
-            &idx,
-            keys.len(),
-            NODE_INDEX_ENTRY_SIZE,
-            0,
-            64,
-            100,
-            9_900,
-        )
-        .unwrap();
+        let strategy =
+            choose_batch_read_strategy(&idx, keys.len(), NODE_INDEX_ENTRY_SIZE, 0, 64, 100, 9_900)
+                .unwrap();
         assert_eq!(strategy, BatchReadStrategy::SeekPerKey);
     }
 
@@ -1973,17 +2421,23 @@ pub(crate) mod tests {
         let (_dir, reader) = write_and_open(&mt);
 
         // Filter type 10 only
-        let nbrs = reader.neighbors(1, Direction::Outgoing, Some(&[10]), 0).unwrap();
+        let nbrs = reader
+            .neighbors(1, Direction::Outgoing, Some(&[10]), 0)
+            .unwrap();
         assert_eq!(nbrs.len(), 1);
         assert_eq!(nbrs[0].node_id, 2);
 
         // Filter type 20 only
-        let nbrs = reader.neighbors(1, Direction::Outgoing, Some(&[20]), 0).unwrap();
+        let nbrs = reader
+            .neighbors(1, Direction::Outgoing, Some(&[20]), 0)
+            .unwrap();
         assert_eq!(nbrs.len(), 1);
         assert_eq!(nbrs[0].node_id, 3);
 
         // Filter non-existent type
-        let nbrs = reader.neighbors(1, Direction::Outgoing, Some(&[99]), 0).unwrap();
+        let nbrs = reader
+            .neighbors(1, Direction::Outgoing, Some(&[99]), 0)
+            .unwrap();
         assert!(nbrs.is_empty());
     }
 
@@ -2015,6 +2469,62 @@ pub(crate) mod tests {
         assert!(nbrs.is_empty());
     }
 
+    #[test]
+    fn test_for_each_adj_posting_breaks_early() {
+        let mut mt = Memtable::new();
+        for id in 1..=4 {
+            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))));
+        }
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 4, 10)));
+
+        let (_dir, reader) = write_and_open(&mt);
+        let mut seen = 0usize;
+        let flow = reader
+            .for_each_adj_posting(
+                1,
+                Direction::Outgoing,
+                None,
+                &mut |_edge_id, _neighbor_id, _weight, _valid_from, _valid_to| {
+                    seen += 1;
+                    ControlFlow::Break(())
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(flow, ControlFlow::Break(())));
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn test_for_each_adj_posting_batch_breaks_early() {
+        let mut mt = Memtable::new();
+        for id in 1..=4 {
+            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))));
+        }
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 4, 10)));
+
+        let (_dir, reader) = write_and_open(&mt);
+        let mut seen = 0usize;
+        let flow = reader
+            .for_each_adj_posting_batch(
+                &[1],
+                Direction::Outgoing,
+                None,
+                &mut |_node_id, _edge_id, _neighbor_id, _weight, _valid_from, _valid_to| {
+                    seen += 1;
+                    ControlFlow::Break(())
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(flow, ControlFlow::Break(())));
+        assert_eq!(seen, 1);
+    }
+
     // --- Empty segment ---
 
     #[test]
@@ -2026,7 +2536,10 @@ pub(crate) mod tests {
         assert_eq!(reader.edge_count(), 0);
         assert!(reader.get_node(1).unwrap().is_none());
         assert!(reader.get_edge(1).unwrap().is_none());
-        assert!(reader.neighbors(1, Direction::Outgoing, None, 0).unwrap().is_empty());
+        assert!(reader
+            .neighbors(1, Direction::Outgoing, None, 0)
+            .unwrap()
+            .is_empty());
     }
 
     // --- Binary search stress ---
@@ -2133,7 +2646,9 @@ pub(crate) mod tests {
         assert!(ids.contains(&3));
 
         // Verify type-filtered neighbors
-        let out1_t10 = reader.neighbors(1, Direction::Outgoing, Some(&[10]), 0).unwrap();
+        let out1_t10 = reader
+            .neighbors(1, Direction::Outgoing, Some(&[10]), 0)
+            .unwrap();
         assert_eq!(out1_t10.len(), 1);
         assert_eq!(out1_t10[0].node_id, 2);
 
@@ -2153,22 +2668,37 @@ pub(crate) mod tests {
         let mut props1 = BTreeMap::new();
         props1.insert("color".to_string(), PropValue::String("red".to_string()));
         mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 1, type_id: 1, key: "apple".to_string(), props: props1,
-            created_at: 1000, updated_at: 1001, weight: 0.5,
+            id: 1,
+            type_id: 1,
+            key: "apple".to_string(),
+            props: props1,
+            created_at: 1000,
+            updated_at: 1001,
+            weight: 0.5,
         }));
 
         let mut props2 = BTreeMap::new();
         props2.insert("color".to_string(), PropValue::String("red".to_string()));
         mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 2, type_id: 1, key: "cherry".to_string(), props: props2,
-            created_at: 1000, updated_at: 1001, weight: 0.5,
+            id: 2,
+            type_id: 1,
+            key: "cherry".to_string(),
+            props: props2,
+            created_at: 1000,
+            updated_at: 1001,
+            weight: 0.5,
         }));
 
         let mut props3 = BTreeMap::new();
         props3.insert("color".to_string(), PropValue::String("green".to_string()));
         mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 3, type_id: 1, key: "lime".to_string(), props: props3,
-            created_at: 1000, updated_at: 1001, weight: 0.5,
+            id: 3,
+            type_id: 1,
+            key: "lime".to_string(),
+            props: props3,
+            created_at: 1000,
+            updated_at: 1001,
+            weight: 0.5,
         }));
 
         let (_dir, reader) = write_and_open(&mt);
@@ -2176,21 +2706,31 @@ pub(crate) mod tests {
         // Query for red nodes
         let key_hash = hash_prop_key("color");
         let val_hash = hash_prop_value(&PropValue::String("red".to_string()));
-        let mut reds = reader.find_nodes_by_prop_hash(1, key_hash, val_hash).unwrap();
+        let mut reds = reader
+            .find_nodes_by_prop_hash(1, key_hash, val_hash)
+            .unwrap();
         reds.sort();
         assert_eq!(reds, vec![1, 2]);
 
         // Query for green nodes
         let val_hash_green = hash_prop_value(&PropValue::String("green".to_string()));
-        let greens = reader.find_nodes_by_prop_hash(1, key_hash, val_hash_green).unwrap();
+        let greens = reader
+            .find_nodes_by_prop_hash(1, key_hash, val_hash_green)
+            .unwrap();
         assert_eq!(greens, vec![3]);
 
         // Non-existent value
         let val_hash_blue = hash_prop_value(&PropValue::String("blue".to_string()));
-        assert!(reader.find_nodes_by_prop_hash(1, key_hash, val_hash_blue).unwrap().is_empty());
+        assert!(reader
+            .find_nodes_by_prop_hash(1, key_hash, val_hash_blue)
+            .unwrap()
+            .is_empty());
 
         // Wrong type_id
-        assert!(reader.find_nodes_by_prop_hash(99, key_hash, val_hash).unwrap().is_empty());
+        assert!(reader
+            .find_nodes_by_prop_hash(99, key_hash, val_hash)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2202,16 +2742,29 @@ pub(crate) mod tests {
         let mut props = BTreeMap::new();
         props.insert("tag".to_string(), PropValue::String("x".to_string()));
         mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 1, type_id: 1, key: "a".to_string(), props: props.clone(),
-            created_at: 1000, updated_at: 1001, weight: 0.5,
+            id: 1,
+            type_id: 1,
+            key: "a".to_string(),
+            props: props.clone(),
+            created_at: 1000,
+            updated_at: 1001,
+            weight: 0.5,
         }));
         mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 2, type_id: 1, key: "b".to_string(), props,
-            created_at: 1000, updated_at: 1001, weight: 0.5,
+            id: 2,
+            type_id: 1,
+            key: "b".to_string(),
+            props,
+            created_at: 1000,
+            updated_at: 1001,
+            weight: 0.5,
         }));
 
         // Delete node 2 (tombstone)
-        mt.apply_op(&WalOp::DeleteNode { id: 2, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 2,
+            deleted_at: 9999,
+        });
 
         let (_dir, reader) = write_and_open(&mt);
 
@@ -2219,7 +2772,9 @@ pub(crate) mod tests {
         let val_hash = hash_prop_value(&PropValue::String("x".to_string()));
 
         // Node 2 is tombstoned, so only node 1 should be returned
-        let results = reader.find_nodes_by_prop_hash(1, key_hash, val_hash).unwrap();
+        let results = reader
+            .find_nodes_by_prop_hash(1, key_hash, val_hash)
+            .unwrap();
         assert_eq!(results, vec![1]);
     }
 
@@ -2232,14 +2787,28 @@ pub(crate) mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")));
         mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")));
         mt.apply_op(&WalOp::UpsertEdge(EdgeRecord {
-            id: 10, from: 1, to: 2, type_id: 5,
-            props: BTreeMap::new(), created_at: 100, updated_at: 100, weight: 0.75,
-            valid_from: 0, valid_to: i64::MAX,
+            id: 10,
+            from: 1,
+            to: 2,
+            type_id: 5,
+            props: BTreeMap::new(),
+            created_at: 100,
+            updated_at: 100,
+            weight: 0.75,
+            valid_from: 0,
+            valid_to: i64::MAX,
         }));
         mt.apply_op(&WalOp::UpsertEdge(EdgeRecord {
-            id: 11, from: 1, to: 3, type_id: 5,
-            props: BTreeMap::new(), created_at: 100, updated_at: 100, weight: 0.25,
-            valid_from: 0, valid_to: i64::MAX,
+            id: 11,
+            from: 1,
+            to: 3,
+            type_id: 5,
+            props: BTreeMap::new(),
+            created_at: 100,
+            updated_at: 100,
+            weight: 0.25,
+            valid_from: 0,
+            valid_to: i64::MAX,
         }));
 
         let (_dir, reader) = write_and_open(&mt);
@@ -2249,9 +2818,17 @@ pub(crate) mod tests {
         // Check that each neighbor has the correct weight
         for n in &nbrs {
             if n.edge_id == 10 {
-                assert!((n.weight - 0.75).abs() < f32::EPSILON, "edge 10 weight: {}", n.weight);
+                assert!(
+                    (n.weight - 0.75).abs() < f32::EPSILON,
+                    "edge 10 weight: {}",
+                    n.weight
+                );
             } else if n.edge_id == 11 {
-                assert!((n.weight - 0.25).abs() < f32::EPSILON, "edge 11 weight: {}", n.weight);
+                assert!(
+                    (n.weight - 0.25).abs() < f32::EPSILON,
+                    "edge 11 weight: {}",
+                    n.weight
+                );
             } else {
                 panic!("unexpected edge_id: {}", n.edge_id);
             }
@@ -2296,7 +2873,10 @@ pub(crate) mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")));
         mt.apply_op(&WalOp::UpsertEdge(make_edge(100, 1, 2, 10)));
-        mt.apply_op(&WalOp::DeleteEdge { id: 100, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteEdge {
+            id: 100,
+            deleted_at: 9999,
+        });
 
         let (_dir, reader) = write_and_open(&mt);
 
@@ -2319,22 +2899,38 @@ pub(crate) mod tests {
         // Write a nodes.dat that says "1 node" but has no index/data
         let mut data = Vec::new();
         data.extend_from_slice(&1u64.to_le_bytes()); // count = 1
-        // No index entry follows (truncated)
+                                                     // No index entry follows (truncated)
         std::fs::write(seg_dir.join("nodes.dat"), &data).unwrap();
 
         // Write empty files for the other required segment files
-        for name in &["edges.dat", "adj_out.idx", "adj_out.dat", "adj_in.idx",
-                       "adj_in.dat", "key_index.dat", "tombstones.dat",
-                       "node_meta.dat", "edge_meta.dat", "timestamp_index.dat"] {
-            std::fs::write(seg_dir.join(name), &[]).unwrap();
+        for name in &[
+            "edges.dat",
+            "adj_out.idx",
+            "adj_out.dat",
+            "adj_in.idx",
+            "adj_in.dat",
+            "key_index.dat",
+            "tombstones.dat",
+            "node_meta.dat",
+            "edge_meta.dat",
+            "timestamp_index.dat",
+        ] {
+            std::fs::write(seg_dir.join(name), []).unwrap();
         }
 
         let reader = SegmentReader::open(&seg_dir, 1).unwrap();
         // get_node triggers binary search which reads an index entry past EOF
         let result = reader.get_node(42);
-        assert!(result.is_err(), "truncated segment should return error, not panic");
+        assert!(
+            result.is_err(),
+            "truncated segment should return error, not panic"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("exceeds data length"), "error should describe bounds issue: {}", err_msg);
+        assert!(
+            err_msg.contains("exceeds data length"),
+            "error should describe bounds issue: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -2345,20 +2941,32 @@ pub(crate) mod tests {
         write_format_ver(&seg_dir);
 
         // Write empty required files
-        for name in &["nodes.dat", "edges.dat", "adj_out.idx", "adj_out.dat",
-                       "adj_in.idx", "adj_in.dat", "key_index.dat",
-                       "node_meta.dat", "edge_meta.dat", "timestamp_index.dat"] {
-            std::fs::write(seg_dir.join(name), &[]).unwrap();
+        for name in &[
+            "nodes.dat",
+            "edges.dat",
+            "adj_out.idx",
+            "adj_out.dat",
+            "adj_in.idx",
+            "adj_in.dat",
+            "key_index.dat",
+            "node_meta.dat",
+            "edge_meta.dat",
+            "timestamp_index.dat",
+        ] {
+            std::fs::write(seg_dir.join(name), []).unwrap();
         }
 
         // Write a tombstones.dat that claims 5 entries but only has the header
         let mut data = Vec::new();
         data.extend_from_slice(&5u64.to_le_bytes()); // count = 5
-        // No actual tombstone entries (truncated)
+                                                     // No actual tombstone entries (truncated)
         std::fs::write(seg_dir.join("tombstones.dat"), &data).unwrap();
 
         let result = SegmentReader::open(&seg_dir, 1);
-        assert!(result.is_err(), "truncated tombstones should return error, not panic");
+        assert!(
+            result.is_err(),
+            "truncated tombstones should return error, not panic"
+        );
     }
 
     #[test]
@@ -2366,8 +2974,8 @@ pub(crate) mod tests {
         // Minimal data that starts a valid node but is truncated mid-record
         // Format v4: no id in data, starts with type_id
         let mut data = Vec::new();
-        data.extend_from_slice(&1u32.to_le_bytes());  // type_id
-        // Missing key_len and beyond (truncated)
+        data.extend_from_slice(&1u32.to_le_bytes()); // type_id
+                                                     // Missing key_len and beyond (truncated)
         let result = decode_node_at(&data, 0, 42);
         assert!(result.is_err());
     }
@@ -2376,8 +2984,8 @@ pub(crate) mod tests {
     fn test_decode_edge_at_truncated_returns_error() {
         // Partial edge record (format v4: no id in data, starts with from)
         let mut data = Vec::new();
-        data.extend_from_slice(&1u64.to_le_bytes());   // from
-        // Missing to, type_id, timestamps, etc.
+        data.extend_from_slice(&1u64.to_le_bytes()); // from
+                                                     // Missing to, type_id, timestamps, etc.
         let result = decode_edge_at(&data, 0, 100);
         assert!(result.is_err());
     }
@@ -2413,7 +3021,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_format_version_future_version_rejected() {
-        use crate::segment_writer::{SEGMENT_MAGIC, SEGMENT_FORMAT_VERSION};
+        use crate::segment_writer::{SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
 
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_test");
@@ -2478,8 +3086,7 @@ pub(crate) mod tests {
         assert_eq!(phc, 2); // 2 props: "name", "score"
 
         // Second entry: node_id=2
-        let (nid2, _, _, tid2, _, _, key_len2, _, phc2) =
-            reader.node_meta_at(1).unwrap();
+        let (nid2, _, _, tid2, _, _, key_len2, _, phc2) = reader.node_meta_at(1).unwrap();
         assert_eq!(nid2, 2);
         assert_eq!(tid2, 2);
         assert_eq!(key_len2, 3); // "bob"
@@ -2510,37 +3117,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_sidecar_prop_hash_roundtrip() {
-        use crate::types::{hash_prop_key, hash_prop_value};
-
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "alice")));
-
-        let (_dir, reader) = write_and_open(&mt);
-
-        let (_, _, _, _, _, _, _, pho, phc) = reader.node_meta_at(0).unwrap();
-        assert_eq!(phc, 2);
-
-        // Read prop hashes and verify against expected
-        let mut hashes = Vec::new();
-        for i in 0..phc as usize {
-            let (kh, vh) = reader.prop_hash_at(pho as usize + i * PROP_HASH_PAIR_SIZE).unwrap();
-            hashes.push((kh, vh));
-        }
-
-        // Props are BTreeMap so sorted: "name" before "score"
-        let expected_name_kh = hash_prop_key("name");
-        let expected_name_vh = hash_prop_value(&PropValue::String("alice".to_string()));
-        let expected_score_kh = hash_prop_key("score");
-        let expected_score_vh = hash_prop_value(&PropValue::Float(0.95));
-
-        assert_eq!(hashes[0].0, expected_name_kh);
-        assert_eq!(hashes[0].1, expected_name_vh);
-        assert_eq!(hashes[1].0, expected_score_kh);
-        assert_eq!(hashes[1].1, expected_score_vh);
-    }
-
-    #[test]
     fn test_sidecar_data_offset_matches_nodes_dat() {
         let mut mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
@@ -2550,8 +3126,7 @@ pub(crate) mod tests {
 
         // Read data_offset/data_len from sidecar and verify node can be decoded there
         for i in 0..reader.node_meta_count() as usize {
-            let (nid, data_offset, data_len, tid, _, _, _, _, _) =
-                reader.node_meta_at(i).unwrap();
+            let (nid, data_offset, data_len, tid, _, _, _, _, _) = reader.node_meta_at(i).unwrap();
             // Verify the offset points to valid data in nodes.dat
             let node = decode_node_at(&reader.nodes_mmap, data_offset as usize, nid).unwrap();
             assert_eq!(node.id, nid);

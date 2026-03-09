@@ -1,6 +1,6 @@
 {
   "name": "overgraph",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "An absurdly fast embedded graph database for Node.js. Sub-microsecond reads, pure Rust core.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -28,7 +28,7 @@
     "url": "https://github.com/Bhensley5/overgraph.git",
     "directory": "overgraph-node"
   },
-  "homepage": "https://github.com/Bhensley5/overgraph",
+  "homepage": "https://overgraph.io",
   "keywords": ["graph-database", "embedded", "performance", "typescript", "napi-rs", "rust"],
   "author": "Brandon Hensley",
   "files": [

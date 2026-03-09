@@ -125,17 +125,18 @@ describe('async delete + neighbors + find', () => {
     assert.equal(result.length, 2);
   });
 
-  it('neighbors2HopAsync returns 2nd-hop nodes', async () => {
+  it('traverseAsync returns 2nd-hop nodes', async () => {
     const a = await db.upsertNodeAsync(1, 'hop-a');
     const b = await db.upsertNodeAsync(1, 'hop-b');
     const c = await db.upsertNodeAsync(1, 'hop-c');
     await db.upsertEdgeAsync(a, b, 10);
     await db.upsertEdgeAsync(b, c, 10);
 
-    const result = await db.neighbors2HopAsync(a, 'outgoing');
-    const nodeSet = new Set(result.toArray().map(e => e.nodeId));
+    const page = await db.traverseAsync(a, 2, 2, 'outgoing');
+    const nodeSet = new Set(page.items.map(hit => hit.nodeId));
     assert.ok(nodeSet.has(c));
     assert.ok(!nodeSet.has(b)); // 1-hop excluded
+    assert.deepEqual(page.items.map(hit => hit.depth), [2]);
   });
 
   it('findNodesAsync returns matching ids', async () => {
@@ -168,18 +169,30 @@ describe('async flush + compact', () => {
   });
 
   it('compactAsync returns stats after multiple flushes', async () => {
-    for (let i = 0; i < 50; i++) {
-      db.upsertNode(1, `cn-${i}`, { idx: i }); // sync for speed
-    }
-    await db.flushAsync();
-    for (let i = 50; i < 100; i++) {
-      db.upsertNode(1, `cn-${i}`, { idx: i });
-    }
-    await db.flushAsync();
+    const testDir = mkdtempSync(join(tmpdir(), 'overgraph-compact-async-'));
+    const testDb = OverGraph.open(join(testDir, 'db'), {
+      walSyncMode: 'immediate',
+      compactAfterNFlushes: 0,
+    });
 
-    const stats = await db.compactAsync();
-    assert.ok(stats);
-    assert.ok(stats.segmentsMerged >= 2);
+    try {
+      for (let i = 0; i < 50; i++) {
+        testDb.upsertNode(1, `cn-${i}`, { idx: i });
+      }
+      await testDb.flushAsync();
+      for (let i = 50; i < 100; i++) {
+        testDb.upsertNode(1, `cn-${i}`, { idx: i });
+      }
+      await testDb.flushAsync();
+
+      assert.ok(testDb.stats().segmentCount >= 2);
+      const stats = await testDb.compactAsync();
+      assert.ok(stats);
+      assert.ok(stats.segmentsMerged >= 2);
+    } finally {
+      await testDb.closeAsync();
+      rmSync(testDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -269,5 +282,21 @@ describe('async does not block event loop', () => {
     // Run flush and timer concurrently
     await Promise.all([db.flushAsync(), timerPromise]);
     assert.ok(timerFired, 'setTimeout should have fired during async flush');
+  });
+});
+
+describe('removed async 2-hop APIs', () => {
+  let tmpDir, db;
+  before(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-async-removed-'));
+    db = freshDb(tmpDir, 'removed');
+  });
+  after(async () => { await db.closeAsync(); rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('keeps neighbors2Hop async wrappers absent', () => {
+    assert.equal(typeof db.neighbors2HopAsync, 'undefined');
+    assert.equal(typeof db.neighbors2HopPagedAsync, 'undefined');
+    assert.equal(typeof db.neighbors2HopConstrainedAsync, 'undefined');
+    assert.equal(typeof db.neighbors2HopConstrainedPagedAsync, 'undefined');
   });
 });

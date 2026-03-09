@@ -29,7 +29,10 @@
     "top_k_limit": 20,
     "time_range_from_ms": 0,
     "time_range_window_ms": 60000,
-    "include_weights_on_export": true
+    "include_weights_on_export": true,
+    "shortest_path_nodes_min": 500,
+    "shortest_path_nodes_divisor": 2,
+    "shortest_path_edge_offsets": [1, 7]
   },
   "scenario_iteration_policy": {
     "default": {
@@ -70,7 +73,28 @@
     },
     "S-CRUD-001": {},
     "S-CRUD-002": {},
-    "S-CRUD-003": {}
+    "S-CRUD-003": {},
+    "S-TRAV-003": {
+      "iters_multiplier": 2
+    },
+    "S-TRAV-004": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    },
+    "S-TRAV-005": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    },
+    "S-TRAV-006": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    }
   },
   "comparability": {
     "S-CRUD-001": {
@@ -95,6 +119,18 @@
     "S-TRAV-002": {
       "status": "comparable"
     },
+    "S-TRAV-007": {
+      "status": "comparable"
+    },
+    "S-TRAV-008": {
+      "status": "comparable"
+    },
+    "S-TRAV-009": {
+      "status": "comparable"
+    },
+    "S-TRAV-010": {
+      "status": "comparable"
+    },
     "S-ADV-001": {
       "status": "comparable"
     },
@@ -114,6 +150,18 @@
       "status": "comparable"
     },
     "S-MAIN-001": {
+      "status": "comparable"
+    },
+    "S-TRAV-003": {
+      "status": "comparable"
+    },
+    "S-TRAV-004": {
+      "status": "comparable"
+    },
+    "S-TRAV-005": {
+      "status": "comparable"
+    },
+    "S-TRAV-006": {
       "status": "comparable"
     }
   },

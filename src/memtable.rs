@@ -1,5 +1,6 @@
 use crate::types::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::ControlFlow;
 
 /// An adjacency entry: one edge connecting to a neighbor.
 #[derive(Debug, Clone)]
@@ -50,6 +51,12 @@ pub struct Memtable {
     time_node_index: BTreeSet<(u32, i64, u64)>,
 }
 
+impl Default for Memtable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Memtable {
     pub fn new() -> Self {
         Memtable {
@@ -76,7 +83,8 @@ impl Memtable {
                 // If the node already exists with a different type_id, remove from old type index
                 if let Some(old) = self.nodes.get(&node.id) {
                     // Remove old time index entry (may differ in type_id or updated_at)
-                    self.time_node_index.remove(&(old.type_id, old.updated_at, old.id));
+                    self.time_node_index
+                        .remove(&(old.type_id, old.updated_at, old.id));
                     if old.type_id != node.type_id {
                         if let Some(set) = self.type_node_index.get_mut(&old.type_id) {
                             set.remove(&node.id);
@@ -112,7 +120,8 @@ impl Memtable {
                         .or_default()
                         .insert(node.id);
                 }
-                self.time_node_index.insert((node.type_id, node.updated_at, node.id));
+                self.time_node_index
+                    .insert((node.type_id, node.updated_at, node.id));
                 self.nodes.insert(node.id, node.clone());
             }
             WalOp::UpsertEdge(edge) => {
@@ -179,7 +188,8 @@ impl Memtable {
             }
             WalOp::DeleteNode { id, deleted_at } => {
                 if let Some(node) = self.nodes.remove(id) {
-                    self.time_node_index.remove(&(node.type_id, node.updated_at, node.id));
+                    self.time_node_index
+                        .remove(&(node.type_id, node.updated_at, node.id));
                     if let Some(set) = self.type_node_index.get_mut(&node.type_id) {
                         set.remove(&node.id);
                         if set.is_empty() {
@@ -344,14 +354,14 @@ impl Memtable {
 
     /// Batch neighbor query: collect neighbors for multiple node IDs.
     /// Memtable is HashMap-based so per-node lookups are O(1); this method
-    /// batches them into a single HashMap result for the engine merge layer.
+    /// batches them into a single `NodeIdMap` result for the engine merge layer.
     pub fn neighbors_batch(
         &self,
         node_ids: &[u64],
         direction: Direction,
         type_filter: Option<&[u32]>,
-    ) -> HashMap<u64, Vec<NeighborEntry>> {
-        let mut results = HashMap::new();
+    ) -> NodeIdMap<Vec<NeighborEntry>> {
+        let mut results = NodeIdMap::default();
         for &nid in node_ids {
             let entries = self.neighbors(nid, direction, type_filter, 0);
             if !entries.is_empty() {
@@ -359,6 +369,119 @@ impl Memtable {
             }
         }
         results
+    }
+
+    /// Iterate adjacency entries for a node, calling the callback for each valid
+    /// (non-tombstoned, type-matching) entry. Used by degree/weight aggregation
+    /// to avoid materializing `Vec<NeighborEntry>`.
+    ///
+    /// Callback receives `(edge_id, neighbor_id, weight, valid_from, valid_to)`.
+    pub fn for_each_adj_entry<F>(
+        &self,
+        node_id: u64,
+        direction: Direction,
+        type_filter: Option<&[u32]>,
+        callback: &mut F,
+    ) -> ControlFlow<()>
+    where
+        F: FnMut(u64, u64, f32, i64, i64) -> ControlFlow<()>,
+    {
+        if self.deleted_nodes.contains_key(&node_id) {
+            return ControlFlow::Continue(());
+        }
+
+        let visit = |map: &HashMap<u64, AdjEntry>, cb: &mut F| -> ControlFlow<()> {
+            for entry in map.values() {
+                if let Some(types) = type_filter {
+                    if !types.contains(&entry.type_id) {
+                        continue;
+                    }
+                }
+                if self.deleted_nodes.contains_key(&entry.neighbor_id) {
+                    continue;
+                }
+                if cb(
+                    entry.edge_id,
+                    entry.neighbor_id,
+                    entry.weight,
+                    entry.valid_from,
+                    entry.valid_to,
+                )
+                .is_break()
+                {
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        };
+
+        match direction {
+            Direction::Outgoing => {
+                if let Some(map) = self.adj_out.get(&node_id) {
+                    visit(map, callback)?;
+                }
+            }
+            Direction::Incoming => {
+                if let Some(map) = self.adj_in.get(&node_id) {
+                    visit(map, callback)?;
+                }
+            }
+            Direction::Both => {
+                let mut seen = HashSet::new();
+                if let Some(map) = self.adj_out.get(&node_id) {
+                    for entry in map.values() {
+                        if let Some(types) = type_filter {
+                            if !types.contains(&entry.type_id) {
+                                continue;
+                            }
+                        }
+                        if self.deleted_nodes.contains_key(&entry.neighbor_id) {
+                            continue;
+                        }
+                        seen.insert(entry.edge_id);
+                        if callback(
+                            entry.edge_id,
+                            entry.neighbor_id,
+                            entry.weight,
+                            entry.valid_from,
+                            entry.valid_to,
+                        )
+                        .is_break()
+                        {
+                            return ControlFlow::Break(());
+                        }
+                    }
+                }
+                if let Some(map) = self.adj_in.get(&node_id) {
+                    for entry in map.values() {
+                        if seen.contains(&entry.edge_id) {
+                            continue;
+                        }
+                        if let Some(types) = type_filter {
+                            if !types.contains(&entry.type_id) {
+                                continue;
+                            }
+                        }
+                        if self.deleted_nodes.contains_key(&entry.neighbor_id) {
+                            continue;
+                        }
+                        if callback(
+                            entry.edge_id,
+                            entry.neighbor_id,
+                            entry.weight,
+                            entry.valid_from,
+                            entry.valid_to,
+                        )
+                        .is_break()
+                        {
+                            return ControlFlow::Break(());
+                        }
+                    }
+                }
+            }
+        }
+
+        ControlFlow::Continue(())
     }
 
     /// Return edge IDs incident to a node (outgoing + incoming).
@@ -475,7 +598,11 @@ impl Memtable {
     /// Find node IDs matching (type_id, prop_key, prop_value).
     /// Uses the hash index for fast lookup, then post-filters to handle collisions.
     pub fn find_nodes(&self, type_id: u32, prop_key: &str, prop_value: &PropValue) -> Vec<u64> {
-        let key = (type_id, hash_prop_key(prop_key), hash_prop_value(prop_value));
+        let key = (
+            type_id,
+            hash_prop_key(prop_key),
+            hash_prop_value(prop_value),
+        );
         match self.prop_node_index.get(&key) {
             Some(ids) => ids
                 .iter()
@@ -496,7 +623,11 @@ impl Memtable {
     /// Used to trigger flush when the memtable grows too large.
     pub fn estimated_size(&self) -> usize {
         // Per node: ~120 bytes base + key + props overhead
-        let node_size: usize = self.nodes.values().map(|n| 120 + n.key.len() + n.props.len() * 80).sum();
+        let node_size: usize = self
+            .nodes
+            .values()
+            .map(|n| 120 + n.key.len() + n.props.len() * 80)
+            .sum();
         // Per edge: ~100 bytes base + props overhead
         let edge_size: usize = self.edges.values().map(|e| 100 + e.props.len() * 80).sum();
         // Tombstones: ~16 bytes each
@@ -505,57 +636,37 @@ impl Memtable {
         let adj_size: usize = self.adj_out.values().map(|m| m.len() * 48).sum::<usize>()
             + self.adj_in.values().map(|m| m.len() * 48).sum::<usize>();
         // Type indexes: ~16 bytes per entry (u64 + hash overhead)
-        let type_idx_size: usize = self.type_node_index.values().map(|s| s.len() * 16).sum::<usize>()
-            + self.type_edge_index.values().map(|s| s.len() * 16).sum::<usize>();
+        let type_idx_size: usize = self
+            .type_node_index
+            .values()
+            .map(|s| s.len() * 16)
+            .sum::<usize>()
+            + self
+                .type_edge_index
+                .values()
+                .map(|s| s.len() * 16)
+                .sum::<usize>();
         // Prop index: ~40 bytes per key (u32 type_id + u64 key_hash + u64 value_hash + set overhead) + 16 per ID
-        let prop_idx_size: usize = self.prop_node_index.iter()
-            .map(|(_, ids)| 40 + ids.len() * 16)
+        let prop_idx_size: usize = self
+            .prop_node_index
+            .values()
+            .map(|ids| 40 + ids.len() * 16)
             .sum();
 
         // Time index: ~48 bytes per entry (tuple + BTree node overhead)
         let time_idx_size = self.time_node_index.len() * 48;
 
-        node_size + edge_size + tombstone_size + adj_size + type_idx_size + prop_idx_size + time_idx_size
+        node_size
+            + edge_size
+            + tombstone_size
+            + adj_size
+            + type_idx_size
+            + prop_idx_size
+            + time_idx_size
     }
 
     /// Remove a node from the memtable and all associated indexes.
     /// Used during compaction to strip auto-pruned nodes without generating tombstones.
-    /// Does NOT add to deleted_nodes (not a WAL-logged deletion).
-    ///
-    /// # Precondition
-    /// Must be called **before** edges referencing this node are inserted into the
-    /// memtable (i.e., between the node-merge and edge-merge phases of compaction).
-    /// If edges already reference this node, they will become orphans. Use the
-    /// `pruned_node_ids` set in the edge-merge phase to cascade-drop them instead.
-    pub(crate) fn remove_node(&mut self, id: u64) {
-        if let Some(node) = self.nodes.remove(&id) {
-            self.time_node_index.remove(&(node.type_id, node.updated_at, node.id));
-            if let Some(set) = self.type_node_index.get_mut(&node.type_id) {
-                set.remove(&id);
-                if set.is_empty() {
-                    self.type_node_index.remove(&node.type_id);
-                }
-            }
-            if let Some(inner) = self.node_key_index.get_mut(&node.type_id) {
-                inner.remove(&node.key);
-                if inner.is_empty() {
-                    self.node_key_index.remove(&node.type_id);
-                }
-            }
-            for (k, v) in &node.props {
-                let key = (node.type_id, hash_prop_key(k), hash_prop_value(v));
-                if let Some(set) = self.prop_node_index.get_mut(&key) {
-                    set.remove(&id);
-                    if set.is_empty() {
-                        self.prop_node_index.remove(&key);
-                    }
-                }
-            }
-        }
-        self.adj_out.remove(&id);
-        self.adj_in.remove(&id);
-    }
-
     /// Returns true if the memtable is empty (no live or deleted records).
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
@@ -700,8 +811,14 @@ mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")));
         mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
 
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
-        mt.apply_op(&WalOp::DeleteEdge { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
+        mt.apply_op(&WalOp::DeleteEdge {
+            id: 1,
+            deleted_at: 9999,
+        });
 
         assert!(mt.get_node(1).is_none());
         assert!(mt.get_edge(1).is_none());
@@ -724,7 +841,10 @@ mod tests {
         assert_eq!(mt.max_edge_id(), 99);
 
         // Delete: max should still reflect deleted IDs
-        mt.apply_op(&WalOp::DeleteNode { id: 42, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 42,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.max_node_id(), 42); // still 42 from deleted_nodes
     }
 
@@ -732,7 +852,10 @@ mod tests {
     fn test_re_upsert_after_delete() {
         let mut mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")));
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert!(mt.get_node(1).is_none());
 
         // Re-upsert with same ID
@@ -766,6 +889,31 @@ mod tests {
         assert!(mt.neighbors(1, Direction::Incoming, None, 0).is_empty());
         // Node 2 has no outgoing
         assert!(mt.neighbors(2, Direction::Outgoing, None, 0).is_empty());
+    }
+
+    #[test]
+    fn test_for_each_adj_entry_breaks_early() {
+        let mut mt = Memtable::new();
+        for id in 1..=4 {
+            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))));
+        }
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 4, 10)));
+
+        let mut seen = 0usize;
+        let flow = mt.for_each_adj_entry(
+            1,
+            Direction::Outgoing,
+            None,
+            &mut |_edge_id, _neighbor_id, _weight, _valid_from, _valid_to| {
+                seen += 1;
+                ControlFlow::Break(())
+            },
+        );
+
+        assert!(matches!(flow, ControlFlow::Break(())));
+        assert_eq!(seen, 1);
     }
 
     #[test]
@@ -840,7 +988,10 @@ mod tests {
 
         assert_eq!(mt.neighbors(1, Direction::Outgoing, None, 0).len(), 1);
 
-        mt.apply_op(&WalOp::DeleteEdge { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteEdge {
+            id: 1,
+            deleted_at: 9999,
+        });
 
         assert!(mt.neighbors(1, Direction::Outgoing, None, 0).is_empty());
         assert!(mt.neighbors(2, Direction::Incoming, None, 0).is_empty());
@@ -858,7 +1009,10 @@ mod tests {
         assert_eq!(mt.neighbors(1, Direction::Outgoing, None, 0).len(), 2);
 
         // Delete node 2. Edge still exists but node 2 should be excluded
-        mt.apply_op(&WalOp::DeleteNode { id: 2, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 2,
+            deleted_at: 9999,
+        });
 
         let out = mt.neighbors(1, Direction::Outgoing, None, 0);
         assert_eq!(out.len(), 1);
@@ -920,10 +1074,16 @@ mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")));
         mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
 
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.nodes_by_type(1), vec![2]);
 
-        mt.apply_op(&WalOp::DeleteEdge { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteEdge {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert!(mt.edges_by_type(10).is_empty());
     }
 
@@ -939,15 +1099,24 @@ mod tests {
         assert_eq!(mt.type_edge_index_key_count(), 1); // type 10
 
         // Delete all members of type 1. Internal map entry should be pruned
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.type_node_index_key_count(), 1); // only type 2 remains
 
         // Delete the edge. Edge type map entry should be pruned
-        mt.apply_op(&WalOp::DeleteEdge { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteEdge {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.type_edge_index_key_count(), 0);
 
         // Delete remaining node
-        mt.apply_op(&WalOp::DeleteNode { id: 2, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 2,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.type_node_index_key_count(), 0);
     }
 
@@ -956,11 +1125,16 @@ mod tests {
         let mut mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "apple", props)));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1, 1, "apple", props,
+        )));
 
         assert_eq!(mt.prop_node_index_key_count(), 1);
 
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.prop_node_index_key_count(), 0); // pruned, not just empty
     }
 
@@ -969,7 +1143,12 @@ mod tests {
         let mut mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "apple", props.clone())));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1,
+            1,
+            "apple",
+            props.clone(),
+        )));
 
         // prop key is (type_id=1, "color", hash("red"))
         assert_eq!(mt.prop_node_index_key_count(), 1);
@@ -977,7 +1156,9 @@ mod tests {
         // Re-upsert same node with different props. Old prop entry should be pruned
         let mut new_props = BTreeMap::new();
         new_props.insert("size".to_string(), PropValue::String("large".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "apple", new_props)));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1, 1, "apple", new_props,
+        )));
 
         // Old (color, red) entry pruned, new (size, large) entry added
         assert_eq!(mt.prop_node_index_key_count(), 1);
@@ -1008,10 +1189,16 @@ mod tests {
         assert_eq!(mt.node_key_index_key_count(), 2); // type 1 + type 2
 
         // Delete only member of type 1. Inner map should be pruned
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.node_key_index_key_count(), 1); // only type 2
 
-        mt.apply_op(&WalOp::DeleteNode { id: 2, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 2,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.node_key_index_key_count(), 0);
     }
 
@@ -1023,10 +1210,13 @@ mod tests {
         mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
 
         assert_eq!(mt.adj_out_key_count(), 1); // node 1 has outgoing
-        assert_eq!(mt.adj_in_key_count(), 1);  // node 2 has incoming
+        assert_eq!(mt.adj_in_key_count(), 1); // node 2 has incoming
 
         // Delete the edge. Adjacency entries should be pruned
-        mt.apply_op(&WalOp::DeleteEdge { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteEdge {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.adj_out_key_count(), 0);
         assert_eq!(mt.adj_in_key_count(), 0);
     }
@@ -1035,7 +1225,10 @@ mod tests {
     fn test_type_index_re_upsert_after_delete() {
         let mut mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")));
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert!(mt.nodes_by_type(1).is_empty());
 
         // Re-upsert, should reappear in type index
@@ -1045,7 +1238,12 @@ mod tests {
 
     // --- Property index tests ---
 
-    fn make_node_with_props(id: u64, type_id: u32, key: &str, props: BTreeMap<String, PropValue>) -> NodeRecord {
+    fn make_node_with_props(
+        id: u64,
+        type_id: u32,
+        key: &str,
+        props: BTreeMap<String, PropValue>,
+    ) -> NodeRecord {
         NodeRecord {
             id,
             type_id,
@@ -1062,15 +1260,24 @@ mod tests {
         let mut mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "apple", props.clone())));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1,
+            1,
+            "apple",
+            props.clone(),
+        )));
 
         let mut props2 = BTreeMap::new();
         props2.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(2, 1, "cherry", props2)));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            2, 1, "cherry", props2,
+        )));
 
         let mut props3 = BTreeMap::new();
         props3.insert("color".to_string(), PropValue::String("green".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(3, 1, "lime", props3)));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            3, 1, "lime", props3,
+        )));
 
         // Find red nodes of type 1
         let mut reds = mt.find_nodes(1, "color", &PropValue::String("red".to_string()));
@@ -1082,32 +1289,57 @@ mod tests {
         assert_eq!(greens, vec![3]);
 
         // Non-existent value
-        assert!(mt.find_nodes(1, "color", &PropValue::String("blue".to_string())).is_empty());
+        assert!(mt
+            .find_nodes(1, "color", &PropValue::String("blue".to_string()))
+            .is_empty());
 
         // Non-existent key
-        assert!(mt.find_nodes(1, "shape", &PropValue::String("round".to_string())).is_empty());
+        assert!(mt
+            .find_nodes(1, "shape", &PropValue::String("round".to_string()))
+            .is_empty());
 
         // Wrong type_id
-        assert!(mt.find_nodes(2, "color", &PropValue::String("red".to_string())).is_empty());
+        assert!(mt
+            .find_nodes(2, "color", &PropValue::String("red".to_string()))
+            .is_empty());
     }
 
     #[test]
     fn test_prop_index_updated_on_upsert() {
         let mut mt = Memtable::new();
         let mut props = BTreeMap::new();
-        props.insert("status".to_string(), PropValue::String("active".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "item", props)));
+        props.insert(
+            "status".to_string(),
+            PropValue::String("active".to_string()),
+        );
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1, 1, "item", props,
+        )));
 
-        assert_eq!(mt.find_nodes(1, "status", &PropValue::String("active".to_string())).len(), 1);
+        assert_eq!(
+            mt.find_nodes(1, "status", &PropValue::String("active".to_string()))
+                .len(),
+            1
+        );
 
         // Update: change status to "inactive"
         let mut props2 = BTreeMap::new();
-        props2.insert("status".to_string(), PropValue::String("inactive".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "item", props2)));
+        props2.insert(
+            "status".to_string(),
+            PropValue::String("inactive".to_string()),
+        );
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1, 1, "item", props2,
+        )));
 
         // Old value gone, new value present
-        assert!(mt.find_nodes(1, "status", &PropValue::String("active".to_string())).is_empty());
-        assert_eq!(mt.find_nodes(1, "status", &PropValue::String("inactive".to_string())), vec![1]);
+        assert!(mt
+            .find_nodes(1, "status", &PropValue::String("active".to_string()))
+            .is_empty());
+        assert_eq!(
+            mt.find_nodes(1, "status", &PropValue::String("inactive".to_string())),
+            vec![1]
+        );
     }
 
     #[test]
@@ -1115,13 +1347,24 @@ mod tests {
         let mut mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "apple", props)));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1, 1, "apple", props,
+        )));
 
-        assert_eq!(mt.find_nodes(1, "color", &PropValue::String("red".to_string())).len(), 1);
+        assert_eq!(
+            mt.find_nodes(1, "color", &PropValue::String("red".to_string()))
+                .len(),
+            1
+        );
 
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
 
-        assert!(mt.find_nodes(1, "color", &PropValue::String("red".to_string())).is_empty());
+        assert!(mt
+            .find_nodes(1, "color", &PropValue::String("red".to_string()))
+            .is_empty());
     }
 
     #[test]
@@ -1130,9 +1373,14 @@ mod tests {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
         props.insert("size".to_string(), PropValue::Int(42));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "item", props)));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1, 1, "item", props,
+        )));
 
-        assert_eq!(mt.find_nodes(1, "color", &PropValue::String("red".to_string())), vec![1]);
+        assert_eq!(
+            mt.find_nodes(1, "color", &PropValue::String("red".to_string())),
+            vec![1]
+        );
         assert_eq!(mt.find_nodes(1, "size", &PropValue::Int(42)), vec![1]);
         assert!(mt.find_nodes(1, "size", &PropValue::Int(99)).is_empty());
     }
@@ -1142,73 +1390,32 @@ mod tests {
         let mut mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("tag".to_string(), PropValue::String("a".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "item", props)));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1, 1, "item", props,
+        )));
 
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
-        assert!(mt.find_nodes(1, "tag", &PropValue::String("a".to_string())).is_empty());
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
+        assert!(mt
+            .find_nodes(1, "tag", &PropValue::String("a".to_string()))
+            .is_empty());
 
         // Re-upsert with different value
         let mut props2 = BTreeMap::new();
         props2.insert("tag".to_string(), PropValue::String("b".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "item_v2", props2)));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
+            1, 1, "item_v2", props2,
+        )));
 
-        assert!(mt.find_nodes(1, "tag", &PropValue::String("a".to_string())).is_empty());
-        assert_eq!(mt.find_nodes(1, "tag", &PropValue::String("b".to_string())), vec![1]);
-    }
-
-    #[test]
-    fn test_remove_node_cleans_all_indexes() {
-        let mut mt = Memtable::new();
-
-        // Insert two nodes of different types with props
-        let mut props = BTreeMap::new();
-        props.insert("tag".to_string(), PropValue::String("x".to_string()));
-        let n1 = NodeRecord {
-            id: 1,
-            type_id: 1,
-            key: "alice".to_string(),
-            props: props.clone(),
-            created_at: 1000,
-            updated_at: 1001,
-            weight: 0.5,
-        };
-        let n2 = make_node(2, 2, "bob");
-        mt.apply_op(&WalOp::UpsertNode(n1));
-        mt.apply_op(&WalOp::UpsertNode(n2));
-
-        // Add adjacency (edges reference node 1)
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
-
-        // Verify indexes are populated
-        assert_eq!(mt.node_count(), 2);
-        assert!(mt.node_by_key(1, "alice").is_some());
-        assert_eq!(mt.type_node_index_key_count(), 2);
-        assert_eq!(mt.prop_node_index_key_count(), 1);
-        assert_eq!(mt.adj_out_key_count(), 1); // node 1 has outgoing
-        assert_eq!(mt.adj_in_key_count(), 1);  // node 2 has incoming
-
-        // Remove node 1
-        mt.remove_node(1);
-
-        // Node itself removed
-        assert_eq!(mt.node_count(), 1);
-        assert!(mt.get_node(1).is_none());
-
-        // Key index cleaned
-        assert!(mt.node_by_key(1, "alice").is_none());
-
-        // Type index for type 1 cleaned (only type 2 remains)
-        assert_eq!(mt.type_node_index_key_count(), 1);
-
-        // Prop index cleaned
-        assert_eq!(mt.prop_node_index_key_count(), 0);
-
-        // Adjacency cleaned for node 1
-        assert_eq!(mt.adj_out_key_count(), 0);
-
-        // Node 2 still intact
-        assert!(mt.get_node(2).is_some());
-        assert!(mt.node_by_key(2, "bob").is_some());
+        assert!(mt
+            .find_nodes(1, "tag", &PropValue::String("a".to_string()))
+            .is_empty());
+        assert_eq!(
+            mt.find_nodes(1, "tag", &PropValue::String("b".to_string())),
+            vec![1]
+        );
     }
 
     #[test]
@@ -1226,7 +1433,10 @@ mod tests {
         // The type index contributes: 2 node types × 1 entry × 16 + 1 edge type × 1 entry × 16 = 48
         // Verify type index adds non-trivial overhead by checking it's larger
         // than just nodes + edges + adjacency alone would suggest
-        assert!(size_with_data >= 48, "estimated_size should include type index overhead");
+        assert!(
+            size_with_data >= 48,
+            "estimated_size should include type index overhead"
+        );
     }
 
     fn make_node_at(id: u64, type_id: u32, key: &str, updated_at: i64) -> NodeRecord {
@@ -1302,21 +1512,10 @@ mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node_at(2, 1, "b", 200)));
         assert_eq!(mt.time_node_index_len(), 2);
 
-        mt.apply_op(&WalOp::DeleteNode { id: 1, deleted_at: 9999 });
-        assert_eq!(mt.time_node_index_len(), 1);
-        assert_eq!(mt.nodes_by_time_range(1, 0, 300).len(), 1);
-        assert!(mt.nodes_by_time_range(1, 0, 300).contains(&2));
-    }
-
-    #[test]
-    fn test_time_index_remove_node_cleanup() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)));
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(2, 1, "b", 200)));
-        assert_eq!(mt.time_node_index_len(), 2);
-
-        // remove_node is used by compaction auto-prune
-        mt.remove_node(1);
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 9999,
+        });
         assert_eq!(mt.time_node_index_len(), 1);
         assert_eq!(mt.nodes_by_time_range(1, 0, 300).len(), 1);
         assert!(mt.nodes_by_time_range(1, 0, 300).contains(&2));

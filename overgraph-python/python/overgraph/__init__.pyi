@@ -52,6 +52,25 @@ class PyNeighborEntry:
     valid_to: int
     def __repr__(self) -> str: ...
 
+class PyTraversalHit:
+    node_id: int
+    depth: int
+    via_edge_id: int | None
+    score: float | None
+    def __repr__(self) -> str: ...
+
+class PyTraversalCursor:
+    depth: int
+    last_node_id: int
+    def __init__(self, depth: int, last_node_id: int) -> None: ...
+    def __repr__(self) -> str: ...
+
+class PyShortestPath:
+    nodes: list[int]
+    edges: list[int]
+    total_cost: float
+    def __repr__(self) -> str: ...
+
 class PySubgraph:
     nodes: list[PyNodeRecord]
     edges: list[PyEdgeRecord]
@@ -134,6 +153,13 @@ class PyEdgePageResult:
 class PyNeighborPageResult:
     items: list[PyNeighborEntry]
     next_cursor: int | None
+    def __len__(self) -> int: ...
+    def __bool__(self) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class PyTraversalPageResult:
+    items: list[PyTraversalHit]
+    next_cursor: PyTraversalCursor | None
     def __len__(self) -> int: ...
     def __bool__(self) -> bool: ...
     def __repr__(self) -> str: ...
@@ -237,25 +263,19 @@ class OverGraph:
         at_epoch: int | None = None,
         decay_lambda: float | None = None,
     ) -> list[PyNeighborEntry]: ...
-    def neighbors_2hop(
+    def traverse(
         self,
-        node_id: int,
+        start: int,
+        min_depth: int = 0,
+        max_depth: int = 2,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
-        limit: int | None = None,
+        edge_type_filter: list[int] | None = None,
+        node_type_filter: list[int] | None = None,
         at_epoch: int | None = None,
         decay_lambda: float | None = None,
-    ) -> list[PyNeighborEntry]: ...
-    def neighbors_2hop_constrained(
-        self,
-        node_id: int,
-        direction: str = "outgoing",
-        traverse_edge_types: list[int] | None = None,
-        target_node_types: list[int] | None = None,
         limit: int | None = None,
-        at_epoch: int | None = None,
-        decay_lambda: float | None = None,
-    ) -> list[PyNeighborEntry]: ...
+        cursor: PyTraversalCursor | None = None,
+    ) -> PyTraversalPageResult: ...
     def top_k_neighbors(
         self,
         node_id: int,
@@ -283,6 +303,70 @@ class OverGraph:
         decay_lambda: float | None = None,
     ) -> dict[int, list[PyNeighborEntry]]: ...
 
+    # Degree counts + aggregations
+    def degree(
+        self,
+        node_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> int: ...
+    def sum_edge_weights(
+        self,
+        node_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> float: ...
+    def avg_edge_weight(
+        self,
+        node_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> float | None: ...
+    def degrees(
+        self,
+        node_ids: list[int],
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> dict[int, int]: ...
+
+    # Shortest path
+    def shortest_path(
+        self,
+        from_id: int,
+        to_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        weight_field: str | None = None,
+        at_epoch: int | None = None,
+        max_depth: int | None = None,
+        max_cost: float | None = None,
+    ) -> PyShortestPath | None: ...
+    def is_connected(
+        self,
+        from_id: int,
+        to_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+        max_depth: int | None = None,
+    ) -> bool: ...
+    def all_shortest_paths(
+        self,
+        from_id: int,
+        to_id: int,
+        direction: str = "outgoing",
+        type_filter: list[int] | None = None,
+        weight_field: str | None = None,
+        at_epoch: int | None = None,
+        max_depth: int | None = None,
+        max_cost: float | None = None,
+        max_paths: int | None = None,
+    ) -> list[PyShortestPath]: ...
+
     # Retention
     def prune(
         self,
@@ -303,6 +387,8 @@ class OverGraph:
     # Maintenance
     def sync(self) -> None: ...
     def flush(self) -> PySegmentInfo | None: ...
+    def ingest_mode(self) -> None: ...
+    def end_ingest(self) -> PyCompactionStats | None: ...
     def compact(self) -> PyCompactionStats | None: ...
     def compact_with_progress(self, callback: Callable[[PyCompactionProgress], bool]) -> PyCompactionStats | None: ...
 
@@ -318,27 +404,6 @@ class OverGraph:
         node_id: int,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
-        limit: int | None = None,
-        after: int | None = None,
-        at_epoch: int | None = None,
-        decay_lambda: float | None = None,
-    ) -> PyNeighborPageResult: ...
-    def neighbors_2hop_paged(
-        self,
-        node_id: int,
-        direction: str = "outgoing",
-        type_filter: list[int] | None = None,
-        limit: int | None = None,
-        after: int | None = None,
-        at_epoch: int | None = None,
-        decay_lambda: float | None = None,
-    ) -> PyNeighborPageResult: ...
-    def neighbors_2hop_constrained_paged(
-        self,
-        node_id: int,
-        direction: str = "outgoing",
-        traverse_edge_types: list[int] | None = None,
-        target_node_types: list[int] | None = None,
         limit: int | None = None,
         after: int | None = None,
         at_epoch: int | None = None,
@@ -361,6 +426,25 @@ class OverGraph:
         edge_type_filter: list[int] | None = None,
         include_weights: bool = True,
     ) -> PyAdjacencyExport: ...
+
+    # Connected Components (Phase 18d)
+    def connected_components(
+        self,
+        edge_type_filter: list[int] | None = None,
+        node_type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> dict[int, int]:
+        """Weakly connected components. Returns {node_id: component_id} where component_id = min node ID in component."""
+        ...
+    def component_of(
+        self,
+        node_id: int,
+        edge_type_filter: list[int] | None = None,
+        node_type_filter: list[int] | None = None,
+        at_epoch: int | None = None,
+    ) -> list[int]:
+        """Returns sorted list of node IDs in the same WCC component as node_id. Empty if node missing/hidden."""
+        ...
 
 # ============================================================
 # Async API
@@ -411,11 +495,21 @@ class AsyncOverGraph:
 
     # Traversal
     async def neighbors(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, limit: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> list[PyNeighborEntry]: ...
-    async def neighbors_2hop(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, limit: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> list[PyNeighborEntry]: ...
-    async def neighbors_2hop_constrained(self, node_id: int, direction: str = "outgoing", traverse_edge_types: list[int] | None = None, target_node_types: list[int] | None = None, limit: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> list[PyNeighborEntry]: ...
+    async def traverse(self, start: int, min_depth: int = 0, max_depth: int = 2, direction: str = "outgoing", edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None, decay_lambda: float | None = None, limit: int | None = None, cursor: PyTraversalCursor | None = None) -> PyTraversalPageResult: ...
     async def top_k_neighbors(self, node_id: int, k: int, direction: str = "outgoing", type_filter: list[int] | None = None, scoring: str = "weight", at_epoch: int | None = None, decay_lambda: float | None = None) -> list[PyNeighborEntry]: ...
     async def extract_subgraph(self, start_node_id: int, max_depth: int = 2, direction: str = "outgoing", edge_type_filter: list[int] | None = None, at_epoch: int | None = None) -> PySubgraph: ...
     async def neighbors_batch(self, node_ids: list[int], direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> dict[int, list[PyNeighborEntry]]: ...
+
+    # Degree counts + aggregations
+    async def degree(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> int: ...
+    async def sum_edge_weights(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> float: ...
+    async def avg_edge_weight(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> float | None: ...
+    async def degrees(self, node_ids: list[int], direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> dict[int, int]: ...
+
+    # Shortest path
+    async def shortest_path(self, from_id: int, to_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, weight_field: str | None = None, at_epoch: int | None = None, max_depth: int | None = None, max_cost: float | None = None) -> PyShortestPath | None: ...
+    async def is_connected(self, from_id: int, to_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None, max_depth: int | None = None) -> bool: ...
+    async def all_shortest_paths(self, from_id: int, to_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, weight_field: str | None = None, at_epoch: int | None = None, max_depth: int | None = None, max_cost: float | None = None, max_paths: int | None = None) -> list[PyShortestPath]: ...
 
     # Retention
     async def prune(self, max_age_ms: int | None = None, max_weight: float | None = None, type_id: int | None = None) -> PyPruneResult: ...
@@ -426,6 +520,8 @@ class AsyncOverGraph:
     # Maintenance
     async def sync(self) -> None: ...
     async def flush(self) -> PySegmentInfo | None: ...
+    async def ingest_mode(self) -> None: ...
+    async def end_ingest(self) -> PyCompactionStats | None: ...
     async def compact(self) -> PyCompactionStats | None: ...
     async def compact_with_progress(self, callback: Callable[[PyCompactionProgress], bool]) -> PyCompactionStats | None: ...
 
@@ -437,9 +533,9 @@ class AsyncOverGraph:
     async def find_nodes_paged(self, type_id: int, prop_key: str, prop_value: Any, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
     async def find_nodes_by_time_range_paged(self, type_id: int, from_ms: int, to_ms: int, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
     async def neighbors_paged(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, limit: int | None = None, after: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> PyNeighborPageResult: ...
-    async def neighbors_2hop_paged(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, limit: int | None = None, after: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> PyNeighborPageResult: ...
-    async def neighbors_2hop_constrained_paged(self, node_id: int, direction: str = "outgoing", traverse_edge_types: list[int] | None = None, target_node_types: list[int] | None = None, limit: int | None = None, after: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> PyNeighborPageResult: ...
 
     # Analytics
     async def personalized_pagerank(self, seed_node_ids: list[int], damping_factor: float | None = None, max_iterations: int | None = None, epsilon: float | None = None, edge_type_filter: list[int] | None = None, max_results: int | None = None) -> PyPprResult: ...
     async def export_adjacency(self, node_type_filter: list[int] | None = None, edge_type_filter: list[int] | None = None, include_weights: bool = True) -> PyAdjacencyExport: ...
+    async def connected_components(self, edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None) -> dict[int, int]: ...
+    async def component_of(self, node_id: int, edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None) -> list[int]: ...

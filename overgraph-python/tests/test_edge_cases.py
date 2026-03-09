@@ -66,8 +66,8 @@ class TestTemporalFiltering:
         assert b in ids, "currently-valid edge should be returned"
         assert c not in ids, "expired edge should be excluded"
 
-    def test_neighbors_2hop_at_epoch(self, db):
-        """2-hop traversal respects at_epoch on both hops."""
+    def test_traverse_two_hop_at_epoch(self, db):
+        """Traversal respects at_epoch across both hops."""
         a = db.upsert_node(1, "a")
         b = db.upsert_node(1, "b")
         c = db.upsert_node(1, "c")
@@ -76,21 +76,20 @@ class TestTemporalFiltering:
         db.upsert_edge(b, c, 10, valid_from=2000, valid_to=6000)
 
         # epoch 3000: both hops valid, C reachable
-        nbrs = db.neighbors_2hop(a, "outgoing", at_epoch=3000)
-        ids = {n.node_id for n in nbrs}
-        assert c in ids
+        page = db.traverse(a, min_depth=2, max_depth=2, direction="outgoing", at_epoch=3000)
+        assert [(hit.node_id, hit.depth) for hit in page.items] == [(c, 2)]
 
         # epoch 500: A->B not yet valid, so nothing reachable
         nbrs_1hop = db.neighbors(a, "outgoing", at_epoch=500)
         assert len(nbrs_1hop) == 0
-        nbrs_2hop = db.neighbors_2hop(a, "outgoing", at_epoch=500)
-        assert len(nbrs_2hop) == 0
+        page = db.traverse(a, min_depth=2, max_depth=2, direction="outgoing", at_epoch=500)
+        assert len(page.items) == 0
 
         # epoch 5500: A->B expired, so B not reachable at 1-hop, C not reachable
         nbrs_1hop = db.neighbors(a, "outgoing", at_epoch=5500)
         assert len(nbrs_1hop) == 0
-        nbrs_2hop = db.neighbors_2hop(a, "outgoing", at_epoch=5500)
-        assert len(nbrs_2hop) == 0
+        page = db.traverse(a, min_depth=2, max_depth=2, direction="outgoing", at_epoch=5500)
+        assert len(page.items) == 0
 
     def test_neighbors_batch_at_epoch(self, db):
         """Batch neighbor queries respect at_epoch."""

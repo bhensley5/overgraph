@@ -262,29 +262,38 @@ class TestAsyncPagination:
 
 class TestAsyncTraversal2:
     @pytest.mark.asyncio
-    async def test_neighbors_2hop(self, async_db):
+    async def test_traverse(self, async_db):
         n1 = await async_db.upsert_node(1, "a")
         n2 = await async_db.upsert_node(1, "b")
         n3 = await async_db.upsert_node(1, "c")
         await async_db.upsert_edge(n1, n2, 10)
         await async_db.upsert_edge(n2, n3, 10)
-        nbrs = await async_db.neighbors_2hop(n1, "outgoing")
-        node_ids = {n.node_id for n in nbrs}
-        assert n3 in node_ids
+        page = await async_db.traverse(n1, min_depth=2, max_depth=2, direction="outgoing")
+        assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
 
     @pytest.mark.asyncio
-    async def test_neighbors_2hop_constrained(self, async_db):
+    async def test_traverse_node_type_filter(self, async_db):
         n1 = await async_db.upsert_node(1, "a")
         n2 = await async_db.upsert_node(2, "b")
         n3 = await async_db.upsert_node(3, "c")
         await async_db.upsert_edge(n1, n2, 10)
         await async_db.upsert_edge(n2, n3, 10)
-        nbrs = await async_db.neighbors_2hop_constrained(
-            n1, "outgoing", traverse_edge_types=[10], target_node_types=[3],
+        page = await async_db.traverse(
+            n1,
+            min_depth=2,
+            max_depth=2,
+            direction="outgoing",
+            edge_type_filter=[10],
+            node_type_filter=[3],
         )
-        node_ids = {n.node_id for n in nbrs}
-        assert n3 in node_ids
-        assert n2 not in node_ids
+        assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
+
+    @pytest.mark.asyncio
+    async def test_removed_two_hop_async_apis_stay_absent(self, async_db):
+        assert not hasattr(async_db, "neighbors_2hop")
+        assert not hasattr(async_db, "neighbors_2hop_paged")
+        assert not hasattr(async_db, "neighbors_2hop_constrained")
+        assert not hasattr(async_db, "neighbors_2hop_constrained_paged")
 
     @pytest.mark.asyncio
     async def test_neighbors_batch(self, async_db):
@@ -389,26 +398,37 @@ class TestAsyncPagination2:
         assert len(page.items) == 3
 
     @pytest.mark.asyncio
-    async def test_neighbors_2hop_paged(self, async_db):
+    async def test_traverse_paged(self, async_db):
         n1 = await async_db.upsert_node(1, "a")
         n2 = await async_db.upsert_node(1, "b")
         n3 = await async_db.upsert_node(1, "c")
         await async_db.upsert_edge(n1, n2, 10)
         await async_db.upsert_edge(n2, n3, 10)
-        page = await async_db.neighbors_2hop_paged(n1, "outgoing")
-        assert len(page.items) >= 1
+        page = await async_db.traverse(n1, min_depth=2, max_depth=2, direction="outgoing")
+        assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
 
     @pytest.mark.asyncio
-    async def test_neighbors_2hop_constrained_paged(self, async_db):
+    async def test_traverse_cursor_roundtrip(self, async_db):
         n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(2, "b")
-        n3 = await async_db.upsert_node(3, "c")
+        n2 = await async_db.upsert_node(1, "b")
+        n3 = await async_db.upsert_node(1, "c")
+        n4 = await async_db.upsert_node(1, "d")
         await async_db.upsert_edge(n1, n2, 10)
         await async_db.upsert_edge(n2, n3, 10)
-        page = await async_db.neighbors_2hop_constrained_paged(
-            n1, "outgoing", traverse_edge_types=[10], target_node_types=[3],
+        await async_db.upsert_edge(n2, n4, 10)
+        p1 = await async_db.traverse(n1, min_depth=2, max_depth=2, direction="outgoing", limit=1)
+        assert len(p1.items) == 1
+        assert p1.next_cursor is not None
+        p2 = await async_db.traverse(
+            n1,
+            min_depth=2,
+            max_depth=2,
+            direction="outgoing",
+            limit=1,
+            cursor=p1.next_cursor,
         )
-        assert len(page.items) >= 1
+        assert len(p2.items) == 1
+        assert p1.items[0].node_id != p2.items[0].node_id
 
 
 class TestAsyncMaintenance2:
@@ -469,3 +489,40 @@ class TestAsyncAnalytics:
         export = await async_db.export_adjacency()
         assert len(export.node_ids) == 2
         assert len(export.edges) == 1
+
+
+class TestAsyncDegree:
+    @pytest.mark.asyncio
+    async def test_degree(self, async_db):
+        a = await async_db.upsert_node(1, "a")
+        b = await async_db.upsert_node(1, "b")
+        await async_db.upsert_edge(a, b, 10, weight=5.0)
+        assert await async_db.degree(a) == 1
+        assert await async_db.degree(b) == 0
+
+    @pytest.mark.asyncio
+    async def test_sum_edge_weights(self, async_db):
+        a = await async_db.upsert_node(1, "a")
+        b = await async_db.upsert_node(1, "b")
+        await async_db.upsert_edge(a, b, 10, weight=5.0)
+        s = await async_db.sum_edge_weights(a)
+        assert abs(s - 5.0) < 1e-6
+
+    @pytest.mark.asyncio
+    async def test_avg_edge_weight(self, async_db):
+        a = await async_db.upsert_node(1, "a")
+        b = await async_db.upsert_node(1, "b")
+        await async_db.upsert_edge(a, b, 10, weight=5.0)
+        avg = await async_db.avg_edge_weight(a)
+        assert avg is not None
+        assert abs(avg - 5.0) < 1e-6
+        assert await async_db.avg_edge_weight(999999) is None
+
+    @pytest.mark.asyncio
+    async def test_degrees_batch(self, async_db):
+        a = await async_db.upsert_node(1, "a")
+        b = await async_db.upsert_node(1, "b")
+        await async_db.upsert_edge(a, b, 10)
+        result = await async_db.degrees([a, b])
+        assert isinstance(result, dict)
+        assert result[a] == 1

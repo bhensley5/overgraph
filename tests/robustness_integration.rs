@@ -30,16 +30,24 @@ fn test_crash_recovery_wal_replay() {
     // Phase 1: write data, flush some to segment, leave some in WAL only
     {
         let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
-        node_a = db.upsert_node(1, "alice", make_props("role", "admin"), 1.0).unwrap();
-        node_b = db.upsert_node(1, "bob", make_props("role", "user"), 0.5).unwrap();
-        edge_ab = db.upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        node_a = db
+            .upsert_node(1, "alice", make_props("role", "admin"), 1.0)
+            .unwrap();
+        node_b = db
+            .upsert_node(1, "bob", make_props("role", "user"), 0.5)
+            .unwrap();
+        edge_ab = db
+            .upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None)
+            .unwrap();
 
         // Flush to segment
         db.flush().unwrap();
 
         // Write more data that stays in WAL only
-        db.upsert_node(2, "charlie", make_props("role", "viewer"), 0.3).unwrap();
-        db.upsert_node(2, "diana", make_props("role", "editor"), 0.8).unwrap();
+        db.upsert_node(2, "charlie", make_props("role", "viewer"), 0.3)
+            .unwrap();
+        db.upsert_node(2, "diana", make_props("role", "editor"), 0.8)
+            .unwrap();
 
         // Drop without close() -- simulates crash
         // (The Drop impl will attempt cleanup but WAL data should be durable)
@@ -52,7 +60,10 @@ fn test_crash_recovery_wal_replay() {
         // Segment data
         let alice = db.get_node(node_a).unwrap().unwrap();
         assert_eq!(alice.key, "alice");
-        assert_eq!(alice.props.get("role"), Some(&PropValue::String("admin".to_string())));
+        assert_eq!(
+            alice.props.get("role"),
+            Some(&PropValue::String("admin".to_string()))
+        );
 
         let bob = db.get_node(node_b).unwrap().unwrap();
         assert_eq!(bob.key, "bob");
@@ -63,13 +74,18 @@ fn test_crash_recovery_wal_replay() {
 
         // WAL-only data should be recovered
         let charlie = db.get_node_by_key(2, "charlie").unwrap();
-        assert!(charlie.is_some(), "WAL-only node 'charlie' should be recovered");
+        assert!(
+            charlie.is_some(),
+            "WAL-only node 'charlie' should be recovered"
+        );
 
         let diana = db.get_node_by_key(2, "diana").unwrap();
         assert!(diana.is_some(), "WAL-only node 'diana' should be recovered");
 
         // Neighbors should work across recovered data
-        let nbrs = db.neighbors(node_a, Direction::Outgoing, None, 0, None, None).unwrap();
+        let nbrs = db
+            .neighbors(node_a, Direction::Outgoing, None, 0, None, None)
+            .unwrap();
         assert_eq!(nbrs.len(), 1);
         assert_eq!(nbrs[0].node_id, node_b);
 
@@ -96,7 +112,8 @@ fn test_crash_recovery_with_deletes() {
         let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
         node_a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
         node_b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None)
+            .unwrap();
         db.flush().unwrap();
 
         // Delete node_a (and cascade edge) -- stays in WAL
@@ -106,10 +123,18 @@ fn test_crash_recovery_with_deletes() {
 
     {
         let db = DatabaseEngine::open(&db_path, &opts).unwrap();
-        assert!(db.get_node(node_a).unwrap().is_none(), "deleted node should stay deleted after crash");
-        assert!(db.get_node(node_b).unwrap().is_some(), "non-deleted node should survive");
+        assert!(
+            db.get_node(node_a).unwrap().is_none(),
+            "deleted node should stay deleted after crash"
+        );
+        assert!(
+            db.get_node(node_b).unwrap().is_some(),
+            "non-deleted node should survive"
+        );
         // Edge should be cascade-deleted
-        let nbrs = db.neighbors(node_b, Direction::Incoming, None, 0, None, None).unwrap();
+        let nbrs = db
+            .neighbors(node_b, Direction::Incoming, None, 0, None, None)
+            .unwrap();
         assert!(nbrs.is_empty(), "cascade-deleted edge should not appear");
         db.close().unwrap();
     }
@@ -207,7 +232,9 @@ fn test_large_scale_100k_nodes() {
     }
 
     // Neighbors
-    let nbrs = db.neighbors(all_ids[0], Direction::Outgoing, None, 0, None, None).unwrap();
+    let nbrs = db
+        .neighbors(all_ids[0], Direction::Outgoing, None, 0, None, None)
+        .unwrap();
     assert!(!nbrs.is_empty());
 
     // Close and reopen
@@ -280,7 +307,9 @@ fn test_engine_wal_truncated_record_recovery() {
     // Write valid data
     {
         let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
-        node_a = db.upsert_node(1, "valid_node", make_props("k", "v"), 1.0).unwrap();
+        node_a = db
+            .upsert_node(1, "valid_node", make_props("k", "v"), 1.0)
+            .unwrap();
         db.close().unwrap();
     }
 
@@ -288,7 +317,10 @@ fn test_engine_wal_truncated_record_recovery() {
     let wal_path = db_path.join("data.wal");
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
         // Write a partial record frame: valid length but truncated payload
         f.write_all(&100u32.to_le_bytes()).unwrap(); // claims 100 bytes of payload
         f.write_all(&[0xDE, 0xAD]).unwrap(); // but only 2 bytes follow
@@ -299,7 +331,10 @@ fn test_engine_wal_truncated_record_recovery() {
     {
         let db = DatabaseEngine::open(&db_path, &opts).unwrap();
         let node = db.get_node(node_a).unwrap();
-        assert!(node.is_some(), "valid node should survive WAL truncation recovery");
+        assert!(
+            node.is_some(),
+            "valid node should survive WAL truncation recovery"
+        );
         assert_eq!(node.unwrap().key, "valid_node");
         db.close().unwrap();
     }
@@ -326,28 +361,37 @@ fn test_temporal_edges_cross_source() {
     let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
 
     // Edge in segment: A→B valid [1000, 5000)
-    db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(1000), Some(5000)).unwrap();
+    db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(1000), Some(5000))
+        .unwrap();
     db.flush().unwrap();
 
     // Edge in memtable: A→C valid [3000, 9000)
-    db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, Some(3000), Some(9000)).unwrap();
+    db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, Some(3000), Some(9000))
+        .unwrap();
 
     // Always-valid edge in memtable: A→D (explicit valid_from=0 means always-valid)
-    db.upsert_edge(a, d, 10, BTreeMap::new(), 1.0, Some(0), None).unwrap();
+    db.upsert_edge(a, d, 10, BTreeMap::new(), 1.0, Some(0), None)
+        .unwrap();
 
     // at_epoch=2000: B (segment) + D (always-valid)
-    let n = db.neighbors(a, Direction::Outgoing, None, 0, Some(2000), None).unwrap();
+    let n = db
+        .neighbors(a, Direction::Outgoing, None, 0, Some(2000), None)
+        .unwrap();
     let ids: Vec<u64> = n.iter().map(|e| e.node_id).collect();
     assert!(ids.contains(&b), "B should be visible at t=2000");
     assert!(ids.contains(&d), "D (always-valid) should be visible");
     assert!(!ids.contains(&c), "C should NOT be visible at t=2000");
 
     // at_epoch=4000: all three
-    let n = db.neighbors(a, Direction::Outgoing, None, 0, Some(4000), None).unwrap();
+    let n = db
+        .neighbors(a, Direction::Outgoing, None, 0, Some(4000), None)
+        .unwrap();
     assert_eq!(n.len(), 3);
 
     // at_epoch=6000: C (memtable) + D (always-valid)
-    let n = db.neighbors(a, Direction::Outgoing, None, 0, Some(6000), None).unwrap();
+    let n = db
+        .neighbors(a, Direction::Outgoing, None, 0, Some(6000), None)
+        .unwrap();
     let ids: Vec<u64> = n.iter().map(|e| e.node_id).collect();
     assert!(!ids.contains(&b), "B should NOT be visible at t=6000");
     assert!(ids.contains(&c), "C should be visible at t=6000");
@@ -358,8 +402,14 @@ fn test_temporal_edges_cross_source() {
     db.flush().unwrap();
     db.compact().unwrap();
 
-    let n = db.neighbors(a, Direction::Outgoing, None, 0, Some(4000), None).unwrap();
-    assert_eq!(n.len(), 3, "temporal filtering should work after compaction");
+    let n = db
+        .neighbors(a, Direction::Outgoing, None, 0, Some(4000), None)
+        .unwrap();
+    assert_eq!(
+        n.len(),
+        3,
+        "temporal filtering should work after compaction"
+    );
 
     db.close().unwrap();
 }

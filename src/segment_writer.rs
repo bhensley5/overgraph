@@ -53,8 +53,6 @@ const TYPE_INDEX_ENTRY_SIZE: u64 = 16;
 const PROP_INDEX_ENTRY_SIZE: u64 = 32;
 /// Size of a property hash pair in node_prop_hashes.dat: key_hash (8) + value_hash (8) = 16 bytes
 const PROP_HASH_PAIR_SIZE: u64 = 16;
-/// Size of a timestamp index entry: type_id (4) + updated_at (8) + node_id (8) = 20 bytes
-const TIMESTAMP_INDEX_ENTRY_SIZE: u64 = 20;
 
 /// Write all segment files for a frozen memtable into the given directory.
 ///
@@ -65,6 +63,7 @@ const TIMESTAMP_INDEX_ENTRY_SIZE: u64 = 20;
 /// IMPORTANT: Two index-writing paths exist and must stay in sync:
 ///   1. This function (flush path, builds indexes from Memtable)
 ///   2. `write_indexes_from_metadata()` (compaction path, builds from sidecars)
+///
 /// If you add a new index type, you MUST add it to BOTH paths.
 pub fn write_segment(
     seg_dir: &Path,
@@ -280,11 +279,21 @@ fn write_adjacency_index(
             write_varint_to_vec(&mut posting_buf, delta);
             write_varint_to_vec(&mut posting_buf, entry.neighbor_id);
             posting_buf.extend_from_slice(&entry.weight.to_le_bytes());
-            debug_assert!(entry.valid_from >= 0, "valid_from must be non-negative for varint encoding");
-            debug_assert!(entry.valid_to >= 0, "valid_to must be non-negative for sentinel encoding");
+            debug_assert!(
+                entry.valid_from >= 0,
+                "valid_from must be non-negative for varint encoding"
+            );
+            debug_assert!(
+                entry.valid_to >= 0,
+                "valid_to must be non-negative for sentinel encoding"
+            );
             write_varint_to_vec(&mut posting_buf, entry.valid_from as u64);
             // Sentinel: 0 means i64::MAX, otherwise value + 1
-            let vt_enc = if entry.valid_to == i64::MAX { 0u64 } else { entry.valid_to as u64 + 1 };
+            let vt_enc = if entry.valid_to == i64::MAX {
+                0u64
+            } else {
+                entry.valid_to as u64 + 1
+            };
             write_varint_to_vec(&mut posting_buf, vt_enc);
         }
 
@@ -323,7 +332,7 @@ fn write_key_index(seg_dir: &Path, nodes: &HashMap<u64, NodeRecord>) -> Result<(
         .values()
         .map(|n| (n.type_id, n.key.as_str(), n.id))
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
 
     let count = entries.len() as u64;
     write_u64(&mut w, count)?;
@@ -435,7 +444,9 @@ fn write_prop_index(
         if ids.is_empty() {
             continue;
         }
-        let entry = disk_groups.entry((*type_id, *key_hash, *value_hash)).or_default();
+        let entry = disk_groups
+            .entry((*type_id, *key_hash, *value_hash))
+            .or_default();
         entry.extend(ids.iter().copied());
     }
 
@@ -464,7 +475,7 @@ fn write_prop_index(
     }
 
     // Write data section (packed u64 node IDs)
-    for (_, ids) in &disk_groups {
+    for ids in disk_groups.values() {
         for &id in ids {
             write_u64(&mut w, id)?;
         }
@@ -555,10 +566,8 @@ fn write_tombstones(
     write_u64(&mut w, count)?;
 
     // Write node tombstones (sorted by ID for determinism)
-    let mut node_entries: Vec<(u64, i64)> = deleted_nodes
-        .iter()
-        .map(|(&id, &ts)| (id, ts))
-        .collect();
+    let mut node_entries: Vec<(u64, i64)> =
+        deleted_nodes.iter().map(|(&id, &ts)| (id, ts)).collect();
     node_entries.sort_unstable_by_key(|&(id, _)| id);
     for (id, deleted_at) in node_entries {
         write_u8(&mut w, 0)?; // kind = node
@@ -567,10 +576,8 @@ fn write_tombstones(
     }
 
     // Write edge tombstones (sorted by ID for determinism)
-    let mut edge_entries: Vec<(u64, i64)> = deleted_edges
-        .iter()
-        .map(|(&id, &ts)| (id, ts))
-        .collect();
+    let mut edge_entries: Vec<(u64, i64)> =
+        deleted_edges.iter().map(|(&id, &ts)| (id, ts)).collect();
     edge_entries.sort_unstable_by_key(|&(id, _)| id);
     for (id, deleted_at) in edge_entries {
         write_u8(&mut w, 1)?; // kind = edge
@@ -781,12 +788,297 @@ fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
 
 /// Return the segment directory path for a given segment ID within a db directory.
 pub fn segment_dir(db_dir: &Path, segment_id: u64) -> PathBuf {
-    db_dir.join("segments").join(format!("seg_{:04}", segment_id))
+    db_dir
+        .join("segments")
+        .join(format!("seg_{:04}", segment_id))
 }
 
 /// Return the temporary segment directory path (used during flush before atomic rename).
 pub fn segment_tmp_dir(db_dir: &Path, segment_id: u64) -> PathBuf {
-    db_dir.join("segments").join(format!("seg_{:04}.tmp", segment_id))
+    db_dir
+        .join("segments")
+        .join(format!("seg_{:04}.tmp", segment_id))
+}
+
+// --- Fast-merge compaction support ---
+
+pub(crate) struct FastMergeCopyInfo {
+    pub orig_data_start: u64,
+    pub new_data_base: u64,
+}
+
+/// Write merged nodes.dat by binary copy from multiple non-overlapping segments.
+///
+/// Instead of deserializing and re-serializing every record, this copies raw
+/// record bytes directly from mmap'd input segments and rebuilds the merged
+/// index with adjusted offsets. Record lengths are derived from the source
+/// nodes.dat index/data layout, which lets the fast path cross-check sidecar
+/// metadata later instead of trusting it blindly.
+///
+/// Returns per-segment offset rebasing info so compaction metadata can compute
+/// merged `data_offset` values directly from sidecars without a second data scan.
+pub(crate) fn write_merged_nodes_dat(
+    seg_dir: &Path,
+    segments: &[SegmentReader],
+) -> Result<Vec<FastMergeCopyInfo>, EngineError> {
+    let path = seg_dir.join("nodes.dat");
+    let file = File::create(&path)?;
+    let mut w = BufWriter::new(file);
+
+    let mut seg_info: Vec<(u64, usize, usize)> = Vec::with_capacity(segments.len());
+    let mut total_count: u64 = 0;
+
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        let mmap = seg.raw_nodes_mmap();
+        if mmap.len() < 8 {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} nodes.dat too short for count header: {} bytes",
+                seg.segment_id,
+                mmap.len()
+            )));
+        }
+        let count = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
+        let index_bytes = (count as usize)
+            .checked_mul(NODE_INDEX_ENTRY_SIZE as usize)
+            .ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "segment {} node index size overflow for {} entries",
+                    seg.segment_id, count
+                ))
+            })?;
+        let data_start = 8usize.checked_add(index_bytes).ok_or_else(|| {
+            EngineError::CorruptRecord(format!(
+                "segment {} node data start overflow",
+                seg.segment_id
+            ))
+        })?;
+        if data_start > mmap.len() {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} nodes.dat index exceeds file length: start={}, len={}",
+                seg.segment_id,
+                data_start,
+                mmap.len()
+            )));
+        }
+        seg_info.push((count, data_start, mmap.len() - data_start));
+        total_count = total_count.checked_add(count).ok_or_else(|| {
+            EngineError::CorruptRecord(format!(
+                "total node count overflow while merging segment {} (index {})",
+                seg.segment_id, seg_idx
+            ))
+        })?;
+    }
+
+    write_u64(&mut w, total_count)?;
+
+    let merged_data_start = 8u64
+        .checked_add(
+            total_count
+                .checked_mul(NODE_INDEX_ENTRY_SIZE)
+                .ok_or_else(|| {
+                    EngineError::CorruptRecord("merged node index size overflow".into())
+                })?,
+        )
+        .ok_or_else(|| EngineError::CorruptRecord("merged node data start overflow".into()))?;
+    let mut cumulative_data_offset = merged_data_start;
+    let mut data_offsets: Vec<u64> = Vec::with_capacity(segments.len());
+    for &(_, _, data_size) in &seg_info {
+        data_offsets.push(cumulative_data_offset);
+        cumulative_data_offset = cumulative_data_offset
+            .checked_add(data_size as u64)
+            .ok_or_else(|| EngineError::CorruptRecord("merged nodes.dat size overflow".into()))?;
+    }
+    let mut all_entries: Vec<(u64, u64)> = Vec::with_capacity(total_count as usize);
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        let mmap = seg.raw_nodes_mmap();
+        let (count, orig_data_start, _) = seg_info[seg_idx];
+        if count == 0 {
+            continue;
+        }
+
+        let offset_adj = data_offsets[seg_idx]
+            .checked_sub(orig_data_start as u64)
+            .ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "segment {} node offset adjustment underflow",
+                    seg.segment_id
+                ))
+            })?;
+
+        for i in 0..count as usize {
+            let entry_off = 8 + i * NODE_INDEX_ENTRY_SIZE as usize;
+            let node_id = u64::from_le_bytes(mmap[entry_off..entry_off + 8].try_into().unwrap());
+            let old_offset =
+                u64::from_le_bytes(mmap[entry_off + 8..entry_off + 16].try_into().unwrap());
+            let new_offset = old_offset.checked_add(offset_adj).ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "segment {} node {} merged offset overflow",
+                    seg.segment_id, node_id
+                ))
+            })?;
+            all_entries.push((node_id, new_offset));
+        }
+    }
+    all_entries.sort_unstable_by_key(|(id, _)| *id);
+
+    for &(node_id, offset) in &all_entries {
+        write_u64(&mut w, node_id)?;
+        write_u64(&mut w, offset)?;
+    }
+
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        let mmap = seg.raw_nodes_mmap();
+        let (_, data_start, data_size) = seg_info[seg_idx];
+        if data_size > 0 {
+            w.write_all(&mmap[data_start..data_start + data_size])?;
+        }
+    }
+
+    w.flush()?;
+    w.get_ref().sync_all()?;
+    Ok(seg_info
+        .into_iter()
+        .zip(data_offsets)
+        .map(|((_, data_start, _), new_data_base)| FastMergeCopyInfo {
+            orig_data_start: data_start as u64,
+            new_data_base,
+        })
+        .collect())
+}
+
+/// Write merged edges.dat by binary copy from multiple non-overlapping segments.
+/// Same approach as `write_merged_nodes_dat`.
+///
+/// Returns per-segment offset rebasing info so compaction metadata can compute
+/// merged `data_offset` values directly from sidecars without a second data scan.
+pub(crate) fn write_merged_edges_dat(
+    seg_dir: &Path,
+    segments: &[SegmentReader],
+) -> Result<Vec<FastMergeCopyInfo>, EngineError> {
+    let path = seg_dir.join("edges.dat");
+    let file = File::create(&path)?;
+    let mut w = BufWriter::new(file);
+
+    let mut seg_info: Vec<(u64, usize, usize)> = Vec::with_capacity(segments.len());
+    let mut total_count: u64 = 0;
+
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        let mmap = seg.raw_edges_mmap();
+        if mmap.len() < 8 {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} edges.dat too short for count header: {} bytes",
+                seg.segment_id,
+                mmap.len()
+            )));
+        }
+        let count = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
+        let index_bytes = (count as usize)
+            .checked_mul(EDGE_INDEX_ENTRY_SIZE as usize)
+            .ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "segment {} edge index size overflow for {} entries",
+                    seg.segment_id, count
+                ))
+            })?;
+        let data_start = 8usize.checked_add(index_bytes).ok_or_else(|| {
+            EngineError::CorruptRecord(format!(
+                "segment {} edge data start overflow",
+                seg.segment_id
+            ))
+        })?;
+        if data_start > mmap.len() {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} edges.dat index exceeds file length: start={}, len={}",
+                seg.segment_id,
+                data_start,
+                mmap.len()
+            )));
+        }
+        seg_info.push((count, data_start, mmap.len() - data_start));
+        total_count = total_count.checked_add(count).ok_or_else(|| {
+            EngineError::CorruptRecord(format!(
+                "total edge count overflow while merging segment {} (index {})",
+                seg.segment_id, seg_idx
+            ))
+        })?;
+    }
+
+    write_u64(&mut w, total_count)?;
+
+    let merged_data_start = 8u64
+        .checked_add(
+            total_count
+                .checked_mul(EDGE_INDEX_ENTRY_SIZE)
+                .ok_or_else(|| {
+                    EngineError::CorruptRecord("merged edge index size overflow".into())
+                })?,
+        )
+        .ok_or_else(|| EngineError::CorruptRecord("merged edge data start overflow".into()))?;
+    let mut cumulative_data_offset = merged_data_start;
+    let mut data_offsets: Vec<u64> = Vec::with_capacity(segments.len());
+    for &(_, _, data_size) in &seg_info {
+        data_offsets.push(cumulative_data_offset);
+        cumulative_data_offset = cumulative_data_offset
+            .checked_add(data_size as u64)
+            .ok_or_else(|| EngineError::CorruptRecord("merged edges.dat size overflow".into()))?;
+    }
+
+    let mut all_entries: Vec<(u64, u64)> = Vec::with_capacity(total_count as usize);
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        let mmap = seg.raw_edges_mmap();
+        let (count, orig_data_start, _) = seg_info[seg_idx];
+        if count == 0 {
+            continue;
+        }
+
+        let offset_adj = data_offsets[seg_idx]
+            .checked_sub(orig_data_start as u64)
+            .ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "segment {} edge offset adjustment underflow",
+                    seg.segment_id
+                ))
+            })?;
+
+        for i in 0..count as usize {
+            let entry_off = 8 + i * EDGE_INDEX_ENTRY_SIZE as usize;
+            let edge_id = u64::from_le_bytes(mmap[entry_off..entry_off + 8].try_into().unwrap());
+            let old_offset =
+                u64::from_le_bytes(mmap[entry_off + 8..entry_off + 16].try_into().unwrap());
+            let new_offset = old_offset.checked_add(offset_adj).ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "segment {} edge {} merged offset overflow",
+                    seg.segment_id, edge_id
+                ))
+            })?;
+            all_entries.push((edge_id, new_offset));
+        }
+    }
+    all_entries.sort_unstable_by_key(|(id, _)| *id);
+
+    for &(edge_id, offset) in &all_entries {
+        write_u64(&mut w, edge_id)?;
+        write_u64(&mut w, offset)?;
+    }
+
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        let mmap = seg.raw_edges_mmap();
+        let (_, data_start, data_size) = seg_info[seg_idx];
+        if data_size > 0 {
+            w.write_all(&mmap[data_start..data_start + data_size])?;
+        }
+    }
+
+    w.flush()?;
+    w.get_ref().sync_all()?;
+    Ok(seg_info
+        .into_iter()
+        .zip(data_offsets)
+        .map(|((_, data_start, _), new_data_base)| FastMergeCopyInfo {
+            orig_data_start: data_start as u64,
+            new_data_base,
+        })
+        .collect())
 }
 
 /// Write nodes.dat by raw-copying only winning record byte spans from source segments.
@@ -837,7 +1129,10 @@ pub(crate) fn write_v3_nodes_dat(
         if end > mmap.len() {
             return Err(EngineError::CorruptRecord(format!(
                 "node {} data span [{}, {}) exceeds mmap length {}",
-                node_id, start, end, mmap.len()
+                node_id,
+                start,
+                end,
+                mmap.len()
             )));
         }
         w.write_all(&mmap[start..end])?;
@@ -890,7 +1185,10 @@ pub(crate) fn write_v3_edges_dat(
         if end > mmap.len() {
             return Err(EngineError::CorruptRecord(format!(
                 "edge {} data span [{}, {}) exceeds mmap length {}",
-                edge_id, start, end, mmap.len()
+                edge_id,
+                start,
+                end,
+                mmap.len()
             )));
         }
         w.write_all(&mmap[start..end])?;
@@ -940,6 +1238,7 @@ pub(crate) struct CompactEdgeMeta {
 /// IMPORTANT: Two index-writing paths exist and must stay in sync:
 ///   1. `write_segment()` (flush path, builds indexes from Memtable)
 ///   2. `write_indexes_from_metadata()` [this fn] (compaction path, builds from sidecars)
+///
 /// If you add a new index type, you MUST add it to BOTH paths.
 ///
 /// `node_metas` and `edge_metas` must be sorted by ID.
@@ -984,10 +1283,17 @@ fn write_key_index_from_meta(
         if key_end > src_mmap.len() {
             return Err(EngineError::CorruptRecord(format!(
                 "node {} key bytes [{}, {}) exceed source mmap length {}",
-                nm.node_id, key_start, key_end, src_mmap.len()
+                nm.node_id,
+                key_start,
+                key_end,
+                src_mmap.len()
             )));
         }
-        entries.push((nm.type_id, src_mmap[key_start..key_end].to_vec(), nm.node_id));
+        entries.push((
+            nm.type_id,
+            src_mmap[key_start..key_end].to_vec(),
+            nm.node_id,
+        ));
     }
 
     // Sort by (type_id, key)
@@ -1119,6 +1425,7 @@ fn write_edge_triple_index_from_meta(
 }
 
 /// Adjacency index from edge metadata. Builds adj_out (is_outgoing=true) or adj_in (is_outgoing=false).
+#[allow(clippy::type_complexity)]
 fn write_adjacency_from_meta(
     seg_dir: &Path,
     prefix: &str,
@@ -1143,10 +1450,13 @@ fn write_adjacency_from_meta(
         } else {
             (em.to, em.from)
         };
-        groups
-            .entry((node_id, em.type_id))
-            .or_default()
-            .push((em.edge_id, neighbor_id, em.weight, em.valid_from, em.valid_to));
+        groups.entry((node_id, em.type_id)).or_default().push((
+            em.edge_id,
+            neighbor_id,
+            em.weight,
+            em.valid_from,
+            em.valid_to,
+        ));
     }
 
     // Sort postings within each group by edge_id
@@ -1227,10 +1537,13 @@ fn write_prop_index_from_meta(
             if end > src_hashes.len() {
                 return Err(EngineError::CorruptRecord(format!(
                     "node {} prop hash pair at offset {} exceeds source length {}",
-                    nm.node_id, pair_off, src_hashes.len()
+                    nm.node_id,
+                    pair_off,
+                    src_hashes.len()
                 )));
             }
-            let key_hash = u64::from_le_bytes(src_hashes[pair_off..pair_off + 8].try_into().unwrap());
+            let key_hash =
+                u64::from_le_bytes(src_hashes[pair_off..pair_off + 8].try_into().unwrap());
             let value_hash =
                 u64::from_le_bytes(src_hashes[pair_off + 8..pair_off + 16].try_into().unwrap());
             disk_groups
@@ -1357,7 +1670,10 @@ fn write_sidecars_from_meta(
             if end > src_hashes.len() {
                 return Err(EngineError::CorruptRecord(format!(
                     "node {} prop hash range [{}, {}) exceeds source length {}",
-                    nm.node_id, base, end, src_hashes.len()
+                    nm.node_id,
+                    base,
+                    end,
+                    src_hashes.len()
                 )));
             }
             hash_w.write_all(&src_hashes[base..end])?;
@@ -1512,27 +1828,16 @@ mod tests {
         // Index entries should be sorted by node_id
         let idx_start = 8;
         let id0 = u64::from_le_bytes(data[idx_start..idx_start + 8].try_into().unwrap());
-        let id1 = u64::from_le_bytes(
-            data[idx_start + 16..idx_start + 24]
-                .try_into()
-                .unwrap(),
-        );
-        let id2 = u64::from_le_bytes(
-            data[idx_start + 32..idx_start + 40]
-                .try_into()
-                .unwrap(),
-        );
+        let id1 = u64::from_le_bytes(data[idx_start + 16..idx_start + 24].try_into().unwrap());
+        let id2 = u64::from_le_bytes(data[idx_start + 32..idx_start + 40].try_into().unwrap());
         assert_eq!(id0, 1);
         assert_eq!(id1, 2);
         assert_eq!(id2, 3);
 
         // Verify the offset of the first record leads to valid data
         // Format v4: id is NOT in the record, first field is type_id (u32)
-        let offset0 = u64::from_le_bytes(
-            data[idx_start + 8..idx_start + 16]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let offset0 =
+            u64::from_le_bytes(data[idx_start + 8..idx_start + 16].try_into().unwrap()) as usize;
         let type_id = u32::from_le_bytes(data[offset0..offset0 + 4].try_into().unwrap());
         assert_eq!(type_id, 1);
     }
@@ -1566,11 +1871,7 @@ mod tests {
         // Index should be sorted: edge 1 then edge 2
         let idx_start = 8;
         let eid0 = u64::from_le_bytes(data[idx_start..idx_start + 8].try_into().unwrap());
-        let eid1 = u64::from_le_bytes(
-            data[idx_start + 16..idx_start + 24]
-                .try_into()
-                .unwrap(),
-        );
+        let eid1 = u64::from_le_bytes(data[idx_start + 16..idx_start + 24].try_into().unwrap());
         assert_eq!(eid0, 1);
         assert_eq!(eid1, 2);
     }
@@ -1578,7 +1879,14 @@ mod tests {
     // --- write_adjacency_index ---
 
     fn make_adj(edge_id: u64, type_id: u32, neighbor_id: u64, weight: f32) -> AdjEntry {
-        AdjEntry { edge_id, type_id, neighbor_id, weight, valid_from: 1000, valid_to: i64::MAX }
+        AdjEntry {
+            edge_id,
+            type_id,
+            neighbor_id,
+            weight,
+            valid_from: 1000,
+            valid_to: i64::MAX,
+        }
     }
 
     fn adj_map_from(node_id: u64, entries: Vec<AdjEntry>) -> HashMap<u64, HashMap<u64, AdjEntry>> {
@@ -1605,11 +1913,14 @@ mod tests {
     #[test]
     fn test_write_adjacency_single_node() {
         let dir = tempfile::tempdir().unwrap();
-        let adj = adj_map_from(1, vec![
-            make_adj(10, 1, 2, 0.5),
-            make_adj(11, 1, 3, 0.7),
-            make_adj(12, 2, 4, 1.0),
-        ]);
+        let adj = adj_map_from(
+            1,
+            vec![
+                make_adj(10, 1, 2, 0.5),
+                make_adj(11, 1, 3, 0.7),
+                make_adj(12, 2, 4, 1.0),
+            ],
+        );
 
         write_adjacency_index(dir.path(), "adj_out", &adj).unwrap();
 
@@ -1621,8 +1932,11 @@ mod tests {
         let dat_data = fs::read(dir.path().join("adj_out.dat")).unwrap();
         // Delta-encoded variable-length postings, much smaller than fixed-size.
         // 3 postings with small ids/deltas → expect < 108 bytes (old fixed-size).
-        assert!(dat_data.len() > 0);
-        assert!(dat_data.len() < 108, "delta encoding should be smaller than fixed 36-byte postings");
+        assert!(!dat_data.is_empty());
+        assert!(
+            dat_data.len() < 108,
+            "delta encoding should be smaller than fixed 36-byte postings"
+        );
     }
 
     #[test]
@@ -1750,14 +2064,30 @@ mod tests {
         assert_eq!(ts0, 1001);
 
         assert_eq!(data[off + entry_size], 0); // kind = node
-        let id1 = u64::from_le_bytes(data[off + entry_size + 1..off + entry_size + 9].try_into().unwrap());
-        let ts1 = i64::from_le_bytes(data[off + entry_size + 9..off + entry_size + 17].try_into().unwrap());
+        let id1 = u64::from_le_bytes(
+            data[off + entry_size + 1..off + entry_size + 9]
+                .try_into()
+                .unwrap(),
+        );
+        let ts1 = i64::from_le_bytes(
+            data[off + entry_size + 9..off + entry_size + 17]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(id1, 5);
         assert_eq!(ts1, 1000);
 
         assert_eq!(data[off + 2 * entry_size], 1); // kind = edge
-        let id2 = u64::from_le_bytes(data[off + 2 * entry_size + 1..off + 2 * entry_size + 9].try_into().unwrap());
-        let ts2 = i64::from_le_bytes(data[off + 2 * entry_size + 9..off + 2 * entry_size + 17].try_into().unwrap());
+        let id2 = u64::from_le_bytes(
+            data[off + 2 * entry_size + 1..off + 2 * entry_size + 9]
+                .try_into()
+                .unwrap(),
+        );
+        let ts2 = i64::from_le_bytes(
+            data[off + 2 * entry_size + 9..off + 2 * entry_size + 17]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(id2, 10);
         assert_eq!(ts2, 2000);
     }
@@ -1773,7 +2103,10 @@ mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")));
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")));
         mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
-        mt.apply_op(&WalOp::DeleteNode { id: 99, deleted_at: 9999 });
+        mt.apply_op(&WalOp::DeleteNode {
+            id: 99,
+            deleted_at: 9999,
+        });
 
         let info = write_segment(&seg_dir, 1, &mt).unwrap();
         assert_eq!(info.id, 1);
@@ -1818,8 +2151,14 @@ mod tests {
     #[test]
     fn test_segment_dir_paths() {
         let db = Path::new("/tmp/mydb");
-        assert_eq!(segment_dir(db, 1), PathBuf::from("/tmp/mydb/segments/seg_0001"));
-        assert_eq!(segment_dir(db, 42), PathBuf::from("/tmp/mydb/segments/seg_0042"));
+        assert_eq!(
+            segment_dir(db, 1),
+            PathBuf::from("/tmp/mydb/segments/seg_0001")
+        );
+        assert_eq!(
+            segment_dir(db, 42),
+            PathBuf::from("/tmp/mydb/segments/seg_0042")
+        );
         assert_eq!(
             segment_tmp_dir(db, 1),
             PathBuf::from("/tmp/mydb/segments/seg_0001.tmp")
@@ -1845,12 +2184,13 @@ mod tests {
         assert_eq!(type_id, 1);
 
         // Properties should be serialized
-        let key_len =
-            u16::from_le_bytes(data[offset + 4..offset + 6].try_into().unwrap()) as usize;
+        let key_len = u16::from_le_bytes(data[offset + 4..offset + 6].try_into().unwrap()) as usize;
         let props_len_offset = offset + 6 + key_len + 8 + 8 + 4; // skip key + timestamps + weight
-        let props_len =
-            u32::from_le_bytes(data[props_len_offset..props_len_offset + 4].try_into().unwrap())
-                as usize;
+        let props_len = u32::from_le_bytes(
+            data[props_len_offset..props_len_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         assert!(props_len > 0); // Properties should be non-empty
     }
 
@@ -1904,23 +2244,47 @@ mod tests {
     #[test]
     fn test_valid_to_sentinel_roundtrip() {
         // i64::MAX encodes as 0
-        let vt_max_enc = if i64::MAX == i64::MAX { 0u64 } else { i64::MAX as u64 + 1 };
+        let vt_max_enc = if i64::MAX == i64::MAX {
+            0u64
+        } else {
+            i64::MAX as u64 + 1
+        };
         assert_eq!(vt_max_enc, 0);
-        let vt_max_dec = if vt_max_enc == 0 { i64::MAX } else { (vt_max_enc - 1) as i64 };
+        let vt_max_dec = if vt_max_enc == 0 {
+            i64::MAX
+        } else {
+            (vt_max_enc - 1) as i64
+        };
         assert_eq!(vt_max_dec, i64::MAX);
 
         // valid_to = 0 encodes as 1
         let vt_zero: i64 = 0;
-        let vt_zero_enc = if vt_zero == i64::MAX { 0u64 } else { vt_zero as u64 + 1 };
+        let vt_zero_enc = if vt_zero == i64::MAX {
+            0u64
+        } else {
+            vt_zero as u64 + 1
+        };
         assert_eq!(vt_zero_enc, 1);
-        let vt_zero_dec = if vt_zero_enc == 0 { i64::MAX } else { (vt_zero_enc - 1) as i64 };
+        let vt_zero_dec = if vt_zero_enc == 0 {
+            i64::MAX
+        } else {
+            (vt_zero_enc - 1) as i64
+        };
         assert_eq!(vt_zero_dec, 0);
 
         // valid_to = 1000 encodes as 1001
         let vt_mid: i64 = 1000;
-        let vt_mid_enc = if vt_mid == i64::MAX { 0u64 } else { vt_mid as u64 + 1 };
+        let vt_mid_enc = if vt_mid == i64::MAX {
+            0u64
+        } else {
+            vt_mid as u64 + 1
+        };
         assert_eq!(vt_mid_enc, 1001);
-        let vt_mid_dec = if vt_mid_enc == 0 { i64::MAX } else { (vt_mid_enc - 1) as i64 };
+        let vt_mid_dec = if vt_mid_enc == 0 {
+            i64::MAX
+        } else {
+            (vt_mid_enc - 1) as i64
+        };
         assert_eq!(vt_mid_dec, 1000);
     }
 

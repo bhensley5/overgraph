@@ -180,16 +180,13 @@ class TestNeighborsPaged:
         assert page.items[0].node_id == n2
 
 
-class TestNeighbors2HopPaged:
-    def test_paged(self, db):
+class TestTraversePaged:
+    def test_depth_window(self, db):
         nodes, _ = make_chain(db, 4)
-        page = db.neighbors_2hop_paged(nodes[0], "outgoing")
-        node_ids = {n.node_id for n in page.items}
-        assert nodes[2] in node_ids
-        assert nodes[0] not in node_ids
+        page = db.traverse(nodes[0], min_depth=2, max_depth=2, direction="outgoing")
+        assert [(hit.node_id, hit.depth) for hit in page.items] == [(nodes[2], 2)]
 
     def test_pagination(self, db):
-        # Create a hub-and-spoke at each layer for more 2-hop results
         center = db.upsert_node(1, "center")
         middles = []
         for i in range(3):
@@ -200,24 +197,34 @@ class TestNeighbors2HopPaged:
             for j in range(3):
                 leaf = db.upsert_node(1, f"leaf_{m}_{j}")
                 db.upsert_edge(m, leaf, 10)
-        # 9 leaves reachable at 2 hops
-        page = db.neighbors_2hop_paged(center, "outgoing", limit=4)
-        assert len(page.items) == 4
-        assert page.next_cursor is not None
+        p1 = db.traverse(center, min_depth=2, max_depth=2, direction="outgoing", limit=4)
+        assert len(p1.items) == 4
+        assert p1.next_cursor is not None
+        assert p1.next_cursor.depth == 2
+        p2 = db.traverse(
+            center,
+            min_depth=2,
+            max_depth=2,
+            direction="outgoing",
+            limit=4,
+            cursor=p1.next_cursor,
+        )
+        ids1 = {hit.node_id for hit in p1.items}
+        ids2 = {hit.node_id for hit in p2.items}
+        assert ids1.isdisjoint(ids2)
 
-
-class TestNeighbors2HopConstrainedPaged:
-    def test_paged(self, db):
+    def test_filtered_page(self, db):
         n1 = db.upsert_node(1, "a")
         n2 = db.upsert_node(2, "b")
         n3 = db.upsert_node(3, "c")
         db.upsert_edge(n1, n2, 10)
         db.upsert_edge(n2, n3, 10)
-        page = db.neighbors_2hop_constrained_paged(
-            n1, "outgoing",
-            traverse_edge_types=[10],
-            target_node_types=[3],
+        page = db.traverse(
+            n1,
+            min_depth=2,
+            max_depth=2,
+            direction="outgoing",
+            edge_type_filter=[10],
+            node_type_filter=[3],
         )
-        node_ids = {n.node_id for n in page.items}
-        assert n3 in node_ids
-        assert n2 not in node_ids
+        assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]

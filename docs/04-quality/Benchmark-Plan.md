@@ -75,19 +75,26 @@ Graph shapes for each profile:
 |---|---|---|---|---|
 | `S-CRUD-001` | `upsert_node` | required | required | required |
 | `S-CRUD-002` | `upsert_edge` | required | required | required |
-| `S-CRUD-003` | `get_node` / `get_nodes` | required | required | required |
-| `S-TRAV-001` | `neighbors` fan-out 10/100/1000 | required | required | required |
-| `S-TRAV-002` | `neighbors_2hop` | required | required | required |
-| `S-TRAV-003` | `neighbors_batch` | required | required | required |
+| `S-BATCH-001` | `batch_upsert_nodes_json` | required | required | required |
+| `S-BATCH-002` | binary batch node ingest | not used | required | required |
+| `S-CRUD-003` | `get_node` | required | required | required |
+| `S-CRUD-004` | `upsert_node_fixed_key` | required | required | required |
+| `S-CRUD-005` | `upsert_edge_fixed_triple` | required | required | required |
+| `S-TRAV-001` | `neighbors` profile-scaled fan-out | required | required | required |
+| `S-TRAV-002` | `traverse` exact depth-2 slice (memtable continuity baseline) | required | required | required |
+| `S-TRAV-003` | `degree` | required | required | required |
+| `S-TRAV-004` | `degrees` | required | required | required |
+| `S-TRAV-005` | `shortest_path` | required | required | required |
+| `S-TRAV-006` | `is_connected` | required | required | required |
+| `S-TRAV-007` | `traverse` depth 1..3 layered (memtable, no filter) | required | required | required |
+| `S-TRAV-008` | `traverse` depth 1..3 layered (segmented, no filter) | required | required | required |
+| `S-TRAV-009` | `traverse` depth 1..3 layered (memtable, emission-only `node_type_filter`) | required | required | required |
+| `S-TRAV-010` | `traverse` depth 1..3 layered (segmented, emission-only `node_type_filter`) | required | required | required |
 | `S-ADV-001` | `top_k_neighbors` | required | required | required |
-| `S-ADV-002` | `find_nodes` / `find_nodes_paged` | required | required | required |
 | `S-ADV-003` | `find_nodes_by_time_range(_paged)` | required | required | required |
 | `S-ADV-004` | `personalized_pagerank` | required | required | required |
 | `S-ADV-005` | `export_adjacency` | required | required | required |
 | `S-MAIN-001` | `flush` | required | required | required |
-| `S-MAIN-002` | `compact` (clean/overlap/dirty) | required | required | required |
-| `S-REC-001` | open/reopen/recovery | required | required | required |
-| `S-DUR-001` | durability mode matrix | required | required | required |
 
 ## Measurement Policy
 
@@ -163,7 +170,8 @@ Guardrails must compare same:
 
 Public benchmark summary must include:
 - top-line numbers for core write/read/traversal
-- advanced query results (2-hop, top-k, time-range, PPR, export)
+- traversal results covering exact depth-2 continuity plus deeper layered memtable and segmented cases
+- advanced query results (top-k, time-range, PPR, export)
 - maintenance/recovery behavior
 - explicit hardware/runtime context
 - command list to reproduce

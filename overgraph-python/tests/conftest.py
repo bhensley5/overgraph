@@ -3,7 +3,8 @@ import shutil
 import tempfile
 
 import pytest
-from overgraph import OverGraph
+import pytest_asyncio
+from overgraph import OverGraph, AsyncOverGraph
 
 
 @pytest.fixture
@@ -26,6 +27,15 @@ def db(db_path):
     database = OverGraph.open(db_path)
     yield database
     database.close()
+
+
+@pytest_asyncio.fixture
+async def async_db(tmp_dir):
+    """Open an AsyncOverGraph, yield it, then close."""
+    path = os.path.join(tmp_dir, "async_testdb")
+    database = await AsyncOverGraph.open(path)
+    yield database
+    await database.close()
 
 
 def make_chain(db, n=5, edge_type=10):

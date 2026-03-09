@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "overgraph"
-version = "0.1.1"
+version = "0.2.0"
 description = "An absurdly fast embedded graph database for Python. Sub-microsecond reads, pure Rust core."
 requires-python = ">=3.9"
 license = {text = "MIT OR Apache-2.0"}
@@ -22,7 +22,7 @@ readme = "README.md"
 
 [project.urls]
 Repository = "https://github.com/Bhensley5/overgraph"
-Homepage = "https://github.com/Bhensley5/overgraph"
+Homepage = "https://overgraph.io"
 
 [tool.maturin]
 features = ["pyo3/extension-module", "pyo3/abi3-py39"]

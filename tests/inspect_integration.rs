@@ -26,7 +26,11 @@ fn test_inspect_empty_db() {
         .expect("failed to run overgraph-inspect");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "inspect failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("OverGraph Database:"));
     assert!(stdout.contains("Version:       1"));
     assert!(stdout.contains("Segments: 0"));
@@ -46,11 +50,13 @@ fn test_inspect_with_data() {
     let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..10 {
-        db.upsert_node(1, &format!("node_{}", i), BTreeMap::new(), 1.0).unwrap();
+        db.upsert_node(1, &format!("node_{}", i), BTreeMap::new(), 1.0)
+            .unwrap();
     }
     let n1 = db.upsert_node(2, "a", BTreeMap::new(), 1.0).unwrap();
     let n2 = db.upsert_node(2, "b", BTreeMap::new(), 1.0).unwrap();
-    db.upsert_edge(n1, n2, 1, BTreeMap::new(), 1.0, None, None).unwrap();
+    db.upsert_edge(n1, n2, 1, BTreeMap::new(), 1.0, None, None)
+        .unwrap();
 
     db.flush().unwrap();
     db.close().unwrap();
@@ -61,7 +67,11 @@ fn test_inspect_with_data() {
         .expect("failed to run overgraph-inspect");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "inspect failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("Segments: 1"));
     // Verify the segment table shows 12 nodes and 1 edge in the right-aligned columns
     assert!(stdout.contains("        12"));
@@ -84,12 +94,14 @@ fn test_inspect_multiple_segments() {
     let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..5 {
-        db.upsert_node(1, &format!("batch1_{}", i), BTreeMap::new(), 1.0).unwrap();
+        db.upsert_node(1, &format!("batch1_{}", i), BTreeMap::new(), 1.0)
+            .unwrap();
     }
     db.flush().unwrap();
 
     for i in 0..3 {
-        db.upsert_node(1, &format!("batch2_{}", i), BTreeMap::new(), 1.0).unwrap();
+        db.upsert_node(1, &format!("batch2_{}", i), BTreeMap::new(), 1.0)
+            .unwrap();
     }
     db.flush().unwrap();
 
@@ -159,7 +171,8 @@ fn test_inspect_json_with_data() {
     let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..5 {
-        db.upsert_node(1, &format!("node_{}", i), BTreeMap::new(), 1.0).unwrap();
+        db.upsert_node(1, &format!("node_{}", i), BTreeMap::new(), 1.0)
+            .unwrap();
     }
     db.flush().unwrap();
     db.close().unwrap();
@@ -170,9 +183,14 @@ fn test_inspect_json_with_data() {
         .expect("failed to run overgraph-inspect");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "inspect --json failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "inspect --json failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("output should be valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output should be valid JSON");
     assert_eq!(parsed["manifest_version"], 1);
     assert_eq!(parsed["segment_count"], 1);
     assert_eq!(parsed["total_nodes"], 5);
@@ -197,7 +215,8 @@ fn test_inspect_json_uninitialized() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
 
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("output should be valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output should be valid JSON");
     assert_eq!(parsed["initialized"], false);
     assert!(parsed["wal_bytes"].is_null());
 }

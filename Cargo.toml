@@ -3,12 +3,12 @@ members = [".", "overgraph-node", "overgraph-python"]
 
 [package]
 name = "overgraph"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "An absurdly fast embedded graph database. Pure Rust, sub-microsecond reads."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Bhensley5/overgraph"
-homepage = "https://github.com/Bhensley5/overgraph"
+homepage = "https://overgraph.io"
 readme = "README.md"
 keywords = ["graph-database", "embedded", "performance", "in-process", "rust"]
 categories = ["database-implementations", "data-structures"]

@@ -62,44 +62,82 @@ class TestNeighbors:
         assert "NeighborEntry" in repr(entry)
 
 
-class TestNeighbors2Hop:
-    def test_2hop(self, db):
-        nodes, _ = make_chain(db, 4)
-        nbrs = db.neighbors_2hop(nodes[0], "outgoing")
-        node_ids = {n.node_id for n in nbrs}
-        # 2-hop returns the 2nd-hop frontier (deduped against 1-hop)
-        assert nodes[2] in node_ids
-        # Should NOT include the start node or 3-hop
-        assert nodes[0] not in node_ids
-        assert nodes[3] not in node_ids
+class TestTraverse:
+    def test_basic_depth_and_order(self, db):
+        start = db.upsert_node(1, "start")
+        depth1_b = db.upsert_node(1, "depth1-b")
+        depth1_a = db.upsert_node(1, "depth1-a")
+        depth2 = db.upsert_node(1, "depth2")
+        db.upsert_edge(start, depth1_b, 10)
+        db.upsert_edge(start, depth1_a, 10)
+        db.upsert_edge(depth1_a, depth2, 10)
 
-    def test_2hop_reaches_beyond_1hop(self, db):
+        page = db.traverse(start, min_depth=0, max_depth=2, direction="outgoing")
+
+        ordered = [(hit.node_id, hit.depth) for hit in page.items]
+        depth1_order = sorted([depth1_a, depth1_b])
+        assert ordered == [
+            (start, 0),
+            (depth1_order[0], 1),
+            (depth1_order[1], 1),
+            (depth2, 2),
+        ]
+        assert page.items[0].via_edge_id is None
+        assert page.items[1].via_edge_id is not None
+        assert "TraversalHit" in repr(page.items[0])
+        assert "TraversalPageResult" in repr(page)
+        assert page.next_cursor is None
+
+    def test_two_hop_window(self, db):
+        nodes, _ = make_chain(db, 4)
+        page = db.traverse(nodes[0], min_depth=2, max_depth=2, direction="outgoing")
+        assert [(hit.node_id, hit.depth) for hit in page.items] == [(nodes[2], 2)]
+
+    def test_cursor_constructor(self, db):
         n1 = db.upsert_node(1, "a")
         n2 = db.upsert_node(1, "b")
         n3 = db.upsert_node(1, "c")
         db.upsert_edge(n1, n2, 10)
         db.upsert_edge(n2, n3, 10)
-        nbrs = db.neighbors_2hop(n1, "outgoing")
-        node_ids = {n.node_id for n in nbrs}
-        assert n3 in node_ids
+        page = db.traverse(n1, min_depth=1, max_depth=2, direction="outgoing", limit=1)
+        assert len(page.items) == 1
+        assert page.next_cursor is not None
+        assert page.next_cursor.depth == 1
+        assert page.next_cursor.last_node_id == n2
+        assert "TraversalCursor" in repr(page.next_cursor)
+
+    def test_removed_two_hop_apis_stay_absent(self, db):
+        assert not hasattr(db, "neighbors_2hop")
+        assert not hasattr(db, "neighbors_2hop_paged")
+        assert not hasattr(db, "neighbors_2hop_constrained")
+        assert not hasattr(db, "neighbors_2hop_constrained_paged")
+
+    def test_rejects_raw_id_cursor(self, db):
+        n1 = db.upsert_node(1, "a")
+        n2 = db.upsert_node(1, "b")
+        n3 = db.upsert_node(1, "c")
+        db.upsert_edge(n1, n2, 10)
+        db.upsert_edge(n2, n3, 10)
+        with pytest.raises(TypeError):
+            db.traverse(n1, min_depth=2, max_depth=2, direction="outgoing", cursor=123)
 
 
-class TestNeighbors2HopConstrained:
-    def test_constrained(self, db):
+class TestTraverseFilters:
+    def test_node_type_filter_is_emission_only(self, db):
         n1 = db.upsert_node(1, "a")
         n2 = db.upsert_node(2, "b")  # type 2
         n3 = db.upsert_node(3, "c")  # type 3
         db.upsert_edge(n1, n2, 10)
         db.upsert_edge(n2, n3, 10)
-        # Only target type 3
-        nbrs = db.neighbors_2hop_constrained(
-            n1, "outgoing",
-            traverse_edge_types=[10],
-            target_node_types=[3],
+        page = db.traverse(
+            n1,
+            min_depth=2,
+            max_depth=2,
+            direction="outgoing",
+            edge_type_filter=[10],
+            node_type_filter=[3],
         )
-        node_ids = {n.node_id for n in nbrs}
-        assert n3 in node_ids
-        assert n2 not in node_ids
+        assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
 
 
 class TestTopKNeighbors:

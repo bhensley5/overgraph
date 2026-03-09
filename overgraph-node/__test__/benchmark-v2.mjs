@@ -167,7 +167,78 @@ function effectiveConfig(profile, scenarioContract) {
     time_range_from_ms: cfg.time_range_from_ms,
     time_range_window_ms: cfg.time_range_window_ms,
     include_weights_on_export: Boolean(cfg.include_weights_on_export),
+    shortest_path_nodes: Math.max(cfg.shortest_path_nodes_min, Math.floor(nodes / cfg.shortest_path_nodes_divisor)),
+    shortest_path_edge_offsets: cfg.shortest_path_edge_offsets,
   };
+}
+
+function traverseDeepBranching(fanout) {
+  return [Math.max(8, Math.min(24, Math.floor(fanout / 4))), 4, 4];
+}
+
+function buildDepthTwoTraversalGraph(db, cfg) {
+  const hopNodes = [{ typeId: 1, key: 'root' }];
+  for (let i = 0; i < cfg.two_hop_mid; i++) {
+    hopNodes.push({ typeId: 1, key: `m-${i}` });
+    for (let j = 0; j < cfg.two_hop_leaves_per_mid; j++) {
+      hopNodes.push({ typeId: 1, key: `l-${i}-${j}` });
+    }
+  }
+  const hopIds = db.batchUpsertNodes(hopNodes);
+  const root = hopIds[0];
+  const midStride = 1 + cfg.two_hop_leaves_per_mid;
+  const hopEdges = [];
+  for (let i = 0; i < cfg.two_hop_mid; i++) {
+    const midId = hopIds[1 + i * midStride];
+    hopEdges.push({ from: root, to: midId, typeId: 1, weight: 1.0 });
+    for (let j = 0; j < cfg.two_hop_leaves_per_mid; j++) {
+      const leafId = hopIds[1 + i * midStride + 1 + j];
+      hopEdges.push({ from: midId, to: leafId, typeId: 1, weight: 1.0 });
+    }
+  }
+  db.batchUpsertEdges(hopEdges);
+  return root;
+}
+
+function buildDeepTraversalGraph(db, cfg) {
+  const [level1, level2, level3] = traverseDeepBranching(cfg.fanout);
+  const nodes = [{ typeId: 1, key: 'root' }];
+  for (let i = 0; i < level1; i++) {
+    nodes.push({ typeId: 11, key: `lvl1-${i}` });
+  }
+  for (let i = 0; i < level1; i++) {
+    for (let j = 0; j < level2; j++) {
+      nodes.push({ typeId: (i + j) % 2 === 0 ? 2 : 3, key: `lvl2-${i}-${j}` });
+    }
+  }
+  for (let i = 0; i < level1; i++) {
+    for (let j = 0; j < level2; j++) {
+      for (let k = 0; k < level3; k++) {
+        nodes.push({ typeId: (i + j + k) % 2 === 0 ? 2 : 3, key: `lvl3-${i}-${j}-${k}` });
+      }
+    }
+  }
+  const ids = db.batchUpsertNodes(nodes);
+  const root = ids[0];
+  const level1Offset = 1;
+  const level2Offset = level1Offset + level1;
+  const level3Offset = level2Offset + level1 * level2;
+  const edges = [];
+  for (let i = 0; i < level1; i++) {
+    const lvl1Id = ids[level1Offset + i];
+    edges.push({ from: root, to: lvl1Id, typeId: 1, weight: 1.0 });
+    for (let j = 0; j < level2; j++) {
+      const lvl2Idx = i * level2 + j;
+      const lvl2Id = ids[level2Offset + lvl2Idx];
+      edges.push({ from: lvl1Id, to: lvl2Id, typeId: 1, weight: 1.0 });
+      for (let k = 0; k < level3; k++) {
+        const lvl3Idx = lvl2Idx * level3 + k;
+        edges.push({ from: lvl2Id, to: ids[level3Offset + lvl3Idx], typeId: 1, weight: 1.0 });
+      }
+    }
+  }
+  db.batchUpsertEdges(edges);
+  return { root, branching: [level1, level2, level3] };
 }
 
 function scenario(
@@ -413,11 +484,19 @@ try {
     const scenarioId = 'S-TRAV-001';
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'trav-neighbors'));
-    const hub = db.upsertNode(1, 'hub');
-    for (let i = 0; i < cfg.fanout; i++) {
-      const n = db.upsertNode(1, `n-${i}`);
-      db.upsertEdge(hub, n, 1, null, 1.0);
-    }
+    const neighNodeIds = db.batchUpsertNodes([
+      { typeId: 1, key: 'hub' },
+      ...Array.from({ length: cfg.fanout }, (_, i) => ({ typeId: 1, key: `n-${i}` })),
+    ]);
+    const hub = neighNodeIds[0];
+    db.batchUpsertEdges(
+      Array.from({ length: cfg.fanout }, (_, i) => ({
+        from: hub,
+        to: neighNodeIds[i + 1],
+        typeId: 1,
+        weight: 1.0,
+      }))
+    );
     const s = runBench(
       () => db.neighbors(hub, 'outgoing'),
       iterCfg.warmup,
@@ -437,36 +516,327 @@ try {
     db.close();
   }
 
-  // S-TRAV-002: neighbors_2hop
+  // S-TRAV-002: traverse exact depth-2
   {
     const scenarioId = 'S-TRAV-002';
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
-    const db = OverGraph.open(join(tmpRoot, 'trav-neighbors-2hop'));
-    const root = db.upsertNode(1, 'root');
-    for (let i = 0; i < cfg.two_hop_mid; i++) {
-      const mid = db.upsertNode(1, `m-${i}`);
-      db.upsertEdge(root, mid, 1, null, 1.0);
-      for (let j = 0; j < cfg.two_hop_leaves_per_mid; j++) {
-        const leaf = db.upsertNode(1, `l-${i}-${j}`);
-        db.upsertEdge(mid, leaf, 1, null, 1.0);
-      }
-    }
+    const db = OverGraph.open(join(tmpRoot, 'trav-traverse-depth2'));
+    const root = buildDepthTwoTraversalGraph(db, cfg);
     const s = runBench(
-      () => db.neighbors2Hop(root, 'outgoing'),
+      () => db.traverse(root, 2, 2, 'outgoing'),
       iterCfg.warmup,
       iterCfg.iters
     );
     scenarios.push(
       scenario(
         scenarioId,
-        'neighbors_2hop',
+        'traverse_depth_2',
         'traversal',
         s,
         iterCfg,
         {
           direction: 'outgoing',
+          min_depth: 2,
+          max_depth: 2,
           mid_nodes: cfg.two_hop_mid,
           leaves_per_mid: cfg.two_hop_leaves_per_mid,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  // S-TRAV-007: deeper traverse, memtable, fast path
+  {
+    const scenarioId = 'S-TRAV-007';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const db = OverGraph.open(join(tmpRoot, 'trav-depth13-memtable'));
+    const { root, branching } = buildDeepTraversalGraph(db, cfg);
+    const s = runBench(
+      () => db.traverse(root, 1, 3, 'outgoing'),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'traverse_depth_1_to_3',
+        'traversal',
+        s,
+        iterCfg,
+        {
+          direction: 'outgoing',
+          layout: 'memtable',
+          min_depth: 1,
+          max_depth: 3,
+          node_type_filter: null,
+          branching,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  // S-TRAV-008: deeper traverse, segmented, fast path
+  {
+    const scenarioId = 'S-TRAV-008';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const db = OverGraph.open(join(tmpRoot, 'trav-depth13-segment'));
+    const { root, branching } = buildDeepTraversalGraph(db, cfg);
+    db.flush();
+    const s = runBench(
+      () => db.traverse(root, 1, 3, 'outgoing'),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'traverse_depth_1_to_3_segment',
+        'traversal',
+        s,
+        iterCfg,
+        {
+          direction: 'outgoing',
+          layout: 'segment',
+          min_depth: 1,
+          max_depth: 3,
+          node_type_filter: null,
+          branching,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  // S-TRAV-009: deeper traverse, memtable, emission-filtered path
+  {
+    const scenarioId = 'S-TRAV-009';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const db = OverGraph.open(join(tmpRoot, 'trav-depth13-filtered-memtable'));
+    const { root, branching } = buildDeepTraversalGraph(db, cfg);
+    const s = runBench(
+      () => db.traverse(root, 1, 3, 'outgoing', null, [2]),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'traverse_depth_1_to_3_filtered',
+        'traversal',
+        s,
+        iterCfg,
+        {
+          direction: 'outgoing',
+          layout: 'memtable',
+          min_depth: 1,
+          max_depth: 3,
+          node_type_filter: [2],
+          branching,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  // S-TRAV-010: deeper traverse, segmented, emission-filtered path
+  {
+    const scenarioId = 'S-TRAV-010';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const db = OverGraph.open(join(tmpRoot, 'trav-depth13-filtered-segment'));
+    const { root, branching } = buildDeepTraversalGraph(db, cfg);
+    db.flush();
+    const s = runBench(
+      () => db.traverse(root, 1, 3, 'outgoing', null, [2]),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'traverse_depth_1_to_3_filtered_segment',
+        'traversal',
+        s,
+        iterCfg,
+        {
+          direction: 'outgoing',
+          layout: 'segment',
+          min_depth: 1,
+          max_depth: 3,
+          node_type_filter: [2],
+          branching,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  // S-TRAV-003: degree (scalar)
+  {
+    const scenarioId = 'S-TRAV-003';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const db = OverGraph.open(join(tmpRoot, 'trav-degree'));
+    const degNodeIds = db.batchUpsertNodes([
+      { typeId: 1, key: 'hub' },
+      ...Array.from({ length: cfg.fanout }, (_, i) => ({ typeId: 1, key: `d-${i}` })),
+    ]);
+    const hub = degNodeIds[0];
+    db.batchUpsertEdges(
+      Array.from({ length: cfg.fanout }, (_, i) => ({
+        from: hub,
+        to: degNodeIds[i + 1],
+        typeId: 1,
+        weight: 1.0,
+      }))
+    );
+    const s = runBench(
+      () => db.degree(hub, 'outgoing'),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'degree',
+        'traversal',
+        s,
+        iterCfg,
+        { fanout: cfg.fanout, direction: 'outgoing' },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  // S-TRAV-004: degrees (batch)
+  {
+    const scenarioId = 'S-TRAV-004';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const db = OverGraph.open(join(tmpRoot, 'trav-degrees'));
+    // Batch all hub + spoke nodes: [hub-0, spoke-0-0, spoke-0-1, ..., hub-1, spoke-1-0, ...]
+    const allNodes = [];
+    for (let h = 0; h < cfg.batch_nodes; h++) {
+      allNodes.push({ typeId: 1, key: `hub-${h}` });
+      for (let i = 0; i < cfg.fanout; i++) {
+        allNodes.push({ typeId: 1, key: `dt-${h}-${i}` });
+      }
+    }
+    const allNodeIds = db.batchUpsertNodes(allNodes);
+    const stride = 1 + cfg.fanout; // hub + its spokes
+    const hubIds = [];
+    const degEdges = [];
+    for (let h = 0; h < cfg.batch_nodes; h++) {
+      const hubId = allNodeIds[h * stride];
+      hubIds.push(hubId);
+      for (let i = 0; i < cfg.fanout; i++) {
+        degEdges.push({ from: hubId, to: allNodeIds[h * stride + 1 + i], typeId: 1, weight: 1.0 });
+      }
+    }
+    db.batchUpsertEdges(degEdges);
+    const s = runBench(
+      () => db.degrees(hubIds, 'outgoing'),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'degrees',
+        'traversal',
+        s,
+        iterCfg,
+        { batch_nodes: cfg.batch_nodes, fanout: cfg.fanout, direction: 'outgoing' },
+        scenarioComparability(scenarioContract, scenarioId),
+        cfg.batch_nodes
+      )
+    );
+    db.close();
+  }
+
+  // S-TRAV-005: shortest_path (BFS)
+  {
+    const scenarioId = 'S-TRAV-005';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const db = OverGraph.open(join(tmpRoot, 'trav-shortest-path'));
+    const ids = db.batchUpsertNodes(
+      Array.from({ length: cfg.shortest_path_nodes }, (_, i) => ({ typeId: 1, key: `sp-${i}` }))
+    );
+    const spEdges = [];
+    for (let i = 0; i < ids.length; i++) {
+      const from = ids[i];
+      const to1 = ids[(i + cfg.shortest_path_edge_offsets[0]) % ids.length];
+      const to2 = ids[(i + cfg.shortest_path_edge_offsets[1]) % ids.length];
+      spEdges.push({ from, to: to1, typeId: 1, weight: 1.0 });
+      spEdges.push({ from, to: to2, typeId: 1, weight: 1.0 });
+    }
+    db.batchUpsertEdges(spEdges);
+    const spFrom = ids[0];
+    const spTo = ids[Math.floor(ids.length / 2)];
+    const s = runBench(
+      () => db.shortestPath(spFrom, spTo, 'outgoing'),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'shortest_path',
+        'traversal',
+        s,
+        iterCfg,
+        {
+          shortest_path_nodes: cfg.shortest_path_nodes,
+          edge_offsets: cfg.shortest_path_edge_offsets,
+          direction: 'outgoing',
+          weight_field: null,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  // S-TRAV-006: is_connected
+  {
+    const scenarioId = 'S-TRAV-006';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const db = OverGraph.open(join(tmpRoot, 'trav-is-connected'));
+    const ids = db.batchUpsertNodes(
+      Array.from({ length: cfg.shortest_path_nodes }, (_, i) => ({ typeId: 1, key: `ic-${i}` }))
+    );
+    const icEdges = [];
+    for (let i = 0; i < ids.length; i++) {
+      const from = ids[i];
+      const to1 = ids[(i + cfg.shortest_path_edge_offsets[0]) % ids.length];
+      const to2 = ids[(i + cfg.shortest_path_edge_offsets[1]) % ids.length];
+      icEdges.push({ from, to: to1, typeId: 1, weight: 1.0 });
+      icEdges.push({ from, to: to2, typeId: 1, weight: 1.0 });
+    }
+    db.batchUpsertEdges(icEdges);
+    const spFrom = ids[0];
+    const spTo = ids[Math.floor(ids.length / 2)];
+    const s = runBench(
+      () => db.isConnected(spFrom, spTo, 'outgoing'),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'is_connected',
+        'traversal',
+        s,
+        iterCfg,
+        {
+          shortest_path_nodes: cfg.shortest_path_nodes,
+          edge_offsets: cfg.shortest_path_edge_offsets,
+          direction: 'outgoing',
         },
         scenarioComparability(scenarioContract, scenarioId)
       )
@@ -479,11 +849,22 @@ try {
     const scenarioId = 'S-ADV-001';
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'adv-top-k'));
-    const hub = db.upsertNode(1, 'hub');
-    for (let i = 0; i < cfg.top_k_candidates; i++) {
-      const n = db.upsertNode(1, `tk-${i}`);
-      db.upsertEdge(hub, n, 1, null, 1.0 + ((i % 100) / 10.0));
-    }
+    const topKNodeIds = db.batchUpsertNodes([
+      { typeId: 1, key: 'hub' },
+      ...Array.from({ length: cfg.top_k_candidates }, (_, i) => ({
+        typeId: 1,
+        key: `tk-${i}`,
+      })),
+    ]);
+    const hub = topKNodeIds[0];
+    db.batchUpsertEdges(
+      Array.from({ length: cfg.top_k_candidates }, (_, i) => ({
+        from: hub,
+        to: topKNodeIds[i + 1],
+        typeId: 1,
+        weight: 1.0 + ((i % 100) / 10.0),
+      }))
+    );
     const s = runBench(
       () => db.topKNeighbors(hub, 'outgoing', null, cfg.top_k_limit, 'weight'),
       iterCfg.warmup,
@@ -513,9 +894,14 @@ try {
     const scenarioId = 'S-ADV-003';
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'adv-time-range'));
-    for (let i = 0; i < cfg.time_range_nodes; i++) {
-      db.upsertNode(1, `tr-${i}`, { idx: i }, 1.0);
-    }
+    db.batchUpsertNodes(
+      Array.from({ length: cfg.time_range_nodes }, (_, i) => ({
+        typeId: 1,
+        key: `tr-${i}`,
+        props: { idx: i },
+        weight: 1.0,
+      }))
+    );
     const fromMs = cfg.time_range_from_ms;
     const toMs = Date.now() + cfg.time_range_window_ms;
     const s = runBench(
@@ -550,13 +936,15 @@ try {
     const ids = db.batchUpsertNodes(
       Array.from({ length: cfg.ppr_nodes }, (_, i) => ({ typeId: 1, key: `ppr-${i}` }))
     );
+    const pprEdges = [];
     for (let i = 0; i < ids.length; i++) {
       const from = ids[i];
       const to1 = ids[(i + cfg.ppr_edge_offsets[0]) % ids.length];
       const to2 = ids[(i + cfg.ppr_edge_offsets[1]) % ids.length];
-      db.upsertEdge(from, to1, 1, null, 1.0);
-      db.upsertEdge(from, to2, 1, null, 0.7);
+      pprEdges.push({ from, to: to1, typeId: 1, weight: 1.0 });
+      pprEdges.push({ from, to: to2, typeId: 1, weight: 0.7 });
     }
+    db.batchUpsertEdges(pprEdges);
     const seed = new Float64Array([ids[0]]);
     const s = runBench(
       () =>
@@ -596,11 +984,13 @@ try {
     const ids = db.batchUpsertNodes(
       Array.from({ length: cfg.export_nodes }, (_, i) => ({ typeId: 1, key: `ex-${i}` }))
     );
+    const exportEdges = [];
     for (let i = 0; i < cfg.export_edges; i++) {
       const from = ids[i % ids.length];
       const to = ids[(i * 13 + 7) % ids.length];
-      if (from !== to) db.upsertEdge(from, to, 1, null, 1.0);
+      if (from !== to) exportEdges.push({ from, to, typeId: 1, weight: 1.0 });
     }
+    db.batchUpsertEdges(exportEdges);
     const s = runBench(
       () => db.exportAdjacency({ includeWeights: cfg.include_weights_on_export }),
       iterCfg.warmup,

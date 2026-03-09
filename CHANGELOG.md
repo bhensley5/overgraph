@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.2.0] - 2026-03-09
+
+### Added
+
+#### Phase 18a - Degree counts and aggregations
+- `degree()` - count edges for a node with direction/type/temporal filters
+- `sum_edge_weights()` - sum edge weights without materializing neighbor list
+- `avg_edge_weight()` - average edge weight (returns `None` if zero edges)
+- `degrees()` - batch degree counts with sorted cursor walk for bulk analysis
+- Node.js and Python bindings for all degree/weight methods
+
+#### Phase 18b - Shortest path (BFS + Dijkstra)
+- `shortest_path()` - find shortest path between two nodes; BFS (unweighted) or bidirectional Dijkstra (weighted)
+- `is_connected()` - fast reachability check using bidirectional BFS with no parent tracking
+- `all_shortest_paths()` - enumerate all shortest paths with equal cost, capped at `max_paths`
+- Supports `weight_field` for automatic algorithm selection: `None` → BFS, `"weight"` → fast Dijkstra, other → hydrated Dijkstra
+- Direction control, edge type filtering, temporal filtering (`at_epoch`), `max_depth`, and `max_cost` parameters
+- Node.js bindings: `shortestPath()`, `isConnected()`, `allShortestPaths()` (sync + async)
+- Python bindings: `shortest_path()`, `is_connected()`, `all_shortest_paths()` (sync + async)
+- Criterion benchmarks for BFS and Dijkstra on 10K and 100K node graphs
+- Cross-language parity harness entries (S-TRAV-005, S-TRAV-006)
+
+#### Phase 18c - Deterministic traversal
+- `traverse()` - breadth-first traversal with depth windows, edge-type filtering, emission-only node-type filtering, and traversal-specific pagination
+- Replaces `neighbors_2hop*` family with generic depth-bounded traversal
+- Node.js and Python bindings (sync + async)
+
+#### Phase 18d - Connected components (WCC)
+- `connected_components()` - global weakly-connected-component labelling via union-find with path compression and union by rank; returns `{node_id → component_id}` map where component_id is the minimum node ID in the component
+- `component_of(node_id)` - BFS-based single-component membership query; returns sorted member list
+- Edge-type, node-type, and temporal (`at_epoch`) filtering on both methods
+- Prune-policy awareness: pruned nodes are invisible to WCC/component_of
+- Node.js bindings: `connectedComponents()`, `componentOf()` (sync + async)
+- Python bindings: `connected_components()`, `component_of()` (sync + async)
+- Note: strongly connected components (SCC) are deferred to Phase 18m
+
 ## [0.1.0] - 2026-03-04
 
 Initial release.
@@ -99,4 +137,5 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.2.0]: https://github.com/Bhensley5/overgraph/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Bhensley5/overgraph/releases/tag/v0.1.0

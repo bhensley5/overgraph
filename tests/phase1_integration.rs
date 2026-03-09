@@ -54,9 +54,7 @@ fn test_full_phase1_lifecycle() {
                 _ => 3, // fact
             };
             let node = make_node(i, type_id, &format!("key:{}", i));
-            engine
-                .write_op(&WalOp::UpsertNode(node))
-                .unwrap();
+            engine.write_op(&WalOp::UpsertNode(node)).unwrap();
         }
 
         // Insert 200 edges across 2 types
@@ -65,9 +63,7 @@ fn test_full_phase1_lifecycle() {
             let to = ((i * 7) % 100) + 1;
             let type_id = if i <= 100 { 10 } else { 20 };
             let edge = make_edge(i, from, to, type_id);
-            engine
-                .write_op(&WalOp::UpsertEdge(edge))
-                .unwrap();
+            engine.write_op(&WalOp::UpsertEdge(edge)).unwrap();
         }
 
         assert_eq!(engine.node_count(), 100);
