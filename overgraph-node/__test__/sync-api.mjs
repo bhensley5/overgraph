@@ -26,7 +26,7 @@ describe('upsert_node / upsert_edge', () => {
   });
 
   it('upsertNode with props and weight', () => {
-    const id = db.upsertNode(1, 'bob', { age: 30, name: 'Bob' }, 0.8);
+    const id = db.upsertNode(1, 'bob', { props: { age: 30, name: 'Bob' }, weight: 0.8 });
     assert.equal(typeof id, 'number');
     assert.ok(id > 0);
   });
@@ -48,7 +48,7 @@ describe('upsert_node / upsert_edge', () => {
   it('upsertEdge with props and weight', () => {
     const a = db.upsertNode(1, 'e-src');
     const b = db.upsertNode(1, 'e-dst');
-    const eid = db.upsertEdge(a, b, 10, { strength: 0.9 }, 2.5);
+    const eid = db.upsertEdge(a, b, 10, { props: { strength: 0.9 }, weight: 2.5 });
     assert.ok(eid > 0);
   });
 });
@@ -185,7 +185,7 @@ describe('batch_upsert_nodes_binary / batch_upsert_edges_binary', () => {
       { from: nodeIds[0], to: nodeIds[1], typeId: 10 },
       { from: nodeIds[0], to: nodeIds[2], typeId: 10 },
     ]));
-    const result = db.neighbors(nodeIds[0], 'outgoing');
+    const result = db.neighbors(nodeIds[0], { direction: 'outgoing' });
     assert.equal(result.length, 2);
   });
 });
@@ -195,9 +195,9 @@ describe('get_node / get_edge', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-get-'));
     db = freshDb(tmpDir, 'get');
-    nodeId = db.upsertNode(3, 'getme', { color: 'blue', score: 42 }, 0.7);
+    nodeId = db.upsertNode(3, 'getme', { props: { color: 'blue', score: 42 }, weight: 0.7 });
     const dst = db.upsertNode(3, 'dst');
-    edgeId = db.upsertEdge(nodeId, dst, 8, { rel: 'parent' }, 1.5);
+    edgeId = db.upsertEdge(nodeId, dst, 8, { props: { rel: 'parent' }, weight: 1.5 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -268,14 +268,14 @@ describe('neighbors / traverse', () => {
     n2 = db.upsertNode(1, 'n2');
     n3 = db.upsertNode(1, 'n3');
     // center -> n1 (type 10), center -> n2 (type 20), n1 -> n3 (type 10)
-    db.upsertEdge(center, n1, 10, null, 1.0);
-    db.upsertEdge(center, n2, 20, null, 2.0);
-    db.upsertEdge(n1, n3, 10, null, 3.0);
+    db.upsertEdge(center, n1, 10, { weight: 1.0 });
+    db.upsertEdge(center, n2, 20, { weight: 2.0 });
+    db.upsertEdge(n1, n3, 10, { weight: 3.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('neighbors returns outgoing neighbors', () => {
-    const result = db.neighbors(center, 'outgoing');
+    const result = db.neighbors(center); // direction defaults to outgoing
     assert.equal(typeof result.length, 'number');
     assert.equal(result.length, 2);
     const nodeSet = new Set([result.nodeId(0), result.nodeId(1)]);
@@ -284,31 +284,31 @@ describe('neighbors / traverse', () => {
   });
 
   it('neighbors with type filter', () => {
-    const result = db.neighbors(center, 'outgoing', [10]);
+    const result = db.neighbors(center, { direction: 'outgoing', typeFilter: [10] });
     assert.equal(result.length, 1);
     assert.equal(result.nodeId(0), n1);
   });
 
   it('neighbors with limit', () => {
-    const result = db.neighbors(center, 'outgoing', null, 1);
+    const result = db.neighbors(center, { direction: 'outgoing', limit: 1 });
     assert.equal(result.length, 1);
   });
 
   it('neighbors incoming', () => {
-    const result = db.neighbors(n1, 'incoming');
+    const result = db.neighbors(n1, { direction: 'incoming' });
     assert.equal(result.length, 1);
     assert.equal(result.nodeId(0), center);
   });
 
   it('neighbors both', () => {
     // n1 has incoming from center and outgoing to n3
-    const result = db.neighbors(n1, 'both');
+    const result = db.neighbors(n1, { direction: 'both' });
     assert.equal(result.length, 2);
   });
 
   it('traverse can return only 2nd-hop nodes', () => {
     // From center: 1-hop = {n1, n2}, 2nd-hop-only = {n3}
-    const page = db.traverse(center, 2, 2, 'outgoing');
+    const page = db.traverse(center, 2, { minDepth: 2, direction: 'outgoing' });
     const nodeSet = new Set(page.items.map(hit => hit.nodeId));
     assert.ok(nodeSet.has(n3));
     assert.ok(!nodeSet.has(n1));
@@ -317,7 +317,7 @@ describe('neighbors / traverse', () => {
   });
 
   it('traverse supports edge filters and deterministic hit fields', () => {
-    const page = db.traverse(center, 2, 2, 'outgoing', [10]);
+    const page = db.traverse(center, 2, { minDepth: 2, direction: 'outgoing', edgeTypeFilter: [10] });
     const nodeSet = new Set(page.items.map(hit => hit.nodeId));
     assert.ok(nodeSet.has(n3));
     assert.equal(page.items.length, 1);
@@ -333,7 +333,7 @@ describe('neighbors / traverse', () => {
   });
 
   it('neighbor weights are returned', () => {
-    const result = db.neighbors(center, 'outgoing');
+    const result = db.neighbors(center, { direction: 'outgoing' });
     assert.equal(result.length, 2);
     // All weights should be numbers > 0
     for (let i = 0; i < result.length; i++) {
@@ -349,10 +349,10 @@ describe('find_nodes', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-find-'));
     db = freshDb(tmpDir, 'find');
-    db.upsertNode(5, 'alice', { city: 'NYC', active: true });
-    db.upsertNode(5, 'bob', { city: 'NYC', active: false });
-    db.upsertNode(5, 'carol', { city: 'LA', active: true });
-    db.upsertNode(6, 'dave', { city: 'NYC' });
+    db.upsertNode(5, 'alice', { props: { city: 'NYC', active: true } });
+    db.upsertNode(5, 'bob', { props: { city: 'NYC', active: false } });
+    db.upsertNode(5, 'carol', { props: { city: 'LA', active: true } });
+    db.upsertNode(6, 'dave', { props: { city: 'NYC' } });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -406,11 +406,11 @@ describe('flush / compact', () => {
 
     try {
       for (let i = 0; i < 50; i++) {
-        testDb.upsertNode(1, `node-${i}`, { idx: i });
+        testDb.upsertNode(1, `node-${i}`, { props: { idx: i } });
       }
       testDb.flush();
       for (let i = 50; i < 100; i++) {
-        testDb.upsertNode(1, `node-${i}`, { idx: i });
+        testDb.upsertNode(1, `node-${i}`, { props: { idx: i } });
       }
       testDb.flush();
 
@@ -437,22 +437,22 @@ describe('edge cases', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('upsertNode with empty props object', () => {
-    const id = db.upsertNode(1, 'empty-props', {});
+    const id = db.upsertNode(1, 'empty-props', { props: {} });
     const n = db.getNode(id);
     assert.ok(n);
     assert.deepEqual(n.props, {});
   });
 
   it('upsertNode with null/undefined props', () => {
-    const id1 = db.upsertNode(1, 'null-props', null);
-    const id2 = db.upsertNode(1, 'undef-props', undefined);
+    const id1 = db.upsertNode(1, 'null-props');
+    const id2 = db.upsertNode(1, 'undef-props');
     assert.ok(db.getNode(id1));
     assert.ok(db.getNode(id2));
   });
 
   it('findNodes with integer property value', () => {
-    db.upsertNode(9, 'scored', { score: 100 });
-    db.upsertNode(9, 'scored2', { score: 200 });
+    db.upsertNode(9, 'scored', { props: { score: 100 } });
+    db.upsertNode(9, 'scored2', { props: { score: 200 } });
     const ids = db.findNodes(9, 'score', 100);
     assert.equal(ids.length, 1);
   });
@@ -471,7 +471,7 @@ describe('edge cases', () => {
 
   it('neighbors on node with no edges returns empty', () => {
     const id = db.upsertNode(1, 'loner');
-    const result = db.neighbors(id, 'outgoing');
+    const result = db.neighbors(id, { direction: 'outgoing' });
     assert.equal(result.length, 0);
   });
 });
@@ -486,7 +486,7 @@ describe('error handling', () => {
 
   it('throws on invalid direction string', () => {
     const id = db.upsertNode(1, 'x');
-    assert.throws(() => db.neighbors(id, 'sideways'), /Invalid direction/);
+    assert.throws(() => db.neighbors(id, { direction: 'sideways' }), /Invalid direction/);
   });
 
   it('rejects negative IDs', () => {
@@ -530,9 +530,9 @@ describe('persistence round-trip', () => {
 
     // Write phase
     const db1 = OverGraph.open(dbPath);
-    const nid = db1.upsertNode(1, 'persist-me', { val: 'hello' });
+    const nid = db1.upsertNode(1, 'persist-me', { props: { val: 'hello' } });
     const dst = db1.upsertNode(1, 'persist-dst');
-    const eid = db1.upsertEdge(nid, dst, 5, { kind: 'test' });
+    const eid = db1.upsertEdge(nid, dst, 5, { props: { kind: 'test' } });
     db1.close();
 
     // Read phase

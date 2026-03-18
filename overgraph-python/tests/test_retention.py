@@ -1,5 +1,6 @@
 import time
 
+import pytest
 from overgraph import OverGraph
 
 
@@ -36,11 +37,10 @@ class TestPrune:
         result = db.prune(max_weight=0.1)
         assert result.nodes_pruned == 0
 
-    def test_prune_no_criteria(self, db):
+    def test_prune_no_criteria_rejects(self, db):
         db.upsert_node(1, "a")
-        result = db.prune()  # no criteria = prune nothing
-        assert result.nodes_pruned == 0
-        assert result.edges_pruned == 0
+        with pytest.raises(Exception, match="at least max_age_ms or max_weight"):
+            db.prune()  # no criteria = error
 
     def test_prune_by_age(self, db):
         db.upsert_node(1, "old", weight=5.0)

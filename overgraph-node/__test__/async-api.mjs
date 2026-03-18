@@ -18,7 +18,7 @@ describe('async upsert + get', () => {
   after(async () => { await db.closeAsync(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('upsertNodeAsync returns a number', async () => {
-    const id = await db.upsertNodeAsync(1, 'alice', { age: 30 }, 0.9);
+    const id = await db.upsertNodeAsync(1, 'alice', { props: { age: 30 }, weight: 0.9 });
     assert.equal(typeof id, 'number');
     assert.ok(id > 0);
   });
@@ -26,13 +26,13 @@ describe('async upsert + get', () => {
   it('upsertEdgeAsync returns a number', async () => {
     const a = await db.upsertNodeAsync(1, 'src');
     const b = await db.upsertNodeAsync(1, 'dst');
-    const eid = await db.upsertEdgeAsync(a, b, 5, { rel: 'knows' }, 1.5);
+    const eid = await db.upsertEdgeAsync(a, b, 5, { props: { rel: 'knows' }, weight: 1.5 });
     assert.equal(typeof eid, 'number');
     assert.ok(eid > 0);
   });
 
   it('getNodeAsync returns full record', async () => {
-    const id = await db.upsertNodeAsync(2, 'bob', { color: 'red' });
+    const id = await db.upsertNodeAsync(2, 'bob', { props: { color: 'red' } });
     const n = await db.getNodeAsync(id);
     assert.ok(n);
     assert.equal(n.id, id);
@@ -49,7 +49,7 @@ describe('async upsert + get', () => {
   it('getEdgeAsync returns full record', async () => {
     const a = await db.upsertNodeAsync(1, 'ea');
     const b = await db.upsertNodeAsync(1, 'eb');
-    const eid = await db.upsertEdgeAsync(a, b, 10, { kind: 'test' });
+    const eid = await db.upsertEdgeAsync(a, b, 10, { props: { kind: 'test' } });
     const e = await db.getEdgeAsync(eid);
     assert.ok(e);
     assert.equal(e.id, eid);
@@ -120,7 +120,7 @@ describe('async delete + neighbors + find', () => {
     await db.upsertEdgeAsync(c, n1, 10);
     await db.upsertEdgeAsync(c, n2, 10);
 
-    const result = await db.neighborsAsync(c, 'outgoing');
+    const result = await db.neighborsAsync(c, { direction: 'outgoing' });
     assert.equal(typeof result.length, 'number');
     assert.equal(result.length, 2);
   });
@@ -132,7 +132,7 @@ describe('async delete + neighbors + find', () => {
     await db.upsertEdgeAsync(a, b, 10);
     await db.upsertEdgeAsync(b, c, 10);
 
-    const page = await db.traverseAsync(a, 2, 2, 'outgoing');
+    const page = await db.traverseAsync(a, 2, { minDepth: 2, direction: 'outgoing' });
     const nodeSet = new Set(page.items.map(hit => hit.nodeId));
     assert.ok(nodeSet.has(c));
     assert.ok(!nodeSet.has(b)); // 1-hop excluded
@@ -140,9 +140,9 @@ describe('async delete + neighbors + find', () => {
   });
 
   it('findNodesAsync returns matching ids', async () => {
-    await db.upsertNodeAsync(7, 'fa', { city: 'NYC' });
-    await db.upsertNodeAsync(7, 'fb', { city: 'NYC' });
-    await db.upsertNodeAsync(7, 'fc', { city: 'LA' });
+    await db.upsertNodeAsync(7, 'fa', { props: { city: 'NYC' } });
+    await db.upsertNodeAsync(7, 'fb', { props: { city: 'NYC' } });
+    await db.upsertNodeAsync(7, 'fc', { props: { city: 'LA' } });
 
     const ids = await db.findNodesAsync(7, 'city', 'NYC');
     assert.ok(ids instanceof Float64Array);
@@ -177,11 +177,11 @@ describe('async flush + compact', () => {
 
     try {
       for (let i = 0; i < 50; i++) {
-        testDb.upsertNode(1, `cn-${i}`, { idx: i });
+        testDb.upsertNode(1, `cn-${i}`, { props: { idx: i } });
       }
       await testDb.flushAsync();
       for (let i = 50; i < 100; i++) {
-        testDb.upsertNode(1, `cn-${i}`, { idx: i });
+        testDb.upsertNode(1, `cn-${i}`, { props: { idx: i } });
       }
       await testDb.flushAsync();
 
@@ -213,11 +213,11 @@ describe('compactWithProgressAsync', () => {
 
   it('returns stats and calls progress callback', async () => {
     for (let i = 0; i < 50; i++) {
-      db.upsertNode(1, `cp-${i}`, { idx: i });
+      db.upsertNode(1, `cp-${i}`, { props: { idx: i } });
     }
     await db.flushAsync();
     for (let i = 50; i < 100; i++) {
-      db.upsertNode(1, `cp-${i}`, { idx: i });
+      db.upsertNode(1, `cp-${i}`, { props: { idx: i } });
     }
     await db.flushAsync();
 
@@ -237,11 +237,11 @@ describe('compactWithProgressAsync', () => {
 
   it('does not block event loop during compaction', async () => {
     for (let i = 0; i < 100; i++) {
-      db.upsertNode(2, `nb2-${i}`, { data: 'y'.repeat(50) });
+      db.upsertNode(2, `nb2-${i}`, { props: { data: 'y'.repeat(50) } });
     }
     await db.flushAsync();
     for (let i = 100; i < 200; i++) {
-      db.upsertNode(2, `nb2-${i}`, { data: 'y'.repeat(50) });
+      db.upsertNode(2, `nb2-${i}`, { props: { data: 'y'.repeat(50) } });
     }
     await db.flushAsync();
 
@@ -268,7 +268,7 @@ describe('async does not block event loop', () => {
   it('setTimeout fires during async flush', async () => {
     // Insert enough data to make flush take a moment
     for (let i = 0; i < 200; i++) {
-      db.upsertNode(1, `nb-${i}`, { data: 'x'.repeat(100) });
+      db.upsertNode(1, `nb-${i}`, { props: { data: 'x'.repeat(100) } });
     }
 
     let timerFired = false;

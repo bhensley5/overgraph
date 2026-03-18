@@ -1,11 +1,12 @@
+use crate::error::EngineError;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 // ---------------------------------------------------------------------------
 // Identity hasher for engine-generated u64 IDs (node IDs, edge IDs).
 //
-// Engine IDs are monotonically assigned u64 values — they are never
+// Engine IDs are monotonically assigned u64 values. They are never
 // adversarial, never strings, and never externally controlled. An identity
 // hash (hash(x) = x) eliminates the ~12ns-per-key SipHash overhead that
 // the default HashMap hasher imposes, giving 10-20x faster lookups and
@@ -60,9 +61,12 @@ pub type NodeIdBuildHasher = BuildHasherDefault<NodeIdHasher>;
 ///
 /// Returned by graph APIs that produce per-node result maps
 /// (`connected_components`, `degrees`, `neighbors_batch`). Supports all
-/// normal `HashMap` operations — iteration, indexing, `get`, `contains_key`,
+/// normal `HashMap` operations: iteration, indexing, `get`, `contains_key`,
 /// etc.
 pub type NodeIdMap<V> = HashMap<u64, V, NodeIdBuildHasher>;
+
+/// A `HashSet` of node or edge IDs with identity hashing.
+pub type NodeIdSet = HashSet<u64, NodeIdBuildHasher>;
 
 /// Property value types supported in node/edge properties.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,6 +105,219 @@ pub fn hash_prop_value(value: &PropValue) -> u64 {
     fnv1a(&bytes)
 }
 
+/// Dense vector payload stored on a node.
+pub type DenseVector = Vec<f32>;
+
+/// Sparse vector payload stored on a node: `(dimension_id, weight)`.
+pub type SparseVector = Vec<(u32, f32)>;
+
+/// Distance metric used for the DB-scoped dense vector space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DenseMetric {
+    Cosine,
+    Euclidean,
+    DotProduct,
+}
+
+/// HNSW build parameters for the DB-scoped dense vector space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswConfig {
+    pub m: u16,
+    pub ef_construction: u16,
+}
+
+/// Default ANN expansion for dense queries when `VectorSearchRequest.ef_search` is omitted.
+pub const DEFAULT_DENSE_EF_SEARCH: usize = 128;
+
+impl Default for HnswConfig {
+    fn default() -> Self {
+        Self {
+            m: 16,
+            ef_construction: 200,
+        }
+    }
+}
+
+/// Configuration for the single DB-scoped dense vector space in Phase 19.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DenseVectorConfig {
+    pub dimension: u32,
+    pub metric: DenseMetric,
+    #[serde(default)]
+    pub hnsw: HnswConfig,
+}
+
+/// Search mode for `vector_search`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VectorSearchMode {
+    Dense,
+    Sparse,
+    Hybrid,
+}
+
+/// Fusion strategy for hybrid vector search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FusionMode {
+    /// Weighted reciprocal rank fusion (default).
+    /// `score(d) = w_dense / (k + rank_dense) + w_sparse / (k + rank_sparse)`
+    #[default]
+    WeightedRankFusion,
+    /// Unweighted reciprocal rank fusion (ignores `dense_weight`/`sparse_weight`).
+    /// `score(d) = 1 / (k + rank_dense) + 1 / (k + rank_sparse)`
+    ReciprocalRankFusion,
+    /// Weighted score fusion with min-max normalization per modality.
+    /// `score(d) = w_dense * norm(dense_score) + w_sparse * norm(sparse_score)`
+    WeightedScoreFusion,
+}
+
+/// Traversal-shaped graph scope for vector search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorSearchScope {
+    pub start_node_id: u64,
+    pub max_depth: u32,
+    pub direction: Direction,
+    pub edge_type_filter: Option<Vec<u32>>,
+    pub at_epoch: Option<i64>,
+}
+
+/// Request parameters for dense, sparse, or hybrid vector search.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorSearchRequest {
+    pub mode: VectorSearchMode,
+    pub dense_query: Option<DenseVector>,
+    pub sparse_query: Option<SparseVector>,
+    pub k: usize,
+    pub type_filter: Option<Vec<u32>>,
+    pub ef_search: Option<usize>,
+    pub scope: Option<VectorSearchScope>,
+    pub dense_weight: Option<f32>,
+    pub sparse_weight: Option<f32>,
+    pub fusion_mode: Option<FusionMode>,
+}
+
+/// A scored vector-search hit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorHit {
+    pub node_id: u64,
+    pub score: f32,
+}
+
+/// Validate DB-scoped dense vector configuration.
+pub fn validate_dense_vector_config(config: &DenseVectorConfig) -> Result<(), EngineError> {
+    if config.dimension == 0 {
+        return Err(EngineError::InvalidOperation(
+            "dense vector dimension must be > 0".into(),
+        ));
+    }
+    if config.hnsw.m == 0 {
+        return Err(EngineError::InvalidOperation(
+            "dense HNSW m must be > 0".into(),
+        ));
+    }
+    if config.hnsw.ef_construction == 0 {
+        return Err(EngineError::InvalidOperation(
+            "dense HNSW ef_construction must be > 0".into(),
+        ));
+    }
+    if config.hnsw.ef_construction < config.hnsw.m {
+        return Err(EngineError::InvalidOperation(format!(
+            "dense HNSW ef_construction ({}) must be >= m ({})",
+            config.hnsw.ef_construction, config.hnsw.m
+        )));
+    }
+    Ok(())
+}
+
+fn validate_finite_vector_component(value: f32, context: &str) -> Result<(), EngineError> {
+    if !value.is_finite() {
+        return Err(EngineError::InvalidOperation(format!(
+            "{} contains NaN or infinite value",
+            context
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a dense vector against the configured DB-scoped dense space.
+pub fn validate_dense_vector(
+    values: &[f32],
+    config: &DenseVectorConfig,
+) -> Result<(), EngineError> {
+    validate_dense_vector_config(config)?;
+    if values.len() != config.dimension as usize {
+        return Err(EngineError::InvalidOperation(format!(
+            "dense vector length {} does not match configured dimension {}",
+            values.len(),
+            config.dimension
+        )));
+    }
+    for &value in values {
+        validate_finite_vector_component(value, "dense vector")?;
+    }
+    Ok(())
+}
+
+fn canonicalize_sparse_vector_entries(
+    mut entries: SparseVector,
+) -> Result<Option<SparseVector>, EngineError> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    for &(_, weight) in &entries {
+        validate_finite_vector_component(weight, "sparse vector")?;
+        if weight < 0.0 {
+            return Err(EngineError::InvalidOperation(
+                "sparse vector weights must be non-negative".into(),
+            ));
+        }
+    }
+    entries.sort_unstable_by_key(|&(dimension_id, _)| dimension_id);
+
+    let mut canonical = Vec::with_capacity(entries.len());
+    for (dimension_id, weight) in entries {
+        if let Some((last_dimension_id, last_weight)) = canonical.last_mut() {
+            if *last_dimension_id == dimension_id {
+                *last_weight += weight;
+                continue;
+            }
+        }
+        canonical.push((dimension_id, weight));
+    }
+
+    canonical.retain(|&(_, weight)| weight != 0.0);
+    if canonical.is_empty() {
+        return Ok(None);
+    }
+
+    for &(_, weight) in &canonical {
+        validate_finite_vector_component(weight, "sparse vector")?;
+    }
+
+    Ok(Some(canonical))
+}
+
+/// Canonicalize a sparse vector: sort by dimension, merge duplicates, and drop zeros.
+pub fn canonicalize_sparse_vector(
+    values: &[(u32, f32)],
+) -> Result<Option<SparseVector>, EngineError> {
+    canonicalize_sparse_vector_entries(values.to_vec())
+}
+
+/// Canonicalize an owned sparse vector without taking an extra clone.
+pub fn canonicalize_sparse_vector_owned(
+    values: SparseVector,
+) -> Result<Option<SparseVector>, EngineError> {
+    canonicalize_sparse_vector_entries(values)
+}
+
+/// A tombstone entry recording when a record was deleted and its last write sequence.
+#[derive(Debug, Clone, Copy)]
+pub struct TombstoneEntry {
+    pub deleted_at: i64,
+    pub last_write_seq: u64,
+}
+
 /// A node record in the graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
@@ -111,6 +328,12 @@ pub struct NodeRecord {
     pub created_at: i64,
     pub updated_at: i64,
     pub weight: f32,
+    #[serde(default)]
+    pub dense_vector: Option<DenseVector>,
+    #[serde(default)]
+    pub sparse_vector: Option<SparseVector>,
+    #[serde(default)]
+    pub last_write_seq: u64,
 }
 
 /// An edge record in the graph.
@@ -128,6 +351,8 @@ pub struct EdgeRecord {
     pub valid_from: i64,
     /// End of the edge's validity window (epoch millis). i64::MAX means "still valid / no expiry".
     pub valid_to: i64,
+    #[serde(default)]
+    pub last_write_seq: u64,
 }
 
 /// Request parameters for cursor-based pagination.
@@ -202,10 +427,44 @@ pub struct ManifestState {
     pub segments: Vec<SegmentInfo>,
     pub next_node_id: u64,
     pub next_edge_id: u64,
+    /// DB-scoped dense vector configuration for Phase 19.
+    #[serde(default)]
+    pub dense_vector: Option<DenseVectorConfig>,
     /// Named prune policies applied automatically during compaction.
     /// Absent from older manifests; defaults to empty.
     #[serde(default)]
     pub prune_policies: BTreeMap<String, PrunePolicy>,
+    /// Next engine sequence number to assign. Persisted across flush/reopen.
+    #[serde(default)]
+    pub next_engine_seq: u64,
+    /// Next WAL generation ID to allocate. Monotonically increasing.
+    #[serde(default)]
+    pub next_wal_generation_id: u64,
+    /// WAL generation ID of the currently active (writable) WAL file.
+    #[serde(default)]
+    pub active_wal_generation_id: u64,
+    /// Flush epochs that are in-flight (frozen or published but not yet retired).
+    #[serde(default)]
+    pub pending_flush_epochs: Vec<FlushEpochMeta>,
+}
+
+/// State of a flush epoch in the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FlushEpochState {
+    /// Memtable frozen, WAL generation retained, segment not yet built.
+    FrozenPendingFlush,
+    /// Segment published, WAL generation pending deletion.
+    PublishedPendingRetire,
+}
+
+/// Manifest entry for a flush epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlushEpochMeta {
+    pub epoch_id: u64,
+    pub wal_generation_id: u64,
+    pub state: FlushEpochState,
+    /// Segment ID, set once the epoch's segment is published.
+    pub segment_id: Option<u64>,
 }
 
 /// Phase of a running compaction, reported via progress callback.
@@ -266,6 +525,345 @@ pub struct NodeInput {
     pub key: String,
     pub props: BTreeMap<String, PropValue>,
     pub weight: f32,
+    pub dense_vector: Option<DenseVector>,
+    pub sparse_vector: Option<SparseVector>,
+}
+
+/// Options for `upsert_node`. All fields have sensible defaults:
+/// empty properties, weight 1.0, no vectors.
+///
+/// ```
+/// # use overgraph::UpsertNodeOptions;
+/// let opts = UpsertNodeOptions::default(); // empty props, weight 1.0
+/// let opts = UpsertNodeOptions { weight: 2.5, ..Default::default() };
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertNodeOptions {
+    /// Node properties. Default: empty.
+    pub props: BTreeMap<String, PropValue>,
+    /// Node weight. Default: 1.0.
+    pub weight: f32,
+    /// Optional dense vector payload.
+    pub dense_vector: Option<DenseVector>,
+    /// Optional sparse vector payload.
+    pub sparse_vector: Option<SparseVector>,
+}
+
+impl Default for UpsertNodeOptions {
+    fn default() -> Self {
+        Self {
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        }
+    }
+}
+
+/// Options for `upsert_edge`. All fields have sensible defaults:
+/// empty properties, weight 1.0, no validity window override.
+///
+/// ```
+/// # use overgraph::UpsertEdgeOptions;
+/// let opts = UpsertEdgeOptions::default(); // empty props, weight 1.0
+/// let opts = UpsertEdgeOptions { weight: 0.5, ..Default::default() };
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertEdgeOptions {
+    /// Edge properties. Default: empty.
+    pub props: BTreeMap<String, PropValue>,
+    /// Edge weight. Default: 1.0.
+    pub weight: f32,
+    /// Start of validity window (epoch millis). Default: None (uses created_at).
+    pub valid_from: Option<i64>,
+    /// End of validity window (epoch millis). Default: None (no expiry).
+    pub valid_to: Option<i64>,
+}
+
+impl Default for UpsertEdgeOptions {
+    fn default() -> Self {
+        Self {
+            props: BTreeMap::new(),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        }
+    }
+}
+
+/// Options for `neighbors`, `neighbors_batch`, and `neighbors_paged`.
+///
+/// For `neighbors_batch`, `limit` is ignored. For `neighbors_paged`,
+/// `limit` is ignored (use `PageRequest` instead).
+///
+/// ```
+/// # use overgraph::NeighborOptions;
+/// let opts = NeighborOptions::default(); // Outgoing, no filter, no limit
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighborOptions {
+    /// Edge direction. Default: Outgoing.
+    pub direction: Direction,
+    /// Only include edges of these types. Default: None (all types).
+    pub type_filter: Option<Vec<u32>>,
+    /// Maximum number of results. Default: None (unlimited).
+    pub limit: Option<usize>,
+    /// Point-in-time epoch for temporal filtering. Default: None (current time).
+    pub at_epoch: Option<i64>,
+    /// Exponential decay lambda for scoring. Default: None (no decay).
+    pub decay_lambda: Option<f32>,
+}
+
+impl Default for NeighborOptions {
+    fn default() -> Self {
+        Self {
+            direction: Direction::Outgoing,
+            type_filter: None,
+            limit: None,
+            at_epoch: None,
+            decay_lambda: None,
+        }
+    }
+}
+
+/// Options for `degree`, `degrees`, `sum_edge_weights`, and `avg_edge_weight`.
+///
+/// ```
+/// # use overgraph::DegreeOptions;
+/// let opts = DegreeOptions::default(); // Outgoing, no filter
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct DegreeOptions {
+    /// Edge direction. Default: Outgoing.
+    pub direction: Direction,
+    /// Only include edges of these types. Default: None (all types).
+    pub type_filter: Option<Vec<u32>>,
+    /// Point-in-time epoch for temporal filtering. Default: None (current time).
+    pub at_epoch: Option<i64>,
+}
+
+impl Default for DegreeOptions {
+    fn default() -> Self {
+        Self {
+            direction: Direction::Outgoing,
+            type_filter: None,
+            at_epoch: None,
+        }
+    }
+}
+
+/// Options for `top_k_neighbors`.
+///
+/// ```
+/// # use overgraph::TopKOptions;
+/// let opts = TopKOptions::default(); // Outgoing, Weight scoring
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopKOptions {
+    /// Edge direction. Default: Outgoing.
+    pub direction: Direction,
+    /// Only include edges of these types. Default: None (all types).
+    pub type_filter: Option<Vec<u32>>,
+    /// Scoring mode for ranking. Default: Weight.
+    pub scoring: ScoringMode,
+    /// Point-in-time epoch for temporal filtering. Default: None (current time).
+    pub at_epoch: Option<i64>,
+}
+
+impl Default for TopKOptions {
+    fn default() -> Self {
+        Self {
+            direction: Direction::Outgoing,
+            type_filter: None,
+            scoring: ScoringMode::Weight,
+            at_epoch: None,
+        }
+    }
+}
+
+/// Options for `traverse`.
+///
+/// ```
+/// # use overgraph::TraverseOptions;
+/// let opts = TraverseOptions::default(); // min_depth=1, Outgoing
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraverseOptions {
+    /// Minimum hop depth (inclusive). Default: 1.
+    pub min_depth: u32,
+    /// Edge direction. Default: Outgoing.
+    pub direction: Direction,
+    /// Only traverse edges of these types. Default: None (all types).
+    pub edge_type_filter: Option<Vec<u32>>,
+    /// Only emit nodes of these types. Default: None (all types).
+    pub node_type_filter: Option<Vec<u32>>,
+    /// Point-in-time epoch for temporal filtering. Default: None (current time).
+    pub at_epoch: Option<i64>,
+    /// Exponential decay lambda for depth-based scoring. Default: None.
+    pub decay_lambda: Option<f64>,
+    /// Maximum number of results. Default: None (unlimited).
+    pub limit: Option<usize>,
+    /// Cursor for pagination. Default: None (start from beginning).
+    pub cursor: Option<TraversalCursor>,
+}
+
+impl Default for TraverseOptions {
+    fn default() -> Self {
+        Self {
+            min_depth: 1,
+            direction: Direction::Outgoing,
+            edge_type_filter: None,
+            node_type_filter: None,
+            at_epoch: None,
+            decay_lambda: None,
+            limit: None,
+            cursor: None,
+        }
+    }
+}
+
+/// Options for `extract_subgraph`.
+///
+/// ```
+/// # use overgraph::SubgraphOptions;
+/// let opts = SubgraphOptions::default(); // Outgoing, no filter
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubgraphOptions {
+    /// Edge direction. Default: Outgoing.
+    pub direction: Direction,
+    /// Only traverse edges of these types. Default: None (all types).
+    pub edge_type_filter: Option<Vec<u32>>,
+    /// Point-in-time epoch for temporal filtering. Default: None (current time).
+    pub at_epoch: Option<i64>,
+}
+
+impl Default for SubgraphOptions {
+    fn default() -> Self {
+        Self {
+            direction: Direction::Outgoing,
+            edge_type_filter: None,
+            at_epoch: None,
+        }
+    }
+}
+
+/// Options for `shortest_path`.
+///
+/// ```
+/// # use overgraph::ShortestPathOptions;
+/// let opts = ShortestPathOptions::default(); // Outgoing, BFS (no weight_field)
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShortestPathOptions {
+    /// Edge direction. Default: Outgoing.
+    pub direction: Direction,
+    /// Only traverse edges of these types. Default: None (all types).
+    pub type_filter: Option<Vec<u32>>,
+    /// Property key to use as edge weight (Dijkstra). Default: None (BFS hop count).
+    pub weight_field: Option<String>,
+    /// Point-in-time epoch for temporal filtering. Default: None (current time).
+    pub at_epoch: Option<i64>,
+    /// Maximum search depth in hops. Default: None (unlimited).
+    pub max_depth: Option<u32>,
+    /// Maximum total path cost. Default: None (unlimited).
+    pub max_cost: Option<f64>,
+}
+
+impl Default for ShortestPathOptions {
+    fn default() -> Self {
+        Self {
+            direction: Direction::Outgoing,
+            type_filter: None,
+            weight_field: None,
+            at_epoch: None,
+            max_depth: None,
+            max_cost: None,
+        }
+    }
+}
+
+/// Options for `all_shortest_paths`.
+///
+/// ```
+/// # use overgraph::AllShortestPathsOptions;
+/// let opts = AllShortestPathsOptions::default(); // Outgoing, BFS
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct AllShortestPathsOptions {
+    /// Edge direction. Default: Outgoing.
+    pub direction: Direction,
+    /// Only traverse edges of these types. Default: None (all types).
+    pub type_filter: Option<Vec<u32>>,
+    /// Property key to use as edge weight (Dijkstra). Default: None (BFS hop count).
+    pub weight_field: Option<String>,
+    /// Point-in-time epoch for temporal filtering. Default: None (current time).
+    pub at_epoch: Option<i64>,
+    /// Maximum search depth in hops. Default: None (unlimited).
+    pub max_depth: Option<u32>,
+    /// Maximum total path cost. Default: None (unlimited).
+    pub max_cost: Option<f64>,
+    /// Maximum number of paths to return. Default: None (all).
+    pub max_paths: Option<usize>,
+}
+
+impl Default for AllShortestPathsOptions {
+    fn default() -> Self {
+        Self {
+            direction: Direction::Outgoing,
+            type_filter: None,
+            weight_field: None,
+            at_epoch: None,
+            max_depth: None,
+            max_cost: None,
+            max_paths: None,
+        }
+    }
+}
+
+/// Options for `is_connected`.
+///
+/// ```
+/// # use overgraph::IsConnectedOptions;
+/// let opts = IsConnectedOptions::default(); // Outgoing
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsConnectedOptions {
+    /// Edge direction. Default: Outgoing.
+    pub direction: Direction,
+    /// Only traverse edges of these types. Default: None (all types).
+    pub type_filter: Option<Vec<u32>>,
+    /// Point-in-time epoch for temporal filtering. Default: None (current time).
+    pub at_epoch: Option<i64>,
+    /// Maximum search depth in hops. Default: None (unlimited).
+    pub max_depth: Option<u32>,
+}
+
+impl Default for IsConnectedOptions {
+    fn default() -> Self {
+        Self {
+            direction: Direction::Outgoing,
+            type_filter: None,
+            at_epoch: None,
+            max_depth: None,
+        }
+    }
+}
+
+/// Options for `connected_components` and `component_of`.
+///
+/// ```
+/// # use overgraph::ComponentOptions;
+/// let opts = ComponentOptions::default(); // no filters
+/// ```
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ComponentOptions {
+    /// Only traverse edges of these types. Default: None (all types).
+    pub edge_type_filter: Option<Vec<u32>>,
+    /// Only include nodes of these types. Default: None (all types).
+    pub node_type_filter: Option<Vec<u32>>,
+    /// Point-in-time epoch for temporal filtering. Default: None (current time).
+    pub at_epoch: Option<i64>,
 }
 
 /// Input for batch edge upsert (user-facing, no ID or timestamps).
@@ -341,10 +939,23 @@ pub struct DbStats {
     pub last_compaction_ms: Option<i64>,
     /// The WAL sync mode this database was opened with.
     pub wal_sync_mode: String,
+    /// Estimated bytes in the active (mutable) memtable.
+    pub active_memtable_bytes: usize,
+    /// Estimated bytes across all immutable memtables pending flush.
+    pub immutable_memtable_bytes: usize,
+    /// Number of immutable memtables pending flush.
+    pub immutable_memtable_count: usize,
+    /// Number of flush operations currently in flight (enqueued to bg worker).
+    pub pending_flush_count: usize,
+    /// The WAL generation ID currently being written to.
+    pub active_wal_generation_id: u64,
+    /// The oldest WAL generation ID still retained for recovery.
+    /// Equal to `active_wal_generation_id` when no immutable memtables are pending.
+    pub oldest_retained_wal_generation_id: u64,
 }
 
 /// Direction for neighbor queries.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     /// Follow outgoing edges (from → to).
     Outgoing,
@@ -545,6 +1156,8 @@ pub struct DbOptions {
     pub create_if_missing: bool,
     pub memtable_flush_threshold: usize,
     pub edge_uniqueness: bool,
+    /// Optional DB-scoped dense vector configuration persisted in the manifest.
+    pub dense_vector: Option<DenseVectorConfig>,
     /// Trigger compaction automatically after this many flushes. 0 = disabled.
     pub compact_after_n_flushes: u32,
     /// WAL sync mode. Default: `WalSyncMode::GroupCommit`.
@@ -555,17 +1168,24 @@ pub struct DbOptions {
     /// Note: batch operations check backpressure once before writing; a single
     /// large batch may temporarily exceed the cap.
     pub memtable_hard_cap_bytes: usize,
+    /// Maximum number of immutable memtables pending flush before writers block.
+    /// When the pending immutable queue reaches this count, the next write
+    /// triggers a synchronous flush to drain one immutable before proceeding.
+    /// Default: 4. Set to 0 to disable immutable count backpressure.
+    pub max_immutable_memtables: usize,
 }
 
 impl Default for DbOptions {
     fn default() -> Self {
         DbOptions {
             create_if_missing: true,
-            memtable_flush_threshold: 64 * 1024 * 1024, // 64MB
+            memtable_flush_threshold: 128 * 1024 * 1024, // 128MB
             edge_uniqueness: false,
+            dense_vector: None,
             compact_after_n_flushes: 3,
             wal_sync_mode: WalSyncMode::default(),
-            memtable_hard_cap_bytes: 128 * 1024 * 1024, // 128MB (2x flush threshold)
+            memtable_hard_cap_bytes: 512 * 1024 * 1024, // 512MB (4x flush threshold)
+            max_immutable_memtables: 4,
         }
     }
 }
@@ -577,8 +1197,9 @@ mod tests {
     fn test_default_db_options() {
         let opts = DbOptions::default();
         assert!(opts.create_if_missing);
-        assert_eq!(opts.memtable_flush_threshold, 64 * 1024 * 1024);
+        assert_eq!(opts.memtable_flush_threshold, 128 * 1024 * 1024);
         assert!(!opts.edge_uniqueness);
+        assert!(opts.dense_vector.is_none());
         assert_eq!(opts.compact_after_n_flushes, 3);
         assert!(matches!(
             opts.wal_sync_mode,
@@ -588,7 +1209,8 @@ mod tests {
                 hard_cap_bytes: 16777216,
             }
         ));
-        assert_eq!(opts.memtable_hard_cap_bytes, 128 * 1024 * 1024);
+        assert_eq!(opts.memtable_hard_cap_bytes, 512 * 1024 * 1024);
+        assert_eq!(opts.max_immutable_memtables, 4);
     }
 
     #[test]
@@ -688,7 +1310,16 @@ mod tests {
             ],
             next_node_id: 151,
             next_edge_id: 276,
+            dense_vector: Some(DenseVectorConfig {
+                dimension: 384,
+                metric: DenseMetric::Cosine,
+                hnsw: HnswConfig::default(),
+            }),
             prune_policies: BTreeMap::new(),
+            next_engine_seq: 0,
+            next_wal_generation_id: 0,
+            active_wal_generation_id: 0,
+            pending_flush_epochs: Vec::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let loaded: ManifestState = serde_json::from_str(&json).unwrap();
@@ -696,6 +1327,144 @@ mod tests {
         assert_eq!(loaded.segments.len(), 2);
         assert_eq!(loaded.next_node_id, 151);
         assert_eq!(loaded.next_edge_id, 276);
+        assert_eq!(loaded.dense_vector, state.dense_vector);
+    }
+
+    #[test]
+    fn test_validate_dense_vector_config_rejects_invalid_values() {
+        let err = validate_dense_vector_config(&DenseVectorConfig {
+            dimension: 0,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig::default(),
+        })
+        .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+
+        let err = validate_dense_vector_config(&DenseVectorConfig {
+            dimension: 8,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig {
+                m: 32,
+                ef_construction: 16,
+            },
+        })
+        .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+    }
+
+    #[test]
+    fn test_validate_dense_vector_rejects_wrong_length_and_non_finite_values() {
+        let config = DenseVectorConfig {
+            dimension: 3,
+            metric: DenseMetric::DotProduct,
+            hnsw: HnswConfig::default(),
+        };
+
+        let err = validate_dense_vector(&[1.0, 2.0], &config).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+
+        let err = validate_dense_vector(&[1.0, f32::NAN, 3.0], &config).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+    }
+
+    #[test]
+    fn test_canonicalize_sparse_vector_sorts_merges_and_drops_zeros() {
+        let canonical = canonicalize_sparse_vector(&[
+            (9, 0.0),
+            (4, 1.5),
+            (2, 2.0),
+            (4, 0.5),
+            (2, 0.0),
+            (7, 3.0),
+            (4, 1.0),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(canonical, vec![(2, 2.0), (4, 3.0), (7, 3.0)]);
+    }
+
+    #[test]
+    fn test_canonicalize_sparse_vector_rejects_non_finite_values() {
+        let err = canonicalize_sparse_vector(&[(1, f32::INFINITY)]).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+    }
+
+    #[test]
+    fn test_canonicalize_sparse_vector_rejects_negative_values() {
+        let err = canonicalize_sparse_vector(&[(1, -0.25)]).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+        assert!(err
+            .to_string()
+            .contains("sparse vector weights must be non-negative"));
+    }
+
+    #[test]
+    fn test_upsert_node_options_default() {
+        let opts = UpsertNodeOptions::default();
+        assert!(opts.props.is_empty());
+        assert_eq!(opts.weight, 1.0);
+        assert!(opts.dense_vector.is_none());
+        assert!(opts.sparse_vector.is_none());
+    }
+
+    #[test]
+    fn test_upsert_edge_options_default() {
+        let opts = UpsertEdgeOptions::default();
+        assert!(opts.props.is_empty());
+        assert_eq!(opts.weight, 1.0);
+        assert!(opts.valid_from.is_none());
+        assert!(opts.valid_to.is_none());
+    }
+
+    #[test]
+    fn test_neighbor_options_default() {
+        let opts = NeighborOptions::default();
+        assert_eq!(opts.direction, Direction::Outgoing);
+        assert!(opts.type_filter.is_none());
+        assert!(opts.limit.is_none());
+        assert!(opts.at_epoch.is_none());
+        assert!(opts.decay_lambda.is_none());
+    }
+
+    #[test]
+    fn test_degree_options_default() {
+        let opts = DegreeOptions::default();
+        assert_eq!(opts.direction, Direction::Outgoing);
+        assert!(opts.type_filter.is_none());
+        assert!(opts.at_epoch.is_none());
+    }
+
+    #[test]
+    fn test_traverse_options_default() {
+        let opts = TraverseOptions::default();
+        assert_eq!(opts.min_depth, 1);
+        assert_eq!(opts.direction, Direction::Outgoing);
+        assert!(opts.edge_type_filter.is_none());
+        assert!(opts.node_type_filter.is_none());
+        assert!(opts.at_epoch.is_none());
+        assert!(opts.decay_lambda.is_none());
+        assert!(opts.limit.is_none());
+        assert!(opts.cursor.is_none());
+    }
+
+    #[test]
+    fn test_shortest_path_options_default() {
+        let opts = ShortestPathOptions::default();
+        assert_eq!(opts.direction, Direction::Outgoing);
+        assert!(opts.type_filter.is_none());
+        assert!(opts.weight_field.is_none());
+        assert!(opts.at_epoch.is_none());
+        assert!(opts.max_depth.is_none());
+        assert!(opts.max_cost.is_none());
+    }
+
+    #[test]
+    fn test_component_options_default() {
+        let opts = ComponentOptions::default();
+        assert!(opts.edge_type_filter.is_none());
+        assert!(opts.node_type_filter.is_none());
+        assert!(opts.at_epoch.is_none());
     }
 
     #[test]

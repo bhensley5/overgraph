@@ -1,4 +1,4 @@
-use overgraph::{DatabaseEngine, DbOptions, NodeInput, PropValue};
+use overgraph::{DatabaseEngine, DbOptions, NodeInput, PropValue, UpsertEdgeOptions};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
@@ -33,6 +33,8 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
                 key: format!("node:{}", i),
                 props,
                 weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
             }
         })
         .collect();
@@ -47,10 +49,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
                     ids1[i],
                     ids1[i + 1],
                     batch1[i].type_id,
-                    BTreeMap::new(),
-                    1.0,
-                    None,
-                    None,
+                    UpsertEdgeOptions::default(),
                 )
                 .unwrap();
         }
@@ -80,6 +79,8 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
                 key: format!("node:{}", i),
                 props,
                 weight: 0.6,
+                dense_vector: None,
+                sparse_vector: None,
             }
         })
         .collect();

@@ -108,7 +108,7 @@ Both language connectors achieve near-parity with Rust on most operations:
 | Growth writes (upsert_node) | 1.5-2.0x | 1.1-1.3x |
 | Flush (disk sync) | ~1.0x | ~1.0x |
 
-The only scenario with meaningful connector overhead is `get_node`, where the absolute Rust latency is so small (~200ns) that any FFI boundary crossing is proportionally significant. In absolute terms, a Node.js point read still completes in under 1 microsecond, fast enough that your application could perform **thousands of graph lookups** in the time budget of a single LLM API call.
+The only scenario with meaningful connector overhead is `get_node`, where the absolute Rust latency is so small (~26ns) that any FFI boundary crossing is proportionally significant. In absolute terms, a Node.js point read still completes in under 1 microsecond, fast enough that your application could perform **thousands of graph lookups** in the time budget of a single LLM API call.
 
 The fixed-state write benchmarks (S-CRUD-004, S-CRUD-005) cleanly isolate FFI overhead from memtable growth noise. Node.js adds 0.5-0.7 microseconds of fixed overhead per write call; Python adds 0.2-0.4 microseconds.
 
@@ -116,7 +116,7 @@ The fixed-state write benchmarks (S-CRUD-004, S-CRUD-005) cleanly isolate FFI ov
 
 A key design goal was that core operations should not degrade as the dataset grows. The numbers confirm this:
 
-- `get_node` stays at ~200ns from 10K to 1M nodes. **Constant time.**
+- `get_node` stays at ~26ns from 10K to 1M nodes. **Constant time.**
 - `neighbors` stays at 2.1-3.7 microseconds regardless of graph size; the adjacency index provides O(1) access.
 - Fixed-state writes stay at 0.4-1.3 microseconds across all scales. **Pure in-memory cost, scale-independent.**
 - Growth write latency is stable at 2-2.8 microseconds across all scales.

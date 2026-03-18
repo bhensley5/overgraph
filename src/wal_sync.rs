@@ -119,6 +119,9 @@ mod tests {
             created_at: 1000 * id as i64,
             updated_at: 1000 * id as i64 + 1,
             weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         })
     }
 
@@ -128,8 +131,8 @@ mod tests {
         let mut writer = WalWriter::open(dir.path()).unwrap();
 
         // Write some records
-        writer.append(&make_test_node(1, "a")).unwrap();
-        writer.append(&make_test_node(2, "b")).unwrap();
+        writer.append(&make_test_node(1, "a"), 1).unwrap();
+        writer.append(&make_test_node(2, "b"), 2).unwrap();
         writer.sync().unwrap();
 
         // Verify records exist
@@ -144,7 +147,7 @@ mod tests {
         assert!(reader.read_all().unwrap().is_empty());
 
         // Write new records after reset
-        writer.append(&make_test_node(3, "c")).unwrap();
+        writer.append(&make_test_node(3, "c"), 3).unwrap();
         writer.sync().unwrap();
         drop(writer);
 
@@ -152,7 +155,7 @@ mod tests {
         let ops = reader.read_all().unwrap();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            WalOp::UpsertNode(node) => assert_eq!(node.key, "c"),
+            (_, WalOp::UpsertNode(node)) => assert_eq!(node.key, "c"),
             _ => panic!("expected UpsertNode"),
         }
     }
@@ -181,7 +184,7 @@ mod tests {
         {
             let (lock, cvar) = &*wal_state;
             let mut s = lock.lock().unwrap();
-            let bytes = s.wal_writer.append(&make_test_node(1, "test")).unwrap();
+            let bytes = s.wal_writer.append(&make_test_node(1, "test"), 1).unwrap();
             s.buffered_bytes += bytes;
             cvar.notify_all(); // soft trigger
         }
@@ -210,7 +213,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut writer = WalWriter::open(dir.path()).unwrap();
 
-        let ops = vec![make_test_node(1, "a"), make_test_node(2, "b")];
+        let ops = vec![
+            (1u64, make_test_node(1, "a")),
+            (2u64, make_test_node(2, "b")),
+        ];
         let total = writer.append_batch(&ops).unwrap();
         // Each record has: 4 (len) + 4 (crc) + payload
         assert!(total > 0);
@@ -230,7 +236,7 @@ mod tests {
         let mut writer = WalWriter::open(dir.path()).unwrap();
 
         // Append data directly (not through sync thread)
-        let bytes = writer.append(&make_test_node(1, "pending")).unwrap();
+        let bytes = writer.append(&make_test_node(1, "pending"), 1).unwrap();
         writer.flush().unwrap(); // flush to OS buffer, but NOT fsync
 
         let state = WalSyncState {
@@ -329,7 +335,7 @@ mod tests {
             let mut s = lock.lock().unwrap();
             let bytes = s
                 .wal_writer
-                .append(&make_test_node(i + 1, &format!("n{}", i)))
+                .append(&make_test_node(i + 1, &format!("n{}", i)), i + 1)
                 .unwrap();
             s.buffered_bytes += bytes;
             cvar.notify_all();

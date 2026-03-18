@@ -82,8 +82,8 @@ export declare class JsSubgraphResult {
 export declare class OverGraph {
   static open(path: string, options?: JsDbOptions | undefined | null): OverGraph
   close(options?: JsCloseOptions | undefined | null): void
-  upsertNode(typeId: number, key: string, props?: Record<string, any> | undefined | null, weight?: number | undefined | null): number
-  upsertEdge(from: number, to: number, typeId: number, props?: Record<string, any> | undefined | null, weight?: number | undefined | null, validFrom?: number | undefined | null, validTo?: number | undefined | null): number
+  upsertNode(typeId: number, key: string, options?: JsUpsertNodeOptions | undefined | null): number
+  upsertEdge(from: number, to: number, typeId: number, options?: JsUpsertEdgeOptions | undefined | null): number
   batchUpsertNodes(nodes: Array<JsNodeInput>): Float64Array
   batchUpsertEdges(edges: Array<JsEdgeInput>): Float64Array
   /**
@@ -110,6 +110,7 @@ export declare class OverGraph {
   getNodeByKey(typeId: number, key: string): JsNodeRecord | null
   getEdgeByTriple(from: number, to: number, typeId: number): JsEdgeRecord | null
   getNodes(ids: Array<number>): Array<JsNodeRecord | undefined | null>
+  getNodesByKeys(keys: Array<JsKeyQuery>): Array<JsNodeRecord | undefined | null>
   getEdges(ids: Array<number>): Array<JsEdgeRecord | undefined | null>
   deleteNode(id: number): void
   deleteEdge(id: number): void
@@ -122,22 +123,22 @@ export declare class OverGraph {
   setPrunePolicyAsync(name: string, policy: JsPrunePolicy): Promise<void>
   removePrunePolicyAsync(name: string): Promise<boolean>
   listPrunePoliciesAsync(): Promise<Array<JsNamedPrunePolicy>>
-  neighbors(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): JsNeighborList
-  traverse(startNodeId: number, minDepth: number, maxDepth: number, direction?: string | undefined | null, edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null, limit?: number | undefined | null, cursor?: JsTraversalCursor | undefined | null): JsTraversalPageResult
-  topKNeighbors(nodeId: number, direction: string | undefined | null, typeFilter: Array<number> | undefined | null, k: number, scoring?: string | undefined | null, decayLambda?: number | undefined | null, atEpoch?: number | undefined | null): JsNeighborList
-  extractSubgraph(startNodeId: number, maxDepth: number, direction?: string | undefined | null, edgeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): JsSubgraphResult
+  neighbors(nodeId: number, options?: JsNeighborsOptions | undefined | null): JsNeighborList
+  traverse(startNodeId: number, maxDepth: number, options?: JsTraverseOptions | undefined | null): JsTraversalPageResult
+  topKNeighbors(nodeId: number, k: number, options?: JsTopKNeighborsOptions | undefined | null): JsNeighborList
+  extractSubgraph(startNodeId: number, maxDepth: number, options?: JsExtractSubgraphOptions | undefined | null): JsSubgraphResult
   /**
    * Batch neighbor query: fetch neighbors for multiple nodes in one call.
    * Returns an array of entries, each mapping a query node to its neighbors.
    */
-  neighborsBatch(nodeIds: Array<number>, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Array<JsNeighborBatchEntry>
-  degree(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): number
-  sumEdgeWeights(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): number
-  avgEdgeWeight(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): number | null
-  degrees(nodeIds: Array<number>, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Array<JsDegreeBatchEntry>
-  shortestPath(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, weightField?: string | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null, maxCost?: number | undefined | null): JsShortestPath | null
-  isConnected(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null): boolean
-  allShortestPaths(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, weightField?: string | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null, maxCost?: number | undefined | null, maxPaths?: number | undefined | null): Array<JsShortestPath>
+  neighborsBatch(nodeIds: Array<number>, options?: JsNeighborsBatchOptions | undefined | null): Array<JsNeighborBatchEntry>
+  degree(nodeId: number, options?: JsDegreeOptions | undefined | null): number
+  sumEdgeWeights(nodeId: number, options?: JsSumEdgeWeightsOptions | undefined | null): number
+  avgEdgeWeight(nodeId: number, options?: JsAvgEdgeWeightOptions | undefined | null): number | null
+  degrees(nodeIds: Array<number>, options?: JsDegreesOptions | undefined | null): Array<JsDegreeBatchEntry>
+  shortestPath(from: number, to: number, options?: JsShortestPathOptions | undefined | null): JsShortestPath | null
+  isConnected(from: number, to: number, options?: JsIsConnectedOptions | undefined | null): boolean
+  allShortestPaths(from: number, to: number, options?: JsAllShortestPathsOptions | undefined | null): Array<JsShortestPath>
   findNodes(typeId: number, propKey: string, propValue: any): Float64Array
   /** Return all node IDs of a given type (unpaged). */
   nodesByType(typeId: number): Float64Array
@@ -151,14 +152,15 @@ export declare class OverGraph {
   edgesByTypePaged(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): JsIdPageResult
   getNodesByTypePaged(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): JsNodePageResult
   getEdgesByTypePaged(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): JsEdgePageResult
-  findNodesPaged(typeId: number, propKey: string, propValue: any, limit?: number | undefined | null, after?: number | undefined | null): JsIdPageResult
+  findNodesPaged(typeId: number, propKey: string, propValue: any, options?: JsFindNodesPagedOptions | undefined | null): JsIdPageResult
   findNodesByTimeRange(typeId: number, fromMs: number, toMs: number): Float64Array
-  findNodesByTimeRangePaged(typeId: number, fromMs: number, toMs: number, limit?: number | undefined | null, after?: number | undefined | null): JsIdPageResult
-  personalizedPagerank(seedNodeIds: Float64Array, options?: JsPprOptions | undefined | null): JsPprResult
+  findNodesByTimeRangePaged(typeId: number, fromMs: number, toMs: number, options?: JsFindNodesByTimeRangePagedOptions | undefined | null): JsIdPageResult
+  personalizedPagerank(seedNodeIds: Array<number>, options?: JsPersonalizedPagerankOptions | undefined | null): JsPprResult
   exportAdjacency(options?: JsExportOptions | undefined | null): JsAdjacencyExport
-  neighborsPaged(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, after?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): JsNeighborPageResult
-  connectedComponents(edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Array<JsComponentEntry>
-  componentOf(nodeId: number, edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Float64Array
+  neighborsPaged(nodeId: number, options?: JsNeighborsPagedOptions | undefined | null): JsNeighborPageResult
+  connectedComponents(options?: JsConnectedComponentsOptions | undefined | null): Array<JsComponentEntry>
+  componentOf(nodeId: number, options?: JsComponentOfOptions | undefined | null): Float64Array
+  vectorSearch(mode: string, options: JsVectorSearchOptions): Array<JsVectorHit>
   /**
    * Force an immediate WAL fsync. In GroupCommit mode, blocks until all
    * buffered data is durable. In Immediate mode, this is a no-op.
@@ -177,8 +179,8 @@ export declare class OverGraph {
   stats(): JsDbStats
   closeAsync(options?: JsCloseOptions | undefined | null): Promise<void>
   statsAsync(): Promise<JsDbStats>
-  upsertNodeAsync(typeId: number, key: string, props?: Record<string, any> | undefined | null, weight?: number | undefined | null): Promise<number>
-  upsertEdgeAsync(from: number, to: number, typeId: number, props?: Record<string, any> | undefined | null, weight?: number | undefined | null, validFrom?: number | undefined | null, validTo?: number | undefined | null): Promise<number>
+  upsertNodeAsync(typeId: number, key: string, options?: JsUpsertNodeOptions | undefined | null): Promise<number>
+  upsertEdgeAsync(from: number, to: number, typeId: number, options?: JsUpsertEdgeOptions | undefined | null): Promise<number>
   batchUpsertNodesAsync(nodes: Array<JsNodeInput>): Promise<Float64Array>
   batchUpsertEdgesAsync(edges: Array<JsEdgeInput>): Promise<Float64Array>
   batchUpsertNodesBinaryAsync(buffer: Buffer): Promise<Float64Array>
@@ -188,16 +190,17 @@ export declare class OverGraph {
   getNodeByKeyAsync(typeId: number, key: string): Promise<JsNodeRecord | null>
   getEdgeByTripleAsync(from: number, to: number, typeId: number): Promise<JsEdgeRecord | null>
   getNodesAsync(ids: Array<number>): Promise<Array<JsNodeRecord | null>>
+  getNodesByKeysAsync(keys: Array<JsKeyQuery>): Promise<Array<JsNodeRecord | null>>
   getEdgesAsync(ids: Array<number>): Promise<Array<JsEdgeRecord | null>>
   deleteNodeAsync(id: number): Promise<void>
   deleteEdgeAsync(id: number): Promise<void>
   invalidateEdgeAsync(id: number, validTo: number): Promise<JsEdgeRecord | null>
   graphPatchAsync(patch: JsGraphPatch): Promise<JsPatchResult>
   pruneAsync(policy: JsPrunePolicy): Promise<JsPruneResult>
-  neighborsAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<JsNeighborList>
-  traverseAsync(startNodeId: number, minDepth: number, maxDepth: number, direction?: string | undefined | null, edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null, limit?: number | undefined | null, cursor?: JsTraversalCursor | undefined | null): Promise<JsTraversalPageResult>
-  topKNeighborsAsync(nodeId: number, direction: string | undefined | null, typeFilter: Array<number> | undefined | null, k: number, scoring?: string | undefined | null, decayLambda?: number | undefined | null, atEpoch?: number | undefined | null): Promise<JsNeighborList>
-  extractSubgraphAsync(startNodeId: number, maxDepth: number, direction?: string | undefined | null, edgeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<JsSubgraphResult>
+  neighborsAsync(nodeId: number, options?: JsNeighborsOptions | undefined | null): Promise<JsNeighborList>
+  traverseAsync(startNodeId: number, maxDepth: number, options?: JsTraverseOptions | undefined | null): Promise<JsTraversalPageResult>
+  topKNeighborsAsync(nodeId: number, k: number, options?: JsTopKNeighborsOptions | undefined | null): Promise<JsNeighborList>
+  extractSubgraphAsync(startNodeId: number, maxDepth: number, options?: JsExtractSubgraphOptions | undefined | null): Promise<JsSubgraphResult>
   findNodesAsync(typeId: number, propKey: string, propValue: any): Promise<Float64Array>
   getNodesByTypeAsync(typeId: number): Promise<Array<JsNodeRecord>>
   getEdgesByTypeAsync(typeId: number): Promise<Array<JsEdgeRecord>>
@@ -205,26 +208,27 @@ export declare class OverGraph {
   countEdgesByTypeAsync(typeId: number): Promise<number>
   nodesByTypeAsync(typeId: number): Promise<Float64Array>
   edgesByTypeAsync(typeId: number): Promise<Float64Array>
-  neighborsBatchAsync(nodeIds: Array<number>, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<Array<JsNeighborBatchEntry>>
-  degreeAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<number>
-  sumEdgeWeightsAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<number>
-  avgEdgeWeightAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<number | null>
-  degreesAsync(nodeIds: Array<number>, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<Array<JsDegreeBatchEntry>>
-  shortestPathAsync(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, weightField?: string | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null, maxCost?: number | undefined | null): Promise<JsShortestPath | null>
-  isConnectedAsync(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null): Promise<boolean>
-  allShortestPathsAsync(from: number, to: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, weightField?: string | undefined | null, atEpoch?: number | undefined | null, maxDepth?: number | undefined | null, maxCost?: number | undefined | null, maxPaths?: number | undefined | null): Promise<Array<JsShortestPath>>
+  neighborsBatchAsync(nodeIds: Array<number>, options?: JsNeighborsBatchOptions | undefined | null): Promise<Array<JsNeighborBatchEntry>>
+  degreeAsync(nodeId: number, options?: JsDegreeOptions | undefined | null): Promise<number>
+  sumEdgeWeightsAsync(nodeId: number, options?: JsSumEdgeWeightsOptions | undefined | null): Promise<number>
+  avgEdgeWeightAsync(nodeId: number, options?: JsAvgEdgeWeightOptions | undefined | null): Promise<number | null>
+  degreesAsync(nodeIds: Array<number>, options?: JsDegreesOptions | undefined | null): Promise<Array<JsDegreeBatchEntry>>
+  shortestPathAsync(from: number, to: number, options?: JsShortestPathOptions | undefined | null): Promise<JsShortestPath | null>
+  isConnectedAsync(from: number, to: number, options?: JsIsConnectedOptions | undefined | null): Promise<boolean>
+  allShortestPathsAsync(from: number, to: number, options?: JsAllShortestPathsOptions | undefined | null): Promise<Array<JsShortestPath>>
   nodesByTypePagedAsync(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): Promise<JsIdPageResult>
   edgesByTypePagedAsync(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): Promise<JsIdPageResult>
   getNodesByTypePagedAsync(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): Promise<JsNodePageResult>
   getEdgesByTypePagedAsync(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): Promise<JsEdgePageResult>
-  findNodesPagedAsync(typeId: number, propKey: string, propValue: any, limit?: number | undefined | null, after?: number | undefined | null): Promise<JsIdPageResult>
+  findNodesPagedAsync(typeId: number, propKey: string, propValue: any, options?: JsFindNodesPagedOptions | undefined | null): Promise<JsIdPageResult>
   findNodesByTimeRangeAsync(typeId: number, fromMs: number, toMs: number): Promise<Float64Array>
-  findNodesByTimeRangePagedAsync(typeId: number, fromMs: number, toMs: number, limit?: number | undefined | null, after?: number | undefined | null): Promise<JsIdPageResult>
-  personalizedPagerankAsync(seedNodeIds: Float64Array, options?: JsPprOptions | undefined | null): Promise<JsPprResult>
+  findNodesByTimeRangePagedAsync(typeId: number, fromMs: number, toMs: number, options?: JsFindNodesByTimeRangePagedOptions | undefined | null): Promise<JsIdPageResult>
+  personalizedPagerankAsync(seedNodeIds: Array<number>, options?: JsPersonalizedPagerankOptions | undefined | null): Promise<JsPprResult>
   exportAdjacencyAsync(options?: JsExportOptions | undefined | null): Promise<JsAdjacencyExport>
-  neighborsPagedAsync(nodeId: number, direction?: string | undefined | null, typeFilter?: Array<number> | undefined | null, limit?: number | undefined | null, after?: number | undefined | null, atEpoch?: number | undefined | null, decayLambda?: number | undefined | null): Promise<JsNeighborPageResult>
-  connectedComponentsAsync(edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<Array<JsComponentEntry>>
-  componentOfAsync(nodeId: number, edgeTypeFilter?: Array<number> | undefined | null, nodeTypeFilter?: Array<number> | undefined | null, atEpoch?: number | undefined | null): Promise<Float64Array>
+  neighborsPagedAsync(nodeId: number, options?: JsNeighborsPagedOptions | undefined | null): Promise<JsNeighborPageResult>
+  connectedComponentsAsync(options?: JsConnectedComponentsOptions | undefined | null): Promise<Array<JsComponentEntry>>
+  componentOfAsync(nodeId: number, options?: JsComponentOfOptions | undefined | null): Promise<Float64Array>
+  vectorSearchAsync(mode: string, options: JsVectorSearchOptions): Promise<Array<JsVectorHit>>
   syncAsync(): Promise<void>
   flushAsync(): Promise<void>
   ingestModeAsync(): Promise<void>
@@ -245,6 +249,22 @@ export interface JsAdjacencyExport {
   edgeTo: Float64Array
   edgeTypeIds: Uint32Array
   edgeWeights?: Float64Array
+}
+
+export interface JsAllShortestPathsOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  weightField?: string
+  atEpoch?: number
+  maxDepth?: number
+  maxCost?: number
+  maxPaths?: number
+}
+
+export interface JsAvgEdgeWeightOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  atEpoch?: number
 }
 
 export interface JsCloseOptions {
@@ -279,18 +299,36 @@ export interface JsComponentEntry {
   componentId: number
 }
 
+export interface JsComponentOfOptions {
+  edgeTypeFilter?: Array<number>
+  nodeTypeFilter?: Array<number>
+  atEpoch?: number
+}
+
+export interface JsConnectedComponentsOptions {
+  edgeTypeFilter?: Array<number>
+  nodeTypeFilter?: Array<number>
+  atEpoch?: number
+}
+
 export interface JsDbOptions {
   createIfMissing?: boolean
   edgeUniqueness?: boolean
   memtableFlushThreshold?: number
   /** Trigger compaction automatically after this many flushes. Default 5, 0 = disabled. */
   compactAfterNFlushes?: number
+  denseVector?: JsDenseVectorConfig
   /** WAL sync mode: 'immediate' or 'group-commit' (default). */
   walSyncMode?: string
   /** Group commit sync interval in milliseconds. Default: 10. */
   groupCommitIntervalMs?: number
   /** Hard cap on memtable size in bytes. Writes trigger a flush when exceeded. 0 = disabled. */
   memtableHardCapBytes?: number
+  /**
+   * Maximum number of immutable memtables pending flush before writers block.
+   * Default: 4. Set to 0 to disable immutable count backpressure.
+   */
+  maxImmutableMemtables?: number
 }
 
 export interface JsDbStats {
@@ -306,11 +344,40 @@ export interface JsDbStats {
   lastCompactionMs?: number
   /** WAL sync mode: "immediate" or "group-commit". */
   walSyncMode: string
+  /** Estimated bytes in the active (mutable) memtable. */
+  activeMemtableBytes: number
+  /** Estimated bytes across all immutable memtables pending flush. */
+  immutableMemtableBytes: number
+  /** Number of immutable memtables pending flush. */
+  immutableMemtableCount: number
+  /** Number of flush operations currently in flight. */
+  pendingFlushCount: number
+  /** The WAL generation ID currently being written to. */
+  activeWalGenerationId: number
+  /** The oldest WAL generation ID still retained for recovery. */
+  oldestRetainedWalGenerationId: number
 }
 
 export interface JsDegreeBatchEntry {
   nodeId: number
   degree: number
+}
+
+export interface JsDegreeOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  atEpoch?: number
+}
+
+export interface JsDegreesOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  atEpoch?: number
+}
+
+export interface JsDenseVectorConfig {
+  dimension: number
+  metric?: string
 }
 
 export interface JsEdgeInput {
@@ -334,6 +401,22 @@ export interface JsExportOptions {
   includeWeights?: boolean
 }
 
+export interface JsExtractSubgraphOptions {
+  direction?: string
+  edgeTypeFilter?: Array<number>
+  atEpoch?: number
+}
+
+export interface JsFindNodesByTimeRangePagedOptions {
+  limit?: number
+  after?: number
+}
+
+export interface JsFindNodesPagedOptions {
+  limit?: number
+  after?: number
+}
+
 export interface JsGraphPatch {
   upsertNodes?: Array<JsNodeInput>
   upsertEdges?: Array<JsEdgeInput>
@@ -345,6 +428,18 @@ export interface JsGraphPatch {
 export interface JsIdPageResult {
   items: Float64Array
   nextCursor?: number
+}
+
+export interface JsIsConnectedOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  atEpoch?: number
+  maxDepth?: number
+}
+
+export interface JsKeyQuery {
+  typeId: number
+  key: string
 }
 
 export interface JsNamedPrunePolicy {
@@ -365,11 +460,37 @@ export interface JsNeighborEntry {
   validTo: number
 }
 
+export interface JsNeighborsBatchOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  atEpoch?: number
+  decayLambda?: number
+}
+
+export interface JsNeighborsOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  limit?: number
+  atEpoch?: number
+  decayLambda?: number
+}
+
+export interface JsNeighborsPagedOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  limit?: number
+  after?: number
+  atEpoch?: number
+  decayLambda?: number
+}
+
 export interface JsNodeInput {
   typeId: number
   key: string
   props?: Record<string, any>
   weight?: number
+  denseVector?: Array<number>
+  sparseVector?: Array<JsSparseEntry>
 }
 
 export interface JsPatchResult {
@@ -377,7 +498,7 @@ export interface JsPatchResult {
   edgeIds: Float64Array
 }
 
-export interface JsPprOptions {
+export interface JsPersonalizedPagerankOptions {
   dampingFactor?: number
   maxIterations?: number
   epsilon?: number
@@ -414,6 +535,34 @@ export interface JsShortestPath {
   totalCost: number
 }
 
+export interface JsShortestPathOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  weightField?: string
+  atEpoch?: number
+  maxDepth?: number
+  maxCost?: number
+}
+
+export interface JsSparseEntry {
+  dimension: number
+  value: number
+}
+
+export interface JsSumEdgeWeightsOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  atEpoch?: number
+}
+
+export interface JsTopKNeighborsOptions {
+  direction?: string
+  typeFilter?: Array<number>
+  scoring?: string
+  decayLambda?: number
+  atEpoch?: number
+}
+
 export interface JsTraversalCursor {
   depth: number
   lastNodeId: number
@@ -429,4 +578,54 @@ export interface JsTraversalHit {
 export interface JsTraversalPageResult {
   items: Array<JsTraversalHit>
   nextCursor?: JsTraversalCursor
+}
+
+export interface JsTraverseOptions {
+  minDepth?: number
+  direction?: string
+  edgeTypeFilter?: Array<number>
+  nodeTypeFilter?: Array<number>
+  atEpoch?: number
+  decayLambda?: number
+  limit?: number
+  cursor?: JsTraversalCursor
+}
+
+export interface JsUpsertEdgeOptions {
+  props?: Record<string, any>
+  weight?: number
+  validFrom?: number
+  validTo?: number
+}
+
+export interface JsUpsertNodeOptions {
+  props?: Record<string, any>
+  weight?: number
+  denseVector?: Array<number>
+  sparseVector?: Array<JsSparseEntry>
+}
+
+export interface JsVectorHit {
+  nodeId: number
+  score: number
+}
+
+export interface JsVectorSearchOptions {
+  k: number
+  denseQuery?: Array<number>
+  sparseQuery?: Array<JsSparseEntry>
+  typeFilter?: Array<number>
+  efSearch?: number
+  scope?: JsVectorSearchScope
+  denseWeight?: number
+  sparseWeight?: number
+  fusionMode?: string
+}
+
+export interface JsVectorSearchScope {
+  startNodeId: number
+  maxDepth: number
+  direction?: string
+  edgeTypeFilter?: Array<number>
+  atEpoch?: number
 }

@@ -4,7 +4,7 @@ This is a technical overview of the OverGraph storage engine for contributors an
 
 ## The big picture
 
-OverGraph is a log-structured merge tree (LSM) graph database. If you've worked with LevelDB, RocksDB, or Cassandra's storage engine, the core ideas will feel familiar. The key difference is that OverGraph is purpose-built for graph data: adjacency indexes, typed nodes and edges, temporal validity, and decay scoring are first-class concepts in the storage format.
+OverGraph is a log-structured merge tree (LSM) graph database with built-in vector search. If you've worked with LevelDB, RocksDB, or Cassandra's storage engine, the core ideas will feel familiar. The key difference is that OverGraph is purpose-built for graph data: adjacency indexes, typed nodes and edges, temporal validity, decay scoring, and vector indexes (dense HNSW + sparse inverted posting lists) are first-class concepts in the storage format.
 
 ```
                     ┌─────────────────────┐
@@ -17,19 +17,19 @@ OverGraph is a log-structured merge tree (LSM) graph database. If you've worked 
                     │                     │
                     │  ┌───────────────┐  │
                     │  │   Memtable    │  │  ← in-memory, mutable
-                    │  │  (HashMap)    │  │
+                    │  │  (HashMap)    │  │    (exact brute-force for vectors)
                     │  └───────┬───────┘  │
                     │          │ flush    │
                     │  ┌───────▼───────┐  │
                     │  │   Segments    │  │  ← on-disk, immutable, mmap'd
-                    │  │  seg_0001/    │  │
+                    │  │  seg_0001/    │  │    (HNSW + posting-list indexes)
                     │  │  seg_0002/    │  │
                     │  │  seg_0003/    │  │
                     │  └───────┬───────┘  │
                     │          │ compact  │
                     │  ┌───────▼───────┐  │
                     │  │  Merged Seg   │  │  ← fewer, larger segments
-                    │  └───────────────┘  │
+                    │  └───────────────┘  │    (indexes rebuilt from metadata)
                     └─────────────────────┘
 ```
 
@@ -83,6 +83,13 @@ Each segment is a directory containing:
 | `timestamp_index.dat` | Sorted `(updated_at, node_id)` pairs |
 | `tombstones.dat` | Set of deleted IDs |
 | `metadata.dat` | Sidecar with per-record metadata for fast compaction |
+| `node_dense_vectors.dat` | Dense vector blob (present only when segment has vectors) |
+| `node_sparse_vectors.dat` | Sparse vector blob (present only when segment has vectors) |
+| `dense_hnsw_graph.dat` | HNSW graph index for dense ANN search |
+| `sparse_postings.dat` | Inverted posting lists for sparse dot-product search |
+| `node_vector_meta.dat` | Per-node vector presence, offsets, and lengths |
+
+Vector files are optional per segment. Segments containing no vectors skip vector file generation entirely: no storage overhead, no index building, no mmap. The manifest tracks which segments have vector data so the engine can skip unnecessary I/O on open.
 
 All segment files are immutable after creation. Reads use memory-mapped I/O (`mmap`), so the OS page cache handles caching without any application-level buffer management. This means reads never block writes and there's no cache invalidation to worry about.
 
@@ -121,13 +128,27 @@ When prune policies are active, the degree methods track per-neighbor-id stats d
 
 `connected_components()` computes a global weakly-connected-component (WCC) labelling using union-find with path compression and union by rank for near-linear O(N·α(N)) time. The algorithm collects all visible nodes via `nodes_by_type()`, then performs a single outgoing `neighbors_batch()` scan to union endpoints. A final pass normalizes each component ID to the minimum node ID in the component for deterministic output.
 
-`component_of(node_id)` answers the targeted question "which nodes are in this node's component?" via BFS using `neighbors_batch()` with `Direction::Both` per frontier layer. This avoids scanning the entire graph when only one component is needed.
+`component_of(node_id, &ComponentOptions)` answers the targeted question "which nodes are in this node's component?" via BFS using `neighbors_batch()` with both-direction traversal per frontier layer. This avoids scanning the entire graph when only one component is needed.
 
 Both methods support edge-type, node-type, and temporal filtering, and respect active prune policies (pruned nodes are invisible to the algorithm).
 
 ### Batch adjacency
 
 For operations that need to traverse from many nodes at once (PPR, subgraph extraction, graph export, batch degree queries), OverGraph uses a sorted cursor walk. All source node IDs are sorted, and the adjacency index is walked once with a single cursor. This avoids repeated binary searches and is significantly faster than individual lookups when the source set is large.
+
+### Vector indexes
+
+OverGraph embeds two kinds of vector indexes directly in the storage engine, following the same per-segment immutable index model as adjacency and property indexes.
+
+**Dense HNSW index.** Each segment containing dense vectors gets an HNSW (Hierarchical Navigable Small World) graph built at flush time. The HNSW implementation is owned by OverGraph (not delegated to an external ANN library), so the on-disk format, reopen path, and segment lifecycle are fully controlled. The DB is configured with one dense vector space (fixed dimension + distance metric: cosine, Euclidean, or dot-product). HNSW parameters (`m` and `ef_construction`) are configurable.
+
+**Sparse inverted index.** Sparse vectors are stored as canonical `(dimension_id, weight)` pairs (sorted, deduplicated, zero-dropped, non-negative). Each segment gets an inverted posting-list index mapping `dimension_id → [(node_id, score)]`. Sparse search scores candidates by exact dot-product against the query, producing correct top-K results without approximation.
+
+**Multi-source merge.** Vector search follows the same visibility model as graph reads: the memtable is checked first (exact brute-force scan), then segments are searched newest-to-oldest. The engine merges candidates across all sources, applies tombstone/shadowing deduplication, and over-fetches as needed to guarantee `k` visible winners. A newer version of a node in a newer segment shadows the same node's vector in an older segment.
+
+**Graph-scoped search.** The `scope` parameter on `vector_search` adds traversal-based reachable-node filtering. The engine first resolves the reachable set from a start node using the same traversal machinery as `traverse()`, then applies that set as a filter during vector candidate scoring. This enables queries like "find the 10 most similar nodes within 3 hops of X" as a single engine call.
+
+**Hybrid fusion.** Hybrid mode runs dense and sparse sub-searches (optionally in parallel via threads), then combines the two candidate lists using one of three built-in fusion modes: weighted rank fusion, reciprocal rank fusion, or weighted score fusion. The caller controls `dense_weight` and `sparse_weight` to tune the blend.
 
 ## Compaction
 
@@ -139,7 +160,7 @@ OverGraph's compaction is designed to be fast:
 
 2. **Binary copy.** Winning records are copied as raw byte spans from input segments to the output segment. No deserialization, no re-serialization. Just memcpy.
 
-3. **Metadata-driven index building.** All output indexes (adjacency, key, type, property, timestamp) are built from the metadata of winning records, not from the records themselves. This avoids a second pass over the data.
+3. **Metadata-driven index building.** All output indexes (adjacency, key, type, property, timestamp) are built from the metadata of winning records, not from the records themselves. This avoids a second pass over the data. Vector indexes (HNSW and sparse posting lists) are rebuilt from surviving vector blob payloads and metadata.
 
 4. **Cascade deletes.** If a node is tombstoned or pruned, all its incident edges are automatically dropped during the edge merge pass.
 
@@ -160,9 +181,10 @@ This means policies take effect instantly for reads, while space reclamation hap
 
 The manifest (`manifest.current`) is a small JSON file that tracks:
 
-- The list of live segment IDs
+- The list of live segment IDs (including per-segment vector presence flags)
 - Next node ID and next edge ID counters
 - Registered prune policies
+- Dense vector configuration (dimension, metric, HNSW parameters)
 - WAL state
 
 The manifest is the source of truth for what data exists. On startup, OverGraph reads the manifest to discover segments, then replays the WAL to recover any writes that happened after the last flush.
@@ -183,7 +205,7 @@ The Node.js and Python connectors are thin wrappers around the Rust engine:
 
 - **Python (PyO3):** All Rust calls release the GIL via `py.allow_threads()`, so other Python threads can run while the database does its work. The async API (`AsyncOverGraph`) uses `asyncio.to_thread()` to wrap sync calls. Properties are deserialized lazily on access, same as Node.js.
 
-Both connectors expose the exact same API surface as the Rust core. There's no feature gap between languages.
+Both connectors expose the exact same API surface as the Rust core, including vector search. There's no feature gap between languages. Vector writes (`dense_vector`, `sparse_vector` on upsert) and `vector_search` (all modes, scoping, fusion) are available in sync and async variants.
 
 ## Property encoding
 

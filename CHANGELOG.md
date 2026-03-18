@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-17
+
+### Changed
+
+#### Storage / Recovery Format
+- **Breaking on-disk format change.** OverGraph now uses:
+  - **WAL format v3**: each WAL record persists the engine-assigned write sequence (`engine_seq`) alongside the operation payload, ensuring exact `last_write_seq` stability across reopen cycles.
+- Databases created with older WAL formats are **not supported** by this release. Opening an older database will fail with a clear version error.
+- Users should **recreate the database** or rebuild data into a fresh DB directory when upgrading across this change.
+- This release intentionally prioritizes recovery correctness over backward compatibility while OverGraph remains pre-1.0.
+
+#### Async Flush Pipeline
+- **Writes no longer block for segment I/O.** The background flush pipeline is now split into three stages: build worker (segment write + fsync), publisher worker (segment open + manifest write + WAL retire), and foreground adoption (cheap in-memory swap). Normal write operations perform zero disk I/O for flush completion.
+- Auto-flush threshold now checks only the active memtable size, not total buffered memory. Backpressure (hard cap + immutable count limit) handles total buffer pressure separately.
+- Flush result application uses a single manifest write instead of two, reducing per-flush fsync overhead.
+
+### Fixed
+
+#### Crash Recovery
+- Fixed a repeated-crash recovery bug in the async flush pipeline. `FrozenPendingFlush` WAL generations are now retained and rebuilt as immutable epochs on reopen instead of being folded into the active memtable and retired too early. This prevents data loss across repeated crash/reopen cycles before a frozen epoch has been durably flushed to a segment.
+- WAL replay now preserves the original persisted write sequence metadata (`last_write_seq`) instead of re-deriving it during reopen.
+
+### Added
+
+#### Phase 19 - Vector / Embedding Search
+- **Dense vector search (HNSW).** Attach `f32` embedding vectors to nodes via `dense_vector` on `upsert_node` / `batch_upsert_nodes` / `graph_patch`. Per-segment HNSW indexes built at flush time. `vector_search(mode="dense")` with cosine, Euclidean, or dot-product distance. DB-scoped config: `DenseVectorConfig { dimension, metric, hnsw: { m, ef_construction } }`. Configurable `ef_search` per query.
+- **Sparse vector search.** Attach sparse vectors (`(dimension_id, weight)` pairs) to nodes. Inverted posting-list indexes per segment. `vector_search(mode="sparse")` with exact dot-product scoring. Works with pre-computed sparse embeddings (SPLADE, BGE-M3, etc.). Sparse vectors canonicalized on write (sorted, deduped, zero-dropped, non-negative).
+- **Hybrid search.** `vector_search(mode="hybrid")` combines dense and sparse candidates. Three built-in fusion modes: `weighted-rank-fusion` (default), `reciprocal-rank-fusion`, `weighted-score-fusion`. Configurable `dense_weight` and `sparse_weight`. Degenerates cleanly to one modality when only one query is provided.
+- **Graph-scoped search.** `scope` parameter on `vector_search` restricts results to nodes reachable from a start node via traversal. Supports `max_depth`, `direction`, `edge_type_filter`, and `at_epoch`. Uses the same traversal machinery as `traverse()`.
+- **Vector compaction.** Dense HNSW indexes rebuilt and sparse posting lists merged during compaction. Vector blob payloads raw-copied for surviving records. Full reopen/recovery parity.
+- **Zero-overhead contract.** Databases that never write vectors see no meaningful regression. Vector index files are only created for segments containing vectors. Flush and compaction skip vector index generation entirely when no surviving node has vectors.
+- **Node.js bindings.** `vectorSearch()` / `vectorSearchAsync()` with `JsVectorSearchOptions`, `JsVectorSearchScope`, `JsVectorHit`. Dense/sparse vector fields on `upsertNode`, `batchUpsertNodes`, `graphPatch`. `denseVector` config on `open()`.
+- **Python bindings.** `vector_search()` (sync + async) with flat kwargs including `scope_*` fields. Dense/sparse vector fields on `upsert_node`, `batch_upsert_nodes`, `graph_patch`. `dense_vector_dimension` / `dense_vector_metric` kwargs on `open()`.
+
 ## [0.2.0] - 2026-03-09
 
 ### Added
@@ -105,7 +139,7 @@ Initial release.
 - Tombstone index
 
 ### Performance
-- Node lookups: ~200ns
+- Node lookups: ~26ns
 - Neighbor traversal: ~2μs
 - Batch writes: 600K+ nodes/sec
 - Sorted cursor walk for batch adjacency operations (PPR, subgraph, export)
@@ -137,5 +171,6 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.3.0]: https://github.com/Bhensley5/overgraph/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Bhensley5/overgraph/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Bhensley5/overgraph/releases/tag/v0.1.0

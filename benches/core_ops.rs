@@ -1,7 +1,9 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, EdgeInput, ExportOptions, NodeInput, PageRequest,
-    PprOptions, PropValue, PrunePolicy, ScoringMode, WalSyncMode,
+    AllShortestPathsOptions, DatabaseEngine, DbOptions, DegreeOptions, EdgeInput, ExportOptions,
+    IsConnectedOptions, NeighborOptions, NodeInput, PageRequest, PprOptions, PropValue,
+    PrunePolicy, ShortestPathOptions, TopKOptions, TraverseOptions, UpsertEdgeOptions,
+    UpsertNodeOptions, WalSyncMode,
 };
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +25,9 @@ fn bench_upsert_node(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("node_{}", i);
-            engine.upsert_node(1, &key, BTreeMap::new(), 1.0).unwrap();
+            engine
+                .upsert_node(1, &key, UpsertNodeOptions::default())
+                .unwrap();
             i += 1;
         });
     });
@@ -38,7 +42,16 @@ fn bench_upsert_node_with_props(c: &mut Criterion) {
             let mut props = BTreeMap::new();
             props.insert("name".to_string(), PropValue::String(key.clone()));
             props.insert("score".to_string(), PropValue::Float(0.95));
-            engine.upsert_node(1, &key, props, 1.0).unwrap();
+            engine
+                .upsert_node(
+                    1,
+                    &key,
+                    UpsertNodeOptions {
+                        props,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
             i += 1;
         });
     });
@@ -54,6 +67,8 @@ fn bench_upsert_edge(c: &mut Criterion) {
                 key: format!("n{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         engine.batch_upsert_nodes(&inputs).unwrap();
@@ -62,7 +77,7 @@ fn bench_upsert_edge(c: &mut Criterion) {
             let from = (i % 1000) + 1;
             let to = ((i + 1) % 1000) + 1;
             engine
-                .upsert_edge(from, to, 1, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(from, to, 1, UpsertEdgeOptions::default())
                 .unwrap();
             i += 1;
         });
@@ -78,6 +93,8 @@ fn bench_get_node(c: &mut Criterion) {
                 key: format!("n{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let ids = engine.batch_upsert_nodes(&inputs).unwrap();
@@ -97,6 +114,8 @@ fn bench_get_node(c: &mut Criterion) {
                 key: format!("n{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let ids = engine.batch_upsert_nodes(&inputs).unwrap();
@@ -117,6 +136,8 @@ fn build_hub_graph(engine: &mut DatabaseEngine, n: usize) -> u64 {
         key: "hub".to_string(),
         props: BTreeMap::new(),
         weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
     }];
     for i in 0..n {
         inputs.push(NodeInput {
@@ -124,6 +145,8 @@ fn build_hub_graph(engine: &mut DatabaseEngine, n: usize) -> u64 {
             key: format!("t{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         });
     }
     let ids = engine.batch_upsert_nodes(&inputs).unwrap();
@@ -149,9 +172,7 @@ fn bench_neighbors(c: &mut Criterion) {
         let (_dir, mut engine) = temp_db();
         let hub = build_hub_graph(&mut engine, 10);
         b.iter(|| {
-            engine
-                .neighbors(hub, Direction::Outgoing, None, usize::MAX, None, None)
-                .unwrap();
+            engine.neighbors(hub, &NeighborOptions::default()).unwrap();
         });
     });
 
@@ -160,9 +181,7 @@ fn bench_neighbors(c: &mut Criterion) {
         let hub = build_hub_graph(&mut engine, 10);
         engine.flush().unwrap();
         b.iter(|| {
-            engine
-                .neighbors(hub, Direction::Outgoing, None, usize::MAX, None, None)
-                .unwrap();
+            engine.neighbors(hub, &NeighborOptions::default()).unwrap();
         });
     });
 
@@ -170,9 +189,7 @@ fn bench_neighbors(c: &mut Criterion) {
         let (_dir, mut engine) = temp_db();
         let hub = build_hub_graph(&mut engine, 100);
         b.iter(|| {
-            engine
-                .neighbors(hub, Direction::Outgoing, None, usize::MAX, None, None)
-                .unwrap();
+            engine.neighbors(hub, &NeighborOptions::default()).unwrap();
         });
     });
 
@@ -181,9 +198,7 @@ fn bench_neighbors(c: &mut Criterion) {
         let hub = build_hub_graph(&mut engine, 100);
         engine.flush().unwrap();
         b.iter(|| {
-            engine
-                .neighbors(hub, Direction::Outgoing, None, usize::MAX, None, None)
-                .unwrap();
+            engine.neighbors(hub, &NeighborOptions::default()).unwrap();
         });
     });
 }
@@ -197,6 +212,8 @@ fn bench_neighbors_with_pit(c: &mut Criterion) {
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         }];
         for i in 0..100 {
             inputs.push(NodeInput {
@@ -204,6 +221,8 @@ fn bench_neighbors_with_pit(c: &mut Criterion) {
                 key: format!("t{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             });
         }
         let ids = engine.batch_upsert_nodes(&inputs).unwrap();
@@ -229,7 +248,13 @@ fn bench_neighbors_with_pit(c: &mut Criterion) {
         let hub = build_pit_graph(&mut engine);
         b.iter(|| {
             engine
-                .neighbors(hub, Direction::Outgoing, None, usize::MAX, Some(now), None)
+                .neighbors(
+                    hub,
+                    &NeighborOptions {
+                        at_epoch: Some(now),
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
         });
     });
@@ -240,7 +265,13 @@ fn bench_neighbors_with_pit(c: &mut Criterion) {
         engine.flush().unwrap();
         b.iter(|| {
             engine
-                .neighbors(hub, Direction::Outgoing, None, usize::MAX, Some(now), None)
+                .neighbors(
+                    hub,
+                    &NeighborOptions {
+                        at_epoch: Some(now),
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
         });
     });
@@ -258,6 +289,8 @@ fn bench_find_nodes(c: &mut Criterion) {
                     key: format!("n{}", i),
                     props,
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 }
             })
             .collect();
@@ -297,6 +330,8 @@ fn bench_flush(c: &mut Criterion) {
                         key: format!("n{}", i),
                         props: BTreeMap::new(),
                         weight: 1.0,
+                        dense_vector: None,
+                        sparse_vector: None,
                     })
                     .collect();
                 let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
@@ -334,6 +369,8 @@ fn bench_batch_upsert_nodes(c: &mut Criterion) {
                     key: format!("batch{}_{}", batch_num, i),
                     props: BTreeMap::new(),
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 })
                 .collect();
             engine.batch_upsert_nodes(&inputs).unwrap();
@@ -387,6 +424,8 @@ fn bench_compact(c: &mut Criterion) {
                             key: format!("s{}_n{}", seg, i),
                             props: make_bench_props(seg * 2000 + i),
                             weight: 1.0,
+                            dense_vector: None,
+                            sparse_vector: None,
                         })
                         .collect();
                     let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
@@ -433,6 +472,8 @@ fn bench_compact(c: &mut Criterion) {
                             key: format!("s{}_n{}", seg, i),
                             props: make_bench_props(seg * 2000 + i),
                             weight: 1.0,
+                            dense_vector: None,
+                            sparse_vector: None,
                         })
                         .collect();
                     let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
@@ -489,6 +530,8 @@ fn bench_compact(c: &mut Criterion) {
                             key: format!("n{}", i),
                             props: make_bench_props(seg * 2000 + i),
                             weight: 1.0,
+                            dense_vector: None,
+                            sparse_vector: None,
                         })
                         .collect();
                     let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
@@ -534,6 +577,8 @@ fn bench_compact(c: &mut Criterion) {
                             key: format!("s{}_n{}", seg, i),
                             props: make_bench_props(seg * 2000 + i),
                             weight: 1.0,
+                            dense_vector: None,
+                            sparse_vector: None,
                         })
                         .collect();
                     let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
@@ -586,7 +631,7 @@ fn bench_group_commit(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             engine
-                .upsert_node(1, &format!("imm_{}", i), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("imm_{}", i), UpsertNodeOptions::default())
                 .unwrap();
             i += 1;
         });
@@ -611,7 +656,7 @@ fn bench_group_commit(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             engine
-                .upsert_node(1, &format!("gc_{}", i), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("gc_{}", i), UpsertNodeOptions::default())
                 .unwrap();
             i += 1;
         });
@@ -636,6 +681,8 @@ fn bench_group_commit(c: &mut Criterion) {
                     key: format!("imm_b{}_{}", batch_num, i),
                     props: BTreeMap::new(),
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 })
                 .collect();
             engine.batch_upsert_nodes(&inputs).unwrap();
@@ -666,6 +713,8 @@ fn bench_group_commit(c: &mut Criterion) {
                     key: format!("gc_b{}_{}", batch_num, i),
                     props: BTreeMap::new(),
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 })
                 .collect();
             engine.batch_upsert_nodes(&inputs).unwrap();
@@ -689,6 +738,8 @@ fn build_multi_hub_graph(engine: &mut DatabaseEngine) -> Vec<u64> {
             },
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         })
         .collect();
     let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
@@ -716,7 +767,7 @@ fn bench_degree(c: &mut Criterion) {
         let (_dir, mut engine) = temp_db();
         let hub = build_hub_graph(&mut engine, 100);
         b.iter(|| {
-            engine.degree(hub, Direction::Outgoing, None, None).unwrap();
+            engine.degree(hub, &DegreeOptions::default()).unwrap();
         });
     });
 
@@ -725,7 +776,7 @@ fn bench_degree(c: &mut Criterion) {
         let hub = build_hub_graph(&mut engine, 100);
         engine.flush().unwrap();
         b.iter(|| {
-            engine.degree(hub, Direction::Outgoing, None, None).unwrap();
+            engine.degree(hub, &DegreeOptions::default()).unwrap();
         });
     });
 
@@ -735,7 +786,13 @@ fn bench_degree(c: &mut Criterion) {
         engine.flush().unwrap();
         b.iter(|| {
             engine
-                .degree(hub, Direction::Outgoing, Some(&[1]), None)
+                .degree(
+                    hub,
+                    &DegreeOptions {
+                        type_filter: Some(vec![1]),
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
         });
     });
@@ -750,7 +807,13 @@ fn bench_degree(c: &mut Criterion) {
             .as_millis() as i64;
         b.iter(|| {
             engine
-                .degree(hub, Direction::Outgoing, None, Some(now))
+                .degree(
+                    hub,
+                    &DegreeOptions {
+                        at_epoch: Some(now),
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
         });
     });
@@ -759,9 +822,7 @@ fn bench_degree(c: &mut Criterion) {
         let (_dir, mut engine) = temp_db();
         let hub_ids = build_multi_hub_graph(&mut engine);
         b.iter(|| {
-            engine
-                .degrees(&hub_ids, Direction::Outgoing, None, None)
-                .unwrap();
+            engine.degrees(&hub_ids, &DegreeOptions::default()).unwrap();
         });
     });
 
@@ -770,9 +831,7 @@ fn bench_degree(c: &mut Criterion) {
         let hub_ids = build_multi_hub_graph(&mut engine);
         engine.flush().unwrap();
         b.iter(|| {
-            engine
-                .degrees(&hub_ids, Direction::Outgoing, None, None)
-                .unwrap();
+            engine.degrees(&hub_ids, &DegreeOptions::default()).unwrap();
         });
     });
 }
@@ -783,7 +842,7 @@ fn bench_degree_scalar_loop(c: &mut Criterion) {
         let hub_ids = build_multi_hub_graph(&mut engine);
         b.iter(|| {
             for &hid in &hub_ids {
-                engine.degree(hid, Direction::Outgoing, None, None).unwrap();
+                engine.degree(hid, &DegreeOptions::default()).unwrap();
             }
         });
     });
@@ -794,7 +853,7 @@ fn bench_degree_scalar_loop(c: &mut Criterion) {
         engine.flush().unwrap();
         b.iter(|| {
             for &hid in &hub_ids {
-                engine.degree(hid, Direction::Outgoing, None, None).unwrap();
+                engine.degree(hid, &DegreeOptions::default()).unwrap();
             }
         });
     });
@@ -810,6 +869,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
             key: "root".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         }];
         for i in 0..100u64 {
             node_inputs.push(NodeInput {
@@ -817,6 +878,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 key: format!("mid_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             });
             for j in 0..10u64 {
                 node_inputs.push(NodeInput {
@@ -824,6 +887,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     key: format!("leaf_{}_{}", i, j),
                     props: BTreeMap::new(),
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 });
             }
         }
@@ -866,14 +931,10 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 .traverse(
                     root,
                     2,
-                    2,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    &TraverseOptions {
+                        min_depth: 2,
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -888,14 +949,10 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 .traverse(
                     root,
                     2,
-                    2,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    &TraverseOptions {
+                        min_depth: 2,
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -912,6 +969,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 key: "root".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             }];
             for i in 0..level1 {
                 node_inputs.push(NodeInput {
@@ -919,6 +978,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     key: format!("lvl1_{}", i),
                     props: BTreeMap::new(),
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 });
             }
             for i in 0..level1 {
@@ -928,6 +989,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                         key: format!("lvl2_{}_{}", i, j),
                         props: BTreeMap::new(),
                         weight: 1.0,
+                        dense_vector: None,
+                        sparse_vector: None,
                     });
                 }
             }
@@ -939,6 +1002,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                             key: format!("lvl3_{}_{}_{}", i, j, k),
                             props: BTreeMap::new(),
                             weight: 1.0,
+                            dense_vector: None,
+                            sparse_vector: None,
                         });
                     }
                 }
@@ -996,18 +1061,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
         let (root, _, _, _) = build_layered_traversal_graph(&mut engine);
         b.iter(|| {
             engine
-                .traverse(
-                    root,
-                    1,
-                    3,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                .traverse(root, 3, &TraverseOptions::default())
                 .unwrap();
         });
     });
@@ -1018,18 +1072,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
         engine.flush().unwrap();
         b.iter(|| {
             engine
-                .traverse(
-                    root,
-                    1,
-                    3,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                .traverse(root, 3, &TraverseOptions::default())
                 .unwrap();
         });
     });
@@ -1043,15 +1086,11 @@ fn bench_advanced_queries(c: &mut Criterion) {
             engine
                 .traverse(
                     root,
-                    1,
                     3,
-                    Direction::Outgoing,
-                    None,
-                    Some(&filtered_types),
-                    None,
-                    None,
-                    None,
-                    None,
+                    &TraverseOptions {
+                        node_type_filter: Some(filtered_types.to_vec()),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1065,15 +1104,11 @@ fn bench_advanced_queries(c: &mut Criterion) {
             engine
                 .traverse(
                     root,
-                    1,
                     3,
-                    Direction::Outgoing,
-                    None,
-                    Some(&filtered_types),
-                    None,
-                    None,
-                    None,
-                    None,
+                    &TraverseOptions {
+                        node_type_filter: Some(filtered_types.to_vec()),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1085,6 +1120,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         }];
         for i in 0..1000u64 {
             node_inputs.push(NodeInput {
@@ -1092,6 +1129,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 key: format!("tk_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             });
         }
         let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
@@ -1116,14 +1155,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
         let hub = build_topk_graph(&mut engine);
         b.iter(|| {
             engine
-                .top_k_neighbors(
-                    hub,
-                    Direction::Outgoing,
-                    None,
-                    20,
-                    ScoringMode::Weight,
-                    None,
-                )
+                .top_k_neighbors(hub, 20, &TopKOptions::default())
                 .unwrap();
         });
     });
@@ -1134,14 +1166,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
         engine.flush().unwrap();
         b.iter(|| {
             engine
-                .top_k_neighbors(
-                    hub,
-                    Direction::Outgoing,
-                    None,
-                    20,
-                    ScoringMode::Weight,
-                    None,
-                )
+                .top_k_neighbors(hub, 20, &TopKOptions::default())
                 .unwrap();
         });
     });
@@ -1158,6 +1183,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 key: format!("{}_{}", prefix, i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         engine.batch_upsert_nodes(&inputs).unwrap();
@@ -1225,6 +1252,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 key: format!("ppr_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let node_ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
@@ -1290,6 +1319,8 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 key: format!("ex_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let node_ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
@@ -1354,6 +1385,8 @@ fn bench_recovery(c: &mut Criterion) {
                             key: format!("wal_{}", batch * 500 + i),
                             props: BTreeMap::new(),
                             weight: 1.0,
+                            dense_vector: None,
+                            sparse_vector: None,
                         })
                         .collect();
                     engine.batch_upsert_nodes(&inputs).unwrap();
@@ -1381,6 +1414,8 @@ fn bench_recovery(c: &mut Criterion) {
                             key: format!("seg{}_{}", seg, i),
                             props: BTreeMap::new(),
                             weight: 1.0,
+                            dense_vector: None,
+                            sparse_vector: None,
                         })
                         .collect();
                     engine.batch_upsert_nodes(&inputs).unwrap();
@@ -1418,6 +1453,8 @@ fn build_ring_graph(n: usize) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
             key: format!("sp_{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         })
         .collect();
     let node_ids = engine.batch_upsert_nodes(&inputs).unwrap();
@@ -1470,7 +1507,7 @@ fn bench_shortest_path(c: &mut Criterion) {
         let to = ids[ids.len() / 2];
         b.iter(|| {
             engine
-                .shortest_path(from, to, Direction::Outgoing, None, None, None, None, None)
+                .shortest_path(from, to, &ShortestPathOptions::default())
                 .unwrap();
         });
     });
@@ -1481,7 +1518,7 @@ fn bench_shortest_path(c: &mut Criterion) {
         let to = ids[ids.len() / 2];
         b.iter(|| {
             engine
-                .shortest_path(from, to, Direction::Outgoing, None, None, None, None, None)
+                .shortest_path(from, to, &ShortestPathOptions::default())
                 .unwrap();
         });
     });
@@ -1493,7 +1530,7 @@ fn bench_shortest_path(c: &mut Criterion) {
         let to = ids[ids.len() / 2];
         b.iter(|| {
             engine
-                .shortest_path(from, to, Direction::Outgoing, None, None, None, None, None)
+                .shortest_path(from, to, &ShortestPathOptions::default())
                 .unwrap();
         });
     });
@@ -1504,7 +1541,7 @@ fn bench_shortest_path(c: &mut Criterion) {
         let to = ids[ids.len() / 2];
         b.iter(|| {
             engine
-                .shortest_path(from, to, Direction::Outgoing, None, None, None, None, None)
+                .shortest_path(from, to, &ShortestPathOptions::default())
                 .unwrap();
         });
     });
@@ -1519,12 +1556,10 @@ fn bench_shortest_path(c: &mut Criterion) {
                 .shortest_path(
                     from,
                     to,
-                    Direction::Outgoing,
-                    None,
-                    Some("weight"),
-                    None,
-                    None,
-                    None,
+                    &ShortestPathOptions {
+                        weight_field: Some("weight".to_string()),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1539,12 +1574,10 @@ fn bench_shortest_path(c: &mut Criterion) {
                 .shortest_path(
                     from,
                     to,
-                    Direction::Outgoing,
-                    None,
-                    Some("weight"),
-                    None,
-                    None,
-                    None,
+                    &ShortestPathOptions {
+                        weight_field: Some("weight".to_string()),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1560,12 +1593,11 @@ fn bench_shortest_path(c: &mut Criterion) {
                 .shortest_path(
                     from,
                     to,
-                    Direction::Outgoing,
-                    None,
-                    Some("weight"),
-                    None,
-                    max_depth,
-                    None,
+                    &ShortestPathOptions {
+                        weight_field: Some("weight".to_string()),
+                        max_depth,
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1581,12 +1613,10 @@ fn bench_shortest_path(c: &mut Criterion) {
                 .shortest_path(
                     from,
                     to,
-                    Direction::Outgoing,
-                    None,
-                    Some("weight"),
-                    None,
-                    None,
-                    None,
+                    &ShortestPathOptions {
+                        weight_field: Some("weight".to_string()),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1601,12 +1631,10 @@ fn bench_shortest_path(c: &mut Criterion) {
                 .shortest_path(
                     from,
                     to,
-                    Direction::Outgoing,
-                    None,
-                    Some("weight"),
-                    None,
-                    None,
-                    None,
+                    &ShortestPathOptions {
+                        weight_field: Some("weight".to_string()),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1619,7 +1647,7 @@ fn bench_shortest_path(c: &mut Criterion) {
         let to = ids[ids.len() / 2];
         b.iter(|| {
             engine
-                .is_connected(from, to, Direction::Outgoing, None, None, None)
+                .is_connected(from, to, &IsConnectedOptions::default())
                 .unwrap();
         });
     });
@@ -1630,7 +1658,7 @@ fn bench_shortest_path(c: &mut Criterion) {
         let to = ids[ids.len() / 2];
         b.iter(|| {
             engine
-                .is_connected(from, to, Direction::Outgoing, None, None, None)
+                .is_connected(from, to, &IsConnectedOptions::default())
                 .unwrap();
         });
     });
@@ -1642,7 +1670,7 @@ fn bench_shortest_path(c: &mut Criterion) {
         let to = ids[ids.len() / 2];
         b.iter(|| {
             engine
-                .is_connected(from, to, Direction::Outgoing, None, None, None)
+                .is_connected(from, to, &IsConnectedOptions::default())
                 .unwrap();
         });
     });
@@ -1653,7 +1681,7 @@ fn bench_shortest_path(c: &mut Criterion) {
         let to = ids[ids.len() / 2];
         b.iter(|| {
             engine
-                .is_connected(from, to, Direction::Outgoing, None, None, None)
+                .is_connected(from, to, &IsConnectedOptions::default())
                 .unwrap();
         });
     });
@@ -1674,6 +1702,8 @@ fn bench_shortest_path(c: &mut Criterion) {
                 key: format!("d_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let ids = engine.batch_upsert_nodes(&inputs).unwrap();
@@ -1721,13 +1751,10 @@ fn bench_shortest_path(c: &mut Criterion) {
                 .all_shortest_paths(
                     from,
                     to,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(50),
+                    &AllShortestPathsOptions {
+                        max_paths: Some(50),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1748,6 +1775,8 @@ fn bench_shortest_path(c: &mut Criterion) {
                 key: format!("d_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let ids = engine.batch_upsert_nodes(&inputs).unwrap();
@@ -1796,13 +1825,10 @@ fn bench_shortest_path(c: &mut Criterion) {
                 .all_shortest_paths(
                     from,
                     to,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(50),
+                    &AllShortestPathsOptions {
+                        max_paths: Some(50),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1823,6 +1849,8 @@ fn bench_shortest_path(c: &mut Criterion) {
                 key: format!("wd_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let ids = engine.batch_upsert_nodes(&inputs).unwrap();
@@ -1870,13 +1898,11 @@ fn bench_shortest_path(c: &mut Criterion) {
                 .all_shortest_paths(
                     from,
                     to,
-                    Direction::Outgoing,
-                    None,
-                    Some("weight"),
-                    None,
-                    None,
-                    None,
-                    Some(50),
+                    &AllShortestPathsOptions {
+                        weight_field: Some("weight".to_string()),
+                        max_paths: Some(50),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
@@ -1897,6 +1923,8 @@ fn bench_shortest_path(c: &mut Criterion) {
                 key: format!("wd_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let ids = engine.batch_upsert_nodes(&inputs).unwrap();
@@ -1945,19 +1973,63 @@ fn bench_shortest_path(c: &mut Criterion) {
                 .all_shortest_paths(
                     from,
                     to,
-                    Direction::Outgoing,
-                    None,
-                    Some("weight"),
-                    None,
-                    None,
-                    None,
-                    Some(50),
+                    &AllShortestPathsOptions {
+                        weight_field: Some("weight".to_string()),
+                        max_paths: Some(50),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         });
     });
 
     group.finish();
+}
+
+fn bench_batch_get_by_keys(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_get_by_keys");
+
+    // Setup: 1000 nodes flushed to segment
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        wal_sync_mode: WalSyncMode::Immediate,
+        compact_after_n_flushes: 0,
+        ..DbOptions::default()
+    };
+    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let keys: Vec<(u32, String)> = (0..1000).map(|i| (1u32, format!("key_{:04}", i))).collect();
+    for (tid, k) in &keys {
+        engine
+            .upsert_node(*tid, k, UpsertNodeOptions::default())
+            .unwrap();
+    }
+    engine.flush().unwrap();
+
+    // Prepare query slices
+    let keys_10: Vec<(u32, &str)> = keys[..10].iter().map(|(t, k)| (*t, k.as_str())).collect();
+    let keys_100: Vec<(u32, &str)> = keys[..100].iter().map(|(t, k)| (*t, k.as_str())).collect();
+    let keys_1000: Vec<(u32, &str)> = keys.iter().map(|(t, k)| (*t, k.as_str())).collect();
+
+    group.bench_function("batch_10", |b| {
+        b.iter(|| engine.get_nodes_by_keys(&keys_10).unwrap());
+    });
+    group.bench_function("batch_100", |b| {
+        b.iter(|| engine.get_nodes_by_keys(&keys_100).unwrap());
+    });
+    group.bench_function("batch_1000", |b| {
+        b.iter(|| engine.get_nodes_by_keys(&keys_1000).unwrap());
+    });
+    group.bench_function("loop_100_single", |b| {
+        b.iter(|| {
+            for &(tid, key) in &keys_100 {
+                engine.get_node_by_key(tid, key).unwrap();
+            }
+        });
+    });
+
+    group.finish();
+    engine.close().unwrap();
 }
 
 criterion_group!(
@@ -1978,5 +2050,6 @@ criterion_group!(
     bench_advanced_queries,
     bench_recovery,
     bench_shortest_path,
+    bench_batch_get_by_keys,
 );
 criterion_main!(benches);

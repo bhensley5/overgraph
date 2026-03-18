@@ -6,7 +6,8 @@
 //! Run: cargo run --example knowledge_graph
 
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, EdgeInput, NodeInput, PprOptions, PropValue,
+    DatabaseEngine, DbOptions, EdgeInput, NeighborOptions, NodeInput, PprOptions, PropValue,
+    UpsertNodeOptions,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -39,18 +40,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             key: "person:alice".into(),
             props: props(&[("name", "Alice"), ("role", "engineer")]),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         },
         NodeInput {
             type_id: ENTITY,
             key: "person:bob".into(),
             props: props(&[("name", "Bob"), ("role", "designer")]),
             weight: 0.9,
+            dense_vector: None,
+            sparse_vector: None,
         },
         NodeInput {
             type_id: ENTITY,
             key: "project:atlas".into(),
             props: props(&[("name", "Atlas"), ("status", "active")]),
             weight: 0.95,
+            dense_vector: None,
+            sparse_vector: None,
         },
     ])?;
     let (alice, bob, project) = (entity_ids[0], entity_ids[1], entity_ids[2]);
@@ -62,12 +69,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             key: "fact:alice-leads-atlas".into(),
             props: props(&[("text", "Alice leads the Atlas project")]),
             weight: 0.9,
+            dense_vector: None,
+            sparse_vector: None,
         },
         NodeInput {
             type_id: FACT,
             key: "fact:bob-designs-atlas".into(),
             props: props(&[("text", "Bob is the lead designer on Atlas")]),
             weight: 0.85,
+            dense_vector: None,
+            sparse_vector: None,
         },
     ])?;
     let (fact1, fact2) = (fact_ids[0], fact_ids[1]);
@@ -76,8 +87,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let convo = db.upsert_node(
         CONVERSATION,
         "convo:2024-01-15",
-        props(&[("summary", "Discussed Atlas project timeline")]),
-        0.7,
+        UpsertNodeOptions {
+            props: props(&[("summary", "Discussed Atlas project timeline")]),
+            weight: 0.7,
+            ..Default::default()
+        },
     )?;
 
     // Connect everything with typed edges
@@ -154,11 +168,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Who is Alice connected to?
     let neighbors = db.neighbors(
         alice,
-        Direction::Outgoing,
-        Some(&[RELATED_TO]),
-        10,
-        None,
-        None,
+        &NeighborOptions {
+            type_filter: Some(vec![RELATED_TO]),
+            limit: Some(10),
+            ..Default::default()
+        },
     )?;
     println!("Alice's connections ({}):", neighbors.len());
     for n in &neighbors {

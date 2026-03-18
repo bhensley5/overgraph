@@ -90,7 +90,7 @@ describe('getNodesByTypePaged', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     for (let i = 0; i < 8; i++) {
-      db.upsertNode(1, `node-${i}`, { idx: i });
+      db.upsertNode(1, `node-${i}`, { props: { idx: i } });
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
@@ -132,7 +132,7 @@ describe('getEdgesByTypePaged', () => {
     const n1 = db.upsertNode(1, 'a');
     const n2 = db.upsertNode(1, 'b');
     for (let i = 0; i < 6; i++) {
-      db.upsertEdge(n1, n2, 10, null, 0.5 + i * 0.1);
+      db.upsertEdge(n1, n2, 10, { weight: 0.5 + i * 0.1 });
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
@@ -154,19 +154,28 @@ describe('findNodesPaged', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     for (let i = 0; i < 7; i++) {
-      db.upsertNode(1, `node-${i}`, { color: 'red' });
+      db.upsertNode(1, `node-${i}`, { props: { color: 'red' } });
     }
-    db.upsertNode(1, 'blue-node', { color: 'blue' });
+    db.upsertNode(1, 'blue-node', { props: { color: 'blue' } });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('paginates property-matched nodes', () => {
-    const all = collectIdPages(db, 'findNodesPaged', 1, 'color', 'red', 3);
-    assert.equal(all.length, 7);
+    const allItems = [];
+    let cursor = null;
+    for (;;) {
+      const page = db.findNodesPaged(1, 'color', 'red', { limit: 3, after: cursor ?? undefined });
+      for (let i = 0; i < page.items.length; i++) {
+        allItems.push(page.items[i]);
+      }
+      cursor = page.nextCursor ?? null;
+      if (cursor === null || cursor === undefined) break;
+    }
+    assert.equal(allItems.length, 7);
   });
 
   it('no matches returns empty', () => {
-    const page = db.findNodesPaged(1, 'color', 'green', 10);
+    const page = db.findNodesPaged(1, 'color', 'green', { limit: 10 });
     assert.equal(page.items.length, 0);
     assert.equal(page.nextCursor, undefined);
   });
@@ -186,7 +195,7 @@ describe('neighborsPaged', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns lazy page with nextCursor', () => {
-    const page = db.neighborsPaged(center, 'outgoing', null, 4);
+    const page = db.neighborsPaged(center, { direction: 'outgoing', limit: 4 });
     assert.equal(page.items.length, 4);
     assert.equal(typeof page.items.nodeId(0), 'number');
     assert.equal(typeof page.items.edgeId(0), 'number');
@@ -200,7 +209,7 @@ describe('neighborsPaged', () => {
     const allEdgeIds = [];
     let cursor = null;
     for (;;) {
-      const page = db.neighborsPaged(center, 'outgoing', null, 4, cursor);
+      const page = db.neighborsPaged(center, { direction: 'outgoing', limit: 4, after: cursor ?? undefined });
       const items = page.items;
       for (let i = 0; i < items.length; i++) {
         allEdgeIds.push(items.edgeId(i));
@@ -211,12 +220,12 @@ describe('neighborsPaged', () => {
     assert.equal(allEdgeIds.length, 12);
 
     // Compare with unpaginated
-    const unpaged = db.neighbors(center, 'outgoing');
+    const unpaged = db.neighbors(center, { direction: 'outgoing' });
     assert.equal(unpaged.length, 12);
   });
 
   it('no limit returns all', () => {
-    const page = db.neighborsPaged(center, 'outgoing');
+    const page = db.neighborsPaged(center, { direction: 'outgoing' });
     assert.equal(page.items.length, 12);
     assert.equal(page.nextCursor, null);
   });
@@ -241,17 +250,17 @@ describe('traverse pagination', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('paginates exact-depth traversal results with traversal cursor objects', () => {
-    const p1 = db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 2);
+    const p1 = db.traverse(a, 2, { minDepth: 2, direction: 'outgoing', limit: 2 });
     assert.equal(p1.items.length, 2);
     assert.ok(p1.nextCursor != null);
     assert.equal(typeof p1.nextCursor.depth, 'number');
     assert.equal(typeof p1.nextCursor.lastNodeId, 'number');
 
-    const p2 = db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 2, p1.nextCursor);
+    const p2 = db.traverse(a, 2, { minDepth: 2, direction: 'outgoing', limit: 2, cursor: p1.nextCursor });
     assert.equal(p2.items.length, 2);
     assert.ok(p2.nextCursor != null);
 
-    const p3 = db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 2, p2.nextCursor);
+    const p3 = db.traverse(a, 2, { minDepth: 2, direction: 'outgoing', limit: 2, cursor: p2.nextCursor });
     assert.equal(p3.items.length, 2);
     assert.equal(p3.nextCursor, undefined);
   });
@@ -260,7 +269,7 @@ describe('traverse pagination', () => {
     const allNodeIds = [];
     let cursor = null;
     for (;;) {
-      const page = db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 3, cursor);
+      const page = db.traverse(a, 2, { minDepth: 2, direction: 'outgoing', limit: 3, cursor: cursor ?? undefined });
       allNodeIds.push(...page.items.map(hit => hit.nodeId));
       cursor = page.nextCursor ?? null;
       if (cursor === null || cursor === undefined) break;
@@ -272,7 +281,7 @@ describe('traverse pagination', () => {
 
   it('rejects raw ID cursors for traversal', () => {
     assert.throws(
-      () => db.traverse(a, 2, 2, 'outgoing', null, null, null, null, 2, 123),
+      () => db.traverse(a, 2, { minDepth: 2, direction: 'outgoing', limit: 2, cursor: 123 }),
     );
   });
 });
@@ -301,9 +310,9 @@ describe('traverse node-type filtering', () => {
     const allNodeIds = [];
     let cursor = null;
     for (;;) {
-      const page = db.traverse(
-        a, 2, 2, 'outgoing', null, [2], null, null, 2, cursor
-      );
+      const page = db.traverse(a, 2, {
+        minDepth: 2, direction: 'outgoing', nodeTypeFilter: [2], limit: 2, cursor: cursor ?? undefined
+      });
       allNodeIds.push(...page.items.map(hit => hit.nodeId));
       cursor = page.nextCursor ?? null;
       if (cursor === null || cursor === undefined) break;
@@ -358,7 +367,7 @@ describe('pagination async variants', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     for (let i = 0; i < 6; i++) {
-      db.upsertNode(1, `n${i}`, { tag: 'a' });
+      db.upsertNode(1, `n${i}`, { props: { tag: 'a' } });
     }
     const n0 = db.findNodes(1, 'tag', 'a')[0];
     const n1 = db.findNodes(1, 'tag', 'a')[1];
@@ -382,7 +391,7 @@ describe('pagination async variants', () => {
   });
 
   it('findNodesPagedAsync works', async () => {
-    const page = await db.findNodesPagedAsync(1, 'tag', 'a', 4);
+    const page = await db.findNodesPagedAsync(1, 'tag', 'a', { limit: 4 });
     assert.equal(page.items.length, 4);
     assert.ok(page.nextCursor !== undefined);
   });
@@ -394,20 +403,20 @@ describe('pagination async variants', () => {
   });
 
   it('neighborsPagedAsync returns lazy result', async () => {
-    const page = await db.neighborsPagedAsync(db.findNodes(1, 'tag', 'a')[0], 'outgoing', null, 10);
+    const page = await db.neighborsPagedAsync(db.findNodes(1, 'tag', 'a')[0], { direction: 'outgoing', limit: 10 });
     assert.equal(typeof page.items.length, 'number');
     assert.equal(page.nextCursor, null);
   });
 
   it('traverseAsync paginates exact-depth traversal hits', async () => {
-    const page = await db.traverseAsync(db.findNodes(1, 'tag', 'a')[0], 1, 2, 'outgoing', null, null, null, null, 10);
+    const page = await db.traverseAsync(db.findNodes(1, 'tag', 'a')[0], 2, { direction: 'outgoing', limit: 10 });
     assert.equal(typeof page.items.length, 'number');
   });
 
   it('traverseAsync accepts node type filters and traversal cursor args', async () => {
-    const page = await db.traverseAsync(
-      db.findNodes(1, 'tag', 'a')[0], 1, 2, 'outgoing', null, [1], null, null, 10
-    );
+    const page = await db.traverseAsync(db.findNodes(1, 'tag', 'a')[0], 2, {
+      direction: 'outgoing', nodeTypeFilter: [1], limit: 10
+    });
     assert.equal(typeof page.items.length, 'number');
   });
 });

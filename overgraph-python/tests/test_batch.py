@@ -104,6 +104,32 @@ class TestGetNodes:
         assert results == []
 
 
+class TestGetNodesByKeys:
+    def test_basic(self, db):
+        db.upsert_node(1, "alice")
+        db.upsert_node(1, "bob")
+        db.upsert_node(2, "charlie")
+        results = db.get_nodes_by_keys([(1, "alice"), (1, "bob"), (2, "charlie")])
+        assert len(results) == 3
+        assert results[0].key == "alice"
+        assert results[1].key == "bob"
+        assert results[2].key == "charlie"
+
+    def test_mixed_found_missing(self, db):
+        db.upsert_node(1, "a")
+        bid = db.upsert_node(1, "b")
+        db.delete_node(bid)
+        results = db.get_nodes_by_keys([(1, "a"), (1, "b"), (1, "nonexistent")])
+        assert len(results) == 3
+        assert results[0] is not None
+        assert results[1] is None
+        assert results[2] is None
+
+    def test_empty(self, db):
+        results = db.get_nodes_by_keys([])
+        assert results == []
+
+
 class TestGetEdges:
     def test_get_multiple(self, db):
         n1 = db.upsert_node(1, "a")

@@ -195,6 +195,11 @@ def effective_config(profile: dict[str, Any], scenario_contract: dict[str, Any])
         "include_weights_on_export": bool(cfg["include_weights_on_export"]),
         "shortest_path_nodes": max(int(cfg["shortest_path_nodes_min"]), nodes // int(cfg["shortest_path_nodes_divisor"])),
         "shortest_path_edge_offsets": [int(v) for v in cfg["shortest_path_edge_offsets"]],
+        "vector_nodes": max(int(cfg["vector_nodes_min"]), int(profile["nodes"]) // int(cfg["vector_nodes_divisor"])),
+        "vector_dim": int(cfg["vector_dim"]),
+        "vector_nnz": int(cfg["vector_nnz"]),
+        "vector_sparse_dims": int(cfg["vector_sparse_dims"]),
+        "vector_k": int(cfg["vector_k"]),
     }
 
 
@@ -254,6 +259,38 @@ def build_deep_traversal_graph(db: OverGraph, fanout: int) -> tuple[int, tuple[i
     return root, (level1, level2, level3)
 
 
+def bench_splitmix64(x: int) -> int:
+    x = (x + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    z = x
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return (z ^ (z >> 31)) & 0xFFFFFFFFFFFFFFFF
+
+
+def bench_dense_vector(dim: int, seed: int) -> list[float]:
+    values: list[float] = []
+    state = seed & 0xFFFFFFFFFFFFFFFF
+    for _ in range(dim):
+        state = bench_splitmix64(state)
+        values.append((state >> 40) / 16_777_215.0 * 2.0 - 1.0)
+    norm = sum(v * v for v in values) ** 0.5
+    if norm > 0:
+        values = [v / norm for v in values]
+    return values
+
+
+def bench_sparse_vector(dim_count: int, nnz: int, seed: int) -> list[tuple[int, float]]:
+    dims: list[int] = []
+    state = seed & 0xFFFFFFFFFFFFFFFF
+    while len(dims) < nnz:
+        state = bench_splitmix64(state)
+        d = int(state % dim_count)
+        if d not in dims:
+            dims.append(d)
+    dims.sort()
+    return [(d, 1.0 - i * 0.05) for i, d in enumerate(dims)]
+
+
 def pack_node_batch(nodes: list[dict[str, Any]]) -> bytes:
     """Pack node dicts using the Python connector binary wire format."""
     buf = bytearray(struct.pack("<I", len(nodes)))
@@ -283,7 +320,7 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "crud-upsert-node"))
         s = run_bench(
-            lambda i: db.upsert_node(1, f"node-{i}", {"idx": i}, 1.0),
+            lambda i: db.upsert_node(1, f"node-{i}", props={"idx": i}, weight=1.0),
             iter_cfg["warmup"],
             iter_cfg["iters"],
             growth=True,
@@ -309,7 +346,7 @@ def main() -> int:
             [{"type_id": 1, "key": f"e-{i}"} for i in range(iter_cfg["warmup"] + iter_cfg["iters"] + 1)]
         )
         s = run_bench(
-            lambda i: db.upsert_edge(node_ids[i], node_ids[i + 1], 1, None, 1.0),
+            lambda i: db.upsert_edge(node_ids[i], node_ids[i + 1], 1, weight=1.0),
             iter_cfg["warmup"],
             iter_cfg["iters"],
             growth=True,
@@ -407,9 +444,9 @@ def main() -> int:
         scenario_id = "S-CRUD-004"
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "crud-upsert-node-fixed"))
-        db.upsert_node(1, "fixed-node", {"idx": 0}, 1.0)
+        db.upsert_node(1, "fixed-node", props={"idx": 0}, weight=1.0)
         s = run_bench(
-            lambda i: db.upsert_node(1, "fixed-node", {"idx": i}, 1.0),
+            lambda i: db.upsert_node(1, "fixed-node", props={"idx": i}, weight=1.0),
             iter_cfg["warmup"],
             iter_cfg["iters"],
         )
@@ -433,7 +470,7 @@ def main() -> int:
         node_a = db.upsert_node(1, "fixed-a")
         node_b = db.upsert_node(1, "fixed-b")
         s = run_bench(
-            lambda _i: db.upsert_edge(node_a, node_b, 1, None, 1.0),
+            lambda _i: db.upsert_edge(node_a, node_b, 1, weight=1.0),
             iter_cfg["warmup"],
             iter_cfg["iters"],
         )
@@ -463,7 +500,7 @@ def main() -> int:
             {"from_id": hub, "to_id": nb_node_ids[1 + i], "type_id": 1, "weight": 1.0}
             for i in range(cfg["fanout"])
         ])
-        s = run_bench(lambda _i: db.neighbors(hub, "outgoing"), iter_cfg["warmup"], iter_cfg["iters"])
+        s = run_bench(lambda _i: db.neighbors(hub, direction="outgoing"), iter_cfg["warmup"], iter_cfg["iters"])
         scenarios.append(
             scenario(
                 scenario_id,
@@ -653,7 +690,7 @@ def main() -> int:
             {"from_id": hub, "to_id": deg_node_ids[1 + i], "type_id": 1, "weight": 1.0}
             for i in range(cfg["fanout"])
         ])
-        s = run_bench(lambda _i: db.degree(hub, "outgoing"), iter_cfg["warmup"], iter_cfg["iters"])
+        s = run_bench(lambda _i: db.degree(hub, direction="outgoing"), iter_cfg["warmup"], iter_cfg["iters"])
         scenarios.append(
             scenario(
                 scenario_id,
@@ -692,7 +729,7 @@ def main() -> int:
                 })
         db.batch_upsert_edges(degree_edges)
         s = run_bench(
-            lambda _i: db.degrees(hub_ids, "outgoing"), iter_cfg["warmup"], iter_cfg["iters"]
+            lambda _i: db.degrees(hub_ids, direction="outgoing"), iter_cfg["warmup"], iter_cfg["iters"]
         )
         scenarios.append(
             scenario(
@@ -728,7 +765,7 @@ def main() -> int:
         sp_from = sp_ids[0]
         sp_to = sp_ids[len(sp_ids) // 2]
         s = run_bench(
-            lambda _i: db.shortest_path(sp_from, sp_to, "outgoing"),
+            lambda _i: db.shortest_path(sp_from, sp_to, direction="outgoing"),
             iter_cfg["warmup"],
             iter_cfg["iters"],
         )
@@ -770,7 +807,7 @@ def main() -> int:
         ic_from = ic_ids[0]
         ic_to = ic_ids[len(ic_ids) // 2]
         s = run_bench(
-            lambda _i: db.is_connected(ic_from, ic_to, "outgoing"),
+            lambda _i: db.is_connected(ic_from, ic_to, direction="outgoing"),
             iter_cfg["warmup"],
             iter_cfg["iters"],
         )
@@ -974,6 +1011,65 @@ def main() -> int:
                 {
                     "nodes_per_iter": cfg["flush_nodes_per_iter"],
                     "edge_chain_cap": cfg["flush_edges_per_iter_cap"],
+                },
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+        db.close()
+
+        # S-VEC-001: hybrid_vector_search
+        scenario_id = "S-VEC-001"
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(
+            str(tmp_root / "vec-hybrid"),
+            dense_vector_dimension=cfg["vector_dim"],
+            dense_vector_metric="cosine",
+        )
+
+        vec_nodes = []
+        for i in range(cfg["vector_nodes"]):
+            seed = 1729 * (i + 1)
+            vec_nodes.append(
+                {
+                    "type_id": 1,
+                    "key": f"v-{i}",
+                    "dense_vector": bench_dense_vector(cfg["vector_dim"], seed),
+                    "sparse_vector": bench_sparse_vector(
+                        cfg["vector_sparse_dims"], cfg["vector_nnz"], seed + 0xCAFE
+                    ),
+                }
+            )
+        db.batch_upsert_nodes(vec_nodes)
+        db.flush()
+
+        query_seed = 0xDEADBEEF
+        dense_q = bench_dense_vector(cfg["vector_dim"], query_seed)
+        sparse_q = bench_sparse_vector(
+            cfg["vector_sparse_dims"], cfg["vector_nnz"], query_seed + 0xCAFE
+        )
+
+        s = run_bench(
+            lambda _i: db.vector_search(
+                "hybrid", cfg["vector_k"], dense_query=dense_q, sparse_query=sparse_q
+            ),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "hybrid_vector_search",
+                "vector",
+                s,
+                iter_cfg,
+                {
+                    "vector_nodes": cfg["vector_nodes"],
+                    "vector_dim": cfg["vector_dim"],
+                    "vector_nnz": cfg["vector_nnz"],
+                    "vector_sparse_dims": cfg["vector_sparse_dims"],
+                    "vector_k": cfg["vector_k"],
+                    "mode": "hybrid",
+                    "fusion_mode": "weighted_rank",
                 },
                 scenario_comparability(scenario_contract, scenario_id),
             )

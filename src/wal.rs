@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::encoding::encode_wal_op;
 use crate::encoding::{decode_wal_op, encode_wal_op_into};
 use crate::error::EngineError;
 use crate::types::WalOp;
@@ -7,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 const WAL_FILENAME: &str = "data.wal";
 const WAL_MAGIC: [u8; 4] = *b"OVGR";
-const WAL_VERSION: u32 = 1;
+const WAL_VERSION: u32 = 3;
 const WAL_HEADER_SIZE: usize = 8; // WAL_MAGIC (4) + WAL_VERSION (4)
 /// Maximum size for a single WAL record payload (64 MB).
 const MAX_WAL_RECORD_SIZE: usize = 64 * 1024 * 1024;
@@ -93,34 +95,93 @@ impl WalWriter {
         })
     }
 
-    /// Append a single WalOp to the WAL. Returns the byte size written.
-    pub fn append(&mut self, op: &WalOp) -> Result<usize, EngineError> {
+    /// Open or create a WAL generation file for appending.
+    ///
+    /// Same as `open()` but uses `wal_generation_path(db_dir, gen_id)` instead
+    /// of the legacy `data.wal` filename.
+    pub fn open_generation(db_dir: &Path, gen_id: u64) -> Result<Self, EngineError> {
+        let path = wal_generation_path(db_dir, gen_id);
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+
+        let file_len = file.metadata()?.len();
+        let needs_header = if file_len == 0 {
+            true
+        } else if file_len < WAL_HEADER_SIZE as u64 {
+            return Err(EngineError::CorruptWal(
+                "WAL file too small for header".into(),
+            ));
+        } else {
+            let mut header = [0u8; WAL_HEADER_SIZE];
+            (&file).read_exact(&mut header)?;
+            validate_wal_header(&header)?;
+            false
+        };
+
+        let mut writer = BufWriter::new(file);
+
+        if needs_header {
+            write_wal_header(&mut writer)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+
+        Ok(WalWriter {
+            path,
+            writer,
+            encode_buf: Vec::new(),
+        })
+    }
+
+    /// Append a single WalOp to the WAL with its engine sequence number.
+    /// The seq is stored as an 8-byte LE prefix inside the CRC-protected payload.
+    /// Frame: [len:u32][crc:u32][seq:u64][walop_bytes]
+    /// Returns the byte size written.
+    pub fn append(&mut self, op: &WalOp, engine_seq: u64) -> Result<usize, EngineError> {
         encode_wal_op_into(op, &mut self.encode_buf)?;
-        let len = self.encode_buf.len() as u32;
-        let crc = crc32fast::hash(&self.encode_buf);
+        let seq_bytes = engine_seq.to_le_bytes();
+        let total_payload = 8 + self.encode_buf.len();
+        let len = total_payload as u32;
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&seq_bytes);
+        hasher.update(&self.encode_buf);
+        let crc = hasher.finalize();
 
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&crc.to_le_bytes())?;
+        self.writer.write_all(&seq_bytes)?;
         self.writer.write_all(&self.encode_buf)?;
 
-        // 4 (len) + 4 (crc) + payload
-        Ok(8 + self.encode_buf.len())
+        // 4 (len) + 4 (crc) + 8 (seq) + walop_bytes
+        Ok(8 + total_payload)
     }
 
-    /// Append multiple WalOps as a single atomic buffer write.
+    /// Append multiple (engine_seq, WalOp) pairs as a single atomic buffer write.
     /// All ops are pre-encoded before any I/O, so encoding failures
     /// don't leave partial data in the write buffer.
     /// Returns total bytes written (framing + payload).
-    pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<usize, EngineError> {
+    pub fn append_batch(&mut self, ops: &[(u64, WalOp)]) -> Result<usize, EngineError> {
         // Pre-encode all ops into a single contiguous buffer
         let mut batch_buf = Vec::new();
-        for op in ops {
+        for (seq, op) in ops {
             encode_wal_op_into(op, &mut self.encode_buf)?;
-            let len = self.encode_buf.len() as u32;
-            let crc = crc32fast::hash(&self.encode_buf);
+            let seq_bytes = seq.to_le_bytes();
+            let total_payload = 8 + self.encode_buf.len();
+            let len = total_payload as u32;
+
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&seq_bytes);
+            hasher.update(&self.encode_buf);
+            let crc = hasher.finalize();
 
             batch_buf.extend_from_slice(&len.to_le_bytes());
             batch_buf.extend_from_slice(&crc.to_le_bytes());
+            batch_buf.extend_from_slice(&seq_bytes);
             batch_buf.extend_from_slice(&self.encode_buf);
         }
 
@@ -192,8 +253,9 @@ impl WalReader {
     /// record (which is treated as a crash boundary; the partial record is ignored).
     ///
     /// Validates the WAL header (magic + version) before reading records.
-    /// Returns an error if the file is not a valid OverGraph WAL.
-    pub fn read_all(&self) -> Result<Vec<WalOp>, EngineError> {
+    /// Returns `(engine_seq, WalOp)` pairs. Returns an error if the file is
+    /// not a valid OverGraph WAL.
+    pub fn read_all(&self) -> Result<Vec<(u64, WalOp)>, EngineError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -257,9 +319,121 @@ impl WalReader {
                 break;
             }
 
-            // Decode the operation. Treat decode failure as crash boundary
-            match decode_wal_op(&payload) {
-                Ok(op) => ops.push(op),
+            // V3 frame: first 8 bytes are engine_seq, rest is WalOp
+            if payload.len() < 8 {
+                break; // truncated seq prefix
+            }
+            let engine_seq = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes for seq"));
+            let walop_bytes = &payload[8..];
+
+            let recognized_tag = walop_bytes
+                .first()
+                .and_then(|tag| crate::types::OpTag::from_u8(*tag))
+                .is_some();
+
+            // Decode the operation. Unknown op tags remain a crash boundary for
+            // garbage tail recovery, but recognized malformed records are hard
+            // corruption and must fail reopen.
+            match decode_wal_op(walop_bytes) {
+                Ok(op) => ops.push((engine_seq, op)),
+                Err(err) if recognized_tag => {
+                    return Err(EngineError::CorruptWal(format!(
+                        "failed to decode WAL record: {}",
+                        err
+                    )));
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(ops)
+    }
+
+    /// Read all valid records from a WAL generation file.
+    /// Same as `read_all()` but reads from `wal_generation_path(db_dir, gen_id)`.
+    pub fn read_generation(db_dir: &Path, gen_id: u64) -> Result<Vec<(u64, WalOp)>, EngineError> {
+        let path = wal_generation_path(db_dir, gen_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        if file_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        if file_len < WAL_HEADER_SIZE as u64 {
+            return Err(EngineError::CorruptWal(
+                "WAL file too small for header".into(),
+            ));
+        }
+
+        let mut reader = BufReader::new(file);
+
+        // Validate header
+        let mut header = [0u8; WAL_HEADER_SIZE];
+        reader
+            .read_exact(&mut header)
+            .map_err(EngineError::IoError)?;
+        validate_wal_header(&header)?;
+
+        let mut ops = Vec::new();
+
+        loop {
+            // Read length
+            let mut len_buf = [0u8; 4];
+            match reader.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(EngineError::IoError(e)),
+            }
+            let payload_len = u32::from_le_bytes(len_buf) as usize;
+
+            if payload_len == 0 || payload_len > MAX_WAL_RECORD_SIZE {
+                break;
+            }
+
+            // Read CRC
+            let mut crc_buf = [0u8; 4];
+            match reader.read_exact(&mut crc_buf) {
+                Ok(()) => {}
+                Err(_) => break,
+            }
+            let stored_crc = u32::from_le_bytes(crc_buf);
+
+            // Read payload
+            let mut payload = vec![0u8; payload_len];
+            match reader.read_exact(&mut payload) {
+                Ok(()) => {}
+                Err(_) => break,
+            }
+
+            // Validate CRC
+            if crc32fast::hash(&payload) != stored_crc {
+                break;
+            }
+
+            // V3 frame: first 8 bytes are engine_seq
+            if payload.len() < 8 {
+                break;
+            }
+            let engine_seq = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes for seq"));
+            let walop_bytes = &payload[8..];
+
+            let recognized_tag = walop_bytes
+                .first()
+                .and_then(|tag| crate::types::OpTag::from_u8(*tag))
+                .is_some();
+
+            match decode_wal_op(walop_bytes) {
+                Ok(op) => ops.push((engine_seq, op)),
+                Err(err) if recognized_tag => {
+                    return Err(EngineError::CorruptWal(format!(
+                        "failed to decode WAL record: {}",
+                        err
+                    )));
+                }
                 Err(_) => break,
             }
         }
@@ -281,6 +455,20 @@ impl WalReader {
 /// Delete the WAL file (used after successful flush/checkpoint).
 pub fn remove_wal(db_dir: &Path) -> Result<(), EngineError> {
     let path = db_dir.join(WAL_FILENAME);
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+/// WAL generation file path: `wal_<generation_id>.wal`
+pub fn wal_generation_path(db_dir: &Path, gen_id: u64) -> PathBuf {
+    db_dir.join(format!("wal_{}.wal", gen_id))
+}
+
+/// Delete a specific WAL generation file.
+pub fn remove_wal_generation(db_dir: &Path, gen_id: u64) -> Result<(), EngineError> {
+    let path = wal_generation_path(db_dir, gen_id);
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
@@ -318,6 +506,9 @@ mod tests {
             created_at: 1000 * id as i64,
             updated_at: 1000 * id as i64 + 1,
             weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         })
     }
 
@@ -333,6 +524,7 @@ mod tests {
             weight: 1.0,
             valid_from: 0,
             valid_to: i64::MAX,
+            last_write_seq: 0,
         })
     }
 
@@ -342,15 +534,17 @@ mod tests {
         let mut writer = WalWriter::open(dir.path()).unwrap();
 
         let op = make_test_node(1, "user:alice");
-        writer.append(&op).unwrap();
+        writer.append(&op, 1).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
         let reader = WalReader::new(dir.path());
-        let ops = reader.read_all().unwrap();
-        assert_eq!(ops.len(), 1);
+        let records = reader.read_all().unwrap();
+        assert_eq!(records.len(), 1);
 
-        match &ops[0] {
+        let (seq, ref op) = records[0];
+        assert_eq!(seq, 1);
+        match op {
             WalOp::UpsertNode(node) => {
                 assert_eq!(node.id, 1);
                 assert_eq!(node.key, "user:alice");
@@ -366,23 +560,49 @@ mod tests {
 
         for i in 0..1000 {
             let op = make_test_node(i, &format!("node:{}", i));
-            writer.append(&op).unwrap();
+            writer.append(&op, i + 1).unwrap();
         }
         writer.flush().unwrap();
         drop(writer);
 
         let reader = WalReader::new(dir.path());
-        let ops = reader.read_all().unwrap();
-        assert_eq!(ops.len(), 1000);
+        let records = reader.read_all().unwrap();
+        assert_eq!(records.len(), 1000);
 
         // Verify first and last
-        match &ops[0] {
-            WalOp::UpsertNode(node) => assert_eq!(node.id, 0),
+        match &records[0] {
+            (seq, WalOp::UpsertNode(node)) => {
+                assert_eq!(*seq, 1);
+                assert_eq!(node.id, 0);
+            }
             _ => panic!("expected UpsertNode"),
         }
-        match &ops[999] {
-            WalOp::UpsertNode(node) => assert_eq!(node.id, 999),
+        match &records[999] {
+            (seq, WalOp::UpsertNode(node)) => {
+                assert_eq!(*seq, 1000);
+                assert_eq!(node.id, 999);
+            }
             _ => panic!("expected UpsertNode"),
+        }
+    }
+
+    #[test]
+    fn test_wal_reader_rejects_older_wal_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(WAL_FILENAME);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&WAL_MAGIC).unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let reader = WalReader::new(dir.path());
+        let err = reader.read_all().unwrap_err();
+        match err {
+            EngineError::CorruptWal(message) => {
+                assert!(message.contains("unsupported WAL version"));
+            }
+            other => panic!("expected CorruptWal, got {}", other),
         }
     }
 
@@ -391,20 +611,26 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut writer = WalWriter::open(dir.path()).unwrap();
 
-        writer.append(&make_test_node(1, "alice")).unwrap();
-        writer.append(&make_test_node(2, "bob")).unwrap();
-        writer.append(&make_test_edge(1, 1, 2)).unwrap();
+        writer.append(&make_test_node(1, "alice"), 1).unwrap();
+        writer.append(&make_test_node(2, "bob"), 2).unwrap();
+        writer.append(&make_test_edge(1, 1, 2), 3).unwrap();
         writer
-            .append(&WalOp::DeleteNode {
-                id: 2,
-                deleted_at: 9999,
-            })
+            .append(
+                &WalOp::DeleteNode {
+                    id: 2,
+                    deleted_at: 9999,
+                },
+                4,
+            )
             .unwrap();
         writer
-            .append(&WalOp::DeleteEdge {
-                id: 1,
-                deleted_at: 9999,
-            })
+            .append(
+                &WalOp::DeleteEdge {
+                    id: 1,
+                    deleted_at: 9999,
+                },
+                5,
+            )
             .unwrap();
         writer.flush().unwrap();
         drop(writer);
@@ -413,11 +639,11 @@ mod tests {
         let ops = reader.read_all().unwrap();
         assert_eq!(ops.len(), 5);
 
-        assert!(matches!(&ops[0], WalOp::UpsertNode(_)));
-        assert!(matches!(&ops[1], WalOp::UpsertNode(_)));
-        assert!(matches!(&ops[2], WalOp::UpsertEdge(_)));
-        assert!(matches!(&ops[3], WalOp::DeleteNode { .. }));
-        assert!(matches!(&ops[4], WalOp::DeleteEdge { .. }));
+        assert!(matches!(&ops[0], (_, WalOp::UpsertNode(_))));
+        assert!(matches!(&ops[1], (_, WalOp::UpsertNode(_))));
+        assert!(matches!(&ops[2], (_, WalOp::UpsertEdge(_))));
+        assert!(matches!(&ops[3], (_, WalOp::DeleteNode { .. })));
+        assert!(matches!(&ops[4], (_, WalOp::DeleteEdge { .. })));
     }
 
     #[test]
@@ -447,7 +673,7 @@ mod tests {
         // Write 5 valid records
         for i in 0..5 {
             writer
-                .append(&make_test_node(i, &format!("n:{}", i)))
+                .append(&make_test_node(i, &format!("n:{}", i)), i + 1)
                 .unwrap();
         }
         writer.flush().unwrap();
@@ -475,7 +701,7 @@ mod tests {
         // Write 3 valid records
         for i in 0..3 {
             writer
-                .append(&make_test_node(i, &format!("n:{}", i)))
+                .append(&make_test_node(i, &format!("n:{}", i)), i + 1)
                 .unwrap();
         }
         writer.flush().unwrap();
@@ -505,7 +731,7 @@ mod tests {
     fn test_wal_truncate() {
         let dir = TempDir::new().unwrap();
         let mut writer = WalWriter::open(dir.path()).unwrap();
-        writer.append(&make_test_node(1, "test")).unwrap();
+        writer.append(&make_test_node(1, "test"), 1).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -522,15 +748,17 @@ mod tests {
 
         // Verify we can reopen a writer on the truncated file
         let mut writer = WalWriter::open(dir.path()).unwrap();
-        writer.append(&make_test_node(2, "after_truncate")).unwrap();
+        writer
+            .append(&make_test_node(2, "after_truncate"), 2)
+            .unwrap();
         writer.flush().unwrap();
         drop(writer);
 
         let reader = WalReader::new(dir.path());
-        let ops = reader.read_all().unwrap();
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
-            WalOp::UpsertNode(node) => assert_eq!(node.key, "after_truncate"),
+        let records = reader.read_all().unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            (_, WalOp::UpsertNode(node)) => assert_eq!(node.key, "after_truncate"),
             _ => panic!("expected UpsertNode"),
         }
     }
@@ -539,7 +767,7 @@ mod tests {
     fn test_wal_remove() {
         let dir = TempDir::new().unwrap();
         let mut writer = WalWriter::open(dir.path()).unwrap();
-        writer.append(&make_test_node(1, "test")).unwrap();
+        writer.append(&make_test_node(1, "test"), 1).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -557,10 +785,10 @@ mod tests {
             id: 1,
             deleted_at: 1000,
         };
-        let size = writer.append(&delete_op).unwrap();
+        let size = writer.append(&delete_op, 1).unwrap();
         // Delete payload: 1 (op) + 8 (id) + 8 (deleted_at) = 17 bytes
-        // Frame: 4 (len) + 4 (crc) + 17 (payload) = 25
-        assert_eq!(size, 25);
+        // Frame: 4 (len) + 4 (crc) + 8 (seq) + 17 (walop) = 33
+        assert_eq!(size, 33);
         writer.flush().unwrap();
     }
 
@@ -573,7 +801,7 @@ mod tests {
             let mut writer = WalWriter::open(dir.path()).unwrap();
             for i in 0..3 {
                 writer
-                    .append(&make_test_node(i, &format!("s1:{}", i)))
+                    .append(&make_test_node(i, &format!("s1:{}", i)), i + 1)
                     .unwrap();
             }
             writer.flush().unwrap();
@@ -584,7 +812,7 @@ mod tests {
             let mut writer = WalWriter::open(dir.path()).unwrap();
             for i in 10..12 {
                 writer
-                    .append(&make_test_node(i, &format!("s2:{}", i)))
+                    .append(&make_test_node(i, &format!("s2:{}", i)), i + 1)
                     .unwrap();
             }
             writer.flush().unwrap();
@@ -659,7 +887,7 @@ mod tests {
         assert!(data.len() >= WAL_HEADER_SIZE);
         assert_eq!(&data[..4], b"OVGR");
         let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        assert_eq!(version, 1);
+        assert_eq!(version, WAL_VERSION);
     }
 
     // --- Regression test for M5: decode error treated as crash boundary ---
@@ -673,14 +901,17 @@ mod tests {
         let mut writer = WalWriter::open(dir.path()).unwrap();
         for i in 0..3 {
             writer
-                .append(&make_test_node(i, &format!("n:{}", i)))
+                .append(&make_test_node(i, &format!("n:{}", i)), i + 1)
                 .unwrap();
         }
         writer.flush().unwrap();
         drop(writer);
 
         // Append a record with VALID CRC but UNPARSEABLE payload (unknown op tag)
-        let bogus_payload = vec![255u8, 0, 0, 0, 0, 0, 0, 0];
+        // V3 format: first 8 bytes are seq, rest is walop bytes
+        let mut bogus_payload = Vec::new();
+        bogus_payload.extend_from_slice(&99u64.to_le_bytes()); // seq
+        bogus_payload.extend_from_slice(&[255u8, 0, 0, 0, 0, 0, 0, 0]); // unknown op tag
         let crc = crc32fast::hash(&bogus_payload);
         let len = bogus_payload.len() as u32;
 
@@ -697,6 +928,42 @@ mod tests {
         assert_eq!(ops.len(), 3);
     }
 
+    #[test]
+    fn test_wal_malformed_recognized_record_is_hard_error() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join(WAL_FILENAME);
+
+        let mut writer = WalWriter::open(dir.path()).unwrap();
+        writer.append(&make_test_node(1, "valid"), 1).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        // V3 format: seq prefix + malformed walop bytes
+        let walop_bytes = encode_wal_op(&make_test_node(2, "bad")).unwrap();
+        let mut malformed_payload = Vec::new();
+        malformed_payload.extend_from_slice(&99u64.to_le_bytes()); // seq
+        malformed_payload.extend_from_slice(&walop_bytes);
+        malformed_payload.push(0xFF); // trailing garbage makes it malformed
+        let crc = crc32fast::hash(&malformed_payload);
+        let len = malformed_payload.len() as u32;
+
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&len.to_le_bytes()).unwrap();
+        file.write_all(&crc.to_le_bytes()).unwrap();
+        file.write_all(&malformed_payload).unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let reader = WalReader::new(dir.path());
+        match reader.read_all() {
+            Err(EngineError::CorruptWal(message)) => {
+                assert!(message.contains("failed to decode WAL record"));
+            }
+            Ok(_) => panic!("expected malformed recognized WAL record to fail"),
+            Err(other) => panic!("expected CorruptWal, got {}", other),
+        }
+    }
+
     // --- Regression test for M1: off-by-one in length sanity check ---
 
     #[test]
@@ -706,8 +973,8 @@ mod tests {
 
         // Write 2 valid records via writer (header auto-added)
         let mut writer = WalWriter::open(dir.path()).unwrap();
-        writer.append(&make_test_node(1, "first")).unwrap();
-        writer.append(&make_test_node(2, "second")).unwrap();
+        writer.append(&make_test_node(1, "first"), 1).unwrap();
+        writer.append(&make_test_node(2, "second"), 2).unwrap();
         writer.flush().unwrap();
         drop(writer);
 

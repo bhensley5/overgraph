@@ -48,7 +48,12 @@ fn main() {
 fn inspect_json(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = load_manifest_readonly(db_path)?;
 
-    let wal_bytes = wal_size(db_path);
+    let wal_files = collect_wal_files(db_path);
+    let wal_bytes: Option<u64> = if wal_files.is_empty() {
+        None
+    } else {
+        Some(wal_files.iter().map(|(_, sz)| sz).sum())
+    };
 
     let output = match manifest {
         Some(m) => {
@@ -194,16 +199,40 @@ fn inspect_text(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_wal_info(db_path: &Path) {
-    let size = wal_size(db_path);
-    match size {
-        Some(bytes) => println!("WAL: data.wal ({})", format_bytes(bytes)),
-        None => println!("WAL: not present"),
+    let wal_files = collect_wal_files(db_path);
+    if wal_files.is_empty() {
+        println!("WAL: not present");
+    } else {
+        let total: u64 = wal_files.iter().map(|(_, sz)| sz).sum();
+        println!(
+            "WAL: {} generation(s) ({})",
+            wal_files.len(),
+            format_bytes(total)
+        );
     }
     println!();
 }
 
-fn wal_size(db_path: &Path) -> Option<u64> {
-    fs::metadata(db_path.join("data.wal")).ok().map(|m| m.len())
+fn collect_wal_files(db_path: &Path) -> Vec<(String, u64)> {
+    let mut files = Vec::new();
+    // Check legacy data.wal
+    let legacy = db_path.join("data.wal");
+    if let Ok(meta) = fs::metadata(&legacy) {
+        files.push(("data.wal".to_string(), meta.len()));
+    }
+    // Check WAL generation files (wal_*.wal)
+    if let Ok(entries) = fs::read_dir(db_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("wal_") && name.ends_with(".wal") {
+                if let Ok(meta) = entry.metadata() {
+                    files.push((name, meta.len()));
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
 }
 
 // Segment directories are flat (no subdirectories). Only sum top-level files.

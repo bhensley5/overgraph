@@ -93,21 +93,21 @@ describe('Full lifecycle integration', () => {
     const db = OverGraph.open(dbPath);
 
     // Node 0 should have outgoing neighbors
-    const nbrs = await db.neighborsAsync(nodeIds[0], 'outgoing');
+    const nbrs = await db.neighborsAsync(nodeIds[0], { direction: 'outgoing' });
     assert.ok(nbrs.length > 0, 'node 0 should have outgoing neighbors');
 
     // Neighbors with type filter
-    const filtered = await db.neighborsAsync(nodeIds[0], 'outgoing', [10]);
+    const filtered = await db.neighborsAsync(nodeIds[0], { direction: 'outgoing', typeFilter: [10] });
     assert.ok(filtered.length <= nbrs.length);
 
     // Neighbors with limit
     if (nbrs.length > 1) {
-      const limited = await db.neighborsAsync(nodeIds[0], 'outgoing', null, 1);
+      const limited = await db.neighborsAsync(nodeIds[0], { direction: 'outgoing', limit: 1 });
       assert.equal(limited.length, 1);
     }
 
     // Incoming neighbors
-    const incoming = await db.neighborsAsync(nodeIds[13], 'incoming');
+    const incoming = await db.neighborsAsync(nodeIds[13], { direction: 'incoming' });
     // node 13 is a target for edges where (i*7+13)%500 == 13, i.e., i=0
     assert.ok(incoming.length > 0, 'node 13 should have incoming neighbors');
 
@@ -117,8 +117,8 @@ describe('Full lifecycle integration', () => {
   it('Step 5: traverse reaches exact 2nd-hop nodes', async () => {
     const db = OverGraph.open(dbPath);
 
-    const hop2 = await db.traverseAsync(nodeIds[0], 2, 2, 'outgoing');
-    const hop1 = await db.neighborsAsync(nodeIds[0], 'outgoing');
+    const hop2 = await db.traverseAsync(nodeIds[0], 2, { minDepth: 2, direction: 'outgoing' });
+    const hop1 = await db.neighborsAsync(nodeIds[0], { direction: 'outgoing' });
     const hop1Set = new Set(hop1.toArray().map(e => e.nodeId));
     assert.ok(hop2.items.length > 0, 'depth-2 traversal should emit at least one hit');
     for (const hit of hop2.items) {
@@ -211,7 +211,7 @@ describe('Full lifecycle integration', () => {
     assert.equal(await db.getEdgeAsync(deletedEdgeId), null, 'deleted edge should stay deleted');
 
     // Verify neighbors still work after compaction + reopen
-    const nbrs = await db.neighborsAsync(nodeIds[0], 'outgoing');
+    const nbrs = await db.neighborsAsync(nodeIds[0], { direction: 'outgoing' });
     assert.ok(nbrs.length > 0, 'neighbors should work after reopen');
 
     // Verify find_nodes still works after compaction + reopen

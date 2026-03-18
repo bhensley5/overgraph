@@ -20,17 +20,17 @@ describe('Async non-blocking verification', () => {
 
     // Pre-populate with enough data to make operations take measurable time
     for (let i = 0; i < 500; i++) {
-      db.upsertNode(1, `node-${i}`, {
+      db.upsertNode(1, `node-${i}`, { props: {
         payload: 'x'.repeat(200),
         idx: i,
         tags: ['a', 'b', 'c'],
-      });
+      }});
     }
     // Create edges
     for (let i = 0; i < 400; i++) {
       const from = db.upsertNode(1, `node-${i}`);
       const to = db.upsertNode(1, `node-${(i + 1) % 500}`);
-      db.upsertEdge(from, to, 1, { order: i });
+      db.upsertEdge(from, to, 1, { props: { order: i } });
     }
   });
 
@@ -64,7 +64,7 @@ describe('Async non-blocking verification', () => {
   it('event loop stays responsive during async compact', async () => {
     // Insert more data and flush again to create a second segment
     for (let i = 500; i < 800; i++) {
-      db.upsertNode(1, `node-${i}`, { payload: 'y'.repeat(200) });
+      db.upsertNode(1, `node-${i}`, { props: { payload: 'y'.repeat(200) } });
     }
     await db.flushAsync();
 
@@ -86,8 +86,8 @@ describe('Async non-blocking verification', () => {
     const results = await Promise.all([
       db.getNodeAsync(1),
       db.findNodesAsync(1, 'idx', 0),
-      db.neighborsAsync(1, 'outgoing'),
-      db.upsertNodeAsync(99, 'concurrent-test', { ts: Date.now() }),
+      db.neighborsAsync(1, { direction: 'outgoing' }),
+      db.upsertNodeAsync(99, 'concurrent-test', { props: { ts: Date.now() } }),
     ]);
 
     // getNode
@@ -102,10 +102,10 @@ describe('Async non-blocking verification', () => {
 
   it('async and sync can interleave without corruption', async () => {
     // Mix sync writes with async reads
-    const id1 = db.upsertNode(50, 'sync-write', { val: 1 });
+    const id1 = db.upsertNode(50, 'sync-write', { props: { val: 1 } });
     const asyncRead = db.getNodeAsync(id1);
 
-    const id2 = db.upsertNode(50, 'sync-write-2', { val: 2 });
+    const id2 = db.upsertNode(50, 'sync-write-2', { props: { val: 2 } });
 
     const node = await asyncRead;
     assert.ok(node);

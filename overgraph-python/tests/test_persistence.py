@@ -91,7 +91,7 @@ class TestWalReplay:
         db.close()
 
         db2 = open_db(db_dir)
-        nbrs = db2.neighbors(n1, "outgoing")
+        nbrs = db2.neighbors(n1, direction="outgoing")
         assert len(nbrs) == 3
         node_ids = {n.node_id for n in nbrs}
         assert node_ids == set(spokes)

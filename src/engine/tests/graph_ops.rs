@@ -7,21 +7,21 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2);
-        assert_eq!(db.degree(a, Direction::Incoming, None, None).unwrap(), 0);
-        assert_eq!(db.degree(a, Direction::Both, None, None).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 2);
 
-        assert_eq!(db.degree(b, Direction::Outgoing, None, None).unwrap(), 0);
-        assert_eq!(db.degree(b, Direction::Incoming, None, None).unwrap(), 1);
-        assert_eq!(db.degree(b, Direction::Both, None, None).unwrap(), 1);
+        assert_eq!(db.degree(b, &DegreeOptions::default()).unwrap(), 0);
+        assert_eq!(db.degree(b, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 1);
+        assert_eq!(db.degree(b, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 1);
 
         db.close().unwrap();
     }
@@ -31,20 +31,20 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         // a→b, b→a, a→c
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, a, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2); // a→b, a→c
-        assert_eq!(db.degree(a, Direction::Incoming, None, None).unwrap(), 1); // b→a
-        assert_eq!(db.degree(a, Direction::Both, None, None).unwrap(), 3);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2); // a→b, a→c
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 1); // b→a
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 3);
 
         db.close().unwrap();
     }
@@ -54,31 +54,31 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 20, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default())
             .unwrap();
 
         assert_eq!(
-            db.degree(a, Direction::Outgoing, Some(&[10]), None)
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![10]), ..Default::default() })
                 .unwrap(),
             1
         );
         assert_eq!(
-            db.degree(a, Direction::Outgoing, Some(&[20]), None)
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![20]), ..Default::default() })
                 .unwrap(),
             1
         );
         assert_eq!(
-            db.degree(a, Direction::Outgoing, Some(&[10, 20]), None)
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![10, 20]), ..Default::default() })
                 .unwrap(),
             2
         );
         assert_eq!(
-            db.degree(a, Direction::Outgoing, Some(&[99]), None)
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![99]), ..Default::default() })
                 .unwrap(),
             0
         );
@@ -91,39 +91,39 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, a, 10, BTreeMap::new(), 3.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // Self-loop: appears in both adj_out and adj_in but must count once
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1);
-        assert_eq!(db.degree(a, Direction::Incoming, None, None).unwrap(), 1);
-        assert_eq!(db.degree(a, Direction::Both, None, None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 1);
 
         db.close().unwrap();
     }
 
     #[test]
     fn test_degree_self_loop_with_normal_edges() {
-        // Self-loop + outgoing + incoming — tests Both dedup more thoroughly
+        // Self-loop + outgoing + incoming. Tests Both dedup more thoroughly
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, a, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default())
             .unwrap(); // self-loop
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap(); // outgoing
-        db.upsert_edge(c, a, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(c, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap(); // incoming
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2); // self-loop + a→b
-        assert_eq!(db.degree(a, Direction::Incoming, None, None).unwrap(), 2); // self-loop + c→a
-        assert_eq!(db.degree(a, Direction::Both, None, None).unwrap(), 3); // dedup self-loop
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2); // self-loop + a→b
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 2); // self-loop + c→a
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 3); // dedup self-loop
 
-        let sum = db.sum_edge_weights(a, Direction::Both, None, None).unwrap();
+        let sum = db.sum_edge_weights(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap();
         assert!((sum - 6.0).abs() < 1e-9); // 1.0 + 2.0 + 3.0
 
         db.close().unwrap();
@@ -133,7 +133,7 @@
     fn test_degree_nonexistent_node() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        assert_eq!(db.degree(999, Direction::Both, None, None).unwrap(), 0);
+        assert_eq!(db.degree(999, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 0);
         db.close().unwrap();
     }
 
@@ -142,15 +142,15 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let e = db
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
         db.delete_edge(e).unwrap();
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 0);
 
         db.close().unwrap();
     }
@@ -160,14 +160,14 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
         db.delete_node(b).unwrap();
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 0);
 
         db.close().unwrap();
     }
@@ -177,25 +177,25 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2);
-        assert_eq!(db.degree(a, Direction::Both, None, None).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 2);
 
         db.close().unwrap();
     }
 
     #[test]
     fn test_degree_cross_source_dedup() {
-        // Edge exists in segment, then re-upserted in memtable — count once.
+        // Edge exists in segment, then re-upserted in memtable. Count once.
         // Requires edge_uniqueness to produce same edge_id for same (from,to,type).
         let dir = TempDir::new().unwrap();
         let opts = DbOptions {
@@ -207,20 +207,20 @@
         };
         let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Re-upsert same edge (same from/to/type → same edge_id with uniqueness)
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
         // Weight should be from the memtable version (newer wins)
         let sum = db
-            .sum_edge_weights(a, Direction::Outgoing, None, None)
+            .sum_edge_weights(a, &DegreeOptions::default())
             .unwrap();
         assert!((sum - 2.0).abs() < 1e-9);
 
@@ -234,9 +234,9 @@
 
         {
             let mut db = open_imm(&db_path);
-            let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-            db.upsert_edge(a, b, 10, BTreeMap::new(), 2.5, None, None)
+            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() })
                 .unwrap();
             db.flush().unwrap();
             db.close().unwrap();
@@ -244,7 +244,7 @@
 
         let db = open_imm(&db_path);
         let a = 1; // Known ID from WAL replay
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
         db.close().unwrap();
     }
 
@@ -253,22 +253,22 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 3.5, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.5, ..Default::default() })
             .unwrap();
 
         let sum = db
-            .sum_edge_weights(a, Direction::Outgoing, None, None)
+            .sum_edge_weights(a, &DegreeOptions::default())
             .unwrap();
         assert!((sum - 5.5).abs() < 1e-9);
 
         // Zero-degree node
         assert_eq!(
-            db.sum_edge_weights(c, Direction::Outgoing, None, None)
+            db.sum_edge_weights(c, &DegreeOptions::default())
                 .unwrap(),
             0.0
         );
@@ -281,18 +281,18 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // Crosses memtable + segment
         let sum = db
-            .sum_edge_weights(a, Direction::Outgoing, None, None)
+            .sum_edge_weights(a, &DegreeOptions::default())
             .unwrap();
         assert!((sum - 5.0).abs() < 1e-9);
 
@@ -304,16 +304,16 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 4.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
 
         let avg = db
-            .avg_edge_weight(a, Direction::Outgoing, None, None)
+            .avg_edge_weight(a, &DegreeOptions::default())
             .unwrap();
         assert!(avg.is_some());
         assert!((avg.unwrap() - 3.0).abs() < 1e-9);
@@ -326,7 +326,7 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
         assert_eq!(
-            db.avg_edge_weight(999, Direction::Both, None, None)
+            db.avg_edge_weight(999, &DegreeOptions { direction: Direction::Both, ..Default::default() })
                 .unwrap(),
             None
         );
@@ -339,25 +339,25 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 20, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, c, 20, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(d, a, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(d, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, d, 10, BTreeMap::new(), 4.0, None, None)
+        db.upsert_edge(a, d, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
 
         for dir_val in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
             for tf in [None, Some(vec![10u32]), Some(vec![20]), Some(vec![10, 20])] {
                 let tf_ref = tf.as_deref();
-                let deg = db.degree(a, dir_val, tf_ref, None).unwrap();
-                let nbrs = db.neighbors(a, dir_val, tf_ref, 0, None, None).unwrap();
+                let deg = db.degree(a, &DegreeOptions { direction: dir_val, type_filter: tf_ref.map(|s| s.to_vec()), ..Default::default() }).unwrap();
+                let nbrs = db.neighbors(a, &NeighborOptions { direction: dir_val, type_filter: tf_ref.map(|s| s.to_vec()), ..Default::default() }).unwrap();
                 assert_eq!(
                     deg,
                     nbrs.len() as u64,
@@ -379,20 +379,20 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.5, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.5, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 2.5, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
         let sum = db
-            .sum_edge_weights(a, Direction::Outgoing, None, None)
+            .sum_edge_weights(a, &DegreeOptions::default())
             .unwrap();
         let nbrs = db
-            .neighbors(a, Direction::Outgoing, None, 0, None, None)
+            .neighbors(a, &NeighborOptions::default())
             .unwrap();
         let nbr_sum: f64 = nbrs.iter().map(|e| e.weight as f64).sum();
         assert!((sum - nbr_sum).abs() < 1e-9);
@@ -405,18 +405,18 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "hub", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "keep", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "prune_me", BTreeMap::new(), 0.1).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        let a = db.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "keep", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "prune_me", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // Before policy: degree=2, sum=5.0
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
         let sum = db
-            .sum_edge_weights(a, Direction::Outgoing, None, None)
+            .sum_edge_weights(a, &DegreeOptions::default())
             .unwrap();
         assert!((sum - 5.0).abs() < 1e-9);
 
@@ -432,18 +432,18 @@
         .unwrap();
 
         // After policy: "prune_me" excluded → degree=1, sum=2.0
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
         let sum = db
-            .sum_edge_weights(a, Direction::Outgoing, None, None)
+            .sum_edge_weights(a, &DegreeOptions::default())
             .unwrap();
         assert!((sum - 2.0).abs() < 1e-9);
 
         // Must match neighbors().len()
         let nbrs = db
-            .neighbors(a, Direction::Outgoing, None, 0, None, None)
+            .neighbors(a, &NeighborOptions::default())
             .unwrap();
         assert_eq!(
-            db.degree(a, Direction::Outgoing, None, None).unwrap(),
+            db.degree(a, &DegreeOptions::default()).unwrap(),
             nbrs.len() as u64
         );
 
@@ -455,20 +455,20 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
         let sum = db
-            .sum_edge_weights(a, Direction::Outgoing, None, None)
+            .sum_edge_weights(a, &DegreeOptions::default())
             .unwrap();
         assert!((sum - 3.0).abs() < 1e-9);
 
@@ -480,13 +480,13 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, a, 10, BTreeMap::new(), 5.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
-        assert_eq!(db.degree(a, Direction::Both, None, None).unwrap(), 1);
-        let sum = db.sum_edge_weights(a, Direction::Both, None, None).unwrap();
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 1);
+        let sum = db.sum_edge_weights(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap();
         assert!((sum - 5.0).abs() < 1e-9);
 
         db.close().unwrap();
@@ -499,18 +499,18 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let degs = db
-            .degrees(&[a, b, c], Direction::Outgoing, None, None)
+            .degrees(&[a, b, c], &DegreeOptions::default())
             .unwrap();
         assert_eq!(*degs.get(&a).unwrap(), 2);
         assert_eq!(*degs.get(&b).unwrap(), 1);
@@ -525,27 +525,27 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 20, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, c, 20, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(d, a, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(d, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let ids = [a, b, c, d];
         for dir_val in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
             for tf in [None, Some(vec![10u32]), Some(vec![20]), Some(vec![10, 20])] {
                 let tf_ref = tf.as_deref();
-                let batch = db.degrees(&ids, dir_val, tf_ref, None).unwrap();
+                let batch = db.degrees(&ids, &DegreeOptions { direction: dir_val, type_filter: tf_ref.map(|s| s.to_vec()), ..Default::default() }).unwrap();
                 for &nid in &ids {
-                    let individual = db.degree(nid, dir_val, tf_ref, None).unwrap();
+                    let individual = db.degree(nid, &DegreeOptions { direction: dir_val, type_filter: tf_ref.map(|s| s.to_vec()), ..Default::default() }).unwrap();
                     let batch_val = batch.get(&nid).copied().unwrap_or(0);
                     assert_eq!(
                         batch_val, individual,
@@ -564,21 +564,21 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // a has edges in segment1, segment2; b has edge in memtable
         let degs = db
-            .degrees(&[a, b, c], Direction::Outgoing, None, None)
+            .degrees(&[a, b, c], &DegreeOptions::default())
             .unwrap();
         assert_eq!(*degs.get(&a).unwrap(), 2);
         assert_eq!(*degs.get(&b).unwrap(), 1);
@@ -600,15 +600,15 @@
         };
         let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
 
-        let degs = db.degrees(&[a], Direction::Outgoing, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
         assert_eq!(*degs.get(&a).unwrap(), 1);
 
         db.close().unwrap();
@@ -619,18 +619,18 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
         db.delete_edge(e1).unwrap();
 
-        let degs = db.degrees(&[a], Direction::Outgoing, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
         assert_eq!(*degs.get(&a).unwrap(), 1); // only a→c remains
 
         db.close().unwrap();
@@ -641,15 +641,15 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, a, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
-        let degs = db.degrees(&[a], Direction::Both, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap();
         assert_eq!(*degs.get(&a).unwrap(), 2); // self-loop counted once + a→b
 
         db.close().unwrap();
@@ -659,28 +659,28 @@
     fn test_degrees_batch_empty_input() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let degs = db.degrees(&[], Direction::Both, None, None).unwrap();
+        let degs = db.degrees(&[], &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap();
         assert!(degs.is_empty());
         db.close().unwrap();
     }
 
     #[test]
     fn test_degrees_batch_unsorted_input() {
-        // Input need not be sorted — sorted internally
+        // Input need not be sorted. Sorted internally.
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // Pass unsorted, with duplicates
         let degs = db
-            .degrees(&[c, a, b, a], Direction::Outgoing, None, None)
+            .degrees(&[c, a, b, a], &DegreeOptions::default())
             .unwrap();
         assert_eq!(*degs.get(&a).unwrap(), 1);
         assert_eq!(*degs.get(&b).unwrap(), 1);
@@ -694,19 +694,19 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
 
         let degs = db
-            .degrees(&[a, b, c], Direction::Outgoing, None, None)
+            .degrees(&[a, b, c], &DegreeOptions::default())
             .unwrap();
         assert_eq!(*degs.get(&a).unwrap(), 2);
         assert!(!degs.contains_key(&b));
@@ -720,16 +720,16 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "hub", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "keep", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "prune_me", BTreeMap::new(), 0.1).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "keep", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "prune_me", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // Before policy
-        let degs = db.degrees(&[a], Direction::Outgoing, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
         assert_eq!(*degs.get(&a).unwrap(), 2);
 
         db.set_prune_policy(
@@ -743,13 +743,13 @@
         .unwrap();
 
         // After policy: "prune_me" excluded
-        let degs = db.degrees(&[a], Direction::Outgoing, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
         assert_eq!(*degs.get(&a).unwrap(), 1);
 
         // Must match individual degree
         assert_eq!(
             degs.get(&a).copied().unwrap_or(0),
-            db.degree(a, Direction::Outgoing, None, None).unwrap()
+            db.degree(a, &DegreeOptions::default()).unwrap()
         );
 
         db.close().unwrap();
@@ -761,26 +761,26 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 20, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(b, c, 20, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(d, a, 10, BTreeMap::new(), 4.0, None, None)
+        db.upsert_edge(d, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 5.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
 
         let ids = [a, b, c, d];
         for dir_val in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
-            let degs = db.degrees(&ids, dir_val, None, None).unwrap();
-            let nbrs = db.neighbors_batch(&ids, dir_val, None, None, None).unwrap();
+            let degs = db.degrees(&ids, &DegreeOptions { direction: dir_val, ..Default::default() }).unwrap();
+            let nbrs = db.neighbors_batch(&ids, &NeighborOptions { direction: dir_val, ..Default::default() }).unwrap();
             for &nid in &ids {
                 let deg = degs.get(&nid).copied().unwrap_or(0);
                 let nbr_count = nbrs.get(&nid).map(|v| v.len() as u64).unwrap_or(0);
@@ -802,20 +802,20 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         // Edge with valid_to = 1 (expired since epoch start)
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 5.0, None, Some(1))
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, valid_from: None, valid_to: Some(1), ..Default::default() })
             .unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 0);
         assert_eq!(
-            db.sum_edge_weights(a, Direction::Outgoing, None, None)
+            db.sum_edge_weights(a, &DegreeOptions::default())
                 .unwrap(),
             0.0
         );
         assert_eq!(
-            db.avg_edge_weight(a, Direction::Outgoing, None, None)
+            db.avg_edge_weight(a, &DegreeOptions::default())
                 .unwrap(),
             None
         );
@@ -828,21 +828,21 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         // Edge with valid_from far in the future
         let future = now_millis() + 100_000_000;
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 5.0, Some(future), None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, valid_from: Some(future), valid_to: None, ..Default::default() })
             .unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 0);
         assert_eq!(
-            db.sum_edge_weights(a, Direction::Outgoing, None, None)
+            db.sum_edge_weights(a, &DegreeOptions::default())
                 .unwrap(),
             0.0
         );
         assert_eq!(
-            db.avg_edge_weight(a, Direction::Outgoing, None, None)
+            db.avg_edge_weight(a, &DegreeOptions::default())
                 .unwrap(),
             None
         );
@@ -855,26 +855,26 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, BTreeMap::new(), 3.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 7.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 7.0, ..Default::default() })
             .unwrap();
 
         // Invalidate e1
         db.invalidate_edge(e1, 1).unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
         assert_eq!(
-            db.sum_edge_weights(a, Direction::Outgoing, None, None)
+            db.sum_edge_weights(a, &DegreeOptions::default())
                 .unwrap(),
             7.0
         );
         assert_eq!(
-            db.avg_edge_weight(a, Direction::Outgoing, None, None)
+            db.avg_edge_weight(a, &DegreeOptions::default())
                 .unwrap(),
             Some(7.0)
         );
@@ -887,16 +887,16 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         // a→b: valid, a→c: expired
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, Some(1))
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(1), ..Default::default() })
             .unwrap();
 
-        let degs = db.degrees(&[a], Direction::Outgoing, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
         assert_eq!(degs.get(&a).copied().unwrap_or(0), 1);
 
         db.close().unwrap();
@@ -907,13 +907,13 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let future = now_millis() + 100_000_000;
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(future), None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(future), valid_to: None, ..Default::default() })
             .unwrap();
 
-        let degs = db.degrees(&[a], Direction::Outgoing, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
         assert_eq!(degs.get(&a).copied().unwrap_or(0), 0);
 
         db.close().unwrap();
@@ -924,14 +924,14 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.invalidate_edge(e1, 1).unwrap();
 
-        let degs = db.degrees(&[a], Direction::Outgoing, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
         assert_eq!(degs.get(&a).copied().unwrap_or(0), 0);
 
         db.close().unwrap();
@@ -939,30 +939,30 @@
 
     #[test]
     fn test_degree_temporal_after_flush() {
-        // Temporal edges flushed to segment — same filtering must apply
+        // Temporal edges flushed to segment. Same filtering must apply.
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         // a→b: valid, a→c: expired
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 3.0, None, Some(1))
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, valid_from: None, valid_to: Some(1), ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
 
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
         assert_eq!(
-            db.sum_edge_weights(a, Direction::Outgoing, None, None)
+            db.sum_edge_weights(a, &DegreeOptions::default())
                 .unwrap(),
             2.0
         );
 
         // Batch too
-        let degs = db.degrees(&[a], Direction::Outgoing, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
         assert_eq!(degs.get(&a).copied().unwrap_or(0), 1);
 
         db.close().unwrap();
@@ -974,23 +974,23 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         // a→b: valid 1000..5000
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(1000), Some(5000))
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(1000), valid_to: Some(5000), ..Default::default() })
             .unwrap();
         // a→c: valid 3000..8000
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, Some(3000), Some(8000))
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, valid_from: Some(3000), valid_to: Some(8000), ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
 
         // At T=500: neither valid
         let t = Some(500);
-        assert_eq!(db.degree(a, Direction::Outgoing, None, t).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() }).unwrap(), 0);
         assert_eq!(
-            db.neighbors(a, Direction::Outgoing, None, 0, t, None)
+            db.neighbors(a, &NeighborOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() })
                 .unwrap()
                 .len(),
             0
@@ -999,38 +999,38 @@
         // At T=2000: only a→b valid
         let t = Some(2000);
         assert_eq!(
-            db.degree(a, Direction::Outgoing, None, t).unwrap(),
-            db.neighbors(a, Direction::Outgoing, None, 0, t, None)
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() }).unwrap(),
+            db.neighbors(a, &NeighborOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() })
                 .unwrap()
                 .len() as u64
         );
-        assert_eq!(db.degree(a, Direction::Outgoing, None, t).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() }).unwrap(), 1);
 
         // At T=4000: both valid
         let t = Some(4000);
         assert_eq!(
-            db.degree(a, Direction::Outgoing, None, t).unwrap(),
-            db.neighbors(a, Direction::Outgoing, None, 0, t, None)
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() }).unwrap(),
+            db.neighbors(a, &NeighborOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() })
                 .unwrap()
                 .len() as u64
         );
-        assert_eq!(db.degree(a, Direction::Outgoing, None, t).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() }).unwrap(), 2);
 
         // At T=6000: only a→c valid
         let t = Some(6000);
         assert_eq!(
-            db.degree(a, Direction::Outgoing, None, t).unwrap(),
-            db.neighbors(a, Direction::Outgoing, None, 0, t, None)
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() }).unwrap(),
+            db.neighbors(a, &NeighborOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() })
                 .unwrap()
                 .len() as u64
         );
-        assert_eq!(db.degree(a, Direction::Outgoing, None, t).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() }).unwrap(), 1);
 
         // At T=9000: neither valid
         let t = Some(9000);
-        assert_eq!(db.degree(a, Direction::Outgoing, None, t).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() }).unwrap(), 0);
         assert_eq!(
-            db.neighbors(a, Direction::Outgoing, None, 0, t, None)
+            db.neighbors(a, &NeighborOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() })
                 .unwrap()
                 .len(),
             0
@@ -1038,7 +1038,7 @@
 
         // Batch at_epoch parity
         let t = Some(4000);
-        let degs = db.degrees(&[a], Direction::Outgoing, None, t).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions { direction: Direction::Outgoing, at_epoch: t, ..Default::default() }).unwrap();
         assert_eq!(degs.get(&a).copied().unwrap_or(0), 2);
 
         db.close().unwrap();
@@ -1052,39 +1052,39 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, BTreeMap::new(), 5.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
-        // Invalidate in memtable — segment still has the valid version
+        // Invalidate in memtable. Segment still has the valid version.
         db.invalidate_edge(e1, 1).unwrap();
 
         // degree must match neighbors (both should be 0)
         let nbrs = db
-            .neighbors(a, Direction::Outgoing, None, 0, None, None)
+            .neighbors(a, &NeighborOptions::default())
             .unwrap();
         assert_eq!(nbrs.len(), 0, "neighbors should see 0 after invalidation");
         assert_eq!(
-            db.degree(a, Direction::Outgoing, None, None).unwrap(),
+            db.degree(a, &DegreeOptions::default()).unwrap(),
             0,
             "degree must match neighbors after invalidate-after-flush"
         );
         assert_eq!(
-            db.sum_edge_weights(a, Direction::Outgoing, None, None)
+            db.sum_edge_weights(a, &DegreeOptions::default())
                 .unwrap(),
             0.0
         );
         assert_eq!(
-            db.avg_edge_weight(a, Direction::Outgoing, None, None)
+            db.avg_edge_weight(a, &DegreeOptions::default())
                 .unwrap(),
             None
         );
 
         // Batch path too
-        let degs = db.degrees(&[a], Direction::Outgoing, None, None).unwrap();
+        let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
         assert_eq!(degs.get(&a).copied().unwrap_or(0), 0);
 
         db.close().unwrap();
@@ -1097,10 +1097,10 @@
         let mut nodes = Vec::new();
         for i in 0..5u64 {
             let key = format!("chain_{}", i);
-            nodes.push(db.upsert_node(1, &key, BTreeMap::new(), 1.0).unwrap());
+            nodes.push(db.upsert_node(1, &key, UpsertNodeOptions::default()).unwrap());
         }
         for i in 0..4 {
-            db.upsert_edge(nodes[i], nodes[i + 1], 10, BTreeMap::new(), 1.0, None, None)
+            db.upsert_edge(nodes[i], nodes[i + 1], 10, UpsertEdgeOptions::default())
                 .unwrap();
         }
         nodes
@@ -1113,17 +1113,17 @@
     ///   \ /
     ///    D
     fn build_diamond(db: &mut DatabaseEngine) -> (u64, u64, u64, u64) {
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
             .unwrap();
         (a, b, c, d)
     }
@@ -1132,14 +1132,14 @@
     fn test_shortest_path_direct_neighbors() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let e = db
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let path = db
-            .shortest_path(a, b, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, b, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1157,16 +1157,7 @@
         let nodes = build_chain(&mut db);
 
         let path = db
-            .shortest_path(
-                nodes[0],
-                nodes[4],
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .shortest_path(nodes[0], nodes[4], &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1183,12 +1174,12 @@
     fn test_shortest_path_no_path_disconnected() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         // No edge between a and b
 
         let path = db
-            .shortest_path(a, b, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, b, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_none());
 
@@ -1199,10 +1190,10 @@
     fn test_shortest_path_same_node() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         let path = db
-            .shortest_path(a, a, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, a, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1219,33 +1210,14 @@
         let db = open_imm(&dir.path().join("db"));
 
         assert!(db
-            .shortest_path(
-                999999,
-                999999,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .shortest_path(999999, 999999, &ShortestPathOptions::default())
             .unwrap()
             .is_none());
         assert!(!db
-            .is_connected(999999, 999999, Direction::Outgoing, None, None, None)
+            .is_connected(999999, 999999, &IsConnectedOptions::default())
             .unwrap());
         assert!(db
-            .all_shortest_paths(
-                999999,
-                999999,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(999999, 999999, &AllShortestPathsOptions::default())
             .unwrap()
             .is_empty());
 
@@ -1256,20 +1228,20 @@
     fn test_shortest_path_directed_no_reverse() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // a -> b exists, but b -> a in Outgoing direction does not
         let path = db
-            .shortest_path(b, a, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(b, a, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_none());
 
         // With Both direction, b -> a should work
         let path = db
-            .shortest_path(b, a, Direction::Both, None, None, None, None, None)
+            .shortest_path(b, a, &ShortestPathOptions { direction: Direction::Both, ..Default::default() })
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1286,7 +1258,7 @@
         let (a, _b, _c, d) = build_diamond(&mut db);
 
         let path = db
-            .shortest_path(a, d, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, d, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1303,49 +1275,31 @@
     fn test_shortest_path_edge_type_filter() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         // Direct path a->c with type 20
-        db.upsert_edge(a, c, 20, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default())
             .unwrap();
         // Indirect path a->b->c with type 10
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
-        // Filter to type 10 only — must go through b
+        // Filter to type 10 only. Must go through b.
         let path = db
-            .shortest_path(
-                a,
-                c,
-                Direction::Outgoing,
-                Some(&[10]),
-                None,
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, c, &ShortestPathOptions { type_filter: Some(vec![10]), ..Default::default() })
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
         assert_eq!(p.total_cost, 2.0);
         assert_eq!(p.nodes, vec![a, b, c]);
 
-        // Filter to type 20 — direct path
+        // Filter to type 20. Direct path.
         let path = db
-            .shortest_path(
-                a,
-                c,
-                Direction::Outgoing,
-                Some(&[20]),
-                None,
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, c, &ShortestPathOptions { type_filter: Some(vec![20]), ..Default::default() })
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1361,33 +1315,15 @@
         let mut db = open_imm(&dir.path().join("db"));
         let nodes = build_chain(&mut db);
 
-        // Path is 4 hops, limit to 2 — should fail
+        // Path is 4 hops, limit to 2. Should fail.
         let path = db
-            .shortest_path(
-                nodes[0],
-                nodes[4],
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                Some(2),
-                None,
-            )
+            .shortest_path(nodes[0], nodes[4], &ShortestPathOptions { max_depth: Some(2), ..Default::default() })
             .unwrap();
         assert!(path.is_none());
 
-        // Limit to 4 — should succeed
+        // Limit to 4. Should succeed.
         let path = db
-            .shortest_path(
-                nodes[0],
-                nodes[4],
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                Some(4),
-                None,
-            )
+            .shortest_path(nodes[0], nodes[4], &ShortestPathOptions { max_depth: Some(4), ..Default::default() })
             .unwrap();
         assert!(path.is_some());
         assert_eq!(path.unwrap().total_cost, 4.0);
@@ -1399,27 +1335,27 @@
     fn test_shortest_path_temporal_filtering() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         // Edge a->b valid from 100 to 200
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(100), Some(200))
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(200), ..Default::default() })
             .unwrap();
         // Edge b->c valid from 100 to 300
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, Some(100), Some(300))
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(300), ..Default::default() })
             .unwrap();
 
         // At time 150: both edges valid, path exists
         let path = db
-            .shortest_path(a, c, Direction::Outgoing, None, None, Some(150), None, None)
+            .shortest_path(a, c, &ShortestPathOptions { at_epoch: Some(150), ..Default::default() })
             .unwrap();
         assert!(path.is_some());
         assert_eq!(path.unwrap().total_cost, 2.0);
 
         // At time 250: a->b expired, no path
         let path = db
-            .shortest_path(a, c, Direction::Outgoing, None, None, Some(250), None, None)
+            .shortest_path(a, c, &ShortestPathOptions { at_epoch: Some(250), ..Default::default() })
             .unwrap();
         assert!(path.is_none());
 
@@ -1433,20 +1369,20 @@
         let nodes = build_chain(&mut db);
 
         assert!(db
-            .is_connected(nodes[0], nodes[4], Direction::Outgoing, None, None, None)
+            .is_connected(nodes[0], nodes[4], &IsConnectedOptions::default())
             .unwrap());
         assert!(db
-            .is_connected(nodes[0], nodes[2], Direction::Outgoing, None, None, None)
+            .is_connected(nodes[0], nodes[2], &IsConnectedOptions::default())
             .unwrap());
 
         // Reverse direction: not connected in Outgoing
         assert!(!db
-            .is_connected(nodes[4], nodes[0], Direction::Outgoing, None, None, None)
+            .is_connected(nodes[4], nodes[0], &IsConnectedOptions::default())
             .unwrap());
 
         // But connected in Both
         assert!(db
-            .is_connected(nodes[4], nodes[0], Direction::Both, None, None, None)
+            .is_connected(nodes[4], nodes[0], &IsConnectedOptions { direction: Direction::Both, ..Default::default() })
             .unwrap());
 
         db.close().unwrap();
@@ -1456,10 +1392,10 @@
     fn test_is_connected_same_node() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         assert!(db
-            .is_connected(a, a, Direction::Outgoing, None, None, None)
+            .is_connected(a, a, &IsConnectedOptions::default())
             .unwrap());
 
         db.close().unwrap();
@@ -1469,11 +1405,11 @@
     fn test_is_connected_disconnected() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         assert!(!db
-            .is_connected(a, b, Direction::Outgoing, None, None, None)
+            .is_connected(a, b, &IsConnectedOptions::default())
             .unwrap());
 
         db.close().unwrap();
@@ -1487,12 +1423,12 @@
 
         // 4 hops needed, max_depth=2 should fail
         assert!(!db
-            .is_connected(nodes[0], nodes[4], Direction::Outgoing, None, None, Some(2))
+            .is_connected(nodes[0], nodes[4], &IsConnectedOptions { max_depth: Some(2), ..Default::default() })
             .unwrap());
 
         // max_depth=4 should succeed
         assert!(db
-            .is_connected(nodes[0], nodes[4], Direction::Outgoing, None, None, Some(4))
+            .is_connected(nodes[0], nodes[4], &IsConnectedOptions { max_depth: Some(4), ..Default::default() })
             .unwrap());
 
         db.close().unwrap();
@@ -1506,16 +1442,7 @@
         db.flush().unwrap();
 
         let path = db
-            .shortest_path(
-                nodes[0],
-                nodes[4],
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .shortest_path(nodes[0], nodes[4], &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1531,27 +1458,27 @@
         let mut db = open_imm(&dir.path().join("db"));
 
         // First segment: a -> b -> c
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Second segment: c -> d -> e
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        let e = db.upsert_node(1, "e", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None)
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let e = db.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(d, e, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(d, e, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Path spans both segments
         let path = db
-            .shortest_path(a, e, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, e, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1566,21 +1493,21 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         db.compact().unwrap();
 
         let path = db
-            .shortest_path(a, c, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, c, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         assert_eq!(path.unwrap().total_cost, 2.0);
@@ -1593,24 +1520,24 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         // Direct path a->c and indirect a->b->c
         let direct = db
-            .upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // Delete direct edge
         db.delete_edge(direct).unwrap();
 
         let path = db
-            .shortest_path(a, c, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, c, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1625,27 +1552,27 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
         // a->b->c and a->d->c
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, d, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(d, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(d, c, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
-        // Delete node b — path through b should be unavailable
+        // Delete node b. Path through b should be unavailable.
         db.delete_node(b).unwrap();
 
         let path = db
-            .shortest_path(a, c, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, c, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1661,20 +1588,20 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
         let cheap_ab = db
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         let cheap_bc = db
-            .upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, d, 10, BTreeMap::new(), 5.0, None, None)
+        db.upsert_edge(a, d, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(d, c, 10, BTreeMap::new(), 5.0, None, None)
+        db.upsert_edge(d, c, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
@@ -1684,60 +1611,31 @@
         db.compact().unwrap();
 
         let bfs = db
-            .shortest_path(a, c, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, c, &ShortestPathOptions::default())
             .unwrap()
             .unwrap();
         assert_eq!(bfs.nodes, vec![a, d, c]);
         assert_eq!(bfs.total_cost, 2.0);
 
         assert!(db
-            .is_connected(a, c, Direction::Outgoing, None, None, None)
+            .is_connected(a, c, &IsConnectedOptions::default())
             .unwrap());
 
         let bfs_paths = db
-            .all_shortest_paths(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, c, &AllShortestPathsOptions::default())
             .unwrap();
         assert_eq!(bfs_paths.len(), 1);
         assert_eq!(bfs_paths[0].nodes, vec![a, d, c]);
 
         let weighted = db
-            .shortest_path(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, c, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(weighted.nodes, vec![a, d, c]);
         assert_eq!(weighted.total_cost, 10.0);
 
         let weighted_paths = db
-            .all_shortest_paths(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, c, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap();
         assert_eq!(weighted_paths.len(), 1);
         assert_eq!(weighted_paths[0].nodes, vec![a, d, c]);
@@ -1753,7 +1651,7 @@
 
         db.ingest_mode();
         for i in 0..10 {
-            db.upsert_node(1, &format!("n{}", i), BTreeMap::new(), 1.0)
+            db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             db.flush().unwrap();
         }
@@ -1825,43 +1723,34 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let end = db.upsert_node(1, "end", BTreeMap::new(), 1.0).unwrap();
-        let bridge = db.upsert_node(1, "bridge", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let end = db.upsert_node(1, "end", UpsertNodeOptions::default()).unwrap();
+        let bridge = db.upsert_node(1, "bridge", UpsertNodeOptions::default()).unwrap();
 
         // 100 dead-end nodes from start
         for i in 0..100 {
             let key = format!("dead_s_{}", i);
-            let n = db.upsert_node(1, &key, BTreeMap::new(), 1.0).unwrap();
-            db.upsert_edge(start, n, 10, BTreeMap::new(), 1.0, None, None)
+            let n = db.upsert_node(1, &key, UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(start, n, 10, UpsertEdgeOptions::default())
                 .unwrap();
         }
 
         // 100 dead-end nodes from end (incoming)
         for i in 0..100 {
             let key = format!("dead_e_{}", i);
-            let n = db.upsert_node(1, &key, BTreeMap::new(), 1.0).unwrap();
-            db.upsert_edge(n, end, 10, BTreeMap::new(), 1.0, None, None)
+            let n = db.upsert_node(1, &key, UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(n, end, 10, UpsertEdgeOptions::default())
                 .unwrap();
         }
 
         // The actual path: start -> bridge -> end
-        db.upsert_edge(start, bridge, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, bridge, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(bridge, end, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(bridge, end, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let path = db
-            .shortest_path(
-                start,
-                end,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .shortest_path(start, end, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1875,19 +1764,19 @@
     fn test_shortest_path_incoming_direction() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         // Edges: a -> b -> c
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // From c to a following Incoming edges (reverse traversal)
         let path = db
-            .shortest_path(c, a, Direction::Incoming, None, None, None, None, None)
+            .shortest_path(c, a, &ShortestPathOptions { direction: Direction::Incoming, ..Default::default() })
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1904,24 +1793,24 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
         // Cycle: a -> b -> c -> a, with d only reachable from c
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, a, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // Should find path despite cycle
         let path = db
-            .shortest_path(a, d, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, d, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1935,21 +1824,21 @@
     fn test_shortest_path_nonexistent_node() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         // Node 999999 was never created
         let path = db
-            .shortest_path(a, 999999, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, 999999, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_none());
 
         let path = db
-            .shortest_path(999999, a, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(999999, a, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_none());
 
         assert!(!db
-            .is_connected(a, 999999, Direction::Outgoing, None, None, None)
+            .is_connected(a, 999999, &IsConnectedOptions::default())
             .unwrap());
 
         db.close().unwrap();
@@ -1960,18 +1849,18 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let hidden = db.upsert_node(1, "hidden", BTreeMap::new(), 0.2).unwrap();
-        let visible = db.upsert_node(1, "visible", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let visible = db.upsert_node(1, "visible", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, hidden, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, hidden, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(hidden, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(hidden, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, visible, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, visible, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(visible, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(visible, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         db.set_prune_policy(
@@ -1985,59 +1874,30 @@
         .unwrap();
 
         let path = db
-            .shortest_path(a, c, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, c, &ShortestPathOptions::default())
             .unwrap()
             .unwrap();
         assert_eq!(path.nodes, vec![a, visible, c]);
 
         assert!(db
-            .is_connected(a, c, Direction::Outgoing, None, None, None)
+            .is_connected(a, c, &IsConnectedOptions::default())
             .unwrap());
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, c, &AllShortestPathsOptions::default())
             .unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].nodes, vec![a, visible, c]);
 
         assert!(db
-            .shortest_path(
-                hidden,
-                hidden,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .shortest_path(hidden, hidden, &ShortestPathOptions::default())
             .unwrap()
             .is_none());
         assert!(!db
-            .is_connected(hidden, hidden, Direction::Outgoing, None, None, None)
+            .is_connected(hidden, hidden, &IsConnectedOptions::default())
             .unwrap());
         assert!(db
-            .all_shortest_paths(
-                hidden,
-                hidden,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(hidden, hidden, &AllShortestPathsOptions::default())
             .unwrap()
             .is_empty());
 
@@ -2049,23 +1909,23 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let hidden = db.upsert_node(1, "hidden", BTreeMap::new(), 0.2).unwrap();
-        let visible = db.upsert_node(1, "visible", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let visible = db.upsert_node(1, "visible", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         let mut cheap = BTreeMap::new();
         cheap.insert("cost".to_string(), PropValue::Float(1.0));
         let mut expensive = BTreeMap::new();
         expensive.insert("cost".to_string(), PropValue::Float(10.0));
 
-        db.upsert_edge(a, hidden, 10, cheap.clone(), 1.0, None, None)
+        db.upsert_edge(a, hidden, 10, UpsertEdgeOptions { props: cheap.clone(), ..Default::default() })
             .unwrap();
-        db.upsert_edge(hidden, c, 10, cheap, 1.0, None, None)
+        db.upsert_edge(hidden, c, 10, UpsertEdgeOptions { props: cheap, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, visible, 10, expensive.clone(), 10.0, None, None)
+        db.upsert_edge(a, visible, 10, UpsertEdgeOptions { props: expensive.clone(), weight: 10.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(visible, c, 10, expensive, 10.0, None, None)
+        db.upsert_edge(visible, c, 10, UpsertEdgeOptions { props: expensive, weight: 10.0, ..Default::default() })
             .unwrap();
 
         db.set_prune_policy(
@@ -2079,49 +1939,21 @@
         .unwrap();
 
         let path = db
-            .shortest_path(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, c, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.nodes, vec![a, visible, c]);
         assert_eq!(path.total_cost, 20.0);
 
         let path = db
-            .shortest_path(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                Some("cost"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, c, &ShortestPathOptions { weight_field: Some("cost".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.nodes, vec![a, visible, c]);
         assert_eq!(path.total_cost, 20.0);
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, c, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].nodes, vec![a, visible, c]);
@@ -2138,28 +1970,19 @@
         // BFS shortest: A->B (1 hop). Dijkstra shortest: A->C->B (cost 5)
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 10.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 10.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         let _ec = db
-            .upsert_edge(c, b, 10, BTreeMap::new(), 3.0, None, None)
+            .upsert_edge(c, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let path = db
-            .shortest_path(
-                a,
-                b,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, b, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 5.0);
@@ -2175,33 +1998,24 @@
         // Use a custom property "cost" on edges
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         let mut props_ab = BTreeMap::new();
         props_ab.insert("cost".to_string(), PropValue::Float(100.0));
-        db.upsert_edge(a, b, 10, props_ab, 1.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { props: props_ab, weight: 1.0, ..Default::default() }).unwrap();
 
         let mut props_ac = BTreeMap::new();
         props_ac.insert("cost".to_string(), PropValue::Float(1.0));
-        db.upsert_edge(a, c, 10, props_ac, 1.0, None, None).unwrap();
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { props: props_ac, weight: 1.0, ..Default::default() }).unwrap();
 
         let mut props_cb = BTreeMap::new();
         props_cb.insert("cost".to_string(), PropValue::Float(2.0));
-        db.upsert_edge(c, b, 10, props_cb, 1.0, None, None).unwrap();
+        db.upsert_edge(c, b, 10, UpsertEdgeOptions { props: props_cb, weight: 1.0, ..Default::default() }).unwrap();
 
         let path = db
-            .shortest_path(
-                a,
-                b,
-                Direction::Outgoing,
-                None,
-                Some("cost"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, b, &ShortestPathOptions { weight_field: Some("cost".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 3.0); // A->C(1) + C->B(2)
@@ -2217,43 +2031,25 @@
         // max_cost=4 should exclude both, returning None
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 5.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, b, 10, BTreeMap::new(), 4.0, None, None)
+        db.upsert_edge(c, b, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
 
         // max_cost=4: nothing reachable
         let path = db
-            .shortest_path(
-                a,
-                b,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                Some(4.0),
-            )
+            .shortest_path(a, b, &ShortestPathOptions { weight_field: Some("weight".to_string()), max_cost: Some(4.0), ..Default::default() })
             .unwrap();
         assert!(path.is_none());
 
         // max_cost=5: direct A->B works
         let path = db
-            .shortest_path(
-                a,
-                b,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                Some(5.0),
-            )
+            .shortest_path(a, b, &ShortestPathOptions { weight_field: Some("weight".to_string()), max_cost: Some(5.0), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 5.0);
@@ -2265,21 +2061,12 @@
     fn test_dijkstra_negative_weight_error() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), -1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: -1.0, ..Default::default() })
             .unwrap();
 
-        let result = db.shortest_path(
-            a,
-            b,
-            Direction::Outgoing,
-            None,
-            Some("weight"),
-            None,
-            None,
-            None,
-        );
+        let result = db.shortest_path(a, b, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() });
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("negative"));
@@ -2293,23 +2080,23 @@
         // The !w.is_finite() guard must catch it.
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("w".to_string(), PropValue::Float(f64::NAN));
-        db.upsert_edge(a, b, 10, props, 1.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { props, weight: 1.0, ..Default::default() }).unwrap();
 
-        let result = db.shortest_path(a, b, Direction::Outgoing, None, Some("w"), None, None, None);
+        let result = db.shortest_path(a, b, &ShortestPathOptions { weight_field: Some("w".to_string()), ..Default::default() });
         assert!(result.is_err());
 
         // Also test Infinity
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         let mut props2 = BTreeMap::new();
         props2.insert("w".to_string(), PropValue::Float(f64::INFINITY));
-        db.upsert_edge(a, c, 10, props2, 1.0, None, None).unwrap();
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { props: props2, weight: 1.0, ..Default::default() }).unwrap();
 
-        let result = db.shortest_path(a, c, Direction::Outgoing, None, Some("w"), None, None, None);
+        let result = db.shortest_path(a, c, &ShortestPathOptions { weight_field: Some("w".to_string()), ..Default::default() });
         assert!(result.is_err());
 
         db.close().unwrap();
@@ -2321,47 +2108,29 @@
         // max_depth on total path hops, not per-side.
         // Chain: A->B->C->D (3 hops, all weight 1).
         // With max_depth=2, each side individually can reach 2 hops,
-        // but the total path is 3 hops — must be rejected.
+        // but the total path is 3 hops. Must be rejected.
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // max_depth=2: 3-hop path should be rejected
         let path = db
-            .shortest_path(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(2),
-                None,
-            )
+            .shortest_path(a, d, &ShortestPathOptions { weight_field: Some("weight".to_string()), max_depth: Some(2), ..Default::default() })
             .unwrap();
         assert!(path.is_none());
 
         // max_depth=3: should succeed
         let path = db
-            .shortest_path(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(3),
-                None,
-            )
+            .shortest_path(a, d, &ShortestPathOptions { weight_field: Some("weight".to_string()), max_depth: Some(3), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 3.0);
@@ -2375,25 +2144,16 @@
         // A->B (weight 0), B->C (weight 0)
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 0.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 0.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
 
         let path = db
-            .shortest_path(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, c, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 0.0);
@@ -2406,19 +2166,10 @@
     fn test_dijkstra_same_node() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         let path = db
-            .shortest_path(
-                a,
-                a,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, a, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.nodes, vec![a]);
@@ -2442,32 +2193,23 @@
         // side meets first.
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, d, 10, BTreeMap::new(), 10.0, None, None)
+        db.upsert_edge(a, d, 10, UpsertEdgeOptions { weight: 10.0, ..Default::default() })
             .unwrap();
 
         let path = db
-            .shortest_path(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, d, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 2.0);
@@ -2482,21 +2224,12 @@
     fn test_dijkstra_no_path() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         // No edges
 
         let path = db
-            .shortest_path(
-                a,
-                b,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, b, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap();
         assert!(path.is_none());
 
@@ -2507,26 +2240,17 @@
     fn test_dijkstra_after_flush() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
         let path = db
-            .shortest_path(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, c, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 5.0);
@@ -2539,28 +2263,19 @@
     fn test_dijkstra_after_compact() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
 
         let path = db
-            .shortest_path(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, c, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 5.0);
@@ -2575,42 +2290,33 @@
         // A->D->E->C (3 hops, cost 1+1+1=3)
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        let e = db.upsert_node(1, "e", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let e = db.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 100.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 100.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 100.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 100.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, d, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(d, e, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(d, e, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(e, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(e, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // BFS: 2 hops (A->B->C)
         let bfs = db
-            .shortest_path(a, c, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, c, &ShortestPathOptions::default())
             .unwrap()
             .unwrap();
         assert_eq!(bfs.total_cost, 2.0);
 
         // Dijkstra: cost 3 (A->D->E->C)
         let dij = db
-            .shortest_path(
-                a,
-                c,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, c, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(dij.total_cost, 3.0);
@@ -2624,44 +2330,26 @@
         // A->B->C->D, all weight 1
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // max_depth=1: can only reach B from A side
         let path = db
-            .shortest_path(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(1),
-                None,
-            )
+            .shortest_path(a, d, &ShortestPathOptions { weight_field: Some("weight".to_string()), max_depth: Some(1), ..Default::default() })
             .unwrap();
         assert!(path.is_none());
 
         // max_depth=3: should find path
         let path = db
-            .shortest_path(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(3),
-                None,
-            )
+            .shortest_path(a, d, &ShortestPathOptions { weight_field: Some("weight".to_string()), max_depth: Some(3), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 3.0);
@@ -2679,17 +2367,7 @@
         let (a, _b, _c, d) = build_diamond(&mut db);
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions::default())
             .unwrap();
         assert_eq!(paths.len(), 2);
         for p in &paths {
@@ -2710,17 +2388,7 @@
         let (a, _, _, d) = build_diamond(&mut db);
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(1),
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions { max_paths: Some(1), ..Default::default() })
             .unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].total_cost, 2.0);
@@ -2732,20 +2400,10 @@
     fn test_all_shortest_paths_bfs_same_node() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                a,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, a, &AllShortestPathsOptions::default())
             .unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].nodes, vec![a]);
@@ -2758,21 +2416,11 @@
     fn test_all_shortest_paths_bfs_no_path() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                b,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, b, &AllShortestPathsOptions::default())
             .unwrap();
         assert!(paths.is_empty());
 
@@ -2784,31 +2432,21 @@
         // Diamond with equal weights: A->B(w=3)->D and A->C(w=3)->D, both cost 6
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 3.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap();
         assert_eq!(paths.len(), 2);
         for p in &paths {
@@ -2824,31 +2462,21 @@
     fn test_all_shortest_paths_dijkstra_max_paths() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-                Some(1),
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), max_paths: Some(1), ..Default::default() })
             .unwrap();
         assert_eq!(paths.len(), 1);
 
@@ -2859,21 +2487,11 @@
     fn test_all_shortest_paths_dijkstra_no_path() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                b,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, b, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap();
         assert!(paths.is_empty());
 
@@ -2884,22 +2502,12 @@
     fn test_all_shortest_paths_negative_weight_error() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), -5.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: -5.0, ..Default::default() })
             .unwrap();
 
-        let result = db.all_shortest_paths(
-            a,
-            b,
-            Direction::Outgoing,
-            None,
-            Some("weight"),
-            None,
-            None,
-            None,
-            None,
-        );
+        let result = db.all_shortest_paths(a, b, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() });
         assert!(result.is_err());
 
         db.close().unwrap();
@@ -2913,17 +2521,7 @@
         db.flush().unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions::default())
             .unwrap();
         assert_eq!(paths.len(), 2);
 
@@ -2934,34 +2532,24 @@
     fn test_all_shortest_paths_bfs_after_compact() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions::default())
             .unwrap();
         assert_eq!(paths.len(), 2);
         for p in &paths {
@@ -2976,24 +2564,15 @@
         // Use PropValue::Int for the weight field
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("distance".to_string(), PropValue::Int(7));
-        db.upsert_edge(a, b, 10, props, 1.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { props, weight: 1.0, ..Default::default() }).unwrap();
 
         let path = db
-            .shortest_path(
-                a,
-                b,
-                Direction::Outgoing,
-                None,
-                Some("distance"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, b, &ShortestPathOptions { weight_field: Some("distance".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 7.0);
@@ -3009,17 +2588,7 @@
         let (a, _, _, d) = build_diamond(&mut db);
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(0),
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions { max_paths: Some(0), ..Default::default() })
             .unwrap();
         assert_eq!(paths.len(), 2); // both diamond paths found
 
@@ -3034,50 +2603,32 @@
         // With max_depth=2: must find the 2-hop path S→A→T, not return None.
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", BTreeMap::new(), 1.0).unwrap();
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let t = db.upsert_node(1, "t", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(s, a, 10, BTreeMap::new(), 4.0, None, None)
+        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, t, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, t, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(s, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, t, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(c, t, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // Without max_depth
         let path = db
-            .shortest_path(
-                s,
-                t,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(s, t, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 5.0);
 
         // With max_depth=2: must find the 2-hop path
         let path = db
-            .shortest_path(
-                s,
-                t,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(2),
-                None,
-            )
+            .shortest_path(s, t, &ShortestPathOptions { weight_field: Some("weight".to_string()), max_depth: Some(2), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 5.0);
@@ -3096,36 +2647,27 @@
         // still recover the shorter-hop equal-cost route.
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", BTreeMap::new(), 1.0).unwrap();
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let v = db.upsert_node(1, "v", BTreeMap::new(), 1.0).unwrap();
-        let x = db.upsert_node(1, "x", BTreeMap::new(), 1.0).unwrap();
-        let t = db.upsert_node(1, "t", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(s, a, 10, BTreeMap::new(), 0.0, None, None)
+        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let v = db.upsert_node(1, "v", UpsertNodeOptions::default()).unwrap();
+        let x = db.upsert_node(1, "x", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 0.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, v, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, v, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, x, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(s, x, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(x, v, 10, BTreeMap::new(), 0.0, None, None)
+        db.upsert_edge(x, v, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(v, t, 10, BTreeMap::new(), 0.0, None, None)
+        db.upsert_edge(v, t, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
 
         let path = db
-            .shortest_path(
-                s,
-                t,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(3),
-                None,
-            )
+            .shortest_path(s, t, &ShortestPathOptions { weight_field: Some("weight".to_string()), max_depth: Some(3), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 1.0);
@@ -3140,33 +2682,24 @@
         // valid path instead of filtering the global optimum down to nothing.
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", BTreeMap::new(), 1.0).unwrap();
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let t = db.upsert_node(1, "t", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(s, a, 10, BTreeMap::new(), 1.0, None, None)
+        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, t, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, t, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(s, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, t, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(c, t, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let path = db
-            .shortest_path(
-                s,
-                t,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(2),
-                None,
-            )
+            .shortest_path(s, t, &ShortestPathOptions { weight_field: Some("weight".to_string()), max_depth: Some(2), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 6.0);
@@ -3177,33 +2710,23 @@
 
     #[test]
     fn test_all_shortest_paths_zero_weight_cycle() {
-        // A → B (weight 0), B → A (weight 0) — zero-weight cycle
+        // A → B (weight 0), B → A (weight 0). Zero-weight cycle.
         // A → T (weight 1)
         // Must not stack-overflow; should return path(s) with cost 1
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let t = db.upsert_node(1, "t", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 0.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, a, 10, BTreeMap::new(), 0.0, None, None)
+        db.upsert_edge(b, a, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, t, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, t, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                t,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, t, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap();
         assert!(!paths.is_empty());
         for p in &paths {
@@ -3223,35 +2746,25 @@
         // max_depth=3: both paths
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", BTreeMap::new(), 1.0).unwrap();
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let t = db.upsert_node(1, "t", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(s, a, 10, BTreeMap::new(), 4.0, None, None)
+        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, t, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, t, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(s, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, t, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(c, t, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // max_depth=2: only the 2-hop path
         let paths = db
-            .all_shortest_paths(
-                s,
-                t,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(2),
-                None,
-                None,
-            )
+            .all_shortest_paths(s, t, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), max_depth: Some(2), ..Default::default() })
             .unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].total_cost, 5.0);
@@ -3259,17 +2772,7 @@
 
         // max_depth=3: both paths
         let paths = db
-            .all_shortest_paths(
-                s,
-                t,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(3),
-                None,
-                None,
-            )
+            .all_shortest_paths(s, t, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), max_depth: Some(3), ..Default::default() })
             .unwrap();
         assert_eq!(paths.len(), 2);
         for p in &paths {
@@ -3283,34 +2786,24 @@
     fn test_all_shortest_paths_dijkstra_max_depth_uses_best_constrained_cost() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", BTreeMap::new(), 1.0).unwrap();
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let t = db.upsert_node(1, "t", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(s, a, 10, BTreeMap::new(), 1.0, None, None)
+        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, t, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, t, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(s, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, t, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(c, t, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                s,
-                t,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                Some(2),
-                None,
-                None,
-            )
+            .all_shortest_paths(s, t, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), max_depth: Some(2), ..Default::default() })
             .unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].total_cost, 6.0);
@@ -3323,32 +2816,22 @@
     fn test_all_shortest_paths_dijkstra_after_flush_weighted() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 3.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
         let paths = db
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap();
         assert_eq!(paths.len(), 2);
         for p in &paths {
@@ -3365,17 +2848,17 @@
 
         let (a, d) = {
             let mut db = open_imm(&db_path);
-            let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-            let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-            let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-            db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
                 .unwrap();
-            db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+            db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
                 .unwrap();
-            db.upsert_edge(b, d, 10, BTreeMap::new(), 2.0, None, None)
+            db.upsert_edge(b, d, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
                 .unwrap();
-            db.upsert_edge(c, d, 10, BTreeMap::new(), 2.0, None, None)
+            db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
                 .unwrap();
             db.flush().unwrap();
             db.compact().unwrap();
@@ -3385,58 +2868,29 @@
 
         let reopened = open_imm(&db_path);
         let bfs_path = reopened
-            .shortest_path(a, d, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, d, &ShortestPathOptions::default())
             .unwrap()
             .unwrap();
         assert_eq!(bfs_path.total_cost, 2.0);
         assert_eq!(bfs_path.edges.len(), 2);
 
         let weighted_path = reopened
-            .shortest_path(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(a, d, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(weighted_path.total_cost, 3.0);
 
         assert!(reopened
-            .is_connected(a, d, Direction::Outgoing, None, None, None)
+            .is_connected(a, d, &IsConnectedOptions::default())
             .unwrap());
 
         let bfs_paths = reopened
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions::default())
             .unwrap();
         assert_eq!(bfs_paths.len(), 2);
 
         let weighted_paths = reopened
-            .all_shortest_paths(
-                a,
-                d,
-                Direction::Outgoing,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-                None,
-            )
+            .all_shortest_paths(a, d, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap();
         assert_eq!(weighted_paths.len(), 2);
         assert!(weighted_paths.iter().all(|path| path.total_cost == 3.0));
@@ -3449,25 +2903,16 @@
         // A->B->C, query with Direction::Both from C to A should find path
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let path = db
-            .shortest_path(
-                c,
-                a,
-                Direction::Both,
-                None,
-                Some("weight"),
-                None,
-                None,
-                None,
-            )
+            .shortest_path(c, a, &ShortestPathOptions { direction: Direction::Both, weight_field: Some("weight".to_string()), ..Default::default() })
             .unwrap()
             .unwrap();
         assert_eq!(path.total_cost, 5.0);
@@ -3481,27 +2926,27 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Bridge edge in memtable only
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let path = db
-            .shortest_path(a, c, Direction::Outgoing, None, None, None, None, None)
+            .shortest_path(a, c, &ShortestPathOptions::default())
             .unwrap();
         assert!(path.is_some());
         assert_eq!(path.unwrap().total_cost, 2.0);
 
         // Also test is_connected
         assert!(db
-            .is_connected(a, c, Direction::Outgoing, None, None, None)
+            .is_connected(a, c, &IsConnectedOptions::default())
             .unwrap());
 
         db.close().unwrap();
@@ -3516,15 +2961,15 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", BTreeMap::new(), 1.0)
+            .upsert_node(1, "center", UpsertNodeOptions::default())
             .unwrap();
         let mut edge_ids = Vec::new();
         for i in 0..8 {
             let neighbor = engine
-                .upsert_node(1, &format!("n{}", i), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             let eid = engine
-                .upsert_edge(center, neighbor, 10, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(center, neighbor, 10, UpsertEdgeOptions::default())
                 .unwrap();
             edge_ids.push(eid);
         }
@@ -3532,17 +2977,10 @@
 
         // Page through 3 at a time
         let p1 = engine
-            .neighbors_paged(
-                center,
-                Direction::Outgoing,
-                None,
-                &PageRequest {
+            .neighbors_paged(center, &NeighborOptions::default(), &PageRequest {
                     limit: Some(3),
                     after: None,
-                },
-                None,
-                None,
-            )
+                })
             .unwrap();
         assert_eq!(p1.items.len(), 3);
         let p1_eids: Vec<u64> = p1.items.iter().map(|e| e.edge_id).collect();
@@ -3550,17 +2988,10 @@
         assert!(p1.next_cursor.is_some());
 
         let p2 = engine
-            .neighbors_paged(
-                center,
-                Direction::Outgoing,
-                None,
-                &PageRequest {
+            .neighbors_paged(center, &NeighborOptions::default(), &PageRequest {
                     limit: Some(3),
                     after: p1.next_cursor,
-                },
-                None,
-                None,
-            )
+                })
             .unwrap();
         assert_eq!(p2.items.len(), 3);
         let p2_eids: Vec<u64> = p2.items.iter().map(|e| e.edge_id).collect();
@@ -3568,17 +2999,10 @@
         assert!(p2.next_cursor.is_some());
 
         let p3 = engine
-            .neighbors_paged(
-                center,
-                Direction::Outgoing,
-                None,
-                &PageRequest {
+            .neighbors_paged(center, &NeighborOptions::default(), &PageRequest {
                     limit: Some(3),
                     after: p2.next_cursor,
-                },
-                None,
-                None,
-            )
+                })
             .unwrap();
         assert_eq!(p3.items.len(), 2);
         let p3_eids: Vec<u64> = p3.items.iter().map(|e| e.edge_id).collect();
@@ -3593,16 +3017,16 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", BTreeMap::new(), 1.0)
+            .upsert_node(1, "center", UpsertNodeOptions::default())
             .unwrap();
 
         // Create 4 edges, flush to segment
         for i in 0..4 {
             let n = engine
-                .upsert_node(1, &format!("seg{}", i), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("seg{}", i), UpsertNodeOptions::default())
                 .unwrap();
             engine
-                .upsert_edge(center, n, 10, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(center, n, 10, UpsertEdgeOptions::default())
                 .unwrap();
         }
         engine.flush().unwrap();
@@ -3610,10 +3034,10 @@
         // Create 4 more in memtable
         for i in 0..4 {
             let n = engine
-                .upsert_node(1, &format!("mem{}", i), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("mem{}", i), UpsertNodeOptions::default())
                 .unwrap();
             engine
-                .upsert_edge(center, n, 10, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(center, n, 10, UpsertEdgeOptions::default())
                 .unwrap();
         }
 
@@ -3622,17 +3046,10 @@
         let mut cursor: Option<u64> = None;
         loop {
             let page = engine
-                .neighbors_paged(
-                    center,
-                    Direction::Outgoing,
-                    None,
-                    &PageRequest {
+                .neighbors_paged(center, &NeighborOptions::default(), &PageRequest {
                         limit: Some(3),
                         after: cursor,
-                    },
-                    None,
-                    None,
-                )
+                    })
                 .unwrap();
             all_paged.extend(page.items.iter().map(|e| e.edge_id));
             cursor = page.next_cursor;
@@ -3653,36 +3070,29 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", BTreeMap::new(), 1.0)
+            .upsert_node(1, "center", UpsertNodeOptions::default())
             .unwrap();
-        let n1 = engine.upsert_node(1, "n1", BTreeMap::new(), 1.0).unwrap();
-        let n2 = engine.upsert_node(1, "n2", BTreeMap::new(), 1.0).unwrap();
-        let n3 = engine.upsert_node(1, "n3", BTreeMap::new(), 1.0).unwrap();
+        let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions::default()).unwrap();
+        let n2 = engine.upsert_node(1, "n2", UpsertNodeOptions::default()).unwrap();
+        let n3 = engine.upsert_node(1, "n3", UpsertNodeOptions::default()).unwrap();
 
         engine
-            .upsert_edge(center, n1, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(center, n1, 10, UpsertEdgeOptions::default())
             .unwrap();
         let e2 = engine
-            .upsert_edge(center, n2, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(center, n2, 10, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(center, n3, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(center, n3, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         engine.delete_edge(e2).unwrap();
 
         let result = engine
-            .neighbors_paged(
-                center,
-                Direction::Outgoing,
-                None,
-                &PageRequest {
+            .neighbors_paged(center, &NeighborOptions::default(), &PageRequest {
                     limit: Some(10),
                     after: None,
-                },
-                None,
-                None,
-            )
+                })
             .unwrap();
         assert_eq!(result.items.len(), 2);
         assert!(result.items.iter().all(|e| e.edge_id != e2));
@@ -3695,49 +3105,35 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", BTreeMap::new(), 1.0)
+            .upsert_node(1, "center", UpsertNodeOptions::default())
             .unwrap();
-        let n1 = engine.upsert_node(1, "n1", BTreeMap::new(), 1.0).unwrap();
-        let n2 = engine.upsert_node(1, "n2", BTreeMap::new(), 1.0).unwrap();
+        let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions::default()).unwrap();
+        let n2 = engine.upsert_node(1, "n2", UpsertNodeOptions::default()).unwrap();
 
         // Edge valid from 100 to 200
         engine
-            .upsert_edge(center, n1, 10, BTreeMap::new(), 1.0, Some(100), Some(200))
+            .upsert_edge(center, n1, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(200), ..Default::default() })
             .unwrap();
         // Edge valid from 150 to 300
         engine
-            .upsert_edge(center, n2, 10, BTreeMap::new(), 1.0, Some(150), Some(300))
+            .upsert_edge(center, n2, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(150), valid_to: Some(300), ..Default::default() })
             .unwrap();
 
         // At epoch 175, both valid
         let result = engine
-            .neighbors_paged(
-                center,
-                Direction::Outgoing,
-                None,
-                &PageRequest {
+            .neighbors_paged(center, &NeighborOptions { at_epoch: Some(175), ..Default::default() }, &PageRequest {
                     limit: Some(10),
                     after: None,
-                },
-                Some(175),
-                None,
-            )
+                })
             .unwrap();
         assert_eq!(result.items.len(), 2);
 
         // At epoch 250, only n2 valid
         let result = engine
-            .neighbors_paged(
-                center,
-                Direction::Outgoing,
-                None,
-                &PageRequest {
+            .neighbors_paged(center, &NeighborOptions { at_epoch: Some(250), ..Default::default() }, &PageRequest {
                     limit: Some(10),
                     after: None,
-                },
-                Some(250),
-                None,
-            )
+                })
             .unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].node_id, n2);
@@ -3751,14 +3147,14 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", BTreeMap::new(), 1.0)
+            .upsert_node(1, "center", UpsertNodeOptions::default())
             .unwrap();
         for i in 0..15 {
             let n = engine
-                .upsert_node(1, &format!("n{}", i), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             engine
-                .upsert_edge(center, n, 10, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(center, n, 10, UpsertEdgeOptions::default())
                 .unwrap();
         }
 
@@ -3767,17 +3163,10 @@
         let mut cursor: Option<u64> = None;
         loop {
             let page = engine
-                .neighbors_paged(
-                    center,
-                    Direction::Outgoing,
-                    None,
-                    &PageRequest {
+                .neighbors_paged(center, &NeighborOptions::default(), &PageRequest {
                         limit: Some(4),
                         after: cursor,
-                    },
-                    None,
-                    None,
-                )
+                    })
                 .unwrap();
             paged_eids.extend(page.items.iter().map(|e| e.edge_id));
             cursor = page.next_cursor;
@@ -3788,7 +3177,7 @@
 
         // Collect all via neighbors()
         let unpaged = engine
-            .neighbors(center, Direction::Outgoing, None, 0, None, None)
+            .neighbors(center, &NeighborOptions::default())
             .unwrap();
         let mut unpaged_eids: Vec<u64> = unpaged.iter().map(|e| e.edge_id).collect();
         unpaged_eids.sort();
@@ -3805,14 +3194,14 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", BTreeMap::new(), 1.0)
+            .upsert_node(1, "center", UpsertNodeOptions::default())
             .unwrap();
-        let n_past = engine.upsert_node(1, "past", BTreeMap::new(), 1.0).unwrap();
+        let n_past = engine.upsert_node(1, "past", UpsertNodeOptions::default()).unwrap();
         let n_current = engine
-            .upsert_node(1, "current", BTreeMap::new(), 1.0)
+            .upsert_node(1, "current", UpsertNodeOptions::default())
             .unwrap();
         let n_future = engine
-            .upsert_node(1, "future", BTreeMap::new(), 1.0)
+            .upsert_node(1, "future", UpsertNodeOptions::default())
             .unwrap();
 
         let now = SystemTime::now()
@@ -3823,60 +3212,35 @@
         // Expired edge (valid_to in the past)
         engine
             .upsert_edge(
-                center,
-                n_past,
-                10,
-                BTreeMap::new(),
-                1.0,
-                Some(now - 2000),
-                Some(now - 1000),
+                center, n_past, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(now - 2000), valid_to: Some(now - 1000), ..Default::default() },
             )
             .unwrap();
         // Currently valid edge
         engine
             .upsert_edge(
-                center,
-                n_current,
-                10,
-                BTreeMap::new(),
-                1.0,
-                Some(now - 1000),
-                Some(now + 100_000),
+                center, n_current, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(now - 1000), valid_to: Some(now + 100_000), ..Default::default() },
             )
             .unwrap();
         // Future edge (valid_from in the future)
         engine
             .upsert_edge(
-                center,
-                n_future,
-                10,
-                BTreeMap::new(),
-                1.0,
-                Some(now + 50_000),
-                Some(now + 100_000),
+                center, n_future, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(now + 50_000), valid_to: Some(now + 100_000), ..Default::default() },
             )
             .unwrap();
 
         // Non-paginated: should return only n_current
         let unpaged = engine
-            .neighbors(center, Direction::Outgoing, None, 0, None, None)
+            .neighbors(center, &NeighborOptions::default())
             .unwrap();
         assert_eq!(unpaged.len(), 1);
         assert_eq!(unpaged[0].node_id, n_current);
 
         // Paginated with at_epoch=None: must match
         let paged = engine
-            .neighbors_paged(
-                center,
-                Direction::Outgoing,
-                None,
-                &PageRequest {
+            .neighbors_paged(center, &NeighborOptions::default(), &PageRequest {
                     limit: Some(10),
                     after: None,
-                },
-                None,
-                None,
-            )
+                })
             .unwrap();
         assert_eq!(
             paged.items.len(),
@@ -3895,7 +3259,7 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", BTreeMap::new(), 1.0)
+            .upsert_node(1, "center", UpsertNodeOptions::default())
             .unwrap();
         let epoch = 500_000i64;
         let mut valid_node_ids = Vec::new();
@@ -3903,19 +3267,13 @@
         // Create 10 edges, alternating valid/invalid at epoch=500000
         for i in 0..10u64 {
             let n = engine
-                .upsert_node(1, &format!("n{}", i), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             if i % 2 == 0 {
                 // Valid: valid_from=100000, valid_to=900000
                 engine
                     .upsert_edge(
-                        center,
-                        n,
-                        10,
-                        BTreeMap::new(),
-                        1.0,
-                        Some(100_000),
-                        Some(900_000),
+                        center, n, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100_000), valid_to: Some(900_000), ..Default::default() },
                     )
                     .unwrap();
                 valid_node_ids.push(n);
@@ -3923,13 +3281,7 @@
                 // Invalid at epoch: valid_from=600000, valid_to=900000
                 engine
                     .upsert_edge(
-                        center,
-                        n,
-                        10,
-                        BTreeMap::new(),
-                        1.0,
-                        Some(600_000),
-                        Some(900_000),
+                        center, n, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(600_000), valid_to: Some(900_000), ..Default::default() },
                     )
                     .unwrap();
             }
@@ -3941,17 +3293,10 @@
         let mut page_count = 0;
         loop {
             let page = engine
-                .neighbors_paged(
-                    center,
-                    Direction::Outgoing,
-                    None,
-                    &PageRequest {
+                .neighbors_paged(center, &NeighborOptions { at_epoch: Some(epoch), ..Default::default() }, &PageRequest {
                         limit: Some(2),
                         after: cursor,
-                    },
-                    Some(epoch),
-                    None,
-                )
+                    })
                 .unwrap();
             paged_nodes.extend(page.items.iter().map(|e| e.node_id));
             cursor = page.next_cursor;
@@ -3976,17 +3321,17 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", BTreeMap::new(), 1.0)
+            .upsert_node(1, "center", UpsertNodeOptions::default())
             .unwrap();
         let mut visible_neighbors = Vec::new();
 
         for i in 0..17u64 {
             let weight = if i < 12 { 0.1 } else { 1.0 };
             let node_id = engine
-                .upsert_node(1, &format!("n{}", i), BTreeMap::new(), weight)
+                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight, ..Default::default() })
                 .unwrap();
             engine
-                .upsert_edge(center, node_id, 10, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(center, node_id, 10, UpsertEdgeOptions::default())
                 .unwrap();
             if weight > 0.5 {
                 visible_neighbors.push(node_id);
@@ -4005,17 +3350,10 @@
             .unwrap();
 
         let page1 = engine
-            .neighbors_paged(
-                center,
-                Direction::Outgoing,
-                None,
-                &PageRequest {
+            .neighbors_paged(center, &NeighborOptions::default(), &PageRequest {
                     limit: Some(3),
                     after: None,
-                },
-                None,
-                None,
-            )
+                })
             .unwrap();
         assert_eq!(
             page1.items.iter().map(|e| e.node_id).collect::<Vec<_>>(),
@@ -4024,17 +3362,10 @@
         assert!(page1.next_cursor.is_some());
 
         let page2 = engine
-            .neighbors_paged(
-                center,
-                Direction::Outgoing,
-                None,
-                &PageRequest {
+            .neighbors_paged(center, &NeighborOptions::default(), &PageRequest {
                     limit: Some(3),
                     after: page1.next_cursor,
-                },
-                None,
-                None,
-            )
+                })
             .unwrap();
         assert_eq!(
             page2.items.iter().map(|e| e.node_id).collect::<Vec<_>>(),
@@ -4055,7 +3386,7 @@
         let mut all_ids = Vec::new();
         for i in 0..10 {
             let id = engine
-                .upsert_node(1, &format!("n{}", i), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             all_ids.push(id);
         }
@@ -4097,7 +3428,7 @@
         collected.sort();
         assert_eq!(collected, all_ids);
         // No duplicates
-        let deduped: HashSet<u64> = collected.iter().copied().collect();
+        let deduped: NodeIdSet = collected.iter().copied().collect();
         assert_eq!(deduped.len(), all_ids.len());
     }
 
@@ -4121,7 +3452,7 @@
                 }),
             );
             let id = engine
-                .upsert_node(1, &format!("n{}", i), props, 1.0)
+                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { props, ..Default::default() })
                 .unwrap();
             if i % 3 == 0 {
                 matching_ids.push(id);
@@ -4154,7 +3485,7 @@
         collected.sort();
         assert_eq!(collected, matching_ids);
         // No duplicates
-        let deduped: HashSet<u64> = collected.iter().copied().collect();
+        let deduped: NodeIdSet = collected.iter().copied().collect();
         assert_eq!(deduped.len(), matching_ids.len());
     }
 
@@ -4171,7 +3502,7 @@
             let mut props = BTreeMap::new();
             props.insert("tag".to_string(), PropValue::String("yes".to_string()));
             let id = engine
-                .upsert_node(1, &format!("pre{}", i), props, 1.0)
+                .upsert_node(1, &format!("pre{}", i), UpsertNodeOptions { props, ..Default::default() })
                 .unwrap();
             all_matching.push(id);
         }
@@ -4180,7 +3511,7 @@
             let mut props = BTreeMap::new();
             props.insert("tag".to_string(), PropValue::String("yes".to_string()));
             let id = engine
-                .upsert_node(1, &format!("post{}", i), props, 1.0)
+                .upsert_node(1, &format!("post{}", i), UpsertNodeOptions { props, ..Default::default() })
                 .unwrap();
             all_matching.push(id);
         }
@@ -4222,7 +3553,7 @@
 
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
-        let n1 = engine.upsert_node(1, "n1", props, 1.0).unwrap();
+        let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions { props, ..Default::default() }).unwrap();
 
         // Flush: n1 with color=red goes to segment
         engine.flush().unwrap();
@@ -4230,7 +3561,7 @@
         // Update n1 to color=blue in memtable
         let mut props2 = BTreeMap::new();
         props2.insert("color".to_string(), PropValue::String("blue".to_string()));
-        engine.upsert_node(1, "n1", props2, 1.0).unwrap();
+        engine.upsert_node(1, "n1", UpsertNodeOptions { props: props2, ..Default::default() }).unwrap();
 
         // find_nodes for color=red must NOT return n1 (stale segment match)
         let red = engine
@@ -4284,7 +3615,7 @@
 
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
-        let n1 = engine.upsert_node(1, "n1", props, 1.0).unwrap();
+        let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions { props, ..Default::default() }).unwrap();
 
         // Flush: S1 has n1 with color=red
         engine.flush().unwrap();
@@ -4292,7 +3623,7 @@
         // Update and flush again: S2 has n1 with color=blue
         let mut props2 = BTreeMap::new();
         props2.insert("color".to_string(), PropValue::String("blue".to_string()));
-        engine.upsert_node(1, "n1", props2, 1.0).unwrap();
+        engine.upsert_node(1, "n1", UpsertNodeOptions { props: props2, ..Default::default() }).unwrap();
         engine.flush().unwrap();
 
         // find_nodes for color=red must NOT return n1
@@ -4317,39 +3648,28 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let depth1_low = db.upsert_node(1, "depth1-low", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let depth1_low = db.upsert_node(1, "depth1-low", UpsertNodeOptions::default()).unwrap();
         let depth1_high = db
-            .upsert_node(1, "depth1-high", BTreeMap::new(), 1.0)
+            .upsert_node(1, "depth1-high", UpsertNodeOptions::default())
             .unwrap();
-        let depth2_low = db.upsert_node(1, "depth2-low", BTreeMap::new(), 1.0).unwrap();
-        let depth2_mid = db.upsert_node(1, "depth2-mid", BTreeMap::new(), 1.0).unwrap();
-        let depth2_high = db.upsert_node(1, "depth2-high", BTreeMap::new(), 1.0).unwrap();
+        let depth2_low = db.upsert_node(1, "depth2-low", UpsertNodeOptions::default()).unwrap();
+        let depth2_mid = db.upsert_node(1, "depth2-mid", UpsertNodeOptions::default()).unwrap();
+        let depth2_high = db.upsert_node(1, "depth2-high", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, depth1_high, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, depth1_high, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, depth1_low, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, depth1_low, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(depth1_high, depth2_high, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(depth1_high, depth2_high, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(depth1_high, depth2_mid, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(depth1_high, depth2_mid, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(depth1_low, depth2_low, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(depth1_low, depth2_low, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
-            .traverse(
-                start,
-                0,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { min_depth: 0, ..Default::default() })
             .unwrap();
 
         let ordered: Vec<(u64, u32)> = result.items.iter().map(|hit| (hit.node_id, hit.depth)).collect();
@@ -4377,30 +3697,19 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let depth2_only = db
-            .traverse(
-                a,
-                2,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(a, 2, &TraverseOptions { min_depth: 2, ..Default::default() })
             .unwrap();
         let depth2_pairs: Vec<(u64, u32)> = depth2_only
             .items
@@ -4410,18 +3719,7 @@
         assert_eq!(depth2_pairs, vec![(c, 2)]);
 
         let limited = db
-            .traverse(
-                a,
-                1,
-                3,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                Some(0.5),
-                Some(2),
-                None,
-            )
+            .traverse(a, 3, &TraverseOptions { decay_lambda: Some(0.5), limit: Some(2), ..Default::default() })
             .unwrap();
         let limited_pairs: Vec<(u64, u32)> = limited
             .items
@@ -4447,20 +3745,9 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let page = db
-            .traverse(
-                start,
-                0,
-                3,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                Some(1),
-                None,
-            )
+            .traverse(start, 3, &TraverseOptions { min_depth: 0, limit: Some(1), ..Default::default() })
             .unwrap();
 
         assert_eq!(page.items.len(), 1);
@@ -4475,13 +3762,13 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let middle = db.upsert_node(2, "middle", BTreeMap::new(), 1.0).unwrap();
-        let hidden = db.upsert_node(2, "hidden", BTreeMap::new(), 0.2).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let middle = db.upsert_node(2, "middle", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node(2, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
 
-        db.upsert_edge(start, middle, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, middle, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(middle, hidden, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(middle, hidden, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.set_prune_policy(
             "low_weight",
@@ -4494,18 +3781,7 @@
         .unwrap();
 
         let page = db
-            .traverse(
-                start,
-                1,
-                2,
-                Direction::Outgoing,
-                None,
-                Some(&[2]),
-                None,
-                None,
-                Some(1),
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { node_type_filter: Some(vec![2]), limit: Some(1), ..Default::default() })
             .unwrap();
 
         assert_eq!(page.items.len(), 1);
@@ -4520,38 +3796,27 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, a, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
-            .traverse(
-                a,
-                1,
-                3,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(a, 3, &TraverseOptions::default())
             .unwrap();
 
         let pairs: Vec<(u64, u32)> = result.items.iter().map(|hit| (hit.node_id, hit.depth)).collect();
         assert_eq!(pairs, vec![(b, 1), (c, 2), (d, 2)]);
-        let unique: HashSet<u64> = result.items.iter().map(|hit| hit.node_id).collect();
+        let unique: NodeIdSet = result.items.iter().map(|hit| hit.node_id).collect();
         assert_eq!(unique.len(), result.items.len());
         assert!(!unique.contains(&a));
 
@@ -4563,45 +3828,23 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let p1 = db
-            .traverse(
-                start,
-                1,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                Some(2),
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { limit: Some(2), ..Default::default() })
             .unwrap();
         let p2 = db
-            .traverse(
-                start,
-                1,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                Some(2),
-                p1.next_cursor.as_ref(),
-            )
+            .traverse(start, 2, &TraverseOptions { limit: Some(2), cursor: p1.next_cursor.clone(), ..Default::default() })
             .unwrap();
 
         let combined: Vec<(u64, u32)> = p1
@@ -4621,31 +3864,20 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, d, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let p1 = db
-            .traverse(
-                start,
-                1,
-                1,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                Some(2),
-                None,
-            )
+            .traverse(start, 1, &TraverseOptions { limit: Some(2), ..Default::default() })
             .unwrap();
         assert_eq!(
             p1.items
@@ -4663,18 +3895,7 @@
         );
 
         let p2 = db
-            .traverse(
-                start,
-                1,
-                1,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                Some(2),
-                p1.next_cursor.as_ref(),
-            )
+            .traverse(start, 1, &TraverseOptions { limit: Some(2), cursor: p1.next_cursor.clone(), ..Default::default() })
             .unwrap();
         assert_eq!(
             p2.items
@@ -4693,28 +3914,17 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let page = db
-            .traverse(
-                start,
-                1,
-                1,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                Some(2),
-                None,
-            )
+            .traverse(start, 1, &TraverseOptions { limit: Some(2), ..Default::default() })
             .unwrap();
         assert_eq!(
             page.items
@@ -4733,28 +3943,17 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let page = db
-            .traverse(
-                start,
-                0,
-                1,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                Some(10),
-                Some(&TraversalCursor {
+            .traverse(start, 1, &TraverseOptions { min_depth: 0, limit: Some(10), cursor: Some(TraversalCursor {
                     depth: 99,
                     last_node_id: u64::MAX,
-                }),
-            )
+                }), ..Default::default() })
             .unwrap();
         assert!(page.items.is_empty());
         assert!(page.next_cursor.is_none());
@@ -4767,31 +3966,20 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let middle = db.upsert_node(2, "middle", BTreeMap::new(), 1.0).unwrap();
-        let target = db.upsert_node(3, "target", BTreeMap::new(), 1.0).unwrap();
-        let wrong_edge = db.upsert_node(3, "wrong-edge", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let middle = db.upsert_node(2, "middle", UpsertNodeOptions::default()).unwrap();
+        let target = db.upsert_node(3, "target", UpsertNodeOptions::default()).unwrap();
+        let wrong_edge = db.upsert_node(3, "wrong-edge", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, middle, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, middle, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(middle, target, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(middle, target, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, wrong_edge, 20, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, wrong_edge, 20, UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
-            .traverse(
-                start,
-                1,
-                2,
-                Direction::Outgoing,
-                Some(&[10]),
-                Some(&[3]),
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { edge_type_filter: Some(vec![10]), node_type_filter: Some(vec![3]), ..Default::default() })
             .unwrap();
 
         let pairs: Vec<(u64, u32)> = result.items.iter().map(|hit| (hit.node_id, hit.depth)).collect();
@@ -4805,31 +3993,20 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let incoming = db
-            .traverse(
-                b,
-                1,
-                1,
-                Direction::Incoming,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(b, 1, &TraverseOptions { direction: Direction::Incoming, ..Default::default() })
             .unwrap();
         assert_eq!(
             incoming
@@ -4841,18 +4018,7 @@
         );
 
         let both = db
-            .traverse(
-                b,
-                1,
-                1,
-                Direction::Both,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(b, 1, &TraverseOptions { direction: Direction::Both, ..Default::default() })
             .unwrap();
         assert_eq!(
             both.items
@@ -4870,37 +4036,26 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let mid_a = db.upsert_node(2, "mid-a", BTreeMap::new(), 1.0).unwrap();
-        let mid_b = db.upsert_node(2, "mid-b", BTreeMap::new(), 1.0).unwrap();
-        let hit_a = db.upsert_node(3, "hit-a", BTreeMap::new(), 1.0).unwrap();
-        let hit_b = db.upsert_node(3, "hit-b", BTreeMap::new(), 1.0).unwrap();
-        let skip = db.upsert_node(4, "skip", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let mid_a = db.upsert_node(2, "mid-a", UpsertNodeOptions::default()).unwrap();
+        let mid_b = db.upsert_node(2, "mid-b", UpsertNodeOptions::default()).unwrap();
+        let hit_a = db.upsert_node(3, "hit-a", UpsertNodeOptions::default()).unwrap();
+        let hit_b = db.upsert_node(3, "hit-b", UpsertNodeOptions::default()).unwrap();
+        let skip = db.upsert_node(4, "skip", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, mid_a, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, mid_a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, mid_b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, mid_b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(mid_a, hit_a, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(mid_a, hit_a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(mid_a, skip, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(mid_a, skip, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(mid_b, hit_b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(mid_b, hit_b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let p1 = db
-            .traverse(
-                start,
-                1,
-                2,
-                Direction::Outgoing,
-                None,
-                Some(&[3]),
-                None,
-                None,
-                Some(1),
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { node_type_filter: Some(vec![3]), limit: Some(1), ..Default::default() })
             .unwrap();
         assert_eq!(
             p1.items
@@ -4918,18 +4073,7 @@
         );
 
         let p2 = db
-            .traverse(
-                start,
-                1,
-                2,
-                Direction::Outgoing,
-                None,
-                Some(&[3]),
-                None,
-                None,
-                Some(1),
-                p1.next_cursor.as_ref(),
-            )
+            .traverse(start, 2, &TraverseOptions { node_type_filter: Some(vec![3]), limit: Some(1), cursor: p1.next_cursor.clone(), ..Default::default() })
             .unwrap();
         assert_eq!(
             p2.items
@@ -4948,32 +4092,26 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let hidden = db.upsert_node(1, "hidden", BTreeMap::new(), 0.2).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
         let hidden_target = db
-            .upsert_node(1, "hidden-target", BTreeMap::new(), 1.0)
+            .upsert_node(1, "hidden-target", UpsertNodeOptions::default())
             .unwrap();
-        let deleted = db.upsert_node(1, "deleted", BTreeMap::new(), 1.0).unwrap();
-        let future = db.upsert_node(1, "future", BTreeMap::new(), 1.0).unwrap();
-        let visible = db.upsert_node(1, "visible", BTreeMap::new(), 1.0).unwrap();
+        let deleted = db.upsert_node(1, "deleted", UpsertNodeOptions::default()).unwrap();
+        let future = db.upsert_node(1, "future", UpsertNodeOptions::default()).unwrap();
+        let visible = db.upsert_node(1, "visible", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, hidden, 10, BTreeMap::new(), 1.0, Some(0), Some(i64::MAX))
+        db.upsert_edge(start, hidden, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() })
             .unwrap();
         db.upsert_edge(
-            hidden,
-            hidden_target,
-            10,
-            BTreeMap::new(),
-            1.0,
-            Some(0),
-            Some(i64::MAX),
+            hidden, hidden_target, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() },
         )
         .unwrap();
-        db.upsert_edge(start, deleted, 10, BTreeMap::new(), 1.0, Some(0), Some(i64::MAX))
+        db.upsert_edge(start, deleted, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() })
             .unwrap();
-        db.upsert_edge(start, future, 10, BTreeMap::new(), 1.0, Some(5_000), Some(6_000))
+        db.upsert_edge(start, future, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(5_000), valid_to: Some(6_000), ..Default::default() })
             .unwrap();
-        db.upsert_edge(start, visible, 10, BTreeMap::new(), 1.0, Some(0), Some(i64::MAX))
+        db.upsert_edge(start, visible, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() })
             .unwrap();
         db.delete_node(deleted).unwrap();
         db.set_prune_policy(
@@ -4987,18 +4125,7 @@
         .unwrap();
 
         let result = db
-            .traverse(
-                start,
-                1,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                Some(1_000),
-                None,
-                None,
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { at_epoch: Some(1_000), ..Default::default() })
             .unwrap();
 
         let pairs: Vec<(u64, u32)> = result.items.iter().map(|hit| (hit.node_id, hit.depth)).collect();
@@ -5012,16 +4139,16 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let keep_a = db.upsert_node(1, "keep-a", BTreeMap::new(), 1.0).unwrap();
-        let hidden = db.upsert_node(1, "hidden", BTreeMap::new(), 0.2).unwrap();
-        let keep_b = db.upsert_node(1, "keep-b", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let keep_a = db.upsert_node(1, "keep-a", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let keep_b = db.upsert_node(1, "keep-b", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, keep_a, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, keep_a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, hidden, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, hidden, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, keep_b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, keep_b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         db.set_prune_policy(
@@ -5035,18 +4162,7 @@
         .unwrap();
 
         let p1 = db
-            .traverse(
-                start,
-                1,
-                1,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                Some(1),
-                None,
-            )
+            .traverse(start, 1, &TraverseOptions { limit: Some(1), ..Default::default() })
             .unwrap();
         assert_eq!(
             p1.items
@@ -5064,18 +4180,7 @@
         );
 
         let p2 = db
-            .traverse(
-                start,
-                1,
-                1,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                Some(1),
-                p1.next_cursor.as_ref(),
-            )
+            .traverse(start, 1, &TraverseOptions { limit: Some(1), cursor: p1.next_cursor.clone(), ..Default::default() })
             .unwrap();
         assert_eq!(
             p2.items
@@ -5094,9 +4199,9 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let hidden_start = db.upsert_node(1, "hidden-start", BTreeMap::new(), 0.2).unwrap();
-        let next = db.upsert_node(1, "next", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(hidden_start, next, 10, BTreeMap::new(), 1.0, None, None)
+        let hidden_start = db.upsert_node(1, "hidden-start", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let next = db.upsert_node(1, "next", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(hidden_start, next, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.set_prune_policy(
             "low_weight",
@@ -5109,35 +4214,13 @@
         .unwrap();
 
         let hidden_result = db
-            .traverse(
-                hidden_start,
-                0,
-                1,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(hidden_start, 1, &TraverseOptions { min_depth: 0, ..Default::default() })
             .unwrap();
         assert!(hidden_result.items.is_empty());
         assert!(hidden_result.next_cursor.is_none());
 
         let missing_result = db
-            .traverse(
-                999_999,
-                0,
-                1,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(999_999, 1, &TraverseOptions { min_depth: 0, ..Default::default() })
             .unwrap();
         assert!(missing_result.items.is_empty());
         assert!(missing_result.next_cursor.is_none());
@@ -5151,82 +4234,38 @@
         let db_path = dir.path().join("db");
         let mut db = open_imm(&db_path);
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, d, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, d, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let baseline = db
-            .traverse(
-                start,
-                0,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { min_depth: 0, ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
         let after_flush = db
-            .traverse(
-                start,
-                0,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { min_depth: 0, ..Default::default() })
             .unwrap();
         assert_eq!(after_flush, baseline);
 
         db.compact().unwrap();
         let after_compact = db
-            .traverse(
-                start,
-                0,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { min_depth: 0, ..Default::default() })
             .unwrap();
         assert_eq!(after_compact, baseline);
 
         db.close().unwrap();
         let reopened = open_imm(&db_path);
         let after_reopen = reopened
-            .traverse(
-                start,
-                0,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { min_depth: 0, ..Default::default() })
             .unwrap();
         assert_eq!(after_reopen, baseline);
         reopened.close().unwrap();
@@ -5238,34 +4277,23 @@
         let db_path = dir.path().join("db");
         let mut db = open_imm(&db_path);
 
-        let start = db.upsert_node(1, "start", BTreeMap::new(), 1.0).unwrap();
-        let middle = db.upsert_node(1, "middle", BTreeMap::new(), 1.0).unwrap();
-        let target = db.upsert_node(1, "target", BTreeMap::new(), 1.0).unwrap();
+        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let middle = db.upsert_node(1, "middle", UpsertNodeOptions::default()).unwrap();
+        let target = db.upsert_node(1, "target", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, middle, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(start, middle, 10, UpsertEdgeOptions::default())
             .unwrap();
         let older_edge = db
-            .upsert_edge(middle, target, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(middle, target, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
         let newer_edge = db
-            .upsert_edge(middle, target, 11, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(middle, target, 11, UpsertEdgeOptions::default())
             .unwrap();
         assert!(older_edge < newer_edge);
 
         let result = db
-            .traverse(
-                start,
-                2,
-                2,
-                Direction::Outgoing,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .traverse(start, 2, &TraverseOptions { min_depth: 2, ..Default::default() })
             .unwrap();
 
         assert_eq!(result.items.len(), 1);
@@ -5275,6 +4303,7 @@
         db.close().unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn traverse_depth_two_page(
         engine: &DatabaseEngine,
         start: u64,
@@ -5287,18 +4316,16 @@
         cursor: Option<&TraversalCursor>,
     ) -> TraversalPageResult {
         engine
-            .traverse(
-                start,
-                2,
-                2,
+            .traverse(start, 2, &TraverseOptions {
+                min_depth: 2,
                 direction,
-                edge_type_filter,
-                node_type_filter,
+                edge_type_filter: edge_type_filter.map(|s| s.to_vec()),
+                node_type_filter: node_type_filter.map(|s| s.to_vec()),
                 at_epoch,
                 decay_lambda,
                 limit,
-                cursor,
-            )
+                cursor: cursor.cloned(),
+            })
             .unwrap()
     }
 
@@ -5308,15 +4335,15 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        let e = engine.upsert_node(1, "e", BTreeMap::new(), 1.0).unwrap();
-        engine.upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None).unwrap();
-        engine.upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None).unwrap();
-        engine.upsert_edge(b, d, 1, BTreeMap::new(), 1.0, None, None).unwrap();
-        engine.upsert_edge(b, e, 1, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let e = engine.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, d, 1, UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, e, 1, UpsertEdgeOptions::default()).unwrap();
 
         let p1 = traverse_depth_two_page(
             &engine,
@@ -5363,17 +4390,17 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         for i in 0..5 {
             let b = engine
-                .upsert_node(1, &format!("b{i}"), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("b{i}"), UpsertNodeOptions::default())
                 .unwrap();
-            engine.upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None).unwrap();
+            engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
             for j in 0..2 {
                 let c = engine
-                    .upsert_node(1, &format!("c{i}_{j}"), BTreeMap::new(), 1.0)
+                    .upsert_node(1, &format!("c{i}_{j}"), UpsertNodeOptions::default())
                     .unwrap();
-                engine.upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None).unwrap();
+                engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
             }
         }
 
@@ -5418,11 +4445,11 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        engine.upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None).unwrap();
-        engine.upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
 
         let page = traverse_depth_two_page(
             &engine,
@@ -5448,15 +4475,15 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(10, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = engine.upsert_node(10, "d", BTreeMap::new(), 1.0).unwrap();
-        let e = engine.upsert_node(20, "e", BTreeMap::new(), 1.0).unwrap();
-        engine.upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None).unwrap();
-        engine.upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None).unwrap();
-        engine.upsert_edge(b, d, 2, BTreeMap::new(), 1.0, None, None).unwrap();
-        engine.upsert_edge(b, e, 1, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(10, "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node(10, "d", UpsertNodeOptions::default()).unwrap();
+        let e = engine.upsert_node(20, "e", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, d, 2, UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, e, 1, UpsertEdgeOptions::default()).unwrap();
 
         let hits = traverse_depth_two_page(
             &engine,
@@ -5479,15 +4506,15 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        engine.upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None).unwrap();
-        engine.upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
         engine.flush().unwrap();
 
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        engine.upsert_edge(b, d, 1, BTreeMap::new(), 1.0, None, None).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(b, d, 1, UpsertEdgeOptions::default()).unwrap();
 
         let page = traverse_depth_two_page(
             &engine,
@@ -5518,13 +4545,13 @@
 
         // Create edge and flush to segment
         let e1 = engine
-            .upsert_edge(1, 2, 10, BTreeMap::new(), 0.5, None, None)
+            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         engine.flush().unwrap();
 
         // Upsert same triple, should find existing in segment and reuse ID
         let e2 = engine
-            .upsert_edge(1, 2, 10, BTreeMap::new(), 0.9, None, None)
+            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         assert_eq!(e1, e2, "same triple should reuse edge ID across flush");
 
@@ -5534,7 +4561,7 @@
 
         // Different triple still gets new ID
         let e3 = engine
-            .upsert_edge(1, 2, 20, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(1, 2, 20, UpsertEdgeOptions::default())
             .unwrap();
         assert_ne!(e1, e3);
 
@@ -5548,16 +4575,16 @@
 
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let n1 = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let n2 = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
+        let n1 = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let n2 = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let eid = engine
-            .upsert_edge(n1, n2, 1, BTreeMap::new(), 0.42, None, None)
+            .upsert_edge(n1, n2, 1, UpsertEdgeOptions { weight: 0.42, ..Default::default() })
             .unwrap();
         engine.flush().unwrap();
 
         // Read neighbors from segment. Weight should be preserved
         let nbrs = engine
-            .neighbors(n1, Direction::Outgoing, None, 0, None, None)
+            .neighbors(n1, &NeighborOptions::default())
             .unwrap();
         assert_eq!(nbrs.len(), 1);
         assert_eq!(nbrs[0].edge_id, eid);
@@ -5583,7 +4610,7 @@
 
         // Create edge and flush (segment 1 has the edge)
         let e1 = engine
-            .upsert_edge(1, 2, 10, BTreeMap::new(), 0.5, None, None)
+            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         engine.flush().unwrap();
 
@@ -5594,7 +4621,7 @@
         // Now both segments are on disk, memtable is clean.
         // Upserting the same triple should get a NEW ID, not resurrect the deleted edge.
         let e2 = engine
-            .upsert_edge(1, 2, 10, BTreeMap::new(), 0.9, None, None)
+            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         assert_ne!(
             e1, e2,
@@ -5614,28 +4641,28 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 0.5).unwrap();
-        let e = engine.upsert_node(1, "e", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let e = engine.upsert_node(1, "e", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 0.1, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.1, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, BTreeMap::new(), 0.9, None, None)
+            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, d, 1, BTreeMap::new(), 0.5, None, None)
+            .upsert_edge(a, d, 1, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, e, 1, BTreeMap::new(), 0.3, None, None)
+            .upsert_edge(a, e, 1, UpsertEdgeOptions { weight: 0.3, ..Default::default() })
             .unwrap();
 
         // Top 2 by weight: c (0.9) and d (0.5)
         let top2 = engine
-            .top_k_neighbors(a, Direction::Outgoing, None, 2, ScoringMode::Weight, None)
+            .top_k_neighbors(a, 2, &TopKOptions::default())
             .unwrap();
         assert_eq!(top2.len(), 2);
         assert_eq!(top2[0].node_id, c);
@@ -5652,25 +4679,25 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         // Edges with explicit valid_from to control recency
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, Some(1000), None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(1000), valid_to: None, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, BTreeMap::new(), 1.0, Some(3000), None)
+            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(3000), valid_to: None, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, d, 1, BTreeMap::new(), 1.0, Some(2000), None)
+            .upsert_edge(a, d, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(2000), valid_to: None, ..Default::default() })
             .unwrap();
 
         // Top 2 by recency: c (3000) and d (2000)
         let top2 = engine
-            .top_k_neighbors(a, Direction::Outgoing, None, 2, ScoringMode::Recency, None)
+            .top_k_neighbors(a, 2, &TopKOptions { scoring: ScoringMode::Recency, ..Default::default() })
             .unwrap();
         assert_eq!(top2.len(), 2);
         assert_eq!(top2[0].node_id, c);
@@ -5685,10 +4712,10 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -5697,25 +4724,18 @@
 
         // b: high weight but old, c: medium weight and recent, d: low weight very recent
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, Some(now - 7_200_000), None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(now - 7_200_000), valid_to: None, ..Default::default() })
             .unwrap(); // 2 hours ago
         engine
-            .upsert_edge(a, c, 1, BTreeMap::new(), 0.8, Some(now - 600_000), None)
+            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.8, valid_from: Some(now - 600_000), valid_to: None, ..Default::default() })
             .unwrap(); // 10 min ago
         engine
-            .upsert_edge(a, d, 1, BTreeMap::new(), 0.3, Some(now - 60_000), None)
+            .upsert_edge(a, d, 1, UpsertEdgeOptions { weight: 0.3, valid_from: Some(now - 60_000), valid_to: None, ..Default::default() })
             .unwrap(); // 1 min ago
 
         // With strong decay (lambda=1.0), recent edges should beat old heavy ones
         let top2 = engine
-            .top_k_neighbors(
-                a,
-                Direction::Outgoing,
-                None,
-                2,
-                ScoringMode::DecayAdjusted { lambda: 1.0 },
-                None,
-            )
+            .top_k_neighbors(a, 2, &TopKOptions { scoring: ScoringMode::DecayAdjusted { lambda: 1.0 }, ..Default::default() })
             .unwrap();
         assert_eq!(top2.len(), 2);
         // c should rank highest (0.8 * exp(-1.0 * 0.167) ≈ 0.68) over d (0.3 * ~1.0 ≈ 0.3)
@@ -5732,14 +4752,14 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let result = engine
-            .top_k_neighbors(a, Direction::Outgoing, None, 0, ScoringMode::Weight, None)
+            .top_k_neighbors(a, 0, &TopKOptions::default())
             .unwrap();
         assert!(result.is_empty());
 
@@ -5752,19 +4772,19 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 0.3, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.3, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, BTreeMap::new(), 0.7, None, None)
+            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.7, ..Default::default() })
             .unwrap();
 
         // k=10 but only 2 neighbors. Returns all 2, sorted desc
         let result = engine
-            .top_k_neighbors(a, Direction::Outgoing, None, 10, ScoringMode::Weight, None)
+            .top_k_neighbors(a, 10, &TopKOptions::default())
             .unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].node_id, c); // higher weight first
@@ -5779,31 +4799,24 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 0.9, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 2, BTreeMap::new(), 0.8, None, None)
+            .upsert_edge(a, c, 2, UpsertEdgeOptions { weight: 0.8, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, d, 1, BTreeMap::new(), 0.7, None, None)
+            .upsert_edge(a, d, 1, UpsertEdgeOptions { weight: 0.7, ..Default::default() })
             .unwrap();
 
         // Top 1 of edge type 1 only
         let result = engine
-            .top_k_neighbors(
-                a,
-                Direction::Outgoing,
-                Some(&[1]),
-                1,
-                ScoringMode::Weight,
-                None,
-            )
+            .top_k_neighbors(a, 1, &TopKOptions { type_filter: Some(vec![1]), ..Default::default() })
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].node_id, b);
@@ -5817,21 +4830,21 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 0.9, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, BTreeMap::new(), 0.8, None, None)
+            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.8, ..Default::default() })
             .unwrap();
 
         engine.delete_node(b).unwrap();
 
         let result = engine
-            .top_k_neighbors(a, Direction::Outgoing, None, 2, ScoringMode::Weight, None)
+            .top_k_neighbors(a, 2, &TopKOptions::default())
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].node_id, c);
@@ -5845,21 +4858,21 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 0.5, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         engine.flush().unwrap();
 
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         engine
-            .upsert_edge(a, c, 1, BTreeMap::new(), 0.9, None, None)
+            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
 
         // Top 1 should be c (0.9) from memtable, beating b (0.5) from segment
         let result = engine
-            .top_k_neighbors(a, Direction::Outgoing, None, 1, ScoringMode::Weight, None)
+            .top_k_neighbors(a, 1, &TopKOptions::default())
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].node_id, c);
@@ -5873,16 +4886,9 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
-        let result = engine.top_k_neighbors(
-            a,
-            Direction::Outgoing,
-            None,
-            5,
-            ScoringMode::DecayAdjusted { lambda: -1.0 },
-            None,
-        );
+        let result = engine.top_k_neighbors(a, 5, &TopKOptions { scoring: ScoringMode::DecayAdjusted { lambda: -1.0 }, ..Default::default() });
         assert!(result.is_err());
 
         engine.close().unwrap();
@@ -5899,26 +4905,26 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
         let e_ab = engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, d, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 1, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 1, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b]));
         assert_eq!(sg.edges.len(), 1);
         assert_eq!(sg.edges[0].id, e_ab);
 
@@ -5932,26 +4938,26 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, d, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 3, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 3, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b, c, d]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b, c, d]));
         assert_eq!(sg.edges.len(), 3);
 
         engine.close().unwrap();
@@ -5964,29 +4970,29 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, c, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, d, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, d, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, d, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 2, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 2, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b, c, d]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b, c, d]));
         // All 4 edges included
         assert_eq!(sg.edges.len(), 4);
         // D appears exactly once in nodes
@@ -6002,27 +5008,27 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
             .unwrap();
         let e_ca = engine
-            .upsert_edge(c, a, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(c, a, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 10, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 10, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b, c]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b, c]));
         // All 3 edges including the back-edge C→A
-        let edge_ids: HashSet<u64> = sg.edges.iter().map(|e| e.id).collect();
+        let edge_ids: NodeIdSet = sg.edges.iter().map(|e| e.id).collect();
         assert_eq!(edge_ids.len(), 3);
         assert!(edge_ids.contains(&e_ca));
 
@@ -6036,22 +5042,22 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let e_aa = engine
-            .upsert_edge(a, a, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, a, 1, UpsertEdgeOptions::default())
             .unwrap();
         let e_ab = engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 5, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 5, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b]));
-        let edge_ids: HashSet<u64> = sg.edges.iter().map(|e| e.id).collect();
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b]));
+        let edge_ids: NodeIdSet = sg.edges.iter().map(|e| e.id).collect();
         assert!(edge_ids.contains(&e_aa));
         assert!(edge_ids.contains(&e_ab));
 
@@ -6065,14 +5071,14 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 0, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 0, &SubgraphOptions::default())
             .unwrap();
 
         assert_eq!(sg.nodes.len(), 1);
@@ -6090,7 +5096,7 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let sg = engine
-            .extract_subgraph(999, 5, Direction::Outgoing, None, None)
+            .extract_subgraph(999, 5, &SubgraphOptions::default())
             .unwrap();
 
         assert!(sg.nodes.is_empty());
@@ -6106,19 +5112,19 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let _c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let _c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 10, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 10, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b]));
 
         engine.close().unwrap();
     }
@@ -6130,22 +5136,22 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(c, 2, Direction::Incoming, None, None)
+            .extract_subgraph(c, 2, &SubgraphOptions { direction: Direction::Incoming, ..Default::default() })
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b, c]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b, c]));
         assert_eq!(sg.edges.len(), 2);
 
         engine.close().unwrap();
@@ -6158,22 +5164,22 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(c, b, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(b, 1, Direction::Both, None, None)
+            .extract_subgraph(b, 1, &SubgraphOptions { direction: Direction::Both, ..Default::default() })
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b, c]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b, c]));
         assert_eq!(sg.edges.len(), 2);
 
         engine.close().unwrap();
@@ -6187,26 +5193,26 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(a, c, 2, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, c, 2, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, d, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, d, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 2, Direction::Outgoing, Some(&[1]), None)
+            .extract_subgraph(a, 2, &SubgraphOptions { edge_type_filter: Some(vec![1]), ..Default::default() })
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b, d]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b, d]));
         assert_eq!(sg.edges.len(), 2);
         // All edges should be type 1
         assert!(sg.edges.iter().all(|e| e.type_id == 1));
@@ -6225,24 +5231,24 @@
         };
         let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine.flush().unwrap();
 
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 2, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 2, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b, c]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b, c]));
         assert_eq!(sg.edges.len(), 2);
 
         engine.close().unwrap();
@@ -6255,24 +5261,24 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine.delete_node(b).unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 5, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 5, &SubgraphOptions::default())
             .unwrap();
 
         // B is deleted, so neighbors() won't return it; C unreachable
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a]));
         assert_eq!(sg.edges.len(), 0);
 
         engine.close().unwrap();
@@ -6285,23 +5291,23 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         let e1 = engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, c, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine.delete_edge(e1).unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 1, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 1, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, c]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, c]));
         assert_eq!(sg.edges.len(), 1);
 
         engine.close().unwrap();
@@ -6315,27 +5321,27 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, Some(100), Some(200))
+            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(200), ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, BTreeMap::new(), 1.0, Some(300), Some(400))
+            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(300), valid_to: Some(400), ..Default::default() })
             .unwrap();
 
         let sg_150 = engine
-            .extract_subgraph(a, 1, Direction::Outgoing, None, Some(150))
+            .extract_subgraph(a, 1, &SubgraphOptions { at_epoch: Some(150), ..Default::default() })
             .unwrap();
-        let node_ids_150: HashSet<u64> = sg_150.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids_150, HashSet::from([a, b]));
+        let node_ids_150: NodeIdSet = sg_150.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids_150, NodeIdSet::from_iter([a, b]));
 
         let sg_350 = engine
-            .extract_subgraph(a, 1, Direction::Outgoing, None, Some(350))
+            .extract_subgraph(a, 1, &SubgraphOptions { at_epoch: Some(350), ..Default::default() })
             .unwrap();
-        let node_ids_350: HashSet<u64> = sg_350.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids_350, HashSet::from([a, c]));
+        let node_ids_350: NodeIdSet = sg_350.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids_350, NodeIdSet::from_iter([a, c]));
 
         engine.close().unwrap();
     }
@@ -6347,23 +5353,23 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "hub", BTreeMap::new(), 1.0).unwrap();
-        let mut expected = HashSet::from([a]);
+        let a = engine.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
+        let mut expected = NodeIdSet::from_iter([a]);
         for i in 0..50 {
             let n = engine
-                .upsert_node(1, &format!("spoke_{}", i), BTreeMap::new(), 1.0)
+                .upsert_node(1, &format!("spoke_{}", i), UpsertNodeOptions::default())
                 .unwrap();
             engine
-                .upsert_edge(a, n, 1, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(a, n, 1, UpsertEdgeOptions::default())
                 .unwrap();
             expected.insert(n);
         }
 
         let sg = engine
-            .extract_subgraph(a, 1, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 1, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
         assert_eq!(node_ids, expected);
         assert_eq!(sg.edges.len(), 50);
 
@@ -6377,30 +5383,30 @@
         let db_path = dir.path().join("testdb");
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = engine.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        let e = engine.upsert_node(1, "e", BTreeMap::new(), 1.0).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let e = engine.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, d, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(d, e, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(d, e, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 2, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 2, &SubgraphOptions::default())
             .unwrap();
 
-        let node_ids: HashSet<u64> = sg.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(node_ids, HashSet::from([a, b, c]));
+        let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(node_ids, NodeIdSet::from_iter([a, b, c]));
         assert_eq!(sg.edges.len(), 2);
 
         engine.close().unwrap();
@@ -6415,18 +5421,18 @@
 
         let mut props_a = BTreeMap::new();
         props_a.insert("name".to_string(), PropValue::String("Alice".to_string()));
-        let a = engine.upsert_node(1, "a", props_a, 0.9).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { props: props_a, weight: 0.9, ..Default::default() }).unwrap();
 
         let mut props_b = BTreeMap::new();
         props_b.insert("name".to_string(), PropValue::String("Bob".to_string()));
-        let b = engine.upsert_node(2, "b", props_b, 0.7).unwrap();
+        let b = engine.upsert_node(2, "b", UpsertNodeOptions { props: props_b, weight: 0.7, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 1, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 1, Direction::Outgoing, None, None)
+            .extract_subgraph(a, 1, &SubgraphOptions::default())
             .unwrap();
 
         let node_a = sg.nodes.iter().find(|n| n.id == a).unwrap();
@@ -6453,18 +5459,18 @@
     fn test_neighbors_batch_basic() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
-            .neighbors_batch(&[a, b, c], Direction::Outgoing, None, None, None)
+            .neighbors_batch(&[a, b, c], &NeighborOptions::default())
             .unwrap();
         assert_eq!(result.get(&a).unwrap().len(), 2); // A→B, A→C
         assert_eq!(result.get(&b).unwrap().len(), 1); // B→C
@@ -6479,30 +5485,30 @@
         let mut ids = Vec::new();
         for i in 0..5 {
             ids.push(
-                db.upsert_node(1, &format!("n{}", i), BTreeMap::new(), 0.5)
+                db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
                     .unwrap(),
             );
         }
-        db.upsert_edge(ids[0], ids[1], 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(ids[0], ids[1], 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(ids[0], ids[2], 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(ids[0], ids[2], 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(ids[1], ids[2], 20, BTreeMap::new(), 3.0, None, None)
+        db.upsert_edge(ids[1], ids[2], 20, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(ids[2], ids[3], 10, BTreeMap::new(), 1.5, None, None)
+        db.upsert_edge(ids[2], ids[3], 10, UpsertEdgeOptions { weight: 1.5, ..Default::default() })
             .unwrap();
-        db.upsert_edge(ids[3], ids[4], 20, BTreeMap::new(), 0.5, None, None)
+        db.upsert_edge(ids[3], ids[4], 20, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
-        db.upsert_edge(ids[4], ids[0], 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(ids[4], ids[0], 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let batch = db
-            .neighbors_batch(&ids, Direction::Outgoing, None, None, None)
+            .neighbors_batch(&ids, &NeighborOptions::default())
             .unwrap();
 
         for &nid in &ids {
             let individual = db
-                .neighbors(nid, Direction::Outgoing, None, 0, None, None)
+                .neighbors(nid, &NeighborOptions::default())
                 .unwrap();
             let batch_entries = batch.get(&nid).cloned().unwrap_or_default();
             let mut ind_edge_ids: Vec<u64> = individual.iter().map(|e| e.edge_id).collect();
@@ -6518,16 +5524,16 @@
     fn test_neighbors_batch_with_type_filter() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 20, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
-            .neighbors_batch(&[a], Direction::Outgoing, Some(&[10]), None, None)
+            .neighbors_batch(&[a], &NeighborOptions { direction: Direction::Outgoing, type_filter: Some(vec![10]), ..Default::default() })
             .unwrap();
         assert_eq!(result.get(&a).unwrap().len(), 1);
         assert_eq!(result[&a][0].edge_type_id, 10);
@@ -6538,23 +5544,23 @@
     fn test_neighbors_batch_cross_segment() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, None, None)
+        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 0.5).unwrap();
-        db.upsert_edge(b, d, 10, BTreeMap::new(), 3.0, None, None)
+        let d = db.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(b, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let result = db
-            .neighbors_batch(&[a, b], Direction::Outgoing, None, None, None)
+            .neighbors_batch(&[a, b], &NeighborOptions::default())
             .unwrap();
         assert_eq!(result.get(&a).unwrap().len(), 2); // B (seg1) + C (seg2)
         assert_eq!(result.get(&b).unwrap().len(), 1); // D (memtable)
@@ -6565,22 +5571,22 @@
     fn test_neighbors_batch_dedup_across_sources() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Re-upsert same edge triple. Should dedup (triple lookup across segments)
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 5.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
 
         // Batch and individual MUST return the same results
         let result = db
-            .neighbors_batch(&[a], Direction::Outgoing, None, None, None)
+            .neighbors_batch(&[a], &NeighborOptions::default())
             .unwrap();
         let individual = db
-            .neighbors(a, Direction::Outgoing, None, 0, None, None)
+            .neighbors(a, &NeighborOptions::default())
             .unwrap();
         let batch_entries = result.get(&a).unwrap();
 
@@ -6597,20 +5603,20 @@
     fn test_neighbors_batch_respects_tombstones() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         db.delete_edge(e1).unwrap();
 
         let result = db
-            .neighbors_batch(&[a], Direction::Outgoing, None, None, None)
+            .neighbors_batch(&[a], &NeighborOptions::default())
             .unwrap();
         let entries = result.get(&a).unwrap();
         assert_eq!(entries.len(), 1);
@@ -6622,16 +5628,16 @@
     fn test_neighbors_batch_direction_both() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(c, b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
-            .neighbors_batch(&[b], Direction::Both, None, None, None)
+            .neighbors_batch(&[b], &NeighborOptions { direction: Direction::Both, ..Default::default() })
             .unwrap();
         let entries = result.get(&b).unwrap();
         assert_eq!(entries.len(), 2); // incoming from A and C
@@ -6642,19 +5648,19 @@
     fn test_neighbors_batch_self_loop_dedup() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         // Self-loop: A→A appears in both adj_out and adj_in
-        db.upsert_edge(a, a, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
-            .neighbors_batch(&[a], Direction::Both, None, None, None)
+            .neighbors_batch(&[a], &NeighborOptions { direction: Direction::Both, ..Default::default() })
             .unwrap();
         let individual = db
-            .neighbors(a, Direction::Both, None, 0, None, None)
+            .neighbors(a, &NeighborOptions { direction: Direction::Both, ..Default::default() })
             .unwrap();
 
         let batch_entries = result.get(&a).unwrap();
@@ -6673,7 +5679,7 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
         let result = db
-            .neighbors_batch(&[], Direction::Outgoing, None, None, None)
+            .neighbors_batch(&[], &NeighborOptions::default())
             .unwrap();
         assert!(result.is_empty());
     }
@@ -6682,17 +5688,17 @@
     fn test_neighbors_batch_unsorted_input() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, a, 10, BTreeMap::new(), 2.0, None, None)
+        db.upsert_edge(c, a, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
 
         // Input in reverse order. Batch method sorts internally
         let result = db
-            .neighbors_batch(&[c, a], Direction::Outgoing, None, None, None)
+            .neighbors_batch(&[c, a], &NeighborOptions::default())
             .unwrap();
         assert_eq!(result.get(&a).unwrap().len(), 1);
         assert_eq!(result.get(&c).unwrap().len(), 1);
@@ -6708,7 +5714,7 @@
         let mut node_ids = Vec::new();
         for i in 0..50 {
             node_ids.push(
-                db.upsert_node(1, &format!("n{}", i), BTreeMap::new(), 0.5)
+                db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
                     .unwrap(),
             );
         }
@@ -6716,23 +5722,11 @@
             let t1 = (i + 1) % 50;
             let t2 = (i + 25) % 50;
             db.upsert_edge(
-                node_ids[i],
-                node_ids[t1],
-                10,
-                BTreeMap::new(),
-                1.0,
-                None,
-                None,
+                node_ids[i], node_ids[t1], 10, UpsertEdgeOptions::default(),
             )
             .unwrap();
             db.upsert_edge(
-                node_ids[i],
-                node_ids[t2],
-                20,
-                BTreeMap::new(),
-                0.5,
-                None,
-                None,
+                node_ids[i], node_ids[t2], 20, UpsertEdgeOptions { weight: 0.5, ..Default::default() },
             )
             .unwrap();
         }
@@ -6743,24 +5737,18 @@
         for i in 0..10 {
             let t = (i + 5) % 50;
             db.upsert_edge(
-                node_ids[i],
-                node_ids[t],
-                30,
-                BTreeMap::new(),
-                0.3,
-                None,
-                None,
+                node_ids[i], node_ids[t], 30, UpsertEdgeOptions { weight: 0.3, ..Default::default() },
             )
             .unwrap();
         }
 
         let batch = db
-            .neighbors_batch(&node_ids, Direction::Outgoing, None, None, None)
+            .neighbors_batch(&node_ids, &NeighborOptions::default())
             .unwrap();
 
         for &nid in &node_ids {
             let individual = db
-                .neighbors(nid, Direction::Outgoing, None, 0, None, None)
+                .neighbors(nid, &NeighborOptions::default())
                 .unwrap();
             let batch_entries = batch.get(&nid).cloned().unwrap_or_default();
             let mut ind_ids: Vec<u64> = individual.iter().map(|e| e.edge_id).collect();
@@ -6783,25 +5771,25 @@
     fn test_self_loop_neighbors_outgoing() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, a, 10, BTreeMap::new(), 1.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let out = db
-            .neighbors(a, Direction::Outgoing, None, 0, None, None)
+            .neighbors(a, &NeighborOptions::default())
             .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].node_id, a);
 
         let inc = db
-            .neighbors(a, Direction::Incoming, None, 0, None, None)
+            .neighbors(a, &NeighborOptions { direction: Direction::Incoming, ..Default::default() })
             .unwrap();
         assert_eq!(inc.len(), 1);
         assert_eq!(inc[0].node_id, a);
 
         // Both direction should dedup the self-loop
         let both = db
-            .neighbors(a, Direction::Both, None, 0, None, None)
+            .neighbors(a, &NeighborOptions { direction: Direction::Both, ..Default::default() })
             .unwrap();
         assert_eq!(
             both.len(),
@@ -6815,14 +5803,14 @@
     fn test_self_loop_survives_flush_and_compact() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let e = db
-            .upsert_edge(a, a, 10, BTreeMap::new(), 2.5, None, None)
+            .upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
         // Add a second segment to enable compaction
-        let _b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let _b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
 
@@ -6832,7 +5820,7 @@
         assert_eq!(edge.weight, 2.5);
 
         let nbrs = db
-            .neighbors(a, Direction::Both, None, 0, None, None)
+            .neighbors(a, &NeighborOptions { direction: Direction::Both, ..Default::default() })
             .unwrap();
         assert_eq!(nbrs.len(), 1);
 
@@ -6850,12 +5838,12 @@
     fn test_self_loop_in_top_k() {
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, a, 10, BTreeMap::new(), 5.0, None, None)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
 
         let top = db
-            .top_k_neighbors(a, Direction::Outgoing, None, 10, ScoringMode::Weight, None)
+            .top_k_neighbors(a, 10, &TopKOptions::default())
             .unwrap();
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].node_id, a);
@@ -6875,15 +5863,15 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
         // a→b (w=2.0), a→c (w=3.0), b→c (w=1.5)
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None).unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 3.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.5, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 1.5, ..Default::default() }).unwrap();
 
         // Rebuild to pick up new edges (no mutation hooks in CP1)
         db.rebuild_degree_cache().unwrap();
@@ -6906,7 +5894,7 @@
         assert_eq!(ec.in_degree, 2);
         assert!((ec.in_weight_sum - 4.5).abs() < 1e-10);
 
-        // d has no edges — should not be in cache (returns ZERO)
+        // d has no edges. Should not be in cache (returns ZERO).
         let ed = db.degree_cache_entry(d);
         assert_eq!(ed.out_degree, 0);
         assert_eq!(ed.in_degree, 0);
@@ -6920,15 +5908,15 @@
         let path = dir.path().join("db");
         {
             let mut db = open_imm(&path);
-            let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-            db.upsert_edge(a, b, 10, BTreeMap::new(), 4.0, None, None).unwrap();
-            db.upsert_edge(b, a, 10, BTreeMap::new(), 2.5, None, None).unwrap();
+            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
+            db.upsert_edge(b, a, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() }).unwrap();
             db.flush().unwrap();
             db.close().unwrap();
         }
 
-        // Reopen — cache should be rebuilt from segments during open()
+        // Reopen. Cache should be rebuilt from segments during open().
         let db = open_imm(&path);
         let ea = db.degree_cache_entry(1);
         assert_eq!(ea.out_degree, 1);
@@ -6951,18 +5939,18 @@
         let path = dir.path().join("db");
         {
             let mut db = open_imm(&path);
-            let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-            let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
             // a→b in segment
-            db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
             // a→c in WAL (unflushed)
-            db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, None, None).unwrap();
+            db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
             db.close().unwrap();
         }
 
-        // Reopen — WAL replays a→c into memtable, segment has a→b
+        // Reopen. WAL replays a→c into memtable, segment has a→b.
         let db = open_imm(&path);
         let ea = db.degree_cache_entry(1);
         assert_eq!(ea.out_degree, 2); // a→b + a→c
@@ -6983,18 +5971,18 @@
         let path = dir.path().join("db");
         {
             let mut db = open_imm(&path);
-            let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-            let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-            let e1 = db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-            db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, None, None).unwrap();
+            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
             db.flush().unwrap();
-            // Delete one edge — tombstone in WAL
+            // Delete one edge. Tombstone in WAL.
             db.delete_edge(e1).unwrap();
             db.close().unwrap();
         }
 
-        // Reopen — segment has both edges, WAL has delete tombstone for e1
+        // Reopen. Segment has both edges, WAL has delete tombstone for e1.
         let db = open_imm(&path);
         let ea = db.degree_cache_entry(1);
         assert_eq!(ea.out_degree, 1); // only a→c survives
@@ -7015,16 +6003,16 @@
         let path = dir.path().join("db");
         {
             let mut db = open_imm(&path);
-            let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             // Self-loop on a
-            db.upsert_edge(a, a, 10, BTreeMap::new(), 3.0, None, None).unwrap();
+            db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
             // Normal edge a→b
-            db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
             db.close().unwrap();
         }
 
-        // Reopen — rebuild from WAL replay
+        // Reopen. Rebuild from WAL replay.
         let db = open_imm(&path);
         // Node IDs: a=1, b=2
         let ea = db.degree_cache_entry(1);
@@ -7038,9 +6026,9 @@
         assert_eq!(both_degree, 2);
 
         // Verify it matches the walk-based API
-        assert_eq!(db.degree(1, Direction::Both, None, None).unwrap(), both_degree);
-        assert_eq!(db.degree(1, Direction::Outgoing, None, None).unwrap(), ea.out_degree as u64);
-        assert_eq!(db.degree(1, Direction::Incoming, None, None).unwrap(), ea.in_degree as u64);
+        assert_eq!(db.degree(1, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), both_degree);
+        assert_eq!(db.degree(1, &DegreeOptions::default()).unwrap(), ea.out_degree as u64);
+        assert_eq!(db.degree(1, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), ea.in_degree as u64);
 
         db.close().unwrap();
     }
@@ -7056,40 +6044,40 @@
 
             let mut nodes = Vec::new();
             for i in 0..10 {
-                nodes.push(db.upsert_node(1, &format!("n{}", i), BTreeMap::new(), 1.0).unwrap());
+                nodes.push(db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default()).unwrap());
             }
 
             // Chain: 0→1→2→...→9
             for i in 0..9 {
-                db.upsert_edge(nodes[i], nodes[i + 1], 10, BTreeMap::new(), (i as f32) + 0.5, None, None).unwrap();
+                db.upsert_edge(nodes[i], nodes[i + 1], 10, UpsertEdgeOptions { weight: (i as f32) + 0.5, ..Default::default() }).unwrap();
             }
             // Hub: node 0 → all others (2..10)
             for i in 2..10 {
-                db.upsert_edge(nodes[0], nodes[i], 20, BTreeMap::new(), 1.0, None, None).unwrap();
+                db.upsert_edge(nodes[0], nodes[i], 20, UpsertEdgeOptions::default()).unwrap();
             }
             // Self-loop on node 5
-            db.upsert_edge(nodes[5], nodes[5], 10, BTreeMap::new(), 7.0, None, None).unwrap();
+            db.upsert_edge(nodes[5], nodes[5], 10, UpsertEdgeOptions { weight: 7.0, ..Default::default() }).unwrap();
 
             // Flush half to segments
             db.flush().unwrap();
 
             // Add edge in WAL (unflushed)
-            db.upsert_edge(nodes[9], nodes[0], 10, BTreeMap::new(), 0.1, None, None).unwrap();
+            db.upsert_edge(nodes[9], nodes[0], 10, UpsertEdgeOptions { weight: 0.1, ..Default::default() }).unwrap();
             db.close().unwrap();
         }
 
-        // Reopen — cache rebuilt from segments + WAL
+        // Reopen. Cache rebuilt from segments + WAL.
         let db = open_imm(&path);
 
         // Node IDs start at 1
         for nid in 1..=10 {
             let cache = db.degree_cache_entry(nid);
 
-            let walk_out_deg = db.degree(nid, Direction::Outgoing, None, None).unwrap();
-            let walk_in_deg = db.degree(nid, Direction::Incoming, None, None).unwrap();
-            let walk_both_deg = db.degree(nid, Direction::Both, None, None).unwrap();
-            let walk_out_w = db.sum_edge_weights(nid, Direction::Outgoing, None, None).unwrap();
-            let walk_in_w = db.sum_edge_weights(nid, Direction::Incoming, None, None).unwrap();
+            let walk_out_deg = db.degree(nid, &DegreeOptions::default()).unwrap();
+            let walk_in_deg = db.degree(nid, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap();
+            let walk_both_deg = db.degree(nid, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap();
+            let walk_out_w = db.sum_edge_weights(nid, &DegreeOptions::default()).unwrap();
+            let walk_in_w = db.sum_edge_weights(nid, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap();
 
             assert_eq!(cache.out_degree as u64, walk_out_deg,
                 "out_degree mismatch for node {}", nid);
@@ -7117,15 +6105,15 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         // Before any edges: cache should be empty for these nodes
         assert_eq!(db.degree_cache_entry(a).out_degree, 0);
         assert_eq!(db.degree_cache_entry(b).in_degree, 0);
 
         // Insert edge a→b
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.5, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() }).unwrap();
 
         let ea = db.degree_cache_entry(a);
         assert_eq!(ea.out_degree, 1);
@@ -7147,16 +6135,16 @@
         let opts = DbOptions { edge_uniqueness: true, ..Default::default() };
         let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         // Insert edge a→b with weight 2.0
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
         assert_eq!(db.degree_cache_entry(a).out_degree, 1);
         assert!((db.degree_cache_entry(a).out_weight_sum - 2.0).abs() < 1e-10);
 
         // Update same edge (same from, to, type_id) with weight 5.0
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 5.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() }).unwrap();
 
         // Degree should NOT change, only weight
         let ea = db.degree_cache_entry(a);
@@ -7175,10 +6163,10 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
-        let e1 = db.upsert_edge(a, b, 10, BTreeMap::new(), 3.0, None, None).unwrap();
+        let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
         assert_eq!(db.degree_cache_entry(a).out_degree, 1);
 
         // Delete the edge (still in memtable, not flushed)
@@ -7199,14 +6187,14 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
-        let e1 = db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None).unwrap();
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 3.0, None, None).unwrap();
+        let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
 
-        // Flush to segments — edges are now segment-only
+        // Flush to segments. Edges are now segment-only.
         db.flush().unwrap();
 
         assert_eq!(db.degree_cache_entry(a).out_degree, 2);
@@ -7229,21 +6217,21 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         // a→b, b→c, c→a (triangle)
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(c, a, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(c, a, 10, UpsertEdgeOptions::default()).unwrap();
 
         assert_eq!(db.degree_cache_entry(a).out_degree, 1);
         assert_eq!(db.degree_cache_entry(a).in_degree, 1);
         assert_eq!(db.degree_cache_entry(b).out_degree, 1);
         assert_eq!(db.degree_cache_entry(b).in_degree, 1);
 
-        // Delete node b — cascades: deletes a→b, b→c, then node b
+        // Delete node b. Cascades: deletes a→b, b→c, then node b.
         db.delete_node(b).unwrap();
 
         // a: lost outgoing a→b, still has incoming c→a
@@ -7269,11 +6257,11 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         // Insert self-loop on a
-        let sl = db.upsert_edge(a, a, 10, BTreeMap::new(), 4.0, None, None).unwrap();
+        let sl = db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
 
         let ea = db.degree_cache_entry(a);
         assert_eq!(ea.out_degree, 1);
@@ -7284,7 +6272,7 @@
         assert_eq!((ea.out_degree + ea.in_degree - ea.self_loop_count) as u64, 1);
 
         // Add normal edge a→b
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
 
         let ea2 = db.degree_cache_entry(a);
         assert_eq!(ea2.out_degree, 2);
@@ -7313,16 +6301,16 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
-        let e1 = db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
         db.delete_edge(e1).unwrap();
 
         let ea_after_first = db.degree_cache_entry(a);
         assert_eq!(ea_after_first.out_degree, 0);
 
-        // Delete again — should be idempotent
+        // Delete again. Should be idempotent.
         db.delete_edge(e1).unwrap();
 
         let ea_after_second = db.degree_cache_entry(a);
@@ -7343,55 +6331,55 @@
         {
             let mut db = open_imm(&path);
 
-            let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-            let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
             // Insert edges
-            let e1 = db.upsert_edge(a, b, 10, BTreeMap::new(), 2.0, None, None).unwrap();
-            db.upsert_edge(a, c, 10, BTreeMap::new(), 3.0, None, None).unwrap();
-            db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+            let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+            db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
+            db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
 
-            assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2);
-            assert_eq!(db.degree(a, Direction::Both, None, None).unwrap(), 2);
-            assert!((db.sum_edge_weights(a, Direction::Outgoing, None, None).unwrap() - 5.0).abs() < 1e-10);
+            assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
+            assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 2);
+            assert!((db.sum_edge_weights(a, &DegreeOptions::default()).unwrap() - 5.0).abs() < 1e-10);
 
             // Flush to segments
             db.flush().unwrap();
 
             // Degree should be unchanged after flush
-            assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2);
-            assert_eq!(db.degree(b, Direction::Both, None, None).unwrap(), 2);
+            assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
+            assert_eq!(db.degree(b, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 2);
 
             // Delete one edge
             db.delete_edge(e1).unwrap();
 
-            assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1);
-            assert_eq!(db.degree(b, Direction::Incoming, None, None).unwrap(), 0);
+            assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
+            assert_eq!(db.degree(b, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 0);
 
             // Add more edges and flush again for compaction
-            db.upsert_edge(c, a, 10, BTreeMap::new(), 4.0, None, None).unwrap();
+            db.upsert_edge(c, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
             db.flush().unwrap();
 
             // Compact
             db.compact().unwrap();
 
             // Degree should reflect post-compact state
-            assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 1); // a→c
-            assert_eq!(db.degree(a, Direction::Incoming, None, None).unwrap(), 1); // c→a
-            assert_eq!(db.degree(a, Direction::Both, None, None).unwrap(), 2);
-            assert_eq!(db.degree(c, Direction::Both, None, None).unwrap(), 3); // a→c(in) + b→c(in) + c→a(out)
+            assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1); // a→c
+            assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 1); // c→a
+            assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 2);
+            assert_eq!(db.degree(c, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 3); // a→c(in) + b→c(in) + c→a(out)
 
             db.close().unwrap();
         }
 
-        // Reopen — cache rebuilt from segments
+        // Reopen. Cache rebuilt from segments.
         {
             let db = open_imm(&path);
-            assert_eq!(db.degree(1, Direction::Outgoing, None, None).unwrap(), 1);
-            assert_eq!(db.degree(1, Direction::Incoming, None, None).unwrap(), 1);
-            assert_eq!(db.degree(1, Direction::Both, None, None).unwrap(), 2);
-            assert_eq!(db.degree(3, Direction::Both, None, None).unwrap(), 3);
+            assert_eq!(db.degree(1, &DegreeOptions::default()).unwrap(), 1);
+            assert_eq!(db.degree(1, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 1);
+            assert_eq!(db.degree(1, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 2);
+            assert_eq!(db.degree(3, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 3);
             db.close().unwrap();
         }
     }
@@ -7404,29 +6392,29 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         // a→b with type 10, a→c with type 20
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(a, c, 20, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default()).unwrap();
 
         // Unfiltered: both edges
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
 
         // Type-filtered: only type 10 (uses walk path, not cache)
-        assert_eq!(db.degree(a, Direction::Outgoing, Some(&[10]), None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![10]), ..Default::default() }).unwrap(), 1);
 
         // Type-filtered: only type 20
-        assert_eq!(db.degree(a, Direction::Outgoing, Some(&[20]), None).unwrap(), 1);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![20]), ..Default::default() }).unwrap(), 1);
 
         // Temporal: at_epoch=Some(now) should still work via walk
         let now = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        assert_eq!(db.degree(a, Direction::Outgoing, None, Some(now)).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, at_epoch: Some(now), ..Default::default() }).unwrap(), 2);
 
         db.close().unwrap();
     }
@@ -7441,19 +6429,19 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
-        // Timeless edge — cache should be used
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        // Timeless edge. Cache should be used.
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
         let entry_a = db.degree_cache_entry(a);
         assert_eq!(entry_a.temporal_edge_count, 0);
         assert_eq!(entry_a.out_degree, 1);
 
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         // Temporal edge (valid_to = now + 10 seconds)
         let future_expiry = now_millis() + 10_000;
-        db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, None, Some(future_expiry))
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
             .unwrap();
 
         // Node a now has temporal_edge_count > 0
@@ -7466,9 +6454,9 @@
         assert_eq!(entry_c.temporal_edge_count, 1);
 
         // degree() still returns correct answer (falls through to walk)
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 2);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
 
-        // Node b has no temporal edges — cache is safe for it
+        // Node b has no temporal edges. Cache is safe for it.
         let entry_b = db.degree_cache_entry(b);
         assert_eq!(entry_b.temporal_edge_count, 0);
     }
@@ -7479,12 +6467,12 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         let future_expiry = now_millis() + 10_000;
         let e = db
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, Some(future_expiry))
+            .upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
             .unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 1);
         assert_eq!(db.degree_cache_entry(b).temporal_edge_count, 1);
@@ -7503,16 +6491,16 @@
         let opts = DbOptions { edge_uniqueness: true, ..Default::default() };
         let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         let future_expiry = now_millis() + 10_000;
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, Some(future_expiry))
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
             .unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 1);
 
         // Re-upsert same edge with valid_to = None (timeless)
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 0);
         assert_eq!(db.degree_cache_entry(b).temporal_edge_count, 0);
     }
@@ -7523,10 +6511,10 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
-        let e = db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let e = db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 0);
 
         // Invalidate (sets valid_to to past → temporal + not valid)
@@ -7534,7 +6522,7 @@
         // temporal_edge_count should be 1 (edge has finite valid_to now)
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 1);
         // Degree should be 0 (edge is expired)
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 0);
     }
 
     #[test]
@@ -7544,11 +6532,11 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         let future_expiry = now_millis() + 10_000;
         let e = db
-            .upsert_edge(a, a, 10, BTreeMap::new(), 1.0, None, Some(future_expiry))
+            .upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
             .unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 1); // once, not twice
 
@@ -7564,15 +6552,15 @@
         let path = dir.path().join("db");
         {
             let mut db = open_imm(&path);
-            let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-            let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
             // Timeless edge
-            db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
             // Temporal edge
             let future = now_millis() + 100_000;
-            db.upsert_edge(a, c, 10, BTreeMap::new(), 2.0, None, Some(future))
+            db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, valid_from: None, valid_to: Some(future), ..Default::default() })
                 .unwrap();
             db.flush().unwrap();
             db.close().unwrap();
@@ -7596,18 +6584,18 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         // Already expired (valid_to = 1ms after epoch)
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, Some(1)).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(1), ..Default::default() }).unwrap();
 
         let entry = db.degree_cache_entry(a);
         assert_eq!(entry.out_degree, 0); // not counted (expired)
         assert_eq!(entry.temporal_edge_count, 1); // still tracked as temporal
 
         // degree() should return 0 (falls through to walk, which also says 0)
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 0);
     }
 
     #[test]
@@ -7619,12 +6607,12 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
         // Future-dated edge: valid_from = far future, valid_to = infinity
         let far_future = i64::MAX - 1_000_000;
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(far_future), None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(far_future), valid_to: None, ..Default::default() }).unwrap();
 
         let entry_a = db.degree_cache_entry(a);
         let entry_b = db.degree_cache_entry(b);
@@ -7638,8 +6626,8 @@
         assert_eq!(entry_b.temporal_edge_count, 1);
 
         // degree() returns 0 (walk path also says 0, edge not yet valid)
-        assert_eq!(db.degree(a, Direction::Outgoing, None, None).unwrap(), 0);
-        assert_eq!(db.degree(b, Direction::Incoming, None, None).unwrap(), 0);
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 0);
+        assert_eq!(db.degree(b, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 0);
 
         db.close().unwrap();
     }
@@ -7655,10 +6643,10 @@
         let b;
         {
             let mut db = open_imm(&path);
-            a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             let far_future = i64::MAX - 1_000_000;
-            db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(far_future), None).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(far_future), valid_to: None, ..Default::default() }).unwrap();
             db.flush().unwrap();
             db.close().unwrap();
         }
@@ -7681,20 +6669,20 @@
 
         let mut nodes = Vec::new();
         for i in 0..5 {
-            nodes.push(db.upsert_node(1, &format!("n{}", i), BTreeMap::new(), 1.0).unwrap());
+            nodes.push(db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default()).unwrap());
         }
 
         // Star topology: 0 → 1,2,3,4
         for i in 1..5 {
-            db.upsert_edge(nodes[0], nodes[i], 10, BTreeMap::new(), 1.0, None, None).unwrap();
+            db.upsert_edge(nodes[0], nodes[i], 10, UpsertEdgeOptions::default()).unwrap();
         }
         // Self-loop on node 2
-        db.upsert_edge(nodes[2], nodes[2], 10, BTreeMap::new(), 2.0, None, None).unwrap();
+        db.upsert_edge(nodes[2], nodes[2], 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
 
-        let batch = db.degrees(&nodes, Direction::Both, None, None).unwrap();
+        let batch = db.degrees(&nodes, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap();
 
         for &nid in &nodes {
-            let individual = db.degree(nid, Direction::Both, None, None).unwrap();
+            let individual = db.degree(nid, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap();
             let batch_deg = batch.get(&nid).copied().unwrap_or(0);
             assert_eq!(individual, batch_deg,
                 "batch vs individual mismatch for node {}", nid);
@@ -7710,14 +6698,14 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        // A — B — C (all connected via directed edges, WCC ignores direction)
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        // A - B - C (all connected via directed edges, WCC ignores direction)
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 3);
         // Component ID = min(node_id) = a
         let comp_id = comps[&a];
@@ -7733,19 +6721,19 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        // Component 1: A — B
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        // Component 1: A - B
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
 
-        // Component 2: C — D — E
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        let e = db.upsert_node(1, "e", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(d, e, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        // Component 2: C - D - E
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let e = db.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(d, e, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 5);
         assert_eq!(comps[&a], a); // min(a, b) = a
         assert_eq!(comps[&b], a);
@@ -7754,7 +6742,7 @@
         assert_eq!(comps[&e], c);
 
         // Two distinct component IDs
-        let unique_comps: HashSet<u64> = comps.values().copied().collect();
+        let unique_comps: NodeIdSet = comps.values().copied().collect();
         assert_eq!(unique_comps.len(), 2);
 
         db.close().unwrap();
@@ -7765,18 +6753,18 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        // No edges — each node is its own component.
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        // No edges. Each node is its own component.
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 3);
         assert_eq!(comps[&a], a);
         assert_eq!(comps[&b], b);
         assert_eq!(comps[&c], c);
 
-        let unique_comps: HashSet<u64> = comps.values().copied().collect();
+        let unique_comps: NodeIdSet = comps.values().copied().collect();
         assert_eq!(unique_comps.len(), 3);
 
         db.close().unwrap();
@@ -7787,12 +6775,12 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         // Self-loop on A, no connection to B.
-        db.upsert_edge(a, a, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 2);
         assert_eq!(comps[&a], a); // self-loop doesn't change membership
         assert_eq!(comps[&b], b);
@@ -7805,15 +6793,15 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         // Multiple edges between A and B shouldn't create multiple links.
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(a, b, 20, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, a, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 20, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, a, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 3);
         assert_eq!(comps[&a], a);
         assert_eq!(comps[&b], a); // same component
@@ -7827,17 +6815,17 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        // A — B — C
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let e1 = db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        // A - B - C
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
 
-        // Delete edge A—B: now A is isolated, B—C connected.
+        // Delete edge A-B: now A is isolated, B-C connected.
         db.delete_edge(e1).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps[&a], a); // isolated
         assert_ne!(comps[&a], comps[&b]); // different component
         assert_eq!(comps[&b], comps[&c]); // still connected
@@ -7845,7 +6833,7 @@
         // Delete node B: now B is gone, C is isolated.
         db.delete_node(b).unwrap();
 
-        let comps2 = db.connected_components(None, None, None).unwrap();
+        let comps2 = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps2.len(), 2); // only A and C
         assert!(!comps2.contains_key(&b));
         assert_eq!(comps2[&a], a);
@@ -7859,22 +6847,22 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        // Edge type 10: A — B
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        // Edge type 20: B — C
-        db.upsert_edge(b, c, 20, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        // Edge type 10: A - B
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        // Edge type 20: B - C
+        db.upsert_edge(b, c, 20, UpsertEdgeOptions::default()).unwrap();
 
-        // Filter by type 10 only: only A—B connected.
-        let comps = db.connected_components(Some(&[10]), None, None).unwrap();
+        // Filter by type 10 only: only A-B connected.
+        let comps = db.connected_components(&ComponentOptions { edge_type_filter: Some(vec![10]), ..Default::default() }).unwrap();
         assert_eq!(comps[&a], a);
         assert_eq!(comps[&b], a);
         assert_eq!(comps[&c], c); // isolated when type 20 excluded
 
-        // Filter by type 20 only: only B—C connected.
-        let comps2 = db.connected_components(Some(&[20]), None, None).unwrap();
+        // Filter by type 20 only: only B-C connected.
+        let comps2 = db.connected_components(&ComponentOptions { edge_type_filter: Some(vec![20]), ..Default::default() }).unwrap();
         assert_eq!(comps2[&a], a); // isolated when type 10 excluded
         assert_eq!(comps2[&b], comps2[&c]); // connected
 
@@ -7887,21 +6875,21 @@
         let mut db = open_imm(&dir.path().join("db"));
 
         // Type 1: A, B.  Type 2: C
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(2, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(2, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
 
         // Filter by node type 1: only A and B visible.
-        let comps = db.connected_components(None, Some(&[1]), None).unwrap();
+        let comps = db.connected_components(&ComponentOptions { node_type_filter: Some(vec![1]), ..Default::default() }).unwrap();
         assert_eq!(comps.len(), 2);
         assert_eq!(comps[&a], a);
         assert_eq!(comps[&b], a);
         assert!(!comps.contains_key(&c));
 
         // Filter by node type 2: only C visible, isolated.
-        let comps2 = db.connected_components(None, Some(&[2]), None).unwrap();
+        let comps2 = db.connected_components(&ComponentOptions { node_type_filter: Some(vec![2]), ..Default::default() }).unwrap();
         assert_eq!(comps2.len(), 1);
         assert_eq!(comps2[&c], c);
 
@@ -7913,17 +6901,17 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
 
         db.flush().unwrap();
 
         // Add more data in memtable after flush.
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         // All three in one component (segment edge + memtable edge).
         assert_eq!(comps[&a], a);
         assert_eq!(comps[&b], a);
@@ -7937,17 +6925,17 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
         db.compact().unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps[&a], a);
         assert_eq!(comps[&b], a);
         assert_eq!(comps[&c], a);
@@ -7962,20 +6950,20 @@
 
         {
             let mut db = open_imm(&db_path);
-            let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-            let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-            db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-            db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
             db.close().unwrap();
         }
 
         let db = open_imm(&db_path);
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 3);
         // All in one component.
-        let unique_comps: HashSet<u64> = comps.values().copied().collect();
+        let unique_comps: NodeIdSet = comps.values().copied().collect();
         assert_eq!(unique_comps.len(), 1);
     }
 
@@ -7984,7 +6972,7 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert!(comps.is_empty());
     }
 
@@ -7994,14 +6982,14 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
         // Only directed edges: A→B, C→B
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(c, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(c, b, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         // All three in one component (WCC ignores direction).
         let comp = comps[&a];
         assert_eq!(comps[&b], comp);
@@ -8016,15 +7004,15 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(c, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, a, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(c, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, a, 10, UpsertEdgeOptions::default()).unwrap();
 
-        // Run twice — must produce identical results.
-        let comps1 = db.connected_components(None, None, None).unwrap();
-        let comps2 = db.connected_components(None, None, None).unwrap();
+        // Run twice. Must produce identical results.
+        let comps1 = db.connected_components(&ComponentOptions::default()).unwrap();
+        let comps2 = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps1, comps2);
         // Component ID = min(a, b, c) = a.
         assert_eq!(comps1[&a], a);
@@ -8039,11 +7027,11 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.1).unwrap(); // low weight
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // low weight
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
 
         // Register prune policy that hides weight <= 0.5.
         db.set_prune_policy(
@@ -8055,7 +7043,7 @@
             },
         ).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         // B is hidden by prune policy, so A and C are each isolated.
         assert_eq!(comps.len(), 2);
         assert!(!comps.contains_key(&b));
@@ -8071,14 +7059,14 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 4);
         assert_eq!(comps[&a], a);
         assert_eq!(comps[&b], a);
@@ -8095,23 +7083,23 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
         // D is isolated.
 
-        let mut members = db.component_of(a, None, None, None).unwrap();
+        let mut members = db.component_of(a, &ComponentOptions::default()).unwrap();
         members.sort_unstable();
         assert_eq!(members, vec![a, b, c]);
 
-        let mut members_b = db.component_of(b, None, None, None).unwrap();
+        let mut members_b = db.component_of(b, &ComponentOptions::default()).unwrap();
         members_b.sort_unstable();
         assert_eq!(members_b, vec![a, b, c]);
 
-        let members_d = db.component_of(d, None, None, None).unwrap();
+        let members_d = db.component_of(d, &ComponentOptions::default()).unwrap();
         assert_eq!(members_d, vec![d]);
 
         db.close().unwrap();
@@ -8122,9 +7110,9 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
-        let members = db.component_of(99999, None, None, None).unwrap();
+        let members = db.component_of(99999, &ComponentOptions::default()).unwrap();
         assert!(members.is_empty());
 
         db.close().unwrap();
@@ -8135,16 +7123,16 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
         db.delete_node(a).unwrap();
 
-        let members = db.component_of(a, None, None, None).unwrap();
+        let members = db.component_of(a, &ComponentOptions::default()).unwrap();
         assert!(members.is_empty());
 
         // B is now isolated (its edge to A is broken).
-        let members_b = db.component_of(b, None, None, None).unwrap();
+        let members_b = db.component_of(b, &ComponentOptions::default()).unwrap();
         assert_eq!(members_b, vec![b]);
 
         db.close().unwrap();
@@ -8155,18 +7143,18 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(2, "b", BTreeMap::new(), 1.0).unwrap(); // type 2
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(2, "b", UpsertNodeOptions::default()).unwrap(); // type 2
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
 
         // Filter by type 1: B (type 2) is invisible, so A and C are isolated.
-        let members = db.component_of(a, None, Some(&[1]), None).unwrap();
+        let members = db.component_of(a, &ComponentOptions { node_type_filter: Some(vec![1]), ..Default::default() }).unwrap();
         assert_eq!(members, vec![a]);
 
         // Start from type 2 node with type 1 filter → empty.
-        let members_b = db.component_of(b, None, Some(&[1]), None).unwrap();
+        let members_b = db.component_of(b, &ComponentOptions { node_type_filter: Some(vec![1]), ..Default::default() }).unwrap();
         assert!(members_b.is_empty());
 
         db.close().unwrap();
@@ -8177,14 +7165,14 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 20, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 20, UpsertEdgeOptions::default()).unwrap();
 
-        // Filter by edge type 10: only A—B connected.
-        let members = db.component_of(a, Some(&[10]), None, None).unwrap();
+        // Filter by edge type 10: only A-B connected.
+        let members = db.component_of(a, &ComponentOptions { edge_type_filter: Some(vec![10]), ..Default::default() }).unwrap();
         assert_eq!(members, vec![a, b]);
 
         db.close().unwrap();
@@ -8195,15 +7183,15 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let members = db.component_of(a, None, None, None).unwrap();
+        let members = db.component_of(a, &ComponentOptions::default()).unwrap();
         assert_eq!(members, vec![a, b, c]);
 
         db.close().unwrap();
@@ -8214,18 +7202,18 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
         db.compact().unwrap();
 
-        let members = db.component_of(c, None, None, None).unwrap();
+        let members = db.component_of(c, &ComponentOptions::default()).unwrap();
         assert_eq!(members, vec![a, b, c]);
 
         db.close().unwrap();
@@ -8241,17 +7229,17 @@
 
         {
             let mut db = open_imm(&db_path);
-            a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-            b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-            c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-            db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-            db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
             db.close().unwrap();
         }
 
         let db = open_imm(&db_path);
-        let members = db.component_of(b, None, None, None).unwrap();
+        let members = db.component_of(b, &ComponentOptions::default()).unwrap();
         assert_eq!(members, vec![a, b, c]);
     }
 
@@ -8260,11 +7248,11 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 0.1).unwrap(); // low weight
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // low weight
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
 
         db.set_prune_policy(
             "low_weight",
@@ -8276,14 +7264,14 @@
         ).unwrap();
 
         // B is hidden → A and C are each isolated.
-        let members_a = db.component_of(a, None, None, None).unwrap();
+        let members_a = db.component_of(a, &ComponentOptions::default()).unwrap();
         assert_eq!(members_a, vec![a]);
 
-        let members_c = db.component_of(c, None, None, None).unwrap();
+        let members_c = db.component_of(c, &ComponentOptions::default()).unwrap();
         assert_eq!(members_c, vec![c]);
 
         // B is hidden → empty result.
-        let members_b = db.component_of(b, None, None, None).unwrap();
+        let members_b = db.component_of(b, &ComponentOptions::default()).unwrap();
         assert!(members_b.is_empty());
 
         db.close().unwrap();
@@ -8295,20 +7283,20 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        let e = db.upsert_node(1, "e", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(d, e, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let e = db.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(d, e, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
 
         // For each node, component_of should return the same set.
         for &node in &[a, b, c, d, e] {
-            let members = db.component_of(node, None, None, None).unwrap();
+            let members = db.component_of(node, &ComponentOptions::default()).unwrap();
             let comp_id = comps[&node];
             // All members should have the same component ID in comps.
             for &member in &members {
@@ -8330,22 +7318,22 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(2, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(b, c, 20, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, None, None).unwrap();
-        db.upsert_edge(a, d, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(2, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, 20, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, d, 10, UpsertEdgeOptions::default()).unwrap();
 
         // Node type filter = [1], edge type filter = [10]
         let ntf = Some(&[1u32][..]);
         let etf = Some(&[10u32][..]);
 
-        let comps = db.connected_components(etf, ntf, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions { edge_type_filter: etf.map(|s| s.to_vec()), node_type_filter: ntf.map(|s| s.to_vec()), ..Default::default() }).unwrap();
         for &node in &[a, c, d] {
-            let members = db.component_of(node, etf, ntf, None).unwrap();
+            let members = db.component_of(node, &ComponentOptions { edge_type_filter: etf.map(|s| s.to_vec()), node_type_filter: ntf.map(|s| s.to_vec()), ..Default::default() }).unwrap();
             let comp_id = comps[&node];
             for &member in &members {
                 assert_eq!(comps[&member], comp_id,
@@ -8364,10 +7352,10 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, a, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default()).unwrap();
 
-        let members = db.component_of(a, None, None, None).unwrap();
+        let members = db.component_of(a, &ComponentOptions::default()).unwrap();
         assert_eq!(members, vec![a]);
 
         db.close().unwrap();
@@ -8380,12 +7368,12 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
 
         // Starting from B, should still find A (Direction::Both in BFS).
-        let members = db.component_of(b, None, None, None).unwrap();
+        let members = db.component_of(b, &ComponentOptions::default()).unwrap();
         assert_eq!(members, vec![a, b]);
 
         db.close().unwrap();
@@ -8397,26 +7385,26 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-        let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
 
         let now = now_millis();
 
-        // A→B: valid window [0, 1000) — expired at `now` but valid at epoch 500
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(0), Some(1000)).unwrap();
+        // A→B: valid window [0, 1000). Expired at `now` but valid at epoch 500.
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(1000), ..Default::default() }).unwrap();
         // B→C: always valid
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
         // C→D: not yet valid (valid_from far in the future)
         let future = now + 100_000_000;
-        db.upsert_edge(c, d, 10, BTreeMap::new(), 1.0, Some(future), None).unwrap();
+        db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(future), valid_to: None, ..Default::default() }).unwrap();
 
         // With at_epoch=None (defaults to now):
         //   A→B expired → A isolated
         //   B→C valid → B and C connected
         //   C→D future → D isolated
-        let comps = db.connected_components(None, None, None).unwrap();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps[&a], a, "A should be isolated (expired edge)");
         assert_eq!(comps[&b], comps[&c], "B and C should be connected");
         assert_ne!(comps[&a], comps[&b], "A should not be in B-C component");
@@ -8425,7 +7413,7 @@
         // With at_epoch = 500 (inside the A→B validity window):
         //   A→B valid → connected
         //   B→C valid (valid_from defaults to created_at which is ≤ now, valid at 500
-        //     only if valid_from ≤ 500 — but valid_from=now which is >> 500)
+        //     only if valid_from ≤ 500, but valid_from=now which is >> 500)
         //   So at epoch 500, B→C is NOT valid because its valid_from = now >> 500.
         //   Use explicit valid_from=0 for the B→C edge to test properly.
         db.close().unwrap();
@@ -8434,22 +7422,22 @@
         let dir2 = TempDir::new().unwrap();
         let mut db2 = open_imm(&dir2.path().join("db"));
 
-        let a2 = db2.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b2 = db2.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c2 = db2.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a2 = db2.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b2 = db2.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c2 = db2.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         // A→B: valid [0, 1000)
-        db2.upsert_edge(a2, b2, 10, BTreeMap::new(), 1.0, Some(0), Some(1000)).unwrap();
+        db2.upsert_edge(a2, b2, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(1000), ..Default::default() }).unwrap();
         // B→C: valid [0, i64::MAX)
-        db2.upsert_edge(b2, c2, 10, BTreeMap::new(), 1.0, Some(0), None).unwrap();
+        db2.upsert_edge(b2, c2, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: None, ..Default::default() }).unwrap();
 
         // at_epoch=500: both edges valid → all connected
-        let comps_t500 = db2.connected_components(None, None, Some(500)).unwrap();
+        let comps_t500 = db2.connected_components(&ComponentOptions { at_epoch: Some(500), ..Default::default() }).unwrap();
         assert_eq!(comps_t500[&a2], comps_t500[&b2], "A-B connected at epoch 500");
         assert_eq!(comps_t500[&b2], comps_t500[&c2], "B-C connected at epoch 500");
 
         // at_epoch=2000: A→B expired → A isolated, B-C connected
-        let comps_t2000 = db2.connected_components(None, None, Some(2000)).unwrap();
+        let comps_t2000 = db2.connected_components(&ComponentOptions { at_epoch: Some(2000), ..Default::default() }).unwrap();
         assert_eq!(comps_t2000[&a2], a2, "A isolated at epoch 2000");
         assert_eq!(comps_t2000[&b2], comps_t2000[&c2], "B-C connected at epoch 2000");
         assert_ne!(comps_t2000[&a2], comps_t2000[&b2], "A not in B-C component at epoch 2000");
@@ -8463,25 +7451,25 @@
         let dir = TempDir::new().unwrap();
         let mut db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
 
         // A→B: valid [0, 1000)
-        db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(0), Some(1000)).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(1000), ..Default::default() }).unwrap();
         // B→C: always valid from epoch 0
-        db.upsert_edge(b, c, 10, BTreeMap::new(), 1.0, Some(0), None).unwrap();
+        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: None, ..Default::default() }).unwrap();
 
         // at_epoch=2000: A→B expired → A alone, B-C together.
-        let members_a = db.component_of(a, None, None, Some(2000)).unwrap();
+        let members_a = db.component_of(a, &ComponentOptions { at_epoch: Some(2000), ..Default::default() }).unwrap();
         assert_eq!(members_a, vec![a], "A isolated at epoch 2000");
 
-        let mut members_b = db.component_of(b, None, None, Some(2000)).unwrap();
+        let mut members_b = db.component_of(b, &ComponentOptions { at_epoch: Some(2000), ..Default::default() }).unwrap();
         members_b.sort_unstable();
         assert_eq!(members_b, vec![b, c], "B-C connected at epoch 2000");
 
         // at_epoch=500: A→B valid → all three connected.
-        let mut members_a_t500 = db.component_of(a, None, None, Some(500)).unwrap();
+        let mut members_a_t500 = db.component_of(a, &ComponentOptions { at_epoch: Some(500), ..Default::default() }).unwrap();
         members_a_t500.sort_unstable();
         assert_eq!(members_a_t500, vec![a, b, c], "A-B-C connected at epoch 500");
 

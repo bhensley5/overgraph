@@ -1,5 +1,6 @@
+use crate::dense_hnsw::exact_dense_search_above_cutoff;
 use crate::error::EngineError;
-use crate::manifest::{default_manifest, load_manifest, write_manifest};
+use crate::manifest::{default_manifest, load_manifest, load_manifest_readonly, write_manifest};
 use crate::memtable::Memtable;
 use crate::segment_reader::SegmentReader;
 use crate::segment_writer::{
@@ -7,15 +8,17 @@ use crate::segment_writer::{
     write_merged_nodes_dat, write_segment, write_v3_edges_dat, write_v3_nodes_dat, CompactEdgeMeta,
     CompactNodeMeta, FastMergeCopyInfo,
 };
+use crate::source_list::SourceList;
+use crate::sparse_postings::{accumulate_sparse_posting_scores, sparse_dot_score};
 use crate::types::*;
-use crate::wal::{truncate_wal, WalReader, WalWriter};
+use crate::wal::{remove_wal_generation, wal_generation_path, WalReader, WalWriter};
 use crate::wal_sync::{shutdown_sync_thread, sync_thread_loop, WalSyncState};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
@@ -130,7 +133,7 @@ fn merge_sorted_paged<T: Clone>(
 fn merge_type_ids_paged(
     memtable_ids: Vec<u64>,
     segment_sorted_ids: Vec<Vec<u64>>,
-    deleted: &HashSet<u64>,
+    deleted: &NodeIdSet,
     page: &PageRequest,
 ) -> PageResult<u64> {
     merge_sorted_paged(
@@ -149,8 +152,121 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
+fn reconcile_dense_vector_manifest(
+    manifest: &mut ManifestState,
+    options: &DbOptions,
+) -> Result<bool, EngineError> {
+    if let Some(config) = manifest.dense_vector.as_ref() {
+        validate_dense_vector_config(config)?;
+    }
+    if let Some(config) = options.dense_vector.as_ref() {
+        validate_dense_vector_config(config)?;
+    }
+
+    match (&manifest.dense_vector, &options.dense_vector) {
+        (Some(existing), Some(requested)) if existing != requested => {
+            Err(EngineError::InvalidOperation(format!(
+                "dense vector configuration mismatch: manifest has {:?}, open requested {:?}",
+                existing, requested
+            )))
+        }
+        (None, Some(requested)) => {
+            manifest.dense_vector = Some(requested.clone());
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn normalize_node_vectors_for_write(
+    dense_config: Option<&DenseVectorConfig>,
+    dense_vector: Option<&DenseVector>,
+    sparse_vector: Option<&SparseVector>,
+) -> Result<(Option<DenseVector>, Option<SparseVector>), EngineError> {
+    let dense_vector = match dense_vector {
+        Some(values) => {
+            let config = dense_config.ok_or_else(|| {
+                EngineError::InvalidOperation(
+                    "dense vector writes require DbOptions::dense_vector to be configured".into(),
+                )
+            })?;
+            validate_dense_vector(values, config)?;
+            Some(values.clone())
+        }
+        None => None,
+    };
+
+    let sparse_vector = match sparse_vector {
+        Some(values) => canonicalize_sparse_vector(values)?,
+        None => None,
+    };
+
+    Ok((dense_vector, sparse_vector))
+}
+
+fn normalize_owned_node_vectors_for_write(
+    dense_config: Option<&DenseVectorConfig>,
+    dense_vector: Option<DenseVector>,
+    sparse_vector: Option<SparseVector>,
+) -> Result<(Option<DenseVector>, Option<SparseVector>), EngineError> {
+    let dense_vector = match dense_vector {
+        Some(values) => {
+            let config = dense_config.ok_or_else(|| {
+                EngineError::InvalidOperation(
+                    "dense vector writes require DbOptions::dense_vector to be configured".into(),
+                )
+            })?;
+            validate_dense_vector(&values, config)?;
+            Some(values)
+        }
+        None => None,
+    };
+
+    let sparse_vector = match sparse_vector {
+        Some(values) => canonicalize_sparse_vector_owned(values)?,
+        None => None,
+    };
+
+    Ok((dense_vector, sparse_vector))
+}
+
+fn normalize_wal_op_for_write(
+    dense_config: Option<&DenseVectorConfig>,
+    op: &WalOp,
+) -> Result<WalOp, EngineError> {
+    match op {
+        WalOp::UpsertNode(node) => {
+            let (dense_vector, sparse_vector) = normalize_node_vectors_for_write(
+                dense_config,
+                node.dense_vector.as_ref(),
+                node.sparse_vector.as_ref(),
+            )?;
+            let mut normalized = node.clone();
+            normalized.dense_vector = dense_vector;
+            normalized.sparse_vector = sparse_vector;
+            Ok(WalOp::UpsertNode(normalized))
+        }
+        _ => Ok(op.clone()),
+    }
+}
+
+fn normalize_wal_op_for_replay(
+    dense_config: Option<&DenseVectorConfig>,
+    op: WalOp,
+) -> Result<WalOp, EngineError> {
+    normalize_wal_op_for_write(dense_config, &op).map_err(|err| match (&op, err) {
+        (WalOp::UpsertNode(node), EngineError::InvalidOperation(message)) => {
+            EngineError::CorruptWal(format!(
+                "invalid vector payload for replayed node {} (key={}): {}",
+                node.id, node.key, message
+            ))
+        }
+        (_, err) => err,
+    })
+}
+
 /// Returns true if an edge is valid (not expired, not future) at the given reference time.
-/// Same predicate used by `neighbors()` — extracted to prevent drift.
+/// Same predicate used by `neighbors()`. Extracted to prevent drift.
 #[inline]
 fn is_edge_valid_at(valid_from: i64, valid_to: i64, reference_time: i64) -> bool {
     valid_from <= reference_time && valid_to > reference_time
@@ -207,14 +323,18 @@ impl PrecomputedPruneCutoffs {
 
     /// Returns true if the node matches ANY registered policy (should be excluded).
     fn excludes(&self, node: &NodeRecord) -> bool {
-        for &(age_cutoff, max_weight, type_id) in &self.policies {
+        self.excludes_fields(node.type_id, node.updated_at, node.weight)
+    }
+
+    fn excludes_fields(&self, node_type_id: u32, updated_at: i64, weight: f32) -> bool {
+        for &(age_cutoff, max_weight, policy_type_id) in &self.policies {
             if matches_prune_cutoff(
-                node.type_id,
-                node.updated_at,
-                node.weight,
+                node_type_id,
+                updated_at,
+                weight,
                 age_cutoff,
                 max_weight,
-                type_id,
+                policy_type_id,
             ) {
                 return true;
             }
@@ -306,6 +426,8 @@ pub struct DatabaseEngine {
     wal_sync_mode: WalSyncMode,
     /// Hard cap on memtable size in bytes. Writes trigger a flush when exceeded. 0 = disabled.
     memtable_hard_cap: usize,
+    /// Maximum number of immutable memtables before writers block. 0 = disabled.
+    max_immutable_memtables: usize,
     /// In-progress background compaction, if any.
     bg_compact: Option<BgCompactHandle>,
     /// Timestamp of the last completed compaction (manual or background).
@@ -313,7 +435,43 @@ pub struct DatabaseEngine {
     /// Runtime degree cache: node_id → aggregate degree/weight stats.
     /// Accelerates unfiltered, non-temporal, no-policy degree queries to O(1).
     /// Rebuilt on open() and after compaction; updated incrementally on mutations.
-    degree_cache: HashMap<u64, DegreeEntry>,
+    degree_cache: NodeIdMap<DegreeEntry>,
+    /// Monotonic engine sequence counter. Incremented per WAL op.
+    /// Assigned to records and tombstones via `last_write_seq`.
+    engine_seq: u64,
+    /// Monotonic shared view of the next node ID. Used by publisher-thread
+    /// manifest writes so counters can never regress behind published segments.
+    next_node_id_seen: Arc<AtomicU64>,
+    /// Monotonic shared view of the next edge ID.
+    next_edge_id_seen: Arc<AtomicU64>,
+    /// Monotonic shared view of the latest durable engine_seq.
+    engine_seq_seen: Arc<AtomicU64>,
+    /// Serialize all manifest writes across engine, flush publisher, and compaction.
+    manifest_write_lock: Arc<Mutex<()>>,
+    /// Frozen memtable epochs awaiting or undergoing flush, newest-first.
+    /// Single source of truth: entries stay here until the output segment is
+    /// published, keeping frozen data visible to reads throughout the flush.
+    immutable_epochs: Vec<ImmutableEpoch>,
+    /// Cached sum of all immutable epoch memtable sizes. Updated on
+    /// freeze (add) and apply_bg_flush_result (remove) to avoid
+    /// iterating immutable_epochs on every write for backpressure checks.
+    immutable_bytes_total: usize,
+    /// Active WAL generation ID.
+    active_wal_generation_id: u64,
+    /// Handle for the persistent background flush worker thread.
+    bg_flush: Option<BgFlushHandle>,
+    /// Oldest unresolved flush pipeline error. Cleared when the same epoch
+    /// later publishes and is adopted successfully.
+    flush_pipeline_error: Option<FlushPipelineError>,
+    /// Whether the current sticky flush error has already been surfaced once.
+    flush_pipeline_error_reported: bool,
+    /// One-shot pause hook for the next enqueued flush (test only).
+    /// Wrapped in Mutex so DatabaseEngine stays Sync for scoped threads.
+    #[cfg(test)]
+    flush_pause: Mutex<Option<FlushPauseHook>>,
+    /// One-shot failure injection flag (test only).
+    #[cfg(test)]
+    flush_force_error: bool,
 }
 
 /// Captured pre-mutation edge state for degree cache updates.
@@ -350,7 +508,111 @@ struct BgCompactResult {
     reader: SegmentReader,
     old_seg_dirs: Vec<PathBuf>,
     stats: CompactionStats,
-    input_segment_ids: HashSet<u64>,
+    input_segment_ids: NodeIdSet,
+}
+
+/// Handle for the split async flush pipeline.
+struct BgFlushHandle {
+    /// Send frozen memtables + metadata to the build worker.
+    work_tx: std::sync::mpsc::Sender<BgFlushWork>,
+    /// Receive completed adoption or failure events. Mutex provides Sync.
+    event_rx: Mutex<std::sync::mpsc::Receiver<BgFlushEvent>>,
+    /// Build worker thread handle.
+    build_handle: Option<JoinHandle<()>>,
+    /// Publisher worker thread handle.
+    publish_handle: Option<JoinHandle<()>>,
+    /// Shared cancel flag for the whole pipeline.
+    cancel: Arc<AtomicBool>,
+    /// Number of completion events enqueued by the pipeline.
+    events_ready: Arc<AtomicUsize>,
+    /// Number of completion events consumed by the engine thread.
+    events_applied: usize,
+}
+
+/// Work item sent to the background build worker.
+struct BgFlushWork {
+    epoch_id: u64,
+    frozen: Arc<Memtable>,
+    seg_id: u64,
+    tmp_dir: PathBuf,
+    final_dir: PathBuf,
+    dense_config: Option<DenseVectorConfig>,
+    wal_gen_id: u64,
+    #[cfg(test)]
+    pause: Option<FlushPauseHook>,
+    #[cfg(test)]
+    force_write_error: bool,
+}
+
+/// Segment built durably on disk and ready for publisher-thread manifest work.
+struct BuiltFlushResult {
+    epoch_id: u64,
+    wal_gen_to_retire: u64,
+    seg_info: SegmentInfo,
+    seg_id: u64,
+    final_dir: PathBuf,
+    dense_config: Option<DenseVectorConfig>,
+}
+
+/// Cheap foreground-only adoption payload. No disk I/O remains at this stage.
+struct PublishedFlushAdoption {
+    epoch_id: u64,
+    wal_gen_to_retire: u64,
+    seg_info: SegmentInfo,
+    reader: SegmentReader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushPipelineStage {
+    Build,
+    PublishOpenReader,
+    PublishManifest,
+}
+
+#[derive(Debug, Clone)]
+struct FlushPipelineError {
+    epoch_id: u64,
+    wal_generation_id: u64,
+    stage: FlushPipelineStage,
+    message: String,
+}
+
+impl FlushPipelineError {
+    fn to_engine_error(&self) -> EngineError {
+        EngineError::InvalidOperation(format!(
+            "bg flush {:?} failed for epoch {} wal {}: {}",
+            self.stage, self.epoch_id, self.wal_generation_id, self.message
+        ))
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum BgFlushEvent {
+    Adopt(PublishedFlushAdoption),
+    Failed(FlushPipelineError),
+}
+
+/// A frozen memtable epoch awaiting (or undergoing) background flush.
+/// Stays visible to reads until the output segment is published and the
+/// epoch is retired. Single source of truth for frozen-memtable lifecycle.
+pub(crate) struct ImmutableEpoch {
+    /// Logical epoch identifier. Currently equal to `wal_generation_id` but
+    /// kept separate so epoch allocation can diverge from WAL generations
+    /// in the future without a data model change.
+    pub(crate) epoch_id: u64,
+    /// WAL generation that contains this epoch's data. Used to retire the
+    /// WAL file after the segment is published.
+    pub(crate) wal_generation_id: u64,
+    pub(crate) memtable: Arc<Memtable>,
+    pub(crate) in_flight: bool,
+}
+
+/// One-shot pause token consumed by exactly one BgFlushWork item.
+/// Worker signals `ready_tx` when paused, then blocks on `release_rx`.
+#[cfg(test)]
+struct FlushPauseHook {
+    ready_tx: std::sync::mpsc::SyncSender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,44 +634,167 @@ impl DatabaseEngine {
         }
 
         // Load or create manifest
-        let manifest = match load_manifest(path)? {
+        let loaded_manifest = load_manifest(path)?;
+        let created_manifest = loaded_manifest.is_none();
+        let mut manifest = match loaded_manifest {
             Some(m) => m,
-            None => {
-                let m = default_manifest();
-                write_manifest(path, &m)?;
-                m
-            }
+            None => default_manifest(),
+        };
+        let manifest_dirty = reconcile_dense_vector_manifest(&mut manifest, options)?;
+        if created_manifest || manifest_dirty {
+            write_manifest(path, &manifest)?;
         };
 
-        // Replay WAL to rebuild in-memory state
-        let wal_reader = WalReader::new(path);
-        let wal_ops = wal_reader.read_all()?;
-
-        let mut memtable = Memtable::new();
-        for op in wal_ops {
-            memtable.apply_op(&op);
+        // --- WAL generation migration ---
+        // If this is an old manifest (next_wal_generation_id == 0) and data.wal
+        // exists, migrate to WAL generation format by renaming data.wal → wal_0.wal.
+        let legacy_wal_path = path.join("data.wal");
+        let gen0_path = wal_generation_path(path, 0);
+        if manifest.next_wal_generation_id == 0
+            && manifest.active_wal_generation_id == 0
+            && manifest.pending_flush_epochs.is_empty()
+            && legacy_wal_path.exists()
+            && !gen0_path.exists()
+        {
+            std::fs::rename(&legacy_wal_path, &gen0_path)?;
         }
 
-        // Compute next IDs from max of manifest and replayed state
-        let next_node_id = manifest
+        // Ensure next_wal_generation_id is at least active + 1 and above any
+        // pending epoch generation IDs.
+        let mut max_gen = manifest.active_wal_generation_id;
+        for epoch in &manifest.pending_flush_epochs {
+            max_gen = max_gen.max(epoch.wal_generation_id);
+        }
+        manifest.next_wal_generation_id = manifest.next_wal_generation_id.max(max_gen + 1);
+
+        // --- Replay WAL generations ---
+        // Frozen epochs are replayed into separate immutable memtables so their
+        // WAL files and manifest entries are preserved. This prevents data loss
+        // on repeated crashes: if we folded frozen data into the active memtable
+        // and deleted the frozen WAL, a second crash before flush would lose it.
+        //
+        // Frozen epochs are replayed oldest-first (ascending gen ID) so that
+        // engine_seq increases monotonically. They become immutable_epochs
+        // (newest-first) and are flushed to segments through the normal pipeline.
+        //
+        // PublishedPendingRetire epochs are NOT replayed (data is in segments).
+        let mut frozen_epochs: Vec<(u64, u64)> = manifest
+            .pending_flush_epochs
+            .iter()
+            .filter(|e| e.state == FlushEpochState::FrozenPendingFlush)
+            .map(|e| (e.epoch_id, e.wal_generation_id))
+            .collect();
+        frozen_epochs.sort_unstable_by_key(|&(_, gen)| gen);
+
+        let mut engine_seq = manifest.next_engine_seq;
+        let mut immutable_epochs_on_open: Vec<ImmutableEpoch> = Vec::new();
+        let mut immutable_bytes_on_open: usize = 0;
+
+        for &(epoch_id, wal_gen_id) in &frozen_epochs {
+            let mut frozen_mt = Memtable::new();
+            let wal_records = WalReader::read_generation(path, wal_gen_id)?;
+            for (seq, op) in wal_records {
+                let op = normalize_wal_op_for_replay(manifest.dense_vector.as_ref(), op)?;
+                engine_seq = engine_seq.max(seq);
+                frozen_mt.apply_op(&op, seq);
+            }
+            immutable_bytes_on_open += frozen_mt.estimated_size();
+            // Newest-first: insert at front so older epochs are at the back.
+            immutable_epochs_on_open.insert(
+                0,
+                ImmutableEpoch {
+                    epoch_id,
+                    wal_generation_id: wal_gen_id,
+                    memtable: Arc::new(frozen_mt),
+                    in_flight: false,
+                },
+            );
+        }
+
+        // Replay active WAL generation into the active memtable.
+        // Use the persisted engine_seq from each WAL record (V3 format).
+        let mut memtable = Memtable::new();
+        let active_wal_records =
+            WalReader::read_generation(path, manifest.active_wal_generation_id)?;
+        for (seq, op) in active_wal_records {
+            let op = normalize_wal_op_for_replay(manifest.dense_vector.as_ref(), op)?;
+            engine_seq = engine_seq.max(seq);
+            memtable.apply_op(&op, seq);
+        }
+
+        // Compute next IDs from active memtable + immutable epochs + manifest.
+        let mut max_node_id = manifest
             .next_node_id
             .max(memtable.max_node_id().saturating_add(1));
-        let next_edge_id = manifest
+        let mut max_edge_id = manifest
             .next_edge_id
             .max(memtable.max_edge_id().saturating_add(1));
+        for epoch in &immutable_epochs_on_open {
+            max_node_id = max_node_id.max(epoch.memtable.max_node_id().saturating_add(1));
+            max_edge_id = max_edge_id.max(epoch.memtable.max_edge_id().saturating_add(1));
+        }
+        let next_node_id = max_node_id;
+        let next_edge_id = max_edge_id;
 
         // Load existing segments (newest-first for read merging).
         // Only segments listed in the manifest are opened. Orphan segment
         // directories (from a crash between segment write and manifest update)
         // are intentionally NOT loaded. Their data may be partial or corrupt.
         // Their IDs are still accounted for in next_segment_id below.
+        //
+        // If a PublishedPendingRetire epoch references a segment, that segment
+        // must exist and be readable on reopen. Otherwise we'd lose both the
+        // segment and the retained WAL recovery path.
         let mut segments = Vec::new();
         for seg_info in manifest.segments.iter().rev() {
             let seg_path = segment_dir(path, seg_info.id);
             if seg_path.exists() {
-                let reader = SegmentReader::open(&seg_path, seg_info.id)?;
+                let reader =
+                    SegmentReader::open(&seg_path, seg_info.id, manifest.dense_vector.as_ref())?;
                 segments.push(reader);
+            } else if manifest.pending_flush_epochs.iter().any(|e| {
+                e.state == FlushEpochState::PublishedPendingRetire
+                    && e.segment_id == Some(seg_info.id)
+            }) {
+                return Err(EngineError::InvalidOperation(format!(
+                    "manifest references published segment {} for pending flush recovery, but {} is missing",
+                    seg_info.id,
+                    seg_path.display()
+                )));
             }
+        }
+
+        // PublishedPendingRetire epochs: their segment is now verified live, so
+        // clean up the retained WAL generation file and remove the epoch entry.
+        let live_segment_ids: NodeIdSet = manifest.segments.iter().map(|s| s.id).collect();
+        let mut published_gen_ids = Vec::new();
+        for epoch in manifest
+            .pending_flush_epochs
+            .iter()
+            .filter(|e| e.state == FlushEpochState::PublishedPendingRetire)
+        {
+            let seg_id = epoch.segment_id.ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "PublishedPendingRetire epoch {} is missing segment_id",
+                    epoch.epoch_id
+                ))
+            })?;
+            if !live_segment_ids.contains(&seg_id) {
+                return Err(EngineError::InvalidOperation(format!(
+                    "PublishedPendingRetire epoch {} references segment {} that is not present in the manifest",
+                    epoch.epoch_id, seg_id
+                )));
+            }
+            published_gen_ids.push(epoch.wal_generation_id);
+        }
+        if !published_gen_ids.is_empty() {
+            manifest
+                .pending_flush_epochs
+                .retain(|e| e.state != FlushEpochState::PublishedPendingRetire);
+            for gen_id in &published_gen_ids {
+                let _ = remove_wal_generation(path, *gen_id);
+            }
+            write_manifest(path, &manifest)?;
         }
 
         // Compute next_segment_id from both manifest AND filesystem.
@@ -424,9 +809,10 @@ impl DatabaseEngine {
         // write and manifest update, or between bg compact output and apply).
         // Safe to delete. The manifest is the source of truth.
         cleanup_orphan_segments(path, &manifest);
+        cleanup_orphan_wal_files(path, &manifest);
 
-        // Open WAL writer for new appends
-        let wal_writer = WalWriter::open(path)?;
+        // Open WAL writer for the active generation
+        let wal_writer = WalWriter::open_generation(path, manifest.active_wal_generation_id)?;
 
         // Validate GroupCommit parameters
         if let WalSyncMode::GroupCommit {
@@ -480,6 +866,11 @@ impl DatabaseEngine {
             }
         };
 
+        let active_wal_generation_id = manifest.active_wal_generation_id;
+        let next_node_id_seen = Arc::new(AtomicU64::new(next_node_id));
+        let next_edge_id_seen = Arc::new(AtomicU64::new(next_edge_id));
+        let engine_seq_seen = Arc::new(AtomicU64::new(engine_seq));
+        let manifest_write_lock = Arc::new(Mutex::new(()));
         let mut engine = DatabaseEngine {
             db_dir: path.to_path_buf(),
             manifest,
@@ -499,9 +890,25 @@ impl DatabaseEngine {
             compacting: false,
             wal_sync_mode,
             memtable_hard_cap: options.memtable_hard_cap_bytes,
+            max_immutable_memtables: options.max_immutable_memtables,
             bg_compact: None,
             last_compaction_ms: None,
-            degree_cache: HashMap::new(),
+            degree_cache: NodeIdMap::default(),
+            engine_seq,
+            next_node_id_seen,
+            next_edge_id_seen,
+            engine_seq_seen,
+            manifest_write_lock,
+            immutable_epochs: immutable_epochs_on_open,
+            immutable_bytes_total: immutable_bytes_on_open,
+            active_wal_generation_id,
+            bg_flush: None,
+            flush_pipeline_error: None,
+            flush_pipeline_error_reported: false,
+            #[cfg(test)]
+            flush_pause: Mutex::new(None),
+            #[cfg(test)]
+            flush_force_error: false,
         };
 
         engine.rebuild_degree_cache()?;
@@ -509,19 +916,47 @@ impl DatabaseEngine {
         Ok(engine)
     }
 
-    /// Close the database cleanly. Syncs WAL and writes manifest.
-    /// Waits for any in-progress background compaction to finish.
+    /// Close the database cleanly. Freezes the active memtable (if non-empty),
+    /// flushes all pending immutable memtables to segments, waits for
+    /// background compaction, and writes the final manifest.
+    /// After close() returns, no immutable memtables or retained WAL
+    /// generations remain.
     pub fn close(mut self) -> Result<(), EngineError> {
+        self.try_apply_all_bg_flushes();
+        let mut first_error: Option<EngineError> = None;
+
+        if !self.memtable.is_empty() || !self.immutable_epochs.is_empty() {
+            if let Err(e) = self.flush() {
+                first_error = Some(e);
+            }
+        } else {
+            self.drain_bg_flush();
+        }
+
         self.wait_for_bg_compact();
-        self.close_inner()
+        for event in self.shutdown_bg_flush() {
+            let _ = self.process_bg_flush_event(event);
+        }
+        let close_result = self.close_inner();
+        match (first_error, close_result) {
+            (Some(err), _) => Err(err),
+            (None, Err(err)) => Err(err),
+            (None, Ok(())) => self.current_flush_pipeline_error().map_or(Ok(()), Err),
+        }
     }
 
     /// Close the database, cancelling any in-progress background compaction
-    /// instead of waiting for it to finish. Use this for fast shutdown when
+    /// instead of waiting for it to finish. Syncs the active WAL and persists
+    /// manifest with retained WAL generations. Use this for fast shutdown when
     /// you don't need the bg compaction result.
     pub fn close_fast(mut self) -> Result<(), EngineError> {
         self.cancel_bg_compact();
-        self.close_inner()
+        self.try_apply_all_bg_flushes();
+        for event in self.shutdown_bg_flush() {
+            let _ = self.process_bg_flush_event(event);
+        }
+        self.close_inner()?;
+        self.current_flush_pipeline_error().map_or(Ok(()), Err)
     }
 
     /// Shared close logic: sync WAL, write manifest.
@@ -538,10 +973,72 @@ impl DatabaseEngine {
                 }
             }
         }
-        self.manifest.next_node_id = self.next_node_id;
-        self.manifest.next_edge_id = self.next_edge_id;
-        write_manifest(&self.db_dir, &self.manifest)?;
-        Ok(())
+        let active_wal_generation_id = self.active_wal_generation_id;
+        self.with_runtime_manifest_write(|manifest| {
+            manifest.active_wal_generation_id = active_wal_generation_id;
+            Ok(())
+        })
+    }
+
+    /// Construct a `SourceList` over the current engine state.
+    fn sources(&self) -> SourceList<'_> {
+        SourceList {
+            active: &self.memtable,
+            immutable: &self.immutable_epochs,
+            segments: &self.segments,
+        }
+    }
+
+    fn update_next_node_id_seen(&self) {
+        self.next_node_id_seen
+            .fetch_max(self.next_node_id, Ordering::Release);
+    }
+
+    fn update_next_edge_id_seen(&self) {
+        self.next_edge_id_seen
+            .fetch_max(self.next_edge_id, Ordering::Release);
+    }
+
+    fn update_engine_seq_seen(&self) {
+        self.engine_seq_seen
+            .fetch_max(self.engine_seq, Ordering::Release);
+    }
+
+    fn merge_runtime_manifest_counters(&self, manifest: &mut ManifestState) {
+        manifest.next_node_id = manifest
+            .next_node_id
+            .max(self.next_node_id_seen.load(Ordering::Acquire));
+        manifest.next_edge_id = manifest
+            .next_edge_id
+            .max(self.next_edge_id_seen.load(Ordering::Acquire));
+        manifest.next_engine_seq = manifest
+            .next_engine_seq
+            .max(self.engine_seq_seen.load(Ordering::Acquire));
+    }
+
+    fn load_current_manifest_for_write(&self) -> Result<ManifestState, EngineError> {
+        let mut manifest = load_manifest_readonly(&self.db_dir)?
+            .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
+        manifest.next_wal_generation_id = manifest
+            .next_wal_generation_id
+            .max(self.manifest.next_wal_generation_id);
+        manifest.active_wal_generation_id = manifest
+            .active_wal_generation_id
+            .max(self.manifest.active_wal_generation_id);
+        Ok(manifest)
+    }
+
+    fn with_runtime_manifest_write<T>(
+        &mut self,
+        mutate: impl FnOnce(&mut ManifestState) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let _guard = self.manifest_write_lock.lock().unwrap();
+        let mut manifest = self.load_current_manifest_for_write()?;
+        let result = mutate(&mut manifest)?;
+        self.merge_runtime_manifest_counters(&mut manifest);
+        write_manifest(&self.db_dir, &manifest)?;
+        self.manifest = manifest;
+        Ok(result)
     }
 
     // --- Write path helpers ---
@@ -562,6 +1059,22 @@ impl DatabaseEngine {
         }
         if self.memtable.deleted_edges().contains_key(&id) {
             return Ok(None);
+        }
+        // Search immutable memtables (newest-first)
+        for epoch in &self.immutable_epochs {
+            if let Some(edge) = epoch.memtable.get_edge(id) {
+                return Ok(Some(EdgeCore {
+                    from: edge.from,
+                    to: edge.to,
+                    created_at: edge.created_at,
+                    weight: edge.weight,
+                    valid_from: edge.valid_from,
+                    valid_to: edge.valid_to,
+                }));
+            }
+            if epoch.memtable.deleted_edges().contains_key(&id) {
+                return Ok(None);
+            }
         }
         for seg in &self.segments {
             if seg.is_edge_deleted(id) {
@@ -739,7 +1252,7 @@ impl DatabaseEngine {
                                 edge.valid_to,
                             );
                         } else if new_temporal {
-                            // Not valid now but temporal — track so cache bypasses this node
+                            // Not valid now but temporal; track so cache bypasses this node
                             self.degree_cache_temporal_adjust(edge.from, edge.to, 1);
                         }
                     }
@@ -850,11 +1363,11 @@ impl DatabaseEngine {
                             old.valid_to,
                         );
                     } else if is_cache_bypass_edge(old.valid_from, old.valid_to, old.created_at) {
-                        // Edge wasn't valid but was temporal — remove tracking
+                        // Edge wasn't valid but was temporal; remove tracking
                         self.degree_cache_temporal_adjust(old.from, old.to, -1);
                     }
                 }
-                // If old_edge is None, edge doesn't exist — no cache update needed
+                // If old_edge is None, edge doesn't exist. No cache update needed
                 // (matches idempotent tombstone semantics)
             }
             WalOp::DeleteNode { id, .. } => {
@@ -870,24 +1383,52 @@ impl DatabaseEngine {
     }
 
     /// Internal helper that handles WAL append + memtable apply for both sync modes.
-    fn append_and_apply(&mut self, ops: &[WalOp]) -> Result<(), EngineError> {
-        self.wal_append(|w| w.append_batch(ops))?;
+    fn append_and_apply_normalized(&mut self, ops: &[WalOp]) -> Result<(), EngineError> {
+        // Assign sequences before WAL write so the WAL persists exact seqs.
+        let base_seq = self.engine_seq;
+        let sequenced: Vec<(u64, WalOp)> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| (base_seq + 1 + i as u64, op.clone()))
+            .collect();
+        self.wal_append(|w| w.append_batch(&sequenced))?;
         let now = now_millis();
-        for op in ops {
+        for (seq, op) in &sequenced {
+            self.engine_seq = *seq;
             let old_edge = self.capture_old_edge_for_cache(op, now);
-            self.memtable.apply_op(op);
+            self.memtable.apply_op(op, *seq);
             self.update_degree_cache_for_op(op, old_edge, now);
         }
+        self.update_engine_seq_seen();
+        Ok(())
+    }
+
+    /// Internal helper that validates/canonicalizes node vectors before append/apply.
+    fn append_and_apply(&mut self, ops: &[WalOp]) -> Result<(), EngineError> {
+        let normalized_ops: Vec<WalOp> = ops
+            .iter()
+            .map(|op| normalize_wal_op_for_write(self.manifest.dense_vector.as_ref(), op))
+            .collect::<Result<_, _>>()?;
+        self.append_and_apply_normalized(&normalized_ops)
+    }
+
+    /// Internal helper for a single pre-normalized WAL op.
+    fn append_and_apply_one_normalized(&mut self, op: &WalOp) -> Result<(), EngineError> {
+        let seq = self.engine_seq + 1;
+        self.wal_append(|w| w.append(op, seq))?;
+        self.engine_seq = seq;
+        let now = now_millis();
+        let old_edge = self.capture_old_edge_for_cache(op, now);
+        self.memtable.apply_op(op, seq);
+        self.update_degree_cache_for_op(op, old_edge, now);
+        self.update_engine_seq_seen();
         Ok(())
     }
 
     /// Internal helper for a single WAL op (avoids vec allocation for common case).
     fn append_and_apply_one(&mut self, op: &WalOp) -> Result<(), EngineError> {
-        self.wal_append(|w| w.append(op))?;
-        let now = now_millis();
-        let old_edge = self.capture_old_edge_for_cache(op, now);
-        self.memtable.apply_op(op);
-        self.update_degree_cache_for_op(op, old_edge, now);
+        let normalized = normalize_wal_op_for_write(self.manifest.dense_vector.as_ref(), op)?;
+        self.append_and_apply_one_normalized(&normalized)?;
         Ok(())
     }
 
@@ -970,29 +1511,17 @@ impl DatabaseEngine {
 
     // --- Flush pipeline ---
 
-    /// Flush the current memtable to an immutable on-disk segment.
+    /// Freeze the active memtable: sync the current WAL generation, allocate a
+    /// new WAL generation, record the frozen epoch in the manifest, open a new
+    /// WAL writer, and move the active memtable to the immutable queue.
     ///
-    /// 1. Freeze current memtable, replace with empty one
-    /// 2. Write segment to tmp directory
-    /// 3. Atomic rename tmp → final
-    /// 4. Update manifest with new segment
-    /// 5. Truncate WAL
-    /// 6. Re-open WAL writer (Immediate) or truncate-and-reset (GroupCommit)
-    /// 7. Open segment reader for the new segment
-    ///
-    /// Returns the new SegmentInfo, or None if memtable was empty.
-    pub fn flush(&mut self) -> Result<Option<SegmentInfo>, EngineError> {
-        // Pick up any completed background compaction before proceeding.
-        self.try_complete_bg_compact();
-
+    /// No-op if the active memtable is empty.
+    pub(crate) fn freeze_memtable(&mut self) -> Result<(), EngineError> {
         if self.memtable.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
 
-        // Sync WAL before flush to ensure all ops are durable.
-        // In GroupCommit mode, only sync here. Truncation happens AFTER the
-        // segment + manifest are written to disk (see below), to avoid data loss
-        // if a crash occurs between WAL truncation and segment write.
+        // 1. Sync current active WAL generation
         match &self.wal_sync_mode {
             WalSyncMode::Immediate => {
                 self.wal_writer_immediate
@@ -1013,108 +1542,486 @@ impl DatabaseEngine {
                     state.sync_error_count = 0;
                     cvar.notify_all();
                 }
-                // Lock released here. Safe because &mut self prevents concurrent writes
             }
         }
+        self.update_engine_seq_seen();
 
-        // Freeze memtable: swap in empty, keep frozen for restore on failure
-        let frozen = std::mem::take(&mut self.memtable);
+        // 2. Allocate new WAL generation
+        let old_wal_gen = self.active_wal_generation_id;
+        let epoch_id = old_wal_gen;
+        let new_wal_gen = self.with_runtime_manifest_write(|manifest| {
+            let new_wal_gen = manifest.next_wal_generation_id;
+            manifest.next_wal_generation_id = new_wal_gen + 1;
+            manifest.pending_flush_epochs.push(FlushEpochMeta {
+                epoch_id,
+                wal_generation_id: old_wal_gen,
+                state: FlushEpochState::FrozenPendingFlush,
+                segment_id: None,
+            });
+            manifest.active_wal_generation_id = new_wal_gen;
+            Ok(new_wal_gen)
+        })?;
 
-        let seg_id = self.next_segment_id;
-        self.next_segment_id += 1;
-
-        let tmp_dir = segment_tmp_dir(&self.db_dir, seg_id);
-        let final_dir = segment_dir(&self.db_dir, seg_id);
-
-        // Ensure segments/ directory exists
-        let segments_dir = self.db_dir.join("segments");
-        if let Err(e) = std::fs::create_dir_all(&segments_dir) {
-            self.memtable = frozen;
-            self.next_segment_id -= 1;
-            return Err(e.into());
-        }
-
-        // Write segment files to tmp directory
-        let seg_info = match write_segment(&tmp_dir, seg_id, &frozen) {
-            Ok(info) => info,
-            Err(e) => {
-                self.memtable = frozen;
-                self.next_segment_id -= 1;
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(e);
-            }
-        };
-
-        // Atomic rename tmp → final
-        if let Err(e) = std::fs::rename(&tmp_dir, &final_dir) {
-            self.memtable = frozen;
-            self.next_segment_id -= 1;
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(e.into());
-        }
-
-        // Update manifest
-        self.manifest.segments.push(seg_info.clone());
-        self.manifest.next_node_id = self.next_node_id;
-        self.manifest.next_edge_id = self.next_edge_id;
-        write_manifest(&self.db_dir, &self.manifest)?;
-
-        // Truncate WAL (all data now safe in segment + manifest).
-        // This MUST happen after the manifest is durable. Otherwise a crash
-        // between WAL truncation and manifest write would lose data.
+        // 4. Open new WAL writer (after manifest is durable)
         match &self.wal_sync_mode {
             WalSyncMode::Immediate => {
-                truncate_wal(&self.db_dir)?;
-                self.wal_writer_immediate = Some(WalWriter::open(&self.db_dir)?);
+                self.wal_writer_immediate =
+                    Some(WalWriter::open_generation(&self.db_dir, new_wal_gen)?);
             }
             WalSyncMode::GroupCommit { .. } => {
-                // Hold the lock across truncate_and_reset to prevent the sync thread
-                // from accessing a stale/mid-truncate writer handle.
                 let arc = self.wal_state.as_ref().expect("group commit WAL state");
-                let (lock, cvar) = &**arc;
+                let (lock, _cvar) = &**arc;
                 let mut state = lock.lock().unwrap();
-                state.wal_writer.truncate_and_reset()?;
-                cvar.notify_all();
+                state.wal_writer = WalWriter::open_generation(&self.db_dir, new_wal_gen)?;
             }
         }
 
-        // Open segment reader (newest-first: insert at front)
-        let reader = SegmentReader::open(&final_dir, seg_id)?;
-        self.segments.insert(0, reader);
+        // 5. Swap memtable to immutable queue (newest-first = insert at front)
+        self.active_wal_generation_id = new_wal_gen;
+        let frozen = std::mem::take(&mut self.memtable);
+        let frozen_size = frozen.estimated_size();
+        self.immutable_epochs.insert(
+            0,
+            ImmutableEpoch {
+                epoch_id: old_wal_gen,
+                wal_generation_id: old_wal_gen,
+                memtable: Arc::new(frozen),
+                in_flight: false,
+            },
+        );
+        self.immutable_bytes_total += frozen_size;
 
-        // Auto-compact: track flushes and trigger background compaction when
-        // threshold is reached. Skip when we're already inside a sync compact()
-        // call (re-entry guard) or when a background compaction is in progress.
-        if !self.compacting && self.bg_compact.is_none() && self.compact_after_n_flushes > 0 {
-            self.flush_count_since_last_compact += 1;
-            if self.flush_count_since_last_compact >= self.compact_after_n_flushes
-                && self.segments.len() >= 2
-            {
-                let _ = self.start_bg_compact();
-            }
-        }
-
-        Ok(Some(seg_info))
+        Ok(())
     }
 
-    /// Check if the memtable should be flushed based on size threshold.
+    /// Flush the current memtable to an immutable on-disk segment.
+    ///
+    /// 1. Apply any already-completed background flush results
+    /// 2. Freeze current memtable (sync WAL, allocate new WAL generation)
+    /// 3. Enqueue all pending immutable epochs to the background flush worker
+    /// 4. Wait for all in-flight flushes to complete and publish results
+    ///
+    /// Returns the last SegmentInfo written, or None if memtable was empty.
+    /// On worker failure, returns `Err` and failed epochs remain in
+    /// `immutable_epochs` with `in_flight = false`. Data is safe (WAL
+    /// retained for replay on reopen). A subsequent `flush()` call will
+    /// re-enqueue and retry the failed epochs.
+    pub fn flush(&mut self) -> Result<Option<SegmentInfo>, EngineError> {
+        self.try_complete_bg_compact();
+        self.try_apply_all_bg_flushes();
+
+        if self.memtable.is_empty() && self.immutable_epochs.is_empty() {
+            return self.current_flush_pipeline_error().map_or(Ok(None), Err);
+        }
+
+        if !self.memtable.is_empty() {
+            self.freeze_memtable()?;
+        }
+
+        if self.immutable_epochs.is_empty() {
+            return self.current_flush_pipeline_error().map_or(Ok(None), Err);
+        }
+
+        self.ensure_bg_flush_worker();
+        self.enqueue_all_non_in_flight()?;
+
+        let mut last_seg_info = None;
+        while self.immutable_epochs.iter().any(|e| e.in_flight) {
+            match self.wait_for_one_flush() {
+                Ok(Some(info)) => {
+                    last_seg_info = Some(info);
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if let Some(err) = self.current_flush_pipeline_error() {
+            return Err(err);
+        }
+        Ok(last_seg_info)
+    }
+
+    /// Total buffered memtable bytes: active + all immutables.
+    fn total_memtable_bytes(&self) -> usize {
+        self.memtable.estimated_size() + self.immutable_bytes_total
+    }
+
+    /// Check if the active memtable should be frozen based on size threshold.
     /// Called automatically after writes when flush_threshold > 0.
+    /// Only the active memtable size is checked; immutable epochs are already
+    /// queued for the bg worker and handled by backpressure separately.
     fn maybe_auto_flush(&mut self) -> Result<(), EngineError> {
+        self.try_apply_all_bg_flushes();
+        self.maybe_surface_or_retry_flush_pipeline_error()?;
         if self.flush_threshold > 0 && self.memtable.estimated_size() >= self.flush_threshold {
-            self.flush()?;
+            if !self.memtable.is_empty() {
+                self.freeze_memtable()?;
+            }
+            self.ensure_bg_flush_worker();
+            self.enqueue_all_non_in_flight()?;
+            // Return immediately, no waiting! Data stays visible in immutable_epochs.
         }
         Ok(())
     }
 
-    /// Check if the memtable has reached the hard cap. If so, trigger a
-    /// synchronous flush before allowing the next write to proceed.
-    /// This is the backpressure mechanism: writes "block" (flush inline) when
-    /// the memtable is at capacity, preventing unbounded memory growth.
+    /// Check if the total buffered memtable bytes have reached the hard cap
+    /// or the immutable memtable count exceeds `max_immutable_memtables`.
+    /// If so, wait for one pending flush to complete (or freeze + enqueue one
+    /// if nothing is in flight) before allowing the next write to proceed.
+    /// Only drains enough to relieve pressure, not everything. This matches the
+    /// RocksDB/WiredTiger approach of spreading backpressure cost across
+    /// writes instead of punishing one unlucky writer with a full drain.
     fn maybe_backpressure_flush(&mut self) -> Result<(), EngineError> {
-        if self.memtable_hard_cap > 0 && self.memtable.estimated_size() >= self.memtable_hard_cap {
-            self.flush()?;
+        self.try_apply_all_bg_flushes();
+        self.maybe_surface_or_retry_flush_pipeline_error()?;
+        let bytes_exceeded =
+            self.memtable_hard_cap > 0 && self.total_memtable_bytes() >= self.memtable_hard_cap;
+        let count_exceeded = self.max_immutable_memtables > 0
+            && self.immutable_epochs.len() >= self.max_immutable_memtables;
+        if bytes_exceeded || count_exceeded {
+            if self.immutable_epochs.iter().any(|e| e.in_flight) {
+                // Work is already in flight; wait for one to complete.
+                self.wait_for_one_flush()?;
+            } else if !self.immutable_epochs.is_empty() {
+                // Immutables queued but not yet sent to worker. Enqueue and wait.
+                self.ensure_bg_flush_worker();
+                self.enqueue_flush()?;
+                self.wait_for_one_flush()?;
+            } else {
+                // Only active memtable is large. Freeze it, enqueue, wait.
+                self.freeze_memtable()?;
+                self.ensure_bg_flush_worker();
+                self.enqueue_flush()?;
+                self.wait_for_one_flush()?;
+            }
         }
         Ok(())
+    }
+
+    // --- Background flush ---
+
+    /// Lazily start the persistent background flush worker thread.
+    fn ensure_bg_flush_worker(&mut self) {
+        if self.bg_flush.is_some() {
+            return;
+        }
+        let (work_tx, work_rx) = std::sync::mpsc::channel();
+        let (built_tx, built_rx) = std::sync::mpsc::sync_channel(1);
+        let event_cap = self.max_immutable_memtables.max(4) + 1;
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(event_cap);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let events_ready = Arc::new(AtomicUsize::new(0));
+
+        let build_cancel = Arc::clone(&cancel);
+        let build_events_ready = Arc::clone(&events_ready);
+        let build_event_tx = event_tx.clone();
+        let build_handle = std::thread::spawn(move || {
+            bg_flush_build_worker(
+                work_rx,
+                built_tx,
+                build_event_tx,
+                build_cancel,
+                build_events_ready,
+            );
+        });
+
+        let publish_cancel = Arc::clone(&cancel);
+        let publish_events_ready = Arc::clone(&events_ready);
+        let db_dir = self.db_dir.clone();
+        let manifest_write_lock = Arc::clone(&self.manifest_write_lock);
+        let next_node_id_seen = Arc::clone(&self.next_node_id_seen);
+        let next_edge_id_seen = Arc::clone(&self.next_edge_id_seen);
+        let engine_seq_seen = Arc::clone(&self.engine_seq_seen);
+        let publish_handle = std::thread::spawn(move || {
+            bg_flush_publish_worker(
+                db_dir,
+                built_rx,
+                event_tx,
+                manifest_write_lock,
+                next_node_id_seen,
+                next_edge_id_seen,
+                engine_seq_seen,
+                publish_cancel,
+                publish_events_ready,
+            );
+        });
+
+        self.bg_flush = Some(BgFlushHandle {
+            work_tx,
+            event_rx: Mutex::new(event_rx),
+            build_handle: Some(build_handle),
+            publish_handle: Some(publish_handle),
+            cancel,
+            events_ready,
+            events_applied: 0,
+        });
+    }
+
+    /// Find the oldest non-in-flight epoch, mark it in-flight, and send it
+    /// to the background build worker. The epoch stays in `immutable_epochs`
+    /// until a later cheap adoption event removes it after durable publish.
+    fn enqueue_flush(&mut self) -> Result<(), EngineError> {
+        let bg = self
+            .bg_flush
+            .as_ref()
+            .expect("bg flush worker must be running before enqueue");
+
+        // Find oldest non-in-flight epoch (last in vec since newest-first)
+        let epoch_idx = self
+            .immutable_epochs
+            .iter()
+            .rposition(|e| !e.in_flight)
+            .expect("enqueue_flush: no non-in-flight epoch available");
+
+        let epoch_id = self.immutable_epochs[epoch_idx].epoch_id;
+        let wal_gen_id = self.immutable_epochs[epoch_idx].wal_generation_id;
+        let frozen = Arc::clone(&self.immutable_epochs[epoch_idx].memtable);
+
+        let seg_id = self.next_segment_id;
+
+        let segments_dir = self.db_dir.join("segments");
+        std::fs::create_dir_all(&segments_dir)?;
+
+        let work = BgFlushWork {
+            epoch_id,
+            frozen,
+            seg_id,
+            tmp_dir: segment_tmp_dir(&self.db_dir, seg_id),
+            final_dir: segment_dir(&self.db_dir, seg_id),
+            dense_config: self.manifest.dense_vector.clone(),
+            wal_gen_id,
+            #[cfg(test)]
+            pause: self.flush_pause.lock().unwrap().take(),
+            #[cfg(test)]
+            force_write_error: {
+                let err = self.flush_force_error;
+                self.flush_force_error = false;
+                err
+            },
+        };
+
+        bg.work_tx
+            .send(work)
+            .map_err(|_| EngineError::InvalidOperation("bg flush worker died".into()))?;
+
+        // Commit state only after all fallible operations succeed.
+        // Setting in_flight before send would create a phantom in-flight epoch
+        // if send fails, because the drain loop would deadlock waiting for a result
+        // that will never arrive.
+        self.immutable_epochs[epoch_idx].in_flight = true;
+        self.next_segment_id += 1;
+        Ok(())
+    }
+
+    /// Enqueue all non-in-flight immutable epochs to the background flush worker.
+    fn enqueue_all_non_in_flight(&mut self) -> Result<(), EngineError> {
+        while self.immutable_epochs.iter().any(|e| !e.in_flight) {
+            self.enqueue_flush()?;
+        }
+        Ok(())
+    }
+
+    /// Non-blocking: drain all completed flush results.
+    fn try_apply_all_bg_flushes(&mut self) {
+        loop {
+            let event = {
+                let bg = match self.bg_flush.as_ref() {
+                    Some(bg) => bg,
+                    None => return,
+                };
+                let ready = bg.events_ready.load(Ordering::Acquire);
+                if ready <= bg.events_applied {
+                    return;
+                }
+                let rx = bg.event_rx.lock().unwrap();
+                match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(_) => return,
+                }
+            };
+            if let Some(bg) = self.bg_flush.as_mut() {
+                bg.events_applied += 1;
+            }
+            match self.process_bg_flush_event(event) {
+                Ok(_) => {}
+                Err(e) => eprintln!("try_apply_all_bg_flushes: {}", e),
+            }
+        }
+    }
+
+    /// Blocking: wait for one flush result from the background worker.
+    fn wait_for_one_flush(&mut self) -> Result<Option<SegmentInfo>, EngineError> {
+        let recv_result = {
+            let bg = self
+                .bg_flush
+                .as_ref()
+                .ok_or_else(|| EngineError::InvalidOperation("no bg flush worker".into()))?;
+            let rx = bg.event_rx.lock().unwrap();
+            rx.recv()
+        };
+        match recv_result {
+            Ok(event) => {
+                if let Some(bg) = self.bg_flush.as_mut() {
+                    bg.events_applied += 1;
+                }
+                let result = self.process_bg_flush_event(event);
+                if result.is_err() {
+                    self.flush_pipeline_error_reported = true;
+                }
+                result
+            }
+            Err(_) => {
+                let shutdown_events = self.shutdown_bg_flush();
+                for event in shutdown_events {
+                    let _ = self.process_bg_flush_event(event);
+                }
+                self.reset_all_flush_in_flight();
+                if let Some(err) = self.current_flush_pipeline_error() {
+                    Err(err)
+                } else {
+                    Err(EngineError::InvalidOperation("bg flush worker died".into()))
+                }
+            }
+        }
+    }
+
+    fn process_bg_flush_event(
+        &mut self,
+        event: BgFlushEvent,
+    ) -> Result<Option<SegmentInfo>, EngineError> {
+        match event {
+            BgFlushEvent::Adopt(adoption) => {
+                let seg_info = adoption.seg_info.clone();
+                if !self
+                    .manifest
+                    .segments
+                    .iter()
+                    .any(|s| s.id == adoption.seg_info.id)
+                {
+                    self.manifest.segments.push(adoption.seg_info);
+                }
+                self.manifest.pending_flush_epochs.retain(|epoch| {
+                    !(epoch.epoch_id == adoption.epoch_id
+                        && epoch.wal_generation_id == adoption.wal_gen_to_retire)
+                });
+                self.segments.insert(0, adoption.reader);
+                if let Some(idx) = self
+                    .immutable_epochs
+                    .iter()
+                    .position(|epoch| epoch.epoch_id == adoption.epoch_id)
+                {
+                    let removed = self.immutable_epochs.remove(idx);
+                    self.immutable_bytes_total = self
+                        .immutable_bytes_total
+                        .saturating_sub(removed.memtable.estimated_size());
+                }
+                if self
+                    .flush_pipeline_error
+                    .as_ref()
+                    .is_some_and(|err| err.epoch_id == adoption.epoch_id)
+                {
+                    self.flush_pipeline_error = None;
+                    self.flush_pipeline_error_reported = false;
+                }
+
+                if !self.compacting && self.bg_compact.is_none() && self.compact_after_n_flushes > 0
+                {
+                    self.flush_count_since_last_compact += 1;
+                    if self.flush_count_since_last_compact >= self.compact_after_n_flushes
+                        && self.segments.len() >= 2
+                    {
+                        let _ = self.start_bg_compact();
+                    }
+                }
+
+                Ok(Some(seg_info))
+            }
+            BgFlushEvent::Failed(err) => {
+                self.record_flush_pipeline_error(err.clone());
+                self.reset_all_flush_in_flight();
+                let shutdown_events = self.shutdown_bg_flush();
+                for shutdown_event in shutdown_events {
+                    let _ = self.process_bg_flush_event(shutdown_event);
+                }
+                Err(err.to_engine_error())
+            }
+        }
+    }
+
+    /// Block until all in-flight background flush work completes and is applied.
+    /// Does not enqueue new work from immutable_epochs.
+    fn drain_bg_flush(&mut self) {
+        while self.immutable_epochs.iter().any(|e| e.in_flight) {
+            match self.wait_for_one_flush() {
+                Ok(_) => {}
+                Err(e) => {
+                    // Continue draining; don't leave in-flight epochs orphaned.
+                    // wait_for_one_flush resets in_flight on error, so the loop
+                    // will terminate when no more in-flight work remains.
+                    eprintln!("drain_bg_flush: error waiting for flush: {}", e);
+                }
+            }
+        }
+    }
+
+    fn reset_all_flush_in_flight(&mut self) {
+        for epoch in &mut self.immutable_epochs {
+            epoch.in_flight = false;
+        }
+    }
+
+    fn record_flush_pipeline_error(&mut self, err: FlushPipelineError) {
+        match &self.flush_pipeline_error {
+            Some(existing) if existing.wal_generation_id < err.wal_generation_id => {}
+            _ => {
+                self.flush_pipeline_error = Some(err);
+                self.flush_pipeline_error_reported = false;
+            }
+        }
+    }
+
+    fn maybe_surface_or_retry_flush_pipeline_error(&mut self) -> Result<(), EngineError> {
+        if let Some(err) = self.flush_pipeline_error.clone() {
+            if !self.flush_pipeline_error_reported {
+                self.flush_pipeline_error_reported = true;
+                return Err(err.to_engine_error());
+            }
+            if self.immutable_epochs.iter().any(|epoch| !epoch.in_flight) {
+                self.ensure_bg_flush_worker();
+                self.enqueue_all_non_in_flight()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn current_flush_pipeline_error(&mut self) -> Option<EngineError> {
+        self.flush_pipeline_error.clone().map(|err| {
+            self.flush_pipeline_error_reported = true;
+            err.to_engine_error()
+        })
+    }
+
+    /// Shut down the background flush workers, if running, and return any
+    /// already-queued completion events so callers can perform lazy adoption.
+    fn shutdown_bg_flush(&mut self) -> Vec<BgFlushEvent> {
+        if let Some(mut bg) = self.bg_flush.take() {
+            bg.cancel.store(true, Ordering::Relaxed);
+            drop(bg.work_tx);
+            if let Some(handle) = bg.build_handle.take() {
+                let _ = handle.join();
+            }
+            if let Some(handle) = bg.publish_handle.take() {
+                let _ = handle.join();
+            }
+            let mut events = Vec::new();
+            let rx = bg.event_rx.lock().unwrap();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            return events;
+        }
+        Vec::new()
     }
 
     // --- Background compaction ---
@@ -1142,6 +2049,7 @@ impl DatabaseEngine {
         let db_dir = self.db_dir.clone();
         let prune_policies: Vec<PrunePolicy> =
             self.manifest.prune_policies.values().cloned().collect();
+        let dense_vector = self.manifest.dense_vector.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = Arc::clone(&cancel);
         let handle = std::thread::spawn(move || {
@@ -1150,6 +2058,7 @@ impl DatabaseEngine {
                 seg_id,
                 input_segments,
                 prune_policies,
+                dense_vector,
                 &cancel_clone,
             )
         });
@@ -1208,24 +2117,43 @@ impl DatabaseEngine {
     /// Apply a completed background compaction result: update manifest, swap
     /// segments, and delete old segment directories.
     fn apply_bg_compact_result(&mut self, result: BgCompactResult) -> Option<CompactionStats> {
-        // Build new manifest: remove compacted input segments, add output.
-        let mut new_manifest = self.manifest.clone();
-        new_manifest
-            .segments
-            .retain(|s| !result.input_segment_ids.contains(&s.id));
-        new_manifest.segments.push(result.seg_info.clone());
+        let updated_manifest = {
+            let _guard = self.manifest_write_lock.lock().unwrap();
+            let mut manifest = match self.load_current_manifest_for_write() {
+                Ok(manifest) => manifest,
+                Err(e) => {
+                    eprintln!("Background compaction: manifest load failed: {}", e);
+                    let output_dir = segment_dir(&self.db_dir, result.stats.output_segment_id);
+                    let _ = std::fs::remove_dir_all(output_dir);
+                    return None;
+                }
+            };
 
-        if let Err(e) = write_manifest(&self.db_dir, &new_manifest) {
-            eprintln!("Background compaction: manifest write failed: {}", e);
-            // Output segment exists on disk but manifest doesn't reference it.
-            // Old segments are still intact, so no data loss. Clean up orphan.
-            let output_dir = segment_dir(&self.db_dir, result.stats.output_segment_id);
-            let _ = std::fs::remove_dir_all(output_dir);
-            return None;
-        }
+            let live_seg_ids: NodeIdSet = manifest.segments.iter().map(|s| s.id).collect();
+            for input_id in &result.input_segment_ids {
+                if !live_seg_ids.contains(input_id) {
+                    let output_dir = segment_dir(&self.db_dir, result.stats.output_segment_id);
+                    let _ = std::fs::remove_dir_all(output_dir);
+                    return None;
+                }
+            }
 
-        // Manifest is durable. Swap in-memory state.
-        self.manifest = new_manifest;
+            manifest
+                .segments
+                .retain(|s| !result.input_segment_ids.contains(&s.id));
+            manifest.segments.push(result.seg_info.clone());
+            self.merge_runtime_manifest_counters(&mut manifest);
+
+            if let Err(e) = write_manifest(&self.db_dir, &manifest) {
+                eprintln!("Background compaction: manifest write failed: {}", e);
+                let output_dir = segment_dir(&self.db_dir, result.stats.output_segment_id);
+                let _ = std::fs::remove_dir_all(output_dir);
+                return None;
+            }
+            manifest
+        };
+
+        self.manifest = updated_manifest;
         // Remove input segments, keep any new segments added by flushes during
         // background compaction (they have different IDs).
         self.segments
@@ -1240,7 +2168,7 @@ impl DatabaseEngine {
 
         self.last_compaction_ms = Some(now_millis());
 
-        // Rebuild degree cache — segments changed during background compaction
+        // Rebuild degree cache. Segments changed during background compaction.
         if let Err(e) = self.rebuild_degree_cache() {
             eprintln!("Background compaction: degree cache rebuild failed: {}", e);
         }
@@ -1299,8 +2227,9 @@ impl DatabaseEngine {
     where
         F: FnMut(&CompactionProgress) -> bool,
     {
-        // Wait for any in-progress background compaction before proceeding.
+        // Wait for any in-progress background work before proceeding.
         self.wait_for_bg_compact();
+        self.try_apply_all_bg_flushes();
 
         if self.segments.len() < 2 {
             return Ok(None);
@@ -1312,7 +2241,7 @@ impl DatabaseEngine {
         // Reset flush counter after any compaction attempt (success or failure)
         self.flush_count_since_last_compact = 0;
 
-        // Rebuild degree cache after successful compaction — segments have changed
+        // Rebuild degree cache after successful compaction. Segments have changed.
         if let Ok(Some(_)) = &result {
             self.rebuild_degree_cache()?;
         }
@@ -1329,8 +2258,10 @@ impl DatabaseEngine {
     {
         let compact_start = std::time::Instant::now();
 
-        // Flush memtable first so compaction sees all data and tombstones
-        if !self.memtable.is_empty() {
+        // Flush memtable + any pending immutable epochs first so compaction
+        // sees all data and tombstones (async auto-flush may leave epochs
+        // in-flight that contain tombstones needed for correct compaction).
+        if !self.memtable.is_empty() || !self.immutable_epochs.is_empty() {
             self.flush()?;
         }
 
@@ -1396,31 +2327,34 @@ impl DatabaseEngine {
         }
 
         // Open new segment reader BEFORE modifying any state (M3 fix)
-        let new_reader = match SegmentReader::open(&final_dir, seg_id) {
-            Ok(r) => r,
-            Err(e) => {
-                // Output segment exists on disk but we can't read it.
-                // Clean up orphan directory and release the segment ID.
-                self.next_segment_id -= 1;
-                let _ = std::fs::remove_dir_all(&final_dir);
-                return Err(e);
-            }
-        };
+        let new_reader =
+            match SegmentReader::open(&final_dir, seg_id, self.manifest.dense_vector.as_ref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Output segment exists on disk but we can't read it.
+                    // Clean up orphan directory and release the segment ID.
+                    self.next_segment_id -= 1;
+                    let _ = std::fs::remove_dir_all(&final_dir);
+                    return Err(e);
+                }
+            };
 
         // Collect old segment info for cleanup
-        let old_seg_ids: HashSet<u64> = self.segments.iter().map(|s| s.segment_id).collect();
+        let old_seg_ids: NodeIdSet = self.segments.iter().map(|s| s.segment_id).collect();
         let old_seg_dirs: Vec<PathBuf> = old_seg_ids
             .iter()
             .map(|&id| segment_dir(&self.db_dir, id))
             .collect();
 
-        // Build new manifest before mutating in-memory state (M2 fix)
-        let mut new_manifest = self.manifest.clone();
-        new_manifest
-            .segments
-            .retain(|s| !old_seg_ids.contains(&s.id));
-        new_manifest.segments.push(seg_info.clone());
-        write_manifest(&self.db_dir, &new_manifest)?;
+        let new_manifest = {
+            let _guard = self.manifest_write_lock.lock().unwrap();
+            let mut manifest = self.load_current_manifest_for_write()?;
+            manifest.segments.retain(|s| !old_seg_ids.contains(&s.id));
+            manifest.segments.push(seg_info.clone());
+            self.merge_runtime_manifest_counters(&mut manifest);
+            write_manifest(&self.db_dir, &manifest)?;
+            manifest
+        };
 
         // Manifest is durable. Now safe to swap in-memory state
         self.manifest = new_manifest;
@@ -1518,7 +2452,12 @@ impl DatabaseEngine {
             return Err(EngineError::CompactionCancelled);
         }
 
-        build_fast_merge_output(tmp_dir, seg_id, &self.segments)
+        build_fast_merge_output(
+            tmp_dir,
+            seg_id,
+            &self.segments,
+            self.manifest.dense_vector.as_ref(),
+        )
     }
 
     /// V3 compaction: metadata-only planning + raw binary copy.
@@ -1545,8 +2484,8 @@ impl DatabaseEngine {
         F: FnMut(&CompactionProgress) -> bool,
     {
         // --- Phase 1: Collect tombstones ---
-        let mut deleted_nodes: HashSet<u64> = HashSet::new();
-        let mut deleted_edges: HashSet<u64> = HashSet::new();
+        let mut deleted_nodes: NodeIdSet = NodeIdSet::default();
+        let mut deleted_edges: NodeIdSet = NodeIdSet::default();
         if has_tombstones {
             for (i, seg) in self.segments.iter().enumerate() {
                 deleted_nodes.extend(seg.deleted_node_ids());
@@ -1635,7 +2574,13 @@ impl DatabaseEngine {
         let nodes_auto_pruned = plan.pruned_node_ids.len() as u64;
         let edges_auto_pruned = plan.edges_auto_pruned;
 
-        let seg_info = v3_build_output(tmp_dir, seg_id, &self.segments, &plan)?;
+        let seg_info = v3_build_output(
+            tmp_dir,
+            seg_id,
+            &self.segments,
+            &plan,
+            self.manifest.dense_vector.as_ref(),
+        )?;
 
         Ok((seg_info, nodes_auto_pruned, edges_auto_pruned))
     }
@@ -1659,6 +2604,14 @@ impl DatabaseEngine {
             WalSyncMode::Immediate => "immediate".to_string(),
             WalSyncMode::GroupCommit { .. } => "group-commit".to_string(),
         };
+        let immutable_memtable_bytes = self.immutable_bytes_total;
+        let oldest_retained_wal_gen = self
+            .manifest
+            .pending_flush_epochs
+            .iter()
+            .map(|e| e.wal_generation_id)
+            .min()
+            .unwrap_or(self.active_wal_generation_id);
         DbStats {
             pending_wal_bytes,
             segment_count: self.segments.len(),
@@ -1666,6 +2619,12 @@ impl DatabaseEngine {
             edge_tombstone_count: self.memtable.deleted_edges().len(),
             last_compaction_ms: self.last_compaction_ms,
             wal_sync_mode: sync_mode_str,
+            active_memtable_bytes: self.memtable.estimated_size(),
+            immutable_memtable_bytes,
+            immutable_memtable_count: self.immutable_epochs.len(),
+            pending_flush_count: self.immutable_epochs.iter().filter(|e| e.in_flight).count(),
+            active_wal_generation_id: self.active_wal_generation_id,
+            oldest_retained_wal_generation_id: oldest_retained_wal_gen,
         }
     }
 
@@ -1698,11 +2657,13 @@ impl DatabaseEngine {
             WalOp::UpsertNode(node) => {
                 if node.id >= self.next_node_id {
                     self.next_node_id = node.id + 1;
+                    self.update_next_node_id_seen();
                 }
             }
             WalOp::UpsertEdge(edge) => {
                 if edge.id >= self.next_edge_id {
                     self.next_edge_id = edge.id + 1;
+                    self.update_next_edge_id_seen();
                 }
             }
             _ => {}
@@ -1721,14 +2682,38 @@ impl DatabaseEngine {
         &self.manifest
     }
 
-    /// Return the count of live nodes in memtable only.
+    /// Approximate count of live nodes across all sources.
+    ///
+    /// Sums memtable and segment counts minus tombstones. This is O(sources),
+    /// not O(data). May overcount when the same node ID exists across
+    /// active memtable, immutable memtables, and segments (e.g., a node
+    /// upserted in gen 0, frozen, then upserted again in gen 1 counts
+    /// from both memtables). Not suitable for exact cardinality; use as
+    /// a monitoring/inspection metric.
     pub fn node_count(&self) -> usize {
-        self.memtable.node_count()
+        let mut count = self.memtable.node_count();
+        for epoch in &self.immutable_epochs {
+            count += epoch.memtable.node_count();
+        }
+        for seg in &self.segments {
+            count += (seg.node_count() as usize).saturating_sub(seg.deleted_node_count());
+        }
+        count
     }
 
-    /// Return the count of live edges in memtable only.
+    /// Approximate count of live edges across all sources.
+    ///
+    /// Same caveats as [`node_count`]: O(sources), may overcount when the
+    /// same edge spans active, immutable, and segment sources.
     pub fn edge_count(&self) -> usize {
-        self.memtable.edge_count()
+        let mut count = self.memtable.edge_count();
+        for epoch in &self.immutable_epochs {
+            count += epoch.memtable.edge_count();
+        }
+        for seg in &self.segments {
+            count += (seg.edge_count() as usize).saturating_sub(seg.deleted_edge_count());
+        }
+        count
     }
 
     /// Return the next node ID that will be allocated.
@@ -1748,18 +2733,12 @@ impl DatabaseEngine {
 
     /// Return the total number of tombstoned node IDs across all segments.
     pub fn segment_tombstone_node_count(&self) -> usize {
-        self.segments
-            .iter()
-            .map(|s| s.deleted_node_ids().len())
-            .sum()
+        self.segments.iter().map(|s| s.deleted_node_count()).sum()
     }
 
     /// Return the total number of tombstoned edge IDs across all segments.
     pub fn segment_tombstone_edge_count(&self) -> usize {
-        self.segments
-            .iter()
-            .map(|s| s.deleted_edge_ids().len())
-            .sum()
+        self.segments.iter().map(|s| s.deleted_edge_count()).sum()
     }
 }
 
@@ -1768,6 +2747,10 @@ impl Drop for DatabaseEngine {
         // Best-effort: wait for background compaction to finish.
         // Errors are swallowed. Drop must not panic.
         self.wait_for_bg_compact();
+
+        // Best-effort: drain any completed bg flush results, then shut down worker.
+        self.drain_bg_flush();
+        self.shutdown_bg_flush();
 
         // Best-effort: shut down sync thread and flush buffered data.
         if self.sync_thread.is_some() {
@@ -1805,6 +2788,19 @@ fn scan_max_segment_id(db_dir: &Path) -> u64 {
     max_id
 }
 
+/// Fsync a directory so metadata updates like rename() are durable.
+/// No-op on Windows, where directory fsync is not supported the same way.
+fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let file = std::fs::File::open(dir)?;
+        file.sync_all()?;
+    }
+    #[cfg(target_os = "windows")]
+    let _ = dir;
+    Ok(())
+}
+
 /// Remove segment directories on disk that are not referenced by the manifest.
 /// These are orphans from crashes between segment write and manifest update
 /// (or between background compaction output and apply). Best-effort: I/O errors
@@ -1815,14 +2811,18 @@ fn cleanup_orphan_segments(db_dir: &Path, manifest: &ManifestState) {
         Ok(e) => e,
         Err(_) => return,
     };
-    let manifest_ids: HashSet<u64> = manifest.segments.iter().map(|s| s.id).collect();
+    let manifest_ids: NodeIdSet = manifest.segments.iter().map(|s| s.id).collect();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if let Some(id_str) = name.strip_prefix("seg_") {
+            // Clean up .tmp directories from interrupted flush/compaction
+            if id_str.ends_with(".tmp") {
+                let _ = std::fs::remove_dir_all(entry.path());
+                continue;
+            }
             if let Ok(id) = id_str.parse::<u64>() {
                 if !manifest_ids.contains(&id) {
-                    // Also skip tmp dirs (seg_XXXX.tmp). strip_prefix won't match those
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
@@ -1830,7 +2830,36 @@ fn cleanup_orphan_segments(db_dir: &Path, manifest: &ManifestState) {
     }
 }
 
-/// Test helper: access the degree cache for validation.
+/// Remove WAL generation files on disk that are not referenced by the manifest.
+/// Orphan WAL files can appear when a crash occurs after WAL retirement completes
+/// on disk but before the manifest is updated, or from other interrupted sequences.
+fn cleanup_orphan_wal_files(db_dir: &Path, manifest: &ManifestState) {
+    // Collect all WAL gen IDs that the manifest knows about
+    let mut live_gens: NodeIdSet = NodeIdSet::default();
+    live_gens.insert(manifest.active_wal_generation_id);
+    for epoch in &manifest.pending_flush_epochs {
+        live_gens.insert(epoch.wal_generation_id);
+    }
+    let entries = match std::fs::read_dir(db_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(rest) = name.strip_prefix("wal_") {
+            if let Some(id_str) = rest.strip_suffix(".wal") {
+                if let Ok(gen_id) = id_str.parse::<u64>() {
+                    if !live_gens.contains(&gen_id) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Test helpers: access internal state for validation.
 #[cfg(test)]
 impl DatabaseEngine {
     pub(crate) fn degree_cache_entry(&self, node_id: u64) -> DegreeEntry {
@@ -1838,6 +2867,65 @@ impl DatabaseEngine {
             .get(&node_id)
             .copied()
             .unwrap_or(DegreeEntry::ZERO)
+    }
+
+    pub(crate) fn immutable_memtable_count(&self) -> usize {
+        self.immutable_epochs.len()
+    }
+
+    pub(crate) fn active_wal_generation(&self) -> u64 {
+        self.active_wal_generation_id
+    }
+
+    pub(crate) fn active_memtable(&self) -> &Memtable {
+        &self.memtable
+    }
+
+    /// Set a one-shot pause hook. Consumed by the next enqueue_flush call.
+    /// Returns (ready_rx, release_tx). Test waits on ready_rx to confirm
+    /// worker is paused, then sends on release_tx to resume.
+    pub(crate) fn set_flush_pause(
+        &mut self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self.flush_pause.lock().unwrap() = Some(FlushPauseHook {
+            ready_tx,
+            release_rx,
+        });
+        (ready_rx, release_tx)
+    }
+
+    /// Set a one-shot failure injection. The next `enqueue_flush` call will
+    /// produce a BgFlushWork with `force_write_error = true`, causing the worker
+    /// to return an error without writing a segment. Only affects one enqueue;
+    /// subsequent enqueues are normal. Best used with a single pending epoch.
+    pub(crate) fn set_flush_force_error(&mut self) {
+        self.flush_force_error = true;
+    }
+
+    /// Enqueue one flush (expose for tests).
+    pub(crate) fn enqueue_one_flush(&mut self) -> Result<(), EngineError> {
+        self.ensure_bg_flush_worker();
+        self.enqueue_flush()
+    }
+
+    /// Wait for one flush result (expose for tests).
+    pub(crate) fn wait_one_flush(&mut self) -> Result<Option<SegmentInfo>, EngineError> {
+        self.wait_for_one_flush()
+    }
+
+    /// Number of immutable epochs (frozen memtables, in-flight or not).
+    pub(crate) fn immutable_epoch_count(&self) -> usize {
+        self.immutable_epochs.len()
+    }
+
+    /// Number of in-flight flushes.
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.immutable_epochs.iter().filter(|e| e.in_flight).count()
     }
 }
 
@@ -1880,6 +2968,255 @@ fn select_compaction_path(
     }
 }
 
+fn send_bg_flush_event(
+    tx: &std::sync::mpsc::SyncSender<BgFlushEvent>,
+    events_ready: &AtomicUsize,
+    event: BgFlushEvent,
+) {
+    if tx.send(event).is_ok() {
+        events_ready.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Background build worker. Writes immutable epochs to segment directories and
+/// hands only durably renamed results to the publisher thread.
+fn bg_flush_build_worker(
+    rx: std::sync::mpsc::Receiver<BgFlushWork>,
+    built_tx: std::sync::mpsc::SyncSender<BuiltFlushResult>,
+    event_tx: std::sync::mpsc::SyncSender<BgFlushEvent>,
+    cancel: Arc<AtomicBool>,
+    events_ready: Arc<AtomicUsize>,
+) {
+    while let Ok(work) = rx.recv() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Test hooks: one-shot pause and failure injection.
+        #[cfg(test)]
+        {
+            if let Some(hook) = work.pause {
+                let _ = hook.ready_tx.send(()); // signal "I'm paused"
+                let _ = hook.release_rx.recv(); // block until test releases
+            }
+            if work.force_write_error {
+                send_bg_flush_event(
+                    &event_tx,
+                    &events_ready,
+                    BgFlushEvent::Failed(FlushPipelineError {
+                        epoch_id: work.epoch_id,
+                        wal_generation_id: work.wal_gen_id,
+                        stage: FlushPipelineStage::Build,
+                        message: "injected test failure".into(),
+                    }),
+                );
+                cancel.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+
+        // Ensure segments/ parent exists
+        if let Some(parent) = work.tmp_dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let built_result = match write_segment(
+            &work.tmp_dir,
+            work.seg_id,
+            &work.frozen,
+            work.dense_config.as_ref(),
+        ) {
+            Ok(seg_info) => match std::fs::rename(&work.tmp_dir, &work.final_dir) {
+                Ok(()) => {
+                    if let Some(parent) = work.final_dir.parent() {
+                        if let Err(e) = fsync_dir(parent) {
+                            let _ = std::fs::remove_dir_all(&work.final_dir);
+                            send_bg_flush_event(
+                                &event_tx,
+                                &events_ready,
+                                BgFlushEvent::Failed(FlushPipelineError {
+                                    epoch_id: work.epoch_id,
+                                    wal_generation_id: work.wal_gen_id,
+                                    stage: FlushPipelineStage::Build,
+                                    message: format!("segment parent fsync failed: {}", e),
+                                }),
+                            );
+                            cancel.store(true, Ordering::Relaxed);
+                            break;
+                        } else {
+                            BuiltFlushResult {
+                                epoch_id: work.epoch_id,
+                                wal_gen_to_retire: work.wal_gen_id,
+                                seg_info,
+                                seg_id: work.seg_id,
+                                final_dir: work.final_dir,
+                                dense_config: work.dense_config,
+                            }
+                        }
+                    } else {
+                        let _ = std::fs::remove_dir_all(&work.final_dir);
+                        send_bg_flush_event(
+                            &event_tx,
+                            &events_ready,
+                            BgFlushEvent::Failed(FlushPipelineError {
+                                epoch_id: work.epoch_id,
+                                wal_generation_id: work.wal_gen_id,
+                                stage: FlushPipelineStage::Build,
+                                message: "segment final dir is missing a parent".into(),
+                            }),
+                        );
+                        cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&work.tmp_dir);
+                    send_bg_flush_event(
+                        &event_tx,
+                        &events_ready,
+                        BgFlushEvent::Failed(FlushPipelineError {
+                            epoch_id: work.epoch_id,
+                            wal_generation_id: work.wal_gen_id,
+                            stage: FlushPipelineStage::Build,
+                            message: format!("segment rename failed: {}", e),
+                        }),
+                    );
+                    cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+            },
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work.tmp_dir);
+                send_bg_flush_event(
+                    &event_tx,
+                    &events_ready,
+                    BgFlushEvent::Failed(FlushPipelineError {
+                        epoch_id: work.epoch_id,
+                        wal_generation_id: work.wal_gen_id,
+                        stage: FlushPipelineStage::Build,
+                        message: format!("segment write failed: {}", e),
+                    }),
+                );
+                cancel.store(true, Ordering::Relaxed);
+                break;
+            }
+        };
+
+        if built_tx.send(built_result).is_err() {
+            break;
+        }
+    }
+}
+
+/// Publisher worker. Converts built segment outputs into durable manifest
+/// state and emits cheap foreground adoption payloads.
+#[allow(clippy::too_many_arguments)]
+fn bg_flush_publish_worker(
+    db_dir: PathBuf,
+    rx: std::sync::mpsc::Receiver<BuiltFlushResult>,
+    event_tx: std::sync::mpsc::SyncSender<BgFlushEvent>,
+    manifest_write_lock: Arc<Mutex<()>>,
+    next_node_id_seen: Arc<AtomicU64>,
+    next_edge_id_seen: Arc<AtomicU64>,
+    engine_seq_seen: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    events_ready: Arc<AtomicUsize>,
+) {
+    while let Ok(result) = rx.recv() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let reader = match SegmentReader::open(
+            &result.final_dir,
+            result.seg_id,
+            result.dense_config.as_ref(),
+        ) {
+            Ok(reader) => reader,
+            Err(e) => {
+                send_bg_flush_event(
+                    &event_tx,
+                    &events_ready,
+                    BgFlushEvent::Failed(FlushPipelineError {
+                        epoch_id: result.epoch_id,
+                        wal_generation_id: result.wal_gen_to_retire,
+                        stage: FlushPipelineStage::PublishOpenReader,
+                        message: format!("failed to open segment {}: {}", result.seg_id, e),
+                    }),
+                );
+                cancel.store(true, Ordering::Relaxed);
+                break;
+            }
+        };
+
+        let publish_result: Result<(), EngineError> = (|| {
+            let _guard = manifest_write_lock.lock().unwrap();
+            let mut manifest = load_manifest_readonly(&db_dir)?
+                .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
+            if !manifest
+                .segments
+                .iter()
+                .any(|seg| seg.id == result.seg_info.id)
+            {
+                manifest.segments.push(result.seg_info.clone());
+            }
+            let pending_idx = manifest
+                .pending_flush_epochs
+                .iter()
+                .position(|epoch| {
+                    epoch.epoch_id == result.epoch_id
+                        && epoch.wal_generation_id == result.wal_gen_to_retire
+                        && epoch.state == FlushEpochState::FrozenPendingFlush
+                })
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "missing FrozenPendingFlush epoch {} wal {} during publish",
+                        result.epoch_id, result.wal_gen_to_retire
+                    ))
+                })?;
+            manifest.pending_flush_epochs.remove(pending_idx);
+            manifest.next_node_id = manifest
+                .next_node_id
+                .max(next_node_id_seen.load(Ordering::Acquire));
+            manifest.next_edge_id = manifest
+                .next_edge_id
+                .max(next_edge_id_seen.load(Ordering::Acquire));
+            manifest.next_engine_seq = manifest
+                .next_engine_seq
+                .max(engine_seq_seen.load(Ordering::Acquire));
+            write_manifest(&db_dir, &manifest)?;
+            Ok(())
+        })();
+
+        if let Err(e) = publish_result {
+            send_bg_flush_event(
+                &event_tx,
+                &events_ready,
+                BgFlushEvent::Failed(FlushPipelineError {
+                    epoch_id: result.epoch_id,
+                    wal_generation_id: result.wal_gen_to_retire,
+                    stage: FlushPipelineStage::PublishManifest,
+                    message: e.to_string(),
+                }),
+            );
+            cancel.store(true, Ordering::Relaxed);
+            break;
+        }
+
+        let _ = remove_wal_generation(&db_dir, result.wal_gen_to_retire);
+        send_bg_flush_event(
+            &event_tx,
+            &events_ready,
+            BgFlushEvent::Adopt(PublishedFlushAdoption {
+                epoch_id: result.epoch_id,
+                wal_gen_to_retire: result.wal_gen_to_retire,
+                seg_info: result.seg_info,
+                reader,
+            }),
+        );
+    }
+}
+
 /// Background compaction worker. Runs on a spawned thread.
 /// Re-opens input segments via independent mmap handles, merges them into a
 /// single output segment, and returns the result for the main thread to apply.
@@ -1888,6 +3225,7 @@ fn bg_compact_worker(
     seg_id: u64,
     input_segments: Vec<(u64, PathBuf)>,
     prune_policies: Vec<PrunePolicy>,
+    dense_vector: Option<DenseVectorConfig>,
     cancel: &AtomicBool,
 ) -> Result<BgCompactResult, EngineError> {
     let compact_start = std::time::Instant::now();
@@ -1896,7 +3234,7 @@ fn bg_compact_worker(
     // with the main thread's readers of the same files).
     let mut segments = Vec::with_capacity(input_segments.len());
     for (id, path) in &input_segments {
-        segments.push(SegmentReader::open(path, *id)?);
+        segments.push(SegmentReader::open(path, *id, dense_vector.as_ref())?);
     }
 
     let input_segment_count = segments.len();
@@ -1913,19 +3251,22 @@ fn bg_compact_worker(
     let final_dir = segment_dir(&db_dir, seg_id);
 
     let (seg_info, nodes_auto_pruned, edges_auto_pruned) = match compaction_path {
-        CompactionPath::FastMerge => match bg_fast_merge(&segments, &tmp_dir, seg_id, cancel) {
-            Ok(seg_info) => (seg_info, 0, 0),
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(e);
+        CompactionPath::FastMerge => {
+            match bg_fast_merge(&segments, &tmp_dir, seg_id, dense_vector.as_ref(), cancel) {
+                Ok(seg_info) => (seg_info, 0, 0),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    return Err(e);
+                }
             }
-        },
+        }
         CompactionPath::UnifiedV3 => match bg_standard_merge(
             &segments,
             &tmp_dir,
             seg_id,
             has_tombstones,
             &prune_policies,
+            dense_vector.as_ref(),
             cancel,
         ) {
             Ok(result) => result,
@@ -1943,7 +3284,7 @@ fn bg_compact_worker(
     }
 
     // Open the output segment reader (will be sent back to the main thread).
-    let reader = match SegmentReader::open(&final_dir, seg_id) {
+    let reader = match SegmentReader::open(&final_dir, seg_id, dense_vector.as_ref()) {
         Ok(r) => r,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&final_dir);
@@ -1951,7 +3292,7 @@ fn bg_compact_worker(
         }
     };
 
-    let input_segment_ids: HashSet<u64> = input_segments.iter().map(|(id, _)| *id).collect();
+    let input_segment_ids: NodeIdSet = input_segments.iter().map(|(id, _)| *id).collect();
     let old_seg_dirs: Vec<PathBuf> = input_segments
         .iter()
         .map(|(id, _)| segment_dir(&db_dir, *id))
@@ -1993,6 +3334,11 @@ struct NodeWinner {
     key_len: u16,
     prop_hash_offset: u64,
     prop_hash_count: u32,
+    dense_vector_offset: u64,
+    dense_vector_len: u32,
+    sparse_vector_offset: u64,
+    sparse_vector_len: u32,
+    last_write_seq: u64,
 }
 
 /// Winning edge record with full metadata from sidecar. Avoids re-reading sidecar in output.
@@ -2007,13 +3353,14 @@ struct EdgeWinner {
     weight: f32,
     valid_from: i64,
     valid_to: i64,
+    last_write_seq: u64,
 }
 
 /// Result of V3 compaction planning: which records survive and pruning stats.
 struct V3Plan {
     node_winners: BTreeMap<u64, NodeWinner>,
     edge_winners: BTreeMap<u64, EdgeWinner>,
-    pruned_node_ids: HashSet<u64>,
+    pruned_node_ids: NodeIdSet,
     edges_auto_pruned: u64,
 }
 
@@ -2051,16 +3398,16 @@ fn matches_any_prune_policy_meta(
 fn v3_plan_winners(
     segments: &[SegmentReader],
     prune_policies: &[PrunePolicy],
-    deleted_nodes: &HashSet<u64>,
-    deleted_edges: &HashSet<u64>,
+    deleted_nodes: &NodeIdSet,
+    deleted_edges: &NodeIdSet,
 ) -> Result<V3Plan, EngineError> {
     let now = now_millis();
     let has_policies = !prune_policies.is_empty();
 
     // --- Select winning nodes from metadata (newest-first, first seen wins) ---
     let mut node_winners: BTreeMap<u64, NodeWinner> = BTreeMap::new();
-    let mut pruned_node_ids: HashSet<u64> = HashSet::new();
-    let mut seen_nodes: HashSet<u64> = HashSet::new();
+    let mut pruned_node_ids: NodeIdSet = NodeIdSet::default();
+    let mut seen_nodes: NodeIdSet = NodeIdSet::default();
 
     for (seg_idx, seg) in segments.iter().enumerate() {
         let count = seg.node_meta_count() as usize;
@@ -2075,7 +3422,10 @@ fn v3_plan_winners(
                 key_len,
                 prop_hash_offset,
                 prop_hash_count,
+                last_write_seq,
             ) = seg.node_meta_at(i)?;
+            let (dense_vector_offset, dense_vector_len, sparse_vector_offset, sparse_vector_len) =
+                seg.node_vector_meta_at(i)?;
 
             if seen_nodes.contains(&node_id) {
                 continue; // Already have a newer version
@@ -2105,6 +3455,11 @@ fn v3_plan_winners(
                     key_len,
                     prop_hash_offset,
                     prop_hash_count,
+                    dense_vector_offset,
+                    dense_vector_len,
+                    sparse_vector_offset,
+                    sparse_vector_len,
+                    last_write_seq,
                 },
             );
         }
@@ -2112,9 +3467,9 @@ fn v3_plan_winners(
 
     // --- Select winning edges from metadata ---
     // O(1) endpoint lookup for edge cascade filtering (BTreeMap.contains_key is O(log N))
-    let surviving_node_ids: HashSet<u64> = node_winners.keys().copied().collect();
+    let surviving_node_ids: NodeIdSet = node_winners.keys().copied().collect();
     let mut edge_winners: BTreeMap<u64, EdgeWinner> = BTreeMap::new();
-    let mut seen_edges: HashSet<u64> = HashSet::new();
+    let mut seen_edges: NodeIdSet = NodeIdSet::default();
     let mut edges_auto_pruned: u64 = 0;
 
     for (seg_idx, seg) in segments.iter().enumerate() {
@@ -2131,6 +3486,7 @@ fn v3_plan_winners(
                 weight,
                 valid_from,
                 valid_to,
+                last_write_seq,
             ) = seg.edge_meta_at(i)?;
 
             if !seen_edges.insert(edge_id) {
@@ -2167,6 +3523,7 @@ fn v3_plan_winners(
                     weight,
                     valid_from,
                     valid_to,
+                    last_write_seq,
                 },
             );
         }
@@ -2187,6 +3544,7 @@ fn v3_build_output(
     seg_id: u64,
     segments: &[SegmentReader],
     plan: &V3Plan,
+    dense_config: Option<&DenseVectorConfig>,
 ) -> Result<SegmentInfo, EngineError> {
     std::fs::create_dir_all(tmp_dir)?;
 
@@ -2244,8 +3602,13 @@ fn v3_build_output(
             key_len: w.key_len,
             prop_hash_offset: w.prop_hash_offset,
             prop_hash_count: w.prop_hash_count,
+            dense_vector_offset: w.dense_vector_offset,
+            dense_vector_len: w.dense_vector_len,
+            sparse_vector_offset: w.sparse_vector_offset,
+            sparse_vector_len: w.sparse_vector_len,
             src_seg_idx: w.seg_idx,
             src_data_offset: w.data_offset,
+            last_write_seq: w.last_write_seq,
         });
     }
 
@@ -2270,11 +3633,12 @@ fn v3_build_output(
             weight: w.weight,
             valid_from: w.valid_from,
             valid_to: w.valid_to,
+            last_write_seq: w.last_write_seq,
         });
     }
 
     // Build all secondary indexes and sidecars from metadata
-    write_indexes_from_metadata(tmp_dir, segments, &node_metas, &edge_metas)?;
+    write_indexes_from_metadata(tmp_dir, segments, &node_metas, &edge_metas, dense_config)?;
 
     let node_count = plan.node_winners.len() as u64;
     let edge_count = plan.edge_winners.len() as u64;
@@ -2304,7 +3668,10 @@ fn collect_fast_merge_node_metas(
                 key_len,
                 prop_hash_offset,
                 prop_hash_count,
+                last_write_seq,
             ) = seg.node_meta_at(i)?;
+            let (dense_vector_offset, dense_vector_len, sparse_vector_offset, sparse_vector_len) =
+                seg.node_vector_meta_at(i)?;
             let rebased_offset =
                 info.new_data_base
                     .checked_add(data_offset.checked_sub(info.orig_data_start).ok_or_else(
@@ -2331,8 +3698,13 @@ fn collect_fast_merge_node_metas(
                 key_len,
                 prop_hash_offset,
                 prop_hash_count,
+                dense_vector_offset,
+                dense_vector_len,
+                sparse_vector_offset,
+                sparse_vector_len,
                 src_seg_idx: seg_idx,
                 src_data_offset: data_offset,
+                last_write_seq,
             });
         }
     }
@@ -2367,6 +3739,7 @@ fn collect_fast_merge_edge_metas(
                 weight,
                 valid_from,
                 valid_to,
+                last_write_seq,
             ) = seg.edge_meta_at(i)?;
             let rebased_offset =
                 info.new_data_base
@@ -2395,6 +3768,7 @@ fn collect_fast_merge_edge_metas(
                 weight,
                 valid_from,
                 valid_to,
+                last_write_seq,
             });
         }
     }
@@ -2414,6 +3788,7 @@ fn build_fast_merge_output(
     tmp_dir: &Path,
     seg_id: u64,
     segments: &[SegmentReader],
+    dense_config: Option<&DenseVectorConfig>,
 ) -> Result<SegmentInfo, EngineError> {
     std::fs::create_dir_all(tmp_dir)?;
 
@@ -2422,7 +3797,7 @@ fn build_fast_merge_output(
     let node_metas = collect_fast_merge_node_metas(segments, &node_copy_info)?;
     let edge_metas = collect_fast_merge_edge_metas(segments, &edge_copy_info)?;
 
-    write_indexes_from_metadata(tmp_dir, segments, &node_metas, &edge_metas)?;
+    write_indexes_from_metadata(tmp_dir, segments, &node_metas, &edge_metas, dense_config)?;
 
     Ok(SegmentInfo {
         id: seg_id,
@@ -2438,13 +3813,14 @@ fn bg_fast_merge(
     segments: &[SegmentReader],
     tmp_dir: &Path,
     seg_id: u64,
+    dense_config: Option<&DenseVectorConfig>,
     cancel: &AtomicBool,
 ) -> Result<SegmentInfo, EngineError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(EngineError::CompactionCancelled);
     }
 
-    let seg_info = build_fast_merge_output(tmp_dir, seg_id, segments)?;
+    let seg_info = build_fast_merge_output(tmp_dir, seg_id, segments, dense_config)?;
 
     if cancel.load(Ordering::Relaxed) {
         return Err(EngineError::CompactionCancelled);
@@ -2462,11 +3838,12 @@ fn bg_standard_merge(
     seg_id: u64,
     has_tombstones: bool,
     prune_policies: &[PrunePolicy],
+    dense_config: Option<&DenseVectorConfig>,
     cancel: &AtomicBool,
 ) -> Result<(SegmentInfo, u64, u64), EngineError> {
     // Collect tombstones
-    let mut deleted_nodes: HashSet<u64> = HashSet::new();
-    let mut deleted_edges: HashSet<u64> = HashSet::new();
+    let mut deleted_nodes: NodeIdSet = NodeIdSet::default();
+    let mut deleted_edges: NodeIdSet = NodeIdSet::default();
     if has_tombstones {
         for seg in segments {
             deleted_nodes.extend(seg.deleted_node_ids());
@@ -2488,7 +3865,7 @@ fn bg_standard_merge(
     let nodes_auto_pruned = plan.pruned_node_ids.len() as u64;
     let edges_auto_pruned = plan.edges_auto_pruned;
 
-    let seg_info = v3_build_output(tmp_dir, seg_id, segments, &plan)?;
+    let seg_info = v3_build_output(tmp_dir, seg_id, segments, &plan, dense_config)?;
 
     Ok((seg_info, nodes_auto_pruned, edges_auto_pruned))
 }
@@ -2514,6 +3891,9 @@ mod tests {
             created_at: 1000 * id as i64,
             updated_at: 1000 * id as i64 + 1,
             weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         }
     }
 
@@ -2529,6 +3909,7 @@ mod tests {
             weight: 1.0,
             valid_from: 0,
             valid_to: i64::MAX,
+            last_write_seq: 0,
         }
     }
 

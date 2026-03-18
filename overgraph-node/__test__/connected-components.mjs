@@ -82,7 +82,7 @@ describe('connectedComponents (sync)', () => {
     db.upsertEdge(g, h, 10);
     db.upsertEdge(h, i, 20);
 
-    const comps = db.connectedComponents([10]);
+    const comps = db.connectedComponents({ edgeTypeFilter: [10] });
     const map = Object.fromEntries(comps.map(e => [e.nodeId, e.componentId]));
     assert.equal(map[g], map[h]); // connected via type 10
     assert.notEqual(map[h], map[i]); // type 20 excluded
@@ -95,7 +95,7 @@ describe('connectedComponents (sync)', () => {
     db.upsertEdge(j, k, 10);
     db.upsertEdge(k, l, 10);
 
-    const comps = db.connectedComponents(undefined, [1]);
+    const comps = db.connectedComponents({ nodeTypeFilter: [1] });
     const map = Object.fromEntries(comps.map(e => [e.nodeId, e.componentId]));
     assert.ok(map[j] !== undefined);
     assert.ok(map[l] !== undefined);
@@ -162,7 +162,7 @@ describe('componentOf (sync)', () => {
     const f = db.upsertNode(1, 'f');
     db.upsertEdge(e, f, 20);
 
-    const members = Array.from(db.componentOf(e, [10]));
+    const members = Array.from(db.componentOf(e, { edgeTypeFilter: [10] }));
     // Edge type 20 excluded, so e is isolated.
     assert.deepEqual(members, [e]);
   });
@@ -172,13 +172,13 @@ describe('componentOf (sync)', () => {
     const h = db.upsertNode(2, 'h');
     db.upsertEdge(g, h, 10);
 
-    const members = Array.from(db.componentOf(g, undefined, [1]));
+    const members = Array.from(db.componentOf(g, { nodeTypeFilter: [1] }));
     // h is type 2, filtered out
     assert.deepEqual(members, [g]);
   });
 
   it('returns empty for start node excluded by type filter', () => {
-    const members = Array.from(db.componentOf(a, undefined, [99]));
+    const members = Array.from(db.componentOf(a, { nodeTypeFilter: [99] }));
     assert.equal(members.length, 0);
   });
 

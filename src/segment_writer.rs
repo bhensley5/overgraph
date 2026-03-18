@@ -1,8 +1,10 @@
+use crate::dense_hnsw::{write_dense_hnsw_index_from_points, DensePointInput};
 use crate::error::EngineError;
 use crate::memtable::{AdjEntry, Memtable};
 use crate::segment_reader::SegmentReader;
+use crate::sparse_postings::write_sparse_posting_files;
 use crate::types::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -39,7 +41,18 @@ pub const SEGMENT_MAGIC: [u8; 4] = *b"EGRM";
 /// v3: added valid_from/valid_to to adjacency postings
 /// v4: BTreeMap props, removed redundant ID from records, delta-encoded adjacency
 /// v5: metadata sidecars (node_meta.dat, edge_meta.dat, node_prop_hashes.dat)
-pub const SEGMENT_FORMAT_VERSION: u32 = 5;
+/// v6: optional node vector sidecars/blobs
+/// v7: optional dense HNSW sidecars (dense_hnsw_meta.dat, dense_hnsw_graph.dat)
+/// v8: optional sparse posting-list sidecars (sparse_posting_index.dat, sparse_postings.dat)
+/// v9: last_write_seq in node_meta (60B), edge_meta (80B), tombstones (25B)
+pub const SEGMENT_FORMAT_VERSION: u32 = 9;
+
+pub(crate) const NODE_VECTOR_META_FILENAME: &str = "node_vector_meta.dat";
+pub(crate) const NODE_DENSE_VECTOR_BLOB_FILENAME: &str = "node_dense_vectors.dat";
+pub(crate) const NODE_SPARSE_VECTOR_BLOB_FILENAME: &str = "node_sparse_vectors.dat";
+pub(crate) const NODE_VECTOR_META_ENTRY_SIZE: usize = 28;
+const NODE_VECTOR_FLAG_DENSE: u8 = 0b0000_0001;
+const NODE_VECTOR_FLAG_SPARSE: u8 = 0b0000_0010;
 
 // --- Segment file format constants ---
 
@@ -53,6 +66,8 @@ const TYPE_INDEX_ENTRY_SIZE: u64 = 16;
 const PROP_INDEX_ENTRY_SIZE: u64 = 32;
 /// Size of a property hash pair in node_prop_hashes.dat: key_hash (8) + value_hash (8) = 16 bytes
 const PROP_HASH_PAIR_SIZE: u64 = 16;
+const DENSE_VECTOR_VALUE_SIZE: u64 = 4;
+const SPARSE_VECTOR_ENTRY_SIZE: u64 = 8;
 
 /// Write all segment files for a frozen memtable into the given directory.
 ///
@@ -69,6 +84,7 @@ pub fn write_segment(
     seg_dir: &Path,
     segment_id: u64,
     memtable: &Memtable,
+    dense_config: Option<&DenseVectorConfig>,
 ) -> Result<SegmentInfo, EngineError> {
     fs::create_dir_all(seg_dir)?;
 
@@ -86,7 +102,9 @@ pub fn write_segment(
     write_edge_triple_index(seg_dir, edges)?;
     write_timestamp_index(seg_dir, memtable.time_node_index())?;
     write_tombstones(seg_dir, memtable.deleted_nodes(), memtable.deleted_edges())?;
-    write_sidecars(seg_dir, &node_data, &edge_data, nodes, edges)?;
+    let dense_points = write_sidecars(seg_dir, &node_data, &edge_data, nodes, edges)?;
+    write_dense_hnsw_index_from_points(seg_dir, dense_config, dense_points)?;
+    write_sparse_posting_index(seg_dir, nodes)?;
     write_format_version(seg_dir)?;
 
     // fsync all files and the directory
@@ -108,7 +126,7 @@ pub fn write_segment(
 /// used by sidecar writers to record raw byte spans.
 fn write_nodes_dat(
     seg_dir: &Path,
-    nodes: &HashMap<u64, NodeRecord>,
+    nodes: &NodeIdMap<NodeRecord>,
 ) -> Result<Vec<(u64, u64, u32)>, EngineError> {
     let path = seg_dir.join("nodes.dat");
     let file = File::create(&path)?;
@@ -160,7 +178,7 @@ fn write_nodes_dat(
 /// used by sidecar writers to record raw byte spans.
 fn write_edges_dat(
     seg_dir: &Path,
-    edges: &HashMap<u64, EdgeRecord>,
+    edges: &NodeIdMap<EdgeRecord>,
 ) -> Result<Vec<(u64, u64, u32)>, EngineError> {
     let path = seg_dir.join("edges.dat");
     let file = File::create(&path)?;
@@ -233,7 +251,7 @@ fn write_varint_to_vec(buf: &mut Vec<u8>, mut val: u64) {
 fn write_adjacency_index(
     seg_dir: &Path,
     prefix: &str,
-    adj: &HashMap<u64, HashMap<u64, AdjEntry>>,
+    adj: &NodeIdMap<NodeIdMap<AdjEntry>>,
 ) -> Result<(), EngineError> {
     let idx_path = seg_dir.join(format!("{}.idx", prefix));
     let dat_path = seg_dir.join(format!("{}.dat", prefix));
@@ -322,7 +340,7 @@ fn write_adjacency_index(
 /// [data section: entries sorted by (type_id, key)]
 ///
 /// Each entry: [type_id: u32][node_id: u64][key_len: u16][key: bytes]
-fn write_key_index(seg_dir: &Path, nodes: &HashMap<u64, NodeRecord>) -> Result<(), EngineError> {
+fn write_key_index(seg_dir: &Path, nodes: &NodeIdMap<NodeRecord>) -> Result<(), EngineError> {
     let path = seg_dir.join("key_index.dat");
     let file = File::create(&path)?;
     let mut w = BufWriter::new(file);
@@ -379,7 +397,7 @@ fn write_key_index(seg_dir: &Path, nodes: &HashMap<u64, NodeRecord>) -> Result<(
 fn write_type_index(
     seg_dir: &Path,
     filename: &str,
-    type_index: &HashMap<u32, HashSet<u64>>,
+    type_index: &HashMap<u32, NodeIdSet>,
 ) -> Result<(), EngineError> {
     let path = seg_dir.join(format!("{}.dat", filename));
     let file = File::create(&path)?;
@@ -432,7 +450,7 @@ fn write_type_index(
 /// [data: packed u64 node IDs per group, grouped contiguously]
 fn write_prop_index(
     seg_dir: &Path,
-    prop_index: &HashMap<(u32, u64, u64), HashSet<u64>>,
+    prop_index: &HashMap<(u32, u64, u64), NodeIdSet>,
 ) -> Result<(), EngineError> {
     let path = seg_dir.join("prop_index.dat");
     let file = File::create(&path)?;
@@ -491,7 +509,7 @@ fn write_prop_index(
 /// [entries: count × (from: u64, to: u64, type_id: u32, edge_id: u64), sorted by (from, to, type_id)]
 fn write_edge_triple_index(
     seg_dir: &Path,
-    edges: &HashMap<u64, EdgeRecord>,
+    edges: &NodeIdMap<EdgeRecord>,
 ) -> Result<(), EngineError> {
     let path = seg_dir.join("edge_triple_index.dat");
     let file = File::create(&path)?;
@@ -549,14 +567,14 @@ fn write_timestamp_index(
     Ok(())
 }
 
-/// tombstones.dat format:
+/// tombstones.dat format (v9):
 /// [count: u64]
-/// [(kind: u8, id: u64, deleted_at: i64) × count]
-/// kind: 0 = node, 1 = edge
+/// [(kind: u8, id: u64, deleted_at: i64, last_write_seq: u64) × count]
+/// kind: 0 = node, 1 = edge. Entry size: 25 bytes.
 fn write_tombstones(
     seg_dir: &Path,
-    deleted_nodes: &HashMap<u64, i64>,
-    deleted_edges: &HashMap<u64, i64>,
+    deleted_nodes: &NodeIdMap<TombstoneEntry>,
+    deleted_edges: &NodeIdMap<TombstoneEntry>,
 ) -> Result<(), EngineError> {
     let path = seg_dir.join("tombstones.dat");
     let file = File::create(&path)?;
@@ -566,23 +584,25 @@ fn write_tombstones(
     write_u64(&mut w, count)?;
 
     // Write node tombstones (sorted by ID for determinism)
-    let mut node_entries: Vec<(u64, i64)> =
-        deleted_nodes.iter().map(|(&id, &ts)| (id, ts)).collect();
+    let mut node_entries: Vec<(u64, &TombstoneEntry)> =
+        deleted_nodes.iter().map(|(&id, ts)| (id, ts)).collect();
     node_entries.sort_unstable_by_key(|&(id, _)| id);
-    for (id, deleted_at) in node_entries {
+    for (id, ts) in node_entries {
         write_u8(&mut w, 0)?; // kind = node
         write_u64(&mut w, id)?;
-        w.write_all(&deleted_at.to_le_bytes())?;
+        w.write_all(&ts.deleted_at.to_le_bytes())?;
+        write_u64(&mut w, ts.last_write_seq)?;
     }
 
     // Write edge tombstones (sorted by ID for determinism)
-    let mut edge_entries: Vec<(u64, i64)> =
-        deleted_edges.iter().map(|(&id, &ts)| (id, ts)).collect();
+    let mut edge_entries: Vec<(u64, &TombstoneEntry)> =
+        deleted_edges.iter().map(|(&id, ts)| (id, ts)).collect();
     edge_entries.sort_unstable_by_key(|&(id, _)| id);
-    for (id, deleted_at) in edge_entries {
+    for (id, ts) in edge_entries {
         write_u8(&mut w, 1)?; // kind = edge
         write_u64(&mut w, id)?;
-        w.write_all(&deleted_at.to_le_bytes())?;
+        w.write_all(&ts.deleted_at.to_le_bytes())?;
+        write_u64(&mut w, ts.last_write_seq)?;
     }
 
     w.flush()?;
@@ -643,28 +663,30 @@ pub(crate) fn write_sidecars(
     seg_dir: &Path,
     node_data: &[(u64, u64, u32)],
     edge_data: &[(u64, u64, u32)],
-    nodes: &HashMap<u64, NodeRecord>,
-    edges: &HashMap<u64, EdgeRecord>,
-) -> Result<(), EngineError> {
+    nodes: &NodeIdMap<NodeRecord>,
+    edges: &NodeIdMap<EdgeRecord>,
+) -> Result<Vec<DensePointInput>, EngineError> {
     write_node_meta_and_prop_hashes(seg_dir, node_data, nodes)?;
+    let dense_points = write_node_vector_sidecars(seg_dir, node_data, nodes)?;
     write_edge_meta(seg_dir, edge_data, edges)?;
-    Ok(())
+    Ok(dense_points)
 }
 
 /// node_meta.dat format:
 /// [count: u64]
 /// [entries: count × NodeMetaEntry, sorted by node_id]
 ///
-/// NodeMetaEntry (52 bytes):
+/// NodeMetaEntry (60 bytes):
 ///   node_id: u64, data_offset: u64, data_len: u32, type_id: u32,
 ///   updated_at: i64, weight: f32, key_len: u16,
-///   prop_hash_offset: u64, prop_hash_count: u32, reserved: u16
+///   prop_hash_offset: u64, prop_hash_count: u32,
+///   last_write_seq: u64, reserved: u16
 ///
 /// Also writes node_prop_hashes.dat (interlinked via prop_hash_offset/count).
 fn write_node_meta_and_prop_hashes(
     seg_dir: &Path,
     node_data: &[(u64, u64, u32)],
-    nodes: &HashMap<u64, NodeRecord>,
+    nodes: &NodeIdMap<NodeRecord>,
 ) -> Result<(), EngineError> {
     let meta_path = seg_dir.join("node_meta.dat");
     let hash_path = seg_dir.join("node_prop_hashes.dat");
@@ -692,7 +714,7 @@ fn write_node_meta_and_prop_hashes(
             .collect();
         let prop_hash_count = prop_hashes.len() as u32;
 
-        // Write node_meta entry
+        // Write node_meta entry (60 bytes)
         write_u64(&mut meta_w, node_id)?;
         write_u64(&mut meta_w, data_offset)?;
         write_u32(&mut meta_w, data_len)?;
@@ -702,6 +724,7 @@ fn write_node_meta_and_prop_hashes(
         write_u16(&mut meta_w, node.key.len() as u16)?;
         write_u64(&mut meta_w, prop_hash_offset)?;
         write_u32(&mut meta_w, prop_hash_count)?;
+        write_u64(&mut meta_w, node.last_write_seq)?;
         write_u16(&mut meta_w, 0)?; // reserved
 
         // Write property hash pairs
@@ -719,19 +742,132 @@ fn write_node_meta_and_prop_hashes(
     Ok(())
 }
 
+fn write_node_vector_sidecars(
+    seg_dir: &Path,
+    node_data: &[(u64, u64, u32)],
+    nodes: &NodeIdMap<NodeRecord>,
+) -> Result<Vec<DensePointInput>, EngineError> {
+    let mut has_dense = false;
+    let mut has_sparse = false;
+    for &(node_id, _, _) in node_data {
+        let node = nodes.get(&node_id).ok_or_else(|| {
+            EngineError::CorruptRecord(format!("node {} not found for vector sidecar", node_id))
+        })?;
+        has_dense |= node.dense_vector.is_some();
+        has_sparse |= node.sparse_vector.is_some();
+    }
+
+    if !has_dense && !has_sparse {
+        return Ok(Vec::new());
+    }
+
+    let meta_file = File::create(seg_dir.join(NODE_VECTOR_META_FILENAME))?;
+    let mut meta_w = BufWriter::new(meta_file);
+    write_u64(&mut meta_w, node_data.len() as u64)?;
+
+    let mut dense_w = if has_dense {
+        Some(BufWriter::new(File::create(
+            seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME),
+        )?))
+    } else {
+        None
+    };
+    let mut sparse_w = if has_sparse {
+        Some(BufWriter::new(File::create(
+            seg_dir.join(NODE_SPARSE_VECTOR_BLOB_FILENAME),
+        )?))
+    } else {
+        None
+    };
+
+    let mut dense_offset = 0u64;
+    let mut sparse_offset = 0u64;
+    let mut dense_points = Vec::new();
+
+    for &(node_id, _, _) in node_data {
+        let node = nodes.get(&node_id).ok_or_else(|| {
+            EngineError::CorruptRecord(format!("node {} not found for vector sidecar", node_id))
+        })?;
+
+        let mut flags = 0u8;
+        let mut dense_len = 0u32;
+        let mut sparse_len = 0u32;
+        let mut entry_dense_offset = 0u64;
+        let mut entry_sparse_offset = 0u64;
+
+        if let Some(values) = node.dense_vector.as_ref() {
+            flags |= NODE_VECTOR_FLAG_DENSE;
+            dense_len = values.len() as u32;
+            entry_dense_offset = dense_offset;
+            dense_points.push(DensePointInput {
+                node_id,
+                dense_vector_offset: entry_dense_offset,
+                values: values.clone(),
+            });
+            let w = dense_w.as_mut().expect("dense blob writer must exist");
+            for &value in values {
+                w.write_all(&value.to_le_bytes())?;
+            }
+            dense_offset = dense_offset
+                .checked_add(values.len() as u64 * DENSE_VECTOR_VALUE_SIZE)
+                .ok_or_else(|| {
+                    EngineError::CorruptRecord("dense vector blob offset overflow".into())
+                })?;
+        }
+
+        if let Some(values) = node.sparse_vector.as_ref() {
+            flags |= NODE_VECTOR_FLAG_SPARSE;
+            sparse_len = values.len() as u32;
+            entry_sparse_offset = sparse_offset;
+            let w = sparse_w.as_mut().expect("sparse blob writer must exist");
+            for &(dimension_id, weight) in values {
+                write_u32(w, dimension_id)?;
+                w.write_all(&weight.to_le_bytes())?;
+            }
+            sparse_offset = sparse_offset
+                .checked_add(values.len() as u64 * SPARSE_VECTOR_ENTRY_SIZE)
+                .ok_or_else(|| {
+                    EngineError::CorruptRecord("sparse vector blob offset overflow".into())
+                })?;
+        }
+
+        write_u8(&mut meta_w, flags)?;
+        meta_w.write_all(&[0u8; 3])?;
+        write_u64(&mut meta_w, entry_dense_offset)?;
+        write_u32(&mut meta_w, dense_len)?;
+        write_u64(&mut meta_w, entry_sparse_offset)?;
+        write_u32(&mut meta_w, sparse_len)?;
+    }
+
+    meta_w.flush()?;
+    meta_w.get_ref().sync_all()?;
+
+    if let Some(mut w) = dense_w {
+        w.flush()?;
+        w.get_ref().sync_all()?;
+    }
+    if let Some(mut w) = sparse_w {
+        w.flush()?;
+        w.get_ref().sync_all()?;
+    }
+
+    Ok(dense_points)
+}
+
 /// edge_meta.dat format:
 /// [count: u64]
 /// [entries: count × EdgeMetaEntry, sorted by edge_id]
 ///
-/// EdgeMetaEntry (72 bytes):
+/// EdgeMetaEntry (80 bytes):
 ///   edge_id: u64, data_offset: u64, data_len: u32,
 ///   from: u64, to: u64, type_id: u32,
 ///   updated_at: i64, weight: f32,
-///   valid_from: i64, valid_to: i64, reserved: u32
+///   valid_from: i64, valid_to: i64,
+///   last_write_seq: u64, reserved: u32
 fn write_edge_meta(
     seg_dir: &Path,
     edge_data: &[(u64, u64, u32)],
-    edges: &HashMap<u64, EdgeRecord>,
+    edges: &NodeIdMap<EdgeRecord>,
 ) -> Result<(), EngineError> {
     let path = seg_dir.join("edge_meta.dat");
     let file = File::create(&path)?;
@@ -755,6 +891,7 @@ fn write_edge_meta(
         w.write_all(&edge.weight.to_le_bytes())?;
         w.write_all(&edge.valid_from.to_le_bytes())?;
         w.write_all(&edge.valid_to.to_le_bytes())?;
+        write_u64(&mut w, edge.last_write_seq)?;
         write_u32(&mut w, 0)?; // reserved
     }
 
@@ -1214,8 +1351,13 @@ pub(crate) struct CompactNodeMeta {
     pub key_len: u16,
     pub prop_hash_offset: u64,
     pub prop_hash_count: u32,
+    pub dense_vector_offset: u64,
+    pub dense_vector_len: u32,
+    pub sparse_vector_offset: u64,
+    pub sparse_vector_len: u32,
     pub src_seg_idx: usize,
     pub src_data_offset: u64,
+    pub last_write_seq: u64,
 }
 
 /// Edge metadata collected from source sidecars for metadata-driven index building.
@@ -1230,6 +1372,7 @@ pub(crate) struct CompactEdgeMeta {
     pub weight: f32,
     pub valid_from: i64,
     pub valid_to: i64,
+    pub last_write_seq: u64,
 }
 
 /// Build all secondary indexes and sidecars from metadata without Memtable decode.
@@ -1247,6 +1390,7 @@ pub(crate) fn write_indexes_from_metadata(
     segments: &[SegmentReader],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
+    dense_config: Option<&DenseVectorConfig>,
 ) -> Result<(), EngineError> {
     write_key_index_from_meta(seg_dir, segments, node_metas)?;
     write_node_type_index_from_meta(seg_dir, node_metas)?;
@@ -1257,7 +1401,9 @@ pub(crate) fn write_indexes_from_metadata(
     write_prop_index_from_meta(seg_dir, segments, node_metas)?;
     write_timestamp_index_from_meta(seg_dir, node_metas)?;
     write_empty_tombstones(seg_dir)?;
-    write_sidecars_from_meta(seg_dir, segments, node_metas, edge_metas)?;
+    let dense_points = write_sidecars_from_meta(seg_dir, segments, node_metas, edge_metas)?;
+    write_dense_hnsw_index_from_points(seg_dir, dense_config, dense_points)?;
+    write_sparse_posting_index_from_meta(seg_dir, segments, node_metas)?;
     write_format_version(seg_dir)?;
     fsync_dir(seg_dir)?;
     Ok(())
@@ -1633,7 +1779,7 @@ fn write_sidecars_from_meta(
     segments: &[SegmentReader],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
-) -> Result<(), EngineError> {
+) -> Result<Vec<DensePointInput>, EngineError> {
     // node_meta.dat + node_prop_hashes.dat
     let meta_path = seg_dir.join("node_meta.dat");
     let hash_path = seg_dir.join("node_prop_hashes.dat");
@@ -1649,7 +1795,7 @@ fn write_sidecars_from_meta(
     let mut new_prop_hash_offset: u64 = 0;
 
     for nm in node_metas {
-        // Write node_meta entry with updated data_offset and prop_hash_offset
+        // Write node_meta entry with updated data_offset and prop_hash_offset (60 bytes)
         write_u64(&mut meta_w, nm.node_id)?;
         write_u64(&mut meta_w, nm.new_data_offset)?;
         write_u32(&mut meta_w, nm.data_len)?;
@@ -1659,6 +1805,7 @@ fn write_sidecars_from_meta(
         write_u16(&mut meta_w, nm.key_len)?;
         write_u64(&mut meta_w, new_prop_hash_offset)?;
         write_u32(&mut meta_w, nm.prop_hash_count)?;
+        write_u64(&mut meta_w, nm.last_write_seq)?;
         write_u16(&mut meta_w, 0)?; // reserved
 
         // Copy property hash pairs from source segment
@@ -1686,6 +1833,8 @@ fn write_sidecars_from_meta(
     hash_w.flush()?;
     hash_w.get_ref().sync_all()?;
 
+    let dense_points = write_node_vector_sidecars_from_meta(seg_dir, segments, node_metas)?;
+
     // edge_meta.dat
     let edge_meta_path = seg_dir.join("edge_meta.dat");
     let edge_meta_file = File::create(&edge_meta_path)?;
@@ -1705,11 +1854,220 @@ fn write_sidecars_from_meta(
         em_w.write_all(&em.weight.to_le_bytes())?;
         em_w.write_all(&em.valid_from.to_le_bytes())?;
         em_w.write_all(&em.valid_to.to_le_bytes())?;
+        write_u64(&mut em_w, em.last_write_seq)?;
         write_u32(&mut em_w, 0)?; // reserved
     }
 
     em_w.flush()?;
     em_w.get_ref().sync_all()?;
+    Ok(dense_points)
+}
+
+fn write_node_vector_sidecars_from_meta(
+    seg_dir: &Path,
+    segments: &[SegmentReader],
+    node_metas: &[CompactNodeMeta],
+) -> Result<Vec<DensePointInput>, EngineError> {
+    let has_dense = node_metas.iter().any(|nm| nm.dense_vector_len > 0);
+    let has_sparse = node_metas.iter().any(|nm| nm.sparse_vector_len > 0);
+
+    if !has_dense && !has_sparse {
+        return Ok(Vec::new());
+    }
+
+    let meta_file = File::create(seg_dir.join(NODE_VECTOR_META_FILENAME))?;
+    let mut meta_w = BufWriter::new(meta_file);
+    write_u64(&mut meta_w, node_metas.len() as u64)?;
+
+    let mut dense_w = if has_dense {
+        Some(BufWriter::new(File::create(
+            seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME),
+        )?))
+    } else {
+        None
+    };
+    let mut sparse_w = if has_sparse {
+        Some(BufWriter::new(File::create(
+            seg_dir.join(NODE_SPARSE_VECTOR_BLOB_FILENAME),
+        )?))
+    } else {
+        None
+    };
+
+    let mut new_dense_offset = 0u64;
+    let mut new_sparse_offset = 0u64;
+    let mut dense_points = Vec::new();
+
+    for nm in node_metas {
+        let mut flags = 0u8;
+        let mut entry_dense_offset = 0u64;
+        let mut entry_sparse_offset = 0u64;
+
+        if nm.dense_vector_len > 0 {
+            flags |= NODE_VECTOR_FLAG_DENSE;
+            entry_dense_offset = new_dense_offset;
+        }
+        if nm.sparse_vector_len > 0 {
+            flags |= NODE_VECTOR_FLAG_SPARSE;
+            entry_sparse_offset = new_sparse_offset;
+        }
+
+        write_u8(&mut meta_w, flags)?;
+        meta_w.write_all(&[0u8; 3])?;
+        write_u64(&mut meta_w, entry_dense_offset)?;
+        write_u32(&mut meta_w, nm.dense_vector_len)?;
+        write_u64(&mut meta_w, entry_sparse_offset)?;
+        write_u32(&mut meta_w, nm.sparse_vector_len)?;
+
+        if nm.dense_vector_len > 0 {
+            let src = segments[nm.src_seg_idx].raw_node_dense_vectors_mmap();
+            let base = nm.dense_vector_offset as usize;
+            let len = nm.dense_vector_len as usize * DENSE_VECTOR_VALUE_SIZE as usize;
+            let end = base + len;
+            if end > src.len() {
+                return Err(EngineError::CorruptRecord(format!(
+                    "node {} dense vector range [{}, {}) exceeds source length {}",
+                    nm.node_id,
+                    base,
+                    end,
+                    src.len()
+                )));
+            }
+            let mut values = Vec::with_capacity(nm.dense_vector_len as usize);
+            for index in 0..nm.dense_vector_len as usize {
+                let value_offset = base + index * DENSE_VECTOR_VALUE_SIZE as usize;
+                values.push(f32::from_le_bytes(
+                    src[value_offset..value_offset + DENSE_VECTOR_VALUE_SIZE as usize]
+                        .try_into()
+                        .unwrap(),
+                ));
+            }
+            dense_points.push(DensePointInput {
+                node_id: nm.node_id,
+                dense_vector_offset: entry_dense_offset,
+                values,
+            });
+            dense_w
+                .as_mut()
+                .expect("dense blob writer must exist")
+                .write_all(&src[base..end])?;
+            new_dense_offset = new_dense_offset.checked_add(len as u64).ok_or_else(|| {
+                EngineError::CorruptRecord("dense vector output offset overflow".into())
+            })?;
+        }
+
+        if nm.sparse_vector_len > 0 {
+            let src = segments[nm.src_seg_idx].raw_node_sparse_vectors_mmap();
+            let base = nm.sparse_vector_offset as usize;
+            let len = nm.sparse_vector_len as usize * SPARSE_VECTOR_ENTRY_SIZE as usize;
+            let end = base + len;
+            if end > src.len() {
+                return Err(EngineError::CorruptRecord(format!(
+                    "node {} sparse vector range [{}, {}) exceeds source length {}",
+                    nm.node_id,
+                    base,
+                    end,
+                    src.len()
+                )));
+            }
+            sparse_w
+                .as_mut()
+                .expect("sparse blob writer must exist")
+                .write_all(&src[base..end])?;
+            new_sparse_offset = new_sparse_offset.checked_add(len as u64).ok_or_else(|| {
+                EngineError::CorruptRecord("sparse vector output offset overflow".into())
+            })?;
+        }
+    }
+
+    meta_w.flush()?;
+    meta_w.get_ref().sync_all()?;
+
+    if let Some(mut w) = dense_w {
+        w.flush()?;
+        w.get_ref().sync_all()?;
+    }
+    if let Some(mut w) = sparse_w {
+        w.flush()?;
+        w.get_ref().sync_all()?;
+    }
+
+    Ok(dense_points)
+}
+
+fn write_sparse_posting_index(
+    seg_dir: &Path,
+    nodes: &NodeIdMap<NodeRecord>,
+) -> Result<(), EngineError> {
+    let mut groups: BTreeMap<u32, Vec<(u64, f32)>> = BTreeMap::new();
+    for node in nodes.values() {
+        let Some(values) = node.sparse_vector.as_ref() else {
+            continue;
+        };
+        for &(dimension_id, weight) in values {
+            groups
+                .entry(dimension_id)
+                .or_default()
+                .push((node.id, weight));
+        }
+    }
+    sort_sparse_posting_groups(&mut groups)?;
+    write_sparse_posting_files(seg_dir, &groups)
+}
+
+fn write_sparse_posting_index_from_meta(
+    seg_dir: &Path,
+    segments: &[SegmentReader],
+    node_metas: &[CompactNodeMeta],
+) -> Result<(), EngineError> {
+    let mut groups: BTreeMap<u32, Vec<(u64, f32)>> = BTreeMap::new();
+    for nm in node_metas {
+        if nm.sparse_vector_len == 0 {
+            continue;
+        }
+        let src = segments[nm.src_seg_idx].raw_node_sparse_vectors_mmap();
+        let base = nm.sparse_vector_offset as usize;
+        let len = nm.sparse_vector_len as usize * SPARSE_VECTOR_ENTRY_SIZE as usize;
+        let end = base + len;
+        if end > src.len() {
+            return Err(EngineError::CorruptRecord(format!(
+                "node {} sparse posting source range [{}, {}) exceeds source length {}",
+                nm.node_id,
+                base,
+                end,
+                src.len()
+            )));
+        }
+        for index in 0..nm.sparse_vector_len as usize {
+            let entry_offset = base + index * SPARSE_VECTOR_ENTRY_SIZE as usize;
+            let dimension_id =
+                u32::from_le_bytes(src[entry_offset..entry_offset + 4].try_into().unwrap());
+            let weight =
+                f32::from_le_bytes(src[entry_offset + 4..entry_offset + 8].try_into().unwrap());
+            groups
+                .entry(dimension_id)
+                .or_default()
+                .push((nm.node_id, weight));
+        }
+    }
+    sort_sparse_posting_groups(&mut groups)?;
+    write_sparse_posting_files(seg_dir, &groups)
+}
+
+fn sort_sparse_posting_groups(
+    groups: &mut BTreeMap<u32, Vec<(u64, f32)>>,
+) -> Result<(), EngineError> {
+    for (&dimension_id, postings) in groups.iter_mut() {
+        postings.sort_unstable_by_key(|&(node_id, _)| node_id);
+        for window in postings.windows(2) {
+            if window[0].0 == window[1].0 {
+                return Err(EngineError::CorruptRecord(format!(
+                    "sparse posting dimension {} has duplicate node {}",
+                    dimension_id, window[0].0
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1726,6 +2084,9 @@ mod tests {
             created_at: 1000,
             updated_at: 1001,
             weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         }
     }
 
@@ -1741,6 +2102,9 @@ mod tests {
             created_at: 1000,
             updated_at: 1001,
             weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         }
     }
 
@@ -1756,6 +2120,7 @@ mod tests {
             weight: 1.0,
             valid_from: 0,
             valid_to: i64::MAX,
+            last_write_seq: 0,
         }
     }
 
@@ -1802,7 +2167,7 @@ mod tests {
     #[test]
     fn test_write_nodes_dat_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let nodes = HashMap::new();
+        let nodes = NodeIdMap::default();
         write_nodes_dat(dir.path(), &nodes).unwrap();
 
         let data = fs::read(dir.path().join("nodes.dat")).unwrap();
@@ -1814,7 +2179,7 @@ mod tests {
     #[test]
     fn test_write_nodes_dat_multiple() {
         let dir = tempfile::tempdir().unwrap();
-        let mut nodes = HashMap::new();
+        let mut nodes = NodeIdMap::default();
         nodes.insert(3, make_node(3, 1, "charlie"));
         nodes.insert(1, make_node(1, 1, "alice"));
         nodes.insert(2, make_node(2, 1, "bob"));
@@ -1847,7 +2212,7 @@ mod tests {
     #[test]
     fn test_write_edges_dat_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let edges = HashMap::new();
+        let edges = NodeIdMap::default();
         write_edges_dat(dir.path(), &edges).unwrap();
 
         let data = fs::read(dir.path().join("edges.dat")).unwrap();
@@ -1858,7 +2223,7 @@ mod tests {
     #[test]
     fn test_write_edges_dat_multiple() {
         let dir = tempfile::tempdir().unwrap();
-        let mut edges = HashMap::new();
+        let mut edges = NodeIdMap::default();
         edges.insert(2, make_edge(2, 1, 3, 10));
         edges.insert(1, make_edge(1, 1, 2, 10));
 
@@ -1889,9 +2254,9 @@ mod tests {
         }
     }
 
-    fn adj_map_from(node_id: u64, entries: Vec<AdjEntry>) -> HashMap<u64, HashMap<u64, AdjEntry>> {
-        let mut outer = HashMap::new();
-        let mut inner = HashMap::new();
+    fn adj_map_from(node_id: u64, entries: Vec<AdjEntry>) -> NodeIdMap<NodeIdMap<AdjEntry>> {
+        let mut outer = NodeIdMap::default();
+        let mut inner = NodeIdMap::default();
         for e in entries {
             inner.insert(e.edge_id, e);
         }
@@ -1902,7 +2267,7 @@ mod tests {
     #[test]
     fn test_write_adjacency_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let adj: HashMap<u64, HashMap<u64, AdjEntry>> = HashMap::new();
+        let adj: NodeIdMap<NodeIdMap<AdjEntry>> = NodeIdMap::default();
         write_adjacency_index(dir.path(), "adj_out", &adj).unwrap();
 
         let idx_data = fs::read(dir.path().join("adj_out.idx")).unwrap();
@@ -1942,11 +2307,11 @@ mod tests {
     #[test]
     fn test_write_adjacency_sorted_index() {
         let dir = tempfile::tempdir().unwrap();
-        let mut adj: HashMap<u64, HashMap<u64, AdjEntry>> = HashMap::new();
-        let mut m5 = HashMap::new();
+        let mut adj: NodeIdMap<NodeIdMap<AdjEntry>> = NodeIdMap::default();
+        let mut m5 = NodeIdMap::default();
         m5.insert(10, make_adj(10, 1, 6, 0.5));
         adj.insert(5, m5);
-        let mut m1 = HashMap::new();
+        let mut m1 = NodeIdMap::default();
         m1.insert(11, make_adj(11, 1, 2, 0.7));
         adj.insert(1, m1);
 
@@ -1968,7 +2333,7 @@ mod tests {
     #[test]
     fn test_write_key_index_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let nodes = HashMap::new();
+        let nodes = NodeIdMap::default();
         write_key_index(dir.path(), &nodes).unwrap();
 
         let data = fs::read(dir.path().join("key_index.dat")).unwrap();
@@ -1980,7 +2345,7 @@ mod tests {
     #[test]
     fn test_write_key_index_sorted_by_type_and_key() {
         let dir = tempfile::tempdir().unwrap();
-        let mut nodes = HashMap::new();
+        let mut nodes = NodeIdMap::default();
         nodes.insert(1, make_node(1, 2, "zebra"));
         nodes.insert(2, make_node(2, 1, "bob"));
         nodes.insert(3, make_node(3, 1, "alice"));
@@ -2028,8 +2393,8 @@ mod tests {
     #[test]
     fn test_write_tombstones_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let dn = HashMap::new();
-        let de = HashMap::new();
+        let dn = NodeIdMap::default();
+        let de = NodeIdMap::default();
         write_tombstones(dir.path(), &dn, &de).unwrap();
 
         let data = fs::read(dir.path().join("tombstones.dat")).unwrap();
@@ -2040,11 +2405,29 @@ mod tests {
     #[test]
     fn test_write_tombstones_mixed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut dn = HashMap::new();
-        dn.insert(5, 1000i64);
-        dn.insert(3, 1001i64);
-        let mut de = HashMap::new();
-        de.insert(10, 2000i64);
+        let mut dn = NodeIdMap::default();
+        dn.insert(
+            5,
+            TombstoneEntry {
+                deleted_at: 1000,
+                last_write_seq: 0,
+            },
+        );
+        dn.insert(
+            3,
+            TombstoneEntry {
+                deleted_at: 1001,
+                last_write_seq: 0,
+            },
+        );
+        let mut de = NodeIdMap::default();
+        de.insert(
+            10,
+            TombstoneEntry {
+                deleted_at: 2000,
+                last_write_seq: 0,
+            },
+        );
 
         write_tombstones(dir.path(), &dn, &de).unwrap();
 
@@ -2052,9 +2435,9 @@ mod tests {
         let count = u64::from_le_bytes(data[0..8].try_into().unwrap());
         assert_eq!(count, 3);
 
-        // Each tombstone: 1 byte kind + 8 bytes id + 8 bytes deleted_at = 17 bytes
+        // Each tombstone: 1 byte kind + 8 bytes id + 8 bytes deleted_at + 8 bytes last_write_seq = 25 bytes
         // Node tombstones first (sorted: 3, 5), then edge tombstones (sorted: 10)
-        let entry_size = 17;
+        let entry_size = 25;
         let off = 8;
 
         assert_eq!(data[off], 0); // kind = node
@@ -2100,15 +2483,18 @@ mod tests {
         let seg_dir = dir.path().join("seg_0001");
 
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
-        mt.apply_op(&WalOp::DeleteNode {
-            id: 99,
-            deleted_at: 9999,
-        });
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 99,
+                deleted_at: 9999,
+            },
+            0,
+        );
 
-        let info = write_segment(&seg_dir, 1, &mt).unwrap();
+        let info = write_segment(&seg_dir, 1, &mt, None).unwrap();
         assert_eq!(info.id, 1);
         assert_eq!(info.node_count, 2);
         assert_eq!(info.edge_count, 1);
@@ -2131,6 +2517,15 @@ mod tests {
         assert!(seg_dir.join("node_meta.dat").exists());
         assert!(seg_dir.join("edge_meta.dat").exists());
         assert!(seg_dir.join("node_prop_hashes.dat").exists());
+        assert!(!seg_dir.join(NODE_VECTOR_META_FILENAME).exists());
+        assert!(!seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME).exists());
+        assert!(!seg_dir.join(NODE_SPARSE_VECTOR_BLOB_FILENAME).exists());
+        assert!(!seg_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)
+            .exists());
+        assert!(!seg_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)
+            .exists());
     }
 
     #[test]
@@ -2139,13 +2534,83 @@ mod tests {
         let seg_dir = dir.path().join("seg_0001");
 
         let mt = Memtable::new();
-        let info = write_segment(&seg_dir, 1, &mt).unwrap();
+        let info = write_segment(&seg_dir, 1, &mt, None).unwrap();
         assert_eq!(info.node_count, 0);
         assert_eq!(info.edge_count, 0);
 
         // All files should still be created
         assert!(seg_dir.join("nodes.dat").exists());
         assert!(seg_dir.join("edges.dat").exists());
+    }
+
+    #[test]
+    fn test_write_segment_with_vectors_writes_vector_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+
+        let mut mt = Memtable::new();
+        let mut node = make_node(1, 1, "alice");
+        node.dense_vector = Some(vec![0.1, 0.2, 0.3]);
+        node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
+
+        let dense_config = DenseVectorConfig {
+            dimension: 3,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig::default(),
+        };
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        assert!(seg_dir.join(NODE_VECTOR_META_FILENAME).exists());
+        assert!(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME).exists());
+        assert!(seg_dir.join(NODE_SPARSE_VECTOR_BLOB_FILENAME).exists());
+        assert!(seg_dir
+            .join(crate::sparse_postings::SPARSE_POSTING_INDEX_FILENAME)
+            .exists());
+        assert!(seg_dir
+            .join(crate::sparse_postings::SPARSE_POSTINGS_FILENAME)
+            .exists());
+        assert!(seg_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)
+            .exists());
+        assert!(seg_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)
+            .exists());
+    }
+
+    #[test]
+    fn test_write_segment_with_sparse_only_vectors_skips_dense_hnsw() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+
+        let mut mt = Memtable::new();
+        let mut node = make_node(1, 1, "sparse");
+        node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+
+        let dense_config = DenseVectorConfig {
+            dimension: 3,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig::default(),
+        };
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        assert!(seg_dir.join(NODE_VECTOR_META_FILENAME).exists());
+        assert!(!seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME).exists());
+        assert!(seg_dir.join(NODE_SPARSE_VECTOR_BLOB_FILENAME).exists());
+        assert!(seg_dir
+            .join(crate::sparse_postings::SPARSE_POSTING_INDEX_FILENAME)
+            .exists());
+        assert!(seg_dir
+            .join(crate::sparse_postings::SPARSE_POSTINGS_FILENAME)
+            .exists());
+        assert!(!seg_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)
+            .exists());
+        assert!(!seg_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)
+            .exists());
     }
 
     #[test]
@@ -2168,7 +2633,7 @@ mod tests {
     #[test]
     fn test_write_nodes_with_properties() {
         let dir = tempfile::tempdir().unwrap();
-        let mut nodes = HashMap::new();
+        let mut nodes = NodeIdMap::default();
         nodes.insert(1, make_node_with_props(1, 1, "alice"));
 
         write_nodes_dat(dir.path(), &nodes).unwrap();
@@ -2293,7 +2758,7 @@ mod tests {
     #[test]
     fn test_write_node_meta_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut nodes = HashMap::new();
+        let mut nodes = NodeIdMap::default();
         nodes.insert(1, make_node_with_props(1, 1, "alice"));
         nodes.insert(2, make_node(2, 2, "bob"));
 
@@ -2329,7 +2794,7 @@ mod tests {
         assert_eq!(prop_hash_count, 2);
 
         // Second entry (node_id=2)
-        let off2 = 8 + 52; // NODE_META_ENTRY_SIZE = 52
+        let off2 = 8 + 60; // NODE_META_ENTRY_SIZE = 60
         let nid2 = u64::from_le_bytes(meta[off2..off2 + 8].try_into().unwrap());
         assert_eq!(nid2, 2);
         let type_id2 = u32::from_le_bytes(meta[off2 + 20..off2 + 24].try_into().unwrap());
@@ -2346,7 +2811,7 @@ mod tests {
     #[test]
     fn test_write_edge_meta_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut edges = HashMap::new();
+        let mut edges = NodeIdMap::default();
         edges.insert(10, make_edge(10, 1, 2, 5));
         edges.insert(20, make_edge(20, 3, 4, 7));
 
@@ -2380,8 +2845,8 @@ mod tests {
     #[test]
     fn test_sidecars_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let nodes = HashMap::new();
-        let edges = HashMap::new();
+        let nodes = NodeIdMap::default();
+        let edges = NodeIdMap::default();
         let node_data = write_nodes_dat(dir.path(), &nodes).unwrap();
         let edge_data = write_edges_dat(dir.path(), &edges).unwrap();
         write_sidecars(dir.path(), &node_data, &edge_data, &nodes, &edges).unwrap();

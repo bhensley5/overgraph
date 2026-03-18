@@ -1,6 +1,8 @@
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, EdgeInput, ExportOptions, NodeInput, PprOptions,
-    PropValue, ScoringMode, WalSyncMode,
+    DatabaseEngine, DbOptions, DegreeOptions, DenseMetric, DenseVectorConfig, EdgeInput,
+    ExportOptions, HnswConfig, IsConnectedOptions, NeighborOptions, NodeInput, PprOptions,
+    PropValue, ShortestPathOptions, TopKOptions, TraverseOptions, UpsertEdgeOptions,
+    UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, WalSyncMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -73,6 +75,12 @@ struct EffectiveConfigContract {
     shortest_path_nodes_min: usize,
     shortest_path_nodes_divisor: usize,
     shortest_path_edge_offsets: Vec<usize>,
+    vector_dim: u32,
+    vector_nodes_min: usize,
+    vector_nodes_divisor: usize,
+    vector_nnz: usize,
+    vector_sparse_dims: u32,
+    vector_k: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -127,6 +135,11 @@ struct EffectiveConfigResolved {
     include_weights_on_export: bool,
     shortest_path_nodes: usize,
     shortest_path_edge_offsets: Vec<usize>,
+    vector_nodes: usize,
+    vector_dim: u32,
+    vector_nnz: usize,
+    vector_sparse_dims: u32,
+    vector_k: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,7 +270,14 @@ fn main() -> Result<(), String> {
         let mut engine = open_db(&tmp_root.db_path("crud-upsert-node"))?;
         let stats = run_bench_growth(iter_cfg, |i| {
             engine
-                .upsert_node(1, &format!("node-{i}"), idx_props(i), 1.0)
+                .upsert_node(
+                    1,
+                    &format!("node-{i}"),
+                    UpsertNodeOptions {
+                        props: idx_props(i),
+                        ..Default::default()
+                    },
+                )
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -285,6 +305,8 @@ fn main() -> Result<(), String> {
                 key: format!("e-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let node_ids = engine
@@ -297,10 +319,7 @@ fn main() -> Result<(), String> {
                     node_ids[i],
                     node_ids[i + 1],
                     1,
-                    BTreeMap::new(),
-                    1.0,
-                    None,
-                    None,
+                    UpsertEdgeOptions::default(),
                 )
                 .map(|_| ())
         })?;
@@ -330,6 +349,8 @@ fn main() -> Result<(), String> {
                     key: format!("bn-{i}-{j}"),
                     props: idx_props(j),
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 })
                 .collect();
             engine.batch_upsert_nodes(&inputs).map(|_| ())
@@ -359,6 +380,8 @@ fn main() -> Result<(), String> {
                 key: format!("gn-{i}"),
                 props: idx_props(i),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let node_ids = engine
@@ -389,11 +412,25 @@ fn main() -> Result<(), String> {
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let mut engine = open_db(&tmp_root.db_path("crud-upsert-node-fixed"))?;
         engine
-            .upsert_node(1, "fixed-node", idx_props(0), 1.0)
+            .upsert_node(
+                1,
+                "fixed-node",
+                UpsertNodeOptions {
+                    props: idx_props(0),
+                    ..Default::default()
+                },
+            )
             .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |i| {
             engine
-                .upsert_node(1, "fixed-node", idx_props(i), 1.0)
+                .upsert_node(
+                    1,
+                    "fixed-node",
+                    UpsertNodeOptions {
+                        props: idx_props(i),
+                        ..Default::default()
+                    },
+                )
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -419,14 +456,14 @@ fn main() -> Result<(), String> {
         let mut engine = DatabaseEngine::open(&tmp_root.db_path("crud-upsert-edge-fixed"), &opts)
             .map_err(|e| e.to_string())?;
         let node_a = engine
-            .upsert_node(1, "fixed-a", BTreeMap::new(), 1.0)
+            .upsert_node(1, "fixed-a", UpsertNodeOptions::default())
             .map_err(|e| e.to_string())?;
         let node_b = engine
-            .upsert_node(1, "fixed-b", BTreeMap::new(), 1.0)
+            .upsert_node(1, "fixed-b", UpsertNodeOptions::default())
             .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .upsert_edge(node_a, node_b, 1, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(node_a, node_b, 1, UpsertEdgeOptions::default())
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -453,12 +490,16 @@ fn main() -> Result<(), String> {
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         }];
         node_inputs.extend((0..cfg.fanout).map(|i| NodeInput {
             type_id: 1,
             key: format!("n-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         }));
         let ids = engine
             .batch_upsert_nodes(&node_inputs)
@@ -481,7 +522,7 @@ fn main() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .neighbors(hub, Direction::Outgoing, None, 0, None, None)
+                .neighbors(hub, &NeighborOptions::default())
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -510,14 +551,10 @@ fn main() -> Result<(), String> {
                 .traverse(
                     root,
                     2,
-                    2,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    &TraverseOptions {
+                        min_depth: 2,
+                        ..Default::default()
+                    },
                 )
                 .map(|_| ())
         })?;
@@ -549,18 +586,7 @@ fn main() -> Result<(), String> {
         let (root, level1, level2, level3) = build_deep_traversal_graph(&mut engine, cfg.fanout)?;
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .traverse(
-                    root,
-                    1,
-                    3,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                .traverse(root, 3, &TraverseOptions::default())
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -593,18 +619,7 @@ fn main() -> Result<(), String> {
         engine.flush().map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .traverse(
-                    root,
-                    1,
-                    3,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                .traverse(root, 3, &TraverseOptions::default())
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -634,20 +649,15 @@ fn main() -> Result<(), String> {
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let mut engine = open_db(&tmp_root.db_path("trav-depth13-filtered-memtable"))?;
         let (root, level1, level2, level3) = build_deep_traversal_graph(&mut engine, cfg.fanout)?;
-        let node_type_filter = [2u32];
         let stats = run_bench(iter_cfg, |_i| {
             engine
                 .traverse(
                     root,
-                    1,
                     3,
-                    Direction::Outgoing,
-                    None,
-                    Some(&node_type_filter),
-                    None,
-                    None,
-                    None,
-                    None,
+                    &TraverseOptions {
+                        node_type_filter: Some(vec![2u32]),
+                        ..Default::default()
+                    },
                 )
                 .map(|_| ())
         })?;
@@ -679,20 +689,15 @@ fn main() -> Result<(), String> {
         let mut engine = open_db(&tmp_root.db_path("trav-depth13-filtered-segment"))?;
         let (root, level1, level2, level3) = build_deep_traversal_graph(&mut engine, cfg.fanout)?;
         engine.flush().map_err(|e| e.to_string())?;
-        let node_type_filter = [2u32];
         let stats = run_bench(iter_cfg, |_i| {
             engine
                 .traverse(
                     root,
-                    1,
                     3,
-                    Direction::Outgoing,
-                    None,
-                    Some(&node_type_filter),
-                    None,
-                    None,
-                    None,
-                    None,
+                    &TraverseOptions {
+                        node_type_filter: Some(vec![2u32]),
+                        ..Default::default()
+                    },
                 )
                 .map(|_| ())
         })?;
@@ -727,12 +732,16 @@ fn main() -> Result<(), String> {
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         }];
         node_inputs.extend((0..cfg.fanout).map(|i| NodeInput {
             type_id: 1,
             key: format!("d-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         }));
         let ids = engine
             .batch_upsert_nodes(&node_inputs)
@@ -754,9 +763,7 @@ fn main() -> Result<(), String> {
             .batch_upsert_edges(&edge_inputs)
             .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
-            engine
-                .degree(hub, Direction::Outgoing, None, None)
-                .map(|_| ())
+            engine.degree(hub, &DegreeOptions::default()).map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
 
@@ -785,6 +792,8 @@ fn main() -> Result<(), String> {
                 key: format!("hub-{h}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             });
             for i in 0..cfg.fanout {
                 node_inputs.push(NodeInput {
@@ -792,6 +801,8 @@ fn main() -> Result<(), String> {
                     key: format!("dt-{h}-{i}"),
                     props: BTreeMap::new(),
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 });
             }
         }
@@ -821,7 +832,7 @@ fn main() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .degrees(&hub_ids, Direction::Outgoing, None, None)
+                .degrees(&hub_ids, &DegreeOptions::default())
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -850,6 +861,8 @@ fn main() -> Result<(), String> {
                 key: format!("sp-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let node_ids = engine
@@ -899,16 +912,7 @@ fn main() -> Result<(), String> {
         let sp_to = node_ids[node_ids.len() / 2];
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .shortest_path(
-                    sp_from,
-                    sp_to,
-                    Direction::Outgoing,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                .shortest_path(sp_from, sp_to, &ShortestPathOptions::default())
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -942,6 +946,8 @@ fn main() -> Result<(), String> {
                 key: format!("ic-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let node_ids = engine
@@ -991,7 +997,7 @@ fn main() -> Result<(), String> {
         let sp_to = node_ids[node_ids.len() / 2];
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .is_connected(sp_from, sp_to, Direction::Outgoing, None, None, None)
+                .is_connected(sp_from, sp_to, &IsConnectedOptions::default())
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -1022,12 +1028,16 @@ fn main() -> Result<(), String> {
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         }];
         node_inputs.extend((0..cfg.top_k_candidates).map(|i| NodeInput {
             type_id: 1,
             key: format!("tk-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         }));
         let ids = engine
             .batch_upsert_nodes(&node_inputs)
@@ -1055,14 +1065,7 @@ fn main() -> Result<(), String> {
 
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .top_k_neighbors(
-                    hub,
-                    Direction::Outgoing,
-                    None,
-                    cfg.top_k_limit,
-                    ScoringMode::Weight,
-                    None,
-                )
+                .top_k_neighbors(hub, cfg.top_k_limit, &TopKOptions::default())
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -1095,6 +1098,8 @@ fn main() -> Result<(), String> {
                 key: format!("tr-{i}"),
                 props: idx_props(i),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         engine
@@ -1138,6 +1143,8 @@ fn main() -> Result<(), String> {
                 key: format!("ppr-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let node_ids = engine
@@ -1230,6 +1237,8 @@ fn main() -> Result<(), String> {
                 key: format!("ex-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
         let node_ids = engine
@@ -1296,6 +1305,8 @@ fn main() -> Result<(), String> {
                     key: format!("fl-{i}-{j}"),
                     props: idx_props(j),
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 })
                 .collect();
             let node_ids = engine.batch_upsert_nodes(&nodes)?;
@@ -1330,6 +1341,77 @@ fn main() -> Result<(), String> {
             json!({
                 "nodes_per_iter": cfg.flush_nodes_per_iter,
                 "edge_chain_cap": cfg.flush_edges_per_iter_cap
+            }),
+            scenario_comparability(&scenario_contract, scenario_id),
+        ));
+    }
+
+    // S-VEC-001: hybrid_vector_search
+    {
+        let scenario_id = "S-VEC-001";
+        let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
+        let mut engine = open_vector_db(&tmp_root.db_path("vec-hybrid"), cfg.vector_dim)?;
+
+        let inputs: Vec<NodeInput> = (0..cfg.vector_nodes)
+            .map(|i| {
+                let seed = 1729u64.wrapping_mul(i as u64 + 1);
+                NodeInput {
+                    type_id: 1,
+                    key: format!("v-{i}"),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    dense_vector: Some(bench_dense_vector(cfg.vector_dim as usize, seed)),
+                    sparse_vector: Some(bench_sparse_vector(
+                        cfg.vector_sparse_dims,
+                        cfg.vector_nnz,
+                        seed.wrapping_add(0xCAFE),
+                    )),
+                }
+            })
+            .collect();
+        engine
+            .batch_upsert_nodes(&inputs)
+            .map_err(|e| e.to_string())?;
+        engine.flush().map_err(|e| e.to_string())?;
+
+        let query_seed = 0xDEAD_BEEF_u64;
+        let dense_query = bench_dense_vector(cfg.vector_dim as usize, query_seed);
+        let sparse_query = bench_sparse_vector(
+            cfg.vector_sparse_dims,
+            cfg.vector_nnz,
+            query_seed.wrapping_add(0xCAFE),
+        );
+        let request = VectorSearchRequest {
+            mode: VectorSearchMode::Hybrid,
+            dense_query: Some(dense_query),
+            sparse_query: Some(sparse_query),
+            k: cfg.vector_k,
+            type_filter: None,
+            ef_search: None,
+            scope: None,
+            dense_weight: None,
+            sparse_weight: None,
+            fusion_mode: None,
+        };
+
+        let stats = run_bench(iter_cfg, |_| engine.vector_search(&request).map(|_| ()))?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "hybrid_vector_search",
+            "vector",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "vector_nodes": cfg.vector_nodes,
+                "vector_dim": cfg.vector_dim,
+                "vector_nnz": cfg.vector_nnz,
+                "vector_sparse_dims": cfg.vector_sparse_dims,
+                "vector_k": cfg.vector_k,
+                "mode": "hybrid",
+                "fusion_mode": "weighted_rank"
             }),
             scenario_comparability(&scenario_contract, scenario_id),
         ));
@@ -1462,6 +1544,13 @@ fn effective_config(
             .shortest_path_nodes_min
             .max(nodes / cfg.shortest_path_nodes_divisor.max(1)),
         shortest_path_edge_offsets: cfg.shortest_path_edge_offsets.clone(),
+        vector_nodes: cfg
+            .vector_nodes_min
+            .max(profile.nodes / cfg.vector_nodes_divisor.max(1)),
+        vector_dim: cfg.vector_dim,
+        vector_nnz: cfg.vector_nnz,
+        vector_sparse_dims: cfg.vector_sparse_dims,
+        vector_k: cfg.vector_k,
     }
 }
 
@@ -1478,6 +1567,8 @@ fn build_depth_two_traversal_graph(
         key: "root".to_string(),
         props: BTreeMap::new(),
         weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
     }];
     for i in 0..cfg.two_hop_mid {
         node_inputs.push(NodeInput {
@@ -1485,6 +1576,8 @@ fn build_depth_two_traversal_graph(
             key: format!("m-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         });
         for j in 0..cfg.two_hop_leaves_per_mid {
             node_inputs.push(NodeInput {
@@ -1492,6 +1585,8 @@ fn build_depth_two_traversal_graph(
                 key: format!("l-{i}-{j}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             });
         }
     }
@@ -1541,6 +1636,8 @@ fn build_deep_traversal_graph(
         key: "root".to_string(),
         props: BTreeMap::new(),
         weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
     }];
     for i in 0..level1 {
         node_inputs.push(NodeInput {
@@ -1548,6 +1645,8 @@ fn build_deep_traversal_graph(
             key: format!("lvl1-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
         });
     }
     for i in 0..level1 {
@@ -1557,6 +1656,8 @@ fn build_deep_traversal_graph(
                 key: format!("lvl2-{i}-{j}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
             });
         }
     }
@@ -1568,6 +1669,8 @@ fn build_deep_traversal_graph(
                     key: format!("lvl3-{i}-{j}-{k}"),
                     props: BTreeMap::new(),
                     weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
                 });
             }
         }
@@ -1698,6 +1801,57 @@ fn benchmark_db_options() -> DbOptions {
 fn open_db(path: &Path) -> Result<DatabaseEngine, String> {
     let opts = benchmark_db_options();
     DatabaseEngine::open(path, &opts).map_err(|e| e.to_string())
+}
+
+fn open_vector_db(path: &Path, dim: u32) -> Result<DatabaseEngine, String> {
+    let mut opts = benchmark_db_options();
+    opts.dense_vector = Some(DenseVectorConfig {
+        dimension: dim,
+        metric: DenseMetric::Cosine,
+        hnsw: HnswConfig::default(),
+    });
+    DatabaseEngine::open(path, &opts).map_err(|e| e.to_string())
+}
+
+fn bench_splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn bench_dense_vector(dim: usize, seed: u64) -> Vec<f32> {
+    let mut values = Vec::with_capacity(dim);
+    let mut state = seed;
+    for _ in 0..dim {
+        state = bench_splitmix64(state);
+        values.push((state >> 40) as f32 / 16_777_215.0 * 2.0 - 1.0);
+    }
+    let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in &mut values {
+            *v /= norm;
+        }
+    }
+    values
+}
+
+fn bench_sparse_vector(dim_count: u32, nnz: usize, seed: u64) -> Vec<(u32, f32)> {
+    let mut dims = Vec::with_capacity(nnz);
+    let mut state = seed;
+    while dims.len() < nnz {
+        state = bench_splitmix64(state);
+        let d = (state % dim_count as u64) as u32;
+        if !dims.contains(&d) {
+            dims.push(d);
+        }
+    }
+    dims.sort_unstable();
+    dims.into_iter()
+        .enumerate()
+        .map(|(i, d)| (d, 1.0 - i as f32 * 0.05))
+        .collect()
 }
 
 fn run_bench<F>(iter_cfg: IterConfig, f: F) -> Result<Stats, String>

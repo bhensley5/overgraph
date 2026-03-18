@@ -9,12 +9,12 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use overgraph::{DatabaseEngine, DbOptions, Direction};
+//! use overgraph::{DatabaseEngine, DbOptions, UpsertNodeOptions, NeighborOptions};
 //!
 //! use std::path::Path;
 //! let mut db = DatabaseEngine::open(Path::new("./my-db"), &DbOptions::default()).unwrap();
-//! let id = db.upsert_node(1, "user:alice", Default::default(), 1.0).unwrap();
-//! let neighbors = db.neighbors(id, Direction::Outgoing, None, 50, None, None).unwrap();
+//! let id = db.upsert_node(1, "user:alice", UpsertNodeOptions::default()).unwrap();
+//! let neighbors = db.neighbors(id, &NeighborOptions { limit: Some(50), ..Default::default() }).unwrap();
 //! db.close().unwrap();
 //! ```
 //!
@@ -36,6 +36,8 @@ pub mod types;
 // Internal modules: accessible within the workspace (connectors, CLI binaries)
 // but hidden from public documentation since they are implementation details.
 #[doc(hidden)]
+pub mod dense_hnsw;
+#[doc(hidden)]
 pub mod encoding;
 #[doc(hidden)]
 pub mod manifest;
@@ -45,6 +47,10 @@ pub mod memtable;
 pub mod segment_reader;
 #[doc(hidden)]
 pub mod segment_writer;
+#[doc(hidden)]
+pub mod source_list;
+#[doc(hidden)]
+pub mod sparse_postings;
 #[doc(hidden)]
 pub mod wal;
 #[doc(hidden)]

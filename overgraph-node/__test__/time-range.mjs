@@ -108,7 +108,7 @@ describe('findNodesByTimeRangePaged (sync)', () => {
     const allItems = [];
     let cursor = null;
     for (;;) {
-      const page = db.findNodesByTimeRangePaged(1, 0, Number.MAX_SAFE_INTEGER, 3, cursor);
+      const page = db.findNodesByTimeRangePaged(1, 0, Number.MAX_SAFE_INTEGER, { limit: 3, after: cursor ?? undefined });
       for (let i = 0; i < page.items.length; i++) allItems.push(page.items[i]);
       cursor = page.nextCursor ?? null;
       if (cursor === null || cursor === undefined) break;
@@ -117,7 +117,7 @@ describe('findNodesByTimeRangePaged (sync)', () => {
   });
 
   it('first page has correct size', () => {
-    const page = db.findNodesByTimeRangePaged(1, 0, Number.MAX_SAFE_INTEGER, 3);
+    const page = db.findNodesByTimeRangePaged(1, 0, Number.MAX_SAFE_INTEGER, { limit: 3 });
     assert.equal(page.items.length, 3);
     assert.ok(page.nextCursor !== null && page.nextCursor !== undefined);
   });
@@ -145,7 +145,7 @@ describe('findNodesByTimeRange async', () => {
   });
 
   it('findNodesByTimeRangePagedAsync paginates', async () => {
-    const page = await db.findNodesByTimeRangePagedAsync(1, 0, Number.MAX_SAFE_INTEGER, 2);
+    const page = await db.findNodesByTimeRangePagedAsync(1, 0, Number.MAX_SAFE_INTEGER, { limit: 2 });
     assert.equal(page.items.length, 2);
     assert.ok(page.nextCursor !== null && page.nextCursor !== undefined);
   });

@@ -10,9 +10,9 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let id1 = engine
-            .upsert_node(1, "alice", BTreeMap::new(), 0.5)
+            .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
-        let id2 = engine.upsert_node(1, "bob", BTreeMap::new(), 0.6).unwrap();
+        let id2 = engine.upsert_node(1, "bob", UpsertNodeOptions { weight: 0.6, ..Default::default() }).unwrap();
 
         assert_ne!(id1, id2);
         assert_eq!(engine.node_count(), 2);
@@ -31,11 +31,11 @@
 
         let mut props_v1 = BTreeMap::new();
         props_v1.insert("version".to_string(), PropValue::Int(1));
-        let id1 = engine.upsert_node(1, "alice", props_v1, 0.5).unwrap();
+        let id1 = engine.upsert_node(1, "alice", UpsertNodeOptions { props: props_v1, weight: 0.5, ..Default::default() }).unwrap();
 
         let mut props_v2 = BTreeMap::new();
         props_v2.insert("version".to_string(), PropValue::Int(2));
-        let id2 = engine.upsert_node(1, "alice", props_v2, 0.9).unwrap();
+        let id2 = engine.upsert_node(1, "alice", UpsertNodeOptions { props: props_v2, weight: 0.9, ..Default::default() }).unwrap();
 
         // Same (type_id, key) → same ID, updated fields
         assert_eq!(id1, id2);
@@ -49,6 +49,213 @@
     }
 
     #[test]
+    fn test_upsert_node_accepts_default_weight() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let node_id = engine.upsert_node(1, "alice", UpsertNodeOptions::default()).unwrap();
+
+        let node = engine.get_node(node_id).unwrap().unwrap();
+        assert!((node.weight - 1.0).abs() < f32::EPSILON);
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_upsert_node_with_vectors_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let opts = DbOptions {
+            dense_vector: Some(DenseVectorConfig {
+                dimension: 3,
+                metric: DenseMetric::Cosine,
+                hnsw: HnswConfig::default(),
+            }),
+            ..DbOptions::default()
+        };
+
+        let node_id;
+        {
+            let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+            node_id = engine
+                .upsert_node(
+                    1,
+                    "alice",
+                    UpsertNodeOptions {
+                        weight: 0.5,
+                        dense_vector: Some(vec![0.1, 0.2, 0.3]),
+                        sparse_vector: Some(vec![(9, 0.0), (4, 1.0), (2, 2.0), (4, 0.5), (2, 0.0)]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            let node = engine.get_node(node_id).unwrap().unwrap();
+            assert_eq!(node.dense_vector, Some(vec![0.1, 0.2, 0.3]));
+            assert_eq!(node.sparse_vector, Some(vec![(2, 2.0), (4, 1.5)]));
+            engine.close().unwrap();
+        }
+
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let node = engine.get_node(node_id).unwrap().unwrap();
+        assert_eq!(node.dense_vector, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(node.sparse_vector, Some(vec![(2, 2.0), (4, 1.5)]));
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_upsert_node_dense_vector_requires_config() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let err = engine
+            .upsert_node(
+                1,
+                "alice",
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    dense_vector: Some(vec![0.1, 0.2, 0.3]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_upsert_node_rejects_wrong_dense_dimension() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let opts = DbOptions {
+            dense_vector: Some(DenseVectorConfig {
+                dimension: 2,
+                metric: DenseMetric::Cosine,
+                hnsw: HnswConfig::default(),
+            }),
+            ..DbOptions::default()
+        };
+        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+
+        let err = engine
+            .upsert_node(
+                1,
+                "alice",
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    dense_vector: Some(vec![0.1, 0.2, 0.3]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_write_op_normalizes_node_vectors() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let opts = DbOptions {
+            dense_vector: Some(DenseVectorConfig {
+                dimension: 2,
+                metric: DenseMetric::Cosine,
+                hnsw: HnswConfig::default(),
+            }),
+            ..DbOptions::default()
+        };
+        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+
+        engine
+            .write_op(&WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "manual".to_string(),
+                props: BTreeMap::new(),
+                created_at: 100,
+                updated_at: 101,
+                weight: 0.5,
+                dense_vector: Some(vec![0.1, 0.2]),
+                sparse_vector: Some(vec![(5, 0.0), (3, 1.0), (3, 2.0)]),
+                last_write_seq: 0,
+            }))
+            .unwrap();
+
+        let node = engine.get_node(1).unwrap().unwrap();
+        assert_eq!(node.dense_vector, Some(vec![0.1, 0.2]));
+        assert_eq!(node.sparse_vector, Some(vec![(3, 3.0)]));
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_batch_upsert_nodes_with_vectors_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let opts = DbOptions {
+            dense_vector: Some(DenseVectorConfig {
+                dimension: 3,
+                metric: DenseMetric::Cosine,
+                hnsw: HnswConfig::default(),
+            }),
+            ..DbOptions::default()
+        };
+
+        let alice_id;
+        let bob_id;
+        {
+            let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+            let ids = engine
+                .batch_upsert_nodes(&[
+                    NodeInput {
+                        type_id: 1,
+                        key: "alice".to_string(),
+                        props: BTreeMap::new(),
+                        weight: 0.5,
+                        dense_vector: Some(vec![0.1, 0.2, 0.3]),
+                        sparse_vector: Some(vec![
+                            (9, 0.0),
+                            (4, 1.0),
+                            (2, 2.0),
+                            (4, 0.25),
+                        ]),
+                    },
+                    NodeInput {
+                        type_id: 1,
+                        key: "bob".to_string(),
+                        props: BTreeMap::new(),
+                        weight: 0.7,
+                        dense_vector: None,
+                        sparse_vector: None,
+                    },
+                ])
+                .unwrap();
+
+            alice_id = ids[0];
+            bob_id = ids[1];
+
+            let alice = engine.get_node(alice_id).unwrap().unwrap();
+            assert_eq!(alice.dense_vector, Some(vec![0.1, 0.2, 0.3]));
+            assert_eq!(alice.sparse_vector, Some(vec![(2, 2.0), (4, 1.25)]));
+
+            let bob = engine.get_node(bob_id).unwrap().unwrap();
+            assert!(bob.dense_vector.is_none());
+            assert!(bob.sparse_vector.is_none());
+            engine.close().unwrap();
+        }
+
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let alice = engine.get_node(alice_id).unwrap().unwrap();
+        assert_eq!(alice.dense_vector, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(alice.sparse_vector, Some(vec![(2, 2.0), (4, 1.25)]));
+
+        let bob = engine.get_node(bob_id).unwrap().unwrap();
+        assert!(bob.dense_vector.is_none());
+        assert!(bob.sparse_vector.is_none());
+        engine.close().unwrap();
+    }
+
+    #[test]
     fn test_upsert_node_different_types_same_key() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
@@ -56,10 +263,10 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let id1 = engine
-            .upsert_node(1, "alice", BTreeMap::new(), 0.5)
+            .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         let id2 = engine
-            .upsert_node(2, "alice", BTreeMap::new(), 0.5)
+            .upsert_node(2, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
 
         // Different type_id → different nodes
@@ -80,7 +287,7 @@
         for i in 0..10 {
             ids.push(
                 engine
-                    .upsert_node(1, &format!("node:{}", i), BTreeMap::new(), 0.5)
+                    .upsert_node(1, &format!("node:{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
                     .unwrap(),
             );
         }
@@ -101,12 +308,12 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let n1 = engine
-            .upsert_node(1, "alice", BTreeMap::new(), 0.5)
+            .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
-        let n2 = engine.upsert_node(1, "bob", BTreeMap::new(), 0.5).unwrap();
+        let n2 = engine.upsert_node(1, "bob", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         let e1 = engine
-            .upsert_edge(n1, n2, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(n1, n2, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         assert_eq!(engine.edge_count(), 1);
@@ -126,10 +333,10 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let e1 = engine
-            .upsert_edge(1, 2, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(1, 2, 10, UpsertEdgeOptions::default())
             .unwrap();
         let e2 = engine
-            .upsert_edge(1, 2, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(1, 2, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // Without uniqueness: creates separate edges
@@ -151,10 +358,10 @@
         let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         let e1 = engine
-            .upsert_edge(1, 2, 10, BTreeMap::new(), 0.5, None, None)
+            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         let e2 = engine
-            .upsert_edge(1, 2, 10, BTreeMap::new(), 0.9, None, None)
+            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
 
         // With uniqueness: same triple → same ID, updated weight
@@ -164,7 +371,7 @@
 
         // Different triple → new edge
         let e3 = engine
-            .upsert_edge(1, 2, 20, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(1, 2, 20, UpsertEdgeOptions::default())
             .unwrap();
         assert_ne!(e1, e3);
         assert_eq!(engine.edge_count(), 2);
@@ -185,6 +392,8 @@
                 key: format!("node:{}", i),
                 props: BTreeMap::new(),
                 weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
 
@@ -210,7 +419,7 @@
 
         // Pre-insert a node
         let pre_id = engine
-            .upsert_node(1, "existing", BTreeMap::new(), 0.5)
+            .upsert_node(1, "existing", UpsertNodeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
 
         // Batch with duplicate key and one that matches pre-existing
@@ -220,18 +429,24 @@
                 key: "new1".into(),
                 props: BTreeMap::new(),
                 weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
             },
             NodeInput {
                 type_id: 1,
                 key: "existing".into(),
                 props: BTreeMap::new(),
                 weight: 0.9,
+                dense_vector: None,
+                sparse_vector: None,
             },
             NodeInput {
                 type_id: 1,
                 key: "new1".into(),
                 props: BTreeMap::new(),
                 weight: 0.8,
+                dense_vector: None,
+                sparse_vector: None,
             }, // dup within batch
         ];
 
@@ -279,31 +494,32 @@
         {
             let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             id1 = engine
-                .upsert_node(1, "alice", BTreeMap::new(), 0.5)
+                .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
                 .unwrap();
-            id2 = engine.upsert_node(1, "bob", BTreeMap::new(), 0.6).unwrap();
+            id2 = engine.upsert_node(1, "bob", UpsertNodeOptions { weight: 0.6, ..Default::default() }).unwrap();
             eid = engine
-                .upsert_edge(id1, id2, 10, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(id1, id2, 10, UpsertEdgeOptions::default())
                 .unwrap();
             engine.close().unwrap();
         }
 
         {
             let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-            assert_eq!(engine.node_count(), 2);
+            // close() flushes to segments; verify via cross-source lookup
+            assert_eq!(engine.get_nodes_by_type(1).unwrap().len(), 2);
             assert_eq!(engine.get_node(id1).unwrap().unwrap().key, "alice");
             assert_eq!(engine.get_node(id2).unwrap().unwrap().key, "bob");
             assert_eq!(engine.get_edge(eid).unwrap().unwrap().from, id1);
 
-            // Upsert dedup should still work after replay
+            // Upsert dedup should still work after close-flush + reopen
             let id1_again = engine
-                .upsert_node(1, "alice", BTreeMap::new(), 0.99)
+                .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.99, ..Default::default() })
                 .unwrap();
             assert_eq!(id1_again, id1);
 
             // New allocations should not reuse old IDs
             let id3 = engine
-                .upsert_node(1, "charlie", BTreeMap::new(), 0.5)
+                .upsert_node(1, "charlie", UpsertNodeOptions { weight: 0.5, ..Default::default() })
                 .unwrap();
             assert!(id3 > id2);
 
@@ -319,13 +535,13 @@
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let id1 = engine
-            .upsert_node(1, "alice", BTreeMap::new(), 0.5)
+            .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         let created_at_v1 = engine.get_node(id1).unwrap().unwrap().created_at;
 
         // Small delay not needed, just upsert again. created_at must be preserved
         let id2 = engine
-            .upsert_node(1, "alice", BTreeMap::new(), 0.9)
+            .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         assert_eq!(id1, id2);
 
@@ -349,7 +565,7 @@
 
         // Pre-insert an edge
         let pre_id = engine
-            .upsert_edge(1, 2, 10, BTreeMap::new(), 0.5, None, None)
+            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
 
         // Batch with: duplicate within batch + match against pre-existing
@@ -403,12 +619,12 @@
             let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             for i in 0..10 {
                 engine
-                    .upsert_node(1, &format!("n:{}", i), BTreeMap::new(), 0.5)
+                    .upsert_node(1, &format!("n:{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
                     .unwrap();
             }
             for i in 0..5 {
                 engine
-                    .upsert_edge(i, i + 1, 10, BTreeMap::new(), 1.0, None, None)
+                    .upsert_edge(i, i + 1, 10, UpsertEdgeOptions::default())
                     .unwrap();
             }
             last_node_id = engine.next_node_id();
@@ -433,19 +649,19 @@
 
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(a, c, 20, BTreeMap::new(), 0.8, None, None)
+            .upsert_edge(a, c, 20, UpsertEdgeOptions { weight: 0.8, ..Default::default() })
             .unwrap();
 
         let out = engine
-            .neighbors(a, Direction::Outgoing, None, 0, None, None)
+            .neighbors(a, &NeighborOptions::default())
             .unwrap();
         assert_eq!(out.len(), 2);
         let neighbor_ids: Vec<u64> = out.iter().map(|e| e.node_id).collect();
@@ -462,19 +678,19 @@
 
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, c, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, c, 10, UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(b, c, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         let inc = engine
-            .neighbors(c, Direction::Incoming, None, 0, None, None)
+            .neighbors(c, &NeighborOptions { direction: Direction::Incoming, ..Default::default() })
             .unwrap();
         assert_eq!(inc.len(), 2);
         let neighbor_ids: Vec<u64> = inc.iter().map(|e| e.node_id).collect();
@@ -491,19 +707,19 @@
 
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-        let c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap(); // type 10
         engine
-            .upsert_edge(a, c, 20, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, c, 20, UpsertEdgeOptions::default())
             .unwrap(); // type 20
 
         let typed = engine
-            .neighbors(a, Direction::Outgoing, Some(&[10]), 0, None, None)
+            .neighbors(a, &NeighborOptions { type_filter: Some(vec![10]), ..Default::default() })
             .unwrap();
         assert_eq!(typed.len(), 1);
         assert_eq!(typed[0].node_id, b);
@@ -518,18 +734,18 @@
 
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let hub = engine.upsert_node(1, "hub", BTreeMap::new(), 0.5).unwrap();
+        let hub = engine.upsert_node(1, "hub", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         for i in 0..10 {
             let n = engine
-                .upsert_node(1, &format!("spoke:{}", i), BTreeMap::new(), 0.5)
+                .upsert_node(1, &format!("spoke:{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
                 .unwrap();
             engine
-                .upsert_edge(hub, n, 10, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(hub, n, 10, UpsertEdgeOptions::default())
                 .unwrap();
         }
 
         let limited = engine
-            .neighbors(hub, Direction::Outgoing, None, 3, None, None)
+            .neighbors(hub, &NeighborOptions { limit: Some(3), ..Default::default() })
             .unwrap();
         assert_eq!(limited.len(), 3);
 
@@ -543,10 +759,10 @@
 
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         engine
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         engine.delete_node(b).unwrap();
@@ -556,7 +772,7 @@
 
         // b excluded from a's neighbors (node tombstone filtering)
         let out = engine
-            .neighbors(a, Direction::Outgoing, None, 0, None, None)
+            .neighbors(a, &NeighborOptions::default())
             .unwrap();
         assert!(out.is_empty());
 
@@ -570,10 +786,10 @@
 
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-        let b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
+        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let eid = engine
-            .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         engine.delete_edge(eid).unwrap();
@@ -581,7 +797,7 @@
         assert!(engine.get_edge(eid).unwrap().is_none());
         assert_eq!(engine.edge_count(), 0);
         assert!(engine
-            .neighbors(a, Direction::Outgoing, None, 0, None, None)
+            .neighbors(a, &NeighborOptions::default())
             .unwrap()
             .is_empty());
 
@@ -596,10 +812,10 @@
         let (a, b, eid);
         {
             let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-            a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-            b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
+            a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+            b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
             eid = engine
-                .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
                 .unwrap();
             engine.delete_node(b).unwrap();
             engine.delete_edge(eid).unwrap();
@@ -610,10 +826,11 @@
             let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             assert!(engine.get_node(b).unwrap().is_none());
             assert!(engine.get_edge(eid).unwrap().is_none());
-            assert_eq!(engine.node_count(), 1);
-            assert_eq!(engine.edge_count(), 0);
+            // close() flushes to segments; use cross-source counts
+            assert_eq!(engine.get_nodes_by_type(1).unwrap().len(), 1);
+            // Verify deleted edge not visible
             assert!(engine
-                .neighbors(a, Direction::Outgoing, None, 0, None, None)
+                .neighbors(a, &NeighborOptions::default())
                 .unwrap()
                 .is_empty());
             engine.close().unwrap();
@@ -628,17 +845,17 @@
         let (a, b, c);
         {
             let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-            a = engine.upsert_node(1, "a", BTreeMap::new(), 0.5).unwrap();
-            b = engine.upsert_node(1, "b", BTreeMap::new(), 0.5).unwrap();
-            c = engine.upsert_node(1, "c", BTreeMap::new(), 0.5).unwrap();
+            a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+            b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+            c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
             engine
-                .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+                .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
                 .unwrap();
             engine
-                .upsert_edge(a, c, 20, BTreeMap::new(), 0.8, None, None)
+                .upsert_edge(a, c, 20, UpsertEdgeOptions { weight: 0.8, ..Default::default() })
                 .unwrap();
             engine
-                .upsert_edge(b, c, 10, BTreeMap::new(), 0.5, None, None)
+                .upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
                 .unwrap();
             engine.close().unwrap();
         }
@@ -647,21 +864,20 @@
             let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             // a → b, c
             let out_a = engine
-                .neighbors(a, Direction::Outgoing, None, 0, None, None)
+                .neighbors(a, &NeighborOptions::default())
                 .unwrap();
             assert_eq!(out_a.len(), 2);
             // b → c
             let out_b = engine
-                .neighbors(b, Direction::Outgoing, None, 0, None, None)
+                .neighbors(b, &NeighborOptions::default())
                 .unwrap();
             assert_eq!(out_b.len(), 1);
             assert_eq!(out_b[0].node_id, c);
             // c ← a, b
             let inc_c = engine
-                .neighbors(c, Direction::Incoming, None, 0, None, None)
+                .neighbors(c, &NeighborOptions { direction: Direction::Incoming, ..Default::default() })
                 .unwrap();
             assert_eq!(inc_c.len(), 2);
             engine.close().unwrap();
         }
     }
-

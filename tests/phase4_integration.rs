@@ -1,4 +1,6 @@
-use overgraph::{DatabaseEngine, DbOptions, Direction, PropValue};
+use overgraph::{
+    DatabaseEngine, DbOptions, NeighborOptions, PropValue, UpsertEdgeOptions, UpsertNodeOptions,
+};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
@@ -23,6 +25,8 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
                 p
             },
             weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
         })
         .collect();
     node_ids.extend(engine.batch_upsert_nodes(&batch).unwrap());
@@ -30,7 +34,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
 
     // --- Step 1b: Insert 10k edges (chain + cross-links) ---
     let mut edge_ids = Vec::with_capacity(10_000);
-    // Chain: node[i] → node[i+1]
+    // Chain: node[i] -> node[i+1]
     let chain: Vec<overgraph::EdgeInput> = (0..4_999)
         .map(|i| overgraph::EdgeInput {
             from: node_ids[i],
@@ -115,7 +119,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
         stats.nodes_kept
     );
 
-    // Disk should shrink compared to pre-compaction (two segments → one, minus tombstoned data)
+    // Disk should shrink compared to pre-compaction (two segments -> one, minus tombstoned data)
     let size_after_compact = dir_size(&db_path);
     assert!(
         size_after_compact < size_after_delete_flush,
@@ -172,9 +176,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
     // Neighbor queries should work correctly on surviving nodes
     // Pick a node in the middle of the surviving range
     let mid = node_ids[delete_count + 500];
-    let out = engine
-        .neighbors(mid, Direction::Outgoing, None, 0, None, None)
-        .unwrap();
+    let out = engine.neighbors(mid, &NeighborOptions::default()).unwrap();
     // Should have at least one outgoing edge (chain or cross-link)
     assert!(
         !out.is_empty(),
@@ -192,7 +194,13 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
 
     // Type-filtered neighbors should still work
     let chain_only = engine
-        .neighbors(mid, Direction::Outgoing, Some(&[10]), 0, None, None)
+        .neighbors(
+            mid,
+            &NeighborOptions {
+                type_filter: Some(vec![10]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     for entry in &chain_only {
         assert_eq!(entry.edge_type_id, 10);
@@ -229,33 +237,89 @@ fn test_reads_consistent_through_compaction_lifecycle() {
 
     // --- Build a graph across 3 segments + memtable ---
 
-    // Segment 1: nodes A, B, C with edges A→B, B→C
+    // Segment 1: nodes A, B, C with edges A->B, B->C
     let a = engine
-        .upsert_node(1, "alpha", props(&[("v", 1)]), 0.9)
+        .upsert_node(
+            1,
+            "alpha",
+            UpsertNodeOptions {
+                props: props(&[("v", 1)]),
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "beta", props(&[("v", 2)]), 0.8)
+        .upsert_node(
+            1,
+            "beta",
+            UpsertNodeOptions {
+                props: props(&[("v", 2)]),
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let c = engine
-        .upsert_node(2, "gamma", props(&[("v", 3)]), 0.7)
+        .upsert_node(
+            2,
+            "gamma",
+            UpsertNodeOptions {
+                props: props(&[("v", 3)]),
+                weight: 0.7,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let e_ab = engine
-        .upsert_edge(a, b, 10, BTreeMap::new(), 1.0, None, None)
+        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
     let e_bc = engine
-        .upsert_edge(b, c, 10, BTreeMap::new(), 0.9, None, None)
+        .upsert_edge(
+            b,
+            c,
+            10,
+            UpsertEdgeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
-    // Segment 2: update B's props, add node D, edge C→D, delete edge A→B
+    // Segment 2: update B's props, add node D, edge C->D, delete edge A->B
     let _ = engine
-        .upsert_node(1, "beta", props(&[("v", 20)]), 0.85)
+        .upsert_node(
+            1,
+            "beta",
+            UpsertNodeOptions {
+                props: props(&[("v", 20)]),
+                weight: 0.85,
+                ..Default::default()
+            },
+        )
         .unwrap(); // update B
     let d = engine
-        .upsert_node(3, "delta", props(&[("v", 4)]), 0.6)
+        .upsert_node(
+            3,
+            "delta",
+            UpsertNodeOptions {
+                props: props(&[("v", 4)]),
+                weight: 0.6,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let e_cd = engine
-        .upsert_edge(c, d, 20, BTreeMap::new(), 0.8, None, None)
+        .upsert_edge(
+            c,
+            d,
+            20,
+            UpsertEdgeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.delete_edge(e_ab).unwrap();
     engine.flush().unwrap();
@@ -263,10 +327,26 @@ fn test_reads_consistent_through_compaction_lifecycle() {
     // Segment 3: delete node C (and its edges should be excluded from neighbors)
     engine.delete_node(c).unwrap();
     let e = engine
-        .upsert_node(1, "epsilon", props(&[("v", 5)]), 0.5)
+        .upsert_node(
+            1,
+            "epsilon",
+            UpsertNodeOptions {
+                props: props(&[("v", 5)]),
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let e_de = engine
-        .upsert_edge(d, e, 10, BTreeMap::new(), 0.7, None, None)
+        .upsert_edge(
+            d,
+            e,
+            10,
+            UpsertEdgeOptions {
+                weight: 0.7,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -286,42 +366,42 @@ fn test_reads_consistent_through_compaction_lifecycle() {
     assert!(pre_e.is_some(), "epsilon should exist before compact");
     assert!(
         engine.get_edge(e_ab).unwrap().is_none(),
-        "edge A→B should be deleted before compact"
+        "edge A->B should be deleted before compact"
     );
-    // Edges B→C and C→D are cascade-deleted when node C is deleted
+    // Edges B->C and C->D are cascade-deleted when node C is deleted
     // (delete_node scans all sources including segments)
     assert!(
         engine.get_edge(e_bc).unwrap().is_none(),
-        "edge B→C should be cascade-deleted with node C"
+        "edge B->C should be cascade-deleted with node C"
     );
     assert!(
         engine.get_edge(e_cd).unwrap().is_none(),
-        "edge C→D should be cascade-deleted with node C"
+        "edge C->D should be cascade-deleted with node C"
     );
     assert!(
         engine.get_edge(e_de).unwrap().is_some(),
-        "edge D→E should exist before compact"
+        "edge D->E should exist before compact"
     );
     assert_eq!(
         pre_b.as_ref().unwrap().props.get("v"),
         Some(&PropValue::Int(20)),
         "beta should have updated props"
     );
-    // Neighbor queries: B has no outgoing edges (B→C was cascade-deleted)
+    // Neighbor queries: B has no outgoing edges (B->C was cascade-deleted)
     assert!(
         engine
-            .neighbors(b, Direction::Outgoing, None, 0, None, None)
+            .neighbors(b, &NeighborOptions::default())
             .unwrap()
             .is_empty(),
-        "beta outgoing should be empty (B→C cascade-deleted)"
+        "beta outgoing should be empty (B->C cascade-deleted)"
     );
     assert_eq!(
         engine
-            .neighbors(d, Direction::Outgoing, None, 0, None, None)
+            .neighbors(d, &NeighborOptions::default())
             .unwrap()
             .len(),
         1,
-        "delta should have D→E outgoing"
+        "delta should have D->E outgoing"
     );
 
     // --- Compact ---
@@ -371,39 +451,33 @@ fn test_reads_consistent_through_compaction_lifecycle() {
     let post_e_cd = engine.get_edge(e_cd).unwrap();
     let post_e_de = engine.get_edge(e_de).unwrap();
 
-    assert!(post_e_ab.is_none(), "deleted edge A→B reappeared");
-    // Edges B→C and C→D had a deleted endpoint (node C). Compaction removes
+    assert!(post_e_ab.is_none(), "deleted edge A->B reappeared");
+    // Edges B->C and C->D had a deleted endpoint (node C). Compaction removes
     // dangling edges to prevent stale references after tombstones are consumed.
     assert!(
         post_e_bc.is_none(),
-        "edge B→C should be removed, target C deleted"
+        "edge B->C should be removed, target C deleted"
     );
     assert!(
         post_e_cd.is_none(),
-        "edge C→D should be removed, source C deleted"
+        "edge C->D should be removed, source C deleted"
     );
-    assert!(post_e_de.is_some(), "edge D→E should survive compaction");
+    assert!(post_e_de.is_some(), "edge D->E should survive compaction");
 
     // Neighbor queries, consistent with edges removed
-    let post_b_out = engine
-        .neighbors(b, Direction::Outgoing, None, 0, None, None)
-        .unwrap();
-    let post_d_out = engine
-        .neighbors(d, Direction::Outgoing, None, 0, None, None)
-        .unwrap();
-    let post_a_out = engine
-        .neighbors(a, Direction::Outgoing, None, 0, None, None)
-        .unwrap();
+    let post_b_out = engine.neighbors(b, &NeighborOptions::default()).unwrap();
+    let post_d_out = engine.neighbors(d, &NeighborOptions::default()).unwrap();
+    let post_a_out = engine.neighbors(a, &NeighborOptions::default()).unwrap();
 
-    // B had B→C before (hidden by deleted-node filter), now physically gone
+    // B had B->C before (hidden by deleted-node filter), now physically gone
     assert!(
         post_b_out.is_empty(),
         "beta should have no outgoing neighbors"
     );
-    // D→E survives; D was also target of C→D but that edge is gone
-    assert_eq!(post_d_out.len(), 1, "delta should still have D→E");
+    // D->E survives; D was also target of C->D but that edge is gone
+    assert_eq!(post_d_out.len(), 1, "delta should still have D->E");
     assert_eq!(post_d_out[0].node_id, e);
-    // A had A→B deleted explicitly, no other outgoing
+    // A had A->B deleted explicitly, no other outgoing
     assert!(
         post_a_out.is_empty(),
         "alpha should have no outgoing neighbors"
@@ -414,7 +488,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         stats.nodes_removed >= 1,
         "Expected at least 1 node removed (gamma)"
     );
-    // A→B (explicit delete) + B→C (dangling target) + C→D (dangling source) = 3
+    // A->B (explicit delete) + B->C (dangling target) + C->D (dangling source) = 3
     assert!(
         stats.edges_removed >= 3,
         "Expected at least 3 edges removed"
@@ -435,17 +509,15 @@ fn test_reads_consistent_through_compaction_lifecycle() {
     assert!(engine.get_edge(e_ab).unwrap().is_none());
     assert!(
         engine.get_edge(e_bc).unwrap().is_none(),
-        "dangling edge B→C survived reopen"
+        "dangling edge B->C survived reopen"
     );
     assert!(
         engine.get_edge(e_cd).unwrap().is_none(),
-        "dangling edge C→D survived reopen"
+        "dangling edge C->D survived reopen"
     );
     assert!(engine.get_edge(e_de).unwrap().is_some());
 
-    let d_out = engine
-        .neighbors(d, Direction::Outgoing, None, 0, None, None)
-        .unwrap();
+    let d_out = engine.neighbors(d, &NeighborOptions::default()).unwrap();
     assert_eq!(d_out.len(), 1);
     assert_eq!(d_out[0].node_id, e);
 
