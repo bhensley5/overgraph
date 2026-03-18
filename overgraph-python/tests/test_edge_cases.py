@@ -33,22 +33,22 @@ class TestTemporalFiltering:
         db.upsert_edge(a, c, 10, valid_from=3000, valid_to=9000)
 
         # epoch 2000: only A->B is valid
-        nbrs = db.neighbors(a, "outgoing", at_epoch=2000)
+        nbrs = db.neighbors(a, direction="outgoing", at_epoch=2000)
         ids = {n.node_id for n in nbrs}
         assert ids == {b}
 
         # epoch 4000: both valid
-        nbrs = db.neighbors(a, "outgoing", at_epoch=4000)
+        nbrs = db.neighbors(a, direction="outgoing", at_epoch=4000)
         ids = {n.node_id for n in nbrs}
         assert ids == {b, c}
 
         # epoch 6000: only A->C is valid (A->B expired at 5000)
-        nbrs = db.neighbors(a, "outgoing", at_epoch=6000)
+        nbrs = db.neighbors(a, direction="outgoing", at_epoch=6000)
         ids = {n.node_id for n in nbrs}
         assert ids == {c}
 
         # epoch 99999: neither valid
-        nbrs = db.neighbors(a, "outgoing", at_epoch=99999)
+        nbrs = db.neighbors(a, direction="outgoing", at_epoch=99999)
         assert nbrs == []
 
     def test_neighbors_at_epoch_without_filter_uses_current_time(self, db):
@@ -61,7 +61,7 @@ class TestTemporalFiltering:
         db.upsert_edge(a, b, 10, valid_from=0, valid_to=now + 60000)  # valid
         db.upsert_edge(a, c, 10, valid_from=1000, valid_to=5000)  # expired
 
-        nbrs = db.neighbors(a, "outgoing")
+        nbrs = db.neighbors(a, direction="outgoing")
         ids = {n.node_id for n in nbrs}
         assert b in ids, "currently-valid edge should be returned"
         assert c not in ids, "expired edge should be excluded"
@@ -76,19 +76,19 @@ class TestTemporalFiltering:
         db.upsert_edge(b, c, 10, valid_from=2000, valid_to=6000)
 
         # epoch 3000: both hops valid, C reachable
-        page = db.traverse(a, min_depth=2, max_depth=2, direction="outgoing", at_epoch=3000)
+        page = db.traverse(a, 2, min_depth=2, direction="outgoing", at_epoch=3000)
         assert [(hit.node_id, hit.depth) for hit in page.items] == [(c, 2)]
 
         # epoch 500: A->B not yet valid, so nothing reachable
-        nbrs_1hop = db.neighbors(a, "outgoing", at_epoch=500)
+        nbrs_1hop = db.neighbors(a, direction="outgoing", at_epoch=500)
         assert len(nbrs_1hop) == 0
-        page = db.traverse(a, min_depth=2, max_depth=2, direction="outgoing", at_epoch=500)
+        page = db.traverse(a, 2, min_depth=2, direction="outgoing", at_epoch=500)
         assert len(page.items) == 0
 
         # epoch 5500: A->B expired, so B not reachable at 1-hop, C not reachable
-        nbrs_1hop = db.neighbors(a, "outgoing", at_epoch=5500)
+        nbrs_1hop = db.neighbors(a, direction="outgoing", at_epoch=5500)
         assert len(nbrs_1hop) == 0
-        page = db.traverse(a, min_depth=2, max_depth=2, direction="outgoing", at_epoch=5500)
+        page = db.traverse(a, 2, min_depth=2, direction="outgoing", at_epoch=5500)
         assert len(page.items) == 0
 
     def test_neighbors_batch_at_epoch(self, db):
@@ -123,18 +123,18 @@ class TestTemporalFiltering:
         db.upsert_edge(center, s3, 10, weight=1.0, valid_from=3000, valid_to=9000)
 
         # epoch 2000: only s1 valid
-        top = db.top_k_neighbors(center, 3, "outgoing", scoring="weight", at_epoch=2000)
+        top = db.top_k_neighbors(center, 3, direction="outgoing", scoring="weight", at_epoch=2000)
         ids = {n.node_id for n in top}
         assert ids == {s1}
 
         # epoch 4000: all three valid, top 2 by weight should be s1 and s2
-        top2 = db.top_k_neighbors(center, 2, "outgoing", scoring="weight", at_epoch=4000)
+        top2 = db.top_k_neighbors(center, 2, direction="outgoing", scoring="weight", at_epoch=4000)
         ids = {n.node_id for n in top2}
         assert ids == {s1, s2}
 
         # epoch 99999: none valid
         top_none = db.top_k_neighbors(
-            center, 3, "outgoing", scoring="weight", at_epoch=99999
+            center, 3, direction="outgoing", scoring="weight", at_epoch=99999
         )
         assert len(top_none) == 0
 
@@ -147,12 +147,12 @@ class TestTemporalFiltering:
         db.upsert_edge(b, c, 10, valid_from=2000, valid_to=6000)
 
         # epoch 3000: both edges valid
-        sg = db.extract_subgraph(a, max_depth=2, at_epoch=3000)
+        sg = db.extract_subgraph(a, 2, at_epoch=3000)
         sg_ids = {n.id for n in sg.nodes}
         assert {a, b, c} == sg_ids
 
         # epoch 500: A->B not valid yet, only A reachable
-        sg = db.extract_subgraph(a, max_depth=2, at_epoch=500)
+        sg = db.extract_subgraph(a, 2, at_epoch=500)
         sg_ids = {n.id for n in sg.nodes}
         assert sg_ids == {a}
 
@@ -259,7 +259,7 @@ class TestSelfLoops:
         """A self-loop should appear in outgoing neighbors."""
         a = db.upsert_node(1, "a")
         db.upsert_edge(a, a, 10)
-        nbrs = db.neighbors(a, "outgoing")
+        nbrs = db.neighbors(a, direction="outgoing")
         assert len(nbrs) == 1
         assert nbrs[0].node_id == a
 
@@ -267,7 +267,7 @@ class TestSelfLoops:
         """A self-loop should appear in incoming neighbors."""
         a = db.upsert_node(1, "a")
         db.upsert_edge(a, a, 10)
-        nbrs = db.neighbors(a, "incoming")
+        nbrs = db.neighbors(a, direction="incoming")
         assert len(nbrs) == 1
         assert nbrs[0].node_id == a
 
@@ -275,7 +275,7 @@ class TestSelfLoops:
         """A self-loop queried with 'both' should not produce duplicates."""
         a = db.upsert_node(1, "a")
         db.upsert_edge(a, a, 10)
-        nbrs = db.neighbors(a, "both")
+        nbrs = db.neighbors(a, direction="both")
         # Self-loop should appear exactly once (deduplicated)
         assert len(nbrs) == 1
         assert nbrs[0].node_id == a
@@ -284,7 +284,7 @@ class TestSelfLoops:
         """Subgraph extraction handles self-loops without infinite recursion."""
         a = db.upsert_node(1, "a")
         db.upsert_edge(a, a, 10)
-        sg = db.extract_subgraph(a, max_depth=2)
+        sg = db.extract_subgraph(a, 2)
         assert len(sg.nodes) == 1
         assert len(sg.edges) == 1
 
@@ -294,7 +294,7 @@ class TestSelfLoops:
         b = db.upsert_node(1, "b")
         db.upsert_edge(a, a, 10)
         db.upsert_edge(a, b, 10)
-        nbrs = db.neighbors(a, "outgoing")
+        nbrs = db.neighbors(a, direction="outgoing")
         ids = {n.node_id for n in nbrs}
         assert ids == {a, b}
 

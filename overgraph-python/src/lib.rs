@@ -1,9 +1,14 @@
+#![allow(clippy::too_many_arguments)]
+
 use eg::{
-    AdjacencyExport, CompactionPhase, CompactionProgress, CompactionStats, DatabaseEngine,
-    DbOptions, DbStats, Direction, EdgeInput, EdgeRecord, EngineError, ExportOptions, GraphPatch,
-    NeighborEntry, NodeIdMap, NodeInput, NodeRecord, PageRequest, PprOptions, PprResult, PropValue,
-    PrunePolicy, PruneResult, ScoringMode, ShortestPath, Subgraph, TraversalCursor, TraversalHit,
-    TraversalPageResult, WalSyncMode,
+    AdjacencyExport, AllShortestPathsOptions, CompactionPhase, CompactionProgress, CompactionStats,
+    ComponentOptions, DatabaseEngine, DbOptions, DbStats, DegreeOptions, DenseMetric,
+    DenseVectorConfig, Direction, EdgeInput, EdgeRecord, EngineError, ExportOptions, FusionMode,
+    GraphPatch, HnswConfig, IsConnectedOptions, NeighborEntry, NeighborOptions, NodeIdMap,
+    NodeInput, NodeRecord, PageRequest, PprOptions, PprResult, PropValue, PrunePolicy, PruneResult,
+    ScoringMode, ShortestPath, ShortestPathOptions, Subgraph, SubgraphOptions, TopKOptions,
+    TraversalCursor, TraversalHit, TraversalPageResult, TraverseOptions, UpsertEdgeOptions,
+    UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, VectorSearchScope, WalSyncMode,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -126,7 +131,7 @@ impl OverGraph {
 
     // --- Single CRUD ---
 
-    #[pyo3(signature = (type_id, key, props=None, weight=1.0))]
+    #[pyo3(signature = (type_id, key, *, props=None, weight=1.0, dense_vector=None, sparse_vector=None))]
     fn upsert_node(
         &self,
         py: Python<'_>,
@@ -134,15 +139,20 @@ impl OverGraph {
         key: String,
         props: Option<&Bound<'_, PyDict>>,
         weight: f64,
+        dense_vector: Option<Vec<f32>>,
+        sparse_vector: Option<Vec<(u32, f32)>>,
     ) -> PyResult<u64> {
         let props = convert_py_props(py, props)?;
-        let w = weight as f32;
-        with_engine(self, py, move |eng| {
-            eng.upsert_node(type_id, &key, props, w)
-        })
+        let opts = UpsertNodeOptions {
+            props,
+            weight: weight as f32,
+            dense_vector,
+            sparse_vector,
+        };
+        with_engine(self, py, move |eng| eng.upsert_node(type_id, &key, opts))
     }
 
-    #[pyo3(signature = (from_id, to_id, type_id, props=None, weight=1.0, valid_from=None, valid_to=None))]
+    #[pyo3(signature = (from_id, to_id, type_id, *, props=None, weight=1.0, valid_from=None, valid_to=None))]
     fn upsert_edge(
         &self,
         py: Python<'_>,
@@ -155,9 +165,14 @@ impl OverGraph {
         valid_to: Option<i64>,
     ) -> PyResult<u64> {
         let props = convert_py_props(py, props)?;
-        let w = weight as f32;
+        let opts = UpsertEdgeOptions {
+            props,
+            weight: weight as f32,
+            valid_from,
+            valid_to,
+        };
         with_engine(self, py, move |eng| {
-            eng.upsert_edge(from_id, to_id, type_id, props, w, valid_from, valid_to)
+            eng.upsert_edge(from_id, to_id, type_id, opts)
         })
     }
 
@@ -232,6 +247,21 @@ impl OverGraph {
     fn get_nodes(&self, py: Python<'_>, ids: Vec<u64>) -> PyResult<Vec<Option<PyNodeRecord>>> {
         with_engine_ref(self, py, move |eng| {
             let results = eng.get_nodes(&ids)?;
+            Ok(results
+                .into_iter()
+                .map(|r| r.map(PyNodeRecord::from))
+                .collect())
+        })
+    }
+
+    fn get_nodes_by_keys(
+        &self,
+        py: Python<'_>,
+        keys: Vec<(u32, String)>,
+    ) -> PyResult<Vec<Option<PyNodeRecord>>> {
+        with_engine_ref(self, py, move |eng| {
+            let refs: Vec<(u32, &str)> = keys.iter().map(|(t, k)| (*t, k.as_str())).collect();
+            let results = eng.get_nodes_by_keys(&refs)?;
             Ok(results
                 .into_iter()
                 .map(|r| r.map(PyNodeRecord::from))
@@ -337,7 +367,7 @@ impl OverGraph {
 
     // --- Traversal ---
 
-    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, limit=None, at_epoch=None, decay_lambda=None))]
+    #[pyo3(signature = (node_id, *, direction="outgoing", type_filter=None, limit=None, at_epoch=None, decay_lambda=None))]
     fn neighbors(
         &self,
         py: Python<'_>,
@@ -350,29 +380,29 @@ impl OverGraph {
     ) -> PyResult<Vec<PyNeighborEntry>> {
         let dir = parse_direction(direction)?;
         let dl = decay_lambda.map(|v| v as f32);
+        let opts = NeighborOptions {
+            direction: dir,
+            type_filter,
+            limit,
+            at_epoch,
+            decay_lambda: dl,
+        };
         with_engine_ref(self, py, move |eng| {
             Ok(eng
-                .neighbors(
-                    node_id,
-                    dir,
-                    type_filter.as_deref(),
-                    limit.unwrap_or(0),
-                    at_epoch,
-                    dl,
-                )?
+                .neighbors(node_id, &opts)?
                 .into_iter()
                 .map(PyNeighborEntry::from)
                 .collect())
         })
     }
 
-    #[pyo3(signature = (start, min_depth=0, max_depth=2, direction="outgoing", edge_type_filter=None, node_type_filter=None, at_epoch=None, decay_lambda=None, limit=None, cursor=None))]
+    #[pyo3(signature = (start, max_depth, *, min_depth=1, direction="outgoing", edge_type_filter=None, node_type_filter=None, at_epoch=None, decay_lambda=None, limit=None, cursor=None))]
     fn traverse(
         &self,
         py: Python<'_>,
         start: u64,
-        min_depth: u32,
         max_depth: u32,
+        min_depth: u32,
         direction: &str,
         edge_type_filter: Option<Vec<u32>>,
         node_type_filter: Option<Vec<u32>>,
@@ -383,23 +413,24 @@ impl OverGraph {
     ) -> PyResult<PyTraversalPageResult> {
         let dir = parse_direction(direction)?;
         let cursor = cursor.map(TraversalCursor::from);
+        let opts = TraverseOptions {
+            min_depth,
+            direction: dir,
+            edge_type_filter,
+            node_type_filter,
+            at_epoch,
+            decay_lambda,
+            limit,
+            cursor,
+        };
         with_engine_ref(self, py, move |eng| {
-            Ok(PyTraversalPageResult::from(eng.traverse(
-                start,
-                min_depth,
-                max_depth,
-                dir,
-                edge_type_filter.as_deref(),
-                node_type_filter.as_deref(),
-                at_epoch,
-                decay_lambda,
-                limit,
-                cursor.as_ref(),
-            )?))
+            Ok(PyTraversalPageResult::from(
+                eng.traverse(start, max_depth, &opts)?,
+            ))
         })
     }
 
-    #[pyo3(signature = (node_id, k, direction="outgoing", type_filter=None, scoring="weight", at_epoch=None, decay_lambda=None))]
+    #[pyo3(signature = (node_id, k, *, direction="outgoing", type_filter=None, scoring="weight", at_epoch=None, decay_lambda=None))]
     fn top_k_neighbors(
         &self,
         py: Python<'_>,
@@ -413,16 +444,22 @@ impl OverGraph {
     ) -> PyResult<Vec<PyNeighborEntry>> {
         let dir = parse_direction(direction)?;
         let sm = parse_scoring_mode(scoring, decay_lambda)?;
+        let opts = TopKOptions {
+            direction: dir,
+            type_filter,
+            scoring: sm,
+            at_epoch,
+        };
         with_engine_ref(self, py, move |eng| {
             Ok(eng
-                .top_k_neighbors(node_id, dir, type_filter.as_deref(), k, sm, at_epoch)?
+                .top_k_neighbors(node_id, k, &opts)?
                 .into_iter()
                 .map(PyNeighborEntry::from)
                 .collect())
         })
     }
 
-    #[pyo3(signature = (start_node_id, max_depth=2, direction="outgoing", edge_type_filter=None, at_epoch=None))]
+    #[pyo3(signature = (start_node_id, max_depth, *, direction="outgoing", edge_type_filter=None, at_epoch=None))]
     fn extract_subgraph(
         &self,
         py: Python<'_>,
@@ -433,21 +470,20 @@ impl OverGraph {
         at_epoch: Option<i64>,
     ) -> PyResult<PySubgraph> {
         let dir = parse_direction(direction)?;
+        let opts = SubgraphOptions {
+            direction: dir,
+            edge_type_filter,
+            at_epoch,
+        };
         with_engine_ref(self, py, move |eng| {
-            let sg = eng.extract_subgraph(
-                start_node_id,
-                max_depth,
-                dir,
-                edge_type_filter.as_deref(),
-                at_epoch,
-            )?;
+            let sg = eng.extract_subgraph(start_node_id, max_depth, &opts)?;
             Ok(PySubgraph::from(sg))
         })
     }
 
     /// Batch neighbor query: fetch neighbors for multiple nodes in one call.
     /// Returns dict[int, list[PyNeighborEntry]] mapping each queried node_id to its neighbors.
-    #[pyo3(signature = (node_ids, direction="outgoing", type_filter=None, at_epoch=None, decay_lambda=None))]
+    #[pyo3(signature = (node_ids, *, direction="outgoing", type_filter=None, at_epoch=None, decay_lambda=None))]
     fn neighbors_batch(
         &self,
         py: Python<'_>,
@@ -459,8 +495,15 @@ impl OverGraph {
     ) -> PyResult<HashMap<u64, Vec<PyNeighborEntry>>> {
         let dir = parse_direction(direction)?;
         let dl = decay_lambda.map(|v| v as f32);
+        let opts = NeighborOptions {
+            direction: dir,
+            type_filter,
+            limit: None,
+            at_epoch,
+            decay_lambda: dl,
+        };
         with_engine_ref(self, py, move |eng| {
-            let map = eng.neighbors_batch(&node_ids, dir, type_filter.as_deref(), at_epoch, dl)?;
+            let map = eng.neighbors_batch(&node_ids, &opts)?;
             Ok(map
                 .into_iter()
                 .map(|(k, v)| (k, v.into_iter().map(PyNeighborEntry::from).collect()))
@@ -470,7 +513,7 @@ impl OverGraph {
 
     // --- Degree counts + aggregations (Phase 18a) ---
 
-    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, at_epoch=None))]
+    #[pyo3(signature = (node_id, *, direction="outgoing", type_filter=None, at_epoch=None))]
     fn degree(
         &self,
         py: Python<'_>,
@@ -480,12 +523,15 @@ impl OverGraph {
         at_epoch: Option<i64>,
     ) -> PyResult<u64> {
         let dir = parse_direction(direction)?;
-        with_engine_ref(self, py, move |eng| {
-            eng.degree(node_id, dir, type_filter.as_deref(), at_epoch)
-        })
+        let opts = DegreeOptions {
+            direction: dir,
+            type_filter,
+            at_epoch,
+        };
+        with_engine_ref(self, py, move |eng| eng.degree(node_id, &opts))
     }
 
-    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, at_epoch=None))]
+    #[pyo3(signature = (node_id, *, direction="outgoing", type_filter=None, at_epoch=None))]
     fn sum_edge_weights(
         &self,
         py: Python<'_>,
@@ -495,12 +541,15 @@ impl OverGraph {
         at_epoch: Option<i64>,
     ) -> PyResult<f64> {
         let dir = parse_direction(direction)?;
-        with_engine_ref(self, py, move |eng| {
-            eng.sum_edge_weights(node_id, dir, type_filter.as_deref(), at_epoch)
-        })
+        let opts = DegreeOptions {
+            direction: dir,
+            type_filter,
+            at_epoch,
+        };
+        with_engine_ref(self, py, move |eng| eng.sum_edge_weights(node_id, &opts))
     }
 
-    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, at_epoch=None))]
+    #[pyo3(signature = (node_id, *, direction="outgoing", type_filter=None, at_epoch=None))]
     fn avg_edge_weight(
         &self,
         py: Python<'_>,
@@ -510,12 +559,15 @@ impl OverGraph {
         at_epoch: Option<i64>,
     ) -> PyResult<Option<f64>> {
         let dir = parse_direction(direction)?;
-        with_engine_ref(self, py, move |eng| {
-            eng.avg_edge_weight(node_id, dir, type_filter.as_deref(), at_epoch)
-        })
+        let opts = DegreeOptions {
+            direction: dir,
+            type_filter,
+            at_epoch,
+        };
+        with_engine_ref(self, py, move |eng| eng.avg_edge_weight(node_id, &opts))
     }
 
-    #[pyo3(signature = (node_ids, direction="outgoing", type_filter=None, at_epoch=None))]
+    #[pyo3(signature = (node_ids, *, direction="outgoing", type_filter=None, at_epoch=None))]
     fn degrees(
         &self,
         py: Python<'_>,
@@ -525,14 +577,17 @@ impl OverGraph {
         at_epoch: Option<i64>,
     ) -> PyResult<NodeIdMap<u64>> {
         let dir = parse_direction(direction)?;
-        with_engine_ref(self, py, move |eng| {
-            eng.degrees(&node_ids, dir, type_filter.as_deref(), at_epoch)
-        })
+        let opts = DegreeOptions {
+            direction: dir,
+            type_filter,
+            at_epoch,
+        };
+        with_engine_ref(self, py, move |eng| eng.degrees(&node_ids, &opts))
     }
 
     // --- Shortest path (Phase 18b) ---
 
-    #[pyo3(signature = (from_id, to_id, direction="outgoing", type_filter=None, weight_field=None, at_epoch=None, max_depth=None, max_cost=None))]
+    #[pyo3(signature = (from_id, to_id, *, direction="outgoing", type_filter=None, weight_field=None, at_epoch=None, max_depth=None, max_cost=None))]
     fn shortest_path(
         &self,
         py: Python<'_>,
@@ -546,23 +601,22 @@ impl OverGraph {
         max_cost: Option<f64>,
     ) -> PyResult<Option<PyShortestPath>> {
         let dir = parse_direction(direction)?;
+        let opts = ShortestPathOptions {
+            direction: dir,
+            type_filter,
+            weight_field: weight_field.map(|s| s.to_string()),
+            at_epoch,
+            max_depth,
+            max_cost,
+        };
         with_engine_ref(self, py, move |eng| {
             Ok(eng
-                .shortest_path(
-                    from_id,
-                    to_id,
-                    dir,
-                    type_filter.as_deref(),
-                    weight_field,
-                    at_epoch,
-                    max_depth,
-                    max_cost,
-                )?
+                .shortest_path(from_id, to_id, &opts)?
                 .map(PyShortestPath::from))
         })
     }
 
-    #[pyo3(signature = (from_id, to_id, direction="outgoing", type_filter=None, at_epoch=None, max_depth=None))]
+    #[pyo3(signature = (from_id, to_id, *, direction="outgoing", type_filter=None, at_epoch=None, max_depth=None))]
     fn is_connected(
         &self,
         py: Python<'_>,
@@ -574,19 +628,16 @@ impl OverGraph {
         max_depth: Option<u32>,
     ) -> PyResult<bool> {
         let dir = parse_direction(direction)?;
-        with_engine_ref(self, py, move |eng| {
-            eng.is_connected(
-                from_id,
-                to_id,
-                dir,
-                type_filter.as_deref(),
-                at_epoch,
-                max_depth,
-            )
-        })
+        let opts = IsConnectedOptions {
+            direction: dir,
+            type_filter,
+            at_epoch,
+            max_depth,
+        };
+        with_engine_ref(self, py, move |eng| eng.is_connected(from_id, to_id, &opts))
     }
 
-    #[pyo3(signature = (from_id, to_id, direction="outgoing", type_filter=None, weight_field=None, at_epoch=None, max_depth=None, max_cost=None, max_paths=None))]
+    #[pyo3(signature = (from_id, to_id, *, direction="outgoing", type_filter=None, weight_field=None, at_epoch=None, max_depth=None, max_cost=None, max_paths=None))]
     fn all_shortest_paths(
         &self,
         py: Python<'_>,
@@ -601,19 +652,18 @@ impl OverGraph {
         max_paths: Option<usize>,
     ) -> PyResult<Vec<PyShortestPath>> {
         let dir = parse_direction(direction)?;
+        let opts = AllShortestPathsOptions {
+            direction: dir,
+            type_filter,
+            weight_field: weight_field.map(|s| s.to_string()),
+            at_epoch,
+            max_depth,
+            max_cost,
+            max_paths,
+        };
         with_engine_ref(self, py, move |eng| {
             Ok(eng
-                .all_shortest_paths(
-                    from_id,
-                    to_id,
-                    dir,
-                    type_filter.as_deref(),
-                    weight_field,
-                    at_epoch,
-                    max_depth,
-                    max_cost,
-                    max_paths,
-                )?
+                .all_shortest_paths(from_id, to_id, &opts)?
                 .into_iter()
                 .map(PyShortestPath::from)
                 .collect())
@@ -647,7 +697,7 @@ impl OverGraph {
 
     // --- Retention ---
 
-    #[pyo3(signature = (max_age_ms=None, max_weight=None, type_id=None))]
+    #[pyo3(signature = (*, max_age_ms=None, max_weight=None, type_id=None))]
     fn prune(
         &self,
         py: Python<'_>,
@@ -665,7 +715,7 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (name, max_age_ms=None, max_weight=None, type_id=None))]
+    #[pyo3(signature = (name, *, max_age_ms=None, max_weight=None, type_id=None))]
     fn set_prune_policy(
         &self,
         py: Python<'_>,
@@ -777,7 +827,7 @@ impl OverGraph {
 
     // --- Pagination ---
 
-    #[pyo3(signature = (type_id, limit=None, after=None))]
+    #[pyo3(signature = (type_id, *, limit=None, after=None))]
     fn nodes_by_type_paged(
         &self,
         py: Python<'_>,
@@ -793,7 +843,7 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (type_id, limit=None, after=None))]
+    #[pyo3(signature = (type_id, *, limit=None, after=None))]
     fn edges_by_type_paged(
         &self,
         py: Python<'_>,
@@ -809,7 +859,7 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (type_id, limit=None, after=None))]
+    #[pyo3(signature = (type_id, *, limit=None, after=None))]
     fn get_nodes_by_type_paged(
         &self,
         py: Python<'_>,
@@ -827,7 +877,7 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (type_id, limit=None, after=None))]
+    #[pyo3(signature = (type_id, *, limit=None, after=None))]
     fn get_edges_by_type_paged(
         &self,
         py: Python<'_>,
@@ -845,7 +895,7 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (type_id, prop_key, prop_value, limit=None, after=None))]
+    #[pyo3(signature = (type_id, prop_key, prop_value, *, limit=None, after=None))]
     fn find_nodes_paged(
         &self,
         py: Python<'_>,
@@ -864,7 +914,7 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (type_id, from_ms, to_ms, limit=None, after=None))]
+    #[pyo3(signature = (type_id, from_ms, to_ms, *, limit=None, after=None))]
     fn find_nodes_by_time_range_paged(
         &self,
         py: Python<'_>,
@@ -882,7 +932,7 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (node_id, direction="outgoing", type_filter=None, limit=None, after=None, at_epoch=None, decay_lambda=None))]
+    #[pyo3(signature = (node_id, *, direction="outgoing", type_filter=None, limit=None, after=None, at_epoch=None, decay_lambda=None))]
     fn neighbors_paged(
         &self,
         py: Python<'_>,
@@ -896,10 +946,16 @@ impl OverGraph {
     ) -> PyResult<PyNeighborPageResult> {
         let dir = parse_direction(direction)?;
         let dl = decay_lambda.map(|v| v as f32);
+        let opts = NeighborOptions {
+            direction: dir,
+            type_filter,
+            limit: None,
+            at_epoch,
+            decay_lambda: dl,
+        };
         let page = PageRequest { limit, after };
         with_engine_ref(self, py, move |eng| {
-            let result =
-                eng.neighbors_paged(node_id, dir, type_filter.as_deref(), &page, at_epoch, dl)?;
+            let result = eng.neighbors_paged(node_id, &opts, &page)?;
             Ok(PyNeighborPageResult {
                 items: result
                     .items
@@ -913,7 +969,7 @@ impl OverGraph {
 
     // --- Analytics ---
 
-    #[pyo3(signature = (seed_node_ids, damping_factor=None, max_iterations=None, epsilon=None, edge_type_filter=None, max_results=None))]
+    #[pyo3(signature = (seed_node_ids, *, damping_factor=None, max_iterations=None, epsilon=None, edge_type_filter=None, max_results=None))]
     fn personalized_pagerank(
         &self,
         py: Python<'_>,
@@ -939,7 +995,7 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (node_type_filter=None, edge_type_filter=None, include_weights=true))]
+    #[pyo3(signature = (*, node_type_filter=None, edge_type_filter=None, include_weights=true))]
     fn export_adjacency(
         &self,
         py: Python<'_>,
@@ -964,7 +1020,7 @@ impl OverGraph {
     /// Returns a dict mapping each visible node ID to its component ID
     /// (the minimum node ID in that component). WCC treats all edges as
     /// undirected. Isolated nodes become singleton components.
-    #[pyo3(signature = (edge_type_filter=None, node_type_filter=None, at_epoch=None))]
+    #[pyo3(signature = (*, edge_type_filter=None, node_type_filter=None, at_epoch=None))]
     fn connected_components(
         &self,
         py: Python<'_>,
@@ -972,19 +1028,18 @@ impl OverGraph {
         node_type_filter: Option<Vec<u32>>,
         at_epoch: Option<i64>,
     ) -> PyResult<NodeIdMap<u64>> {
-        with_engine_ref(self, py, move |eng| {
-            eng.connected_components(
-                edge_type_filter.as_deref(),
-                node_type_filter.as_deref(),
-                at_epoch,
-            )
-        })
+        let opts = ComponentOptions {
+            edge_type_filter,
+            node_type_filter,
+            at_epoch,
+        };
+        with_engine_ref(self, py, move |eng| eng.connected_components(&opts))
     }
 
     /// Returns the sorted list of node IDs in the same weakly connected
     /// component as the given node. Returns an empty list if the node
     /// doesn't exist, is deleted, or is hidden by prune policy.
-    #[pyo3(signature = (node_id, edge_type_filter=None, node_type_filter=None, at_epoch=None))]
+    #[pyo3(signature = (node_id, *, edge_type_filter=None, node_type_filter=None, at_epoch=None))]
     fn component_of(
         &self,
         py: Python<'_>,
@@ -993,13 +1048,72 @@ impl OverGraph {
         node_type_filter: Option<Vec<u32>>,
         at_epoch: Option<i64>,
     ) -> PyResult<Vec<u64>> {
+        let opts = ComponentOptions {
+            edge_type_filter,
+            node_type_filter,
+            at_epoch,
+        };
+        with_engine_ref(self, py, move |eng| eng.component_of(node_id, &opts))
+    }
+
+    // --- Vector search (Phase 19) ---
+
+    #[pyo3(signature = (mode, k, *, dense_query=None, sparse_query=None, type_filter=None, ef_search=None, scope_start_node_id=None, scope_max_depth=None, scope_direction=None, scope_edge_type_filter=None, scope_at_epoch=None, dense_weight=None, sparse_weight=None, fusion_mode=None))]
+    fn vector_search(
+        &self,
+        py: Python<'_>,
+        mode: &str,
+        k: usize,
+        dense_query: Option<Vec<f32>>,
+        sparse_query: Option<Vec<(u32, f32)>>,
+        type_filter: Option<Vec<u32>>,
+        ef_search: Option<usize>,
+        scope_start_node_id: Option<u64>,
+        scope_max_depth: Option<u32>,
+        scope_direction: Option<&str>,
+        scope_edge_type_filter: Option<Vec<u32>>,
+        scope_at_epoch: Option<i64>,
+        dense_weight: Option<f32>,
+        sparse_weight: Option<f32>,
+        fusion_mode: Option<&str>,
+    ) -> PyResult<Vec<PyVectorHit>> {
+        let mode = parse_vector_search_mode(mode)?;
+        let fusion = parse_fusion_mode(fusion_mode)?;
+        let scope = match scope_start_node_id {
+            None => None,
+            Some(start) => Some(VectorSearchScope {
+                start_node_id: start,
+                max_depth: scope_max_depth.ok_or_else(|| {
+                    PyErr::new::<PyValueError, _>(
+                        "scope_max_depth is required when scope_start_node_id is provided",
+                    )
+                })?,
+                direction: parse_direction(scope_direction.unwrap_or("outgoing"))?,
+                edge_type_filter: scope_edge_type_filter,
+                at_epoch: scope_at_epoch,
+            }),
+        };
+        let request = VectorSearchRequest {
+            mode,
+            dense_query,
+            sparse_query,
+            k,
+            type_filter,
+            ef_search,
+            scope,
+            dense_weight,
+            sparse_weight,
+            fusion_mode: fusion,
+        };
         with_engine_ref(self, py, move |eng| {
-            eng.component_of(
-                node_id,
-                edge_type_filter.as_deref(),
-                node_type_filter.as_deref(),
-                at_epoch,
-            )
+            let hits = eng.vector_search(&request)?;
+            Ok(hits
+                .into_iter()
+                .map(|h| PyVectorHit {
+                    node_id: h.node_id,
+                    score: h.score as f64,
+                })
+                .collect())
         })
     }
 }
@@ -1023,6 +1137,18 @@ pub struct PyDbStats {
     pub last_compaction_ms: Option<i64>,
     #[pyo3(get)]
     pub wal_sync_mode: String,
+    #[pyo3(get)]
+    pub active_memtable_bytes: usize,
+    #[pyo3(get)]
+    pub immutable_memtable_bytes: usize,
+    #[pyo3(get)]
+    pub immutable_memtable_count: usize,
+    #[pyo3(get)]
+    pub pending_flush_count: usize,
+    #[pyo3(get)]
+    pub active_wal_generation_id: u64,
+    #[pyo3(get)]
+    pub oldest_retained_wal_generation_id: u64,
 }
 
 impl From<DbStats> for PyDbStats {
@@ -1034,6 +1160,12 @@ impl From<DbStats> for PyDbStats {
             edge_tombstone_count: s.edge_tombstone_count,
             last_compaction_ms: s.last_compaction_ms,
             wal_sync_mode: s.wal_sync_mode,
+            active_memtable_bytes: s.active_memtable_bytes,
+            immutable_memtable_bytes: s.immutable_memtable_bytes,
+            immutable_memtable_count: s.immutable_memtable_count,
+            pending_flush_count: s.pending_flush_count,
+            active_wal_generation_id: s.active_wal_generation_id,
+            oldest_retained_wal_generation_id: s.oldest_retained_wal_generation_id,
         }
     }
 }
@@ -1042,12 +1174,16 @@ impl From<DbStats> for PyDbStats {
 impl PyDbStats {
     fn __repr__(&self) -> String {
         format!(
-            "DbStats(segments={}, wal_bytes={}, tombstones=({}, {}), sync='{}')",
+            "DbStats(segments={}, wal_bytes={}, tombstones=({}, {}), sync='{}', \
+             immutables={}, pending_flushes={}, wal_gen={})",
             self.segment_count,
             self.pending_wal_bytes,
             self.node_tombstone_count,
             self.edge_tombstone_count,
             self.wal_sync_mode,
+            self.immutable_memtable_count,
+            self.pending_flush_count,
+            self.active_wal_generation_id,
         )
     }
 }
@@ -1247,6 +1383,25 @@ impl PyTraversalHit {
         format!(
             "TraversalHit(node_id={}, depth={}, via_edge_id={:?})",
             self.node_id, self.depth, self.via_edge_id
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyVectorHit {
+    #[pyo3(get)]
+    pub node_id: u64,
+    #[pyo3(get)]
+    pub score: f64,
+}
+
+#[pymethods]
+impl PyVectorHit {
+    fn __repr__(&self) -> String {
+        format!(
+            "VectorHit(node_id={}, score={:.4})",
+            self.node_id, self.score
         )
     }
 }
@@ -1905,6 +2060,7 @@ impl PyAdjacencyExport {
 // Property conversion: Python <-> Rust PropValue
 // ============================================================
 
+#[allow(clippy::only_used_in_recursion)]
 fn py_to_prop_value(py: Python<'_>, obj: &Bound<'_, pyo3::PyAny>) -> PyResult<PropValue> {
     if obj.is_none() {
         Ok(PropValue::Null)
@@ -2002,6 +2158,9 @@ const KNOWN_OPTIONS: &[&str] = &[
     "wal_sync_mode",
     "group_commit_interval_ms",
     "memtable_hard_cap_bytes",
+    "max_immutable_memtables",
+    "dense_vector_dimension",
+    "dense_vector_metric",
 ];
 
 fn parse_db_options(d: &Bound<'_, PyDict>) -> PyResult<DbOptions> {
@@ -2042,6 +2201,29 @@ fn parse_db_options(d: &Bound<'_, PyDict>) -> PyResult<DbOptions> {
         None => defaults.wal_sync_mode,
     };
 
+    let dense_vector = match d.get_item("dense_vector_dimension")? {
+        Some(v) => {
+            let dimension: u32 = v.extract()?;
+            let metric = match d.get_item("dense_vector_metric")? {
+                Some(m) => {
+                    let s: String = m.extract()?;
+                    match s.as_str() {
+                        "euclidean" => DenseMetric::Euclidean,
+                        "dot_product" => DenseMetric::DotProduct,
+                        _ => DenseMetric::Cosine,
+                    }
+                }
+                None => DenseMetric::Cosine,
+            };
+            Some(DenseVectorConfig {
+                dimension,
+                metric,
+                hnsw: HnswConfig::default(),
+            })
+        }
+        None => None,
+    };
+
     Ok(DbOptions {
         create_if_missing: d
             .get_item("create_if_missing")?
@@ -2063,12 +2245,18 @@ fn parse_db_options(d: &Bound<'_, PyDict>) -> PyResult<DbOptions> {
             .map(|v| v.extract())
             .transpose()?
             .unwrap_or(defaults.compact_after_n_flushes),
+        dense_vector,
         wal_sync_mode,
         memtable_hard_cap_bytes: d
             .get_item("memtable_hard_cap_bytes")?
             .map(|v| v.extract::<usize>())
             .transpose()?
             .unwrap_or(defaults.memtable_hard_cap_bytes),
+        max_immutable_memtables: d
+            .get_item("max_immutable_memtables")?
+            .map(|v| v.extract::<usize>())
+            .transpose()?
+            .unwrap_or(defaults.max_immutable_memtables),
     })
 }
 
@@ -2096,11 +2284,21 @@ fn parse_node_inputs(py: Python<'_>, list: &Bound<'_, PyList>) -> PyResult<Vec<N
             .map(|v| v.extract::<f64>())
             .transpose()?
             .unwrap_or(1.0) as f32;
+        let dense_vector: Option<Vec<f32>> = d
+            .get_item("dense_vector")?
+            .map(|v| v.extract())
+            .transpose()?;
+        let sparse_vector: Option<Vec<(u32, f32)>> = d
+            .get_item("sparse_vector")?
+            .map(|v| v.extract())
+            .transpose()?;
         inputs.push(NodeInput {
             type_id,
             key,
             props,
             weight,
+            dense_vector,
+            sparse_vector,
         });
     }
     Ok(inputs)
@@ -2217,6 +2415,31 @@ fn parse_graph_patch(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<GraphPat
 // ============================================================
 // Direction / scoring helpers
 // ============================================================
+
+fn parse_vector_search_mode(s: &str) -> PyResult<VectorSearchMode> {
+    match s {
+        "dense" => Ok(VectorSearchMode::Dense),
+        "sparse" => Ok(VectorSearchMode::Sparse),
+        "hybrid" => Ok(VectorSearchMode::Hybrid),
+        other => Err(PyValueError::new_err(format!(
+            "Invalid mode '{}'. Must be 'dense', 'sparse', or 'hybrid'.",
+            other
+        ))),
+    }
+}
+
+fn parse_fusion_mode(s: Option<&str>) -> PyResult<Option<FusionMode>> {
+    match s {
+        None => Ok(None),
+        Some("weighted_rank") => Ok(Some(FusionMode::WeightedRankFusion)),
+        Some("reciprocal_rank") => Ok(Some(FusionMode::ReciprocalRankFusion)),
+        Some("weighted_score") => Ok(Some(FusionMode::WeightedScoreFusion)),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "Invalid fusion_mode '{}'. Must be 'weighted_rank', 'reciprocal_rank', or 'weighted_score'.",
+            other
+        ))),
+    }
+}
 
 fn parse_direction(s: &str) -> PyResult<Direction> {
     match s {
@@ -2382,6 +2605,8 @@ fn decode_node_batch_py(buf: &[u8]) -> PyResult<Vec<NodeInput>> {
             key,
             props,
             weight,
+            dense_vector: None,
+            sparse_vector: None,
         });
     }
     if r.pos != buf.len() {
@@ -2465,6 +2690,7 @@ fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPatchResult>()?;
     m.add_class::<PyNeighborEntry>()?;
     m.add_class::<PyTraversalHit>()?;
+    m.add_class::<PyVectorHit>()?;
     m.add_class::<PyTraversalCursor>()?;
     m.add_class::<PyShortestPath>()?;
     m.add_class::<PySubgraph>()?;

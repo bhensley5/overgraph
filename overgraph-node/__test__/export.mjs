@@ -33,9 +33,9 @@ describe('exportAdjacency, full graph', () => {
     a = db.upsertNode(1, 'a');
     b = db.upsertNode(1, 'b');
     c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 1, null, 2.0);
-    db.upsertEdge(b, c, 1, null, 3.0);
-    db.upsertEdge(c, a, 2, null, 1.0);
+    db.upsertEdge(a, b, 1, { weight: 2.0 });
+    db.upsertEdge(b, c, 1, { weight: 3.0 });
+    db.upsertEdge(c, a, 2, { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -79,9 +79,9 @@ describe('exportAdjacency, filters', () => {
     a = db.upsertNode(1, 'a');
     b = db.upsertNode(2, 'b');
     c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 1, null, 1.0);
-    db.upsertEdge(a, c, 1, null, 1.0);
-    db.upsertEdge(a, c, 2, null, 2.0);
+    db.upsertEdge(a, b, 1, { weight: 1.0 });
+    db.upsertEdge(a, c, 1, { weight: 1.0 });
+    db.upsertEdge(a, c, 2, { weight: 2.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -113,10 +113,10 @@ describe('exportAdjacency, across flush', () => {
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     const a = db.upsertNode(1, 'a');
     const b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 1, null, 1.0);
+    db.upsertEdge(a, b, 1, { weight: 1.0 });
     db.flush();
     const c = db.upsertNode(1, 'c');
-    db.upsertEdge(b, c, 1, null, 2.0);
+    db.upsertEdge(b, c, 1, { weight: 2.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -134,7 +134,7 @@ describe('exportAdjacencyAsync', () => {
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     a = db.upsertNode(1, 'a');
     b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 1, null, 1.0);
+    db.upsertEdge(a, b, 1, { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 

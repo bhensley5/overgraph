@@ -13,6 +13,12 @@ class PyDbStats:
     edge_tombstone_count: int
     last_compaction_ms: int | None
     wal_sync_mode: str
+    active_memtable_bytes: int
+    immutable_memtable_bytes: int
+    immutable_memtable_count: int
+    pending_flush_count: int
+    active_wal_generation_id: int
+    oldest_retained_wal_generation_id: int
     def __repr__(self) -> str: ...
 
 class PyNodeRecord:
@@ -57,6 +63,11 @@ class PyTraversalHit:
     depth: int
     via_edge_id: int | None
     score: float | None
+    def __repr__(self) -> str: ...
+
+class PyVectorHit:
+    node_id: int
+    score: float
     def __repr__(self) -> str: ...
 
 class PyTraversalCursor:
@@ -211,14 +222,18 @@ class OverGraph:
         self,
         type_id: int,
         key: str,
+        *,
         props: dict[str, Any] | None = None,
         weight: float = 1.0,
+        dense_vector: list[float] | None = None,
+        sparse_vector: list[tuple[int, float]] | None = None,
     ) -> int: ...
     def upsert_edge(
         self,
         from_id: int,
         to_id: int,
         type_id: int,
+        *,
         props: dict[str, Any] | None = None,
         weight: float = 1.0,
         valid_from: int | None = None,
@@ -236,6 +251,7 @@ class OverGraph:
     def batch_upsert_nodes(self, nodes: list[dict[str, Any]]) -> list[int]: ...
     def batch_upsert_edges(self, edges: list[dict[str, Any]]) -> list[int]: ...
     def get_nodes(self, node_ids: list[int]) -> list[PyNodeRecord | None]: ...
+    def get_nodes_by_keys(self, keys: list[tuple[int, str]]) -> list[PyNodeRecord | None]: ...
     def get_edges(self, edge_ids: list[int]) -> list[PyEdgeRecord | None]: ...
     def graph_patch(self, patch: dict[str, Any]) -> PyPatchResult: ...
 
@@ -257,6 +273,7 @@ class OverGraph:
     def neighbors(
         self,
         node_id: int,
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         limit: int | None = None,
@@ -266,8 +283,9 @@ class OverGraph:
     def traverse(
         self,
         start: int,
-        min_depth: int = 0,
-        max_depth: int = 2,
+        max_depth: int,
+        *,
+        min_depth: int = 1,
         direction: str = "outgoing",
         edge_type_filter: list[int] | None = None,
         node_type_filter: list[int] | None = None,
@@ -280,6 +298,7 @@ class OverGraph:
         self,
         node_id: int,
         k: int,
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         scoring: str = "weight",
@@ -289,7 +308,8 @@ class OverGraph:
     def extract_subgraph(
         self,
         start_node_id: int,
-        max_depth: int = 2,
+        max_depth: int,
+        *,
         direction: str = "outgoing",
         edge_type_filter: list[int] | None = None,
         at_epoch: int | None = None,
@@ -297,6 +317,7 @@ class OverGraph:
     def neighbors_batch(
         self,
         node_ids: list[int],
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         at_epoch: int | None = None,
@@ -307,6 +328,7 @@ class OverGraph:
     def degree(
         self,
         node_id: int,
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         at_epoch: int | None = None,
@@ -314,6 +336,7 @@ class OverGraph:
     def sum_edge_weights(
         self,
         node_id: int,
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         at_epoch: int | None = None,
@@ -321,6 +344,7 @@ class OverGraph:
     def avg_edge_weight(
         self,
         node_id: int,
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         at_epoch: int | None = None,
@@ -328,6 +352,7 @@ class OverGraph:
     def degrees(
         self,
         node_ids: list[int],
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         at_epoch: int | None = None,
@@ -338,6 +363,7 @@ class OverGraph:
         self,
         from_id: int,
         to_id: int,
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         weight_field: str | None = None,
@@ -349,6 +375,7 @@ class OverGraph:
         self,
         from_id: int,
         to_id: int,
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         at_epoch: int | None = None,
@@ -358,6 +385,7 @@ class OverGraph:
         self,
         from_id: int,
         to_id: int,
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         weight_field: str | None = None,
@@ -370,6 +398,7 @@ class OverGraph:
     # Retention
     def prune(
         self,
+        *,
         max_age_ms: int | None = None,
         max_weight: float | None = None,
         type_id: int | None = None,
@@ -377,6 +406,7 @@ class OverGraph:
     def set_prune_policy(
         self,
         name: str,
+        *,
         max_age_ms: int | None = None,
         max_weight: float | None = None,
         type_id: int | None = None,
@@ -393,15 +423,16 @@ class OverGraph:
     def compact_with_progress(self, callback: Callable[[PyCompactionProgress], bool]) -> PyCompactionStats | None: ...
 
     # Pagination
-    def nodes_by_type_paged(self, type_id: int, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
-    def edges_by_type_paged(self, type_id: int, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
-    def get_nodes_by_type_paged(self, type_id: int, limit: int | None = None, after: int | None = None) -> PyNodePageResult: ...
-    def get_edges_by_type_paged(self, type_id: int, limit: int | None = None, after: int | None = None) -> PyEdgePageResult: ...
-    def find_nodes_paged(self, type_id: int, prop_key: str, prop_value: Any, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
-    def find_nodes_by_time_range_paged(self, type_id: int, from_ms: int, to_ms: int, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
+    def nodes_by_type_paged(self, type_id: int, *, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
+    def edges_by_type_paged(self, type_id: int, *, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
+    def get_nodes_by_type_paged(self, type_id: int, *, limit: int | None = None, after: int | None = None) -> PyNodePageResult: ...
+    def get_edges_by_type_paged(self, type_id: int, *, limit: int | None = None, after: int | None = None) -> PyEdgePageResult: ...
+    def find_nodes_paged(self, type_id: int, prop_key: str, prop_value: Any, *, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
+    def find_nodes_by_time_range_paged(self, type_id: int, from_ms: int, to_ms: int, *, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
     def neighbors_paged(
         self,
         node_id: int,
+        *,
         direction: str = "outgoing",
         type_filter: list[int] | None = None,
         limit: int | None = None,
@@ -414,6 +445,7 @@ class OverGraph:
     def personalized_pagerank(
         self,
         seed_node_ids: list[int],
+        *,
         damping_factor: float | None = None,
         max_iterations: int | None = None,
         epsilon: float | None = None,
@@ -422,6 +454,7 @@ class OverGraph:
     ) -> PyPprResult: ...
     def export_adjacency(
         self,
+        *,
         node_type_filter: list[int] | None = None,
         edge_type_filter: list[int] | None = None,
         include_weights: bool = True,
@@ -430,6 +463,7 @@ class OverGraph:
     # Connected Components (Phase 18d)
     def connected_components(
         self,
+        *,
         edge_type_filter: list[int] | None = None,
         node_type_filter: list[int] | None = None,
         at_epoch: int | None = None,
@@ -439,12 +473,33 @@ class OverGraph:
     def component_of(
         self,
         node_id: int,
+        *,
         edge_type_filter: list[int] | None = None,
         node_type_filter: list[int] | None = None,
         at_epoch: int | None = None,
     ) -> list[int]:
         """Returns sorted list of node IDs in the same WCC component as node_id. Empty if node missing/hidden."""
         ...
+
+    # Vector search (Phase 19)
+    def vector_search(
+        self,
+        mode: str,
+        k: int,
+        *,
+        dense_query: list[float] | None = None,
+        sparse_query: list[tuple[int, float]] | None = None,
+        type_filter: list[int] | None = None,
+        ef_search: int | None = None,
+        scope_start_node_id: int | None = None,
+        scope_max_depth: int | None = None,
+        scope_direction: str | None = None,
+        scope_edge_type_filter: list[int] | None = None,
+        scope_at_epoch: int | None = None,
+        dense_weight: float | None = None,
+        sparse_weight: float | None = None,
+        fusion_mode: str | None = None,
+    ) -> list[PyVectorHit]: ...
 
 # ============================================================
 # Async API
@@ -464,8 +519,8 @@ class AsyncOverGraph:
     async def stats(self) -> PyDbStats: ...
 
     # Single CRUD
-    async def upsert_node(self, type_id: int, key: str, props: dict[str, Any] | None = None, weight: float = 1.0) -> int: ...
-    async def upsert_edge(self, from_id: int, to_id: int, type_id: int, props: dict[str, Any] | None = None, weight: float = 1.0, valid_from: int | None = None, valid_to: int | None = None) -> int: ...
+    async def upsert_node(self, type_id: int, key: str, *, props: dict[str, Any] | None = None, weight: float = 1.0, dense_vector: list[float] | None = None, sparse_vector: list[tuple[int, float]] | None = None) -> int: ...
+    async def upsert_edge(self, from_id: int, to_id: int, type_id: int, *, props: dict[str, Any] | None = None, weight: float = 1.0, valid_from: int | None = None, valid_to: int | None = None) -> int: ...
     async def get_node(self, node_id: int) -> PyNodeRecord | None: ...
     async def get_edge(self, edge_id: int) -> PyEdgeRecord | None: ...
     async def get_node_by_key(self, type_id: int, key: str) -> PyNodeRecord | None: ...
@@ -480,6 +535,7 @@ class AsyncOverGraph:
     async def batch_upsert_nodes_binary(self, buffer: bytes) -> list[int]: ...
     async def batch_upsert_edges_binary(self, buffer: bytes) -> list[int]: ...
     async def get_nodes(self, node_ids: list[int]) -> list[PyNodeRecord | None]: ...
+    async def get_nodes_by_keys(self, keys: list[tuple[int, str]]) -> list[PyNodeRecord | None]: ...
     async def get_edges(self, edge_ids: list[int]) -> list[PyEdgeRecord | None]: ...
     async def graph_patch(self, patch: dict[str, Any]) -> PyPatchResult: ...
 
@@ -494,26 +550,26 @@ class AsyncOverGraph:
     async def find_nodes_by_time_range(self, type_id: int, from_ms: int, to_ms: int) -> IdArray: ...
 
     # Traversal
-    async def neighbors(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, limit: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> list[PyNeighborEntry]: ...
-    async def traverse(self, start: int, min_depth: int = 0, max_depth: int = 2, direction: str = "outgoing", edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None, decay_lambda: float | None = None, limit: int | None = None, cursor: PyTraversalCursor | None = None) -> PyTraversalPageResult: ...
-    async def top_k_neighbors(self, node_id: int, k: int, direction: str = "outgoing", type_filter: list[int] | None = None, scoring: str = "weight", at_epoch: int | None = None, decay_lambda: float | None = None) -> list[PyNeighborEntry]: ...
-    async def extract_subgraph(self, start_node_id: int, max_depth: int = 2, direction: str = "outgoing", edge_type_filter: list[int] | None = None, at_epoch: int | None = None) -> PySubgraph: ...
-    async def neighbors_batch(self, node_ids: list[int], direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> dict[int, list[PyNeighborEntry]]: ...
+    async def neighbors(self, node_id: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, limit: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> list[PyNeighborEntry]: ...
+    async def traverse(self, start: int, max_depth: int, *, min_depth: int = 1, direction: str = "outgoing", edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None, decay_lambda: float | None = None, limit: int | None = None, cursor: PyTraversalCursor | None = None) -> PyTraversalPageResult: ...
+    async def top_k_neighbors(self, node_id: int, k: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, scoring: str = "weight", at_epoch: int | None = None, decay_lambda: float | None = None) -> list[PyNeighborEntry]: ...
+    async def extract_subgraph(self, start_node_id: int, max_depth: int, *, direction: str = "outgoing", edge_type_filter: list[int] | None = None, at_epoch: int | None = None) -> PySubgraph: ...
+    async def neighbors_batch(self, node_ids: list[int], *, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> dict[int, list[PyNeighborEntry]]: ...
 
     # Degree counts + aggregations
-    async def degree(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> int: ...
-    async def sum_edge_weights(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> float: ...
-    async def avg_edge_weight(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> float | None: ...
-    async def degrees(self, node_ids: list[int], direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> dict[int, int]: ...
+    async def degree(self, node_id: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> int: ...
+    async def sum_edge_weights(self, node_id: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> float: ...
+    async def avg_edge_weight(self, node_id: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> float | None: ...
+    async def degrees(self, node_ids: list[int], *, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None) -> dict[int, int]: ...
 
     # Shortest path
-    async def shortest_path(self, from_id: int, to_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, weight_field: str | None = None, at_epoch: int | None = None, max_depth: int | None = None, max_cost: float | None = None) -> PyShortestPath | None: ...
-    async def is_connected(self, from_id: int, to_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None, max_depth: int | None = None) -> bool: ...
-    async def all_shortest_paths(self, from_id: int, to_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, weight_field: str | None = None, at_epoch: int | None = None, max_depth: int | None = None, max_cost: float | None = None, max_paths: int | None = None) -> list[PyShortestPath]: ...
+    async def shortest_path(self, from_id: int, to_id: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, weight_field: str | None = None, at_epoch: int | None = None, max_depth: int | None = None, max_cost: float | None = None) -> PyShortestPath | None: ...
+    async def is_connected(self, from_id: int, to_id: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, at_epoch: int | None = None, max_depth: int | None = None) -> bool: ...
+    async def all_shortest_paths(self, from_id: int, to_id: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, weight_field: str | None = None, at_epoch: int | None = None, max_depth: int | None = None, max_cost: float | None = None, max_paths: int | None = None) -> list[PyShortestPath]: ...
 
     # Retention
-    async def prune(self, max_age_ms: int | None = None, max_weight: float | None = None, type_id: int | None = None) -> PyPruneResult: ...
-    async def set_prune_policy(self, name: str, max_age_ms: int | None = None, max_weight: float | None = None, type_id: int | None = None) -> None: ...
+    async def prune(self, *, max_age_ms: int | None = None, max_weight: float | None = None, type_id: int | None = None) -> PyPruneResult: ...
+    async def set_prune_policy(self, name: str, *, max_age_ms: int | None = None, max_weight: float | None = None, type_id: int | None = None) -> None: ...
     async def remove_prune_policy(self, name: str) -> bool: ...
     async def list_prune_policies(self) -> list[PyNamedPrunePolicy]: ...
 
@@ -526,16 +582,17 @@ class AsyncOverGraph:
     async def compact_with_progress(self, callback: Callable[[PyCompactionProgress], bool]) -> PyCompactionStats | None: ...
 
     # Pagination
-    async def nodes_by_type_paged(self, type_id: int, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
-    async def edges_by_type_paged(self, type_id: int, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
-    async def get_nodes_by_type_paged(self, type_id: int, limit: int | None = None, after: int | None = None) -> PyNodePageResult: ...
-    async def get_edges_by_type_paged(self, type_id: int, limit: int | None = None, after: int | None = None) -> PyEdgePageResult: ...
-    async def find_nodes_paged(self, type_id: int, prop_key: str, prop_value: Any, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
-    async def find_nodes_by_time_range_paged(self, type_id: int, from_ms: int, to_ms: int, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
-    async def neighbors_paged(self, node_id: int, direction: str = "outgoing", type_filter: list[int] | None = None, limit: int | None = None, after: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> PyNeighborPageResult: ...
+    async def nodes_by_type_paged(self, type_id: int, *, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
+    async def edges_by_type_paged(self, type_id: int, *, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
+    async def get_nodes_by_type_paged(self, type_id: int, *, limit: int | None = None, after: int | None = None) -> PyNodePageResult: ...
+    async def get_edges_by_type_paged(self, type_id: int, *, limit: int | None = None, after: int | None = None) -> PyEdgePageResult: ...
+    async def find_nodes_paged(self, type_id: int, prop_key: str, prop_value: Any, *, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
+    async def find_nodes_by_time_range_paged(self, type_id: int, from_ms: int, to_ms: int, *, limit: int | None = None, after: int | None = None) -> PyIdPageResult: ...
+    async def neighbors_paged(self, node_id: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, limit: int | None = None, after: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> PyNeighborPageResult: ...
 
     # Analytics
-    async def personalized_pagerank(self, seed_node_ids: list[int], damping_factor: float | None = None, max_iterations: int | None = None, epsilon: float | None = None, edge_type_filter: list[int] | None = None, max_results: int | None = None) -> PyPprResult: ...
-    async def export_adjacency(self, node_type_filter: list[int] | None = None, edge_type_filter: list[int] | None = None, include_weights: bool = True) -> PyAdjacencyExport: ...
-    async def connected_components(self, edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None) -> dict[int, int]: ...
-    async def component_of(self, node_id: int, edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None) -> list[int]: ...
+    async def personalized_pagerank(self, seed_node_ids: list[int], *, damping_factor: float | None = None, max_iterations: int | None = None, epsilon: float | None = None, edge_type_filter: list[int] | None = None, max_results: int | None = None) -> PyPprResult: ...
+    async def export_adjacency(self, *, node_type_filter: list[int] | None = None, edge_type_filter: list[int] | None = None, include_weights: bool = True) -> PyAdjacencyExport: ...
+    async def connected_components(self, *, edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None) -> dict[int, int]: ...
+    async def component_of(self, node_id: int, *, edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None) -> list[int]: ...
+    async def vector_search(self, mode: str, k: int, *, dense_query: list[float] | None = None, sparse_query: list[tuple[int, float]] | None = None, type_filter: list[int] | None = None, ef_search: int | None = None, scope_start_node_id: int | None = None, scope_max_depth: int | None = None, scope_direction: str | None = None, scope_edge_type_filter: list[int] | None = None, scope_at_epoch: int | None = None, dense_weight: float | None = None, sparse_weight: float | None = None, fusion_mode: str | None = None) -> list[PyVectorHit]: ...

@@ -21,7 +21,7 @@ const SUPPORTS = 12;
 
 async function main() {
   // Open (or create) a database in a local directory
-  const db = await OverGraph.openAsync('./example-graph');
+  const db = OverGraph.open('./example-graph');
 
   try {
     // --- Build a knowledge graph ---
@@ -40,8 +40,10 @@ async function main() {
     ]);
 
     // Create a conversation node
-    const convo = await db.upsertNodeAsync(CONVERSATION, 'convo:2024-01-15',
-      { summary: 'Discussed Atlas project timeline' }, 0.7);
+    const convo = await db.upsertNodeAsync(CONVERSATION, 'convo:2024-01-15', {
+      props: { summary: 'Discussed Atlas project timeline' },
+      weight: 0.7,
+    });
 
     // Connect everything with typed edges
     await db.batchUpsertEdgesAsync([
@@ -59,7 +61,11 @@ async function main() {
     // --- Query the graph ---
 
     // 1. Who is Alice connected to?
-    const aliceNeighbors = await db.neighborsAsync(alice, 'outgoing', [RELATED_TO], 10);
+    const aliceNeighbors = await db.neighborsAsync(alice, {
+      direction: 'outgoing',
+      typeFilter: [RELATED_TO],
+      limit: 10,
+    });
     console.log(`Alice's connections (${aliceNeighbors.length}):`);
     for (let i = 0; i < aliceNeighbors.length; i++) {
       const node = await db.getNodeAsync(aliceNeighbors.nodeId(i));
@@ -74,7 +80,11 @@ async function main() {
     }
 
     // 3. Top-K: most important connections from the Atlas project
-    const topK = await db.topKNeighborsAsync(project, 'incoming', [RELATED_TO], 5, 'weight');
+    const topK = await db.topKNeighborsAsync(project, 5, {
+      direction: 'incoming',
+      typeFilter: [RELATED_TO],
+      scoring: 'weight',
+    });
     console.log(`\nTop connections to Atlas (${topK.length}):`);
     for (let i = 0; i < topK.length; i++) {
       const node = await db.getNodeAsync(topK.nodeId(i));

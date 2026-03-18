@@ -169,6 +169,11 @@ function effectiveConfig(profile, scenarioContract) {
     include_weights_on_export: Boolean(cfg.include_weights_on_export),
     shortest_path_nodes: Math.max(cfg.shortest_path_nodes_min, Math.floor(nodes / cfg.shortest_path_nodes_divisor)),
     shortest_path_edge_offsets: cfg.shortest_path_edge_offsets,
+    vector_nodes: Math.max(cfg.vector_nodes_min, Math.floor(profile.nodes / cfg.vector_nodes_divisor)),
+    vector_dim: cfg.vector_dim,
+    vector_nnz: cfg.vector_nnz,
+    vector_sparse_dims: cfg.vector_sparse_dims,
+    vector_k: cfg.vector_k,
   };
 }
 
@@ -241,6 +246,40 @@ function buildDeepTraversalGraph(db, cfg) {
   return { root, branching: [level1, level2, level3] };
 }
 
+function benchSplitmix64(x) {
+  x = (x + 0x9E3779B97F4A7C15n) & 0xFFFFFFFFFFFFFFFFn;
+  let z = x;
+  z = ((z ^ (z >> 30n)) * 0xBF58476D1CE4E5B9n) & 0xFFFFFFFFFFFFFFFFn;
+  z = ((z ^ (z >> 27n)) * 0x94D049BB133111EBn) & 0xFFFFFFFFFFFFFFFFn;
+  return (z ^ (z >> 31n)) & 0xFFFFFFFFFFFFFFFFn;
+}
+
+function benchDenseVector(dim, seed) {
+  const values = new Array(dim);
+  let state = BigInt(seed);
+  for (let i = 0; i < dim; i++) {
+    state = benchSplitmix64(state);
+    values[i] = Number(state >> 40n) / 16777215 * 2 - 1;
+  }
+  const norm = Math.sqrt(values.reduce((a, v) => a + v * v, 0));
+  if (norm > 0) {
+    for (let i = 0; i < dim; i++) values[i] /= norm;
+  }
+  return values;
+}
+
+function benchSparseVector(dimCount, nnz, seed) {
+  const dims = [];
+  let state = BigInt(seed);
+  while (dims.length < nnz) {
+    state = benchSplitmix64(state);
+    const d = Number(state % BigInt(dimCount));
+    if (!dims.includes(d)) dims.push(d);
+  }
+  dims.sort((a, b) => a - b);
+  return dims.map((d, i) => ({ dimension: d, value: 1.0 - i * 0.05 }));
+}
+
 function scenario(
   id,
   name,
@@ -282,7 +321,7 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'crud-upsert-node'));
     const s = runBench(
-      (i) => db.upsertNode(1, `node-${i}`, { idx: i }, 1.0),
+      (i) => db.upsertNode(1, `node-${i}`, { props: { idx: i }, weight: 1.0 }),
       iterCfg.warmup,
       iterCfg.iters,
       true
@@ -310,7 +349,7 @@ try {
       Array.from({ length: iterCfg.warmup + iterCfg.iters + 1 }, (_, i) => ({ typeId: 1, key: `e-${i}` }))
     );
     const s = runBench(
-      (i) => db.upsertEdge(nodeIds[i], nodeIds[i + 1], 1, null, 1.0),
+      (i) => db.upsertEdge(nodeIds[i], nodeIds[i + 1], 1, { weight: 1.0 }),
       iterCfg.warmup,
       iterCfg.iters,
       true
@@ -431,9 +470,9 @@ try {
     const scenarioId = 'S-CRUD-004';
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'crud-upsert-node-fixed'));
-    db.upsertNode(1, 'fixed-node', { idx: 0 }, 1.0);
+    db.upsertNode(1, 'fixed-node', { props: { idx: 0 }, weight: 1.0 });
     const s = runBench(
-      (i) => db.upsertNode(1, 'fixed-node', { idx: i }, 1.0),
+      (i) => db.upsertNode(1, 'fixed-node', { props: { idx: i }, weight: 1.0 }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -461,7 +500,7 @@ try {
     const nodeA = db.upsertNode(1, 'fixed-a');
     const nodeB = db.upsertNode(1, 'fixed-b');
     const s = runBench(
-      () => db.upsertEdge(nodeA, nodeB, 1, null, 1.0),
+      () => db.upsertEdge(nodeA, nodeB, 1, { weight: 1.0 }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -498,7 +537,7 @@ try {
       }))
     );
     const s = runBench(
-      () => db.neighbors(hub, 'outgoing'),
+      () => db.neighbors(hub, { direction: 'outgoing' }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -523,7 +562,7 @@ try {
     const db = OverGraph.open(join(tmpRoot, 'trav-traverse-depth2'));
     const root = buildDepthTwoTraversalGraph(db, cfg);
     const s = runBench(
-      () => db.traverse(root, 2, 2, 'outgoing'),
+      () => db.traverse(root, 2, { minDepth: 2, direction: 'outgoing' }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -554,7 +593,7 @@ try {
     const db = OverGraph.open(join(tmpRoot, 'trav-depth13-memtable'));
     const { root, branching } = buildDeepTraversalGraph(db, cfg);
     const s = runBench(
-      () => db.traverse(root, 1, 3, 'outgoing'),
+      () => db.traverse(root, 3, { direction: 'outgoing' }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -587,7 +626,7 @@ try {
     const { root, branching } = buildDeepTraversalGraph(db, cfg);
     db.flush();
     const s = runBench(
-      () => db.traverse(root, 1, 3, 'outgoing'),
+      () => db.traverse(root, 3, { direction: 'outgoing' }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -619,7 +658,7 @@ try {
     const db = OverGraph.open(join(tmpRoot, 'trav-depth13-filtered-memtable'));
     const { root, branching } = buildDeepTraversalGraph(db, cfg);
     const s = runBench(
-      () => db.traverse(root, 1, 3, 'outgoing', null, [2]),
+      () => db.traverse(root, 3, { direction: 'outgoing', nodeTypeFilter: [2] }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -652,7 +691,7 @@ try {
     const { root, branching } = buildDeepTraversalGraph(db, cfg);
     db.flush();
     const s = runBench(
-      () => db.traverse(root, 1, 3, 'outgoing', null, [2]),
+      () => db.traverse(root, 3, { direction: 'outgoing', nodeTypeFilter: [2] }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -696,7 +735,7 @@ try {
       }))
     );
     const s = runBench(
-      () => db.degree(hub, 'outgoing'),
+      () => db.degree(hub, { direction: 'outgoing' }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -740,7 +779,7 @@ try {
     }
     db.batchUpsertEdges(degEdges);
     const s = runBench(
-      () => db.degrees(hubIds, 'outgoing'),
+      () => db.degrees(hubIds, { direction: 'outgoing' }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -779,7 +818,7 @@ try {
     const spFrom = ids[0];
     const spTo = ids[Math.floor(ids.length / 2)];
     const s = runBench(
-      () => db.shortestPath(spFrom, spTo, 'outgoing'),
+      () => db.shortestPath(spFrom, spTo, { direction: 'outgoing' }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -822,7 +861,7 @@ try {
     const spFrom = ids[0];
     const spTo = ids[Math.floor(ids.length / 2)];
     const s = runBench(
-      () => db.isConnected(spFrom, spTo, 'outgoing'),
+      () => db.isConnected(spFrom, spTo, { direction: 'outgoing' }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -866,7 +905,7 @@ try {
       }))
     );
     const s = runBench(
-      () => db.topKNeighbors(hub, 'outgoing', null, cfg.top_k_limit, 'weight'),
+      () => db.topKNeighbors(hub, cfg.top_k_limit, { direction: 'outgoing', scoring: 'weight' }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -945,10 +984,9 @@ try {
       pprEdges.push({ from, to: to2, typeId: 1, weight: 0.7 });
     }
     db.batchUpsertEdges(pprEdges);
-    const seed = new Float64Array([ids[0]]);
     const s = runBench(
       () =>
-        db.personalizedPagerank(seed, {
+        db.personalizedPagerank([ids[0]], {
           maxIterations: cfg.ppr_max_iterations,
           maxResults: cfg.ppr_max_results,
         }),
@@ -1048,6 +1086,57 @@ try {
         {
           nodes_per_iter: cfg.flush_nodes_per_iter,
           edge_chain_cap: cfg.flush_edges_per_iter_cap,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  // S-VEC-001: hybrid_vector_search
+  {
+    const scenarioId = 'S-VEC-001';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const db = OverGraph.open(join(tmpRoot, 'vec-hybrid'), {
+      denseVector: { dimension: cfg.vector_dim, metric: 'cosine' },
+    });
+
+    const nodes = Array.from({ length: cfg.vector_nodes }, (_, i) => {
+      const seed = 1729 * (i + 1);
+      return {
+        typeId: 1,
+        key: `v-${i}`,
+        denseVector: benchDenseVector(cfg.vector_dim, seed),
+        sparseVector: benchSparseVector(cfg.vector_sparse_dims, cfg.vector_nnz, seed + 0xCAFE),
+      };
+    });
+    db.batchUpsertNodes(nodes);
+    db.flush();
+
+    const querySeed = 0xDEADBEEF;
+    const denseQuery = benchDenseVector(cfg.vector_dim, querySeed);
+    const sparseQuery = benchSparseVector(cfg.vector_sparse_dims, cfg.vector_nnz, querySeed + 0xCAFE);
+
+    const s = runBench(
+      () => db.vectorSearch('hybrid', { k: cfg.vector_k, denseQuery, sparseQuery }),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'hybrid_vector_search',
+        'vector',
+        s,
+        iterCfg,
+        {
+          vector_nodes: cfg.vector_nodes,
+          vector_dim: cfg.vector_dim,
+          vector_nnz: cfg.vector_nnz,
+          vector_sparse_dims: cfg.vector_sparse_dims,
+          vector_k: cfg.vector_k,
+          mode: 'hybrid',
+          fusion_mode: 'weighted_rank',
         },
         scenarioComparability(scenarioContract, scenarioId)
       )

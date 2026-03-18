@@ -153,17 +153,17 @@ class TestFindNodesByTimeRangePaged:
 class TestNeighborsPaged:
     def test_single_page(self, db):
         center, spokes = make_star(db)
-        page = db.neighbors_paged(center, "outgoing")
+        page = db.neighbors_paged(center, direction="outgoing")
         assert len(page.items) == 5
         assert page.next_cursor is None
         assert "NeighborPageResult" in repr(page)
 
     def test_pagination(self, db):
         center, spokes = make_star(db, spokes=10)
-        p1 = db.neighbors_paged(center, "outgoing", limit=3)
+        p1 = db.neighbors_paged(center, direction="outgoing", limit=3)
         assert len(p1.items) == 3
         assert p1.next_cursor is not None
-        p2 = db.neighbors_paged(center, "outgoing", limit=3, after=p1.next_cursor)
+        p2 = db.neighbors_paged(center, direction="outgoing", limit=3, after=p1.next_cursor)
         assert len(p2.items) == 3
         ids1 = {n.node_id for n in p1.items}
         ids2 = {n.node_id for n in p2.items}
@@ -175,7 +175,7 @@ class TestNeighborsPaged:
         n3 = db.upsert_node(1, "c")
         db.upsert_edge(n1, n2, 10)
         db.upsert_edge(n1, n3, 20)
-        page = db.neighbors_paged(n1, "outgoing", type_filter=[10])
+        page = db.neighbors_paged(n1, direction="outgoing", type_filter=[10])
         assert len(page.items) == 1
         assert page.items[0].node_id == n2
 
@@ -183,7 +183,7 @@ class TestNeighborsPaged:
 class TestTraversePaged:
     def test_depth_window(self, db):
         nodes, _ = make_chain(db, 4)
-        page = db.traverse(nodes[0], min_depth=2, max_depth=2, direction="outgoing")
+        page = db.traverse(nodes[0], 2, min_depth=2, direction="outgoing")
         assert [(hit.node_id, hit.depth) for hit in page.items] == [(nodes[2], 2)]
 
     def test_pagination(self, db):
@@ -197,14 +197,14 @@ class TestTraversePaged:
             for j in range(3):
                 leaf = db.upsert_node(1, f"leaf_{m}_{j}")
                 db.upsert_edge(m, leaf, 10)
-        p1 = db.traverse(center, min_depth=2, max_depth=2, direction="outgoing", limit=4)
+        p1 = db.traverse(center, 2, min_depth=2, direction="outgoing", limit=4)
         assert len(p1.items) == 4
         assert p1.next_cursor is not None
         assert p1.next_cursor.depth == 2
         p2 = db.traverse(
             center,
+            2,
             min_depth=2,
-            max_depth=2,
             direction="outgoing",
             limit=4,
             cursor=p1.next_cursor,
@@ -221,8 +221,8 @@ class TestTraversePaged:
         db.upsert_edge(n2, n3, 10)
         page = db.traverse(
             n1,
+            2,
             min_depth=2,
-            max_depth=2,
             direction="outgoing",
             edge_type_filter=[10],
             node_type_filter=[3],

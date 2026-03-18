@@ -87,7 +87,7 @@ try {
 
   {
     const db = OverGraph.open(join(tmpDir, 'single-node'));
-    const s = bench((i) => db.upsertNode(1, `node-${i}`, { idx: i }, 1.0));
+    const s = bench((i) => db.upsertNode(1, `node-${i}`, { props: { idx: i }, weight: 1.0 }));
     printRow('upsert_node', s);
     db.close();
   }
@@ -98,7 +98,7 @@ try {
     for (let i = 0; i < WARMUP_ITERS + BENCH_ITERS + 1; i++) {
       nodeIds.push(db.upsertNode(1, `en-${i}`));
     }
-    const s = bench((i) => db.upsertEdge(nodeIds[i], nodeIds[i + 1], 1, null, 1.0));
+    const s = bench((i) => db.upsertEdge(nodeIds[i], nodeIds[i + 1], 1, { weight: 1.0 }));
     printRow('upsert_edge', s);
     db.close();
   }
@@ -233,9 +233,9 @@ try {
     const hub = db.upsertNode(1, 'hub');
     for (let i = 0; i < 10; i++) {
       const n = db.upsertNode(1, `nbr10-${i}`);
-      db.upsertEdge(hub, n, 1, null, 1.0);
+      db.upsertEdge(hub, n, 1, { weight: 1.0 });
     }
-    const s = bench(() => db.neighbors(hub, 'outgoing'));
+    const s = bench(() => db.neighbors(hub, { direction: 'outgoing' }));
     printRow('neighbors (10 edges)', s);
     db.close();
   }
@@ -245,9 +245,9 @@ try {
     const hub = db.upsertNode(1, 'hub');
     for (let i = 0; i < 100; i++) {
       const n = db.upsertNode(1, `nbr100-${i}`);
-      db.upsertEdge(hub, n, 1, null, 1.0);
+      db.upsertEdge(hub, n, 1, { weight: 1.0 });
     }
-    const s = bench(() => db.neighbors(hub, 'outgoing'));
+    const s = bench(() => db.neighbors(hub, { direction: 'outgoing' }));
     printRow('neighbors (100 edges)', s);
     db.close();
   }
@@ -255,7 +255,7 @@ try {
   {
     const db = OverGraph.open(join(tmpDir, 'find'));
     for (let i = 0; i < 1000; i++) {
-      db.upsertNode(1, `fn-${i}`, { bucket: i < 500 ? 'target' : 'other' });
+      db.upsertNode(1, `fn-${i}`, { props: { bucket: i < 500 ? 'target' : 'other' } });
     }
     const s = bench(() => db.findNodes(1, 'bucket', 'target'));
     printRow('find_nodes (500/1000 match)', s);

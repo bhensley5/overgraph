@@ -32,19 +32,19 @@ describe('neighbors, decay_lambda', () => {
     spoke2 = db.upsertNode(1, 'spoke2');
 
     // spoke1: recent edge (1 hour old)
-    db.upsertEdge(center, spoke1, 10, null, 1.0, recentFrom);
+    db.upsertEdge(center, spoke1, 10, { weight: 1.0, validFrom: recentFrom });
     // spoke2: old edge (100 hours old)
-    db.upsertEdge(center, spoke2, 10, null, 1.0, oldFrom);
+    db.upsertEdge(center, spoke2, 10, { weight: 1.0, validFrom: oldFrom });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns both neighbors with decay_lambda applied', () => {
-    const result = db.neighbors(center, 'outgoing', undefined, 0, now, 0.01);
+    const result = db.neighbors(center, { direction: 'outgoing', atEpoch: now, decayLambda: 0.01 });
     assert.equal(result.length, 2);
   });
 
   it('recent edge has higher adjusted weight than old edge', () => {
-    const result = db.neighbors(center, 'outgoing', undefined, 0, now, 0.01);
+    const result = db.neighbors(center, { direction: 'outgoing', atEpoch: now, decayLambda: 0.01 });
     const arr = result.toArray();
 
     const spoke1Entry = arr.find(e => e.nodeId === spoke1);
@@ -62,7 +62,7 @@ describe('neighbors, decay_lambda', () => {
 
   it('negative decay_lambda throws an error', () => {
     assert.throws(
-      () => db.neighbors(center, 'outgoing', undefined, 0, undefined, -0.5),
+      () => db.neighbors(center, { direction: 'outgoing', decayLambda: -0.5 }),
       /decay/i,
     );
   });
@@ -85,20 +85,20 @@ describe('neighbors, at_epoch temporal filtering', () => {
     c = db.upsertNode(1, 'c');
 
     // A->B valid [1000, 5000)
-    db.upsertEdge(a, b, 10, null, 1.0, 1000, 5000);
+    db.upsertEdge(a, b, 10, { weight: 1.0, validFrom: 1000, validTo: 5000 });
     // A->C valid [3000, 9000)
-    db.upsertEdge(a, c, 10, null, 1.0, 3000, 9000);
+    db.upsertEdge(a, c, 10, { weight: 1.0, validFrom: 3000, validTo: 9000 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('at_epoch=2000 returns only B', () => {
-    const result = db.neighbors(a, 'outgoing', undefined, 0, 2000);
+    const result = db.neighbors(a, { direction: 'outgoing', atEpoch: 2000 });
     assert.equal(result.length, 1);
     assert.equal(result.nodeId(0), b);
   });
 
   it('at_epoch=4000 returns both B and C', () => {
-    const result = db.neighbors(a, 'outgoing', undefined, 0, 4000);
+    const result = db.neighbors(a, { direction: 'outgoing', atEpoch: 4000 });
     assert.equal(result.length, 2);
     const ids = new Set([result.nodeId(0), result.nodeId(1)]);
     assert.ok(ids.has(b));
@@ -106,13 +106,13 @@ describe('neighbors, at_epoch temporal filtering', () => {
   });
 
   it('at_epoch=6000 returns only C (B expired)', () => {
-    const result = db.neighbors(a, 'outgoing', undefined, 0, 6000);
+    const result = db.neighbors(a, { direction: 'outgoing', atEpoch: 6000 });
     assert.equal(result.length, 1);
     assert.equal(result.nodeId(0), c);
   });
 
   it('at_epoch=99999 returns neither (both expired)', () => {
-    const result = db.neighbors(a, 'outgoing', undefined, 0, 99999);
+    const result = db.neighbors(a, { direction: 'outgoing', atEpoch: 99999 });
     assert.equal(result.length, 0);
   });
 });
@@ -131,8 +131,8 @@ describe('prune, maxAgeMs', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('maxAgeMs prunes nodes older than the threshold', async () => {
-    const id1 = db.upsertNode(1, 'age-a', {}, 1.0);
-    const id2 = db.upsertNode(1, 'age-b', {}, 1.0);
+    const id1 = db.upsertNode(1, 'age-a', { weight: 1.0 });
+    const id2 = db.upsertNode(1, 'age-b', { weight: 1.0 });
 
     // Wait so nodes are clearly older than the threshold
     await sleep(50);
@@ -144,8 +144,8 @@ describe('prune, maxAgeMs', () => {
   });
 
   it('maxAgeMs=999999999 keeps everything (nothing is that old)', () => {
-    const id1 = db.upsertNode(1, 'age-c', {}, 1.0);
-    const id2 = db.upsertNode(1, 'age-d', {}, 1.0);
+    const id1 = db.upsertNode(1, 'age-c', { weight: 1.0 });
+    const id2 = db.upsertNode(1, 'age-d', { weight: 1.0 });
 
     const result = db.prune({ maxAgeMs: 999999999 });
     assert.equal(result.nodesPruned, 0);
@@ -169,9 +169,9 @@ describe('prune, combined maxAgeMs AND maxWeight', () => {
 
   it('only prunes nodes matching BOTH criteria', async () => {
     // Low weight node (matches weight criterion)
-    const lowWeight = db.upsertNode(1, 'low-w', {}, 0.1);
+    const lowWeight = db.upsertNode(1, 'low-w', { weight: 0.1 });
     // High weight node (does not match weight criterion)
-    const highWeight = db.upsertNode(1, 'high-w', {}, 0.9);
+    const highWeight = db.upsertNode(1, 'high-w', { weight: 0.9 });
 
     // Wait so nodes are old enough
     await sleep(50);
@@ -187,7 +187,7 @@ describe('prune, combined maxAgeMs AND maxWeight', () => {
   });
 
   it('very large maxAgeMs prevents pruning even when weight matches', () => {
-    const node = db.upsertNode(1, 'combo-safe', {}, 0.1);
+    const node = db.upsertNode(1, 'combo-safe', { weight: 0.1 });
 
     // Weight criterion matches (0.1 <= 0.5), but maxAgeMs is huge so node is too young
     const result = db.prune({ maxAgeMs: 999999999999, maxWeight: 0.5 });
@@ -237,13 +237,13 @@ describe('personalizedPagerank, dampingFactor edge cases', () => {
     a = db.upsertNode(1, 'a');
     b = db.upsertNode(1, 'b');
     c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 1, null, 1.0);
-    db.upsertEdge(b, c, 1, null, 1.0);
+    db.upsertEdge(a, b, 1, { weight: 1.0 });
+    db.upsertEdge(b, c, 1, { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('very low dampingFactor (0.01): seed dominates hugely', () => {
-    const r = db.personalizedPagerank(new Float64Array([a]), {
+    const r = db.personalizedPagerank([a], {
       dampingFactor: 0.01,
       maxIterations: 100,
     });
@@ -262,7 +262,7 @@ describe('personalizedPagerank, dampingFactor edge cases', () => {
   });
 
   it('very high dampingFactor (0.99): rank spreads more evenly', () => {
-    const r = db.personalizedPagerank(new Float64Array([a]), {
+    const r = db.personalizedPagerank([a], {
       dampingFactor: 0.99,
       maxIterations: 200,
     });
@@ -281,11 +281,11 @@ describe('personalizedPagerank, dampingFactor edge cases', () => {
   });
 
   it('relative distribution changes with damping factor', () => {
-    const rLow = db.personalizedPagerank(new Float64Array([a]), {
+    const rLow = db.personalizedPagerank([a], {
       dampingFactor: 0.01,
       maxIterations: 100,
     });
-    const rHigh = db.personalizedPagerank(new Float64Array([a]), {
+    const rHigh = db.personalizedPagerank([a], {
       dampingFactor: 0.99,
       maxIterations: 200,
     });
@@ -356,24 +356,24 @@ describe('self-loops', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-selfloop-'));
     db = freshDb(tmpDir, 'selfloop');
     a = db.upsertNode(1, 'self');
-    db.upsertEdge(a, a, 10, null, 1.0);
+    db.upsertEdge(a, a, 10, { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('outgoing neighbors include self-loop', () => {
-    const result = db.neighbors(a, 'outgoing');
+    const result = db.neighbors(a, { direction: 'outgoing' });
     assert.equal(result.length, 1);
     assert.equal(result.nodeId(0), a);
   });
 
   it('incoming neighbors include self-loop', () => {
-    const result = db.neighbors(a, 'incoming');
+    const result = db.neighbors(a, { direction: 'incoming' });
     assert.equal(result.length, 1);
     assert.equal(result.nodeId(0), a);
   });
 
   it('direction=both does not duplicate self-loop', () => {
-    const result = db.neighbors(a, 'both');
+    const result = db.neighbors(a, { direction: 'both' });
     // A self-loop should appear exactly once, not twice
     assert.equal(result.length, 1, `expected 1 neighbor for self-loop with 'both', got ${result.length}`);
     assert.equal(result.nodeId(0), a);
@@ -396,7 +396,7 @@ describe('concurrent async stress', () => {
   it('50 parallel upsertNodeAsync calls all succeed', async () => {
     const promises = [];
     for (let i = 0; i < 50; i++) {
-      promises.push(db.upsertNodeAsync(1, `stress-${i}`, { idx: i }));
+      promises.push(db.upsertNodeAsync(1, `stress-${i}`, { props: { idx: i } }));
     }
     const ids = await Promise.all(promises);
 

@@ -45,7 +45,7 @@ describe('neighborsBatch (sync)', () => {
   });
 
   it('respects direction parameter', () => {
-    const results = db.neighborsBatch([n2], 'incoming');
+    const results = db.neighborsBatch([n2], { direction: 'incoming' });
     assert.equal(results.length, 1);
     assert.equal(results[0].queryNodeId, n2);
     // n2 has 1 incoming neighbor (n1)
@@ -54,7 +54,7 @@ describe('neighborsBatch (sync)', () => {
   });
 
   it('respects type filter', () => {
-    const results = db.neighborsBatch([n1], 'outgoing', [10]);
+    const results = db.neighborsBatch([n1], { direction: 'outgoing', typeFilter: [10] });
     assert.equal(results.length, 1);
     // n1 has 1 outgoing edge of type 10 (to n2)
     assert.equal(results[0].neighbors.length, 1);
@@ -75,9 +75,9 @@ describe('neighborsBatch (sync)', () => {
   });
 
   it('matches individual neighbors calls', () => {
-    const batchResults = db.neighborsBatch([n1, n2], 'outgoing');
-    const n1Individual = db.neighbors(n1, 'outgoing');
-    const n2Individual = db.neighbors(n2, 'outgoing');
+    const batchResults = db.neighborsBatch([n1, n2], { direction: 'outgoing' });
+    const n1Individual = db.neighbors(n1, { direction: 'outgoing' });
+    const n2Individual = db.neighbors(n2, { direction: 'outgoing' });
 
     const batchN1 = batchResults.find(r => r.queryNodeId === n1);
     const batchN2 = batchResults.find(r => r.queryNodeId === n2);
@@ -103,18 +103,18 @@ describe('neighborsBatch, temporal (at_epoch)', () => {
     n1 = db.upsertNode(1, 'a');
     n2 = db.upsertNode(1, 'b');
     // Edge valid from 1000 to 2000
-    db.upsertEdge(n1, n2, 10, undefined, 1.0, 1000, 2000);
+    db.upsertEdge(n1, n2, 10, { weight: 1.0, validFrom: 1000, validTo: 2000 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns edge within valid window', () => {
-    const results = db.neighborsBatch([n1], 'outgoing', undefined, 1500);
+    const results = db.neighborsBatch([n1], { direction: 'outgoing', atEpoch: 1500 });
     assert.equal(results.length, 1);
     assert.equal(results[0].neighbors.length, 1);
   });
 
   it('excludes edge outside valid window', () => {
-    const results = db.neighborsBatch([n1], 'outgoing', undefined, 3000);
+    const results = db.neighborsBatch([n1], { direction: 'outgoing', atEpoch: 3000 });
     assert.ok(results.length === 0 || results[0].neighbors.length === 0);
   });
 });

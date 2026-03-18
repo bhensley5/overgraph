@@ -1,6 +1,7 @@
-use overgraph::{DatabaseEngine, DbOptions, PrunePolicy, WalSyncMode};
+use overgraph::{
+    DatabaseEngine, DbOptions, PrunePolicy, UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
+};
 use serde_json;
-use std::collections::BTreeMap;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -34,7 +35,7 @@ fn test_inspect_empty_db() {
     assert!(stdout.contains("OverGraph Database:"));
     assert!(stdout.contains("Version:       1"));
     assert!(stdout.contains("Segments: 0"));
-    assert!(stdout.contains("WAL: data.wal"));
+    assert!(stdout.contains("WAL: 1 generation(s)"));
 }
 
 #[test]
@@ -50,12 +51,16 @@ fn test_inspect_with_data() {
     let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..10 {
-        db.upsert_node(1, &format!("node_{}", i), BTreeMap::new(), 1.0)
+        db.upsert_node(1, &format!("node_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
-    let n1 = db.upsert_node(2, "a", BTreeMap::new(), 1.0).unwrap();
-    let n2 = db.upsert_node(2, "b", BTreeMap::new(), 1.0).unwrap();
-    db.upsert_edge(n1, n2, 1, BTreeMap::new(), 1.0, None, None)
+    let n1 = db
+        .upsert_node(2, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let n2 = db
+        .upsert_node(2, "b", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(n1, n2, 1, UpsertEdgeOptions::default())
         .unwrap();
 
     db.flush().unwrap();
@@ -94,13 +99,13 @@ fn test_inspect_multiple_segments() {
     let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..5 {
-        db.upsert_node(1, &format!("batch1_{}", i), BTreeMap::new(), 1.0)
+        db.upsert_node(1, &format!("batch1_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.flush().unwrap();
 
     for i in 0..3 {
-        db.upsert_node(1, &format!("batch2_{}", i), BTreeMap::new(), 1.0)
+        db.upsert_node(1, &format!("batch2_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.flush().unwrap();
@@ -171,7 +176,7 @@ fn test_inspect_json_with_data() {
     let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..5 {
-        db.upsert_node(1, &format!("node_{}", i), BTreeMap::new(), 1.0)
+        db.upsert_node(1, &format!("node_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.flush().unwrap();

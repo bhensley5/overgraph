@@ -1,26 +1,38 @@
 // Write operations: upsert, delete, batch, patch, prune.
-// This file is include!()'d into mod.rs — all items share the engine module scope.
+// This file is include!()'d into mod.rs. All items share the engine module scope.
 
 impl DatabaseEngine {
     // --- High-level graph APIs ---
 
     /// Upsert a node. If a node with the same (type_id, key) exists, updates it.
     /// Otherwise allocates a new ID. Returns the node ID.
+    ///
+    /// ```no_run
+    /// # use overgraph::*;
+    /// # use std::path::Path;
+    /// # let mut db = DatabaseEngine::open(Path::new("./db"), &DbOptions::default()).unwrap();
+    /// let id = db.upsert_node(1, "user:alice", UpsertNodeOptions::default()).unwrap();
+    /// ```
     pub fn upsert_node(
         &mut self,
         type_id: u32,
         key: &str,
-        props: BTreeMap<String, PropValue>,
-        weight: f32,
+        options: UpsertNodeOptions,
     ) -> Result<u64, EngineError> {
         self.maybe_backpressure_flush()?;
         let now = now_millis();
+        let (dense_vector, sparse_vector) = normalize_owned_node_vectors_for_write(
+            self.manifest.dense_vector.as_ref(),
+            options.dense_vector,
+            options.sparse_vector,
+        )?;
 
         let (id, created_at) = match self.find_existing_node(type_id, key)? {
             Some((id, created_at)) => (id, created_at),
             None => {
                 let id = self.next_node_id;
                 self.next_node_id += 1;
+                self.update_next_node_id_seen();
                 (id, now)
             }
         };
@@ -29,14 +41,17 @@ impl DatabaseEngine {
             id,
             type_id,
             key: key.to_string(),
-            props,
+            props: options.props,
             created_at,
             updated_at: now,
-            weight,
+            weight: options.weight,
+            dense_vector,
+            sparse_vector,
+            last_write_seq: 0,
         };
 
         let op = WalOp::UpsertNode(node);
-        self.append_and_apply_one(&op)?;
+        self.append_and_apply_one_normalized(&op)?;
         self.maybe_auto_flush()?;
         Ok(id)
     }
@@ -44,16 +59,19 @@ impl DatabaseEngine {
     /// Upsert an edge. If edge_uniqueness is enabled and an edge with the same
     /// (from, to, type_id) exists, updates it. Otherwise allocates a new ID.
     /// Returns the edge ID.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// ```no_run
+    /// # use overgraph::*;
+    /// # use std::path::Path;
+    /// # let mut db = DatabaseEngine::open(Path::new("./db"), &DbOptions::default()).unwrap();
+    /// let eid = db.upsert_edge(1, 2, 1, UpsertEdgeOptions::default()).unwrap();
+    /// ```
     pub fn upsert_edge(
         &mut self,
         from: u64,
         to: u64,
         type_id: u32,
-        props: BTreeMap<String, PropValue>,
-        weight: f32,
-        valid_from: Option<i64>,
-        valid_to: Option<i64>,
+        options: UpsertEdgeOptions,
     ) -> Result<u64, EngineError> {
         self.maybe_backpressure_flush()?;
         let now = now_millis();
@@ -64,12 +82,14 @@ impl DatabaseEngine {
                 None => {
                     let id = self.next_edge_id;
                     self.next_edge_id += 1;
+                    self.update_next_edge_id_seen();
                     (id, now)
                 }
             }
         } else {
             let id = self.next_edge_id;
             self.next_edge_id += 1;
+            self.update_next_edge_id_seen();
             (id, now)
         };
 
@@ -78,16 +98,17 @@ impl DatabaseEngine {
             from,
             to,
             type_id,
-            props,
+            props: options.props,
             created_at,
             updated_at: now,
-            weight,
-            valid_from: valid_from.unwrap_or(created_at),
-            valid_to: valid_to.unwrap_or(i64::MAX),
+            weight: options.weight,
+            valid_from: options.valid_from.unwrap_or(created_at),
+            valid_to: options.valid_to.unwrap_or(i64::MAX),
+            last_write_seq: 0,
         };
 
         let op = WalOp::UpsertEdge(edge);
-        self.append_and_apply_one(&op)?;
+        self.append_and_apply_one_normalized(&op)?;
         self.maybe_auto_flush()?;
         Ok(id)
     }
@@ -103,6 +124,11 @@ impl DatabaseEngine {
         let mut batch_keys: HashMap<(u32, String), (u64, i64)> = HashMap::new();
 
         for input in inputs {
+            let (dense_vector, sparse_vector) = normalize_node_vectors_for_write(
+                self.manifest.dense_vector.as_ref(),
+                input.dense_vector.as_ref(),
+                input.sparse_vector.as_ref(),
+            )?;
             let key_tuple = (input.type_id, input.key.clone());
 
             let (id, created_at) = if let Some(&(id, created_at)) = batch_keys.get(&key_tuple) {
@@ -115,6 +141,7 @@ impl DatabaseEngine {
             } else {
                 let id = self.next_node_id;
                 self.next_node_id += 1;
+                self.update_next_node_id_seen();
                 (id, now)
             };
 
@@ -128,11 +155,14 @@ impl DatabaseEngine {
                 created_at,
                 updated_at: now,
                 weight: input.weight,
+                dense_vector,
+                sparse_vector,
+                last_write_seq: 0,
             }));
             ids.push(id);
         }
 
-        self.append_and_apply(&ops)?;
+        self.append_and_apply_normalized(&ops)?;
 
         self.maybe_auto_flush()?;
         Ok(ids)
@@ -160,11 +190,13 @@ impl DatabaseEngine {
                 } else {
                     let id = self.next_edge_id;
                     self.next_edge_id += 1;
+                    self.update_next_edge_id_seen();
                     (id, now)
                 }
             } else {
                 let id = self.next_edge_id;
                 self.next_edge_id += 1;
+                self.update_next_edge_id_seen();
                 (id, now)
             };
 
@@ -183,11 +215,12 @@ impl DatabaseEngine {
                 weight: input.weight,
                 valid_from: input.valid_from.unwrap_or(created_at),
                 valid_to: input.valid_to.unwrap_or(i64::MAX),
+                last_write_seq: 0,
             }));
             ids.push(id);
         }
 
-        self.append_and_apply(&ops)?;
+        self.append_and_apply_normalized(&ops)?;
 
         self.maybe_auto_flush()?;
         Ok(ids)
@@ -216,7 +249,7 @@ impl DatabaseEngine {
             deleted_at: now,
         });
 
-        self.append_and_apply(&ops)?;
+        self.append_and_apply_normalized(&ops)?;
         self.maybe_auto_flush()?;
         Ok(())
     }
@@ -229,7 +262,7 @@ impl DatabaseEngine {
             id,
             deleted_at: now_millis(),
         };
-        self.append_and_apply_one(&op)?;
+        self.append_and_apply_one_normalized(&op)?;
         self.maybe_auto_flush()?;
         Ok(())
     }
@@ -257,7 +290,7 @@ impl DatabaseEngine {
         };
 
         let op = WalOp::UpsertEdge(updated.clone());
-        self.append_and_apply_one(&op)?;
+        self.append_and_apply_one_normalized(&op)?;
         self.maybe_auto_flush()?;
         Ok(Some(updated))
     }
@@ -278,6 +311,11 @@ impl DatabaseEngine {
         let mut batch_keys: HashMap<(u32, String), (u64, i64)> = HashMap::new();
 
         for input in &patch.upsert_nodes {
+            let (dense_vector, sparse_vector) = normalize_node_vectors_for_write(
+                self.manifest.dense_vector.as_ref(),
+                input.dense_vector.as_ref(),
+                input.sparse_vector.as_ref(),
+            )?;
             let key_tuple = (input.type_id, input.key.clone());
             let (id, created_at) = if let Some(&(id, created_at)) = batch_keys.get(&key_tuple) {
                 (id, created_at)
@@ -288,6 +326,7 @@ impl DatabaseEngine {
             } else {
                 let id = self.next_node_id;
                 self.next_node_id += 1;
+                self.update_next_node_id_seen();
                 (id, now)
             };
             batch_keys.insert(key_tuple, (id, created_at));
@@ -299,6 +338,9 @@ impl DatabaseEngine {
                 created_at,
                 updated_at: now,
                 weight: input.weight,
+                dense_vector,
+                sparse_vector,
+                last_write_seq: 0,
             }));
             node_ids.push(id);
         }
@@ -319,11 +361,13 @@ impl DatabaseEngine {
                 } else {
                     let id = self.next_edge_id;
                     self.next_edge_id += 1;
+                    self.update_next_edge_id_seen();
                     (id, now)
                 }
             } else {
                 let id = self.next_edge_id;
                 self.next_edge_id += 1;
+                self.update_next_edge_id_seen();
                 (id, now)
             };
             if self.edge_uniqueness {
@@ -340,6 +384,7 @@ impl DatabaseEngine {
                 weight: input.weight,
                 valid_from: input.valid_from.unwrap_or(created_at),
                 valid_to: input.valid_to.unwrap_or(i64::MAX),
+                last_write_seq: 0,
             }));
             edge_ids.push(id);
         }
@@ -392,7 +437,7 @@ impl DatabaseEngine {
         }
 
         // --- Single WAL batch ---
-        self.append_and_apply(&ops)?;
+        self.append_and_apply_normalized(&ops)?;
         self.maybe_auto_flush()?;
 
         Ok(PatchResult { node_ids, edge_ids })
@@ -407,10 +452,9 @@ impl DatabaseEngine {
     pub fn prune(&mut self, policy: &PrunePolicy) -> Result<PruneResult, EngineError> {
         // Require at least one substantive filter
         if policy.max_age_ms.is_none() && policy.max_weight.is_none() {
-            return Ok(PruneResult {
-                nodes_pruned: 0,
-                edges_pruned: 0,
-            });
+            return Err(EngineError::InvalidOperation(
+                "Prune policy must set at least max_age_ms or max_weight".to_string(),
+            ));
         }
 
         // Reject nonsensical negative age threshold
@@ -438,7 +482,7 @@ impl DatabaseEngine {
         // Build WAL ops: cascade-delete incident edges, then delete nodes.
         // Dedup edge deletes in case two pruned nodes share an edge.
         let mut ops = Vec::new();
-        let mut edges_seen = HashSet::new();
+        let mut edges_seen = NodeIdSet::default();
         let prune_tombstones = self.collect_tombstones();
 
         for &nid in &targets {
@@ -468,7 +512,7 @@ impl DatabaseEngine {
         let nodes_pruned = targets.len() as u64;
         let edges_pruned = edges_seen.len() as u64;
 
-        self.append_and_apply(&ops)?;
+        self.append_and_apply_normalized(&ops)?;
         self.maybe_auto_flush()?;
 
         Ok(PruneResult {
@@ -502,21 +546,37 @@ impl DatabaseEngine {
                 .collect();
             Ok(targets)
         } else {
-            // Scan all nodes: memtable first, then segments (newest-first), dedup by ID
-            let mut deleted: HashSet<u64> = self.memtable.deleted_nodes().keys().copied().collect();
+            // Scan all nodes: active memtable first, then immutable memtables
+            // (newest-first), then segments (newest-first), dedup by ID.
+            // Flat tombstone set is safe here: monotonic ID allocation guarantees
+            // tombstoned IDs are never re-upserted, so source precedence doesn't matter.
+            let mut deleted: NodeIdSet = self.memtable.deleted_nodes().keys().copied().collect();
+            for epoch in &self.immutable_epochs {
+                deleted.extend(epoch.memtable.deleted_nodes().keys().copied());
+            }
             for seg in &self.segments {
                 deleted.extend(seg.deleted_node_ids());
             }
 
-            let mut seen = HashSet::new();
+            let mut seen = NodeIdSet::default();
             let mut targets = Vec::new();
 
-            // Memtable nodes (freshest)
+            // Active memtable nodes (freshest)
             for node in self.memtable.nodes().values() {
                 if !deleted.contains(&node.id) && seen.insert(node.id)
                     && Self::matches_prune_criteria(node, age_cutoff, policy.max_weight) {
                         targets.push(node.id);
                     }
+            }
+
+            // Immutable memtable nodes (newest-first)
+            for epoch in &self.immutable_epochs {
+                for node in epoch.memtable.nodes().values() {
+                    if !deleted.contains(&node.id) && seen.insert(node.id)
+                        && Self::matches_prune_criteria(node, age_cutoff, policy.max_weight) {
+                            targets.push(node.id);
+                        }
+                }
             }
 
             // Segment nodes (newest segments first, skip already-seen)
@@ -578,19 +638,20 @@ impl DatabaseEngine {
                 ));
             }
         }
-        self.manifest
-            .prune_policies
-            .insert(name.to_string(), policy);
-        write_manifest(&self.db_dir, &self.manifest)?;
+        let name = name.to_string();
+        self.with_runtime_manifest_write(|manifest| {
+            manifest.prune_policies.insert(name, policy);
+            Ok(())
+        })?;
         Ok(())
     }
 
     /// Remove a named prune policy. Returns true if it existed.
     pub fn remove_prune_policy(&mut self, name: &str) -> Result<bool, EngineError> {
-        let removed = self.manifest.prune_policies.remove(name).is_some();
-        if removed {
-            write_manifest(&self.db_dir, &self.manifest)?;
-        }
+        let name = name.to_string();
+        let removed = self.with_runtime_manifest_write(|manifest| {
+            Ok(manifest.prune_policies.remove(&name).is_some())
+        })?;
         Ok(removed)
     }
 

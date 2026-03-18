@@ -142,6 +142,16 @@ class TestAsyncBatch:
         assert edges[0].from_id == n1
 
     @pytest.mark.asyncio
+    async def test_get_nodes_by_keys(self, async_db):
+        await async_db.upsert_node(1, "alice")
+        await async_db.upsert_node(1, "bob")
+        results = await async_db.get_nodes_by_keys([(1, "alice"), (1, "bob"), (1, "missing")])
+        assert len(results) == 3
+        assert results[0].key == "alice"
+        assert results[1].key == "bob"
+        assert results[2] is None
+
+    @pytest.mark.asyncio
     async def test_graph_patch(self, async_db):
         result = await async_db.graph_patch({
             "upsert_nodes": [
@@ -173,7 +183,7 @@ class TestAsyncTraversal:
         n1 = await async_db.upsert_node(1, "a")
         n2 = await async_db.upsert_node(1, "b")
         await async_db.upsert_edge(n1, n2, 10)
-        nbrs = await async_db.neighbors(n1, "outgoing")
+        nbrs = await async_db.neighbors(n1, direction="outgoing")
         assert len(nbrs) == 1
         assert nbrs[0].node_id == n2
 
@@ -256,7 +266,7 @@ class TestAsyncPagination:
         for i in range(5):
             s = await async_db.upsert_node(1, f"s{i}")
             await async_db.upsert_edge(center, s, 10)
-        page = await async_db.neighbors_paged(center, "outgoing", limit=3)
+        page = await async_db.neighbors_paged(center, direction="outgoing", limit=3)
         assert len(page.items) == 3
 
 
@@ -268,7 +278,7 @@ class TestAsyncTraversal2:
         n3 = await async_db.upsert_node(1, "c")
         await async_db.upsert_edge(n1, n2, 10)
         await async_db.upsert_edge(n2, n3, 10)
-        page = await async_db.traverse(n1, min_depth=2, max_depth=2, direction="outgoing")
+        page = await async_db.traverse(n1, 2, min_depth=2, direction="outgoing")
         assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
 
     @pytest.mark.asyncio
@@ -280,8 +290,8 @@ class TestAsyncTraversal2:
         await async_db.upsert_edge(n2, n3, 10)
         page = await async_db.traverse(
             n1,
+            2,
             min_depth=2,
-            max_depth=2,
             direction="outgoing",
             edge_type_filter=[10],
             node_type_filter=[3],
@@ -404,7 +414,7 @@ class TestAsyncPagination2:
         n3 = await async_db.upsert_node(1, "c")
         await async_db.upsert_edge(n1, n2, 10)
         await async_db.upsert_edge(n2, n3, 10)
-        page = await async_db.traverse(n1, min_depth=2, max_depth=2, direction="outgoing")
+        page = await async_db.traverse(n1, 2, min_depth=2, direction="outgoing")
         assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
 
     @pytest.mark.asyncio
@@ -416,13 +426,13 @@ class TestAsyncPagination2:
         await async_db.upsert_edge(n1, n2, 10)
         await async_db.upsert_edge(n2, n3, 10)
         await async_db.upsert_edge(n2, n4, 10)
-        p1 = await async_db.traverse(n1, min_depth=2, max_depth=2, direction="outgoing", limit=1)
+        p1 = await async_db.traverse(n1, 2, min_depth=2, direction="outgoing", limit=1)
         assert len(p1.items) == 1
         assert p1.next_cursor is not None
         p2 = await async_db.traverse(
             n1,
+            2,
             min_depth=2,
-            max_depth=2,
             direction="outgoing",
             limit=1,
             cursor=p1.next_cursor,

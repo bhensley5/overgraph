@@ -1,12 +1,25 @@
+use crate::dense_hnsw::{
+    dense_score_from_bytes, load_dense_hnsw_query_points, search_dense_hnsw_scoped_with_points,
+    search_dense_hnsw_with_points, validate_dense_hnsw_files, DenseHnswHeader, DenseQueryPoint,
+    DENSE_HNSW_GRAPH_FILENAME, DENSE_HNSW_META_FILENAME,
+};
 use crate::error::EngineError;
-use crate::segment_writer::{SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
+use crate::segment_writer::{
+    NODE_DENSE_VECTOR_BLOB_FILENAME, NODE_SPARSE_VECTOR_BLOB_FILENAME, NODE_VECTOR_META_ENTRY_SIZE,
+    NODE_VECTOR_META_FILENAME, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC,
+};
+use crate::sparse_postings::{
+    read_sparse_posting_groups, validate_sparse_posting_files, SPARSE_POSTINGS_FILENAME,
+    SPARSE_POSTING_INDEX_FILENAME,
+};
 use crate::types::*;
 use memmap2::Mmap;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::ops::ControlFlow;
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Segment file data, either mmap'd or an empty placeholder.
 /// Segment data files (e.g. adj_out.dat) can be 0 bytes when empty.
@@ -43,6 +56,16 @@ fn read_u16_at(data: &[u8], offset: usize) -> Result<u16, EngineError> {
     Ok(u16::from_le_bytes(slice.try_into().unwrap()))
 }
 
+fn read_u8_at(data: &[u8], offset: usize) -> Result<u8, EngineError> {
+    data.get(offset).copied().ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "u8 read at offset {} exceeds data length {}",
+            offset,
+            data.len()
+        ))
+    })
+}
+
 fn read_u32_at(data: &[u8], offset: usize) -> Result<u32, EngineError> {
     let end = offset
         .checked_add(4)
@@ -71,6 +94,20 @@ fn read_u64_at(data: &[u8], offset: usize) -> Result<u64, EngineError> {
     })?;
     // unwrap safe: slice is exactly 8 bytes, guaranteed by get() above
     Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn collect_node_ids(nodes_data: &[u8]) -> Result<Vec<u64>, EngineError> {
+    if nodes_data.len() < 8 {
+        return Ok(Vec::new());
+    }
+    let count = read_u64_at(nodes_data, 0)? as usize;
+    let mut ids = Vec::with_capacity(count);
+    let idx_start = 8;
+    for index in 0..count {
+        let entry_off = idx_start + index * NODE_INDEX_ENTRY_SIZE;
+        ids.push(read_u64_at(nodes_data, entry_off)?);
+    }
+    Ok(ids)
 }
 
 fn read_i64_at(data: &[u8], offset: usize) -> Result<i64, EngineError> {
@@ -157,7 +194,7 @@ const NODE_INDEX_ENTRY_SIZE: usize = 16; // node_id (8) + offset (8)
 const EDGE_INDEX_ENTRY_SIZE: usize = 16; // edge_id (8) + offset (8)
 const ADJ_INDEX_ENTRY_SIZE: usize = 24; // node_id (8) + type_id (4) + offset (8) + count (4)
                                         // ADJ_POSTING_SIZE removed. Postings are now variable-length (delta + varint encoded)
-const TOMBSTONE_ENTRY_SIZE: usize = 17; // kind (1) + id (8) + deleted_at (8)
+const TOMBSTONE_ENTRY_SIZE: usize = 25; // kind (1) + id (8) + deleted_at (8) + last_write_seq (8)
 const TYPE_INDEX_ENTRY_SIZE: usize = 16; // type_id (4) + offset (8) + count (4)
 const PROP_INDEX_ENTRY_SIZE: usize = 32; // type_id (4) + key_hash (8) + value_hash (8) + offset (8) + count (4)
 const EDGE_TRIPLE_ENTRY_SIZE: usize = 28; // from (8) + to (8) + type_id (4) + edge_id (8)
@@ -272,14 +309,101 @@ fn choose_batch_read_strategy(
     }
 }
 
+/// Lower bound for the key index (variable-length entries addressed via offset
+/// table). Returns the first entry index where `(type_id, key) >= (target_type,
+/// target_key)`, in [0, count].
+fn lower_bound_key_index(
+    data: &[u8],
+    offset_table_start: usize,
+    count: usize,
+    target_type: u32,
+    target_key: &str,
+) -> Result<usize, EngineError> {
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let entry_offset = read_u64_at(data, offset_table_start + mid * 8)? as usize;
+        let entry_type = read_u32_at(data, entry_offset)?;
+        let key_len = read_u16_at(data, entry_offset + 12)? as usize;
+        let key_bytes = read_bytes_at(data, entry_offset + 14, key_len)?;
+        let entry_key = std::str::from_utf8(key_bytes).map_err(|_| {
+            EngineError::CorruptRecord(format!(
+                "invalid UTF-8 in key index at offset {}",
+                entry_offset + 14
+            ))
+        })?;
+        if (entry_type, entry_key) < (target_type, target_key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// Upper bound for the key index. Returns the first entry index where
+/// `(type_id, key) > (target_type, target_key)`, in [0, count].
+fn upper_bound_key_index(
+    data: &[u8],
+    offset_table_start: usize,
+    count: usize,
+    target_type: u32,
+    target_key: &str,
+) -> Result<usize, EngineError> {
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let entry_offset = read_u64_at(data, offset_table_start + mid * 8)? as usize;
+        let entry_type = read_u32_at(data, entry_offset)?;
+        let key_len = read_u16_at(data, entry_offset + 12)? as usize;
+        let key_bytes = read_bytes_at(data, entry_offset + 14, key_len)?;
+        let entry_key = std::str::from_utf8(key_bytes).map_err(|_| {
+            EngineError::CorruptRecord(format!(
+                "invalid UTF-8 in key index at offset {}",
+                entry_offset + 14
+            ))
+        })?;
+        if (entry_type, entry_key) <= (target_type, target_key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
 /// An mmap-backed reader for an immutable segment directory.
 ///
 /// Provides O(log N) lookups by ID for nodes and edges, adjacency queries
 /// from pre-built indexes, key-based lookups, and tombstone checks.
-/// Size of a node metadata entry in node_meta.dat (52 bytes).
-const NODE_META_ENTRY_SIZE: usize = 52;
-/// Size of an edge metadata entry in edge_meta.dat (72 bytes).
-const EDGE_META_ENTRY_SIZE: usize = 72;
+/// Size of a node metadata entry in node_meta.dat (60 bytes, v9).
+const NODE_META_ENTRY_SIZE: usize = 60;
+/// Size of an edge metadata entry in edge_meta.dat (80 bytes, v9).
+const EDGE_META_ENTRY_SIZE: usize = 80;
+const NODE_VECTOR_FLAG_DENSE: u8 = 0b0000_0001;
+const NODE_VECTOR_FLAG_SPARSE: u8 = 0b0000_0010;
+const DENSE_VECTOR_VALUE_SIZE: usize = 4;
+const SPARSE_VECTOR_ENTRY_SIZE: usize = 8;
+
+#[derive(Clone, Copy)]
+struct DenseScoringMeta {
+    type_id: u32,
+    updated_at: i64,
+    weight: f32,
+    dense_offset: usize,
+    dense_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SparseScoringMeta {
+    type_id: u32,
+    updated_at: i64,
+    weight: f32,
+    sparse_offset: usize,
+    sparse_len: usize,
+}
 
 pub struct SegmentReader {
     pub segment_id: u64,
@@ -300,10 +424,20 @@ pub struct SegmentReader {
     node_meta_mmap: MappedData,
     edge_meta_mmap: MappedData,
     node_prop_hashes_mmap: MappedData,
+    node_vector_meta_mmap: MappedData,
+    node_dense_vectors_mmap: MappedData,
+    node_sparse_vectors_mmap: MappedData,
+    dense_hnsw_meta_mmap: MappedData,
+    dense_hnsw_graph_mmap: MappedData,
+    dense_hnsw_header: Option<DenseHnswHeader>,
+    dense_hnsw_points: Vec<DenseQueryPoint>,
+    sparse_posting_index_mmap: MappedData,
+    sparse_postings_mmap: MappedData,
     // Timestamp range index
     timestamp_index_mmap: MappedData,
-    deleted_nodes: HashSet<u64>,
-    deleted_edges: HashSet<u64>,
+    deleted_nodes: NodeIdMap<TombstoneEntry>,
+    deleted_edges: NodeIdMap<TombstoneEntry>,
+    node_ids: OnceLock<Box<[u64]>>,
     node_count: u64,
     edge_count: u64,
 }
@@ -311,8 +445,19 @@ pub struct SegmentReader {
 impl SegmentReader {
     /// Open a segment directory and mmap all files.
     /// Validates the format version file.
-    pub fn open(seg_dir: &Path, segment_id: u64) -> Result<Self, EngineError> {
+    pub fn open(
+        seg_dir: &Path,
+        segment_id: u64,
+        dense_config: Option<&DenseVectorConfig>,
+    ) -> Result<Self, EngineError> {
         let format_version = read_format_version(seg_dir)?;
+        let vector_meta_path = seg_dir.join(NODE_VECTOR_META_FILENAME);
+        let dense_blob_path = seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME);
+        let sparse_blob_path = seg_dir.join(NODE_SPARSE_VECTOR_BLOB_FILENAME);
+        let dense_hnsw_meta_path = seg_dir.join(DENSE_HNSW_META_FILENAME);
+        let dense_hnsw_graph_path = seg_dir.join(DENSE_HNSW_GRAPH_FILENAME);
+        let sparse_posting_index_path = seg_dir.join(SPARSE_POSTING_INDEX_FILENAME);
+        let sparse_postings_path = seg_dir.join(SPARSE_POSTINGS_FILENAME);
         let nodes_mmap = mmap_file(&seg_dir.join("nodes.dat"))?;
         let edges_mmap = mmap_file(&seg_dir.join("edges.dat"))?;
         let adj_out_idx = mmap_file(&seg_dir.join("adj_out.idx"))?;
@@ -328,6 +473,13 @@ impl SegmentReader {
         let node_meta_mmap = mmap_file(&seg_dir.join("node_meta.dat"))?;
         let edge_meta_mmap = mmap_file(&seg_dir.join("edge_meta.dat"))?;
         let node_prop_hashes_mmap = mmap_file_optional(&seg_dir.join("node_prop_hashes.dat"))?;
+        let node_vector_meta_mmap = mmap_file_optional(&vector_meta_path)?;
+        let node_dense_vectors_mmap = mmap_file_optional(&dense_blob_path)?;
+        let node_sparse_vectors_mmap = mmap_file_optional(&sparse_blob_path)?;
+        let dense_hnsw_meta_mmap = mmap_file_optional(&dense_hnsw_meta_path)?;
+        let dense_hnsw_graph_mmap = mmap_file_optional(&dense_hnsw_graph_path)?;
+        let sparse_posting_index_mmap = mmap_file_optional(&sparse_posting_index_path)?;
+        let sparse_postings_mmap = mmap_file_optional(&sparse_postings_path)?;
         let timestamp_index_mmap = mmap_file(&seg_dir.join("timestamp_index.dat"))?;
 
         let (deleted_nodes, deleted_edges) = load_tombstones(&seg_dir.join("tombstones.dat"))?;
@@ -342,6 +494,78 @@ impl SegmentReader {
         } else {
             0
         };
+        let node_meta_count = if node_meta_mmap.len() >= 8 {
+            read_u64_at(&node_meta_mmap, 0)?
+        } else {
+            0
+        };
+
+        if format_version < 6
+            && (!node_vector_meta_mmap.is_empty()
+                || !node_dense_vectors_mmap.is_empty()
+                || !node_sparse_vectors_mmap.is_empty())
+        {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} has unexpected vector sidecars for format version {}",
+                segment_id, format_version
+            )));
+        }
+        if format_version < 7
+            && (!dense_hnsw_meta_mmap.is_empty() || !dense_hnsw_graph_mmap.is_empty())
+        {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} has unexpected dense HNSW files for format version {}",
+                segment_id, format_version
+            )));
+        }
+        if format_version < 8
+            && (!sparse_posting_index_mmap.is_empty() || !sparse_postings_mmap.is_empty())
+        {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} has unexpected sparse posting files for format version {}",
+                segment_id, format_version
+            )));
+        }
+
+        let vector_summary = validate_node_vector_sidecars(
+            segment_id,
+            &node_vector_meta_mmap,
+            &node_dense_vectors_mmap,
+            &node_sparse_vectors_mmap,
+            node_meta_count,
+        )?;
+        let dense_hnsw_header = validate_dense_hnsw_files(
+            &dense_hnsw_meta_mmap,
+            &dense_hnsw_graph_mmap,
+            node_dense_vectors_mmap.len(),
+            vector_summary.dense_count,
+            dense_config,
+        )?;
+        let dense_hnsw_points = if let Some(header) = dense_hnsw_header {
+            load_dense_hnsw_query_points(&dense_hnsw_meta_mmap, header)?
+        } else {
+            Vec::new()
+        };
+        if format_version < 8 && vector_summary.sparse_count > 0 {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} format version {} predates sparse posting support; sparse-bearing segments must be rewritten as v8",
+                segment_id, format_version
+            )));
+        }
+        validate_sparse_posting_files(
+            &sparse_posting_index_mmap,
+            &sparse_postings_mmap,
+            vector_summary.sparse_count,
+            true,
+        )?;
+        validate_sparse_posting_parity(
+            segment_id,
+            &node_meta_mmap,
+            &node_vector_meta_mmap,
+            &node_sparse_vectors_mmap,
+            &sparse_posting_index_mmap,
+            &sparse_postings_mmap,
+        )?;
 
         Ok(SegmentReader {
             segment_id,
@@ -360,9 +584,19 @@ impl SegmentReader {
             node_meta_mmap,
             edge_meta_mmap,
             node_prop_hashes_mmap,
+            node_vector_meta_mmap,
+            node_dense_vectors_mmap,
+            node_sparse_vectors_mmap,
+            dense_hnsw_meta_mmap,
+            dense_hnsw_graph_mmap,
+            dense_hnsw_header,
+            dense_hnsw_points,
+            sparse_posting_index_mmap,
+            sparse_postings_mmap,
             timestamp_index_mmap,
             deleted_nodes,
             deleted_edges,
+            node_ids: OnceLock::new(),
             node_count,
             edge_count,
         })
@@ -371,27 +605,36 @@ impl SegmentReader {
     /// Get a node by ID. Returns None if not found or tombstoned.
     /// Returns Err on corrupt segment data.
     pub fn get_node(&self, id: u64) -> Result<Option<NodeRecord>, EngineError> {
-        if self.deleted_nodes.contains(&id) {
+        if self.deleted_nodes.contains_key(&id) {
             return Ok(None);
         }
-        let offset = match self.binary_search_node_index(id)? {
-            Some(o) => o,
+        let (index, offset) = match self.binary_search_node_index(id)? {
+            Some(entry) => entry,
             None => return Ok(None),
         };
-        Ok(Some(decode_node_at(&self.nodes_mmap, offset, id)?))
+        let mut node = decode_node_at(&self.nodes_mmap, offset, id)?;
+        self.hydrate_node_vectors(index, &mut node)?;
+        // Hydrate last_write_seq from metadata sidecar
+        let (_, _, _, _, _, _, _, _, _, last_write_seq) = self.node_meta_at(index)?;
+        node.last_write_seq = last_write_seq;
+        Ok(Some(node))
     }
 
     /// Get an edge by ID. Returns None if not found or tombstoned.
     /// Returns Err on corrupt segment data.
     pub fn get_edge(&self, id: u64) -> Result<Option<EdgeRecord>, EngineError> {
-        if self.deleted_edges.contains(&id) {
+        if self.deleted_edges.contains_key(&id) {
             return Ok(None);
         }
-        let offset = match self.binary_search_edge_index(id)? {
-            Some(o) => o,
+        let (index, offset) = match self.binary_search_edge_index(id)? {
+            Some(entry) => entry,
             None => return Ok(None),
         };
-        Ok(Some(decode_edge_at(&self.edges_mmap, offset, id)?))
+        let mut edge = decode_edge_at(&self.edges_mmap, offset, id)?;
+        // Hydrate last_write_seq from metadata sidecar
+        let (_, _, _, _, _, _, _, _, _, _, last_write_seq) = self.edge_meta_at(index)?;
+        edge.last_write_seq = last_write_seq;
+        Ok(Some(edge))
     }
 
     /// Get the fixed-width edge fields needed for engine-side cache updates
@@ -402,11 +645,11 @@ impl SegmentReader {
         &self,
         id: u64,
     ) -> Result<Option<(u64, u64, i64, f32, i64, i64)>, EngineError> {
-        if self.deleted_edges.contains(&id) {
+        if self.deleted_edges.contains_key(&id) {
             return Ok(None);
         }
-        let offset = match self.binary_search_edge_index(id)? {
-            Some(o) => o,
+        let (_, offset) = match self.binary_search_edge_index(id)? {
+            Some(entry) => entry,
             None => return Ok(None),
         };
         let data = &self.edges_mmap[..];
@@ -426,6 +669,156 @@ impl SegmentReader {
             None => return Ok(None),
         };
         self.get_node(node_id)
+    }
+
+    /// Batch resolve (type_id, key) pairs to node records using the key index.
+    ///
+    /// `lookups` must be sorted by `(type_id, key)`. Each entry is
+    /// `(orig_idx, type_id, key)`. Found (non-tombstoned) records are written
+    /// into `results[orig_idx]`. Returns the set of `orig_idx` values that
+    /// were found in this segment's key index (regardless of tombstone status),
+    /// so the caller can remove them from further searching.
+    ///
+    /// Two-phase design:
+    ///   Phase 1: resolve keys -> node_ids via key_index (dual-strategy)
+    ///   Phase 2: batch-fetch node records via get_nodes_batch (one sorted
+    ///             merge-walk through nodes.dat, not N binary searches)
+    pub fn resolve_keys_batch(
+        &self,
+        lookups: &[(usize, u32, &str)],
+        results: &mut [Option<NodeRecord>],
+    ) -> Result<Vec<usize>, EngineError> {
+        if lookups.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 1: key_index → (orig_idx, node_id) pairs
+        let resolved = self.resolve_keys_to_ids(lookups)?;
+        if resolved.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let found_indices: Vec<usize> = resolved.iter().map(|&(orig_idx, _)| orig_idx).collect();
+
+        // Phase 2: batch-fetch node records from nodes.dat
+        // Build (orig_idx, node_id) sorted by node_id for get_nodes_batch.
+        let mut node_lookups: Vec<(usize, u64)> = resolved
+            .iter()
+            .filter(|&&(_, nid)| !self.deleted_nodes.contains_key(&nid))
+            .copied()
+            .collect();
+        node_lookups.sort_unstable_by_key(|&(_, nid)| nid);
+        self.get_nodes_batch(&node_lookups, results)?;
+
+        Ok(found_indices)
+    }
+
+    /// Phase 1 of resolve_keys_batch: walk the key index to map each
+    /// (type_id, key) query to a node_id. Returns (orig_idx, node_id) pairs
+    /// for keys found in this segment's key index.
+    fn resolve_keys_to_ids(
+        &self,
+        lookups: &[(usize, u32, &str)],
+    ) -> Result<Vec<(usize, u64)>, EngineError> {
+        let mut resolved = Vec::new();
+        let data = &self.key_index_mmap[..];
+        if data.len() < 8 {
+            return Ok(resolved);
+        }
+        let count = read_u64_at(data, 0)? as usize;
+        if count == 0 {
+            return Ok(resolved);
+        }
+
+        let offset_table_start = 8;
+
+        // Count unique keys for strategy selection
+        let unique_keys = {
+            let mut n = 0usize;
+            let mut prev: Option<(u32, &str)> = None;
+            for &(_, tid, key) in lookups {
+                if prev != Some((tid, key)) {
+                    n += 1;
+                    prev = Some((tid, key));
+                }
+            }
+            n
+        };
+
+        let strategy = if unique_keys <= 2 || count <= 1 {
+            BatchReadStrategy::SeekPerKey
+        } else {
+            let (min_type, min_key) = (lookups[0].1, lookups[0].2);
+            let (max_type, max_key) = (lookups[lookups.len() - 1].1, lookups[lookups.len() - 1].2);
+
+            let span_start =
+                lower_bound_key_index(data, offset_table_start, count, min_type, min_key)?;
+            let span_end =
+                upper_bound_key_index(data, offset_table_start, count, max_type, max_key)?;
+            let span = span_end.saturating_sub(span_start).max(unique_keys);
+
+            let seek_cost = unique_keys
+                .saturating_mul(ceil_log2_usize(count))
+                .saturating_mul(BATCH_RANDOM_ACCESS_PENALTY);
+
+            if seek_cost <= span {
+                BatchReadStrategy::SeekPerKey
+            } else {
+                BatchReadStrategy::MergeWalk
+            }
+        };
+
+        if strategy == BatchReadStrategy::SeekPerKey {
+            let mut prev_query: Option<(u32, &str)> = None;
+            let mut prev_node_id: Option<u64> = None;
+            for &(orig_idx, type_id, key) in lookups {
+                let node_id = if prev_query == Some((type_id, key)) {
+                    prev_node_id
+                } else {
+                    let found = self.binary_search_key_index(type_id, key)?;
+                    prev_query = Some((type_id, key));
+                    prev_node_id = found;
+                    found
+                };
+                if let Some(nid) = node_id {
+                    resolved.push((orig_idx, nid));
+                }
+            }
+        } else {
+            // Merge-walk: single cursor through key index entries
+            let mut idx_pos = 0usize;
+            for &(orig_idx, type_id, key) in lookups {
+                while idx_pos < count {
+                    let entry_offset =
+                        read_u64_at(data, offset_table_start + idx_pos * 8)? as usize;
+                    let entry_type = read_u32_at(data, entry_offset)?;
+                    let key_len = read_u16_at(data, entry_offset + 12)? as usize;
+                    let key_bytes = read_bytes_at(data, entry_offset + 14, key_len)?;
+                    let entry_key = std::str::from_utf8(key_bytes).map_err(|_| {
+                        EngineError::CorruptRecord(format!(
+                            "invalid UTF-8 in key index at offset {}",
+                            entry_offset + 14
+                        ))
+                    })?;
+
+                    match (entry_type, entry_key).cmp(&(type_id, key)) {
+                        std::cmp::Ordering::Less => {
+                            idx_pos += 1;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let node_id = read_u64_at(data, entry_offset + 4)?;
+                            resolved.push((orig_idx, node_id));
+                            break;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(resolved)
     }
 
     /// Query neighbors of a node. Checks both outgoing and incoming adjacency
@@ -495,7 +888,7 @@ impl SegmentReader {
 
     /// Check if a node ID is tombstoned in this segment.
     pub fn is_node_deleted(&self, id: u64) -> bool {
-        self.deleted_nodes.contains(&id)
+        self.deleted_nodes.contains_key(&id)
     }
 
     /// Batch lookup: resolve multiple node IDs over the sorted index.
@@ -548,9 +941,9 @@ impl SegmentReader {
         if strategy == BatchReadStrategy::SeekPerKey {
             // Seek path selected by shared cost model
             let mut prev_id: Option<u64> = None;
-            let mut prev_offset: Option<usize> = None;
+            let mut prev_offset: Option<(usize, usize)> = None;
             for &(orig_idx, target_id) in lookups {
-                if self.deleted_nodes.contains(&target_id) {
+                if self.deleted_nodes.contains_key(&target_id) {
                     continue;
                 }
                 let offset = if prev_id == Some(target_id) {
@@ -561,15 +954,19 @@ impl SegmentReader {
                     prev_offset = found;
                     found
                 };
-                if let Some(offset) = offset {
-                    results[orig_idx] = Some(decode_node_at(&self.nodes_mmap, offset, target_id)?);
+                if let Some((index, offset)) = offset {
+                    let mut node = decode_node_at(&self.nodes_mmap, offset, target_id)?;
+                    self.hydrate_node_vectors(index, &mut node)?;
+                    let (_, _, _, _, _, _, _, _, _, lws) = self.node_meta_at(index)?;
+                    node.last_write_seq = lws;
+                    results[orig_idx] = Some(node);
                 }
             }
         } else {
             // Merge-walk path selected by shared cost model
             let mut idx_pos = 0usize;
             for &(orig_idx, target_id) in lookups {
-                if self.deleted_nodes.contains(&target_id) {
+                if self.deleted_nodes.contains_key(&target_id) {
                     continue;
                 }
                 while idx_pos < count {
@@ -579,7 +976,11 @@ impl SegmentReader {
                         idx_pos += 1;
                     } else if id == target_id {
                         let offset = read_u64_at(data, entry_off + 8)? as usize;
-                        results[orig_idx] = Some(decode_node_at(&self.nodes_mmap, offset, id)?);
+                        let mut node = decode_node_at(&self.nodes_mmap, offset, id)?;
+                        self.hydrate_node_vectors(idx_pos, &mut node)?;
+                        let (_, _, _, _, _, _, _, _, _, lws) = self.node_meta_at(idx_pos)?;
+                        node.last_write_seq = lws;
+                        results[orig_idx] = Some(node);
                         break;
                     } else {
                         break;
@@ -587,6 +988,396 @@ impl SegmentReader {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Batch metadata lookup: resolve multiple node IDs without decoding full
+    /// node records or hydrating vectors. `lookups` must be sorted by ID.
+    /// Found metadata is written into `results[original_index]` as
+    /// `(type_id, updated_at, weight)`.
+    pub(crate) fn get_node_meta_batch(
+        &self,
+        lookups: &[(usize, u64)],
+        results: &mut [Option<(u32, i64, f32)>],
+    ) -> Result<(), EngineError> {
+        if lookups.is_empty() {
+            return Ok(());
+        }
+        let data = &self.nodes_mmap[..];
+        if data.len() < 8 {
+            return Ok(());
+        }
+        let count = read_u64_at(data, 0)? as usize;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let idx_start = 8;
+        let min_key = lookups.first().map(|&(_, id)| id).unwrap_or(0);
+        let max_key = lookups.last().map(|&(_, id)| id).unwrap_or(0);
+        let unique_keys = {
+            let mut n = 0usize;
+            let mut prev: Option<u64> = None;
+            for &(_, id) in lookups {
+                if prev != Some(id) {
+                    n += 1;
+                    prev = Some(id);
+                }
+            }
+            n
+        };
+        let strategy = choose_batch_read_strategy(
+            data,
+            count,
+            NODE_INDEX_ENTRY_SIZE,
+            0,
+            unique_keys,
+            min_key,
+            max_key,
+        )?;
+
+        if strategy == BatchReadStrategy::SeekPerKey {
+            let mut prev_id: Option<u64> = None;
+            let mut prev_meta: Option<(u32, i64, f32)> = None;
+            for &(orig_idx, target_id) in lookups {
+                if self.deleted_nodes.contains_key(&target_id) {
+                    continue;
+                }
+                let meta = if prev_id == Some(target_id) {
+                    prev_meta
+                } else if let Some((index, _offset)) = self.binary_search_node_index(target_id)? {
+                    let (
+                        _node_id,
+                        _data_offset,
+                        _data_len,
+                        type_id,
+                        updated_at,
+                        weight,
+                        _key_len,
+                        _prop_hash_offset,
+                        _prop_hash_count,
+                        _last_write_seq,
+                    ) = self.node_meta_at(index)?;
+                    let found = Some((type_id, updated_at, weight));
+                    prev_id = Some(target_id);
+                    prev_meta = found;
+                    found
+                } else {
+                    prev_id = Some(target_id);
+                    prev_meta = None;
+                    None
+                };
+                results[orig_idx] = meta;
+            }
+        } else {
+            let mut idx_pos = 0usize;
+            for &(orig_idx, target_id) in lookups {
+                if self.deleted_nodes.contains_key(&target_id) {
+                    continue;
+                }
+                while idx_pos < count {
+                    let entry_off = idx_start + idx_pos * NODE_INDEX_ENTRY_SIZE;
+                    let id = read_u64_at(data, entry_off)?;
+                    if id < target_id {
+                        idx_pos += 1;
+                    } else if id == target_id {
+                        let (
+                            _node_id,
+                            _data_offset,
+                            _data_len,
+                            type_id,
+                            updated_at,
+                            weight,
+                            _key_len,
+                            _prop_hash_offset,
+                            _prop_hash_count,
+                            _last_write_seq,
+                        ) = self.node_meta_at(idx_pos)?;
+                        results[orig_idx] = Some((type_id, updated_at, weight));
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Batch dense scoring over sorted candidate IDs. Found candidates are scored
+    /// immediately without hydrating full `NodeRecord`s. Unfound candidates are
+    /// appended to `remaining_out` in sorted order for older segments.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn score_dense_candidates_sorted<F>(
+        &self,
+        ids: &[u64],
+        query: &[f32],
+        metric: DenseMetric,
+        query_norm: Option<f32>,
+        mut include: F,
+        hits_out: &mut Vec<VectorHit>,
+        remaining_out: &mut Vec<u64>,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(u32, i64, f32) -> bool,
+    {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let data = &self.nodes_mmap[..];
+        let node_meta = &self.node_meta_mmap[..];
+        let vector_meta = &self.node_vector_meta_mmap[..];
+        if data.len() < 8 {
+            remaining_out.extend_from_slice(ids);
+            return Ok(());
+        }
+        let count = read_u64_at(data, 0)? as usize;
+        if count == 0 {
+            remaining_out.extend_from_slice(ids);
+            return Ok(());
+        }
+
+        let idx_start = 8;
+        let min_key = ids.first().copied().unwrap_or(0);
+        let max_key = ids.last().copied().unwrap_or(0);
+        let mut unique_keys = 0usize;
+        let mut prev: Option<u64> = None;
+        for &id in ids {
+            if prev != Some(id) {
+                unique_keys += 1;
+                prev = Some(id);
+            }
+        }
+        let strategy = choose_batch_read_strategy(
+            data,
+            count,
+            NODE_INDEX_ENTRY_SIZE,
+            0,
+            unique_keys,
+            min_key,
+            max_key,
+        )?;
+
+        if strategy == BatchReadStrategy::SeekPerKey {
+            let mut prev_id: Option<u64> = None;
+            let mut prev_found: Option<DenseScoringMeta> = None;
+            for &target_id in ids {
+                if self.deleted_nodes.contains_key(&target_id) {
+                    continue;
+                }
+
+                let found = if prev_id == Some(target_id) {
+                    prev_found
+                } else if let Some((index, _offset)) = self.binary_search_node_index(target_id)? {
+                    let found = Some(read_dense_scoring_meta(node_meta, vector_meta, index)?);
+                    prev_id = Some(target_id);
+                    prev_found = found;
+                    found
+                } else {
+                    prev_id = Some(target_id);
+                    prev_found = None;
+                    None
+                };
+
+                let Some(found) = found else {
+                    remaining_out.push(target_id);
+                    continue;
+                };
+                if found.dense_len == 0 || !include(found.type_id, found.updated_at, found.weight) {
+                    continue;
+                }
+                hits_out.push(VectorHit {
+                    node_id: target_id,
+                    score: dense_score_from_bytes(
+                        metric,
+                        query,
+                        query_norm,
+                        &self.node_dense_vectors_mmap,
+                        found.dense_offset,
+                        found.dense_len,
+                    )?,
+                });
+            }
+        } else {
+            let mut idx_pos = 0usize;
+            for &target_id in ids {
+                if self.deleted_nodes.contains_key(&target_id) {
+                    continue;
+                }
+
+                let mut found = None;
+                while idx_pos < count {
+                    let entry_off = idx_start + idx_pos * NODE_INDEX_ENTRY_SIZE;
+                    let id = read_u64_at(data, entry_off)?;
+                    if id < target_id {
+                        idx_pos += 1;
+                    } else if id == target_id {
+                        found = Some(read_dense_scoring_meta(node_meta, vector_meta, idx_pos)?);
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+
+                let Some(found) = found else {
+                    remaining_out.push(target_id);
+                    continue;
+                };
+                if found.dense_len == 0 || !include(found.type_id, found.updated_at, found.weight) {
+                    continue;
+                }
+                hits_out.push(VectorHit {
+                    node_id: target_id,
+                    score: dense_score_from_bytes(
+                        metric,
+                        query,
+                        query_norm,
+                        &self.node_dense_vectors_mmap,
+                        found.dense_offset,
+                        found.dense_len,
+                    )?,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Score sparse vectors for a sorted list of candidate node IDs.
+    /// Reads sparse vectors directly from the segment blob and computes
+    /// dot products against the query without allocating per-node Vec.
+    /// Nodes not found in this segment are appended to `remaining_out`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn score_sparse_candidates_sorted<F>(
+        &self,
+        ids: &[u64],
+        query: &[(u32, f32)],
+        mut include: F,
+        hits_out: &mut Vec<(u64, f32)>,
+        remaining_out: &mut Vec<u64>,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(u32, i64, f32) -> bool,
+    {
+        if ids.is_empty() || query.is_empty() {
+            return Ok(());
+        }
+        let data = &self.nodes_mmap[..];
+        let node_meta = &self.node_meta_mmap[..];
+        let vector_meta = &self.node_vector_meta_mmap[..];
+        let sparse_blob = &self.node_sparse_vectors_mmap[..];
+        if data.len() < 8 {
+            remaining_out.extend_from_slice(ids);
+            return Ok(());
+        }
+        let count = read_u64_at(data, 0)? as usize;
+        if count == 0 {
+            remaining_out.extend_from_slice(ids);
+            return Ok(());
+        }
+
+        let idx_start = 8;
+        let min_key = ids.first().copied().unwrap_or(0);
+        let max_key = ids.last().copied().unwrap_or(0);
+        let mut unique_keys = 0usize;
+        let mut prev: Option<u64> = None;
+        for &id in ids {
+            if prev != Some(id) {
+                unique_keys += 1;
+                prev = Some(id);
+            }
+        }
+        let strategy = choose_batch_read_strategy(
+            data,
+            count,
+            NODE_INDEX_ENTRY_SIZE,
+            0,
+            unique_keys,
+            min_key,
+            max_key,
+        )?;
+
+        if strategy == BatchReadStrategy::SeekPerKey {
+            let mut prev_id: Option<u64> = None;
+            let mut prev_found: Option<SparseScoringMeta> = None;
+            for &target_id in ids {
+                if self.deleted_nodes.contains_key(&target_id) {
+                    continue;
+                }
+
+                let found = if prev_id == Some(target_id) {
+                    prev_found
+                } else if let Some((index, _offset)) = self.binary_search_node_index(target_id)? {
+                    let found = Some(read_sparse_scoring_meta(node_meta, vector_meta, index)?);
+                    prev_id = Some(target_id);
+                    prev_found = found;
+                    found
+                } else {
+                    prev_id = Some(target_id);
+                    prev_found = None;
+                    None
+                };
+
+                let Some(found) = found else {
+                    remaining_out.push(target_id);
+                    continue;
+                };
+                if found.sparse_len == 0 || !include(found.type_id, found.updated_at, found.weight)
+                {
+                    continue;
+                }
+                let score = sparse_dot_score_from_blob(
+                    query,
+                    sparse_blob,
+                    found.sparse_offset,
+                    found.sparse_len,
+                )?;
+                if score > 0.0 {
+                    hits_out.push((target_id, score));
+                }
+            }
+        } else {
+            let mut idx_pos = 0usize;
+            for &target_id in ids {
+                if self.deleted_nodes.contains_key(&target_id) {
+                    continue;
+                }
+
+                let mut found = None;
+                while idx_pos < count {
+                    let entry_off = idx_start + idx_pos * NODE_INDEX_ENTRY_SIZE;
+                    let id = read_u64_at(data, entry_off)?;
+                    if id < target_id {
+                        idx_pos += 1;
+                    } else if id == target_id {
+                        found = Some(read_sparse_scoring_meta(node_meta, vector_meta, idx_pos)?);
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+
+                let Some(found) = found else {
+                    remaining_out.push(target_id);
+                    continue;
+                };
+                if found.sparse_len == 0 || !include(found.type_id, found.updated_at, found.weight)
+                {
+                    continue;
+                }
+                let score = sparse_dot_score_from_blob(
+                    query,
+                    sparse_blob,
+                    found.sparse_offset,
+                    found.sparse_len,
+                )?;
+                if score > 0.0 {
+                    hits_out.push((target_id, score));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -640,28 +1431,31 @@ impl SegmentReader {
         if strategy == BatchReadStrategy::SeekPerKey {
             // Seek path selected by shared cost model
             let mut prev_id: Option<u64> = None;
-            let mut prev_offset: Option<usize> = None;
+            let mut prev_entry: Option<(usize, usize)> = None;
             for &(orig_idx, target_id) in lookups {
-                if self.deleted_edges.contains(&target_id) {
+                if self.deleted_edges.contains_key(&target_id) {
                     continue;
                 }
-                let offset = if prev_id == Some(target_id) {
-                    prev_offset
+                let entry = if prev_id == Some(target_id) {
+                    prev_entry
                 } else {
                     let found = self.binary_search_edge_index(target_id)?;
                     prev_id = Some(target_id);
-                    prev_offset = found;
+                    prev_entry = found;
                     found
                 };
-                if let Some(offset) = offset {
-                    results[orig_idx] = Some(decode_edge_at(&self.edges_mmap, offset, target_id)?);
+                if let Some((index, offset)) = entry {
+                    let mut edge = decode_edge_at(&self.edges_mmap, offset, target_id)?;
+                    let (_, _, _, _, _, _, _, _, _, _, lws) = self.edge_meta_at(index)?;
+                    edge.last_write_seq = lws;
+                    results[orig_idx] = Some(edge);
                 }
             }
         } else {
             // Merge-walk path selected by shared cost model
             let mut idx_pos = 0usize;
             for &(orig_idx, target_id) in lookups {
-                if self.deleted_edges.contains(&target_id) {
+                if self.deleted_edges.contains_key(&target_id) {
                     continue;
                 }
                 while idx_pos < count {
@@ -671,7 +1465,10 @@ impl SegmentReader {
                         idx_pos += 1;
                     } else if id == target_id {
                         let offset = read_u64_at(data, entry_off + 8)? as usize;
-                        results[orig_idx] = Some(decode_edge_at(&self.edges_mmap, offset, id)?);
+                        let mut edge = decode_edge_at(&self.edges_mmap, offset, id)?;
+                        let (_, _, _, _, _, _, _, _, _, _, lws) = self.edge_meta_at(idx_pos)?;
+                        edge.last_write_seq = lws;
+                        results[orig_idx] = Some(edge);
                         break;
                     } else {
                         break;
@@ -684,25 +1481,72 @@ impl SegmentReader {
 
     /// Check if an edge ID is tombstoned in this segment.
     pub fn is_edge_deleted(&self, id: u64) -> bool {
-        self.deleted_edges.contains(&id)
+        self.deleted_edges.contains_key(&id)
     }
 
-    /// Return the set of deleted node IDs in this segment.
-    pub fn deleted_node_ids(&self) -> &HashSet<u64> {
+    /// Check if a node ID exists (has a live record) in this segment's index.
+    /// Does NOT check tombstones; only checks whether the node index contains this ID.
+    pub fn has_node(&self, id: u64) -> bool {
+        self.binary_search_node_index(id).ok().flatten().is_some()
+    }
+
+    /// Check if an edge ID exists (has a live record) in this segment's index.
+    /// Does NOT check tombstones; only checks whether the edge index contains this ID.
+    pub fn has_edge(&self, id: u64) -> bool {
+        self.binary_search_edge_index(id).ok().flatten().is_some()
+    }
+
+    /// Return the deleted node tombstone map in this segment.
+    pub fn deleted_node_tombstones(&self) -> &NodeIdMap<TombstoneEntry> {
         &self.deleted_nodes
     }
 
-    /// Return the set of deleted edge IDs in this segment.
-    pub fn deleted_edge_ids(&self) -> &HashSet<u64> {
+    /// Return the deleted edge tombstone map in this segment.
+    pub fn deleted_edge_tombstones(&self) -> &NodeIdMap<TombstoneEntry> {
         &self.deleted_edges
+    }
+
+    /// Return the number of tombstoned nodes in this segment.
+    pub fn deleted_node_count(&self) -> usize {
+        self.deleted_nodes.len()
+    }
+
+    /// Return the number of tombstoned edges in this segment.
+    pub fn deleted_edge_count(&self) -> usize {
+        self.deleted_edges.len()
+    }
+
+    /// Return the set of deleted node IDs in this segment (keys only).
+    pub fn deleted_node_ids(&self) -> NodeIdSet {
+        self.deleted_nodes.keys().copied().collect()
+    }
+
+    /// Return the set of deleted edge IDs in this segment (keys only).
+    pub fn deleted_edge_ids(&self) -> NodeIdSet {
+        self.deleted_edges.keys().copied().collect()
+    }
+
+    /// Return all node IDs present in this segment.
+    pub fn node_ids(&self) -> Result<&[u64], EngineError> {
+        if let Some(node_ids) = self.node_ids.get() {
+            return Ok(node_ids.as_ref());
+        }
+
+        let node_ids = collect_node_ids(&self.nodes_mmap)?.into_boxed_slice();
+        let _ = self.node_ids.set(node_ids);
+        Ok(self
+            .node_ids
+            .get()
+            .expect("node_ids must be initialized after set")
+            .as_ref())
     }
 
     /// Enumerate unique node IDs that appear in this segment's adjacency indexes.
     /// Scans both adj_out and adj_in index files and returns the union of node IDs.
     /// Used by degree cache rebuild to find adjacency-bearing nodes without
     /// enumerating all visible node records.
-    pub fn adj_node_ids(&self) -> Result<HashSet<u64>, EngineError> {
-        let mut ids = HashSet::new();
+    pub fn adj_node_ids(&self) -> Result<NodeIdSet, EngineError> {
+        let mut ids = NodeIdSet::default();
         Self::collect_adj_index_node_ids(&self.adj_out_idx, &mut ids)?;
         Self::collect_adj_index_node_ids(&self.adj_in_idx, &mut ids)?;
         Ok(ids)
@@ -714,7 +1558,7 @@ impl SegmentReader {
     /// consecutive duplicates (same node, different type_id) are common.
     fn collect_adj_index_node_ids(
         idx_mmap: &MappedData,
-        out: &mut HashSet<u64>,
+        out: &mut NodeIdSet,
     ) -> Result<(), EngineError> {
         let idx_data = &idx_mmap[..];
         if idx_data.len() < 8 {
@@ -804,12 +1648,12 @@ impl SegmentReader {
 
     /// Read a node metadata entry by index (0-based).
     /// Returns (node_id, data_offset, data_len, type_id, updated_at, weight, key_len,
-    ///          prop_hash_offset, prop_hash_count).
+    ///          prop_hash_offset, prop_hash_count, last_write_seq).
     #[allow(clippy::type_complexity)]
     pub(crate) fn node_meta_at(
         &self,
         index: usize,
-    ) -> Result<(u64, u64, u32, u32, i64, f32, u16, u64, u32), EngineError> {
+    ) -> Result<(u64, u64, u32, u32, i64, f32, u16, u64, u32, u64), EngineError> {
         let data = &self.node_meta_mmap[..];
         let off = 8 + index * NODE_META_ENTRY_SIZE;
         let node_id = read_u64_at(data, off)?;
@@ -821,6 +1665,7 @@ impl SegmentReader {
         let key_len = read_u16_at(data, off + 36)?;
         let prop_hash_offset = read_u64_at(data, off + 38)?;
         let prop_hash_count = read_u32_at(data, off + 46)?;
+        let last_write_seq = read_u64_at(data, off + 50)?;
         Ok((
             node_id,
             data_offset,
@@ -831,6 +1676,41 @@ impl SegmentReader {
             key_len,
             prop_hash_offset,
             prop_hash_count,
+            last_write_seq,
+        ))
+    }
+
+    pub(crate) fn node_vector_meta_at(
+        &self,
+        index: usize,
+    ) -> Result<(u64, u32, u64, u32), EngineError> {
+        let data = &self.node_vector_meta_mmap[..];
+        if data.is_empty() {
+            return Ok((0, 0, 0, 0));
+        }
+        let (flags, dense_offset, dense_len, sparse_offset, sparse_len) =
+            read_node_vector_meta_entry(data, index)?;
+        Ok((
+            if flags & NODE_VECTOR_FLAG_DENSE != 0 {
+                dense_offset
+            } else {
+                0
+            },
+            if flags & NODE_VECTOR_FLAG_DENSE != 0 {
+                dense_len
+            } else {
+                0
+            },
+            if flags & NODE_VECTOR_FLAG_SPARSE != 0 {
+                sparse_offset
+            } else {
+                0
+            },
+            if flags & NODE_VECTOR_FLAG_SPARSE != 0 {
+                sparse_len
+            } else {
+                0
+            },
         ))
     }
 
@@ -845,12 +1725,12 @@ impl SegmentReader {
 
     /// Read an edge metadata entry by index (0-based).
     /// Returns (edge_id, data_offset, data_len, from, to, type_id, updated_at,
-    ///          weight, valid_from, valid_to).
+    ///          weight, valid_from, valid_to, last_write_seq).
     #[allow(clippy::type_complexity)]
     pub(crate) fn edge_meta_at(
         &self,
         index: usize,
-    ) -> Result<(u64, u64, u32, u64, u64, u32, i64, f32, i64, i64), EngineError> {
+    ) -> Result<(u64, u64, u32, u64, u64, u32, i64, f32, i64, i64, u64), EngineError> {
         let data = &self.edge_meta_mmap[..];
         let off = 8 + index * EDGE_META_ENTRY_SIZE;
         let edge_id = read_u64_at(data, off)?;
@@ -863,6 +1743,7 @@ impl SegmentReader {
         let weight = read_f32_at(data, off + 48)?;
         let valid_from = read_i64_at(data, off + 52)?;
         let valid_to = read_i64_at(data, off + 60)?;
+        let last_write_seq = read_u64_at(data, off + 68)?;
         Ok((
             edge_id,
             data_offset,
@@ -874,12 +1755,115 @@ impl SegmentReader {
             weight,
             valid_from,
             valid_to,
+            last_write_seq,
         ))
     }
 
     /// Raw mmap bytes for node_prop_hashes.dat (used by V3 compaction).
     pub(crate) fn raw_node_prop_hashes_mmap(&self) -> &[u8] {
         &self.node_prop_hashes_mmap[..]
+    }
+
+    pub(crate) fn raw_node_dense_vectors_mmap(&self) -> &[u8] {
+        &self.node_dense_vectors_mmap[..]
+    }
+
+    pub(crate) fn raw_node_sparse_vectors_mmap(&self) -> &[u8] {
+        &self.node_sparse_vectors_mmap[..]
+    }
+
+    pub(crate) fn raw_sparse_posting_index_mmap(&self) -> &[u8] {
+        &self.sparse_posting_index_mmap[..]
+    }
+
+    pub(crate) fn raw_sparse_postings_mmap(&self) -> &[u8] {
+        &self.sparse_postings_mmap[..]
+    }
+
+    pub(crate) fn dense_hnsw_header(&self) -> Option<DenseHnswHeader> {
+        self.dense_hnsw_header
+    }
+
+    pub(crate) fn search_dense_hnsw(
+        &self,
+        query: &[f32],
+        ef_search: usize,
+        limit: usize,
+    ) -> Result<Vec<(u64, f32)>, EngineError> {
+        let Some(header) = self.dense_hnsw_header else {
+            return Ok(Vec::new());
+        };
+        search_dense_hnsw_with_points(
+            header,
+            &self.dense_hnsw_points,
+            &self.dense_hnsw_graph_mmap,
+            &self.node_dense_vectors_mmap,
+            query,
+            ef_search,
+            limit,
+        )
+    }
+
+    pub(crate) fn search_dense_hnsw_scoped(
+        &self,
+        query: &[f32],
+        ef_search: usize,
+        limit: usize,
+        scope_ids: &crate::types::NodeIdSet,
+    ) -> Result<Vec<(u64, f32)>, EngineError> {
+        let Some(header) = self.dense_hnsw_header else {
+            return Ok(Vec::new());
+        };
+        search_dense_hnsw_scoped_with_points(
+            header,
+            &self.dense_hnsw_points,
+            &self.dense_hnsw_graph_mmap,
+            &self.node_dense_vectors_mmap,
+            query,
+            ef_search,
+            limit,
+            scope_ids,
+        )
+    }
+
+    pub(crate) fn raw_dense_hnsw_meta_mmap(&self) -> &[u8] {
+        &self.dense_hnsw_meta_mmap[..]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_dense_hnsw_graph_mmap(&self) -> &[u8] {
+        &self.dense_hnsw_graph_mmap[..]
+    }
+
+    fn hydrate_node_vectors(&self, index: usize, node: &mut NodeRecord) -> Result<(), EngineError> {
+        let (dense_offset, dense_len, sparse_offset, sparse_len) =
+            self.node_vector_meta_at(index)?;
+
+        if dense_len > 0 {
+            let mut values = Vec::with_capacity(dense_len as usize);
+            let base = dense_offset as usize;
+            for i in 0..dense_len as usize {
+                values.push(read_f32_at(
+                    &self.node_dense_vectors_mmap,
+                    base + i * DENSE_VECTOR_VALUE_SIZE,
+                )?);
+            }
+            node.dense_vector = Some(values);
+        }
+
+        if sparse_len > 0 {
+            let mut values = Vec::with_capacity(sparse_len as usize);
+            let base = sparse_offset as usize;
+            for i in 0..sparse_len as usize {
+                let entry_off = base + i * SPARSE_VECTOR_ENTRY_SIZE;
+                let dimension_id = read_u32_at(&self.node_sparse_vectors_mmap, entry_off)?;
+                let weight = read_f32_at(&self.node_sparse_vectors_mmap, entry_off + 4)?;
+                values.push((dimension_id, weight));
+            }
+            node.sparse_vector = Some(values);
+        }
+
+        Ok(())
     }
 
     // --- Iteration methods (for compaction) ---
@@ -898,7 +1882,9 @@ impl SegmentReader {
             let entry_off = idx_start + i * NODE_INDEX_ENTRY_SIZE;
             let id = read_u64_at(data, entry_off)?;
             let offset = read_u64_at(data, entry_off + 8)? as usize;
-            nodes.push(decode_node_at(data, offset, id)?);
+            let mut node = decode_node_at(data, offset, id)?;
+            self.hydrate_node_vectors(i, &mut node)?;
+            nodes.push(node);
         }
         Ok(nodes)
     }
@@ -942,7 +1928,7 @@ impl SegmentReader {
         &self,
         mmap: &MappedData,
         target_type: u32,
-        deleted: &HashSet<u64>,
+        deleted: &NodeIdMap<TombstoneEntry>,
     ) -> Result<Vec<u64>, EngineError> {
         let data = &mmap[..];
         if data.len() < 8 {
@@ -975,7 +1961,7 @@ impl SegmentReader {
                 let mut result = Vec::with_capacity(id_count);
                 for i in 0..id_count {
                     let id = read_u64_at(data, offset + i * 8)?;
-                    if !deleted.contains(&id) {
+                    if !deleted.contains_key(&id) {
                         result.push(id);
                     }
                 }
@@ -1066,7 +2052,7 @@ impl SegmentReader {
                 break;
             }
             let node_id = read_u64_at(data, off + 12)?;
-            if !self.deleted_nodes.contains(&node_id) {
+            if !self.deleted_nodes.contains_key(&node_id) {
                 result.push(node_id);
             }
             pos += 1;
@@ -1176,7 +2162,7 @@ impl SegmentReader {
                             let mut result = Vec::with_capacity(id_count);
                             for i in 0..id_count {
                                 let id = read_u64_at(data, offset + i * 8)?;
-                                if !self.deleted_nodes.contains(&id) {
+                                if !self.deleted_nodes.contains_key(&id) {
                                     result.push(id);
                                 }
                             }
@@ -1193,8 +2179,11 @@ impl SegmentReader {
     // --- Internal binary search methods ---
 
     /// Binary search the node index for a given node_id.
-    /// Returns the byte offset into the data section, or None if not found.
-    fn binary_search_node_index(&self, target_id: u64) -> Result<Option<usize>, EngineError> {
+    /// Returns the node's index position and byte offset into the data section.
+    fn binary_search_node_index(
+        &self,
+        target_id: u64,
+    ) -> Result<Option<(usize, usize)>, EngineError> {
         let data = &self.nodes_mmap[..];
         if data.len() < 8 {
             return Ok(None);
@@ -1218,14 +2207,17 @@ impl SegmentReader {
                 hi = mid;
             } else {
                 let offset = read_u64_at(data, entry_off + 8)? as usize;
-                return Ok(Some(offset));
+                return Ok(Some((mid, offset)));
             }
         }
         Ok(None)
     }
 
     /// Binary search the edge index for a given edge_id.
-    fn binary_search_edge_index(&self, target_id: u64) -> Result<Option<usize>, EngineError> {
+    fn binary_search_edge_index(
+        &self,
+        target_id: u64,
+    ) -> Result<Option<(usize, usize)>, EngineError> {
         let data = &self.edges_mmap[..];
         if data.len() < 8 {
             return Ok(None);
@@ -1249,7 +2241,7 @@ impl SegmentReader {
                 hi = mid;
             } else {
                 let offset = read_u64_at(data, entry_off + 8)? as usize;
-                return Ok(Some(offset));
+                return Ok(Some((mid, offset)));
             }
         }
         Ok(None)
@@ -1425,10 +2417,10 @@ impl SegmentReader {
                     (vt_enc - 1) as i64
                 };
 
-                if self.deleted_edges.contains(&edge_id) {
+                if self.deleted_edges.contains_key(&edge_id) {
                     continue;
                 }
-                if self.deleted_nodes.contains(&neighbor_id) {
+                if self.deleted_nodes.contains_key(&neighbor_id) {
                     continue;
                 }
 
@@ -1451,7 +2443,7 @@ impl SegmentReader {
     /// to avoid materializing `Vec<NeighborEntry>`.
     ///
     /// Callback receives `(edge_id, neighbor_id, weight, valid_from, valid_to)`.
-    /// For `Direction::Both`, self-loops may invoke the callback twice — caller
+    /// For `Direction::Both`, self-loops may invoke the callback twice. Caller
     /// handles dedup.
     pub fn for_each_adj_posting<F>(
         &self,
@@ -1569,10 +2561,10 @@ impl SegmentReader {
                     (vt_enc - 1) as i64
                 };
 
-                if self.deleted_edges.contains(&edge_id) {
+                if self.deleted_edges.contains_key(&edge_id) {
                     continue;
                 }
-                if self.deleted_nodes.contains(&neighbor_id) {
+                if self.deleted_nodes.contains_key(&neighbor_id) {
                     continue;
                 }
 
@@ -1602,8 +2594,9 @@ impl SegmentReader {
         node_ids: &[u64],
         direction: Direction,
         type_filter: Option<&[u32]>,
-    ) -> Result<HashMap<u64, Vec<NeighborEntry>>, EngineError> {
-        let mut results: HashMap<u64, Vec<NeighborEntry>> = HashMap::with_capacity(node_ids.len());
+    ) -> Result<NodeIdMap<Vec<NeighborEntry>>, EngineError> {
+        let mut results: NodeIdMap<Vec<NeighborEntry>> =
+            NodeIdMap::with_capacity_and_hasher(node_ids.len(), Default::default());
 
         match direction {
             Direction::Outgoing => {
@@ -1641,7 +2634,7 @@ impl SegmentReader {
                 )?;
                 // Deduplicate by edge_id per node (self-loops appear in both)
                 for entries in results.values_mut() {
-                    let mut seen = HashSet::new();
+                    let mut seen = NodeIdSet::default();
                     entries.retain(|e| seen.insert(e.edge_id));
                 }
             }
@@ -1659,7 +2652,7 @@ impl SegmentReader {
         dat_mmap: &MappedData,
         node_ids: &[u64],
         type_filter: Option<&[u32]>,
-        results: &mut HashMap<u64, Vec<NeighborEntry>>,
+        results: &mut NodeIdMap<Vec<NeighborEntry>>,
     ) -> Result<(), EngineError> {
         let idx_data = &idx_mmap[..];
         let dat_data = &dat_mmap[..];
@@ -1766,10 +2759,10 @@ impl SegmentReader {
                         (vt_enc - 1) as i64
                     };
 
-                    if self.deleted_edges.contains(&edge_id) {
+                    if self.deleted_edges.contains_key(&edge_id) {
                         continue;
                     }
-                    if self.deleted_nodes.contains(&neighbor_id) {
+                    if self.deleted_nodes.contains_key(&neighbor_id) {
                         continue;
                     }
 
@@ -1793,7 +2786,7 @@ impl SegmentReader {
     /// callback instead of building `Vec<NeighborEntry>`.
     ///
     /// `node_ids` must be sorted and deduplicated. For `Direction::Both`, self-loops
-    /// may invoke the callback twice per edge — caller handles dedup.
+    /// may invoke the callback twice per edge. Caller handles dedup.
     ///
     /// Callback receives `(queried_node_id, edge_id, neighbor_id, weight, valid_from, valid_to)`.
     pub fn for_each_adj_posting_batch<F>(
@@ -1946,10 +2939,10 @@ impl SegmentReader {
                         (vt_enc - 1) as i64
                     };
 
-                    if self.deleted_edges.contains(&edge_id) {
+                    if self.deleted_edges.contains_key(&edge_id) {
                         continue;
                     }
-                    if self.deleted_nodes.contains(&neighbor_id) {
+                    if self.deleted_nodes.contains_key(&neighbor_id) {
                         continue;
                     }
 
@@ -2037,6 +3030,397 @@ fn mmap_file(path: &Path) -> Result<MappedData, EngineError> {
     Ok(MappedData::Mmap(mmap))
 }
 
+fn validate_node_vector_sidecars(
+    segment_id: u64,
+    vector_meta: &[u8],
+    dense_blob: &[u8],
+    sparse_blob: &[u8],
+    expected_count: u64,
+) -> Result<NodeVectorSidecarSummary, EngineError> {
+    if vector_meta.is_empty() {
+        if !dense_blob.is_empty() || !sparse_blob.is_empty() {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} has vector blobs without node vector metadata",
+                segment_id
+            )));
+        }
+        return Ok(NodeVectorSidecarSummary {
+            dense_count: 0,
+            sparse_count: 0,
+        });
+    }
+
+    if vector_meta.len() < 8 {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} node vector metadata too short: {} bytes",
+            segment_id,
+            vector_meta.len()
+        )));
+    }
+
+    let count = read_u64_at(vector_meta, 0)?;
+    if count != expected_count {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} node vector metadata count {} does not match node metadata count {}",
+            segment_id, count, expected_count
+        )));
+    }
+
+    let expected_len = 8usize
+        .checked_add(count as usize * NODE_VECTOR_META_ENTRY_SIZE)
+        .ok_or_else(|| EngineError::CorruptRecord("node vector metadata size overflow".into()))?;
+    if vector_meta.len() != expected_len {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} node vector metadata size {} does not match expected {}",
+            segment_id,
+            vector_meta.len(),
+            expected_len
+        )));
+    }
+
+    let mut has_dense = false;
+    let mut has_sparse = false;
+    let mut next_dense_offset = 0usize;
+    let mut next_sparse_offset = 0usize;
+    let mut dense_count = 0usize;
+    let mut sparse_count = 0usize;
+
+    for index in 0..count as usize {
+        let (flags, dense_offset, dense_len, sparse_offset, sparse_len) =
+            read_node_vector_meta_entry(vector_meta, index)?;
+        if flags & !(NODE_VECTOR_FLAG_DENSE | NODE_VECTOR_FLAG_SPARSE) != 0 {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} node vector entry {} has invalid flags {:#010b}",
+                segment_id, index, flags
+            )));
+        }
+
+        if flags & NODE_VECTOR_FLAG_DENSE == 0 {
+            if dense_offset != 0 || dense_len != 0 {
+                return Err(EngineError::CorruptRecord(format!(
+                    "segment {} node vector entry {} has dense payload without dense flag",
+                    segment_id, index
+                )));
+            }
+        } else {
+            has_dense = true;
+            dense_count += 1;
+            let dense_offset = dense_offset as usize;
+            if dense_offset != next_dense_offset {
+                return Err(EngineError::CorruptRecord(format!(
+                    "segment {} node vector entry {} dense offset {} does not match expected {}",
+                    segment_id, index, dense_offset, next_dense_offset
+                )));
+            }
+            validate_blob_range(
+                dense_blob,
+                dense_offset as u64,
+                dense_len as usize * DENSE_VECTOR_VALUE_SIZE,
+                "dense",
+                segment_id,
+                index,
+            )?;
+            next_dense_offset = next_dense_offset
+                .checked_add(dense_len as usize * DENSE_VECTOR_VALUE_SIZE)
+                .ok_or_else(|| EngineError::CorruptRecord("dense blob size overflow".into()))?;
+        }
+
+        if flags & NODE_VECTOR_FLAG_SPARSE == 0 {
+            if sparse_offset != 0 || sparse_len != 0 {
+                return Err(EngineError::CorruptRecord(format!(
+                    "segment {} node vector entry {} has sparse payload without sparse flag",
+                    segment_id, index
+                )));
+            }
+        } else {
+            has_sparse = true;
+            sparse_count += 1;
+            let sparse_offset = sparse_offset as usize;
+            if sparse_offset != next_sparse_offset {
+                return Err(EngineError::CorruptRecord(format!(
+                    "segment {} node vector entry {} sparse offset {} does not match expected {}",
+                    segment_id, index, sparse_offset, next_sparse_offset
+                )));
+            }
+            validate_blob_range(
+                sparse_blob,
+                sparse_offset as u64,
+                sparse_len as usize * SPARSE_VECTOR_ENTRY_SIZE,
+                "sparse",
+                segment_id,
+                index,
+            )?;
+            next_sparse_offset = next_sparse_offset
+                .checked_add(sparse_len as usize * SPARSE_VECTOR_ENTRY_SIZE)
+                .ok_or_else(|| EngineError::CorruptRecord("sparse blob size overflow".into()))?;
+        }
+    }
+
+    if has_dense && dense_blob.is_empty() {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} references dense vectors but dense blob is missing",
+            segment_id
+        )));
+    }
+    if has_sparse && sparse_blob.is_empty() {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} references sparse vectors but sparse blob is missing",
+            segment_id
+        )));
+    }
+    if !has_dense && !dense_blob.is_empty() {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} has orphaned dense vector blob",
+            segment_id
+        )));
+    }
+    if !has_sparse && !sparse_blob.is_empty() {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} has orphaned sparse vector blob",
+            segment_id
+        )));
+    }
+    if has_dense && next_dense_offset != dense_blob.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} dense vector blob has trailing or unreferenced bytes: expected {}, got {}",
+            segment_id,
+            next_dense_offset,
+            dense_blob.len()
+        )));
+    }
+    if has_sparse && next_sparse_offset != sparse_blob.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} sparse vector blob has trailing or unreferenced bytes: expected {}, got {}",
+            segment_id,
+            next_sparse_offset,
+            sparse_blob.len()
+        )));
+    }
+
+    Ok(NodeVectorSidecarSummary {
+        dense_count,
+        sparse_count,
+    })
+}
+
+struct NodeVectorSidecarSummary {
+    dense_count: usize,
+    sparse_count: usize,
+}
+
+fn validate_sparse_posting_parity(
+    segment_id: u64,
+    node_meta: &[u8],
+    vector_meta: &[u8],
+    sparse_blob: &[u8],
+    sparse_posting_index: &[u8],
+    sparse_postings: &[u8],
+) -> Result<(), EngineError> {
+    if vector_meta.is_empty() {
+        if !sparse_posting_index.is_empty() || !sparse_postings.is_empty() {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} has sparse posting files without node vector metadata",
+                segment_id
+            )));
+        }
+        return Ok(());
+    }
+
+    let mut expected = BTreeMap::<u32, Vec<(u64, f32)>>::new();
+    let count = read_u64_at(node_meta, 0)? as usize;
+    for index in 0..count {
+        let node_id = read_u64_at(node_meta, 8 + index * NODE_META_ENTRY_SIZE)?;
+        let (flags, _dense_offset, _dense_len, sparse_offset, sparse_len) =
+            read_node_vector_meta_entry(vector_meta, index)?;
+        if flags & NODE_VECTOR_FLAG_SPARSE == 0 {
+            continue;
+        }
+
+        let base = sparse_offset as usize;
+        for entry_index in 0..sparse_len as usize {
+            let entry_off = base + entry_index * SPARSE_VECTOR_ENTRY_SIZE;
+            let dimension_id = read_u32_at(sparse_blob, entry_off)?;
+            let weight = read_f32_at(sparse_blob, entry_off + 4)?;
+            if weight < 0.0 {
+                return Err(EngineError::CorruptRecord(format!(
+                    "segment {} sparse vector payload for node {} dimension {} has negative weight",
+                    segment_id, node_id, dimension_id
+                )));
+            }
+            expected
+                .entry(dimension_id)
+                .or_default()
+                .push((node_id, weight));
+        }
+    }
+
+    let actual = read_sparse_posting_groups(sparse_posting_index, sparse_postings)?;
+    if expected.len() != actual.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} sparse posting dimension count {} does not match sparse vector payload count {}",
+            segment_id,
+            actual.len(),
+            expected.len()
+        )));
+    }
+
+    for (dimension_id, expected_postings) in &expected {
+        let Some(actual_postings) = actual.get(dimension_id) else {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} sparse posting files are missing dimension {} from sparse vectors",
+                segment_id, dimension_id
+            )));
+        };
+        if expected_postings.len() != actual_postings.len() {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} sparse posting dimension {} count {} does not match sparse vector payload count {}",
+                segment_id,
+                dimension_id,
+                actual_postings.len(),
+                expected_postings.len()
+            )));
+        }
+        for (expected_posting, actual_posting) in
+            expected_postings.iter().zip(actual_postings.iter())
+        {
+            if expected_posting.0 != actual_posting.0
+                || expected_posting.1.to_bits() != actual_posting.1.to_bits()
+            {
+                return Err(EngineError::CorruptRecord(format!(
+                    "segment {} sparse posting dimension {} does not match sparse vector payloads",
+                    segment_id, dimension_id
+                )));
+            }
+        }
+    }
+
+    for dimension_id in actual.keys() {
+        if !expected.contains_key(dimension_id) {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} sparse posting dimension {} is not present in sparse vector payloads",
+                segment_id, dimension_id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_blob_range(
+    blob: &[u8],
+    offset: u64,
+    len: usize,
+    kind: &str,
+    segment_id: u64,
+    index: usize,
+) -> Result<(), EngineError> {
+    let base = offset as usize;
+    let end = base
+        .checked_add(len)
+        .ok_or_else(|| EngineError::CorruptRecord(format!("{kind} vector range overflow")))?;
+    if end > blob.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} node vector entry {} {} range [{}, {}) exceeds blob length {}",
+            segment_id,
+            index,
+            kind,
+            base,
+            end,
+            blob.len()
+        )));
+    }
+    Ok(())
+}
+
+fn read_node_vector_meta_entry(
+    data: &[u8],
+    index: usize,
+) -> Result<(u8, u64, u32, u64, u32), EngineError> {
+    let off = 8 + index * NODE_VECTOR_META_ENTRY_SIZE;
+    let flags = read_u8_at(data, off)?;
+    let dense_offset = read_u64_at(data, off + 4)?;
+    let dense_len = read_u32_at(data, off + 12)?;
+    let sparse_offset = read_u64_at(data, off + 16)?;
+    let sparse_len = read_u32_at(data, off + 24)?;
+    Ok((flags, dense_offset, dense_len, sparse_offset, sparse_len))
+}
+
+fn read_dense_scoring_meta(
+    node_meta: &[u8],
+    vector_meta: &[u8],
+    index: usize,
+) -> Result<DenseScoringMeta, EngineError> {
+    let node_off = 8 + index * NODE_META_ENTRY_SIZE;
+    let node_end = node_off
+        .checked_add(NODE_META_ENTRY_SIZE)
+        .ok_or_else(|| EngineError::CorruptRecord("node meta offset overflow".into()))?;
+    let node_entry = node_meta.get(node_off..node_end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "node meta read at index {} exceeds data length {}",
+            index,
+            node_meta.len()
+        ))
+    })?;
+
+    let vector_off = 8 + index * NODE_VECTOR_META_ENTRY_SIZE;
+    let vector_end = vector_off
+        .checked_add(NODE_VECTOR_META_ENTRY_SIZE)
+        .ok_or_else(|| EngineError::CorruptRecord("node vector meta offset overflow".into()))?;
+    let vector_entry = vector_meta.get(vector_off..vector_end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "node vector meta read at index {} exceeds data length {}",
+            index,
+            vector_meta.len()
+        ))
+    })?;
+
+    Ok(DenseScoringMeta {
+        type_id: u32::from_le_bytes(node_entry[20..24].try_into().unwrap()),
+        updated_at: i64::from_le_bytes(node_entry[24..32].try_into().unwrap()),
+        weight: f32::from_le_bytes(node_entry[32..36].try_into().unwrap()),
+        dense_offset: u64::from_le_bytes(vector_entry[4..12].try_into().unwrap()) as usize,
+        dense_len: u32::from_le_bytes(vector_entry[12..16].try_into().unwrap()) as usize,
+    })
+}
+
+fn read_sparse_scoring_meta(
+    node_meta: &[u8],
+    vector_meta: &[u8],
+    index: usize,
+) -> Result<SparseScoringMeta, EngineError> {
+    let node_off = 8 + index * NODE_META_ENTRY_SIZE;
+    let node_end = node_off
+        .checked_add(NODE_META_ENTRY_SIZE)
+        .ok_or_else(|| EngineError::CorruptRecord("node meta offset overflow".into()))?;
+    let node_entry = node_meta.get(node_off..node_end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "node meta read at index {} exceeds data length {}",
+            index,
+            node_meta.len()
+        ))
+    })?;
+
+    let vector_off = 8 + index * NODE_VECTOR_META_ENTRY_SIZE;
+    let vector_end = vector_off
+        .checked_add(NODE_VECTOR_META_ENTRY_SIZE)
+        .ok_or_else(|| EngineError::CorruptRecord("node vector meta offset overflow".into()))?;
+    let vector_entry = vector_meta.get(vector_off..vector_end).ok_or_else(|| {
+        EngineError::CorruptRecord(format!(
+            "node vector meta read at index {} exceeds data length {}",
+            index,
+            vector_meta.len()
+        ))
+    })?;
+
+    Ok(SparseScoringMeta {
+        type_id: u32::from_le_bytes(node_entry[20..24].try_into().unwrap()),
+        updated_at: i64::from_le_bytes(node_entry[24..32].try_into().unwrap()),
+        weight: f32::from_le_bytes(node_entry[32..36].try_into().unwrap()),
+        sparse_offset: u64::from_le_bytes(vector_entry[16..24].try_into().unwrap()) as usize,
+        sparse_len: u32::from_le_bytes(vector_entry[24..28].try_into().unwrap()) as usize,
+    })
+}
+
 /// Decode a NodeRecord from mmap data at a given byte offset.
 /// The ID is passed separately; it comes from the index, not the data section.
 /// Layout: type_id(4) key_len(2) key(N) created_at(8) updated_at(8) weight(4) props_len(4) props(M)
@@ -2071,6 +3455,9 @@ fn decode_node_at(data: &[u8], offset: usize, id: u64) -> Result<NodeRecord, Eng
         created_at,
         updated_at,
         weight,
+        dense_vector: None,
+        sparse_vector: None,
+        last_write_seq: 0,
     })
 }
 
@@ -2108,19 +3495,22 @@ fn decode_edge_at(data: &[u8], offset: usize, id: u64) -> Result<EdgeRecord, Eng
         weight,
         valid_from,
         valid_to,
+        last_write_seq: 0,
     })
 }
 
-/// Load tombstone sets from a tombstones.dat file.
-fn load_tombstones(path: &Path) -> Result<(HashSet<u64>, HashSet<u64>), EngineError> {
+/// Load tombstone maps from a tombstones.dat file.
+fn load_tombstones(
+    path: &Path,
+) -> Result<(NodeIdMap<TombstoneEntry>, NodeIdMap<TombstoneEntry>), EngineError> {
     let data = std::fs::read(path)?;
     if data.len() < 8 {
-        return Ok((HashSet::new(), HashSet::new()));
+        return Ok((NodeIdMap::default(), NodeIdMap::default()));
     }
     let count = read_u64_at(&data, 0)? as usize;
 
-    let mut deleted_nodes = HashSet::new();
-    let mut deleted_edges = HashSet::new();
+    let mut deleted_nodes = NodeIdMap::default();
+    let mut deleted_edges = NodeIdMap::default();
 
     for i in 0..count {
         let off = 8 + i * TOMBSTONE_ENTRY_SIZE;
@@ -2134,19 +3524,53 @@ fn load_tombstones(path: &Path) -> Result<(HashSet<u64>, HashSet<u64>), EngineEr
         }
         let kind = data[off];
         let id = read_u64_at(&data, off + 1)?;
-        // deleted_at at off + 9 (available but not needed for lookup)
+        let deleted_at = read_i64_at(&data, off + 9)?;
+        let last_write_seq = read_u64_at(&data, off + 17)?;
+        let entry = TombstoneEntry {
+            deleted_at,
+            last_write_seq,
+        };
         match kind {
             0 => {
-                deleted_nodes.insert(id);
+                deleted_nodes.insert(id, entry);
             }
             1 => {
-                deleted_edges.insert(id);
+                deleted_edges.insert(id, entry);
             }
             _ => {} // Unknown kind, skip
         }
     }
 
     Ok((deleted_nodes, deleted_edges))
+}
+
+/// Compute sparse dot product between a sorted query and a sparse vector
+/// stored in the segment blob at `offset` with `entry_count` entries.
+/// Both query and blob entries are sorted by dimension_id; uses merge-walk.
+fn sparse_dot_score_from_blob(
+    query: &[(u32, f32)],
+    sparse_blob: &[u8],
+    offset: usize,
+    entry_count: usize,
+) -> Result<f32, EngineError> {
+    let mut score = 0.0f32;
+    let mut qi = 0usize;
+    let mut vi = 0usize;
+    while qi < query.len() && vi < entry_count {
+        let entry_off = offset + vi * SPARSE_VECTOR_ENTRY_SIZE;
+        let dim_id = read_u32_at(sparse_blob, entry_off)?;
+        let weight = read_f32_at(sparse_blob, entry_off + 4)?;
+        match query[qi].0.cmp(&dim_id) {
+            std::cmp::Ordering::Less => qi += 1,
+            std::cmp::Ordering::Greater => vi += 1,
+            std::cmp::Ordering::Equal => {
+                score += query[qi].1 * weight;
+                qi += 1;
+                vi += 1;
+            }
+        }
+    }
+    Ok(score)
 }
 
 #[cfg(test)]
@@ -2178,6 +3602,9 @@ pub(crate) mod tests {
             created_at: 1000,
             updated_at: 1001,
             weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         }
     }
 
@@ -2193,6 +3620,9 @@ pub(crate) mod tests {
             created_at: 1000,
             updated_at: 2000,
             weight: 0.75,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         }
     }
 
@@ -2208,16 +3638,32 @@ pub(crate) mod tests {
             weight: 1.0,
             valid_from: 0,
             valid_to: i64::MAX,
+            last_write_seq: 0,
         }
     }
 
     /// Helper: build a memtable, write segment, open reader
     fn write_and_open(mt: &Memtable) -> (tempfile::TempDir, SegmentReader) {
+        write_and_open_with_dense_config(mt, None)
+    }
+
+    fn write_and_open_with_dense_config(
+        mt: &Memtable,
+        dense_config: Option<&DenseVectorConfig>,
+    ) -> (tempfile::TempDir, SegmentReader) {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        write_segment(&seg_dir, 1, mt).unwrap();
-        let reader = SegmentReader::open(&seg_dir, 1).unwrap();
+        write_segment(&seg_dir, 1, mt, dense_config).unwrap();
+        let reader = SegmentReader::open(&seg_dir, 1, dense_config).unwrap();
         (dir, reader)
+    }
+
+    fn dense_config(dimension: u32) -> DenseVectorConfig {
+        DenseVectorConfig {
+            dimension,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig::default(),
+        }
     }
 
     fn build_u64_key_index(keys: &[u64], entry_size: usize, key_offset: usize) -> Vec<u8> {
@@ -2272,7 +3718,7 @@ pub(crate) mod tests {
     #[test]
     fn test_get_node_found() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(42, 1, "alice")));
+        mt.apply_op(&WalOp::UpsertNode(make_node(42, 1, "alice")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         let node = reader.get_node(42).unwrap().unwrap();
@@ -2286,7 +3732,7 @@ pub(crate) mod tests {
     #[test]
     fn test_get_node_not_found() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         assert!(reader.get_node(999).unwrap().is_none());
@@ -2295,7 +3741,7 @@ pub(crate) mod tests {
     #[test]
     fn test_get_node_with_properties() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "alice")));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "alice")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         let node = reader.get_node(1).unwrap().unwrap();
@@ -2311,13 +3757,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_get_node_with_vectors() {
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(3);
+        let mut node = make_node(7, 1, "vector");
+        node.dense_vector = Some(vec![0.1, 0.2, 0.3]);
+        node.sparse_vector = Some(vec![(2, 1.5), (9, 0.25)]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+
+        let (_dir, reader) = write_and_open_with_dense_config(&mt, Some(&dense_config));
+        let node = reader.get_node(7).unwrap().unwrap();
+        assert_eq!(node.dense_vector, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(node.sparse_vector, Some(vec![(2, 1.5), (9, 0.25)]));
+    }
+
+    #[test]
+    fn test_all_nodes_hydrates_mixed_vectors() {
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(2);
+        let mut with_vectors = make_node(1, 1, "with_vectors");
+        with_vectors.dense_vector = Some(vec![0.5, 0.6]);
+        mt.apply_op(&WalOp::UpsertNode(with_vectors), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "plain")), 0);
+
+        let (_dir, reader) = write_and_open_with_dense_config(&mt, Some(&dense_config));
+        let nodes = reader.all_nodes().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].dense_vector, Some(vec![0.5, 0.6]));
+        assert!(nodes[0].sparse_vector.is_none());
+        assert!(nodes[1].dense_vector.is_none());
+        assert!(nodes[1].sparse_vector.is_none());
+    }
+
+    #[test]
     fn test_get_node_tombstoned() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")));
-        mt.apply_op(&WalOp::DeleteNode {
-            id: 1,
-            deleted_at: 9999,
-        });
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 9999,
+            },
+            0,
+        );
 
         let (_dir, reader) = write_and_open(&mt);
         assert!(reader.get_node(1).unwrap().is_none());
@@ -2329,7 +3811,7 @@ pub(crate) mod tests {
     #[test]
     fn test_get_edge_found() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(100, 1, 2, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(100, 1, 2, 10)), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         let edge = reader.get_edge(100).unwrap().unwrap();
@@ -2351,9 +3833,9 @@ pub(crate) mod tests {
     #[test]
     fn test_node_by_key_found() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 2, "alice"))); // different type
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 2, "alice")), 0); // different type
 
         let (_dir, reader) = write_and_open(&mt);
         let node = reader.node_by_key(1, "alice").unwrap().unwrap();
@@ -2369,7 +3851,7 @@ pub(crate) mod tests {
     #[test]
     fn test_node_by_key_not_found() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         assert!(reader.node_by_key(1, "bob").unwrap().is_none());
@@ -2381,17 +3863,17 @@ pub(crate) mod tests {
     #[test]
     fn test_neighbors_outgoing() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         let nbrs = reader.neighbors(1, Direction::Outgoing, None, 0).unwrap();
         assert_eq!(nbrs.len(), 2);
 
-        let ids: HashSet<u64> = nbrs.iter().map(|n| n.node_id).collect();
+        let ids: NodeIdSet = nbrs.iter().map(|n| n.node_id).collect();
         assert!(ids.contains(&2));
         assert!(ids.contains(&3));
     }
@@ -2399,9 +3881,9 @@ pub(crate) mod tests {
     #[test]
     fn test_neighbors_incoming() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         let nbrs = reader.neighbors(2, Direction::Incoming, None, 0).unwrap();
@@ -2412,11 +3894,11 @@ pub(crate) mod tests {
     #[test]
     fn test_neighbors_with_type_filter() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 20)));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 20)), 0);
 
         let (_dir, reader) = write_and_open(&mt);
 
@@ -2444,10 +3926,10 @@ pub(crate) mod tests {
     #[test]
     fn test_neighbors_with_limit() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "hub")));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "hub")), 0);
         for i in 2..=6 {
-            mt.apply_op(&WalOp::UpsertNode(make_node(i, 1, &format!("n{}", i))));
-            mt.apply_op(&WalOp::UpsertEdge(make_edge(i - 1, 1, i, 10)));
+            mt.apply_op(&WalOp::UpsertNode(make_node(i, 1, &format!("n{}", i))), 0);
+            mt.apply_op(&WalOp::UpsertEdge(make_edge(i - 1, 1, i, 10)), 0);
         }
 
         let (_dir, reader) = write_and_open(&mt);
@@ -2462,7 +3944,7 @@ pub(crate) mod tests {
     #[test]
     fn test_neighbors_no_adjacency() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "lonely")));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "lonely")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         let nbrs = reader.neighbors(1, Direction::Outgoing, None, 0).unwrap();
@@ -2473,11 +3955,11 @@ pub(crate) mod tests {
     fn test_for_each_adj_posting_breaks_early() {
         let mut mt = Memtable::new();
         for id in 1..=4 {
-            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))));
+            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))), 0);
         }
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 4, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 4, 10)), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         let mut seen = 0usize;
@@ -2501,11 +3983,11 @@ pub(crate) mod tests {
     fn test_for_each_adj_posting_batch_breaks_early() {
         let mut mt = Memtable::new();
         for id in 1..=4 {
-            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))));
+            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))), 0);
         }
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 4, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 4, 10)), 0);
 
         let (_dir, reader) = write_and_open(&mt);
         let mut seen = 0usize;
@@ -2548,7 +4030,7 @@ pub(crate) mod tests {
     fn test_binary_search_many_nodes() {
         let mut mt = Memtable::new();
         for i in 1..=100 {
-            mt.apply_op(&WalOp::UpsertNode(make_node(i, 1, &format!("n{}", i))));
+            mt.apply_op(&WalOp::UpsertNode(make_node(i, 1, &format!("n{}", i))), 0);
         }
 
         let (_dir, reader) = write_and_open(&mt);
@@ -2568,11 +4050,10 @@ pub(crate) mod tests {
     fn test_binary_search_key_index_many() {
         let mut mt = Memtable::new();
         for i in 1..=50 {
-            mt.apply_op(&WalOp::UpsertNode(make_node(
-                i,
-                (i % 3) as u32 + 1,
-                &format!("key_{:04}", i),
-            )));
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node(i, (i % 3) as u32 + 1, &format!("key_{:04}", i))),
+                0,
+            );
         }
 
         let (_dir, reader) = write_and_open(&mt);
@@ -2594,26 +4075,31 @@ pub(crate) mod tests {
 
         // Build a small graph
         for i in 1..=5 {
-            mt.apply_op(&WalOp::UpsertNode(make_node_with_props(
-                i,
-                1,
-                &format!("node_{}", i),
-            )));
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node_with_props(i, 1, &format!("node_{}", i))),
+                0,
+            );
         }
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 2, 3, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 3, 20)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(4, 4, 5, 10)));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 2, 3, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 3, 20)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(4, 4, 5, 10)), 0);
 
         // Delete one node and one edge
-        mt.apply_op(&WalOp::DeleteNode {
-            id: 99,
-            deleted_at: 9999,
-        });
-        mt.apply_op(&WalOp::DeleteEdge {
-            id: 99,
-            deleted_at: 9999,
-        });
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 99,
+                deleted_at: 9999,
+            },
+            0,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 99,
+                deleted_at: 9999,
+            },
+            0,
+        );
 
         let (_dir, reader) = write_and_open(&mt);
 
@@ -2641,7 +4127,7 @@ pub(crate) mod tests {
         // Verify neighbors
         let out1 = reader.neighbors(1, Direction::Outgoing, None, 0).unwrap();
         assert_eq!(out1.len(), 2); // edges to 2 and 3
-        let ids: HashSet<u64> = out1.iter().map(|n| n.node_id).collect();
+        let ids: NodeIdSet = out1.iter().map(|n| n.node_id).collect();
         assert!(ids.contains(&2));
         assert!(ids.contains(&3));
 
@@ -2667,39 +4153,57 @@ pub(crate) mod tests {
 
         let mut props1 = BTreeMap::new();
         props1.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 1,
-            type_id: 1,
-            key: "apple".to_string(),
-            props: props1,
-            created_at: 1000,
-            updated_at: 1001,
-            weight: 0.5,
-        }));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "apple".to_string(),
+                props: props1,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
 
         let mut props2 = BTreeMap::new();
         props2.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 2,
-            type_id: 1,
-            key: "cherry".to_string(),
-            props: props2,
-            created_at: 1000,
-            updated_at: 1001,
-            weight: 0.5,
-        }));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 2,
+                type_id: 1,
+                key: "cherry".to_string(),
+                props: props2,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
 
         let mut props3 = BTreeMap::new();
         props3.insert("color".to_string(), PropValue::String("green".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 3,
-            type_id: 1,
-            key: "lime".to_string(),
-            props: props3,
-            created_at: 1000,
-            updated_at: 1001,
-            weight: 0.5,
-        }));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 3,
+                type_id: 1,
+                key: "lime".to_string(),
+                props: props3,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
 
         let (_dir, reader) = write_and_open(&mt);
 
@@ -2741,30 +4245,45 @@ pub(crate) mod tests {
 
         let mut props = BTreeMap::new();
         props.insert("tag".to_string(), PropValue::String("x".to_string()));
-        mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 1,
-            type_id: 1,
-            key: "a".to_string(),
-            props: props.clone(),
-            created_at: 1000,
-            updated_at: 1001,
-            weight: 0.5,
-        }));
-        mt.apply_op(&WalOp::UpsertNode(NodeRecord {
-            id: 2,
-            type_id: 1,
-            key: "b".to_string(),
-            props,
-            created_at: 1000,
-            updated_at: 1001,
-            weight: 0.5,
-        }));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "a".to_string(),
+                props: props.clone(),
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 2,
+                type_id: 1,
+                key: "b".to_string(),
+                props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
 
         // Delete node 2 (tombstone)
-        mt.apply_op(&WalOp::DeleteNode {
-            id: 2,
-            deleted_at: 9999,
-        });
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 2,
+                deleted_at: 9999,
+            },
+            0,
+        );
 
         let (_dir, reader) = write_and_open(&mt);
 
@@ -2783,33 +4302,41 @@ pub(crate) mod tests {
     #[test]
     fn test_neighbor_weight_preserved_in_segment() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")));
-        mt.apply_op(&WalOp::UpsertEdge(EdgeRecord {
-            id: 10,
-            from: 1,
-            to: 2,
-            type_id: 5,
-            props: BTreeMap::new(),
-            created_at: 100,
-            updated_at: 100,
-            weight: 0.75,
-            valid_from: 0,
-            valid_to: i64::MAX,
-        }));
-        mt.apply_op(&WalOp::UpsertEdge(EdgeRecord {
-            id: 11,
-            from: 1,
-            to: 3,
-            type_id: 5,
-            props: BTreeMap::new(),
-            created_at: 100,
-            updated_at: 100,
-            weight: 0.25,
-            valid_from: 0,
-            valid_to: i64::MAX,
-        }));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
+        mt.apply_op(
+            &WalOp::UpsertEdge(EdgeRecord {
+                id: 10,
+                from: 1,
+                to: 2,
+                type_id: 5,
+                props: BTreeMap::new(),
+                created_at: 100,
+                updated_at: 100,
+                weight: 0.75,
+                valid_from: 0,
+                valid_to: i64::MAX,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+        mt.apply_op(
+            &WalOp::UpsertEdge(EdgeRecord {
+                id: 11,
+                from: 1,
+                to: 3,
+                type_id: 5,
+                props: BTreeMap::new(),
+                created_at: 100,
+                updated_at: 100,
+                weight: 0.25,
+                valid_from: 0,
+                valid_to: i64::MAX,
+                last_write_seq: 0,
+            }),
+            0,
+        );
 
         let (_dir, reader) = write_and_open(&mt);
         let nbrs = reader.neighbors(1, Direction::Outgoing, None, 0).unwrap();
@@ -2840,12 +4367,12 @@ pub(crate) mod tests {
     #[test]
     fn test_edge_triple_index_roundtrip() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(100, 1, 2, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(101, 1, 3, 10)));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(102, 2, 3, 20)));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(100, 1, 2, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(101, 1, 3, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(102, 2, 3, 20)), 0);
 
         let (_dir, reader) = write_and_open(&mt);
 
@@ -2870,13 +4397,16 @@ pub(crate) mod tests {
     #[test]
     fn test_edge_triple_index_excludes_tombstoned() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(100, 1, 2, 10)));
-        mt.apply_op(&WalOp::DeleteEdge {
-            id: 100,
-            deleted_at: 9999,
-        });
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(100, 1, 2, 10)), 0);
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 100,
+                deleted_at: 9999,
+            },
+            0,
+        );
 
         let (_dir, reader) = write_and_open(&mt);
 
@@ -2918,7 +4448,7 @@ pub(crate) mod tests {
             std::fs::write(seg_dir.join(name), []).unwrap();
         }
 
-        let reader = SegmentReader::open(&seg_dir, 1).unwrap();
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
         // get_node triggers binary search which reads an index entry past EOF
         let result = reader.get_node(42);
         assert!(
@@ -2962,7 +4492,7 @@ pub(crate) mod tests {
                                                      // No actual tombstone entries (truncated)
         std::fs::write(seg_dir.join("tombstones.dat"), &data).unwrap();
 
-        let result = SegmentReader::open(&seg_dir, 1);
+        let result = SegmentReader::open(&seg_dir, 1, None);
         assert!(
             result.is_err(),
             "truncated tombstones should return error, not panic"
@@ -3063,20 +4593,434 @@ pub(crate) mod tests {
         assert!(err.to_string().contains("too old"), "got: {}", err);
     }
 
+    #[test]
+    fn test_open_rejects_orphan_vector_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "plain")), 0);
+        write_segment(&seg_dir, 1, &mt, None).unwrap();
+
+        std::fs::write(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME), [0u8; 4]).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, None).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("vector blobs without node vector metadata"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_vector_metadata_count_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = DenseVectorConfig {
+            dimension: 2,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig::default(),
+        };
+        let mut node = make_node(1, 1, "vector");
+        node.dense_vector = Some(vec![0.1, 0.2]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        let mut meta = std::fs::read(seg_dir.join(NODE_VECTOR_META_FILENAME)).unwrap();
+        meta[0..8].copy_from_slice(&2u64.to_le_bytes());
+        std::fs::write(seg_dir.join(NODE_VECTOR_META_FILENAME), meta).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, Some(&dense_config))
+            .err()
+            .unwrap();
+        assert!(err
+            .to_string()
+            .contains("does not match node metadata count"));
+    }
+
+    #[test]
+    fn test_open_rejects_vector_blob_with_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(2);
+        let mut node = make_node(1, 1, "vector");
+        node.dense_vector = Some(vec![0.1, 0.2]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        let mut dense_blob = std::fs::read(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME)).unwrap();
+        dense_blob.extend_from_slice(&0.9f32.to_le_bytes());
+        std::fs::write(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME), dense_blob).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, Some(&dense_config))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("trailing or unreferenced bytes"));
+    }
+
+    #[test]
+    fn test_open_exposes_dense_hnsw_header_for_dense_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(3);
+
+        let mut first = make_node(1, 1, "a");
+        first.dense_vector = Some(vec![0.1, 0.2, 0.3]);
+        mt.apply_op(&WalOp::UpsertNode(first), 0);
+
+        let mut second = make_node(2, 1, "b");
+        second.dense_vector = Some(vec![0.3, 0.2, 0.1]);
+        mt.apply_op(&WalOp::UpsertNode(second), 0);
+
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        let reader = SegmentReader::open(&seg_dir, 1, Some(&dense_config)).unwrap();
+        let header = reader.dense_hnsw_header().unwrap();
+
+        assert_eq!(header.point_count, 2);
+        assert_eq!(header.metric, DenseMetric::Cosine);
+        assert_eq!(header.dimension, 3);
+        assert_eq!(header.m, dense_config.hnsw.m);
+        assert_eq!(
+            reader.raw_dense_hnsw_meta_mmap(),
+            &std::fs::read(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)).unwrap()
+        );
+        assert_eq!(
+            reader.raw_dense_hnsw_graph_mmap(),
+            &std::fs::read(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_missing_dense_hnsw_files_for_dense_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(3);
+
+        let mut first = make_node(1, 1, "a");
+        first.dense_vector = Some(vec![0.1, 0.2, 0.3]);
+        mt.apply_op(&WalOp::UpsertNode(first), 0);
+
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        std::fs::remove_file(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)).unwrap();
+        std::fs::remove_file(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, Some(&dense_config))
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("dense HNSW files are missing for 1 dense vectors"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_keeps_dense_hnsw_empty_for_vectorless_segments() {
+        let mut mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "plain")), 0);
+
+        let (_dir, reader) = write_and_open(&mt);
+
+        assert!(reader.dense_hnsw_header().is_none());
+        assert!(reader.raw_dense_hnsw_meta_mmap().is_empty());
+        assert!(reader.raw_dense_hnsw_graph_mmap().is_empty());
+    }
+
+    #[test]
+    fn test_open_rejects_dense_hnsw_files_in_v6_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(2);
+        let mut node = make_node(1, 1, "vector");
+        node.dense_vector = Some(vec![0.1, 0.2]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        let mut format_ver = std::fs::read(seg_dir.join("format.ver")).unwrap();
+        format_ver[4..8].copy_from_slice(&6u32.to_le_bytes());
+        std::fs::write(seg_dir.join("format.ver"), format_ver).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, Some(&dense_config))
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("unexpected dense HNSW files for format version 6"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_dense_hnsw_metric_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(2);
+        let mut node = make_node(1, 1, "vector");
+        node.dense_vector = Some(vec![0.1, 0.2]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        let mut meta =
+            std::fs::read(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)).unwrap();
+        meta[26] = 1; // Euclidean
+        std::fs::write(
+            seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME),
+            meta,
+        )
+        .unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, Some(&dense_config))
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("does not match configured metric"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_missing_sparse_posting_files_for_sparse_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+
+        let mut node = make_node(1, 1, "sparse");
+        node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, None).unwrap();
+
+        std::fs::remove_file(seg_dir.join(crate::sparse_postings::SPARSE_POSTING_INDEX_FILENAME))
+            .unwrap();
+        std::fs::remove_file(seg_dir.join(crate::sparse_postings::SPARSE_POSTINGS_FILENAME))
+            .unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, None).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("segment has sparse vectors but sparse posting files are missing"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_sparse_posting_files_in_v7_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+
+        let mut node = make_node(1, 1, "sparse");
+        node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, None).unwrap();
+
+        let mut format_ver = std::fs::read(seg_dir.join("format.ver")).unwrap();
+        format_ver[4..8].copy_from_slice(&7u32.to_le_bytes());
+        std::fs::write(seg_dir.join("format.ver"), format_ver).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, None).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("unexpected sparse posting files for format version 7"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_sparse_vectors_in_v7_segment_without_postings() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+
+        let mut node = make_node(1, 1, "sparse");
+        node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, None).unwrap();
+
+        std::fs::remove_file(seg_dir.join(crate::sparse_postings::SPARSE_POSTING_INDEX_FILENAME))
+            .unwrap();
+        std::fs::remove_file(seg_dir.join(crate::sparse_postings::SPARSE_POSTINGS_FILENAME))
+            .unwrap();
+
+        let mut format_ver = std::fs::read(seg_dir.join("format.ver")).unwrap();
+        format_ver[4..8].copy_from_slice(&7u32.to_le_bytes());
+        std::fs::write(seg_dir.join("format.ver"), format_ver).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, None).err().unwrap();
+        assert!(
+            err.to_string().contains("predates sparse posting support"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_sparse_posting_parity_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+
+        let mut node = make_node(1, 1, "sparse");
+        node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, None).unwrap();
+
+        let mut postings =
+            std::fs::read(seg_dir.join(crate::sparse_postings::SPARSE_POSTINGS_FILENAME)).unwrap();
+        postings[8..12].copy_from_slice(&9.0f32.to_le_bytes());
+        std::fs::write(
+            seg_dir.join(crate::sparse_postings::SPARSE_POSTINGS_FILENAME),
+            postings,
+        )
+        .unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, None).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("does not match sparse vector payloads"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_dense_hnsw_hnsw_param_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(2);
+        let mut node = make_node(1, 1, "vector");
+        node.dense_vector = Some(vec![0.1, 0.2]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        let mut meta =
+            std::fs::read(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)).unwrap();
+        meta[22..24].copy_from_slice(&(dense_config.hnsw.m + 1).to_le_bytes());
+        std::fs::write(
+            seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME),
+            meta,
+        )
+        .unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, Some(&dense_config))
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("does not match configured m"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_dense_hnsw_dimension_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(2);
+        let mut node = make_node(1, 1, "vector");
+        node.dense_vector = Some(vec![0.1, 0.2]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        let mut meta =
+            std::fs::read(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)).unwrap();
+        meta[28..32].copy_from_slice(&3u32.to_le_bytes());
+        std::fs::write(
+            seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME),
+            meta,
+        )
+        .unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, Some(&dense_config))
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("does not match configured dimension"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_dense_hnsw_ef_construction_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(2);
+        let mut node = make_node(1, 1, "vector");
+        node.dense_vector = Some(vec![0.1, 0.2]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        let mut meta =
+            std::fs::read(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)).unwrap();
+        meta[24..26].copy_from_slice(&(dense_config.hnsw.ef_construction + 1).to_le_bytes());
+        std::fs::write(
+            seg_dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME),
+            meta,
+        )
+        .unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, Some(&dense_config))
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("does not match configured ef_construction"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_dense_hnsw_without_dense_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = Memtable::new();
+        let dense_config = dense_config(2);
+        let mut node = make_node(1, 1, "vector");
+        node.dense_vector = Some(vec![0.1, 0.2]);
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        write_segment(&seg_dir, 1, &mt, Some(&dense_config)).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, None).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("require DbOptions::dense_vector to be configured"),
+            "got: {}",
+            err
+        );
+    }
+
     // --- V5 sidecar reader tests ---
 
     #[test]
     fn test_sidecar_node_meta_roundtrip() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "alice")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bob")));
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "alice")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bob")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
 
         assert_eq!(reader.node_meta_count(), 2);
 
         // First entry: node_id=1
-        let (nid, _off, _len, tid, updated_at, weight, key_len, _pho, phc) =
+        let (nid, _off, _len, tid, updated_at, weight, key_len, _pho, phc, _lws) =
             reader.node_meta_at(0).unwrap();
         assert_eq!(nid, 1);
         assert_eq!(tid, 1);
@@ -3086,7 +5030,7 @@ pub(crate) mod tests {
         assert_eq!(phc, 2); // 2 props: "name", "score"
 
         // Second entry: node_id=2
-        let (nid2, _, _, tid2, _, _, key_len2, _, phc2) = reader.node_meta_at(1).unwrap();
+        let (nid2, _, _, tid2, _, _, key_len2, _, phc2, _) = reader.node_meta_at(1).unwrap();
         assert_eq!(nid2, 2);
         assert_eq!(tid2, 2);
         assert_eq!(key_len2, 3); // "bob"
@@ -3096,15 +5040,15 @@ pub(crate) mod tests {
     #[test]
     fn test_sidecar_edge_meta_roundtrip() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")));
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 0);
 
         let (_dir, reader) = write_and_open(&mt);
 
         assert_eq!(reader.edge_meta_count(), 1);
 
-        let (eid, _off, _len, from, to, tid, updated_at, weight, vf, vt) =
+        let (eid, _off, _len, from, to, tid, updated_at, weight, vf, vt, _lws) =
             reader.edge_meta_at(0).unwrap();
         assert_eq!(eid, 10);
         assert_eq!(from, 1);
@@ -3119,14 +5063,15 @@ pub(crate) mod tests {
     #[test]
     fn test_sidecar_data_offset_matches_nodes_dat() {
         let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")));
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bb")));
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bb")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
 
         // Read data_offset/data_len from sidecar and verify node can be decoded there
         for i in 0..reader.node_meta_count() as usize {
-            let (nid, data_offset, data_len, tid, _, _, _, _, _) = reader.node_meta_at(i).unwrap();
+            let (nid, data_offset, data_len, tid, _, _, _, _, _, _) =
+                reader.node_meta_at(i).unwrap();
             // Verify the offset points to valid data in nodes.dat
             let node = decode_node_at(&reader.nodes_mmap, data_offset as usize, nid).unwrap();
             assert_eq!(node.id, nid);

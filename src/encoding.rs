@@ -29,6 +29,11 @@ fn write_f32(buf: &mut Vec<u8>, v: f32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+fn write_sparse_vector_entry(buf: &mut Vec<u8>, dimension_id: u32, weight: f32) {
+    write_u32(buf, dimension_id);
+    write_f32(buf, weight);
+}
+
 const MAX_BYTES_LEN: usize = 64 * 1024 * 1024; // 64MB safety limit
 
 fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), EngineError> {
@@ -108,6 +113,13 @@ fn read_f32(cursor: &mut Cursor<&[u8]>) -> Result<f32, EngineError> {
     Ok(f32::from_le_bytes(buf))
 }
 
+fn remaining_bytes(cursor: &Cursor<&[u8]>) -> usize {
+    cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize)
+}
+
 fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, EngineError> {
     let len = read_u32(cursor)? as usize;
     if len > MAX_BYTES_LEN {
@@ -150,6 +162,26 @@ pub fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), EngineErr
             let props_bytes = rmp_serde::to_vec(&node.props)
                 .map_err(|e| EngineError::SerializationError(e.to_string()))?;
             write_bytes(buf, &props_bytes)?;
+            let mut flags = 0u8;
+            if node.dense_vector.is_some() {
+                flags |= 0b0000_0001;
+            }
+            if node.sparse_vector.is_some() {
+                flags |= 0b0000_0010;
+            }
+            write_u8(buf, flags);
+            if let Some(dense) = &node.dense_vector {
+                write_u32(buf, dense.len() as u32);
+                for &value in dense {
+                    write_f32(buf, value);
+                }
+            }
+            if let Some(sparse) = &node.sparse_vector {
+                write_u32(buf, sparse.len() as u32);
+                for &(dimension_id, weight) in sparse {
+                    write_sparse_vector_entry(buf, dimension_id, weight);
+                }
+            }
         }
         WalOp::UpsertEdge(edge) => {
             write_u8(buf, OpTag::UpsertEdge as u8);
@@ -163,7 +195,7 @@ pub fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), EngineErr
             let props_bytes = rmp_serde::to_vec(&edge.props)
                 .map_err(|e| EngineError::SerializationError(e.to_string()))?;
             write_bytes(buf, &props_bytes)?;
-            // Temporal fields (added in v2, detected by trailing bytes on decode)
+            // Temporal fields are decoded from the trailing payload when present.
             write_i64(buf, edge.valid_from);
             write_i64(buf, edge.valid_to);
         }
@@ -206,6 +238,49 @@ pub fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
             let props_bytes = read_bytes(&mut cursor)?;
             let props: BTreeMap<String, PropValue> = rmp_serde::from_slice(&props_bytes)
                 .map_err(|e| EngineError::SerializationError(e.to_string()))?;
+            let (dense_vector, sparse_vector) = if remaining_bytes(&cursor) == 0 {
+                (None, None)
+            } else {
+                let flags = read_u8(&mut cursor)?;
+                if flags & !0b0000_0011 != 0 {
+                    return Err(EngineError::CorruptRecord(format!(
+                        "invalid vector flags on node WAL op: {:#010b}",
+                        flags
+                    )));
+                }
+
+                let dense_vector = if flags & 0b0000_0001 != 0 {
+                    let len = read_u32(&mut cursor)? as usize;
+                    let mut values = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        values.push(read_f32(&mut cursor)?);
+                    }
+                    Some(values)
+                } else {
+                    None
+                };
+
+                let sparse_vector = if flags & 0b0000_0010 != 0 {
+                    let len = read_u32(&mut cursor)? as usize;
+                    let mut values = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        let dimension_id = read_u32(&mut cursor)?;
+                        let weight = read_f32(&mut cursor)?;
+                        values.push((dimension_id, weight));
+                    }
+                    Some(values)
+                } else {
+                    None
+                };
+
+                if remaining_bytes(&cursor) != 0 {
+                    return Err(EngineError::CorruptRecord(
+                        "unexpected trailing bytes in node WAL op".into(),
+                    ));
+                }
+
+                (dense_vector, sparse_vector)
+            };
 
             Ok(WalOp::UpsertNode(NodeRecord {
                 id,
@@ -215,6 +290,9 @@ pub fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
                 created_at,
                 updated_at,
                 weight,
+                dense_vector,
+                sparse_vector,
+                last_write_seq: 0,
             }))
         }
         Some(OpTag::UpsertEdge) => {
@@ -243,6 +321,7 @@ pub fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
                 weight,
                 valid_from,
                 valid_to,
+                last_write_seq: 0,
             }))
         }
         Some(OpTag::DeleteNode) => {
@@ -281,6 +360,9 @@ mod tests {
             created_at: 1000000,
             updated_at: 1000001,
             weight: 0.95,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         });
 
         let encoded = encode_wal_op(&op).unwrap();
@@ -305,6 +387,60 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_upsert_node_with_vectors() {
+        let op = WalOp::UpsertNode(NodeRecord {
+            id: 7,
+            type_id: 2,
+            key: "vector-node".to_string(),
+            props: BTreeMap::new(),
+            created_at: 10,
+            updated_at: 11,
+            weight: 0.5,
+            dense_vector: Some(vec![0.1, 0.2, 0.3]),
+            sparse_vector: Some(vec![(4, 1.5), (9, 2.5)]),
+            last_write_seq: 0,
+        });
+
+        let encoded = encode_wal_op(&op).unwrap();
+        let decoded = decode_wal_op(&encoded).unwrap();
+
+        match decoded {
+            WalOp::UpsertNode(node) => {
+                assert_eq!(node.dense_vector, Some(vec![0.1, 0.2, 0.3]));
+                assert_eq!(node.sparse_vector, Some(vec![(4, 1.5), (9, 2.5)]));
+            }
+            _ => panic!("expected UpsertNode"),
+        }
+    }
+
+    #[test]
+    fn test_decode_legacy_upsert_node_without_vector_payload() {
+        let mut props = BTreeMap::new();
+        props.insert("name".to_string(), PropValue::String("legacy".to_string()));
+
+        let mut encoded = Vec::new();
+        write_u8(&mut encoded, OpTag::UpsertNode as u8);
+        write_u64(&mut encoded, 42);
+        write_u32(&mut encoded, 1);
+        write_str(&mut encoded, "legacy").unwrap();
+        write_i64(&mut encoded, 100);
+        write_i64(&mut encoded, 101);
+        write_f32(&mut encoded, 0.75);
+        let props_bytes = rmp_serde::to_vec(&props).unwrap();
+        write_bytes(&mut encoded, &props_bytes).unwrap();
+
+        let decoded = decode_wal_op(&encoded).unwrap();
+        match decoded {
+            WalOp::UpsertNode(node) => {
+                assert_eq!(node.key, "legacy");
+                assert!(node.dense_vector.is_none());
+                assert!(node.sparse_vector.is_none());
+            }
+            _ => panic!("expected UpsertNode"),
+        }
+    }
+
+    #[test]
     fn test_roundtrip_upsert_edge() {
         let mut props = BTreeMap::new();
         props.insert("role".to_string(), PropValue::String("owner".to_string()));
@@ -320,6 +456,7 @@ mod tests {
             weight: 1.0,
             valid_from: 1500000,
             valid_to: 3000000,
+            last_write_seq: 0,
         });
 
         let encoded = encode_wal_op(&op).unwrap();
@@ -391,6 +528,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             weight: 0.0,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         });
 
         let encoded = encode_wal_op(&op).unwrap();
@@ -434,6 +574,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         });
 
         let encoded = encode_wal_op(&op).unwrap();
@@ -503,6 +646,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             weight: 0.0,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         });
         let result = encode_wal_op(&op);
         assert!(result.is_err());
@@ -522,6 +668,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             weight: 0.0,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
         });
         let encoded = encode_wal_op(&op).unwrap();
         let decoded = decode_wal_op(&encoded).unwrap();

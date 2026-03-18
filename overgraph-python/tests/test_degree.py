@@ -19,8 +19,8 @@ class TestDegree:
         c = db.upsert_node(1, "c")
         db.upsert_edge(a, b, 10)
         db.upsert_edge(a, c, 20)
-        assert db.degree(a, "incoming") == 0
-        assert db.degree(b, "incoming") == 1
+        assert db.degree(a, direction="incoming") == 0
+        assert db.degree(b, direction="incoming") == 1
 
     def test_both(self, db):
         a = db.upsert_node(1, "a")
@@ -28,8 +28,8 @@ class TestDegree:
         c = db.upsert_node(1, "c")
         db.upsert_edge(a, b, 10)
         db.upsert_edge(a, c, 20)
-        assert db.degree(a, "both") == 2
-        assert db.degree(b, "both") == 1
+        assert db.degree(a, direction="both") == 2
+        assert db.degree(b, direction="both") == 1
 
     def test_type_filter(self, db):
         a = db.upsert_node(1, "a")
@@ -37,10 +37,10 @@ class TestDegree:
         c = db.upsert_node(1, "c")
         db.upsert_edge(a, b, 10)
         db.upsert_edge(a, c, 20)
-        assert db.degree(a, "outgoing", type_filter=[10]) == 1
-        assert db.degree(a, "outgoing", type_filter=[20]) == 1
-        assert db.degree(a, "outgoing", type_filter=[10, 20]) == 2
-        assert db.degree(a, "outgoing", type_filter=[99]) == 0
+        assert db.degree(a, direction="outgoing", type_filter=[10]) == 1
+        assert db.degree(a, direction="outgoing", type_filter=[20]) == 1
+        assert db.degree(a, direction="outgoing", type_filter=[10, 20]) == 2
+        assert db.degree(a, direction="outgoing", type_filter=[99]) == 0
 
     def test_nonexistent_node(self, db):
         assert db.degree(999999) == 0
@@ -54,8 +54,8 @@ class TestDegree:
         db.upsert_edge(b, c, 10, weight=1.0)
         for direction in ["outgoing", "incoming", "both"]:
             for nid in [a, b, c]:
-                deg = db.degree(nid, direction)
-                nbrs = db.neighbors(nid, direction)
+                deg = db.degree(nid, direction=direction)
+                nbrs = db.neighbors(nid, direction=direction)
                 assert deg == len(nbrs), (
                     f"mismatch node={nid} dir={direction}: degree={deg} neighbors={len(nbrs)}"
                 )

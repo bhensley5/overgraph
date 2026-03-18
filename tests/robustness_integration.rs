@@ -1,4 +1,7 @@
-use overgraph::{DatabaseEngine, DbOptions, Direction, NodeInput, PropValue, WalSyncMode};
+use overgraph::{
+    DatabaseEngine, DbOptions, Direction, NeighborOptions, NodeInput, PropValue, UpsertEdgeOptions,
+    UpsertNodeOptions, WalSyncMode,
+};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
@@ -31,23 +34,54 @@ fn test_crash_recovery_wal_replay() {
     {
         let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
         node_a = db
-            .upsert_node(1, "alice", make_props("role", "admin"), 1.0)
+            .upsert_node(
+                1,
+                "alice",
+                UpsertNodeOptions {
+                    props: make_props("role", "admin"),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         node_b = db
-            .upsert_node(1, "bob", make_props("role", "user"), 0.5)
+            .upsert_node(
+                1,
+                "bob",
+                UpsertNodeOptions {
+                    props: make_props("role", "user"),
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         edge_ab = db
-            .upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None)
+            .upsert_edge(node_a, node_b, 10, UpsertEdgeOptions::default())
             .unwrap();
 
         // Flush to segment
         db.flush().unwrap();
 
         // Write more data that stays in WAL only
-        db.upsert_node(2, "charlie", make_props("role", "viewer"), 0.3)
-            .unwrap();
-        db.upsert_node(2, "diana", make_props("role", "editor"), 0.8)
-            .unwrap();
+        db.upsert_node(
+            2,
+            "charlie",
+            UpsertNodeOptions {
+                props: make_props("role", "viewer"),
+                weight: 0.3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.upsert_node(
+            2,
+            "diana",
+            UpsertNodeOptions {
+                props: make_props("role", "editor"),
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         // Drop without close() -- simulates crash
         // (The Drop impl will attempt cleanup but WAL data should be durable)
@@ -83,9 +117,7 @@ fn test_crash_recovery_wal_replay() {
         assert!(diana.is_some(), "WAL-only node 'diana' should be recovered");
 
         // Neighbors should work across recovered data
-        let nbrs = db
-            .neighbors(node_a, Direction::Outgoing, None, 0, None, None)
-            .unwrap();
+        let nbrs = db.neighbors(node_a, &NeighborOptions::default()).unwrap();
         assert_eq!(nbrs.len(), 1);
         assert_eq!(nbrs[0].node_id, node_b);
 
@@ -110,9 +142,13 @@ fn test_crash_recovery_with_deletes() {
 
     {
         let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
-        node_a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-        node_b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-        db.upsert_edge(node_a, node_b, 10, BTreeMap::new(), 1.0, None, None)
+        node_a = db
+            .upsert_node(1, "a", UpsertNodeOptions::default())
+            .unwrap();
+        node_b = db
+            .upsert_node(1, "b", UpsertNodeOptions::default())
+            .unwrap();
+        db.upsert_edge(node_a, node_b, 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
@@ -133,7 +169,13 @@ fn test_crash_recovery_with_deletes() {
         );
         // Edge should be cascade-deleted
         let nbrs = db
-            .neighbors(node_b, Direction::Incoming, None, 0, None, None)
+            .neighbors(
+                node_b,
+                &NeighborOptions {
+                    direction: Direction::Incoming,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert!(nbrs.is_empty(), "cascade-deleted edge should not appear");
         db.close().unwrap();
@@ -174,6 +216,8 @@ fn test_large_scale_100k_nodes() {
                     m
                 },
                 weight: (i % 100) as f32 / 100.0,
+                dense_vector: None,
+                sparse_vector: None,
             })
             .collect();
 
@@ -233,7 +277,7 @@ fn test_large_scale_100k_nodes() {
 
     // Neighbors
     let nbrs = db
-        .neighbors(all_ids[0], Direction::Outgoing, None, 0, None, None)
+        .neighbors(all_ids[0], &NeighborOptions::default())
         .unwrap();
     assert!(!nbrs.is_empty());
 
@@ -262,10 +306,12 @@ fn test_engine_manifest_corruption_recovery() {
     // Write data and flush to create a manifest
     {
         let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
-        db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
+        db.upsert_node(1, "a", UpsertNodeOptions::default())
+            .unwrap();
         db.flush().unwrap();
         // Write a second manifest version so manifest.prev exists
-        db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
+        db.upsert_node(1, "b", UpsertNodeOptions::default())
+            .unwrap();
         db.flush().unwrap();
         db.close().unwrap();
     }
@@ -308,13 +354,21 @@ fn test_engine_wal_truncated_record_recovery() {
     {
         let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
         node_a = db
-            .upsert_node(1, "valid_node", make_props("k", "v"), 1.0)
+            .upsert_node(
+                1,
+                "valid_node",
+                UpsertNodeOptions {
+                    props: make_props("k", "v"),
+                    ..Default::default()
+                },
+            )
             .unwrap();
-        db.close().unwrap();
+        // Use close_fast() to preserve WAL (close() would flush + retire WAL)
+        db.close_fast().unwrap();
     }
 
     // Append garbage to WAL (simulating crash mid-write of next record)
-    let wal_path = db_path.join("data.wal");
+    let wal_path = db_path.join("wal_0.wal");
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -355,27 +409,67 @@ fn test_temporal_edges_cross_source() {
     };
 
     let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
-    let a = db.upsert_node(1, "a", BTreeMap::new(), 1.0).unwrap();
-    let b = db.upsert_node(1, "b", BTreeMap::new(), 1.0).unwrap();
-    let c = db.upsert_node(1, "c", BTreeMap::new(), 1.0).unwrap();
-    let d = db.upsert_node(1, "d", BTreeMap::new(), 1.0).unwrap();
-
-    // Edge in segment: A→B valid [1000, 5000)
-    db.upsert_edge(a, b, 10, BTreeMap::new(), 1.0, Some(1000), Some(5000))
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
         .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
+    let d = db
+        .upsert_node(1, "d", UpsertNodeOptions::default())
+        .unwrap();
+
+    // Edge in segment: A->B valid [1000, 5000)
+    db.upsert_edge(
+        a,
+        b,
+        10,
+        UpsertEdgeOptions {
+            valid_from: Some(1000),
+            valid_to: Some(5000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     db.flush().unwrap();
 
-    // Edge in memtable: A→C valid [3000, 9000)
-    db.upsert_edge(a, c, 10, BTreeMap::new(), 1.0, Some(3000), Some(9000))
-        .unwrap();
+    // Edge in memtable: A->C valid [3000, 9000)
+    db.upsert_edge(
+        a,
+        c,
+        10,
+        UpsertEdgeOptions {
+            valid_from: Some(3000),
+            valid_to: Some(9000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
-    // Always-valid edge in memtable: A→D (explicit valid_from=0 means always-valid)
-    db.upsert_edge(a, d, 10, BTreeMap::new(), 1.0, Some(0), None)
-        .unwrap();
+    // Always-valid edge in memtable: A->D (explicit valid_from=0 means always-valid)
+    db.upsert_edge(
+        a,
+        d,
+        10,
+        UpsertEdgeOptions {
+            valid_from: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // at_epoch=2000: B (segment) + D (always-valid)
     let n = db
-        .neighbors(a, Direction::Outgoing, None, 0, Some(2000), None)
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(2000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let ids: Vec<u64> = n.iter().map(|e| e.node_id).collect();
     assert!(ids.contains(&b), "B should be visible at t=2000");
@@ -384,13 +478,25 @@ fn test_temporal_edges_cross_source() {
 
     // at_epoch=4000: all three
     let n = db
-        .neighbors(a, Direction::Outgoing, None, 0, Some(4000), None)
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(4000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(n.len(), 3);
 
     // at_epoch=6000: C (memtable) + D (always-valid)
     let n = db
-        .neighbors(a, Direction::Outgoing, None, 0, Some(6000), None)
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(6000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let ids: Vec<u64> = n.iter().map(|e| e.node_id).collect();
     assert!(!ids.contains(&b), "B should NOT be visible at t=6000");
@@ -398,12 +504,19 @@ fn test_temporal_edges_cross_source() {
     assert!(ids.contains(&d), "D (always-valid) should be visible");
 
     // Compact and re-verify
-    db.upsert_node(1, "filler", BTreeMap::new(), 1.0).unwrap();
+    db.upsert_node(1, "filler", UpsertNodeOptions::default())
+        .unwrap();
     db.flush().unwrap();
     db.compact().unwrap();
 
     let n = db
-        .neighbors(a, Direction::Outgoing, None, 0, Some(4000), None)
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(4000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(
         n.len(),

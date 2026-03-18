@@ -19,8 +19,8 @@ describe('degree (sync)', () => {
     a = db.upsertNode(1, 'a');
     b = db.upsertNode(1, 'b');
     c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10, undefined, 2.0);
-    db.upsertEdge(a, c, 20, undefined, 3.0);
+    db.upsertEdge(a, b, 10, { weight: 2.0 });
+    db.upsertEdge(a, c, 20, { weight: 3.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -30,20 +30,20 @@ describe('degree (sync)', () => {
   });
 
   it('returns incoming degree', () => {
-    assert.equal(db.degree(a, 'incoming'), 0);
-    assert.equal(db.degree(b, 'incoming'), 1);
+    assert.equal(db.degree(a, { direction: 'incoming' }), 0);
+    assert.equal(db.degree(b, { direction: 'incoming' }), 1);
   });
 
   it('returns both direction degree', () => {
-    assert.equal(db.degree(a, 'both'), 2);
-    assert.equal(db.degree(b, 'both'), 1);
+    assert.equal(db.degree(a, { direction: 'both' }), 2);
+    assert.equal(db.degree(b, { direction: 'both' }), 1);
   });
 
   it('filters by type', () => {
-    assert.equal(db.degree(a, 'outgoing', [10]), 1);
-    assert.equal(db.degree(a, 'outgoing', [20]), 1);
-    assert.equal(db.degree(a, 'outgoing', [10, 20]), 2);
-    assert.equal(db.degree(a, 'outgoing', [99]), 0);
+    assert.equal(db.degree(a, { direction: 'outgoing', typeFilter: [10] }), 1);
+    assert.equal(db.degree(a, { direction: 'outgoing', typeFilter: [20] }), 1);
+    assert.equal(db.degree(a, { direction: 'outgoing', typeFilter: [10, 20] }), 2);
+    assert.equal(db.degree(a, { direction: 'outgoing', typeFilter: [99] }), 0);
   });
 
   it('returns 0 for nonexistent node', () => {
@@ -61,8 +61,8 @@ describe('sumEdgeWeights (sync)', () => {
     a = db.upsertNode(1, 'a');
     b = db.upsertNode(1, 'b');
     c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10, undefined, 2.0);
-    db.upsertEdge(a, c, 10, undefined, 3.0);
+    db.upsertEdge(a, b, 10, { weight: 2.0 });
+    db.upsertEdge(a, c, 10, { weight: 3.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -79,10 +79,10 @@ describe('sumEdgeWeights (sync)', () => {
     const x = db2.upsertNode(1, 'x');
     const y = db2.upsertNode(1, 'y');
     const z = db2.upsertNode(1, 'z');
-    db2.upsertEdge(x, y, 10, undefined, 2.0);
-    db2.upsertEdge(x, z, 20, undefined, 5.0);
-    assert.ok(Math.abs(db2.sumEdgeWeights(x, 'outgoing', [10]) - 2.0) < 1e-6);
-    assert.ok(Math.abs(db2.sumEdgeWeights(x, 'outgoing', [20]) - 5.0) < 1e-6);
+    db2.upsertEdge(x, y, 10, { weight: 2.0 });
+    db2.upsertEdge(x, z, 20, { weight: 5.0 });
+    assert.ok(Math.abs(db2.sumEdgeWeights(x, { direction: 'outgoing', typeFilter: [10] }) - 2.0) < 1e-6);
+    assert.ok(Math.abs(db2.sumEdgeWeights(x, { direction: 'outgoing', typeFilter: [20] }) - 5.0) < 1e-6);
     db2.close();
   });
 
@@ -90,9 +90,9 @@ describe('sumEdgeWeights (sync)', () => {
     const db2 = freshDb(tmpDir, 'sum-ep');
     const x = db2.upsertNode(1, 'x');
     const y = db2.upsertNode(1, 'y');
-    db2.upsertEdge(x, y, 10, undefined, 3.0, 100, 200);
-    assert.ok(Math.abs(db2.sumEdgeWeights(x, 'outgoing', null, 150) - 3.0) < 1e-6);
-    assert.equal(db2.sumEdgeWeights(x, 'outgoing', null, 250), 0.0);
+    db2.upsertEdge(x, y, 10, { weight: 3.0, validFrom: 100, validTo: 200 });
+    assert.ok(Math.abs(db2.sumEdgeWeights(x, { direction: 'outgoing', atEpoch: 150 }) - 3.0) < 1e-6);
+    assert.equal(db2.sumEdgeWeights(x, { direction: 'outgoing', atEpoch: 250 }), 0.0);
     db2.close();
   });
 });
@@ -107,8 +107,8 @@ describe('avgEdgeWeight (sync)', () => {
     a = db.upsertNode(1, 'a');
     b = db.upsertNode(1, 'b');
     c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10, undefined, 2.0);
-    db.upsertEdge(a, c, 10, undefined, 4.0);
+    db.upsertEdge(a, b, 10, { weight: 2.0 });
+    db.upsertEdge(a, c, 10, { weight: 4.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -127,9 +127,9 @@ describe('avgEdgeWeight (sync)', () => {
     const x = db2.upsertNode(1, 'x');
     const y = db2.upsertNode(1, 'y');
     const z = db2.upsertNode(1, 'z');
-    db2.upsertEdge(x, y, 10, undefined, 2.0);
-    db2.upsertEdge(x, z, 20, undefined, 6.0);
-    const avg = db2.avgEdgeWeight(x, 'outgoing', [10]);
+    db2.upsertEdge(x, y, 10, { weight: 2.0 });
+    db2.upsertEdge(x, z, 20, { weight: 6.0 });
+    const avg = db2.avgEdgeWeight(x, { direction: 'outgoing', typeFilter: [10] });
     assert.ok(avg !== null);
     assert.ok(Math.abs(avg - 2.0) < 1e-6);
     db2.close();
@@ -139,11 +139,11 @@ describe('avgEdgeWeight (sync)', () => {
     const db2 = freshDb(tmpDir, 'avg-ep');
     const x = db2.upsertNode(1, 'x');
     const y = db2.upsertNode(1, 'y');
-    db2.upsertEdge(x, y, 10, undefined, 4.0, 100, 200);
-    const avg = db2.avgEdgeWeight(x, 'outgoing', null, 150);
+    db2.upsertEdge(x, y, 10, { weight: 4.0, validFrom: 100, validTo: 200 });
+    const avg = db2.avgEdgeWeight(x, { direction: 'outgoing', atEpoch: 150 });
     assert.ok(avg !== null);
     assert.ok(Math.abs(avg - 4.0) < 1e-6);
-    assert.equal(db2.avgEdgeWeight(x, 'outgoing', null, 250), null);
+    assert.equal(db2.avgEdgeWeight(x, { direction: 'outgoing', atEpoch: 250 }), null);
     db2.close();
   });
 });
@@ -188,7 +188,7 @@ describe('degrees batch (sync)', () => {
     const z = db2.upsertNode(1, 'z');
     db2.upsertEdge(x, y, 10);
     db2.upsertEdge(x, z, 20);
-    const results = db2.degrees([x], 'outgoing', [10]);
+    const results = db2.degrees([x], { direction: 'outgoing', typeFilter: [10] });
     const degX = results.find(r => r.nodeId === x);
     assert.ok(degX);
     assert.equal(degX.degree, 1);
@@ -199,12 +199,12 @@ describe('degrees batch (sync)', () => {
     const db2 = freshDb(tmpDir, 'degs-ep');
     const x = db2.upsertNode(1, 'x');
     const y = db2.upsertNode(1, 'y');
-    db2.upsertEdge(x, y, 10, undefined, 1.0, 100, 200);
-    const at150 = db2.degrees([x], 'outgoing', null, 150);
+    db2.upsertEdge(x, y, 10, { weight: 1.0, validFrom: 100, validTo: 200 });
+    const at150 = db2.degrees([x], { direction: 'outgoing', atEpoch: 150 });
     const degAt150 = at150.find(r => r.nodeId === x);
     assert.ok(degAt150);
     assert.equal(degAt150.degree, 1);
-    const at250 = db2.degrees([x], 'outgoing', null, 250);
+    const at250 = db2.degrees([x], { direction: 'outgoing', atEpoch: 250 });
     assert.equal(at250.length, 0);
     db2.close();
   });
@@ -220,17 +220,17 @@ describe('degree matches neighbors length', () => {
     a = db.upsertNode(1, 'a');
     b = db.upsertNode(1, 'b');
     c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10, undefined, 2.0);
-    db.upsertEdge(a, c, 20, undefined, 3.0);
-    db.upsertEdge(b, c, 10, undefined, 1.0);
+    db.upsertEdge(a, b, 10, { weight: 2.0 });
+    db.upsertEdge(a, c, 20, { weight: 3.0 });
+    db.upsertEdge(b, c, 10, { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('degree equals neighbors().length for each direction', () => {
     for (const dir of ['outgoing', 'incoming', 'both']) {
       for (const nid of [a, b, c]) {
-        const deg = db.degree(nid, dir);
-        const nbrs = db.neighbors(nid, dir);
+        const deg = db.degree(nid, { direction: dir });
+        const nbrs = db.neighbors(nid, { direction: dir });
         assert.equal(deg, nbrs.length,
           `mismatch node=${nid} dir=${dir}: degree=${deg} neighbors=${nbrs.length}`);
       }
@@ -247,7 +247,7 @@ describe('degree async', () => {
     db = freshDb(tmpDir, 'degasync');
     a = db.upsertNode(1, 'a');
     b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 10, undefined, 5.0);
+    db.upsertEdge(a, b, 10, { weight: 5.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -295,15 +295,15 @@ describe('degree temporal', () => {
 
   it('ignores expired edge', () => {
     const now = Date.now();
-    db.upsertEdge(a, b, 10, undefined, 1.0, now - 2000, now - 1000);
+    db.upsertEdge(a, b, 10, { weight: 1.0, validFrom: now - 2000, validTo: now - 1000 });
     assert.equal(db.degree(a), 0);
   });
 
   it('at_epoch selects valid window', () => {
     const c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, c, 20, undefined, 1.0, 100, 200);
-    assert.equal(db.degree(a, 'outgoing', null, 150), 1);
-    assert.equal(db.degree(a, 'outgoing', null, 250), 0);
-    assert.equal(db.degree(a, 'outgoing', null, 50), 0);
+    db.upsertEdge(a, c, 20, { weight: 1.0, validFrom: 100, validTo: 200 });
+    assert.equal(db.degree(a, { direction: 'outgoing', atEpoch: 150 }), 1);
+    assert.equal(db.degree(a, { direction: 'outgoing', atEpoch: 250 }), 0);
+    assert.equal(db.degree(a, { direction: 'outgoing', atEpoch: 50 }), 0);
   });
 });

@@ -32,7 +32,13 @@
     "include_weights_on_export": true,
     "shortest_path_nodes_min": 500,
     "shortest_path_nodes_divisor": 2,
-    "shortest_path_edge_offsets": [1, 7]
+    "shortest_path_edge_offsets": [1, 7],
+    "vector_dim": 64,
+    "vector_nodes_min": 500,
+    "vector_nodes_divisor": 20,
+    "vector_nnz": 12,
+    "vector_sparse_dims": 4096,
+    "vector_k": 10
   },
   "scenario_iteration_policy": {
     "default": {
@@ -94,6 +100,12 @@
       "warmup_min": 5,
       "iters_divisor": 2,
       "iters_min": 20
+    },
+    "S-VEC-001": {
+      "warmup_divisor": 4,
+      "warmup_min": 2,
+      "iters_divisor": 4,
+      "iters_min": 10
     }
   },
   "comparability": {
@@ -162,6 +174,9 @@
       "status": "comparable"
     },
     "S-TRAV-006": {
+      "status": "comparable"
+    },
+    "S-VEC-001": {
       "status": "comparable"
     }
   },

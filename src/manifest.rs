@@ -129,7 +129,12 @@ pub fn default_manifest() -> ManifestState {
         segments: Vec::new(),
         next_node_id: 1,
         next_edge_id: 1,
+        dense_vector: None,
         prune_policies: std::collections::BTreeMap::new(),
+        next_engine_seq: 0,
+        next_wal_generation_id: 0,
+        active_wal_generation_id: 0,
+        pending_flush_epochs: Vec::new(),
     }
 }
 
@@ -249,7 +254,25 @@ mod tests {
         assert!(m.segments.is_empty());
         assert_eq!(m.next_node_id, 1);
         assert_eq!(m.next_edge_id, 1);
+        assert!(m.dense_vector.is_none());
         assert!(m.prune_policies.is_empty());
+    }
+
+    #[test]
+    fn test_load_manifest_missing_dense_vector_defaults_to_none() {
+        let dir = TempDir::new().unwrap();
+        let legacy_json = r#"{
+  "version": 1,
+  "segments": [],
+  "next_node_id": 10,
+  "next_edge_id": 20,
+  "prune_policies": {}
+}"#;
+        fs::write(dir.path().join(MANIFEST_CURRENT), legacy_json).unwrap();
+
+        let loaded = load_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.next_node_id, 10);
+        assert!(loaded.dense_vector.is_none());
     }
 
     #[test]
