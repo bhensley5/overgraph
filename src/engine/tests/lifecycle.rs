@@ -124,18 +124,21 @@ fn test_open_canonicalizes_vector_payloads_from_wal_replay() {
     // Write directly to the active WAL generation file (gen 0)
     let mut writer = WalWriter::open_generation(&db_path, 0).unwrap();
     writer
-        .append(&WalOp::UpsertNode(NodeRecord {
-            id: 7,
-            type_id: 1,
-            key: "manual-vector".to_string(),
-            props: BTreeMap::new(),
-            created_at: 100,
-            updated_at: 101,
-            weight: 0.5,
-            dense_vector: Some(vec![0.1, 0.2, 0.3]),
-            sparse_vector: Some(vec![(4, 0.25), (2, 2.0), (4, 0.5), (7, 0.0)]),
-            last_write_seq: 0,
-        }), 1)
+        .append(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 7,
+                type_id: 1,
+                key: "manual-vector".to_string(),
+                props: BTreeMap::new(),
+                created_at: 100,
+                updated_at: 101,
+                weight: 0.5,
+                dense_vector: Some(vec![0.1, 0.2, 0.3]),
+                sparse_vector: Some(vec![(4, 0.25), (2, 2.0), (4, 0.5), (7, 0.0)]),
+                last_write_seq: 0,
+            }),
+            1,
+        )
         .unwrap();
     writer.sync().unwrap();
     drop(writer);
@@ -334,18 +337,21 @@ fn test_open_rejects_invalid_vector_payloads_from_wal_replay() {
     // Write directly to the active WAL generation file (gen 0)
     let mut writer = WalWriter::open_generation(&db_path, 0).unwrap();
     writer
-        .append(&WalOp::UpsertNode(NodeRecord {
-            id: 8,
-            type_id: 1,
-            key: "bad-vector".to_string(),
-            props: BTreeMap::new(),
-            created_at: 100,
-            updated_at: 101,
-            weight: 0.5,
-            dense_vector: Some(vec![0.1, 0.2, 0.3]),
-            sparse_vector: None,
-            last_write_seq: 0,
-        }), 1)
+        .append(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 8,
+                type_id: 1,
+                key: "bad-vector".to_string(),
+                props: BTreeMap::new(),
+                created_at: 100,
+                updated_at: 101,
+                weight: 0.5,
+                dense_vector: Some(vec![0.1, 0.2, 0.3]),
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            1,
+        )
         .unwrap();
     writer.sync().unwrap();
     drop(writer);
@@ -2614,6 +2620,8 @@ fn build_clean_compaction_fixture(engine: &mut DatabaseEngine) -> (Vec<u64>, Vec
     let mut all_node_ids = Vec::new();
     let mut all_edge_ids = Vec::new();
     let mut segment_starts = Vec::new();
+    let mut next_node_id = 1u64;
+    let mut next_edge_id = 1u64;
 
     for seg in 0..3u64 {
         let mut seg_node_ids = Vec::new();
@@ -2624,32 +2632,45 @@ fn build_clean_compaction_fixture(engine: &mut DatabaseEngine) -> (Vec<u64>, Vec
                 "color".to_string(),
                 PropValue::String(if i % 2 == 0 { "red" } else { "blue" }.to_string()),
             );
-            let id = engine
-                .upsert_node(
-                    1,
-                    &format!("s{}_n{}", seg, i),
-                    UpsertNodeOptions {
-                        props,
-                        ..Default::default()
-                    },
-                )
+            let id = next_node_id;
+            next_node_id += 1;
+            let created_at = 1_000 + (seg as i64 * 100) + (i as i64 * 2);
+            engine
+                .write_op(&WalOp::UpsertNode(NodeRecord {
+                    id,
+                    type_id: 1,
+                    key: format!("s{}_n{}", seg, i),
+                    props,
+                    created_at,
+                    updated_at: created_at + 1,
+                    weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
+                    last_write_seq: 0,
+                }))
                 .unwrap();
             seg_node_ids.push(id);
             all_node_ids.push(id);
         }
         segment_starts.push(seg_node_ids[0]);
         for i in 0..4 {
-            let eid = engine
-                .upsert_edge(
-                    seg_node_ids[i],
-                    seg_node_ids[i + 1],
-                    1,
-                    UpsertEdgeOptions {
-                        valid_from: Some(0),
-                        valid_to: Some(i64::MAX),
-                        ..Default::default()
-                    },
-                )
+            let eid = next_edge_id;
+            next_edge_id += 1;
+            let created_at = 5_000 + (seg as i64 * 100) + (i as i64 * 2);
+            engine
+                .write_op(&WalOp::UpsertEdge(EdgeRecord {
+                    id: eid,
+                    from: seg_node_ids[i],
+                    to: seg_node_ids[i + 1],
+                    type_id: 1,
+                    props: BTreeMap::new(),
+                    created_at,
+                    updated_at: created_at + 1,
+                    weight: 1.0,
+                    valid_from: 0,
+                    valid_to: i64::MAX,
+                    last_write_seq: 0,
+                }))
                 .unwrap();
             all_edge_ids.push(eid);
         }
@@ -2667,23 +2688,182 @@ fn assert_compacted_index_files_match(
 ) {
     let left_dir = segment_dir(left_db_dir, left.segments[0].segment_id);
     let right_dir = segment_dir(right_db_dir, right.segments[0].segment_id);
+    assert_segment_common_artifacts_match(&left_dir, &right_dir);
+}
+
+fn assert_segment_common_artifacts_match(left_dir: &std::path::Path, right_dir: &std::path::Path) {
     for filename in [
+        "format.ver",
         "key_index.dat",
         "node_type_index.dat",
         "edge_type_index.dat",
         "edge_triple_index.dat",
         "prop_index.dat",
+        "timestamp_index.dat",
         "adj_out.idx",
         "adj_out.dat",
         "adj_in.idx",
         "adj_in.dat",
         "tombstones.dat",
+        "node_prop_hashes.dat",
     ] {
         assert_eq!(
             std::fs::read(left_dir.join(filename)).unwrap(),
             std::fs::read(right_dir.join(filename)).unwrap(),
             "{} mismatch",
             filename
+        );
+    }
+
+    // Byte-identical vector artifacts (deterministic).
+    for filename in [
+        crate::segment_writer::NODE_VECTOR_META_FILENAME,
+        crate::segment_writer::NODE_DENSE_VECTOR_BLOB_FILENAME,
+        crate::segment_writer::NODE_SPARSE_VECTOR_BLOB_FILENAME,
+        crate::sparse_postings::SPARSE_POSTING_INDEX_FILENAME,
+        crate::sparse_postings::SPARSE_POSTINGS_FILENAME,
+    ] {
+        let left_exists = left_dir.join(filename).exists();
+        let right_exists = right_dir.join(filename).exists();
+        assert_eq!(left_exists, right_exists, "{} presence mismatch", filename);
+        if left_exists {
+            assert_eq!(
+                std::fs::read(left_dir.join(filename)).unwrap(),
+                std::fs::read(right_dir.join(filename)).unwrap(),
+                "{} mismatch",
+                filename
+            );
+        }
+    }
+
+    // HNSW files are non-deterministic (concurrent build) — check presence and
+    // structural integrity, not byte-identical content.
+    {
+        let left_meta_exists = left_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)
+            .exists();
+        let right_meta_exists = right_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)
+            .exists();
+        assert_eq!(
+            left_meta_exists, right_meta_exists,
+            "dense_hnsw_meta.dat presence mismatch"
+        );
+
+        let left_graph_exists = left_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)
+            .exists();
+        let right_graph_exists = right_dir
+            .join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)
+            .exists();
+        assert_eq!(
+            left_graph_exists, right_graph_exists,
+            "dense_hnsw_graph.dat presence mismatch"
+        );
+
+        if left_meta_exists {
+            for dir in [left_dir, right_dir] {
+                let meta =
+                    std::fs::read(dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)).unwrap();
+                let graph =
+                    std::fs::read(dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap();
+                // Verify non-empty and structurally valid (header parses, sizes consistent).
+                assert!(meta.len() >= 36, "HNSW meta too short in {}", dir.display());
+                assert!(!graph.is_empty(), "HNSW graph empty in {}", dir.display());
+                // Verify header magic and version.
+                assert_eq!(&meta[0..4], b"DHNW", "bad HNSW magic in {}", dir.display());
+                let version = u32::from_le_bytes(meta[4..8].try_into().unwrap());
+                assert_eq!(version, 1, "bad HNSW version in {}", dir.display());
+                let point_count = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                assert!(point_count > 0, "zero HNSW points in {}", dir.display());
+            }
+        }
+    }
+}
+
+fn assert_segment_metadata_semantics_match(left: &SegmentReader, right: &SegmentReader) {
+    assert_eq!(left.node_meta_count(), right.node_meta_count());
+    for index in 0..left.node_meta_count() as usize {
+        let left_meta = left.node_meta_at(index).unwrap();
+        let right_meta = right.node_meta_at(index).unwrap();
+        assert_eq!(left_meta.0, right_meta.0, "node {} id mismatch", index);
+        assert_eq!(
+            left_meta.2, right_meta.2,
+            "node {} data_len mismatch",
+            index
+        );
+        assert_eq!(left_meta.3, right_meta.3, "node {} type mismatch", index);
+        assert_eq!(
+            left_meta.4, right_meta.4,
+            "node {} updated_at mismatch",
+            index
+        );
+        assert_eq!(
+            left_meta.5.to_bits(),
+            right_meta.5.to_bits(),
+            "node {} weight mismatch",
+            index
+        );
+        assert_eq!(left_meta.6, right_meta.6, "node {} key_len mismatch", index);
+        assert_eq!(
+            left_meta.8, right_meta.8,
+            "node {} prop_hash_count mismatch",
+            index
+        );
+        assert_eq!(
+            left_meta.9, right_meta.9,
+            "node {} last_write_seq mismatch",
+            index
+        );
+
+        let left_vectors = left.node_vector_meta_at(index).unwrap();
+        let right_vectors = right.node_vector_meta_at(index).unwrap();
+        assert_eq!(
+            (left_vectors.1, left_vectors.3),
+            (right_vectors.1, right_vectors.3),
+            "node {} vector length mismatch",
+            index
+        );
+    }
+
+    assert_eq!(left.edge_meta_count(), right.edge_meta_count());
+    for index in 0..left.edge_meta_count() as usize {
+        let left_meta = left.edge_meta_at(index).unwrap();
+        let right_meta = right.edge_meta_at(index).unwrap();
+        assert_eq!(left_meta.0, right_meta.0, "edge {} id mismatch", index);
+        assert_eq!(
+            left_meta.2, right_meta.2,
+            "edge {} data_len mismatch",
+            index
+        );
+        assert_eq!(left_meta.3, right_meta.3, "edge {} from mismatch", index);
+        assert_eq!(left_meta.4, right_meta.4, "edge {} to mismatch", index);
+        assert_eq!(left_meta.5, right_meta.5, "edge {} type mismatch", index);
+        assert_eq!(
+            left_meta.6, right_meta.6,
+            "edge {} updated_at mismatch",
+            index
+        );
+        assert_eq!(
+            left_meta.7.to_bits(),
+            right_meta.7.to_bits(),
+            "edge {} weight mismatch",
+            index
+        );
+        assert_eq!(
+            left_meta.8, right_meta.8,
+            "edge {} valid_from mismatch",
+            index
+        );
+        assert_eq!(
+            left_meta.9, right_meta.9,
+            "edge {} valid_to mismatch",
+            index
+        );
+        assert_eq!(
+            left_meta.10, right_meta.10,
+            "edge {} last_write_seq mismatch",
+            index
         );
     }
 }
@@ -3203,9 +3383,199 @@ fn test_fast_merge_background_matches_sync() {
         );
     }
     assert_compacted_index_files_match(&sync_engine, &bg_engine, sync_dir.path(), bg_dir.path());
+    assert_segment_metadata_semantics_match(&sync_engine.segments[0], &bg_engine.segments[0]);
 
     sync_engine.close().unwrap();
     bg_engine.close().unwrap();
+}
+
+#[test]
+fn test_fast_merge_matches_single_flush_artifacts_for_vector_segments() {
+    let compact_dir = TempDir::new().unwrap();
+    let flush_dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        edge_uniqueness: true,
+        compact_after_n_flushes: 0,
+        dense_vector: Some(DenseVectorConfig {
+            dimension: 4,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig::default(),
+        }),
+        ..DbOptions::default()
+    };
+
+    let mut compact_engine = DatabaseEngine::open(compact_dir.path(), &opts).unwrap();
+    let mut flush_engine = DatabaseEngine::open(flush_dir.path(), &opts).unwrap();
+    let mut compact_node_ids = Vec::new();
+    let mut flush_node_ids = Vec::new();
+    let mut compact_edge_ids = Vec::new();
+    let mut flush_edge_ids = Vec::new();
+    let mut next_node_id = 1u64;
+    let mut next_edge_id = 1u64;
+
+    for seg in 0..3u64 {
+        let mut compact_seg_ids = Vec::new();
+        let mut flush_seg_ids = Vec::new();
+        for i in 0..6u64 {
+            let dense_vector = vec![
+                1.0 + seg as f32 * 0.1,
+                0.2 + i as f32 * 0.03,
+                0.4 + seg as f32 * 0.05,
+                0.6 + i as f32 * 0.02,
+            ];
+            let sparse_vector = vec![
+                (seg as u32, 1.0 + i as f32 * 0.1),
+                (seg as u32 + 10, 0.5 + seg as f32 * 0.05),
+            ];
+            let mut props = BTreeMap::new();
+            props.insert("seg".to_string(), PropValue::UInt(seg));
+            props.insert("slot".to_string(), PropValue::UInt(i));
+            let node_id = next_node_id;
+            next_node_id += 1;
+            let created_at = 10_000 + (seg as i64 * 100) + (i as i64 * 2);
+            let compact_node = NodeRecord {
+                id: node_id,
+                type_id: 1,
+                key: format!("s{}_n{}", seg, i),
+                props: props.clone(),
+                created_at,
+                updated_at: created_at + 1,
+                weight: 1.0,
+                dense_vector: Some(dense_vector.clone()),
+                sparse_vector: Some(sparse_vector.clone()),
+                last_write_seq: 0,
+            };
+            let flush_node = NodeRecord {
+                props,
+                dense_vector: Some(dense_vector),
+                sparse_vector: Some(sparse_vector),
+                ..compact_node.clone()
+            };
+
+            compact_engine
+                .write_op(&WalOp::UpsertNode(compact_node))
+                .unwrap();
+            flush_engine
+                .write_op(&WalOp::UpsertNode(flush_node))
+                .unwrap();
+
+            let compact_id = node_id;
+            let flush_id = node_id;
+            compact_seg_ids.push(compact_id);
+            flush_seg_ids.push(flush_id);
+            compact_node_ids.push(compact_id);
+            flush_node_ids.push(flush_id);
+        }
+        for i in 0..3usize {
+            let edge_id = next_edge_id;
+            next_edge_id += 1;
+            let created_at = 20_000 + (seg as i64 * 100) + (i as i64 * 2);
+            let compact_edge = EdgeRecord {
+                id: edge_id,
+                from: compact_seg_ids[i],
+                to: compact_seg_ids[i + 1],
+                type_id: 1,
+                props: BTreeMap::new(),
+                created_at,
+                updated_at: created_at + 1,
+                weight: 0.5 + seg as f32 * 0.1 + i as f32 * 0.05,
+                valid_from: seg as i64,
+                valid_to: i64::MAX,
+                last_write_seq: 0,
+            };
+            let flush_edge = EdgeRecord {
+                from: flush_seg_ids[i],
+                to: flush_seg_ids[i + 1],
+                ..compact_edge.clone()
+            };
+
+            compact_engine
+                .write_op(&WalOp::UpsertEdge(compact_edge))
+                .unwrap();
+            flush_engine
+                .write_op(&WalOp::UpsertEdge(flush_edge))
+                .unwrap();
+
+            let compact_edge_id = edge_id;
+            let flush_edge_id = edge_id;
+            compact_edge_ids.push(compact_edge_id);
+            flush_edge_ids.push(flush_edge_id);
+        }
+        compact_engine.flush().unwrap();
+    }
+    flush_engine.flush().unwrap();
+
+    assert_eq!(compact_node_ids, flush_node_ids);
+    assert_eq!(compact_edge_ids, flush_edge_ids);
+    assert_eq!(
+        compaction_path_for(&compact_engine),
+        CompactionPath::FastMerge
+    );
+
+    compact_engine.compact().unwrap().unwrap();
+
+    let compact_nodes = compact_engine.get_nodes(&compact_node_ids).unwrap();
+    let flush_nodes = flush_engine.get_nodes(&flush_node_ids).unwrap();
+    assert_node_batches_match(&compact_nodes, &flush_nodes);
+
+    let compact_edges = compact_engine.get_edges(&compact_edge_ids).unwrap();
+    let flush_edges = flush_engine.get_edges(&flush_edge_ids).unwrap();
+    assert_edge_batches_match(&compact_edges, &flush_edges);
+
+    let compact_seg_dir = segment_dir(compact_dir.path(), compact_engine.segments[0].segment_id);
+    let flush_seg_dir = segment_dir(flush_dir.path(), flush_engine.segments[0].segment_id);
+    assert_segment_common_artifacts_match(&compact_seg_dir, &flush_seg_dir);
+    assert_segment_metadata_semantics_match(&compact_engine.segments[0], &flush_engine.segments[0]);
+
+    // Semantic HNSW parity: both engines should produce equivalent search results.
+    let queries: Vec<Vec<f32>> = vec![
+        vec![1.0, 0.2, 0.4, 0.6],
+        vec![0.5, 0.5, 0.5, 0.5],
+        vec![1.1, 0.35, 0.45, 0.7],
+    ];
+    for query in &queries {
+        let request = VectorSearchRequest {
+            mode: VectorSearchMode::Dense,
+            dense_query: Some(query.clone()),
+            sparse_query: None,
+            k: 5,
+            type_filter: None,
+            ef_search: None,
+            scope: None,
+            dense_weight: None,
+            sparse_weight: None,
+            fusion_mode: None,
+        };
+        let compact_hits = compact_engine.vector_search(&request).unwrap();
+        let flush_hits = flush_engine.vector_search(&request).unwrap();
+        assert_eq!(
+            compact_hits.len(),
+            flush_hits.len(),
+            "hit count mismatch for query {:?}",
+            query
+        );
+        // Top-1 must match (strongest invariant).
+        assert_eq!(
+            compact_hits[0].node_id, flush_hits[0].node_id,
+            "top-1 mismatch for query {:?}: compact={} flush={}",
+            query, compact_hits[0].node_id, flush_hits[0].node_id
+        );
+        // High overlap at top-k.
+        let compact_ids: std::collections::HashSet<u64> =
+            compact_hits.iter().map(|h| h.node_id).collect();
+        let flush_ids: std::collections::HashSet<u64> =
+            flush_hits.iter().map(|h| h.node_id).collect();
+        let overlap = compact_ids.intersection(&flush_ids).count();
+        assert!(
+            overlap >= 3,
+            "low overlap ({}/5) for query {:?}",
+            overlap,
+            query
+        );
+    }
+
+    compact_engine.close().unwrap();
+    flush_engine.close().unwrap();
 }
 
 #[test]
@@ -3517,6 +3887,61 @@ fn test_bg_compact_basic() {
 }
 
 #[test]
+fn test_write_path_applies_finished_bg_compact() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        compact_after_n_flushes: 2,
+        memtable_flush_threshold: 0,
+        memtable_hard_cap_bytes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    for i in 0..10 {
+        engine
+            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .unwrap();
+    }
+    engine.flush().unwrap();
+    for i in 0..10 {
+        engine
+            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .unwrap();
+    }
+    engine.flush().unwrap();
+
+    assert!(engine.bg_compact.is_some());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine
+        .bg_compact
+        .as_ref()
+        .is_some_and(|bg| !bg.handle.is_finished())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background compaction did not finish in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(engine.bg_compact.is_some());
+    assert_eq!(engine.segments.len(), 2);
+
+    engine
+        .upsert_node(1, "c0", UpsertNodeOptions::default())
+        .unwrap();
+
+    assert!(
+        engine.bg_compact.is_none(),
+        "next write should reap finished background compaction"
+    );
+    assert_eq!(engine.segments.len(), 1);
+
+    engine.close().unwrap();
+}
+
+#[test]
 fn test_bg_compact_writes_during() {
     // Write more data while background compaction is running. Verify everything
     // is intact after close/reopen.
@@ -3569,6 +3994,66 @@ fn test_bg_compact_writes_during() {
             );
         }
     }
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_flushes_while_bg_compact_is_outstanding_count_toward_next_run() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        compact_after_n_flushes: 2,
+        memtable_flush_threshold: 0,
+        memtable_hard_cap_bytes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    for i in 0..10 {
+        engine
+            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .unwrap();
+    }
+    engine.flush().unwrap();
+    for i in 0..10 {
+        engine
+            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .unwrap();
+    }
+    engine.flush().unwrap();
+
+    assert!(engine.bg_compact.is_some());
+    assert_eq!(engine.flush_count_since_last_compact, 0);
+
+    for i in 0..10 {
+        engine
+            .upsert_node(1, &format!("c{}", i), UpsertNodeOptions::default())
+            .unwrap();
+    }
+    engine.flush().unwrap();
+
+    assert_eq!(
+        engine.flush_count_since_last_compact, 1,
+        "flushes published while background compaction is outstanding should count toward the next auto-compaction"
+    );
+
+    engine.wait_for_bg_compact();
+    assert_eq!(engine.segments.len(), 2);
+
+    for i in 0..10 {
+        engine
+            .upsert_node(1, &format!("d{}", i), UpsertNodeOptions::default())
+            .unwrap();
+    }
+    engine.flush().unwrap();
+
+    assert!(
+        engine.bg_compact.is_some(),
+        "second auto-compaction should start once the post-compaction flush count reaches the threshold"
+    );
+    engine.wait_for_bg_compact();
+    assert_eq!(engine.segments.len(), 1);
 
     engine.close().unwrap();
 }
@@ -3736,9 +4221,9 @@ fn test_bg_compact_manual_after_bg() {
     }
     engine.flush().unwrap();
 
-    // Manual compact. Should first wait for bg compact, then compact everything
-    let stats = engine.compact().unwrap();
-    assert!(stats.is_some());
+    // Manual compact. With re-trigger scheduling, auto-compaction may have
+    // already reduced segments — compact() returns None if < 2 remain.
+    let _stats = engine.compact().unwrap();
     assert_eq!(engine.segments.len(), 1);
 
     // All data accessible
@@ -5584,8 +6069,14 @@ fn test_last_write_seq_exact_across_freeze_reopen() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let f = db.get_node_by_key(1, "frozen_node").unwrap().unwrap();
         let a = db.get_node_by_key(1, "active_node").unwrap().unwrap();
-        assert_eq!(f.last_write_seq, seq_frozen, "frozen seq changed after flush+reopen");
-        assert_eq!(a.last_write_seq, seq_active, "active seq changed after flush+reopen");
+        assert_eq!(
+            f.last_write_seq, seq_frozen,
+            "frozen seq changed after flush+reopen"
+        );
+        assert_eq!(
+            a.last_write_seq, seq_active,
+            "active seq changed after flush+reopen"
+        );
         db.close().unwrap();
     }
 }
@@ -11115,7 +11606,8 @@ fn test_async_flush_latency_profile() {
 
         for i in 0..WRITE_COUNT {
             let start = Instant::now();
-            db.upsert_node(1, &format!("n{}", i), write_opts(i)).unwrap();
+            db.upsert_node(1, &format!("n{}", i), write_opts(i))
+                .unwrap();
             if (i + 1) % SYNC_FLUSH_INTERVAL == 0 {
                 db.flush().unwrap();
             }
@@ -11140,7 +11632,8 @@ fn test_async_flush_latency_profile() {
 
         for i in 0..WRITE_COUNT {
             let start = Instant::now();
-            db.upsert_node(1, &format!("n{}", i), write_opts(i)).unwrap();
+            db.upsert_node(1, &format!("n{}", i), write_opts(i))
+                .unwrap();
             latencies.push(start.elapsed().as_micros());
         }
         db.close().unwrap();
@@ -11151,7 +11644,10 @@ fn test_async_flush_latency_profile() {
     let sync_blocked = sync_latencies.iter().filter(|&&l| l > 1000).count();
     let async_blocked = async_latencies.iter().filter(|&&l| l > 1000).count();
 
-    eprintln!("\n=== Async Flush Latency Profile ({} writes, threshold=1MB) ===\n", WRITE_COUNT);
+    eprintln!(
+        "\n=== Async Flush Latency Profile ({} writes, threshold=1MB) ===\n",
+        WRITE_COUNT
+    );
     eprintln!("sync_baseline (flush every {}):", SYNC_FLUSH_INTERVAL);
     eprintln!(
         "  p50={:>6}µs  p95={:>6}µs  p99={:>6}µs  max={:>6}µs  blocked(>1ms)={}",
@@ -11189,7 +11685,8 @@ fn test_async_flush_latency_profile() {
         sync_latencies.last().unwrap(),
         async_latencies.last().unwrap(),
         if *sync_latencies.last().unwrap() > 0 {
-            (1.0 - *async_latencies.last().unwrap() as f64 / *sync_latencies.last().unwrap() as f64) * 100.0
+            (1.0 - *async_latencies.last().unwrap() as f64 / *sync_latencies.last().unwrap() as f64)
+                * 100.0
         } else {
             0.0
         }

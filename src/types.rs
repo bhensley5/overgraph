@@ -1051,6 +1051,8 @@ pub struct Subgraph {
 /// Options for Personalized PageRank computation.
 #[derive(Debug, Clone)]
 pub struct PprOptions {
+    /// Algorithm used for Personalized PageRank computation.
+    pub algorithm: PprAlgorithm,
     /// Damping factor (probability of following an edge vs. teleporting).
     /// Default: 0.85. Range: (0.0, 1.0).
     pub damping_factor: f64,
@@ -1058,22 +1060,45 @@ pub struct PprOptions {
     pub max_iterations: u32,
     /// Convergence threshold (L1 norm of rank delta). Default: 1e-6.
     pub epsilon: f64,
+    /// Residual stopping tolerance for approximate forward-push PPR.
+    /// Default: 1e-5. Used only when `algorithm` is `ApproxForwardPush`.
+    pub approx_residual_tolerance: f64,
     /// Optional edge type filter. Only walk edges of these types.
     pub edge_type_filter: Option<Vec<u32>>,
     /// Optional top-k cutoff on returned results.
     pub max_results: Option<usize>,
 }
 
+/// Algorithm choices for Personalized PageRank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PprAlgorithm {
+    ExactPowerIteration,
+    ApproxForwardPush,
+}
+
 impl Default for PprOptions {
     fn default() -> Self {
         PprOptions {
+            algorithm: PprAlgorithm::ExactPowerIteration,
             damping_factor: 0.85,
             max_iterations: 20,
             epsilon: 1e-6,
+            approx_residual_tolerance: 1e-5,
             edge_type_filter: None,
             max_results: None,
         }
     }
+}
+
+/// Approximate PPR metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PprApproxMeta {
+    /// Residual tolerance used for forward push.
+    pub residual_tolerance: f64,
+    /// Number of push operations performed.
+    pub pushes: u64,
+    /// Maximum residual mass remaining on any node when the algorithm stopped.
+    pub max_remaining_residual: f64,
 }
 
 /// Result of a Personalized PageRank computation.
@@ -1085,6 +1110,10 @@ pub struct PprResult {
     pub iterations: u32,
     /// Whether the computation converged (L1 delta < epsilon).
     pub converged: bool,
+    /// Algorithm used to produce this result.
+    pub algorithm: PprAlgorithm,
+    /// Approximate-mode metadata when `algorithm` is `ApproxForwardPush`.
+    pub approx: Option<PprApproxMeta>,
 }
 
 /// Options for graph adjacency export.
@@ -1143,8 +1172,8 @@ pub enum WalSyncMode {
 impl Default for WalSyncMode {
     fn default() -> Self {
         WalSyncMode::GroupCommit {
-            interval_ms: 10,
-            soft_trigger_bytes: 4 * 1024 * 1024, // 4 MB
+            interval_ms: 50,
+            soft_trigger_bytes: 2 * 1024 * 1024, // 2 MB
             hard_cap_bytes: 16 * 1024 * 1024,    // 16 MB
         }
     }
@@ -1182,7 +1211,7 @@ impl Default for DbOptions {
             memtable_flush_threshold: 128 * 1024 * 1024, // 128MB
             edge_uniqueness: false,
             dense_vector: None,
-            compact_after_n_flushes: 3,
+            compact_after_n_flushes: 4,
             wal_sync_mode: WalSyncMode::default(),
             memtable_hard_cap_bytes: 512 * 1024 * 1024, // 512MB (4x flush threshold)
             max_immutable_memtables: 4,
@@ -1200,12 +1229,12 @@ mod tests {
         assert_eq!(opts.memtable_flush_threshold, 128 * 1024 * 1024);
         assert!(!opts.edge_uniqueness);
         assert!(opts.dense_vector.is_none());
-        assert_eq!(opts.compact_after_n_flushes, 3);
+        assert_eq!(opts.compact_after_n_flushes, 4);
         assert!(matches!(
             opts.wal_sync_mode,
             WalSyncMode::GroupCommit {
-                interval_ms: 10,
-                soft_trigger_bytes: 4194304,
+                interval_ms: 50,
+                soft_trigger_bytes: 2097152,
                 hard_cap_bytes: 16777216,
             }
         ));

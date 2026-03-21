@@ -1,6 +1,7 @@
 use crate::dense_hnsw::{write_dense_hnsw_index_from_points, DensePointInput};
 use crate::error::EngineError;
 use crate::memtable::{AdjEntry, Memtable};
+use crate::parallel::engine_cpu_try_join;
 use crate::segment_reader::SegmentReader;
 use crate::sparse_postings::write_sparse_posting_files;
 use crate::types::*;
@@ -93,18 +94,29 @@ pub fn write_segment(
 
     let node_data = write_nodes_dat(seg_dir, nodes)?;
     let edge_data = write_edges_dat(seg_dir, edges)?;
-    write_adjacency_index(seg_dir, "adj_out", memtable.adj_out())?;
-    write_adjacency_index(seg_dir, "adj_in", memtable.adj_in())?;
-    write_key_index(seg_dir, nodes)?;
-    write_type_index(seg_dir, "node_type_index", memtable.type_node_index())?;
-    write_type_index(seg_dir, "edge_type_index", memtable.type_edge_index())?;
-    write_prop_index(seg_dir, memtable.prop_node_index())?;
-    write_edge_triple_index(seg_dir, edges)?;
-    write_timestamp_index(seg_dir, memtable.time_node_index())?;
-    write_tombstones(seg_dir, memtable.deleted_nodes(), memtable.deleted_edges())?;
-    let dense_points = write_sidecars(seg_dir, &node_data, &edge_data, nodes, edges)?;
-    write_dense_hnsw_index_from_points(seg_dir, dense_config, dense_points)?;
-    write_sparse_posting_index(seg_dir, nodes)?;
+    run_index_fanout(
+        || {
+            write_key_index(seg_dir, nodes)?;
+            write_type_index(seg_dir, "node_type_index", memtable.type_node_index())?;
+            write_prop_index(seg_dir, memtable.prop_node_index())?;
+            write_timestamp_index(seg_dir, memtable.time_node_index())?;
+            Ok(())
+        },
+        || {
+            write_adjacency_index(seg_dir, "adj_out", memtable.adj_out())?;
+            write_adjacency_index(seg_dir, "adj_in", memtable.adj_in())?;
+            write_type_index(seg_dir, "edge_type_index", memtable.type_edge_index())?;
+            write_edge_triple_index(seg_dir, edges)?;
+            write_tombstones(seg_dir, memtable.deleted_nodes(), memtable.deleted_edges())?;
+            Ok(())
+        },
+        || {
+            let dense_points = write_sidecars(seg_dir, &node_data, &edge_data, nodes, edges)?;
+            write_dense_hnsw_index_from_points(seg_dir, dense_config, dense_points)?;
+            Ok(())
+        },
+        || write_sparse_posting_index(seg_dir, nodes),
+    )?;
     write_format_version(seg_dir)?;
 
     // fsync all files and the directory
@@ -115,6 +127,23 @@ pub fn write_segment(
         node_count: nodes.len() as u64,
         edge_count: edges.len() as u64,
     })
+}
+
+fn run_index_fanout<NodeBranch, EdgeBranch, VectorBranch, SparseBranch>(
+    node_branch: NodeBranch,
+    edge_branch: EdgeBranch,
+    vector_branch: VectorBranch,
+    sparse_branch: SparseBranch,
+) -> Result<(), EngineError>
+where
+    NodeBranch: FnOnce() -> Result<(), EngineError> + Send,
+    EdgeBranch: FnOnce() -> Result<(), EngineError> + Send,
+    VectorBranch: FnOnce() -> Result<(), EngineError> + Send,
+    SparseBranch: FnOnce() -> Result<(), EngineError> + Send,
+{
+    let _ = engine_cpu_try_join(node_branch, edge_branch)?;
+    let _ = engine_cpu_try_join(vector_branch, sparse_branch)?;
+    Ok(())
 }
 
 /// nodes.dat format:
@@ -1392,18 +1421,29 @@ pub(crate) fn write_indexes_from_metadata(
     edge_metas: &[CompactEdgeMeta],
     dense_config: Option<&DenseVectorConfig>,
 ) -> Result<(), EngineError> {
-    write_key_index_from_meta(seg_dir, segments, node_metas)?;
-    write_node_type_index_from_meta(seg_dir, node_metas)?;
-    write_edge_type_index_from_meta(seg_dir, edge_metas)?;
-    write_edge_triple_index_from_meta(seg_dir, edge_metas)?;
-    write_adjacency_from_meta(seg_dir, "adj_out", edge_metas, true)?;
-    write_adjacency_from_meta(seg_dir, "adj_in", edge_metas, false)?;
-    write_prop_index_from_meta(seg_dir, segments, node_metas)?;
-    write_timestamp_index_from_meta(seg_dir, node_metas)?;
-    write_empty_tombstones(seg_dir)?;
-    let dense_points = write_sidecars_from_meta(seg_dir, segments, node_metas, edge_metas)?;
-    write_dense_hnsw_index_from_points(seg_dir, dense_config, dense_points)?;
-    write_sparse_posting_index_from_meta(seg_dir, segments, node_metas)?;
+    run_index_fanout(
+        || {
+            write_key_index_from_meta(seg_dir, segments, node_metas)?;
+            write_node_type_index_from_meta(seg_dir, node_metas)?;
+            write_prop_index_from_meta(seg_dir, segments, node_metas)?;
+            write_timestamp_index_from_meta(seg_dir, node_metas)?;
+            Ok(())
+        },
+        || {
+            write_adjacency_from_meta(seg_dir, "adj_out", edge_metas, true)?;
+            write_adjacency_from_meta(seg_dir, "adj_in", edge_metas, false)?;
+            write_edge_type_index_from_meta(seg_dir, edge_metas)?;
+            write_edge_triple_index_from_meta(seg_dir, edge_metas)?;
+            write_empty_tombstones(seg_dir)?;
+            Ok(())
+        },
+        || {
+            let dense_points = write_sidecars_from_meta(seg_dir, segments, node_metas, edge_metas)?;
+            write_dense_hnsw_index_from_points(seg_dir, dense_config, dense_points)?;
+            Ok(())
+        },
+        || write_sparse_posting_index_from_meta(seg_dir, segments, node_metas),
+    )?;
     write_format_version(seg_dir)?;
     fsync_dir(seg_dir)?;
     Ok(())

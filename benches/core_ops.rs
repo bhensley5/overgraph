@@ -1,9 +1,9 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use overgraph::{
-    AllShortestPathsOptions, DatabaseEngine, DbOptions, DegreeOptions, EdgeInput, ExportOptions,
-    IsConnectedOptions, NeighborOptions, NodeInput, PageRequest, PprOptions, PropValue,
-    PrunePolicy, ShortestPathOptions, TopKOptions, TraverseOptions, UpsertEdgeOptions,
-    UpsertNodeOptions, WalSyncMode,
+    AllShortestPathsOptions, DatabaseEngine, DbOptions, DegreeOptions, Direction, EdgeInput,
+    ExportOptions, IsConnectedOptions, NeighborOptions, NodeInput, PageRequest, PprAlgorithm,
+    PprOptions, PropValue, PrunePolicy, ShortestPathOptions, TopKOptions, TraverseOptions,
+    UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
 };
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -167,6 +167,71 @@ fn build_hub_graph(engine: &mut DatabaseEngine, n: usize) -> u64 {
     hub
 }
 
+/// Build a hub graph that stresses Direction::Both self-loop dedup:
+/// - bidirectional hub <-> spoke edges
+/// - many hub self-loops (distinct type IDs to satisfy uniqueness)
+fn build_hub_both_selfloop_graph(
+    engine: &mut DatabaseEngine,
+    spoke_count: usize,
+    self_loop_count: usize,
+) -> u64 {
+    let mut inputs: Vec<NodeInput> = vec![NodeInput {
+        type_id: 1,
+        key: "hub_both".to_string(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }];
+    for i in 0..spoke_count {
+        inputs.push(NodeInput {
+            type_id: 1,
+            key: format!("both_t{}", i),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+    let hub = ids[0];
+
+    let mut edges: Vec<EdgeInput> = Vec::with_capacity(spoke_count * 2 + self_loop_count);
+    for &target in &ids[1..] {
+        edges.push(EdgeInput {
+            from: hub,
+            to: target,
+            type_id: 1,
+            props: BTreeMap::new(),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        });
+        edges.push(EdgeInput {
+            from: target,
+            to: hub,
+            type_id: 1,
+            props: BTreeMap::new(),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        });
+    }
+    for i in 0..self_loop_count {
+        edges.push(EdgeInput {
+            from: hub,
+            to: hub,
+            type_id: 10_000 + i as u32,
+            props: BTreeMap::new(),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        });
+    }
+    engine.batch_upsert_edges(&edges).unwrap();
+    hub
+}
+
 fn bench_neighbors(c: &mut Criterion) {
     c.bench_function("neighbors_10_edges", |b| {
         let (_dir, mut engine) = temp_db();
@@ -199,6 +264,58 @@ fn bench_neighbors(c: &mut Criterion) {
         engine.flush().unwrap();
         b.iter(|| {
             engine.neighbors(hub, &NeighborOptions::default()).unwrap();
+        });
+    });
+
+    c.bench_function("neighbors_both_selfloops_100", |b| {
+        let (_dir, mut engine) = temp_db();
+        let hub = build_hub_both_selfloop_graph(&mut engine, 100, 100);
+        let opts = NeighborOptions {
+            direction: Direction::Both,
+            ..NeighborOptions::default()
+        };
+        b.iter(|| {
+            engine.neighbors(hub, &opts).unwrap();
+        });
+    });
+
+    c.bench_function("neighbors_both_selfloops_100_segment", |b| {
+        let (_dir, mut engine) = temp_db();
+        let hub = build_hub_both_selfloop_graph(&mut engine, 100, 100);
+        engine.flush().unwrap();
+        let opts = NeighborOptions {
+            direction: Direction::Both,
+            ..NeighborOptions::default()
+        };
+        b.iter(|| {
+            engine.neighbors(hub, &opts).unwrap();
+        });
+    });
+
+    c.bench_function("neighbors_both_selfloops_100_limit_50", |b| {
+        let (_dir, mut engine) = temp_db();
+        let hub = build_hub_both_selfloop_graph(&mut engine, 100, 100);
+        let opts = NeighborOptions {
+            direction: Direction::Both,
+            limit: Some(50),
+            ..NeighborOptions::default()
+        };
+        b.iter(|| {
+            engine.neighbors(hub, &opts).unwrap();
+        });
+    });
+
+    c.bench_function("neighbors_both_selfloops_100_limit_50_segment", |b| {
+        let (_dir, mut engine) = temp_db();
+        let hub = build_hub_both_selfloop_graph(&mut engine, 100, 100);
+        engine.flush().unwrap();
+        let opts = NeighborOptions {
+            direction: Direction::Both,
+            limit: Some(50),
+            ..NeighborOptions::default()
+        };
+        b.iter(|| {
+            engine.neighbors(hub, &opts).unwrap();
         });
     });
 }
@@ -1311,6 +1428,365 @@ fn bench_advanced_queries(c: &mut Criterion) {
             engine.personalized_pagerank(&[seed], &opts).unwrap();
         });
     });
+
+    let build_ppr_graph_50k = |engine: &mut DatabaseEngine| -> Vec<u64> {
+        let node_inputs: Vec<NodeInput> = (0..50_000u64)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("ppr50k_{}", i),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect();
+        let node_ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+        let edge_inputs: Vec<EdgeInput> = (0..50_000usize)
+            .flat_map(|i| {
+                [
+                    EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[(i + 1) % 50_000],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                    EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[(i + 7) % 50_000],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 0.7,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                ]
+            })
+            .collect();
+        engine.batch_upsert_edges(&edge_inputs).unwrap();
+        node_ids
+    };
+
+    group.bench_function("personalized_pagerank_50000_nodes", |b| {
+        let (_dir, mut engine) = temp_db();
+        let node_ids = build_ppr_graph_50k(&mut engine);
+        let opts = PprOptions {
+            max_results: Some(100),
+            ..PprOptions::default()
+        };
+        let seed = node_ids[0];
+        b.iter(|| {
+            engine.personalized_pagerank(&[seed], &opts).unwrap();
+        });
+    });
+
+    group.bench_function("personalized_pagerank_50000_nodes_segment", |b| {
+        let (_dir, mut engine) = temp_db();
+        let node_ids = build_ppr_graph_50k(&mut engine);
+        engine.flush().unwrap();
+        let opts = PprOptions {
+            max_results: Some(100),
+            ..PprOptions::default()
+        };
+        let seed = node_ids[0];
+        b.iter(|| {
+            engine.personalized_pagerank(&[seed], &opts).unwrap();
+        });
+    });
+
+    let build_ppr_graph_community_hubs_20k = |engine: &mut DatabaseEngine| -> Vec<u64> {
+        const COMMUNITY_COUNT: usize = 40;
+        const COMMUNITY_SIZE: usize = 500;
+        const TOTAL_NODES: usize = COMMUNITY_COUNT * COMMUNITY_SIZE;
+
+        let node_inputs: Vec<NodeInput> = (0..TOTAL_NODES as u64)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("pprch20k_{}", i),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect();
+        let node_ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+
+        let global_hubs: Vec<usize> = (0..8usize)
+            .map(|community| community * COMMUNITY_SIZE)
+            .collect();
+        let edge_inputs: Vec<EdgeInput> = (0..TOTAL_NODES)
+            .flat_map(|i| {
+                let community = i / COMMUNITY_SIZE;
+                let local = i % COMMUNITY_SIZE;
+                let community_base = community * COMMUNITY_SIZE;
+                let community_hub = community_base;
+                let next_community_base = ((community + 1) % COMMUNITY_COUNT) * COMMUNITY_SIZE;
+                let prev_community_base =
+                    ((community + COMMUNITY_COUNT - 1) % COMMUNITY_COUNT) * COMMUNITY_SIZE;
+                let global_hub = global_hubs[community % global_hubs.len()];
+
+                let mut edges = vec![
+                    EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[community_base + ((local + 1) % COMMUNITY_SIZE)],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                    EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[community_base + ((local + 7) % COMMUNITY_SIZE)],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 0.9,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                    EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[community_base + ((local + 31) % COMMUNITY_SIZE)],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 0.8,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                    EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[community_base + ((local * 73 + 19) % COMMUNITY_SIZE)],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 0.7,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                ];
+
+                if local != 0 && local.is_multiple_of(32) {
+                    edges.push(EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[community_hub],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.1,
+                        valid_from: None,
+                        valid_to: None,
+                    });
+                }
+
+                if local.is_multiple_of(25) {
+                    edges.push(EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[next_community_base + ((local * 17 + 11) % COMMUNITY_SIZE)],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 0.35,
+                        valid_from: None,
+                        valid_to: None,
+                    });
+                }
+
+                if local.is_multiple_of(40) {
+                    edges.push(EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[prev_community_base + ((local * 29 + 5) % COMMUNITY_SIZE)],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 0.3,
+                        valid_from: None,
+                        valid_to: None,
+                    });
+                }
+
+                if local == 0 {
+                    edges.push(EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[global_hub],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 1.25,
+                        valid_from: None,
+                        valid_to: None,
+                    });
+                    edges.push(EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[next_community_base],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 0.45,
+                        valid_from: None,
+                        valid_to: None,
+                    });
+                }
+
+                if global_hubs.contains(&i) {
+                    let next_global_hub =
+                        global_hubs[(community % global_hubs.len() + 1) % global_hubs.len()];
+                    edges.push(EdgeInput {
+                        from: node_ids[i],
+                        to: node_ids[next_global_hub],
+                        type_id: 1,
+                        props: BTreeMap::new(),
+                        weight: 0.6,
+                        valid_from: None,
+                        valid_to: None,
+                    });
+                }
+
+                edges
+            })
+            .collect();
+        engine.batch_upsert_edges(&edge_inputs).unwrap();
+        node_ids
+    };
+
+    let community_hub_seed = |node_ids: &[u64]| -> u64 { node_ids[123] };
+    let community_hub_multi_seeds = |node_ids: &[u64]| -> Vec<u64> {
+        (0..8usize)
+            .map(|community| node_ids[community * 500 + 123])
+            .collect()
+    };
+
+    group.bench_function("personalized_pagerank_community_hubs_20000_nodes", |b| {
+        let (_dir, mut engine) = temp_db();
+        let node_ids = build_ppr_graph_community_hubs_20k(&mut engine);
+        let opts = PprOptions {
+            max_results: Some(100),
+            ..PprOptions::default()
+        };
+        let seed = community_hub_seed(&node_ids);
+        b.iter(|| {
+            engine.personalized_pagerank(&[seed], &opts).unwrap();
+        });
+    });
+
+    group.bench_function(
+        "personalized_pagerank_community_hubs_20000_nodes_approx",
+        |b| {
+            let (_dir, mut engine) = temp_db();
+            let node_ids = build_ppr_graph_community_hubs_20k(&mut engine);
+            let opts = PprOptions {
+                algorithm: PprAlgorithm::ApproxForwardPush,
+                approx_residual_tolerance: 1e-5,
+                max_results: Some(100),
+                ..PprOptions::default()
+            };
+            let seed = community_hub_seed(&node_ids);
+            b.iter(|| {
+                engine.personalized_pagerank(&[seed], &opts).unwrap();
+            });
+        },
+    );
+
+    group.bench_function(
+        "personalized_pagerank_community_hubs_20000_nodes_segment",
+        |b| {
+            let (_dir, mut engine) = temp_db();
+            let node_ids = build_ppr_graph_community_hubs_20k(&mut engine);
+            engine.flush().unwrap();
+            let opts = PprOptions {
+                max_results: Some(100),
+                ..PprOptions::default()
+            };
+            let seed = community_hub_seed(&node_ids);
+            b.iter(|| {
+                engine.personalized_pagerank(&[seed], &opts).unwrap();
+            });
+        },
+    );
+
+    group.bench_function(
+        "personalized_pagerank_community_hubs_20000_nodes_segment_approx",
+        |b| {
+            let (_dir, mut engine) = temp_db();
+            let node_ids = build_ppr_graph_community_hubs_20k(&mut engine);
+            engine.flush().unwrap();
+            let opts = PprOptions {
+                algorithm: PprAlgorithm::ApproxForwardPush,
+                approx_residual_tolerance: 1e-5,
+                max_results: Some(100),
+                ..PprOptions::default()
+            };
+            let seed = community_hub_seed(&node_ids);
+            b.iter(|| {
+                engine.personalized_pagerank(&[seed], &opts).unwrap();
+            });
+        },
+    );
+
+    group.bench_function(
+        "personalized_pagerank_community_hubs_20000_nodes_8_seeds",
+        |b| {
+            let (_dir, mut engine) = temp_db();
+            let node_ids = build_ppr_graph_community_hubs_20k(&mut engine);
+            let opts = PprOptions {
+                max_results: Some(100),
+                ..PprOptions::default()
+            };
+            let seeds = community_hub_multi_seeds(&node_ids);
+            b.iter(|| {
+                engine.personalized_pagerank(&seeds, &opts).unwrap();
+            });
+        },
+    );
+
+    group.bench_function(
+        "personalized_pagerank_community_hubs_20000_nodes_8_seeds_approx",
+        |b| {
+            let (_dir, mut engine) = temp_db();
+            let node_ids = build_ppr_graph_community_hubs_20k(&mut engine);
+            let opts = PprOptions {
+                algorithm: PprAlgorithm::ApproxForwardPush,
+                approx_residual_tolerance: 1e-5,
+                max_results: Some(100),
+                ..PprOptions::default()
+            };
+            let seeds = community_hub_multi_seeds(&node_ids);
+            b.iter(|| {
+                engine.personalized_pagerank(&seeds, &opts).unwrap();
+            });
+        },
+    );
+
+    group.bench_function(
+        "personalized_pagerank_community_hubs_20000_nodes_segment_8_seeds",
+        |b| {
+            let (_dir, mut engine) = temp_db();
+            let node_ids = build_ppr_graph_community_hubs_20k(&mut engine);
+            engine.flush().unwrap();
+            let opts = PprOptions {
+                max_results: Some(100),
+                ..PprOptions::default()
+            };
+            let seeds = community_hub_multi_seeds(&node_ids);
+            b.iter(|| {
+                engine.personalized_pagerank(&seeds, &opts).unwrap();
+            });
+        },
+    );
+
+    group.bench_function(
+        "personalized_pagerank_community_hubs_20000_nodes_segment_8_seeds_approx",
+        |b| {
+            let (_dir, mut engine) = temp_db();
+            let node_ids = build_ppr_graph_community_hubs_20k(&mut engine);
+            engine.flush().unwrap();
+            let opts = PprOptions {
+                algorithm: PprAlgorithm::ApproxForwardPush,
+                approx_residual_tolerance: 1e-5,
+                max_results: Some(100),
+                ..PprOptions::default()
+            };
+            let seeds = community_hub_multi_seeds(&node_ids);
+            b.iter(|| {
+                engine.personalized_pagerank(&seeds, &opts).unwrap();
+            });
+        },
+    );
 
     let build_export_graph = |engine: &mut DatabaseEngine| -> Vec<u64> {
         let node_inputs: Vec<NodeInput> = (0..5000u64)

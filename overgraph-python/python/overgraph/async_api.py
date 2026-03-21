@@ -511,16 +511,20 @@ class AsyncOverGraph:
         self,
         seed_node_ids: list[int],
         *,
+        algorithm: str | None = None,
         damping_factor: float | None = None,
         max_iterations: int | None = None,
         epsilon: float | None = None,
+        approx_residual_tolerance: float | None = None,
         edge_type_filter: list[int] | None = None,
         max_results: int | None = None,
     ) -> PyPprResult:
         return await asyncio.to_thread(
             self._db.personalized_pagerank, seed_node_ids,
+            algorithm=algorithm,
             damping_factor=damping_factor, max_iterations=max_iterations,
-            epsilon=epsilon, edge_type_filter=edge_type_filter, max_results=max_results,
+            epsilon=epsilon, approx_residual_tolerance=approx_residual_tolerance,
+            edge_type_filter=edge_type_filter, max_results=max_results,
         )
 
     async def export_adjacency(

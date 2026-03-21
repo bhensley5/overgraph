@@ -63,6 +63,19 @@ class TestPersonalizedPagerank:
         assert result.iterations > 0
         assert len(result.node_ids) > 0
 
+    def test_ppr_approx_mode_exposes_metadata(self, db):
+        center, spokes = make_star(db)
+        result = db.personalized_pagerank(
+            [center],
+            algorithm="approx",
+            approx_residual_tolerance=1e-6,
+        )
+        assert result.algorithm == "approx"
+        assert result.approx is not None
+        assert result.approx.residual_tolerance == 1e-6
+        assert result.approx.pushes >= 0
+        assert len(result.node_ids) > 0
+
     def test_ppr_isolated_node(self, db):
         nid = db.upsert_node(1, "lonely")
         result = db.personalized_pagerank([nid])

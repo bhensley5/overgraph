@@ -3,7 +3,7 @@ members = [".", "overgraph-node", "overgraph-python"]
 
 [package]
 name = "overgraph"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "An absurdly fast embedded graph database. Pure Rust, sub-microsecond reads."
 license = "MIT OR Apache-2.0"
@@ -16,6 +16,7 @@ categories = ["database-implementations", "data-structures"]
 [dependencies]
 crc32fast = "1"
 memmap2 = "0.9"
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rmp-serde = "1"

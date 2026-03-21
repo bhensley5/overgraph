@@ -499,11 +499,19 @@ export interface JsPatchResult {
 }
 
 export interface JsPersonalizedPagerankOptions {
+  algorithm?: 'exact' | 'approx'
   dampingFactor?: number
   maxIterations?: number
   epsilon?: number
+  approxResidualTolerance?: number
   edgeTypeFilter?: Array<number>
   maxResults?: number
+}
+
+export interface JsPprApproxMeta {
+  residualTolerance: number
+  pushes: number
+  maxRemainingResidual: number
 }
 
 export interface JsPprResult {
@@ -511,6 +519,8 @@ export interface JsPprResult {
   scores: Float64Array
   iterations: number
   converged: boolean
+  algorithm: 'exact' | 'approx'
+  approx?: JsPprApproxMeta
 }
 
 export interface JsPrunePolicy {

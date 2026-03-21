@@ -1788,14 +1788,15 @@ fn scenario_comparability(contract: &ScenarioContract, scenario_id: &str) -> Com
 }
 
 fn benchmark_db_options() -> DbOptions {
-    let mut opts = DbOptions::default();
     // Keep benchmark durability mode explicit so report metadata does not silently drift with defaults.
-    opts.wal_sync_mode = WalSyncMode::GroupCommit {
-        interval_ms: 10,
-        soft_trigger_bytes: 4 * 1024 * 1024,
-        hard_cap_bytes: 16 * 1024 * 1024,
-    };
-    opts
+    DbOptions {
+        wal_sync_mode: WalSyncMode::GroupCommit {
+            interval_ms: 10,
+            soft_trigger_bytes: 4 * 1024 * 1024,
+            hard_cap_bytes: 16 * 1024 * 1024,
+        },
+        ..DbOptions::default()
+    }
 }
 
 fn open_db(path: &Path) -> Result<DatabaseEngine, String> {
@@ -1940,6 +1941,7 @@ fn throughput_ops_per_sec(mean_us: f64, ops_per_iteration: usize) -> Option<f64>
     Some((ops_per_iteration as f64 * 1_000_000.0) / mean_us)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_scenario(
     scenario_id: &str,
     name: &str,

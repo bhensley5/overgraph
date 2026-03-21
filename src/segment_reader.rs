@@ -14,7 +14,7 @@ use crate::sparse_postings::{
 };
 use crate::types::*;
 use memmap2::Mmap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::ops::ControlFlow;
 use std::ops::Deref;
@@ -840,6 +840,9 @@ impl SegmentReader {
                     node_id,
                     type_filter,
                     limit,
+                    None,
+                    None,
+                    None,
                     &mut results,
                 )?;
             }
@@ -850,36 +853,66 @@ impl SegmentReader {
                     node_id,
                     type_filter,
                     limit,
+                    None,
+                    None,
+                    None,
                     &mut results,
                 )?;
             }
             Direction::Both => {
-                self.collect_adj_neighbors(
-                    &self.adj_out_idx,
-                    &self.adj_out_dat,
-                    node_id,
-                    type_filter,
-                    limit,
-                    &mut results,
-                )?;
-                let remaining = if limit > 0 {
-                    limit.saturating_sub(results.len())
-                } else {
-                    0 // 0 means no limit
-                };
-                if limit == 0 || remaining > 0 {
+                if limit == 0 {
+                    let mut self_loop_edge_ids = NodeIdSet::default();
+                    self.collect_adj_neighbors(
+                        &self.adj_out_idx,
+                        &self.adj_out_dat,
+                        node_id,
+                        type_filter,
+                        0,
+                        Some(&mut self_loop_edge_ids),
+                        None,
+                        None,
+                        &mut results,
+                    )?;
                     self.collect_adj_neighbors(
                         &self.adj_in_idx,
                         &self.adj_in_dat,
                         node_id,
                         type_filter,
-                        remaining,
+                        0,
+                        None,
+                        Some(&self_loop_edge_ids),
+                        None,
+                        &mut results,
+                    )?;
+                } else {
+                    let mut self_loop_edge_ids = NodeIdSet::default();
+                    self.collect_adj_neighbors(
+                        &self.adj_out_idx,
+                        &self.adj_out_dat,
+                        node_id,
+                        type_filter,
+                        limit,
+                        Some(&mut self_loop_edge_ids),
+                        None,
+                        None,
+                        &mut results,
+                    )?;
+                    let mut remaining = limit.saturating_sub(results.len());
+                    if remaining == 0 {
+                        return Ok(results);
+                    }
+                    self.collect_adj_neighbors(
+                        &self.adj_in_idx,
+                        &self.adj_in_dat,
+                        node_id,
+                        type_filter,
+                        0,
+                        None,
+                        Some(&self_loop_edge_ids),
+                        Some(&mut remaining),
                         &mut results,
                     )?;
                 }
-                // Deduplicate by edge_id (self-loops appear in both)
-                let mut seen = HashSet::new();
-                results.retain(|e| seen.insert(e.edge_id));
             }
         }
 
@@ -1519,6 +1552,11 @@ impl SegmentReader {
     /// Return the set of deleted node IDs in this segment (keys only).
     pub fn deleted_node_ids(&self) -> NodeIdSet {
         self.deleted_nodes.keys().copied().collect()
+    }
+
+    /// Iterate deleted node IDs without allocating a temporary set.
+    pub(crate) fn deleted_node_id_iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.deleted_nodes.keys().copied()
     }
 
     /// Return the set of deleted edge IDs in this segment (keys only).
@@ -2343,6 +2381,7 @@ impl SegmentReader {
 
     /// Collect neighbor entries from an adjacency index + data file pair.
     /// Postings are delta-encoded with varints.
+    #[allow(clippy::too_many_arguments)]
     fn collect_adj_neighbors(
         &self,
         idx_mmap: &MappedData,
@@ -2350,6 +2389,9 @@ impl SegmentReader {
         node_id: u64,
         type_filter: Option<&[u32]>,
         limit: usize,
+        mut record_self_loop_edge_ids: Option<&mut NodeIdSet>,
+        skip_self_loop_edge_ids: Option<&NodeIdSet>,
+        mut raw_budget: Option<&mut usize>,
         results: &mut Vec<NeighborEntry>,
     ) -> Result<(), EngineError> {
         let idx_data = &idx_mmap[..];
@@ -2365,7 +2407,11 @@ impl SegmentReader {
 
         // Scan forward from first entry while node_id matches
         for i in first..count {
-            if limit > 0 && results.len() >= limit {
+            if let Some(remaining) = raw_budget.as_ref() {
+                if **remaining == 0 {
+                    break;
+                }
+            } else if limit > 0 && results.len() >= limit {
                 break;
             }
 
@@ -2390,7 +2436,11 @@ impl SegmentReader {
             let mut prev_edge_id: u64 = 0;
 
             for _j in 0..posting_count {
-                if limit > 0 && results.len() >= limit {
+                if let Some(remaining) = raw_budget.as_ref() {
+                    if **remaining == 0 {
+                        break;
+                    }
+                } else if limit > 0 && results.len() >= limit {
                     break;
                 }
 
@@ -2422,6 +2472,19 @@ impl SegmentReader {
                 }
                 if self.deleted_nodes.contains_key(&neighbor_id) {
                     continue;
+                }
+                if let Some(remaining) = raw_budget.as_deref_mut() {
+                    *remaining = remaining.saturating_sub(1);
+                }
+                if neighbor_id == node_id {
+                    if let Some(skip) = skip_self_loop_edge_ids {
+                        if skip.contains(&edge_id) {
+                            continue;
+                        }
+                    }
+                    if let Some(record) = record_self_loop_edge_ids.as_deref_mut() {
+                        record.insert(edge_id);
+                    }
                 }
 
                 results.push(NeighborEntry {
@@ -3939,6 +4002,23 @@ pub(crate) mod tests {
         // No limit
         let all = reader.neighbors(1, Direction::Outgoing, None, 0).unwrap();
         assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn test_neighbors_both_with_limit_preserves_self_loop_budget_semantics() {
+        let mut mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
+
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 1, 10)), 0); // self-loop
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 2, 1, 10)), 0); // incoming unique
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 3, 1, 10)), 0); // incoming unique
+
+        let (_dir, reader) = write_and_open(&mt);
+        let both = reader.neighbors(1, Direction::Both, None, 2).unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].edge_id, 1);
     }
 
     #[test]

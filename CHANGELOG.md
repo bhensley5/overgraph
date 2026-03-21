@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-21
+
+### Added
+
+#### Engine Parallelism (Phase 22)
+- **Shared parallelism runtime.** CPU-bound read and build paths now use a shared bounded Rayon thread pool. Hybrid vector search, flush index builds, compaction index builds, and multi-segment queries all share the same pool with no thread explosion risk.
+- **Parallel dense vector search.** Multi-segment dense candidate collection runs per-segment HNSW searches in parallel with a tightened ordered merge path. Near-linear speedup on multi-segment workloads.
+- **Parallel sparse vector search.** Multi-segment sparse scoring runs per-segment posting-list walks in parallel with tightened merge-path allocations.
+- **Parallel flush index builds.** Flush-path index generation (adjacency, type, key, property, timestamp, tombstone, and vector indexes) uses staged coarse-task fanout on the shared pool.
+- **Parallel compaction index builds.** Compaction-path index generation uses the same staged fanout as flush, maintaining dual-path parity.
+- **Parallel HNSW construction.** Dense HNSW index builds use per-node read-write locks for concurrent neighbor-list updates, achieving approximately 7x build speedup on multi-core machines.
+- **Approximate forward-push PPR.** New `ApproxForwardPush` algorithm option for Personalized PageRank. Seed-centric forward push that avoids full reachable-graph discovery, much faster for local retrieval workloads. Exact power-iteration remains the default.
+- **Parallel exact PPR.** The existing exact power-iteration PPR now runs its per-iteration matrix-vector products in parallel.
+
+### Changed
+- **GroupCommit defaults tuned.** Default sync interval changed from 200ms to 50ms, soft trigger from 8MB to 2MB for better latency-throughput balance on typical workloads.
+- Identity-hashed self-loop tracking in neighbor queries replaces SipHash, reducing per-edge overhead.
+- Merge-path allocations tightened across dense and sparse search for lower memory pressure during multi-segment queries.
+
+### Fixed
+- Fixed compaction scheduling gaps that could delay segment merges under certain layouts.
+- Fixed inspect CLI crash from a removed internal method.
+
 ## [0.3.0] - 2026-03-17
 
 ### Changed
@@ -171,6 +194,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.4.0]: https://github.com/Bhensley5/overgraph/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Bhensley5/overgraph/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Bhensley5/overgraph/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Bhensley5/overgraph/releases/tag/v0.1.0
