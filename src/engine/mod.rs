@@ -1673,6 +1673,9 @@ impl DatabaseEngine {
     /// RocksDB/WiredTiger approach of spreading backpressure cost across
     /// writes instead of punishing one unlucky writer with a full drain.
     fn maybe_backpressure_flush(&mut self) -> Result<(), EngineError> {
+        if self.bg_compact.is_some() {
+            self.try_complete_bg_compact();
+        }
         self.try_apply_all_bg_flushes();
         self.maybe_surface_or_retry_flush_pipeline_error()?;
         let bytes_exceeded =
@@ -1925,14 +1928,10 @@ impl DatabaseEngine {
                     self.flush_pipeline_error_reported = false;
                 }
 
-                if !self.compacting && self.bg_compact.is_none() && self.compact_after_n_flushes > 0
-                {
-                    self.flush_count_since_last_compact += 1;
-                    if self.flush_count_since_last_compact >= self.compact_after_n_flushes
-                        && self.segments.len() >= 2
-                    {
-                        let _ = self.start_bg_compact();
-                    }
+                if !self.compacting {
+                    self.flush_count_since_last_compact =
+                        self.flush_count_since_last_compact.saturating_add(1);
+                    let _ = self.maybe_schedule_bg_compact();
                 }
 
                 Ok(Some(seg_info))
@@ -2025,6 +2024,20 @@ impl DatabaseEngine {
     }
 
     // --- Background compaction ---
+
+    /// Spawn a background thread to compact all current segments.
+    /// Returns early if a background compaction is already running or < 2 segments.
+    fn maybe_schedule_bg_compact(&mut self) -> Result<(), EngineError> {
+        if self.compacting
+            || self.bg_compact.is_some()
+            || self.compact_after_n_flushes == 0
+            || self.flush_count_since_last_compact < self.compact_after_n_flushes
+            || self.segments.len() < 2
+        {
+            return Ok(());
+        }
+        self.start_bg_compact()
+    }
 
     /// Spawn a background thread to compact all current segments.
     /// Returns early if a background compaction is already running or < 2 segments.
@@ -2172,6 +2185,8 @@ impl DatabaseEngine {
         if let Err(e) = self.rebuild_degree_cache() {
             eprintln!("Background compaction: degree cache rebuild failed: {}", e);
         }
+
+        let _ = self.maybe_schedule_bg_compact();
 
         Some(result.stats)
     }

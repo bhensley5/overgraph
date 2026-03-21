@@ -130,7 +130,6 @@ fn collect_top_k_from_scores(scores: NodeIdMap<f32>, k: usize) -> Vec<VectorHit>
     hits
 }
 
-
 impl DatabaseEngine {
     // --- Read-time policy filtering ---
 
@@ -326,13 +325,14 @@ impl DatabaseEngine {
             }
         }
 
-        // Check immutable memtables (newest-first)
+        // Check immutable memtables (newest-first), reusing a single buffer.
+        let mut next_remaining_imm = Vec::with_capacity(remaining.len());
         for epoch in &self.immutable_epochs {
             if remaining.is_empty() {
                 break;
             }
             remaining.retain(|&node_id| !epoch.memtable.deleted_nodes().contains_key(&node_id));
-            let mut next = Vec::with_capacity(remaining.len());
+            next_remaining_imm.clear();
             for &node_id in &remaining {
                 if let Some(node) = epoch.memtable.get_node(node_id) {
                     if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
@@ -353,10 +353,10 @@ impl DatabaseEngine {
                         });
                     }
                 } else {
-                    next.push(node_id);
+                    next_remaining_imm.push(node_id);
                 }
             }
-            remaining = next;
+            std::mem::swap(&mut remaining, &mut next_remaining_imm);
         }
 
         let mut next_remaining = Vec::with_capacity(remaining.len());
@@ -433,6 +433,102 @@ impl DatabaseEngine {
             .collect()
     }
 
+    /// Reduce a single segment's sparse scores into the top-k heap, maintaining
+    /// newest-first visibility via hidden_ids. Shared by both serial and parallel paths.
+    ///
+    /// `candidates`, `meta_results`, and `remaining` are caller-owned reusable buffers
+    /// that avoid per-segment allocation when called in a loop.
+    #[allow(clippy::too_many_arguments)]
+    fn sparse_reduce_segment_scores(
+        segment: &SegmentReader,
+        scores: NodeIdMap<f32>,
+        hidden_ids: &mut NodeIdSet,
+        scope_ids: Option<&NodeIdSet>,
+        type_filter: Option<&[u32]>,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        top_hits: &mut BinaryHeap<SparseTopKEntry>,
+        k: usize,
+        has_older_segments: bool,
+        candidates: &mut Vec<(u64, f32)>,
+        meta_results: &mut Vec<Option<(u32, i64, f32)>>,
+        remaining: &mut Vec<(usize, u64)>,
+    ) -> Result<(), EngineError> {
+        // Early exit: no scores at all from this segment.
+        if scores.is_empty() {
+            if has_older_segments {
+                hidden_ids.extend(segment.deleted_node_id_iter());
+                hidden_ids.extend(segment.node_ids()?.iter().copied());
+            }
+            return Ok(());
+        }
+
+        candidates.clear();
+        for (node_id, score) in scores {
+            if score > 0.0
+                && !hidden_ids.contains(&node_id)
+                && scope_ids.is_none_or(|s| s.contains(&node_id))
+            {
+                candidates.push((node_id, score));
+            }
+        }
+        if candidates.is_empty() {
+            if has_older_segments {
+                hidden_ids.extend(segment.deleted_node_id_iter());
+                hidden_ids.extend(segment.node_ids()?.iter().copied());
+            }
+            return Ok(());
+        }
+
+        candidates.sort_unstable_by_key(|&(node_id, _)| node_id);
+        meta_results.clear();
+        meta_results.resize(candidates.len(), None);
+        remaining.clear();
+        remaining.extend(
+            candidates
+                .iter()
+                .enumerate()
+                .map(|(index, &(node_id, _))| (index, node_id)),
+        );
+        // Redundant hidden_ids check removed: candidates were already filtered
+        // by !hidden_ids.contains() above, and hidden_ids is not mutated between.
+        remaining.retain(|&(_, node_id)| {
+            if segment.is_node_deleted(node_id) {
+                hidden_ids.insert(node_id);
+                false
+            } else {
+                true
+            }
+        });
+        if remaining.is_empty() {
+            if has_older_segments {
+                hidden_ids.extend(segment.deleted_node_id_iter());
+                hidden_ids.extend(segment.node_ids()?.iter().copied());
+            }
+            return Ok(());
+        }
+
+        segment.get_node_meta_batch(remaining, meta_results)?;
+        for (index, &(node_id, score)) in candidates.iter().enumerate() {
+            let Some((type_id, updated_at, weight)) = meta_results[index] else {
+                continue;
+            };
+            if type_filter.is_some_and(|types| !types.contains(&type_id)) {
+                continue;
+            }
+            if policy_cutoffs
+                .is_some_and(|cutoffs| cutoffs.excludes_fields(type_id, updated_at, weight))
+            {
+                continue;
+            }
+            Self::push_sparse_top_k(top_hits, k, node_id, score);
+        }
+        if has_older_segments {
+            hidden_ids.extend(segment.deleted_node_id_iter());
+            hidden_ids.extend(segment.node_ids()?.iter().copied());
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // Dense tail scan needs all context inline for hot-path efficiency
     fn exact_dense_tail_candidates(
         &self,
@@ -444,23 +540,76 @@ impl DatabaseEngine {
         candidate_ids: &mut NodeIdSet,
         scope_ids: Option<&NodeIdSet>,
     ) -> Result<NodeIdSet, EngineError> {
+        let work_items: Vec<&SegmentReader> = segments
+            .iter()
+            .zip(exhausted.iter())
+            .filter(|(_, ex)| !**ex)
+            .map(|((seg, _), _)| *seg)
+            .collect();
+
+        if work_items.is_empty() {
+            return Ok(NodeIdSet::with_capacity_and_hasher(
+                0,
+                NodeIdBuildHasher::default(),
+            ));
+        }
+
+        let cutoff_score = cutoff.score;
+        let cutoff_node_id = cutoff.node_id;
+
+        let per_segment_hits: Vec<Result<Vec<(u64, f32)>, EngineError>> = if work_items.len()
+            <= 1
+        {
+            // Single non-exhausted segment: skip rayon overhead.
+            work_items
+                .iter()
+                .map(|segment| {
+                    let mut hits = exact_dense_search_above_cutoff(
+                        segment.raw_dense_hnsw_meta_mmap(),
+                        segment.raw_node_dense_vectors_mmap(),
+                        query,
+                        metric,
+                        cutoff_score,
+                        cutoff_node_id,
+                    )?;
+                    if let Some(scope) = scope_ids {
+                        hits.retain(|(node_id, _)| scope.contains(node_id));
+                    }
+                    Ok(hits)
+                })
+                .collect()
+        } else {
+            crate::parallel::engine_cpu_install(|| {
+                use rayon::prelude::*;
+                work_items
+                    .par_iter()
+                    .map(|segment| {
+                        let mut hits = exact_dense_search_above_cutoff(
+                            segment.raw_dense_hnsw_meta_mmap(),
+                            segment.raw_node_dense_vectors_mmap(),
+                            query,
+                            metric,
+                            cutoff_score,
+                            cutoff_node_id,
+                        )?;
+                        if let Some(scope) = scope_ids {
+                            hits.retain(|(node_id, _)| scope.contains(node_id));
+                        }
+                        Ok(hits)
+                    })
+                    .collect()
+            })
+        };
+
+        let total_tail_hits: usize = per_segment_hits
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|hits| hits.len())
+            .sum();
         let mut new_candidate_ids =
-            NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
-        for ((segment, _), segment_exhausted) in segments.iter().zip(exhausted.iter()) {
-            if *segment_exhausted {
-                continue;
-            }
-            for (node_id, _) in exact_dense_search_above_cutoff(
-                segment.raw_dense_hnsw_meta_mmap(),
-                segment.raw_node_dense_vectors_mmap(),
-                query,
-                metric,
-                cutoff.score,
-                cutoff.node_id,
-            )? {
-                if scope_ids.is_some_and(|s| !s.contains(&node_id)) {
-                    continue;
-                }
+            NodeIdSet::with_capacity_and_hasher(total_tail_hits, NodeIdBuildHasher::default());
+        for result in per_segment_hits {
+            for (node_id, _) in result? {
                 if candidate_ids.insert(node_id) {
                     new_candidate_ids.insert(node_id);
                 }
@@ -471,10 +620,7 @@ impl DatabaseEngine {
 
     /// Resolve a `VectorSearchScope` into a set of reachable node IDs using
     /// the existing traversal substrate. The start node (depth 0) is included.
-    fn resolve_scope_ids(
-        &self,
-        scope: &VectorSearchScope,
-    ) -> Result<NodeIdSet, EngineError> {
+    fn resolve_scope_ids(&self, scope: &VectorSearchScope) -> Result<NodeIdSet, EngineError> {
         let traverse_opts = TraverseOptions {
             min_depth: 0,
             direction: scope.direction,
@@ -485,15 +631,9 @@ impl DatabaseEngine {
             limit: None,
             cursor: None,
         };
-        let result = self.traverse(
-            scope.start_node_id,
-            scope.max_depth,
-            &traverse_opts,
-        )?;
-        let mut ids = NodeIdSet::with_capacity_and_hasher(
-            result.items.len(),
-            NodeIdBuildHasher::default(),
-        );
+        let result = self.traverse(scope.start_node_id, scope.max_depth, &traverse_opts)?;
+        let mut ids =
+            NodeIdSet::with_capacity_and_hasher(result.items.len(), NodeIdBuildHasher::default());
         for hit in &result.items {
             ids.insert(hit.node_id);
         }
@@ -554,22 +694,20 @@ impl DatabaseEngine {
 
         // --- Small-scope fast path: skip HNSW, exact-score scope IDs only ---
         if let Some(scope) = scope_ids {
-            let total_dense_points: usize = searchable_segments
-                .iter()
-                .map(|(_, pc)| *pc)
-                .sum::<usize>()
-                + self
-                    .memtable
-                    .nodes()
-                    .values()
-                    .filter(|n| n.dense_vector.is_some())
-                    .count()
-                + self
-                    .immutable_epochs
-                    .iter()
-                    .flat_map(|epoch| epoch.memtable.nodes().values())
-                    .filter(|n| n.dense_vector.is_some())
-                    .count();
+            let total_dense_points: usize =
+                searchable_segments.iter().map(|(_, pc)| *pc).sum::<usize>()
+                    + self
+                        .memtable
+                        .nodes()
+                        .values()
+                        .filter(|n| n.dense_vector.is_some())
+                        .count()
+                    + self
+                        .immutable_epochs
+                        .iter()
+                        .flat_map(|epoch| epoch.memtable.nodes().values())
+                        .filter(|n| n.dense_vector.is_some())
+                        .count();
             if scope.len() <= total_dense_points / 20 || scope.len() <= 2048 {
                 let mut hits = self.score_dense_candidate_ids(
                     scope,
@@ -604,7 +742,9 @@ impl DatabaseEngine {
         // are harmless; score_dense_candidate_ids does a proper newest-first lookup.
         for epoch in &self.immutable_epochs {
             candidate_ids.extend(
-                epoch.memtable.nodes()
+                epoch
+                    .memtable
+                    .nodes()
                     .values()
                     .filter(|node| {
                         node.dense_vector.is_some()
@@ -640,31 +780,86 @@ impl DatabaseEngine {
             let mut segment_exhausted = Vec::with_capacity(searchable_segments.len());
             let mut new_candidate_ids =
                 NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
-            for (segment, point_count) in &searchable_segments {
-                let limit = fetch_limit.min(*point_count);
-                if limit == 0 {
-                    segment_exhausted.push(true);
-                    continue;
-                }
-                let is_exhausted = limit >= *point_count;
-                if !is_exhausted {
-                    exhausted_segments = false;
-                }
-                segment_exhausted.push(is_exhausted);
-                let ef_search = request
-                    .ef_search
-                    .unwrap_or(fetch_limit)
-                    .max(limit)
-                    .min(*point_count);
 
-                let segment_hits = if let Some(scope) = scope_ids {
-                    segment.search_dense_hnsw_scoped(query, ef_search, limit, scope)?
-                } else {
-                    segment.search_dense_hnsw(query, ef_search, limit)?
-                };
-                for (node_id, _) in segment_hits {
-                    if candidate_ids.insert(node_id) {
-                        new_candidate_ids.insert(node_id);
+            // Threshold on total searchable segments (not just non-trivial ones)
+            // because the serial path must still push into segment_exhausted for limit==0 entries.
+            if searchable_segments.len() <= 1 {
+                for (segment, point_count) in &searchable_segments {
+                    let limit = fetch_limit.min(*point_count);
+                    if limit == 0 {
+                        segment_exhausted.push(true);
+                        continue;
+                    }
+                    let is_exhausted = limit >= *point_count;
+                    if !is_exhausted {
+                        exhausted_segments = false;
+                    }
+                    segment_exhausted.push(is_exhausted);
+                    let ef_search = request
+                        .ef_search
+                        .unwrap_or(fetch_limit)
+                        .max(limit)
+                        .min(*point_count);
+
+                    let segment_hits = if let Some(scope) = scope_ids {
+                        segment.search_dense_hnsw_scoped(query, ef_search, limit, scope)?
+                    } else {
+                        segment.search_dense_hnsw(query, ef_search, limit)?
+                    };
+                    for (node_id, _) in segment_hits {
+                        if candidate_ids.insert(node_id) {
+                            new_candidate_ids.insert(node_id);
+                        }
+                    }
+                }
+            } else {
+                // Multi-segment parallel path: collect per-segment results then reduce.
+                let user_ef = request.ef_search;
+                let per_segment_results: Vec<
+                    Result<(Vec<(u64, f32)>, bool), EngineError>,
+                > = crate::parallel::engine_cpu_install(|| {
+                    use rayon::prelude::*;
+                    searchable_segments
+                        .par_iter()
+                        .map(|(segment, point_count)| {
+                            let limit = fetch_limit.min(*point_count);
+                            if limit == 0 {
+                                return Ok((Vec::new(), true));
+                            }
+                            let is_exhausted = limit >= *point_count;
+                            let ef_search = user_ef
+                                .unwrap_or(fetch_limit)
+                                .max(limit)
+                                .min(*point_count);
+                            let hits = if let Some(scope) = scope_ids {
+                                segment.search_dense_hnsw_scoped(
+                                    query, ef_search, limit, scope,
+                                )?
+                            } else {
+                                segment.search_dense_hnsw(query, ef_search, limit)?
+                            };
+                            Ok((hits, is_exhausted))
+                        })
+                        .collect()
+                });
+
+                // Serial reduce: merge per-segment results preserving input order.
+                let total_hits: usize = per_segment_results
+                    .iter()
+                    .filter_map(|r| r.as_ref().ok())
+                    .map(|(hits, _)| hits.len())
+                    .sum();
+                new_candidate_ids.reserve(total_hits);
+                for result in per_segment_results {
+                    let (hits, is_exhausted) = result?;
+                    if !is_exhausted {
+                        exhausted_segments = false;
+                    }
+                    segment_exhausted.push(is_exhausted);
+                    for (node_id, _) in hits {
+                        if candidate_ids.insert(node_id) {
+                            new_candidate_ids.insert(node_id);
+                        }
                     }
                 }
             }
@@ -829,84 +1024,89 @@ impl DatabaseEngine {
             }
         }
 
-        for (segment_index, segment) in self.segments.iter().enumerate() {
-            let has_older_segments = segment_index + 1 < self.segments.len();
-            let mut scores = NodeIdMap::default();
-            accumulate_sparse_posting_scores(
-                segment.raw_sparse_posting_index_mmap(),
-                segment.raw_sparse_postings_mmap(),
-                &query,
-                &mut scores,
-            )?;
-            let mut candidates = Vec::with_capacity(scores.len());
-            for (node_id, score) in scores {
-                if score > 0.0
-                    && !hidden_ids.contains(&node_id)
-                    && scope_ids.is_none_or(|s| s.contains(&node_id))
-                {
-                    candidates.push((node_id, score));
-                }
-            }
-            if candidates.is_empty() {
-                if has_older_segments {
-                    hidden_ids.extend(segment.deleted_node_ids().iter().copied());
-                    hidden_ids.extend(segment.node_ids()?.iter().copied());
-                }
-                continue;
-            }
+        // Count segments with sparse posting data to decide parallel vs serial.
+        let sparse_segment_count = self
+            .segments
+            .iter()
+            .filter(|seg| !seg.raw_sparse_posting_index_mmap().is_empty())
+            .count();
 
-            candidates.sort_unstable_by_key(|&(node_id, _)| node_id);
-            let mut meta_results = vec![None; candidates.len()];
-            let mut remaining: Vec<(usize, u64)> = candidates
-                .iter()
-                .enumerate()
-                .map(|(index, &(node_id, _))| (index, node_id))
-                .collect();
-            remaining.retain(|&(_, node_id)| !hidden_ids.contains(&node_id));
-            if remaining.is_empty() {
-                if has_older_segments {
-                    hidden_ids.extend(segment.deleted_node_ids().iter().copied());
-                    hidden_ids.extend(segment.node_ids()?.iter().copied());
-                }
-                continue;
-            }
+        // Reusable buffers for the reduce loop — allocated once, cleared per iteration.
+        let mut candidates: Vec<(u64, f32)> = Vec::new();
+        let mut meta_results: Vec<Option<(u32, i64, f32)>> = Vec::new();
+        let mut remaining: Vec<(usize, u64)> = Vec::new();
 
-            remaining.retain(|&(_, node_id)| {
-                if segment.is_node_deleted(node_id) {
-                    hidden_ids.insert(node_id);
-                    false
-                } else {
-                    true
-                }
-            });
-            if remaining.is_empty() {
-                if has_older_segments {
-                    hidden_ids.extend(segment.deleted_node_ids().iter().copied());
-                    hidden_ids.extend(segment.node_ids()?.iter().copied());
-                }
-                continue;
+        if sparse_segment_count <= 1 {
+            // Single-segment / no-sparse fast path: skip rayon overhead.
+            for (segment_index, segment) in self.segments.iter().enumerate() {
+                let has_older_segments = segment_index + 1 < self.segments.len();
+                let mut scores = NodeIdMap::default();
+                accumulate_sparse_posting_scores(
+                    segment.raw_sparse_posting_index_mmap(),
+                    segment.raw_sparse_postings_mmap(),
+                    &query,
+                    &mut scores,
+                )?;
+                Self::sparse_reduce_segment_scores(
+                    segment,
+                    scores,
+                    &mut hidden_ids,
+                    scope_ids,
+                    type_filter,
+                    policy_cutoffs.as_ref(),
+                    &mut top_hits,
+                    k,
+                    has_older_segments,
+                    &mut candidates,
+                    &mut meta_results,
+                    &mut remaining,
+                )?;
             }
+        } else {
+            // Multi-segment parallel path: parallel score, serial reduce.
+            let per_segment_scores: Vec<Result<NodeIdMap<f32>, EngineError>> =
+                crate::parallel::engine_cpu_install(|| {
+                    use rayon::prelude::*;
+                    self.segments
+                        .par_iter()
+                        .map(|segment| {
+                            let cap =
+                                (segment.node_count() as usize / 4).max(16);
+                            let mut scores = NodeIdMap::with_capacity_and_hasher(
+                                cap,
+                                NodeIdBuildHasher::default(),
+                            );
+                            accumulate_sparse_posting_scores(
+                                segment.raw_sparse_posting_index_mmap(),
+                                segment.raw_sparse_postings_mmap(),
+                                &query,
+                                &mut scores,
+                            )?;
+                            Ok(scores)
+                        })
+                        .collect()
+                });
 
-            meta_results.fill(None);
-            segment.get_node_meta_batch(&remaining, &mut meta_results)?;
-            for (index, (node_id, score)) in candidates.into_iter().enumerate() {
-                let Some((type_id, updated_at, weight)) = meta_results[index] else {
-                    continue;
-                };
-                if type_filter.is_some_and(|types| !types.contains(&type_id)) {
-                    continue;
-                }
-                if policy_cutoffs
-                    .as_ref()
-                    .is_some_and(|cutoffs| cutoffs.excludes_fields(type_id, updated_at, weight))
-                {
-                    continue;
-                }
-                Self::push_sparse_top_k(&mut top_hits, k, node_id, score);
-            }
-            if has_older_segments {
-                hidden_ids.extend(segment.deleted_node_ids().iter().copied());
-                hidden_ids.extend(segment.node_ids()?.iter().copied());
+            // Serial ordered reduce (newest-to-oldest) for visibility correctness.
+            for (segment_index, (segment, scores_result)) in
+                self.segments.iter().zip(per_segment_scores).enumerate()
+            {
+                let has_older_segments = segment_index + 1 < self.segments.len();
+                let scores = scores_result?;
+                Self::sparse_reduce_segment_scores(
+                    segment,
+                    scores,
+                    &mut hidden_ids,
+                    scope_ids,
+                    type_filter,
+                    policy_cutoffs.as_ref(),
+                    &mut top_hits,
+                    k,
+                    has_older_segments,
+                    &mut candidates,
+                    &mut meta_results,
+                    &mut remaining,
+                )?;
             }
         }
 
@@ -1057,17 +1257,15 @@ impl DatabaseEngine {
         };
 
         // Over-fetch from each modality for better fusion quality.
-        let sub_k = request.k.saturating_mul(HYBRID_OVERFETCH_FACTOR).max(request.k);
+        let sub_k = request
+            .k
+            .saturating_mul(HYBRID_OVERFETCH_FACTOR)
+            .max(request.k);
 
-        let (dense_result, sparse_result) = std::thread::scope(|s| {
-            let dense = s.spawn(|| {
-                self.vector_search_dense_with_scope(request, sub_k, scope_ids.as_ref())
-            });
-            let sparse = s.spawn(|| {
-                self.vector_search_sparse_with_scope(request, sub_k, scope_ids.as_ref())
-            });
-            (dense.join().unwrap(), sparse.join().unwrap())
-        });
+        let (dense_result, sparse_result) = crate::parallel::engine_cpu_join(
+            || self.vector_search_dense_with_scope(request, sub_k, scope_ids.as_ref()),
+            || self.vector_search_sparse_with_scope(request, sub_k, scope_ids.as_ref()),
+        );
         let dense_hits = dense_result?;
         let sparse_hits = sparse_result?;
 
@@ -1076,15 +1274,23 @@ impl DatabaseEngine {
         let sparse_weight = request.sparse_weight.unwrap_or(1.0);
 
         let fused = match fusion_mode {
-            FusionMode::WeightedRankFusion => {
-                fuse_weighted_rank(&dense_hits, &sparse_hits, dense_weight, sparse_weight, request.k)
-            }
+            FusionMode::WeightedRankFusion => fuse_weighted_rank(
+                &dense_hits,
+                &sparse_hits,
+                dense_weight,
+                sparse_weight,
+                request.k,
+            ),
             FusionMode::ReciprocalRankFusion => {
                 fuse_reciprocal_rank(&dense_hits, &sparse_hits, request.k)
             }
-            FusionMode::WeightedScoreFusion => {
-                fuse_weighted_score(&dense_hits, &sparse_hits, dense_weight, sparse_weight, request.k)
-            }
+            FusionMode::WeightedScoreFusion => fuse_weighted_score(
+                &dense_hits,
+                &sparse_hits,
+                dense_weight,
+                sparse_weight,
+                request.k,
+            ),
         };
 
         Ok(fused)
@@ -1257,12 +1463,8 @@ impl DatabaseEngine {
         // Pre-collect deleted node IDs from memtable + all immutable epochs
         // so the per-found-node tombstone check inside the segment loop is O(1)
         // instead of O(F × I).
-        let mut deleted_above: crate::types::NodeIdSet = self
-            .memtable
-            .deleted_nodes()
-            .keys()
-            .copied()
-            .collect();
+        let mut deleted_above: crate::types::NodeIdSet =
+            self.memtable.deleted_nodes().keys().copied().collect();
         for e in &self.immutable_epochs {
             deleted_above.extend(e.memtable.deleted_nodes().keys().copied());
         }
@@ -1805,7 +2007,8 @@ impl DatabaseEngine {
                 after: page.after,
             };
             let merged = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &all_page);
-            let mut visible: NodeIdSet = NodeIdSet::with_capacity_and_hasher(merged.items.len(), Default::default());
+            let mut visible: NodeIdSet =
+                NodeIdSet::with_capacity_and_hasher(merged.items.len(), Default::default());
             let segment_candidates: Vec<u64> = merged
                 .items
                 .iter()
@@ -1872,7 +2075,8 @@ impl DatabaseEngine {
                     .filter(|id| !memtable_verified.contains(id))
                     .collect();
                 let batch_results = self.get_nodes_raw(&segment_candidates)?;
-                let mut visible: NodeIdSet = NodeIdSet::with_capacity_and_hasher(merged.items.len(), Default::default());
+                let mut visible: NodeIdSet =
+                    NodeIdSet::with_capacity_and_hasher(merged.items.len(), Default::default());
                 for id in merged.items.iter().copied() {
                     if memtable_verified.contains(&id) {
                         visible.insert(id);
@@ -2020,7 +2224,8 @@ impl DatabaseEngine {
                 }
 
                 let nodes = self.get_nodes_raw(&chunk.items)?;
-                let mut visible: NodeIdSet = NodeIdSet::with_capacity_and_hasher(chunk.items.len(), Default::default());
+                let mut visible: NodeIdSet =
+                    NodeIdSet::with_capacity_and_hasher(chunk.items.len(), Default::default());
                 for (id, node) in chunk.items.iter().zip(nodes.iter()) {
                     if let Some(n) = node {
                         if n.updated_at >= from_ms && n.updated_at <= to_ms {
@@ -2076,11 +2281,25 @@ impl DatabaseEngine {
         seed_node_ids: &[u64],
         options: &PprOptions,
     ) -> Result<PprResult, EngineError> {
+        let empty_approx = || {
+            if options.algorithm == PprAlgorithm::ApproxForwardPush {
+                Some(PprApproxMeta {
+                    residual_tolerance: options.approx_residual_tolerance,
+                    pushes: 0,
+                    max_remaining_residual: 0.0,
+                })
+            } else {
+                None
+            }
+        };
+
         if seed_node_ids.is_empty() {
             return Ok(PprResult {
                 scores: Vec::new(),
                 iterations: 0,
                 converged: true,
+                algorithm: options.algorithm,
+                approx: empty_approx(),
             });
         }
 
@@ -2088,6 +2307,13 @@ impl DatabaseEngine {
         if damping <= 0.0 || damping >= 1.0 {
             return Err(EngineError::InvalidOperation(
                 "damping_factor must be in (0.0, 1.0)".into(),
+            ));
+        }
+        if options.algorithm == PprAlgorithm::ApproxForwardPush
+            && options.approx_residual_tolerance <= 0.0
+        {
+            return Err(EngineError::InvalidOperation(
+                "approx_residual_tolerance must be > 0.0".into(),
             ));
         }
         let edge_filter = options.edge_type_filter.as_deref();
@@ -2110,10 +2336,169 @@ impl DatabaseEngine {
                 scores: Vec::new(),
                 iterations: 0,
                 converged: true,
+                algorithm: options.algorithm,
+                approx: empty_approx(),
             });
         }
         let num_seeds = seeds.len() as f64;
         let teleport = (1.0 - damping) / num_seeds;
+
+        if options.algorithm == PprAlgorithm::ApproxForwardPush {
+            let batch_opts = NeighborOptions {
+                direction: Direction::Outgoing,
+                type_filter: edge_filter.map(|s| s.to_vec()),
+                limit: None,
+                at_epoch: None,
+                decay_lambda: None,
+            };
+            let tolerance = options.approx_residual_tolerance;
+            let mut reserve: NodeIdMap<f64> =
+                NodeIdMap::with_capacity_and_hasher(seeds.len() * 16, Default::default());
+            let mut residual: NodeIdMap<f64> =
+                NodeIdMap::with_capacity_and_hasher(seeds.len() * 16, Default::default());
+            let mut pending: NodeIdSet =
+                NodeIdSet::with_capacity_and_hasher(seeds.len() * 16, Default::default());
+            let mut neighbor_cache: NodeIdMap<Vec<(u64, f64)>> =
+                NodeIdMap::with_capacity_and_hasher(seeds.len() * 16, Default::default());
+            let mut out_weight_sums: NodeIdMap<f64> =
+                NodeIdMap::with_capacity_and_hasher(seeds.len() * 16, Default::default());
+            let mut pushes = 0u64;
+
+            for &seed in &seeds {
+                *residual.entry(seed).or_insert(0.0) += 1.0 / num_seeds;
+                pending.insert(seed);
+            }
+
+            while !pending.is_empty() {
+                let mut wave: Vec<u64> = pending.drain().collect();
+                wave.sort_unstable();
+                let uncached: Vec<u64> = wave
+                    .iter()
+                    .copied()
+                    .filter(|id| !neighbor_cache.contains_key(id))
+                    .collect();
+
+                if !uncached.is_empty() {
+                    let all_neighbors = self.neighbors_batch(&uncached, &batch_opts)?;
+                    for &node_id in &uncached {
+                        let raw_neighbors: Vec<(u64, f32)> = all_neighbors
+                            .get(&node_id)
+                            .map(|n| n.iter().map(|e| (e.node_id, e.weight)).collect())
+                            .unwrap_or_default();
+                        let total_weight: f64 = raw_neighbors.iter().map(|&(_, w)| w as f64).sum();
+                        if total_weight > 0.0 {
+                            out_weight_sums.insert(node_id, total_weight);
+                            neighbor_cache.insert(
+                                node_id,
+                                raw_neighbors
+                                    .into_iter()
+                                    .map(|(nid, w)| (nid, (w as f64) / total_weight))
+                                    .collect(),
+                            );
+                        } else {
+                            out_weight_sums.insert(node_id, 0.0);
+                            neighbor_cache.insert(node_id, Vec::new());
+                        }
+                    }
+                }
+
+                let mut wave_updates: NodeIdMap<f64> =
+                    NodeIdMap::with_capacity_and_hasher(wave.len() * 8, Default::default());
+                let mut dangling_seed_add = 0.0_f64;
+
+                for node_id in wave {
+                    let res = *residual.get(&node_id).unwrap_or(&0.0);
+                    if res == 0.0 {
+                        continue;
+                    }
+
+                    let out_weight_sum = *out_weight_sums.get(&node_id).unwrap_or(&0.0);
+                    let activation = if out_weight_sum > 0.0 {
+                        res / out_weight_sum
+                    } else {
+                        res
+                    };
+                    if activation <= tolerance {
+                        continue;
+                    }
+
+                    residual.insert(node_id, 0.0);
+                    *reserve.entry(node_id).or_insert(0.0) += (1.0 - damping) * res;
+                    let pushed_mass = damping * res;
+                    pushes += 1;
+
+                    let neighbors = neighbor_cache
+                        .get(&node_id)
+                        .expect("approx PPR neighbor cache should be populated");
+                    if neighbors.is_empty() {
+                        dangling_seed_add += pushed_mass / num_seeds;
+                    } else {
+                        for &(neighbor_id, norm_weight) in neighbors {
+                            *wave_updates.entry(neighbor_id).or_insert(0.0) +=
+                                pushed_mass * norm_weight;
+                        }
+                    }
+                }
+
+                if dangling_seed_add != 0.0 {
+                    for &seed in &seeds {
+                        *wave_updates.entry(seed).or_insert(0.0) += dangling_seed_add;
+                    }
+                }
+
+                for (node_id, delta) in wave_updates {
+                    let next_residual = {
+                        let entry = residual.entry(node_id).or_insert(0.0);
+                        *entry += delta;
+                        *entry
+                    };
+                    if next_residual == 0.0 {
+                        continue;
+                    }
+                    match out_weight_sums.get(&node_id).copied() {
+                        Some(out_weight_sum) => {
+                            let activation = if out_weight_sum > 0.0 {
+                                next_residual / out_weight_sum
+                            } else {
+                                next_residual
+                            };
+                            if activation > tolerance {
+                                pending.insert(node_id);
+                            }
+                        }
+                        None => {
+                            pending.insert(node_id);
+                        }
+                    }
+                }
+            }
+
+            let mut scores: Vec<(u64, f64)> = reserve
+                .into_iter()
+                .filter(|(_, score)| *score > 0.0)
+                .collect();
+            scores.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            if let Some(max) = options.max_results {
+                scores.truncate(max);
+            }
+
+            let max_remaining_residual = residual.values().copied().fold(0.0, f64::max);
+            return Ok(PprResult {
+                scores,
+                iterations: 0,
+                converged: true,
+                algorithm: PprAlgorithm::ApproxForwardPush,
+                approx: Some(PprApproxMeta {
+                    residual_tolerance: tolerance,
+                    pushes,
+                    max_remaining_residual,
+                }),
+            });
+        }
 
         // --- Phase 1: BFS discovery to find all reachable nodes ---
         // Wave-based BFS with batch adjacency: one cursor walk per segment
@@ -2125,12 +2510,12 @@ impl DatabaseEngine {
 
         while !wave.is_empty() {
             let batch_opts = NeighborOptions {
-                    direction: Direction::Outgoing,
-                    type_filter: edge_filter.map(|s| s.to_vec()),
-                    limit: None,
-                    at_epoch: None,
-                    decay_lambda: None,
-                };
+                direction: Direction::Outgoing,
+                type_filter: edge_filter.map(|s| s.to_vec()),
+                limit: None,
+                at_epoch: None,
+                decay_lambda: None,
+            };
             let all_neighbors = self.neighbors_batch(&wave, &batch_opts)?;
 
             let mut next_wave: Vec<u64> = Vec::new();
@@ -2150,7 +2535,8 @@ impl DatabaseEngine {
         }
 
         // --- Phase 2: Build dense mapping ---
-        let idx_to_id: Vec<u64> = discovered.into_iter().collect();
+        let mut idx_to_id: Vec<u64> = discovered.into_iter().collect();
+        idx_to_id.sort_unstable();
         let n = idx_to_id.len();
         let id_to_idx: NodeIdMap<usize> = idx_to_id
             .iter()
@@ -2252,6 +2638,8 @@ impl DatabaseEngine {
             scores,
             iterations,
             converged,
+            algorithm: PprAlgorithm::ExactPowerIteration,
+            approx: None,
         })
     }
 

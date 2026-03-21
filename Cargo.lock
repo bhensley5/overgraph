@@ -614,6 +614,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "memmap2",
+ "rayon",
  "rmp-serde",
  "serde",
  "serde_json",

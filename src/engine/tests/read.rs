@@ -34,11 +34,34 @@ fn test_nodes_by_type_memtable_only() {
 
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let a = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    let b = engine.upsert_node(1, "bob", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "bob",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let c = engine
-        .upsert_node(2, "charlie", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            2,
+            "charlie",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let mut type1 = engine.nodes_by_type(1).unwrap();
@@ -56,8 +79,26 @@ fn test_edges_by_type_memtable_only() {
     let db_path = dir.path().join("testdb");
 
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let e1 = engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -81,17 +122,47 @@ fn test_nodes_by_type_cross_source() {
 
     // Segment: type 1 nodes
     let a = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    let b = engine.upsert_node(1, "bob", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "bob",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     // Memtable: more type 1 + type 2
     let c = engine
-        .upsert_node(1, "charlie", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            1,
+            "charlie",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let d = engine
-        .upsert_node(2, "delta", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            2,
+            "delta",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let mut type1 = engine.nodes_by_type(1).unwrap();
@@ -110,9 +181,25 @@ fn test_nodes_by_type_excludes_deleted() {
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    let b = engine.upsert_node(1, "bob", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "bob",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     // Delete alice (cross-source tombstone: segment data, memtable tombstone)
@@ -134,9 +221,25 @@ fn test_type_index_survives_flush_and_reopen() {
     {
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         a = engine
-            .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+            .upsert_node(
+                1,
+                "alice",
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
             .unwrap();
-        b = engine.upsert_node(2, "bob", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        b = engine
+            .upsert_node(
+                2,
+                "bob",
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         engine
             .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
@@ -163,11 +266,38 @@ fn test_get_nodes_by_type_memtable_only() {
 
     let mut props = BTreeMap::new();
     props.insert("name".to_string(), PropValue::String("Alice".to_string()));
-    engine.upsert_node(1, "alice", UpsertNodeOptions { props: props.clone(), weight: 0.9, ..Default::default() }).unwrap();
-    props.insert("name".to_string(), PropValue::String("Bob".to_string()));
-    engine.upsert_node(1, "bob", UpsertNodeOptions { props, weight: 0.8, ..Default::default() }).unwrap();
     engine
-        .upsert_node(2, "charlie", UpsertNodeOptions { weight: 0.7, ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: props.clone(),
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    props.insert("name".to_string(), PropValue::String("Bob".to_string()));
+    engine
+        .upsert_node(
+            1,
+            "bob",
+            UpsertNodeOptions {
+                props,
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            2,
+            "charlie",
+            UpsertNodeOptions {
+                weight: 0.7,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let type1 = engine.get_nodes_by_type(1).unwrap();
@@ -198,12 +328,18 @@ fn test_get_nodes_by_type_cross_source() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Type 1 nodes in segment
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
 
     // Type 1 node in memtable
-    engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
 
     let records = engine.get_nodes_by_type(1).unwrap();
     assert_eq!(records.len(), 3);
@@ -229,9 +365,25 @@ fn test_get_nodes_by_type_excludes_deleted() {
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    engine.upsert_node(1, "bob", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "bob",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     engine.delete_node(a).unwrap();
@@ -249,8 +401,26 @@ fn test_get_nodes_by_type_excludes_pruned() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-    engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // Policy: prune nodes with weight <= 0.5
     engine
@@ -281,10 +451,16 @@ fn test_get_nodes_by_type_post_compaction() {
     };
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
 
     engine.compact().unwrap();
@@ -306,9 +482,15 @@ fn test_get_edges_by_type_memtable_and_segment() {
     };
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
 
     // Type 10 edge in segment
     engine
@@ -318,11 +500,27 @@ fn test_get_edges_by_type_memtable_and_segment() {
 
     // Type 10 edge in memtable
     engine
-        .upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 0.8, ..Default::default() })
+        .upsert_edge(
+            b,
+            c,
+            10,
+            UpsertEdgeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
         .unwrap();
     // Type 20 edge in memtable
     engine
-        .upsert_edge(a, c, 20, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
+        .upsert_edge(
+            a,
+            c,
+            20,
+            UpsertEdgeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let type10 = engine.get_edges_by_type(10).unwrap();
@@ -358,9 +556,15 @@ fn test_get_edges_by_type_excludes_deleted() {
     };
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
 
     let e1 = engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
@@ -391,13 +595,21 @@ fn test_count_nodes_by_type() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // 3 type-1 nodes across memtable + segment
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
 
     // 1 type-2 node
-    engine.upsert_node(2, "x", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(2, "x", UpsertNodeOptions::default())
+        .unwrap();
 
     assert_eq!(engine.count_nodes_by_type(1).unwrap(), 3);
     assert_eq!(engine.count_nodes_by_type(2).unwrap(), 1);
@@ -417,9 +629,15 @@ fn test_count_edges_by_type() {
     };
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
 
     engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
@@ -445,8 +663,26 @@ fn test_count_nodes_by_type_respects_policies() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-    engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     assert_eq!(engine.count_nodes_by_type(1).unwrap(), 2);
 
@@ -694,9 +930,15 @@ fn test_nodes_by_type_paged_respects_tombstones() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let id1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let id2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let id3 = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let id1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let id2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let id3 = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     engine.delete_node(id2).unwrap();
 
     let result = engine
@@ -720,9 +962,18 @@ fn test_nodes_by_type_paged_respects_prune_policies() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    engine.upsert_node(1, "keep", UpsertNodeOptions::default()).unwrap();
     engine
-        .upsert_node(1, "prune_me", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(1, "keep", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "prune_me",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     engine
@@ -754,9 +1005,15 @@ fn test_edges_by_type_paged_basic() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let n1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let n2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let n3 = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let n1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let n2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let n3 = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
 
     let mut edge_ids: Vec<u64> = Vec::new();
     for _ in 0..6 {
@@ -802,8 +1059,12 @@ fn test_edges_by_type_paged_roundtrip() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let n1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let n2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let n1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let n2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
 
     for _ in 0..10 {
         engine
@@ -845,7 +1106,14 @@ fn test_get_nodes_by_type_paged_hydrates_page_only() {
         let mut props = BTreeMap::new();
         props.insert("idx".to_string(), PropValue::Int(i));
         engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { props, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("n{}", i),
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
 
@@ -892,8 +1160,12 @@ fn test_get_edges_by_type_paged() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let n1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let n2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let n1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let n2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
 
     for _ in 0..6 {
         engine
@@ -946,9 +1218,15 @@ fn test_paged_single_item_pages() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let id1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let id2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let id3 = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let id1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let id2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let id3 = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     let mut expected = [id1, id2, id3];
     expected.sort();
 
@@ -996,8 +1274,12 @@ fn test_paged_limit_larger_than_result_set() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
 
     let result = engine
         .nodes_by_type_paged(
@@ -1045,9 +1327,15 @@ fn test_paged_cursor_on_deleted_id() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let id1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let id2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let id3 = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let id1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let id2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let id3 = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     engine.delete_node(id2).unwrap(); // id2 is now a gap
 
     // Use deleted id2 as cursor. Should still work via binary search insertion point
@@ -1186,7 +1474,14 @@ fn test_merge_paged_with_policies() {
     }
     for i in 0..3 {
         engine
-            .upsert_node(1, &format!("prune{}", i), UpsertNodeOptions { weight: 0.1, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("prune{}", i),
+                UpsertNodeOptions {
+                    weight: 0.1,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
 
@@ -1245,15 +1540,45 @@ fn test_find_nodes_memtable_only() {
 
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), PropValue::String("red".to_string()));
-    let a = engine.upsert_node(1, "apple", UpsertNodeOptions { props: props.clone(), weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "apple",
+            UpsertNodeOptions {
+                props: props.clone(),
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let mut props2 = BTreeMap::new();
     props2.insert("color".to_string(), PropValue::String("red".to_string()));
-    let b = engine.upsert_node(1, "cherry", UpsertNodeOptions { props: props2, weight: 0.5, ..Default::default() }).unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "cherry",
+            UpsertNodeOptions {
+                props: props2,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let mut props3 = BTreeMap::new();
     props3.insert("color".to_string(), PropValue::String("green".to_string()));
-    engine.upsert_node(1, "lime", UpsertNodeOptions { props: props3, weight: 0.5, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "lime",
+            UpsertNodeOptions {
+                props: props3,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let mut reds = engine
         .find_nodes(1, "color", &PropValue::String("red".to_string()))
@@ -1288,13 +1613,33 @@ fn test_find_nodes_cross_source() {
     // Create node in memtable, flush to segment
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), PropValue::String("red".to_string()));
-    let a = engine.upsert_node(1, "apple", UpsertNodeOptions { props, weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "apple",
+            UpsertNodeOptions {
+                props,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     // Create node in memtable (stays in memtable)
     let mut props2 = BTreeMap::new();
     props2.insert("color".to_string(), PropValue::String("red".to_string()));
-    let b = engine.upsert_node(1, "cherry", UpsertNodeOptions { props: props2, weight: 0.5, ..Default::default() }).unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "cherry",
+            UpsertNodeOptions {
+                props: props2,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // find_nodes should merge across memtable + segment
     let mut reds = engine
@@ -1315,8 +1660,28 @@ fn test_find_nodes_excludes_deleted() {
 
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), PropValue::String("red".to_string()));
-    let a = engine.upsert_node(1, "apple", UpsertNodeOptions { props: props.clone(), weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "cherry", UpsertNodeOptions { props, weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "apple",
+            UpsertNodeOptions {
+                props: props.clone(),
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "cherry",
+            UpsertNodeOptions {
+                props,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     engine.delete_node(b).unwrap();
 
@@ -1339,11 +1704,31 @@ fn test_find_nodes_survives_flush_and_reopen() {
 
         let mut props = BTreeMap::new();
         props.insert("lang".to_string(), PropValue::String("rust".to_string()));
-        a = engine.upsert_node(1, "overgraph", UpsertNodeOptions { props, weight: 0.9, ..Default::default() }).unwrap();
+        a = engine
+            .upsert_node(
+                1,
+                "overgraph",
+                UpsertNodeOptions {
+                    props,
+                    weight: 0.9,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         let mut props2 = BTreeMap::new();
         props2.insert("lang".to_string(), PropValue::String("python".to_string()));
-        engine.upsert_node(1, "other", UpsertNodeOptions { props: props2, weight: 0.5, ..Default::default() }).unwrap();
+        engine
+            .upsert_node(
+                1,
+                "other",
+                UpsertNodeOptions {
+                    props: props2,
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         engine.flush().unwrap();
         engine.close().unwrap();
@@ -1378,7 +1763,17 @@ fn test_find_nodes_update_changes_index() {
         "status".to_string(),
         PropValue::String("active".to_string()),
     );
-    let a = engine.upsert_node(1, "item", UpsertNodeOptions { props, weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "item",
+            UpsertNodeOptions {
+                props,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     assert_eq!(
         engine
@@ -1393,7 +1788,17 @@ fn test_find_nodes_update_changes_index() {
         "status".to_string(),
         PropValue::String("inactive".to_string()),
     );
-    let a2 = engine.upsert_node(1, "item", UpsertNodeOptions { props: props2, weight: 0.5, ..Default::default() }).unwrap();
+    let a2 = engine
+        .upsert_node(
+            1,
+            "item",
+            UpsertNodeOptions {
+                props: props2,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(a, a2); // same ID (dedup)
 
     assert!(engine
@@ -1423,7 +1828,14 @@ fn test_find_nodes_paged_basic() {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
         let id = engine
-            .upsert_node(1, &format!("r{}", i), UpsertNodeOptions { props, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("r{}", i),
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         ids.push(id);
     }
@@ -1432,7 +1844,14 @@ fn test_find_nodes_paged_basic() {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("blue".to_string()));
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions { props, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("b{}", i),
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     ids.sort();
@@ -1499,7 +1918,14 @@ fn test_find_nodes_paged_cross_source() {
     // Create 4 in segment
     for i in 0..4 {
         engine
-            .upsert_node(1, &format!("seg{}", i), UpsertNodeOptions { props: props.clone(), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("seg{}", i),
+                UpsertNodeOptions {
+                    props: props.clone(),
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     engine.flush().unwrap();
@@ -1507,7 +1933,14 @@ fn test_find_nodes_paged_cross_source() {
     // Create 4 in memtable
     for i in 0..4 {
         engine
-            .upsert_node(1, &format!("mem{}", i), UpsertNodeOptions { props: props.clone(), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("mem{}", i),
+                UpsertNodeOptions {
+                    props: props.clone(),
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
 
@@ -1549,9 +1982,36 @@ fn test_find_nodes_paged_excludes_deleted() {
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), red.clone());
 
-    let id1 = engine.upsert_node(1, "a", UpsertNodeOptions { props: props.clone(), ..Default::default() }).unwrap();
-    let id2 = engine.upsert_node(1, "b", UpsertNodeOptions { props: props.clone(), ..Default::default() }).unwrap();
-    let id3 = engine.upsert_node(1, "c", UpsertNodeOptions { props: props.clone(), ..Default::default() }).unwrap();
+    let id1 = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let id2 = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let id3 = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.delete_node(id2).unwrap();
 
     let result = engine
@@ -1581,8 +2041,27 @@ fn test_find_nodes_paged_with_policies() {
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), red.clone());
 
-    engine.upsert_node(1, "keep", UpsertNodeOptions { props: props.clone(), ..Default::default() }).unwrap();
-    engine.upsert_node(1, "prune", UpsertNodeOptions { props: props.clone(), weight: 0.1, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "keep",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "prune",
+            UpsertNodeOptions {
+                props: props.clone(),
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     engine
         .set_prune_policy(
@@ -1619,7 +2098,14 @@ fn test_nodes_by_type_paged_policy_refills_past_sparse_filtered_window() {
     for i in 0..17u64 {
         let weight = if i < 12 { 0.1 } else { 1.0 };
         let id = engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("n{}", i),
+                UpsertNodeOptions {
+                    weight,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         if weight > 0.5 {
             visible_ids.push(id);
@@ -1675,7 +2161,15 @@ fn test_find_nodes_paged_policy_refills_past_sparse_filtered_window() {
         props.insert("color".to_string(), red.clone());
         let weight = if i < 12 { 0.1 } else { 1.0 };
         let id = engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { props, weight, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("n{}", i),
+                UpsertNodeOptions {
+                    props,
+                    weight,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         if weight > 0.5 {
             visible_ids.push(id);
@@ -1734,7 +2228,14 @@ fn test_find_nodes_paged_default_returns_all() {
 
     for i in 0..5 {
         engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { props: props.clone(), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("n{}", i),
+                UpsertNodeOptions {
+                    props: props.clone(),
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
 
@@ -1753,8 +2254,26 @@ fn test_upsert_edge_default_temporal_fields() {
     let db_path = dir.path().join("db");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let eid = engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -1773,10 +2292,37 @@ fn test_upsert_edge_custom_temporal_fields() {
     let db_path = dir.path().join("db");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let eid = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { valid_from: Some(1000), valid_to: Some(5000), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                valid_from: Some(1000),
+                valid_to: Some(5000),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let edge = engine.get_edge(eid).unwrap().unwrap();
@@ -1792,10 +2338,37 @@ fn test_temporal_fields_survive_flush_and_segment_read() {
     let db_path = dir.path().join("db");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let eid = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { valid_from: Some(2000), valid_to: Some(8000), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                valid_from: Some(2000),
+                valid_to: Some(8000),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Flush to segment
@@ -1817,10 +2390,37 @@ fn test_temporal_fields_survive_wal_replay() {
     let eid;
     {
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine
+            .upsert_node(
+                1,
+                "a",
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let b = engine
+            .upsert_node(
+                1,
+                "b",
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         eid = engine
-            .upsert_edge(a, b, 10, UpsertEdgeOptions { valid_from: Some(3000), valid_to: Some(9000), ..Default::default() })
+            .upsert_edge(
+                a,
+                b,
+                10,
+                UpsertEdgeOptions {
+                    valid_from: Some(3000),
+                    valid_to: Some(9000),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         engine.close().unwrap();
     }
@@ -1841,9 +2441,36 @@ fn test_batch_upsert_edges_temporal_fields() {
     let db_path = dir.path().join("db");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let inputs = vec![
         EdgeInput {
@@ -1884,16 +2511,52 @@ fn test_temporal_fields_survive_compaction() {
     let db_path = dir.path().join("db");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let eid = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { valid_from: Some(4000), valid_to: Some(7000), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                valid_from: Some(4000),
+                valid_to: Some(7000),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Flush segment 1
     engine.flush().unwrap();
     // Add something to create segment 2
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine
         .upsert_edge(b, c, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -1919,8 +2582,26 @@ fn test_invalidate_edge_closes_validity_window() {
     let db_path = dir.path().join("db");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let eid = engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -1960,9 +2641,36 @@ fn test_invalidated_edge_hidden_from_neighbors() {
     let db_path = dir.path().join("db");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let e_ab = engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -1971,18 +2679,14 @@ fn test_invalidated_edge_hidden_from_neighbors() {
         .unwrap();
 
     // Both neighbors visible
-    let out = engine
-        .neighbors(a, &NeighborOptions::default())
-        .unwrap();
+    let out = engine.neighbors(a, &NeighborOptions::default()).unwrap();
     assert_eq!(out.len(), 2);
 
     // Invalidate a→b at epoch 1 (in the past)
     engine.invalidate_edge(e_ab, 1).unwrap();
 
     // Only a→c should be visible now
-    let out = engine
-        .neighbors(a, &NeighborOptions::default())
-        .unwrap();
+    let out = engine.neighbors(a, &NeighborOptions::default()).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].node_id, c);
 
@@ -1995,8 +2699,26 @@ fn test_invalidated_edge_hidden_after_flush() {
     let db_path = dir.path().join("db");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let eid = engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -2006,9 +2728,7 @@ fn test_invalidated_edge_hidden_after_flush() {
     engine.invalidate_edge(eid, 1).unwrap();
 
     // Edge should be hidden from neighbors
-    let out = engine
-        .neighbors(a, &NeighborOptions::default())
-        .unwrap();
+    let out = engine.neighbors(a, &NeighborOptions::default()).unwrap();
     assert!(out.is_empty());
 
     // But still retrievable via get_edge
@@ -2026,8 +2746,26 @@ fn test_invalidated_edge_survives_wal_replay() {
     let (a, eid);
     {
         let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        a = engine
+            .upsert_node(
+                1,
+                "a",
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let b = engine
+            .upsert_node(
+                1,
+                "b",
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         eid = engine
             .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
             .unwrap();
@@ -2041,9 +2779,7 @@ fn test_invalidated_edge_survives_wal_replay() {
         let edge = engine.get_edge(eid).unwrap().unwrap();
         assert_eq!(edge.valid_to, 1);
 
-        let out = engine
-            .neighbors(a, &NeighborOptions::default())
-            .unwrap();
+        let out = engine.neighbors(a, &NeighborOptions::default()).unwrap();
         assert!(out.is_empty());
         engine.close().unwrap();
     }
@@ -2057,48 +2793,102 @@ fn test_point_in_time_query_sees_valid_edges() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
 
     // Edge a→b: valid from epoch 1000 to 5000
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions { valid_from: Some(1000), valid_to: Some(5000), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(1000),
+                valid_to: Some(5000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     // Edge a→c: valid from epoch 3000 to 8000
     engine
-        .upsert_edge(a, c, 1, UpsertEdgeOptions { valid_from: Some(3000), valid_to: Some(8000), ..Default::default() })
+        .upsert_edge(
+            a,
+            c,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(3000),
+                valid_to: Some(8000),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // At epoch 500: neither edge is valid
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(500), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(500),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 0);
 
     // At epoch 2000: only a→b is valid
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(2000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(2000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].node_id, b);
 
     // At epoch 4000: both edges are valid
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(4000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(4000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 2);
 
     // At epoch 6000: only a→c is valid (a→b expired at 5000)
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(6000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(6000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].node_id, c);
 
     // At epoch 9000: neither edge is valid
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(9000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(9000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 0);
     engine.close().unwrap();
@@ -2110,12 +2900,25 @@ fn test_point_in_time_query_with_invalidated_edge() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
 
     // Create edge with explicit validity window
     let eid = engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions { valid_from: Some(1000), valid_to: Some(10000), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(1000),
+                valid_to: Some(10000),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Invalidate at epoch 5000
@@ -2123,19 +2926,37 @@ fn test_point_in_time_query_with_invalidated_edge() {
 
     // At epoch 3000: edge is valid (before invalidation)
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(3000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(3000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 1);
 
     // At epoch 5000: edge is no longer valid (valid_to is exclusive)
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(5000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(5000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 0);
 
     // At epoch 7000: edge is no longer valid
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(7000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(7000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 0);
     engine.close().unwrap();
@@ -2147,23 +2968,48 @@ fn test_point_in_time_query_after_flush() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
 
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions { valid_from: Some(2000), valid_to: Some(8000), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(2000),
+                valid_to: Some(8000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     // Query from segment: at_epoch=5000 should see it
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(5000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(5000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 1);
 
     // Query from segment: at_epoch=1000 should not
     let out = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(1000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(1000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 0);
     engine.close().unwrap();
@@ -2175,16 +3021,40 @@ fn test_point_in_time_traverse_depth_two() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
 
     // a→b valid 1000-5000, b→c valid 2000-6000
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions { valid_from: Some(1000), valid_to: Some(5000), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(1000),
+                valid_to: Some(5000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_edge(b, c, 1, UpsertEdgeOptions { valid_from: Some(2000), valid_to: Some(6000), ..Default::default() })
+        .upsert_edge(
+            b,
+            c,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(2000),
+                valid_to: Some(6000),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // At epoch 3000: both hops valid, should reach c
@@ -2210,8 +3080,12 @@ fn test_decay_scoring_orders_by_recency() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let hub = engine.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
-    let old = engine.upsert_node(1, "old", UpsertNodeOptions::default()).unwrap();
+    let hub = engine
+        .upsert_node(1, "hub", UpsertNodeOptions::default())
+        .unwrap();
+    let old = engine
+        .upsert_node(1, "old", UpsertNodeOptions::default())
+        .unwrap();
     let recent = engine
         .upsert_node(1, "recent", UpsertNodeOptions::default())
         .unwrap();
@@ -2223,22 +3097,42 @@ fn test_decay_scoring_orders_by_recency() {
     // Both edges have equal base weight=1.0, but different updated_at times
     // Old edge: created/updated a day ago
     engine
-        .upsert_edge(hub, old, 1, UpsertEdgeOptions { valid_from: Some(one_day_ago), ..Default::default() })
+        .upsert_edge(
+            hub,
+            old,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(one_day_ago),
+                ..Default::default()
+            },
+        )
         .unwrap();
     // Recent edge: created/updated an hour ago
     engine
-        .upsert_edge(hub, recent, 1, UpsertEdgeOptions { valid_from: Some(one_hour_ago), ..Default::default() })
+        .upsert_edge(
+            hub,
+            recent,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(one_hour_ago),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Without decay: order is insertion order (or arbitrary)
-    let out = engine
-        .neighbors(hub, &NeighborOptions::default())
-        .unwrap();
+    let out = engine.neighbors(hub, &NeighborOptions::default()).unwrap();
     assert_eq!(out.len(), 2);
 
     // With decay (lambda=0.1): recent edge should have higher score
     let out = engine
-        .neighbors(hub, &NeighborOptions { decay_lambda: Some(0.1), ..Default::default() })
+        .neighbors(
+            hub,
+            &NeighborOptions {
+                decay_lambda: Some(0.1),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 2);
     // First result should be the recent one (higher decay-adjusted weight)
@@ -2255,7 +3149,9 @@ fn test_decay_scoring_with_different_base_weights() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let hub = engine.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
+    let hub = engine
+        .upsert_node(1, "hub", UpsertNodeOptions::default())
+        .unwrap();
     let heavy_old = engine
         .upsert_node(1, "heavy_old", UpsertNodeOptions::default())
         .unwrap();
@@ -2269,18 +3165,41 @@ fn test_decay_scoring_with_different_base_weights() {
 
     // Heavy but old: weight=10.0, updated 2 days ago
     engine
-        .upsert_edge(hub, heavy_old, 1, UpsertEdgeOptions { weight: 10.0, valid_from: Some(two_days_ago), ..Default::default() })
+        .upsert_edge(
+            hub,
+            heavy_old,
+            1,
+            UpsertEdgeOptions {
+                weight: 10.0,
+                valid_from: Some(two_days_ago),
+                ..Default::default()
+            },
+        )
         .unwrap();
     // Light but new: weight=1.0, updated 1 hour ago
     engine
-        .upsert_edge(hub, light_new, 1, UpsertEdgeOptions { valid_from: Some(one_hour_ago), ..Default::default() })
+        .upsert_edge(
+            hub,
+            light_new,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(one_hour_ago),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // With aggressive decay (lambda=0.1): age penalty on the heavy edge should be large
     // score(heavy_old) = 10.0 * exp(-0.1 * 48) ≈ 10.0 * 0.0082 ≈ 0.082
     // score(light_new) = 1.0 * exp(-0.1 * 1) ≈ 1.0 * 0.905 ≈ 0.905
     let out = engine
-        .neighbors(hub, &NeighborOptions { decay_lambda: Some(0.1), ..Default::default() })
+        .neighbors(
+            hub,
+            &NeighborOptions {
+                decay_lambda: Some(0.1),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].node_id, light_new); // light_new wins despite lower base weight
@@ -2294,17 +3213,27 @@ fn test_decay_zero_lambda_no_reorder() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
 
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            1,
+            UpsertEdgeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // decay_lambda=None means no decay applied
-    let out = engine
-        .neighbors(a, &NeighborOptions::default())
-        .unwrap();
+    let out = engine.neighbors(a, &NeighborOptions::default()).unwrap();
     assert_eq!(out.len(), 1);
     assert!((out[0].weight - 5.0).abs() < 0.001); // original weight preserved
     engine.close().unwrap();
@@ -2316,27 +3245,66 @@ fn test_decay_with_limit_returns_top_scored() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let hub = engine.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
-    let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions::default()).unwrap();
-    let n2 = engine.upsert_node(1, "n2", UpsertNodeOptions::default()).unwrap();
-    let n3 = engine.upsert_node(1, "n3", UpsertNodeOptions::default()).unwrap();
+    let hub = engine
+        .upsert_node(1, "hub", UpsertNodeOptions::default())
+        .unwrap();
+    let n1 = engine
+        .upsert_node(1, "n1", UpsertNodeOptions::default())
+        .unwrap();
+    let n2 = engine
+        .upsert_node(1, "n2", UpsertNodeOptions::default())
+        .unwrap();
+    let n3 = engine
+        .upsert_node(1, "n3", UpsertNodeOptions::default())
+        .unwrap();
 
     let now = now_millis();
 
     // Three edges with different ages, same base weight
     engine
-        .upsert_edge(hub, n1, 1, UpsertEdgeOptions { valid_from: Some(now - 72 * 3_600_000), ..Default::default() })
+        .upsert_edge(
+            hub,
+            n1,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(now - 72 * 3_600_000),
+                ..Default::default()
+            },
+        )
         .unwrap(); // 3 days old
     engine
-        .upsert_edge(hub, n2, 1, UpsertEdgeOptions { valid_from: Some(now - 24 * 3_600_000), ..Default::default() })
+        .upsert_edge(
+            hub,
+            n2,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(now - 24 * 3_600_000),
+                ..Default::default()
+            },
+        )
         .unwrap(); // 1 day old
     engine
-        .upsert_edge(hub, n3, 1, UpsertEdgeOptions { valid_from: Some(now - 3_600_000), ..Default::default() })
+        .upsert_edge(
+            hub,
+            n3,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(now - 3_600_000),
+                ..Default::default()
+            },
+        )
         .unwrap(); // 1 hour old
 
     // With decay and limit=2: should return the 2 most recent
     let out = engine
-        .neighbors(hub, &NeighborOptions { limit: Some(2), decay_lambda: Some(0.05), ..Default::default() })
+        .neighbors(
+            hub,
+            &NeighborOptions {
+                limit: Some(2),
+                decay_lambda: Some(0.05),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].node_id, n3); // most recent first
@@ -2350,22 +3318,53 @@ fn test_point_in_time_with_decay() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let hub = engine.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
-    let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions::default()).unwrap();
-    let n2 = engine.upsert_node(1, "n2", UpsertNodeOptions::default()).unwrap();
+    let hub = engine
+        .upsert_node(1, "hub", UpsertNodeOptions::default())
+        .unwrap();
+    let n1 = engine
+        .upsert_node(1, "n1", UpsertNodeOptions::default())
+        .unwrap();
+    let n2 = engine
+        .upsert_node(1, "n2", UpsertNodeOptions::default())
+        .unwrap();
 
     // Edge 1: valid 1000-5000, updated_at=1000
     engine
-        .upsert_edge(hub, n1, 1, UpsertEdgeOptions { valid_from: Some(1000), valid_to: Some(5000), ..Default::default() })
+        .upsert_edge(
+            hub,
+            n1,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(1000),
+                valid_to: Some(5000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     // Edge 2: valid 2000-8000, updated_at=2000
     engine
-        .upsert_edge(hub, n2, 1, UpsertEdgeOptions { valid_from: Some(2000), valid_to: Some(8000), ..Default::default() })
+        .upsert_edge(
+            hub,
+            n2,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(2000),
+                valid_to: Some(8000),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // At epoch 3000 with decay: both visible, decay based on age from reference_time
     let out = engine
-        .neighbors(hub, &NeighborOptions { at_epoch: Some(3000), decay_lambda: Some(0.01), ..Default::default() })
+        .neighbors(
+            hub,
+            &NeighborOptions {
+                at_epoch: Some(3000),
+                decay_lambda: Some(0.01),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 2);
     // n2's edge is newer (updated_at=2000 vs 1000), so it should score higher
@@ -2374,7 +3373,14 @@ fn test_point_in_time_with_decay() {
 
     // At epoch 6000: only edge 2 is valid
     let out = engine
-        .neighbors(hub, &NeighborOptions { at_epoch: Some(6000), decay_lambda: Some(0.01), ..Default::default() })
+        .neighbors(
+            hub,
+            &NeighborOptions {
+                at_epoch: Some(6000),
+                decay_lambda: Some(0.01),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].node_id, n2);
@@ -2387,18 +3393,38 @@ fn test_decay_scoring_after_flush_segment_sourced() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let hub = engine.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
-    let old = engine.upsert_node(1, "old", UpsertNodeOptions::default()).unwrap();
+    let hub = engine
+        .upsert_node(1, "hub", UpsertNodeOptions::default())
+        .unwrap();
+    let old = engine
+        .upsert_node(1, "old", UpsertNodeOptions::default())
+        .unwrap();
     let recent = engine
         .upsert_node(1, "recent", UpsertNodeOptions::default())
         .unwrap();
 
     let now = now_millis();
     engine
-        .upsert_edge(hub, old, 1, UpsertEdgeOptions { valid_from: Some(now - 48 * 3_600_000), ..Default::default() })
+        .upsert_edge(
+            hub,
+            old,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(now - 48 * 3_600_000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_edge(hub, recent, 1, UpsertEdgeOptions { valid_from: Some(now - 3_600_000), ..Default::default() })
+        .upsert_edge(
+            hub,
+            recent,
+            1,
+            UpsertEdgeOptions {
+                valid_from: Some(now - 3_600_000),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Flush to segment. Edges now served from segment reader
@@ -2406,7 +3432,13 @@ fn test_decay_scoring_after_flush_segment_sourced() {
 
     // Decay should still work on segment-sourced edges
     let out = engine
-        .neighbors(hub, &NeighborOptions { decay_lambda: Some(0.05), ..Default::default() })
+        .neighbors(
+            hub,
+            &NeighborOptions {
+                decay_lambda: Some(0.05),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].node_id, recent); // recent edge scores higher
@@ -2421,12 +3453,20 @@ fn test_negative_decay_lambda_returns_error() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
     engine
         .upsert_edge(a, a, 1, UpsertEdgeOptions::default())
         .unwrap();
 
-    let result = engine.neighbors(a, &NeighborOptions { decay_lambda: Some(-0.5), ..Default::default() });
+    let result = engine.neighbors(
+        a,
+        &NeighborOptions {
+            decay_lambda: Some(-0.5),
+            ..Default::default()
+        },
+    );
     assert!(result.is_err());
     engine.close().unwrap();
 }
@@ -2439,37 +3479,100 @@ fn test_temporal_adjacency_postings_survive_flush() {
     let db_path = dir.path().join("testdb");
     let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // Edge a→b valid [1000, 5000)
     engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { valid_from: Some(1000), valid_to: Some(5000), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                valid_from: Some(1000),
+                valid_to: Some(5000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     // Edge a→c valid [3000, 9000)
     engine
-        .upsert_edge(a, c, 10, UpsertEdgeOptions { valid_from: Some(3000), valid_to: Some(9000), ..Default::default() })
+        .upsert_edge(
+            a,
+            c,
+            10,
+            UpsertEdgeOptions {
+                valid_from: Some(3000),
+                valid_to: Some(9000),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     engine.flush().unwrap();
 
     // At t=2000: only a→b visible
     let n = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(2000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(2000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(n.len(), 1);
     assert_eq!(n[0].node_id, b);
 
     // At t=4000: both visible
     let n = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(4000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(4000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(n.len(), 2);
 
     // At t=6000: only a→c visible
     let n = engine
-        .neighbors(a, &NeighborOptions { at_epoch: Some(6000), ..Default::default() })
+        .neighbors(
+            a,
+            &NeighborOptions {
+                at_epoch: Some(6000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(n.len(), 1);
     assert_eq!(n[0].node_id, c);
@@ -2488,8 +3591,26 @@ fn test_adjacency_hashmap_upsert_idempotent() {
     };
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // Insert edge, then upsert it multiple times with different weights
     // With edge_uniqueness, (a, b, 10) deduplicates to the same edge ID.
@@ -2497,18 +3618,32 @@ fn test_adjacency_hashmap_upsert_idempotent() {
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
     let eid2 = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let eid3 = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                weight: 3.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(eid, eid2);
     assert_eq!(eid, eid3);
 
     // Should still have exactly 1 neighbor entry, not 3
-    let n = engine
-        .neighbors(a, &NeighborOptions::default())
-        .unwrap();
+    let n = engine.neighbors(a, &NeighborOptions::default()).unwrap();
     assert_eq!(n.len(), 1);
     assert_eq!(n[0].edge_id, eid);
     assert_eq!(n[0].weight, 3.0); // latest weight
@@ -2554,7 +3689,12 @@ fn test_compact_with_progress_reports_all_phases() {
     // Add some edges to make the edge phase meaningful
     for i in 0..10 {
         engine
-            .upsert_edge(node_ids[i], node_ids[i + 1], 1, UpsertEdgeOptions::default())
+            .upsert_edge(
+                node_ids[i],
+                node_ids[i + 1],
+                1,
+                UpsertEdgeOptions::default(),
+            )
             .unwrap();
     }
     engine.flush().unwrap();
@@ -2702,7 +3842,12 @@ fn test_compact_with_progress_cancel_during_merge_edges() {
     engine.flush().unwrap();
     for i in 0..5 {
         engine
-            .upsert_edge(node_ids[i], node_ids[i + 1], 1, UpsertEdgeOptions::default())
+            .upsert_edge(
+                node_ids[i],
+                node_ids[i + 1],
+                1,
+                UpsertEdgeOptions::default(),
+            )
             .unwrap();
     }
     engine.flush().unwrap();
@@ -2716,9 +3861,7 @@ fn test_compact_with_progress_cancel_during_merge_edges() {
         assert!(engine.get_node(id).unwrap().is_some());
     }
     for nid in &node_ids[..5] {
-        let neighbors = engine
-            .neighbors(*nid, &NeighborOptions::default())
-            .unwrap();
+        let neighbors = engine.neighbors(*nid, &NeighborOptions::default()).unwrap();
         assert!(
             !neighbors.is_empty(),
             "node {} should have outgoing edges",
@@ -2932,7 +4075,14 @@ fn test_get_node_by_key_found() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     let id = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "Alice"), ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "Alice"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let node = engine.get_node_by_key(1, "alice").unwrap().unwrap();
     assert_eq!(node.id, id);
@@ -2950,7 +4100,14 @@ fn test_get_node_by_key_not_found() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "Alice"), ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "Alice"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert!(engine.get_node_by_key(1, "bob").unwrap().is_none());
     assert!(engine.get_node_by_key(2, "alice").unwrap().is_none());
@@ -2962,7 +4119,14 @@ fn test_get_node_by_key_after_flush() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     let id = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "Alice"), ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "Alice"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     let node = engine.get_node_by_key(1, "alice").unwrap().unwrap();
@@ -2976,11 +4140,26 @@ fn test_get_node_by_key_after_compaction() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "v1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "v1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     let id2 = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "v2"), weight: 2.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "v2"),
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine.compact().unwrap();
@@ -2999,7 +4178,14 @@ fn test_get_node_by_key_deleted() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     let id = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "Alice"), ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "Alice"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.delete_node(id).unwrap();
     assert!(engine.get_node_by_key(1, "alice").unwrap().is_none());
@@ -3011,7 +4197,14 @@ fn test_get_node_by_key_deleted_cross_source() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     let id = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "Alice"), ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "Alice"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine.delete_node(id).unwrap();
@@ -3024,11 +4217,26 @@ fn test_get_node_by_key_memtable_shadows_segment() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "v1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "v1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     let id2 = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "v2"), weight: 2.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "v2"),
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let node = engine.get_node_by_key(1, "alice").unwrap().unwrap();
     assert_eq!(node.id, id2);
@@ -3045,10 +4253,23 @@ fn test_get_node_by_key_memtable_shadows_segment() {
 fn test_get_edge_by_triple_found() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let eid = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { props: make_props("rel", "knows"), weight: 0.5, ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                props: make_props("rel", "knows"),
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let edge = engine.get_edge_by_triple(a, b, 10).unwrap().unwrap();
     assert_eq!(edge.id, eid);
@@ -3066,8 +4287,12 @@ fn test_get_edge_by_triple_found() {
 fn test_get_edge_by_triple_not_found() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -3080,8 +4305,12 @@ fn test_get_edge_by_triple_not_found() {
 fn test_get_edge_by_triple_after_flush() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let eid = engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -3095,8 +4324,12 @@ fn test_get_edge_by_triple_after_flush() {
 fn test_get_edge_by_triple_deleted() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let eid = engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -3109,8 +4342,12 @@ fn test_get_edge_by_triple_deleted() {
 fn test_get_edge_by_triple_deleted_cross_source() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let eid = engine
         .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
         .unwrap();
@@ -3131,14 +4368,35 @@ fn test_get_edge_by_triple_after_compaction() {
         ..Default::default()
     };
     let mut engine = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { props: make_props("v", "1"), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                props: make_props("v", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     let eid2 = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { props: make_props("v", "2"), weight: 2.0, ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                props: make_props("v", "2"),
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine.compact().unwrap();
@@ -3158,13 +4416,34 @@ fn test_get_nodes_bulk() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     let a = engine
-        .upsert_node(1, "a", UpsertNodeOptions { props: make_props("name", "A"), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("name", "A"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "b", UpsertNodeOptions { props: make_props("name", "B"), ..Default::default() })
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                props: make_props("name", "B"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let c = engine
-        .upsert_node(1, "c", UpsertNodeOptions { props: make_props("name", "C"), ..Default::default() })
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                props: make_props("name", "C"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let results = engine.get_nodes(&[a, b, c]).unwrap();
     assert_eq!(results.len(), 3);
@@ -3178,8 +4457,12 @@ fn test_get_nodes_bulk() {
 fn test_get_nodes_bulk_mixed_found_missing() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.delete_node(b).unwrap();
     let results = engine.get_nodes(&[a, b, 9999]).unwrap();
     assert_eq!(results.len(), 3);
@@ -3193,9 +4476,13 @@ fn test_get_nodes_bulk_mixed_found_missing() {
 fn test_get_nodes_bulk_cross_source() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let results = engine.get_nodes(&[a, b]).unwrap();
     assert_eq!(results[0].as_ref().unwrap().key, "a");
     assert_eq!(results[1].as_ref().unwrap().key, "b");
@@ -3215,9 +4502,15 @@ fn test_get_nodes_bulk_empty() {
 fn test_get_edges_bulk() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     let e1 = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -3236,9 +4529,15 @@ fn test_get_edges_bulk() {
 fn test_get_edges_bulk_cross_source() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     let e1 = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -3262,21 +4561,56 @@ fn test_get_nodes_bulk_multi_segment_interleaved() {
     let mut engine = open_imm(&dir.path().join("db"));
     // Segment 1: nodes 1, 2, 3
     let a = engine
-        .upsert_node(1, "a", UpsertNodeOptions { props: make_props("seg", "1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("seg", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "b", UpsertNodeOptions { props: make_props("seg", "1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                props: make_props("seg", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let c = engine
-        .upsert_node(1, "c", UpsertNodeOptions { props: make_props("seg", "1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                props: make_props("seg", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     // Segment 2: nodes 4, 5
     let d = engine
-        .upsert_node(1, "d", UpsertNodeOptions { props: make_props("seg", "2"), ..Default::default() })
+        .upsert_node(
+            1,
+            "d",
+            UpsertNodeOptions {
+                props: make_props("seg", "2"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let e = engine
-        .upsert_node(1, "e", UpsertNodeOptions { props: make_props("seg", "2"), ..Default::default() })
+        .upsert_node(
+            1,
+            "e",
+            UpsertNodeOptions {
+                props: make_props("seg", "2"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -3297,11 +4631,17 @@ fn test_get_nodes_bulk_tombstone_in_newer_segment() {
     // Bulk read must respect cross-segment tombstones.
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap(); // seg 1: a, b
     engine.delete_node(a).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap(); // seg 2: tombstone(a), c
 
     let results = engine.get_nodes(&[a, b, c]).unwrap();
@@ -3318,11 +4658,26 @@ fn test_get_nodes_bulk_memtable_shadows_segment() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     let a = engine
-        .upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "old"), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "old"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine
-        .upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "new"), weight: 2.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "new"),
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     // a is now in both memtable (newer) and segment (older)
     let results = engine.get_nodes(&[a]).unwrap();
@@ -3339,7 +4694,9 @@ fn test_get_nodes_bulk_memtable_shadows_segment() {
 fn test_get_nodes_bulk_duplicate_ids() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
     let results = engine.get_nodes(&[a, a, a]).unwrap();
     assert_eq!(results.len(), 3);
     assert_eq!(results[0].as_ref().unwrap().key, "a");
@@ -3354,7 +4711,9 @@ fn test_get_nodes_bulk_duplicate_ids_in_segment() {
     // with duplicate lookups
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
     let results = engine.get_nodes(&[a, a, a]).unwrap();
     assert_eq!(results.len(), 3);
@@ -3368,9 +4727,15 @@ fn test_get_nodes_bulk_duplicate_ids_in_segment() {
 fn test_get_edges_bulk_multi_segment_interleaved() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     // Segment 1
     let e1 = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
@@ -3393,9 +4758,15 @@ fn test_get_edges_bulk_multi_segment_interleaved() {
 fn test_get_edges_bulk_tombstone_cross_segment() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     let e1 = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -3417,17 +4788,46 @@ fn test_get_nodes_bulk_after_compaction() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     let a = engine
-        .upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "b", UpsertNodeOptions { props: make_props("v", "1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                props: make_props("v", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine
-        .upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "2"), weight: 2.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "2"),
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let c = engine
-        .upsert_node(1, "c", UpsertNodeOptions { props: make_props("v", "1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                props: make_props("v", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine.compact().unwrap();
@@ -3449,13 +4849,28 @@ fn test_get_node_by_key_delete_then_recreate() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     let id1 = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("v", "1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("v", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine.delete_node(id1).unwrap();
     // Re-create with same key → gets a NEW id
     let id2 = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("v", "2"), weight: 2.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("v", "2"),
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_ne!(id1, id2);
     let node = engine.get_node_by_key(1, "alice").unwrap().unwrap();
@@ -3474,13 +4889,34 @@ fn test_get_edge_by_triple_uniqueness_off_returns_latest() {
     let dir = TempDir::new().unwrap();
     // Default: edge_uniqueness = false
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let _e1 = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { props: make_props("v", "1"), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                props: make_props("v", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let e2 = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions { props: make_props("v", "2"), weight: 2.0, ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                props: make_props("v", "2"),
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     // With uniqueness off, both edges exist. Triple index maps to the latest.
     let edge = engine.get_edge_by_triple(a, b, 10).unwrap().unwrap();
@@ -3500,8 +4936,12 @@ fn test_graph_patch_mixed_ops() {
     let mut engine = open_imm(&dir.path().join("db"));
 
     // Create some initial data
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let e1 = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -3572,7 +5012,14 @@ fn test_graph_patch_node_dedup() {
 
     // Pre-existing node
     let existing = engine
-        .upsert_node(1, "alice", UpsertNodeOptions { props: make_props("v", "1"), ..Default::default() })
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("v", "1"),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let patch = GraphPatch {
@@ -3626,9 +5073,15 @@ fn test_graph_patch_node_dedup() {
 fn test_graph_patch_delete_with_cascade() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     let e_ab = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -3657,8 +5110,12 @@ fn test_graph_patch_delete_with_cascade() {
 fn test_graph_patch_edge_delete() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let e = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -3684,7 +5141,9 @@ fn test_graph_patch_ordering_upserts_before_deletes() {
     // The delete should win (delete comes after upsert in the WAL).
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
 
     let patch = GraphPatch {
         upsert_nodes: vec![NodeInput {
@@ -3730,8 +5189,12 @@ fn test_graph_patch_survives_wal_replay() {
     let (node_id, edge_id, invalidated_eid);
     {
         let mut engine = open_imm(&db_path);
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = engine
+            .upsert_node(1, "a", UpsertNodeOptions::default())
+            .unwrap();
+        let b = engine
+            .upsert_node(1, "b", UpsertNodeOptions::default())
+            .unwrap();
         invalidated_eid = engine
             .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
@@ -3877,9 +5340,7 @@ fn test_graph_patch_two_step_upsert_then_connect() {
     assert_eq!(edge.type_id, 10);
 
     // Neighbors work
-    let nbrs = engine
-        .neighbors(x, &NeighborOptions::default())
-        .unwrap();
+    let nbrs = engine.neighbors(x, &NeighborOptions::default()).unwrap();
     assert_eq!(nbrs.len(), 1);
     assert_eq!(nbrs[0].node_id, y);
 
@@ -3890,8 +5351,12 @@ fn test_graph_patch_two_step_upsert_then_connect() {
 fn test_graph_patch_after_flush() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let e = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -3931,8 +5396,12 @@ fn test_graph_patch_duplicate_edge_delete_safe() {
     // Should not panic. Duplicate DeleteEdge ops are idempotent.
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let e = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -3955,10 +5424,22 @@ fn test_graph_patch_invalidate_pre_existing_edge() {
     // as a batch after all ops are built, invalidation sees the pre-patch state.
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let e = engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions { props: make_props("v", "original"), ..Default::default() })
+        .upsert_edge(
+            a,
+            b,
+            1,
+            UpsertEdgeOptions {
+                props: make_props("v", "original"),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Upsert the same edge (updates props) AND invalidate it in the same patch.
@@ -3997,8 +5478,12 @@ fn test_delete_node_cascades_segment_edges() {
     // Cascade should still find and delete the edge.
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let e = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -4011,7 +5496,13 @@ fn test_delete_node_cascades_segment_edges() {
     assert!(engine.get_node(b).unwrap().is_some()); // b survives
                                                     // No ghost neighbors on b
     let nbrs = engine
-        .neighbors(b, &NeighborOptions { direction: Direction::Incoming, ..Default::default() })
+        .neighbors(
+            b,
+            &NeighborOptions {
+                direction: Direction::Incoming,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert!(nbrs.is_empty());
     engine.close().unwrap();
@@ -4022,9 +5513,15 @@ fn test_delete_node_cascades_mixed_sources() {
     // Some edges in memtable, some in segments
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     let e1 = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -4046,8 +5543,12 @@ fn test_delete_node_cascades_incoming_segment_edges() {
     // Test that incoming edges (where deleted node is the target) are also cascaded
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let e = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -4057,9 +5558,7 @@ fn test_delete_node_cascades_incoming_segment_edges() {
     engine.delete_node(b).unwrap();
 
     assert!(engine.get_edge(e).unwrap().is_none());
-    let nbrs = engine
-        .neighbors(a, &NeighborOptions::default())
-        .unwrap();
+    let nbrs = engine.neighbors(a, &NeighborOptions::default()).unwrap();
     assert!(nbrs.is_empty());
     engine.close().unwrap();
 }
@@ -4069,8 +5568,12 @@ fn test_graph_patch_delete_cascades_segment_edges() {
     // Same as above but via graph_patch
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     let e = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -4094,7 +5597,9 @@ fn test_graph_patch_delete_cascades_segment_edges() {
 fn test_prune_empty_policy_rejects() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
 
     let err = engine
         .prune(&PrunePolicy {
@@ -4115,7 +5620,9 @@ fn test_prune_type_id_only_rejects() {
     // type_id alone without age or weight is rejected (safety)
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
 
     let err = engine
         .prune(&PrunePolicy {
@@ -4135,8 +5642,12 @@ fn test_prune_by_age_only() {
     let mut engine = open_imm(&dir.path().join("db"));
 
     // Insert nodes. They all get updated_at = now
-    let a = engine.upsert_node(1, "old", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "new", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "old", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "new", UpsertNodeOptions::default())
+        .unwrap();
 
     // Hack: manually set "old" node to have an ancient updated_at via write_op
     let old_node = engine.get_node(a).unwrap().unwrap();
@@ -4167,9 +5678,36 @@ fn test_prune_by_weight_only() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
 
-    let a = engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "mid", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "mid",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // Prune weight <= 0.5
     let result = engine
@@ -4193,13 +5731,34 @@ fn test_prune_combo_age_and_weight() {
     let mut engine = open_imm(&dir.path().join("db"));
 
     let a = engine
-        .upsert_node(1, "old-low", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "old-low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "old-high", UpsertNodeOptions { weight: 0.9, ..Default::default() })
+        .upsert_node(
+            1,
+            "old-high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let c = engine
-        .upsert_node(1, "new-low", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "new-low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Make a and b old
@@ -4240,10 +5799,24 @@ fn test_prune_type_scoped() {
     let mut engine = open_imm(&dir.path().join("db"));
 
     let a = engine
-        .upsert_node(1, "type1-low", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "type1-low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(2, "type2-low", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            2,
+            "type2-low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Prune only type 1 with weight <= 0.5
@@ -4266,9 +5839,36 @@ fn test_prune_cascade_deletes_edges() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let e_ab = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -4305,8 +5905,26 @@ fn test_prune_shared_edge_dedup() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let e = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -4330,8 +5948,26 @@ fn test_prune_empty_result_no_match() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
 
-    engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.8, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // No nodes have weight <= 0.1
     let result = engine
@@ -4353,10 +5989,24 @@ fn test_prune_after_flush_segment_nodes() {
     let mut engine = open_imm(&dir.path().join("db"));
 
     let a = engine
-        .upsert_node(1, "seg-a", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "seg-a",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "seg-b", UpsertNodeOptions { weight: 0.9, ..Default::default() })
+        .upsert_node(
+            1,
+            "seg-b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let e = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
@@ -4387,13 +6037,27 @@ fn test_prune_cross_source_memtable_and_segment() {
 
     // Node in segment
     let a = engine
-        .upsert_node(1, "in-seg", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "in-seg",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     // Node in memtable
     let b = engine
-        .upsert_node(1, "in-mem", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "in-mem",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Edge from memtable node to segment node
@@ -4423,15 +6087,42 @@ fn test_prune_cascade_edges_in_segment() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let e = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     engine.flush().unwrap();
 
     // Update b in memtable (still low weight)
-    engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let result = engine
         .prune(&PrunePolicy {
@@ -4457,8 +6148,26 @@ fn test_prune_survives_wal_replay() {
     let (a, b, e);
     {
         let mut engine = open_imm(&db_path);
-        a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-        b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+        a = engine
+            .upsert_node(
+                1,
+                "a",
+                UpsertNodeOptions {
+                    weight: 0.1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        b = engine
+            .upsert_node(
+                1,
+                "b",
+                UpsertNodeOptions {
+                    weight: 0.9,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         e = engine
             .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
             .unwrap();
@@ -4490,10 +6199,24 @@ fn test_prune_weight_boundary() {
     let mut engine = open_imm(&dir.path().join("db"));
 
     let a = engine
-        .upsert_node(1, "exact", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            1,
+            "exact",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "above", UpsertNodeOptions { weight: 0.500001, ..Default::default() })
+        .upsert_node(
+            1,
+            "above",
+            UpsertNodeOptions {
+                weight: 0.500001,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let result = engine
@@ -4515,7 +6238,16 @@ fn test_prune_already_deleted_node_ignored() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.delete_node(a).unwrap();
 
     // Prune should not count already-deleted nodes
@@ -4554,7 +6286,9 @@ fn test_prune_empty_db() {
 fn test_prune_negative_age_rejected() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
 
     let result = engine.prune(&PrunePolicy {
         max_age_ms: Some(-100),
@@ -4824,17 +6558,60 @@ fn test_compaction_auto_prune_by_weight() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Create nodes with different weights
-    let low = engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-    let high = engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let low = engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let high = engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     // Create more nodes in second segment; update "high" to create overlapping
     // IDs across segments, which forces the standard compaction path.
-    let low2 = engine.upsert_node(1, "low2", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-    let high2 = engine
-        .upsert_node(1, "high2", UpsertNodeOptions { weight: 0.8, ..Default::default() })
+    let low2 = engine
+        .upsert_node(
+            1,
+            "low2",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap(); // overlap
+    let high2 = engine
+        .upsert_node(
+            1,
+            "high2",
+            UpsertNodeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // overlap
     engine.flush().unwrap();
 
     // Register policy: prune weight <= 0.5
@@ -4873,9 +6650,36 @@ fn test_compaction_auto_prune_cascade_edges() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // will be pruned
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // will be pruned
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let e1 = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -4886,8 +6690,26 @@ fn test_compaction_auto_prune_cascade_edges() {
 
     // More data in second segment; update "b" to create overlapping IDs
     // across segments, which forces the standard compaction path.
-    let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.8, ..Default::default() }).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap(); // overlap
+    let d = engine
+        .upsert_node(
+            1,
+            "d",
+            UpsertNodeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // overlap
     engine.flush().unwrap();
 
     engine
@@ -4928,15 +6750,51 @@ fn test_compaction_multiple_policies_or_logic() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Node that matches policy A (low weight) but not B (type 99)
-    let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    let n1 = engine
+        .upsert_node(
+            1,
+            "n1",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     // Node that matches policy B (type 99) but not A (high weight)
-    let n2 = engine.upsert_node(99, "n2", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let n2 = engine
+        .upsert_node(
+            99,
+            "n2",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     // Node that matches neither
-    let n3 = engine.upsert_node(1, "n3", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let n3 = engine
+        .upsert_node(
+            1,
+            "n3",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     // Update n3 in second segment to create overlapping IDs (forces standard path)
-    engine.upsert_node(1, "n3", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "n3",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     // Policy A: prune if weight <= 0.5
@@ -4981,10 +6839,37 @@ fn test_compaction_no_policies_no_prune() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     // No policies registered
@@ -5019,10 +6904,37 @@ fn test_removed_policy_no_longer_prunes() {
         )
         .unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // overlap → standard path
+    engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // overlap → standard path
     engine.flush().unwrap();
 
     // Remove the policy before compaction
@@ -5047,18 +6959,46 @@ fn test_compaction_type_scoped_policy() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let t1_low = engine
-        .upsert_node(1, "t1-low", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "t1-low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let t2_low = engine
-        .upsert_node(2, "t2-low", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            2,
+            "t2-low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let t1_high = engine
-        .upsert_node(1, "t1-high", UpsertNodeOptions { weight: 0.9, ..Default::default() })
+        .upsert_node(
+            1,
+            "t1-high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     // Update t1_high in second segment to create overlapping IDs (forces standard path)
     engine
-        .upsert_node(1, "t1-high", UpsertNodeOptions { weight: 0.9, ..Default::default() })
+        .upsert_node(
+            1,
+            "t1-high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -5095,17 +7035,40 @@ fn test_compaction_prune_stats_in_nodes_removed() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight: 0.1, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("n{}", i),
+                UpsertNodeOptions {
+                    weight: 0.1,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 10..20 {
         engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight: 0.9, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("n{}", i),
+                UpsertNodeOptions {
+                    weight: 0.9,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     // Update n0 in second segment to create overlapping IDs (forces standard path)
-    engine.upsert_node(1, "n0", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "n0",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     engine
@@ -5149,8 +7112,26 @@ fn test_manual_prune_unchanged_by_policies() {
         )
         .unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // Manual prune with a different threshold
     let result = engine
@@ -5190,12 +7171,39 @@ fn test_bg_compaction_applies_prune_policies() {
         )
         .unwrap();
 
-    let low = engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-    let high = engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let low = engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let high = engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     // Second flush with overlapping ID to force standard path in bg compaction
-    engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap(); // triggers auto bg compaction
 
     // Wait for bg compaction to complete
@@ -5219,8 +7227,26 @@ fn test_read_time_policy_get_node() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let low = engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-    let high = engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let low = engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let high = engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // No policy, both visible
     assert!(engine.get_node(low).unwrap().is_some());
@@ -5254,8 +7280,26 @@ fn test_read_time_policy_get_node_by_key() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-    engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // Register policy
     engine
@@ -5286,9 +7330,36 @@ fn test_read_time_policy_get_nodes_batch() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.3, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     engine
         .set_prune_policy(
@@ -5319,8 +7390,26 @@ fn test_read_time_policy_get_node_after_flush() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let low = engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-    let high = engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let low = engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let high = engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap(); // nodes now in segment
 
     engine
@@ -5350,8 +7439,26 @@ fn test_read_time_policy_get_node_by_key_after_flush() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-    engine.upsert_node(1, "high", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     engine
@@ -5385,7 +7492,14 @@ fn test_read_time_policy_upsert_dedup_unaffected() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let id1 = engine
-        .upsert_node(1, "node-a", UpsertNodeOptions { weight: 0.2, ..Default::default() })
+        .upsert_node(
+            1,
+            "node-a",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Register policy that excludes this node from reads
@@ -5405,7 +7519,14 @@ fn test_read_time_policy_upsert_dedup_unaffected() {
 
     // Upsert same (type_id, key). MUST reuse existing ID, not allocate new one
     let id2 = engine
-        .upsert_node(1, "node-a", UpsertNodeOptions { weight: 0.8, ..Default::default() })
+        .upsert_node(
+            1,
+            "node-a",
+            UpsertNodeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(
         id1, id2,
@@ -5429,7 +7550,14 @@ fn test_read_time_policy_upsert_dedup_after_flush() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let id1 = engine
-        .upsert_node(1, "node-a", UpsertNodeOptions { weight: 0.2, ..Default::default() })
+        .upsert_node(
+            1,
+            "node-a",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -5449,7 +7577,14 @@ fn test_read_time_policy_upsert_dedup_after_flush() {
 
     // Upsert must still find and reuse the existing ID from segment
     let id2 = engine
-        .upsert_node(1, "node-a", UpsertNodeOptions { weight: 0.8, ..Default::default() })
+        .upsert_node(
+            1,
+            "node-a",
+            UpsertNodeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(id1, id2);
 
@@ -5466,7 +7601,14 @@ fn test_read_time_policy_add_remove_takes_effect() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let id = engine
-        .upsert_node(1, "target", UpsertNodeOptions { weight: 0.3, ..Default::default() })
+        .upsert_node(
+            1,
+            "target",
+            UpsertNodeOptions {
+                weight: 0.3,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Initially visible
@@ -5502,10 +7644,24 @@ fn test_read_time_policy_type_scoped() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let t1 = engine
-        .upsert_node(1, "t1-low", UpsertNodeOptions { weight: 0.2, ..Default::default() })
+        .upsert_node(
+            1,
+            "t1-low",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let t2 = engine
-        .upsert_node(2, "t2-low", UpsertNodeOptions { weight: 0.2, ..Default::default() })
+        .upsert_node(
+            2,
+            "t2-low",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Policy scoped to type_id=1 only
@@ -5537,7 +7693,16 @@ fn test_read_time_policy_no_policies_zero_overhead() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let id = engine.upsert_node(1, "node", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    let id = engine
+        .upsert_node(
+            1,
+            "node",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // No policies registered, everything visible
     assert!(engine.list_prune_policies().is_empty());
@@ -5559,9 +7724,36 @@ fn test_read_time_policy_multiple_policies_or() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // type 1, low weight
-    let b = engine.upsert_node(2, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // type 2, low weight
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap(); // type 1, high weight
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // type 1, low weight
+    let b = engine
+        .upsert_node(
+            2,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // type 2, low weight
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // type 1, high weight
 
     // Policy 1: type 1, weight <= 0.5
     engine
@@ -5607,7 +7799,14 @@ fn test_read_time_policy_graph_patch_dedup_unaffected() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let id1 = engine
-        .upsert_node(1, "node-a", UpsertNodeOptions { weight: 0.2, ..Default::default() })
+        .upsert_node(
+            1,
+            "node-a",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     engine
@@ -5654,9 +7853,36 @@ fn test_read_time_policy_neighbors() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap(); // will be excluded
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.8, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // will be excluded
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
@@ -5666,9 +7892,7 @@ fn test_read_time_policy_neighbors() {
         .unwrap();
 
     // No policy: both neighbors visible
-    let result = engine
-        .neighbors(a, &NeighborOptions::default())
-        .unwrap();
+    let result = engine.neighbors(a, &NeighborOptions::default()).unwrap();
     assert_eq!(result.len(), 2);
 
     // Register policy: exclude weight <= 0.5
@@ -5684,9 +7908,7 @@ fn test_read_time_policy_neighbors() {
         .unwrap();
 
     // b is excluded by policy
-    let result = engine
-        .neighbors(a, &NeighborOptions::default())
-        .unwrap();
+    let result = engine.neighbors(a, &NeighborOptions::default()).unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].node_id, c);
 
@@ -5704,12 +7926,28 @@ fn test_read_time_policy_neighbors_limit() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let hub = engine.upsert_node(1, "hub", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let hub = engine
+        .upsert_node(
+            1,
+            "hub",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     // 3 high-weight neighbors (visible) + 2 low-weight (hidden by policy)
     let mut visible_ids = Vec::new();
     for i in 0..3 {
         let id = engine
-            .upsert_node(1, &format!("hi-{}", i), UpsertNodeOptions { weight: 0.8, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("hi-{}", i),
+                UpsertNodeOptions {
+                    weight: 0.8,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         engine
             .upsert_edge(hub, id, 1, UpsertEdgeOptions::default())
@@ -5718,7 +7956,14 @@ fn test_read_time_policy_neighbors_limit() {
     }
     for i in 0..2 {
         let id = engine
-            .upsert_node(1, &format!("lo-{}", i), UpsertNodeOptions { weight: 0.1, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("lo-{}", i),
+                UpsertNodeOptions {
+                    weight: 0.1,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         engine
             .upsert_edge(hub, id, 1, UpsertEdgeOptions::default())
@@ -5737,14 +7982,18 @@ fn test_read_time_policy_neighbors_limit() {
         .unwrap();
 
     // Without limit: 3 visible
-    let result = engine
-        .neighbors(hub, &NeighborOptions::default())
-        .unwrap();
+    let result = engine.neighbors(hub, &NeighborOptions::default()).unwrap();
     assert_eq!(result.len(), 3);
 
     // With limit=2: should return exactly 2 (not fewer)
     let result = engine
-        .neighbors(hub, &NeighborOptions { limit: Some(2), ..Default::default() })
+        .neighbors(
+            hub,
+            &NeighborOptions {
+                limit: Some(2),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(result.len(), 2);
 
@@ -5761,10 +8010,46 @@ fn test_read_time_policy_traverse_depth_two() {
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // a -> b -> c (c has low weight, should be excluded)
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap(); // will be excluded
-    let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // will be excluded
+    let d = engine
+        .upsert_node(
+            1,
+            "d",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
@@ -5805,15 +8090,58 @@ fn test_read_time_policy_top_k() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let hub = engine.upsert_node(1, "hub", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let hi = engine.upsert_node(1, "hi", UpsertNodeOptions { weight: 0.8, ..Default::default() }).unwrap();
-    let lo = engine.upsert_node(1, "lo", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+    let hub = engine
+        .upsert_node(
+            1,
+            "hub",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let hi = engine
+        .upsert_node(
+            1,
+            "hi",
+            UpsertNodeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let lo = engine
+        .upsert_node(
+            1,
+            "lo",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     engine
-        .upsert_edge(hub, hi, 1, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+        .upsert_edge(
+            hub,
+            hi,
+            1,
+            UpsertEdgeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_edge(hub, lo, 1, UpsertEdgeOptions { weight: 10.0, ..Default::default() })
+        .upsert_edge(
+            hub,
+            lo,
+            1,
+            UpsertEdgeOptions {
+                weight: 10.0,
+                ..Default::default()
+            },
+        )
         .unwrap(); // higher weight but node excluded
 
     engine
@@ -5846,9 +8174,36 @@ fn test_read_time_policy_extract_subgraph() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.8, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap(); // excluded
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // excluded
 
     engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
@@ -5888,8 +8243,26 @@ fn test_read_time_policy_nodes_by_type() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     engine
         .set_prune_policy(
@@ -5921,8 +8294,28 @@ fn test_read_time_policy_find_nodes() {
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), PropValue::String("red".to_string()));
 
-    engine.upsert_node(1, "a", UpsertNodeOptions { props: props.clone(), weight: 0.2, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { props: props.clone(), weight: 0.9, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: props.clone(),
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                props: props.clone(),
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     engine
         .set_prune_policy(
@@ -5956,8 +8349,26 @@ fn test_read_time_policy_prune_still_works() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     // Edge between them for cascade testing
     engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
@@ -6008,8 +8419,26 @@ fn test_read_time_policy_delete_node_cascade_unaffected() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap(); // will be policy-excluded
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap(); // will be policy-excluded
     let edge_id = engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -6043,9 +8472,36 @@ fn test_read_time_policy_neighbors_after_flush() {
     opts.compact_after_n_flushes = 0;
     let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.9, ..Default::default() }).unwrap();
-    let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-    let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.8, ..Default::default() }).unwrap();
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     engine
         .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
@@ -6067,9 +8523,7 @@ fn test_read_time_policy_neighbors_after_flush() {
         .unwrap();
 
     // Works on segment-sourced neighbors too
-    let result = engine
-        .neighbors(a, &NeighborOptions::default())
-        .unwrap();
+    let result = engine.neighbors(a, &NeighborOptions::default()).unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].node_id, c);
 
@@ -6090,7 +8544,9 @@ fn test_close_fast_basic() {
     };
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    let id = engine.upsert_node(1, "n1", UpsertNodeOptions::default()).unwrap();
+    let id = engine
+        .upsert_node(1, "n1", UpsertNodeOptions::default())
+        .unwrap();
     engine.close_fast().unwrap();
 
     // Reopen. Data should be intact
@@ -6115,7 +8571,9 @@ fn test_close_fast_cancels_bg_compact() {
     for i in 0..3 {
         for j in 0..100 {
             let key = format!("node_{}_{}", i, j);
-            engine.upsert_node(1, &key, UpsertNodeOptions::default()).unwrap();
+            engine
+                .upsert_node(1, &key, UpsertNodeOptions::default())
+                .unwrap();
         }
         engine.flush().unwrap();
     }
@@ -6226,11 +8684,15 @@ fn test_stats_segments_after_flush() {
 
     assert_eq!(engine.stats().segment_count, 0);
 
-    engine.upsert_node(1, "n1", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "n1", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
     assert_eq!(engine.stats().segment_count, 1);
 
-    engine.upsert_node(1, "n2", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "n2", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
     assert_eq!(engine.stats().segment_count, 2);
 
@@ -6247,8 +8709,12 @@ fn test_stats_tombstones() {
     };
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    let n1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let n2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let n1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let n2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine
         .upsert_edge(n1, n2, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -6283,9 +8749,13 @@ fn test_stats_last_compaction_ms() {
     assert!(engine.stats().last_compaction_ms.is_none());
 
     // Create 2 segments and compact
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
 
     let before = now_millis();
@@ -6316,9 +8786,13 @@ fn test_stats_last_compaction_ms_bg() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Create 2 segments
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
 
     let before = now_millis();
@@ -6372,11 +8846,18 @@ fn test_stats_immutable_memtable_fields() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Write some data
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
 
     let stats = engine.stats();
-    assert!(stats.active_memtable_bytes > 0, "active memtable should have data");
+    assert!(
+        stats.active_memtable_bytes > 0,
+        "active memtable should have data"
+    );
     assert_eq!(stats.immutable_memtable_count, 0);
     assert_eq!(stats.immutable_memtable_bytes, 0);
     assert_eq!(stats.active_wal_generation_id, 0);
@@ -6386,15 +8867,23 @@ fn test_stats_immutable_memtable_fields() {
 
     let stats = engine.stats();
     assert_eq!(stats.immutable_memtable_count, 1);
-    assert!(stats.immutable_memtable_bytes > 0,
-        "immutable memtable should have bytes after freeze");
-    assert_eq!(stats.active_wal_generation_id, 1,
-        "active WAL gen should advance after freeze");
-    assert_eq!(stats.oldest_retained_wal_generation_id, 0,
-        "oldest retained gen should be the frozen gen");
+    assert!(
+        stats.immutable_memtable_bytes > 0,
+        "immutable memtable should have bytes after freeze"
+    );
+    assert_eq!(
+        stats.active_wal_generation_id, 1,
+        "active WAL gen should advance after freeze"
+    );
+    assert_eq!(
+        stats.oldest_retained_wal_generation_id, 0,
+        "oldest retained gen should be the frozen gen"
+    );
 
     // Write more, freeze again
-    engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     engine.freeze_memtable().unwrap();
 
     let stats = engine.stats();
@@ -6411,7 +8900,10 @@ fn test_stats_immutable_memtable_fields() {
     assert_eq!(stats.pending_flush_count, 0);
     assert!(stats.segment_count >= 1);
     // After flush, oldest retained should equal active (no pending epochs)
-    assert_eq!(stats.oldest_retained_wal_generation_id, stats.active_wal_generation_id);
+    assert_eq!(
+        stats.oldest_retained_wal_generation_id,
+        stats.active_wal_generation_id
+    );
 
     engine.close().unwrap();
 }
@@ -6431,14 +8923,31 @@ fn test_v3_planner_basic_winner_selection() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Segment 1 (older): nodes with keys a, b, c
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
 
     // Segment 2 (newer): update "a" with new weight, add "d"
-    engine.upsert_node(1, "a", UpsertNodeOptions { weight: 2.0, ..Default::default() }).unwrap();
-    engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(1, "d", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
 
     assert_eq!(engine.segments.len(), 2);
@@ -6465,8 +8974,12 @@ fn test_v3_planner_tombstone_handling() {
     };
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    let id1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let id2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let id1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let id2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
 
     engine.delete_node(id1).unwrap();
@@ -6492,9 +9005,15 @@ fn test_v3_planner_edge_cascade_on_tombstone() {
     };
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    let n1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let n2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let n3 = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let n1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let n2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let n3 = engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     let e1 = engine
         .upsert_edge(n1, n2, 1, UpsertEdgeOptions::default())
         .unwrap();
@@ -6529,15 +9048,36 @@ fn test_v3_planner_prune_policy_from_metadata() {
 
     // Create overlapping segments (overlapping IDs across segments)
     engine
-        .upsert_node(1, "low_weight", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "low_weight",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_node(1, "high_weight", UpsertNodeOptions { weight: 5.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "high_weight",
+            UpsertNodeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     // Update high_weight to create overlapping node ID across segments
     engine
-        .upsert_node(1, "high_weight", UpsertNodeOptions { weight: 5.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "high_weight",
+            UpsertNodeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -6576,12 +9116,35 @@ fn test_v3_planner_prune_policy_edge_cascade() {
     };
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    let n1 = engine.upsert_node(1, "keep", UpsertNodeOptions { weight: 5.0, ..Default::default() }).unwrap();
+    let n1 = engine
+        .upsert_node(
+            1,
+            "keep",
+            UpsertNodeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let n2 = engine
-        .upsert_node(1, "prune_me", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "prune_me",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let n3 = engine
-        .upsert_node(1, "also_keep", UpsertNodeOptions { weight: 5.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "also_keep",
+            UpsertNodeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     let _e1 = engine
         .upsert_edge(n1, n2, 1, UpsertEdgeOptions::default())
@@ -6591,7 +9154,16 @@ fn test_v3_planner_prune_policy_edge_cascade() {
         .unwrap();
     engine.flush().unwrap();
     // Update a node to create overlapping IDs (forces V3 standard path)
-    engine.upsert_node(1, "keep", UpsertNodeOptions { weight: 5.0, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "keep",
+            UpsertNodeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     engine
@@ -6628,21 +9200,56 @@ fn test_v3_planner_prune_policy_or_semantics() {
 
     // Type 1: low weight, type 2: low weight, type 3: safe
     engine
-        .upsert_node(1, "t1_low", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            1,
+            "t1_low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_node(1, "t1_high", UpsertNodeOptions { weight: 5.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "t1_high",
+            UpsertNodeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_node(2, "t2_low", UpsertNodeOptions { weight: 0.1, ..Default::default() })
+        .upsert_node(
+            2,
+            "t2_low",
+            UpsertNodeOptions {
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_node(3, "t3_safe", UpsertNodeOptions { weight: 5.0, ..Default::default() })
+        .upsert_node(
+            3,
+            "t3_safe",
+            UpsertNodeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     // Update a node to create overlap (forces V3 standard path)
     engine
-        .upsert_node(1, "t1_high", UpsertNodeOptions { weight: 5.0, ..Default::default() })
+        .upsert_node(
+            1,
+            "t1_high",
+            UpsertNodeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -6697,7 +9304,14 @@ fn test_v3_planner_overlapping_multi_segment() {
     // Segment 2: update nodes 10-30 with new weights
     for i in 10..30 {
         engine
-            .upsert_node(1, &format!("node_{}", i), UpsertNodeOptions { weight: 2.0, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("node_{}", i),
+                UpsertNodeOptions {
+                    weight: 2.0,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     engine.flush().unwrap();
@@ -6745,8 +9359,12 @@ fn test_v3_compact_preserves_edges_across_segments() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Segment 1: nodes
-    let n1 = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let n2 = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let n1 = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let n2 = engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
 
     // Segment 2: edges
@@ -6766,7 +9384,13 @@ fn test_v3_compact_preserves_edges_across_segments() {
 
     // Adjacency works
     let nbrs = engine
-        .neighbors(n1, &NeighborOptions { limit: Some(100), ..Default::default() })
+        .neighbors(
+            n1,
+            &NeighborOptions {
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(nbrs.len(), 1);
     assert_eq!(nbrs[0].node_id, n2);
@@ -6793,7 +9417,14 @@ fn test_v3_compact_reopen_durability() {
 
     for i in 50..100 {
         engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight: 2.0, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("n{}", i),
+                UpsertNodeOptions {
+                    weight: 2.0,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     engine.flush().unwrap();
@@ -6829,10 +9460,26 @@ fn test_vector_segment_flush_reopen_mixed_nodes() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let vector_node = engine
-        .upsert_node(1, "vector-node", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.1, 0.2, 0.3]), sparse_vector: Some(vec![(3, 1.25), (8, 0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "vector-node",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.1, 0.2, 0.3]),
+                sparse_vector: Some(vec![(3, 1.25), (8, 0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let plain_node = engine
-        .upsert_node(1, "plain-node", UpsertNodeOptions { weight: 0.25, ..Default::default() })
+        .upsert_node(
+            1,
+            "plain-node",
+            UpsertNodeOptions {
+                weight: 0.25,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine.close().unwrap();
@@ -6855,7 +9502,14 @@ fn test_plain_segment_flush_reopen_v6_fast_path() {
     let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let node_id = engine
-        .upsert_node(1, "plain-node", UpsertNodeOptions { weight: 0.25, ..Default::default() })
+        .upsert_node(
+            1,
+            "plain-node",
+            UpsertNodeOptions {
+                weight: 0.25,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine.close().unwrap();
@@ -6894,15 +9548,40 @@ fn test_vector_segments_survive_standard_compaction_reopen() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let node_id = engine
-        .upsert_node(1, "vector-node", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.1, 0.2, 0.3]), ..Default::default() })
+        .upsert_node(
+            1,
+            "vector-node",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.1, 0.2, 0.3]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     engine
-        .upsert_node(1, "vector-node", UpsertNodeOptions { weight: 0.75, dense_vector: Some(vec![0.4, 0.5, 0.6]), sparse_vector: Some(vec![(4, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "vector-node",
+            UpsertNodeOptions {
+                weight: 0.75,
+                dense_vector: Some(vec![0.4, 0.5, 0.6]),
+                sparse_vector: Some(vec![(4, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let sparse_only = engine
-        .upsert_node(1, "sparse-only", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(7, 1.0), (9, 0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "sparse-only",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(7, 1.0), (9, 0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -6939,12 +9618,28 @@ fn test_standard_compaction_clears_stale_vector_payloads() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let node_id = engine
-        .upsert_node(1, "vector-node", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.1, 0.2, 0.3]), sparse_vector: Some(vec![(4, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "vector-node",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.1, 0.2, 0.3]),
+                sparse_vector: Some(vec![(4, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     engine
-        .upsert_node(1, "vector-node", UpsertNodeOptions { weight: 0.9, ..Default::default() })
+        .upsert_node(
+            1,
+            "vector-node",
+            UpsertNodeOptions {
+                weight: 0.9,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -6984,12 +9679,28 @@ fn test_vector_segments_survive_fast_merge_reopen() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let dense_node = engine
-        .upsert_node(1, "dense", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![1.0, 2.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "dense",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![1.0, 2.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let sparse_node = engine
-        .upsert_node(1, "sparse", UpsertNodeOptions { weight: 0.7, sparse_vector: Some(vec![(5, 1.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "sparse",
+            UpsertNodeOptions {
+                weight: 0.7,
+                sparse_vector: Some(vec![(5, 1.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -7480,7 +10191,14 @@ fn test_vector_search_dense_empty_when_unconfigured_or_no_vectors() {
     };
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
     engine
-        .upsert_node(1, "plain", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            1,
+            "plain",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert!(engine
         .vector_search(&dense_search_request(vec![1.0, 0.0], 5, None, None))
@@ -7572,7 +10290,14 @@ fn test_vector_search_sparse_empty_when_no_sparse_vectors() {
     let dir = TempDir::new().unwrap();
     let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     engine
-        .upsert_node(1, "plain", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            1,
+            "plain",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     assert!(engine
@@ -7600,7 +10325,15 @@ fn test_upsert_node_rejects_negative_sparse_weights() {
     let dir = TempDir::new().unwrap();
     let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     let err = engine
-        .upsert_node(1, "bad-sparse", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(1, -0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "bad-sparse",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(1, -0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap_err();
     assert!(err
         .to_string()
@@ -7613,15 +10346,39 @@ fn test_vector_search_sparse_exact_ranking_and_query_canonicalization() {
     let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let segment_best = engine
-        .upsert_node(1, "segment-best", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(1, 2.0), (4, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "segment-best",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(1, 2.0), (4, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let segment_mid = engine
-        .upsert_node(1, "segment-mid", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(1, 1.0), (7, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "segment-mid",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(1, 1.0), (7, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let memtable_low = engine
-        .upsert_node(1, "memtable-low", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(1, 0.5), (4, 0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "memtable-low",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(1, 0.5), (4, 0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     let hits = engine
@@ -7642,7 +10399,15 @@ fn test_vector_search_sparse_zero_overlap_returns_empty() {
     let dir = TempDir::new().unwrap();
     let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     engine
-        .upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(4, 1.0), (7, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(4, 1.0), (7, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -7658,16 +10423,48 @@ fn test_vector_search_sparse_type_filter_deleted_and_policy_exclusion() {
     let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let deleted = engine
-        .upsert_node(1, "deleted", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "deleted",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let kept = engine
-        .upsert_node(1, "kept", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 1.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "kept",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 1.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let pruned = engine
-        .upsert_node(1, "pruned", UpsertNodeOptions { weight: 0.1, sparse_vector: Some(vec![(3, 3.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "pruned",
+            UpsertNodeOptions {
+                weight: 0.1,
+                sparse_vector: Some(vec![(3, 3.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let other_type = engine
-        .upsert_node(2, "other-type", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 4.0)]), ..Default::default() })
+        .upsert_node(
+            2,
+            "other-type",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 4.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine.delete_node(deleted).unwrap();
@@ -7702,21 +10499,61 @@ fn test_vector_search_sparse_combines_shadowing_tombstones_type_filter_and_polic
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let stale_shared = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let deleted = engine
-        .upsert_node(1, "deleted", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "deleted",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let pruned = engine
-        .upsert_node(1, "pruned", UpsertNodeOptions { weight: 0.1, sparse_vector: Some(vec![(3, 3.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "pruned",
+            UpsertNodeOptions {
+                weight: 0.1,
+                sparse_vector: Some(vec![(3, 3.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let other_type = engine
-        .upsert_node(2, "other-type", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 4.0)]), ..Default::default() })
+        .upsert_node(
+            2,
+            "other-type",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 4.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let stable = engine
-        .upsert_node(1, "stable", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 0.8)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "stable",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 0.8)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -7733,7 +10570,15 @@ fn test_vector_search_sparse_combines_shadowing_tombstones_type_filter_and_polic
         .unwrap();
 
     let fresh_shared = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 5.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 5.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(stale_shared, fresh_shared);
 
@@ -7753,10 +10598,26 @@ fn test_vector_search_sparse_flush_and_reopen_parity() {
     let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let a = engine
-        .upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(2, 1.0), (5, 0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(2, 1.0), (5, 0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(2, 0.5), (9, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(2, 0.5), (9, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -7775,6 +10636,48 @@ fn test_vector_search_sparse_flush_and_reopen_parity() {
 }
 
 #[test]
+fn test_vector_search_hybrid_flush_and_reopen_parity() {
+    let (dir, engine, _ids) = setup_hybrid_db();
+    let dense_request = dense_search_request(vec![1.0, 0.0, 0.0, 0.0], 5, None, None);
+    let sparse_request = sparse_search_request(vec![(0, 1.0), (1, 0.5), (2, 0.3)], 5, None);
+    let hybrid_request = hybrid_search_request(
+        Some(vec![1.0, 0.0, 0.0, 0.0]),
+        Some(vec![(0, 1.0), (1, 0.5), (2, 0.3)]),
+        5,
+        Some(FusionMode::WeightedRankFusion),
+        Some(1.0),
+        Some(1.0),
+    );
+
+    let dense_before = engine.vector_search(&dense_request).unwrap();
+    let sparse_before = engine.vector_search(&sparse_request).unwrap();
+    let hybrid_before = engine.vector_search(&hybrid_request).unwrap();
+
+    engine.close().unwrap();
+
+    let reopened = DatabaseEngine::open(
+        dir.path(),
+        &DbOptions {
+            dense_vector: Some(DenseVectorConfig {
+                dimension: 4,
+                metric: DenseMetric::Cosine,
+                hnsw: HnswConfig::default(),
+            }),
+            ..DbOptions::default()
+        },
+    )
+    .unwrap();
+    let dense_after = reopened.vector_search(&dense_request).unwrap();
+    let sparse_after = reopened.vector_search(&sparse_request).unwrap();
+    let hybrid_after = reopened.vector_search(&hybrid_request).unwrap();
+
+    assert_vector_hits_match(&dense_after, &dense_before);
+    assert_vector_hits_match(&sparse_after, &sparse_before);
+    assert_vector_hits_match(&hybrid_after, &hybrid_before);
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_vector_search_sparse_newer_segment_shadows_older_segment_candidate() {
     let dir = TempDir::new().unwrap();
     let opts = DbOptions {
@@ -7784,15 +10687,39 @@ fn test_vector_search_sparse_newer_segment_shadows_older_segment_candidate() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let stale = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(3, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(3, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let stable = engine
-        .upsert_node(1, "stable", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(3, 0.8)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "stable",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(3, 0.8)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let fresh = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(3, 3.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(3, 3.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(stale, fresh);
     engine.flush().unwrap();
@@ -7816,15 +10743,38 @@ fn test_vector_search_sparse_newer_non_match_hides_older_match() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let stale = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(3, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(3, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let stable = engine
-        .upsert_node(1, "stable", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(3, 0.75)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "stable",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(3, 0.75)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let fresh = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.5, ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(stale, fresh);
     engine.flush().unwrap();
@@ -7846,18 +10796,50 @@ fn test_vector_search_sparse_standard_compaction_parity() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let stale = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(2, 0.5), (5, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(2, 0.5), (5, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let stable = engine
-        .upsert_node(1, "stable", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(2, 1.0), (9, 0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "stable",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(2, 1.0), (9, 0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let fresh = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(2, 2.0), (5, 1.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(2, 2.0), (5, 1.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let deleted = engine
-        .upsert_node(2, "deleted", UpsertNodeOptions { weight: 0.4, sparse_vector: Some(vec![(2, 3.0)]), ..Default::default() })
+        .upsert_node(
+            2,
+            "deleted",
+            UpsertNodeOptions {
+                weight: 0.4,
+                sparse_vector: Some(vec![(2, 3.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(stale, fresh);
     engine.flush().unwrap();
@@ -7890,18 +10872,50 @@ fn test_vector_search_sparse_fast_merge_compaction_parity() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let a = engine
-        .upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(3, 1.0), (10, 0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(3, 1.0), (10, 0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(3, 0.8), (11, 0.25)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(3, 0.8), (11, 0.25)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let c = engine
-        .upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(10, 1.0), (12, 0.4)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(10, 1.0), (12, 0.4)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let d = engine
-        .upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(12, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "d",
+            UpsertNodeOptions {
+                weight: 0.5,
+                sparse_vector: Some(vec![(12, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -7939,9 +10953,18 @@ fn test_vector_search_sparse_background_compaction_parity_with_mixed_vectors() {
         for index in 0..16 {
             let key = format!("s{segment}_n{index}");
             let write = if index % 2 == 0 {
-                UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![1.0, 0.0]), sparse_vector: Some(vec![(3, 1.0), (10, 0.25 + index as f32 * 0.01)]), ..Default::default() }
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    dense_vector: Some(vec![1.0, 0.0]),
+                    sparse_vector: Some(vec![(3, 1.0), (10, 0.25 + index as f32 * 0.01)]),
+                    ..Default::default()
+                }
             } else {
-                UpsertNodeOptions { weight: 0.5, sparse_vector: Some(vec![(3, 0.8), (11, 0.2 + index as f32 * 0.01)]), ..Default::default() }
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    sparse_vector: Some(vec![(3, 0.8), (11, 0.2 + index as f32 * 0.01)]),
+                    ..Default::default()
+                }
             };
             engine.upsert_node(1, &key, write).unwrap();
         }
@@ -8167,15 +11190,39 @@ fn test_vector_search_dense_memtable_shadows_segment_and_collapses_duplicates() 
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let alpha = engine
-        .upsert_node(1, "alpha", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.0, 1.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "alpha",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.0, 1.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let beta = engine
-        .upsert_node(1, "beta", UpsertNodeOptions { weight: 0.4, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "beta",
+            UpsertNodeOptions {
+                weight: 0.4,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let alpha_updated = engine
-        .upsert_node(1, "alpha", UpsertNodeOptions { weight: 0.7, dense_vector: Some(vec![1.0, 1.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "alpha",
+            UpsertNodeOptions {
+                weight: 0.7,
+                dense_vector: Some(vec![1.0, 1.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(alpha, alpha_updated);
 
@@ -8202,15 +11249,39 @@ fn test_vector_search_dense_newer_segment_shadows_older_segment() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let alpha = engine
-        .upsert_node(1, "alpha", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.0, 1.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "alpha",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.0, 1.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let beta = engine
-        .upsert_node(1, "beta", UpsertNodeOptions { weight: 0.4, dense_vector: Some(vec![0.8, 0.2]), ..Default::default() })
+        .upsert_node(
+            1,
+            "beta",
+            UpsertNodeOptions {
+                weight: 0.4,
+                dense_vector: Some(vec![0.8, 0.2]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     engine
-        .upsert_node(1, "alpha", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "alpha",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -8237,13 +11308,37 @@ fn test_vector_search_dense_type_filter_and_deleted_node_exclusion() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let deleted = engine
-        .upsert_node(1, "deleted", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "deleted",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let kept = engine
-        .upsert_node(1, "kept", UpsertNodeOptions { weight: 0.4, dense_vector: Some(vec![0.9, 0.1]), ..Default::default() })
+        .upsert_node(
+            1,
+            "kept",
+            UpsertNodeOptions {
+                weight: 0.4,
+                dense_vector: Some(vec![0.9, 0.1]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let other_type = engine
-        .upsert_node(2, "other-type", UpsertNodeOptions { weight: 0.3, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            2,
+            "other-type",
+            UpsertNodeOptions {
+                weight: 0.3,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -8277,22 +11372,70 @@ fn test_vector_search_dense_combines_shadowing_tombstones_type_filter_and_policy
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let shadowed = engine
-        .upsert_node(1, "shadowed", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.0, 1.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shadowed",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.0, 1.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let kept_a = engine
-        .upsert_node(1, "kept-a", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.9, 0.1]), ..Default::default() })
+        .upsert_node(
+            1,
+            "kept-a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.9, 0.1]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let kept_b = engine
-        .upsert_node(1, "kept-b", UpsertNodeOptions { weight: 0.8, dense_vector: Some(vec![0.8, 0.2]), ..Default::default() })
+        .upsert_node(
+            1,
+            "kept-b",
+            UpsertNodeOptions {
+                weight: 0.8,
+                dense_vector: Some(vec![0.8, 0.2]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let deleted = engine
-        .upsert_node(1, "deleted", UpsertNodeOptions { weight: 0.95, dense_vector: Some(vec![0.98, 0.02]), ..Default::default() })
+        .upsert_node(
+            1,
+            "deleted",
+            UpsertNodeOptions {
+                weight: 0.95,
+                dense_vector: Some(vec![0.98, 0.02]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let pruned = engine
-        .upsert_node(1, "pruned", UpsertNodeOptions { weight: 0.1, dense_vector: Some(vec![0.97, 0.03]), ..Default::default() })
+        .upsert_node(
+            1,
+            "pruned",
+            UpsertNodeOptions {
+                weight: 0.1,
+                dense_vector: Some(vec![0.97, 0.03]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let other_type = engine
-        .upsert_node(2, "other-type", UpsertNodeOptions { weight: 0.95, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            2,
+            "other-type",
+            UpsertNodeOptions {
+                weight: 0.95,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -8309,7 +11452,15 @@ fn test_vector_search_dense_combines_shadowing_tombstones_type_filter_and_policy
         .unwrap();
 
     let shadowed_updated = engine
-        .upsert_node(1, "shadowed", UpsertNodeOptions { weight: 0.95, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shadowed",
+            UpsertNodeOptions {
+                weight: 0.95,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(shadowed, shadowed_updated);
 
@@ -8348,21 +11499,52 @@ fn test_vector_search_dense_overfetch_recovers_visible_k() {
     let mut stale_ids = Vec::new();
     for index in 0..9 {
         let node_id = engine
-            .upsert_node(1, &format!("stale-{index}"), UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![1.0 - index as f32 * 0.001, index as f32 * 0.001]), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("stale-{index}"),
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    dense_vector: Some(vec![1.0 - index as f32 * 0.001, index as f32 * 0.001]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         stale_ids.push(node_id);
     }
     let visible_a = engine
-        .upsert_node(1, "visible-a", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.85, 0.15]), ..Default::default() })
+        .upsert_node(
+            1,
+            "visible-a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.85, 0.15]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let visible_b = engine
-        .upsert_node(1, "visible-b", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.75, 0.25]), ..Default::default() })
+        .upsert_node(
+            1,
+            "visible-b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.75, 0.25]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     for index in 0..stale_ids.len() {
         engine
-            .upsert_node(1, &format!("stale-{index}"), UpsertNodeOptions { weight: 0.8, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("stale-{index}"),
+                UpsertNodeOptions {
+                    weight: 0.8,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
 
@@ -8393,23 +11575,54 @@ fn test_vector_search_dense_exhausts_segments_before_returning_top_k() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let weaker = engine
-        .upsert_node(1, "older-weaker", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.7, 0.3]), ..Default::default() })
+        .upsert_node(
+            1,
+            "older-weaker",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.7, 0.3]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     for index in 0..12 {
         engine
-            .upsert_node(1, &format!("shadowed-{index}"), UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![1.0 - index as f32 * 0.001, index as f32 * 0.001]), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("shadowed-{index}"),
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    dense_vector: Some(vec![1.0 - index as f32 * 0.001, index as f32 * 0.001]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     let hidden_better = engine
-        .upsert_node(1, "hidden-better", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.9, 0.1]), ..Default::default() })
+        .upsert_node(
+            1,
+            "hidden-better",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.9, 0.1]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     for index in 0..12 {
         engine
-            .upsert_node(1, &format!("shadowed-{index}"), UpsertNodeOptions { weight: 0.8, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("shadowed-{index}"),
+                UpsertNodeOptions {
+                    weight: 0.8,
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
 
@@ -8436,7 +11649,15 @@ fn test_vector_search_dense_default_ef_search_matches_explicit_default() {
 
     for index in 0..128 {
         engine
-            .upsert_node(1, &format!("n{index}"), UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![1.0 - index as f32 * 0.004, index as f32 * 0.004]), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("n{index}"),
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    dense_vector: Some(vec![1.0 - index as f32 * 0.004, index as f32 * 0.004]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     engine.flush().unwrap();
@@ -8470,10 +11691,26 @@ fn test_vector_search_dense_supports_euclidean_and_dot_product_metrics() {
     };
     let mut euclidean = DatabaseEngine::open(euclidean_dir.path(), &euclidean_opts).unwrap();
     let near = euclidean
-        .upsert_node(1, "near", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.1, 0.1]), ..Default::default() })
+        .upsert_node(
+            1,
+            "near",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.1, 0.1]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let far = euclidean
-        .upsert_node(1, "far", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![2.0, 2.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "far",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![2.0, 2.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     euclidean.flush().unwrap();
 
@@ -8498,10 +11735,26 @@ fn test_vector_search_dense_supports_euclidean_and_dot_product_metrics() {
     };
     let mut dot = DatabaseEngine::open(dot_dir.path(), &dot_opts).unwrap();
     let lower = dot
-        .upsert_node(1, "lower", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![2.0, 1.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "lower",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![2.0, 1.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let higher = dot
-        .upsert_node(1, "higher", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.0, 3.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "higher",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.0, 3.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     dot.flush().unwrap();
 
@@ -8529,16 +11782,48 @@ fn test_vector_search_dense_small_graph_matches_exact_oracle() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let n1 = engine
-        .upsert_node(1, "n1", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "n1",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let n2 = engine
-        .upsert_node(1, "n2", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.8, 0.2]), ..Default::default() })
+        .upsert_node(
+            1,
+            "n2",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.8, 0.2]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let n3 = engine
-        .upsert_node(1, "n3", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.0, 1.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "n3",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.0, 1.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let n4 = engine
-        .upsert_node(1, "n4", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.6, 0.4]), ..Default::default() })
+        .upsert_node(
+            1,
+            "n4",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.6, 0.4]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -8591,18 +11876,50 @@ fn test_vector_search_dense_standard_compaction_parity() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let stale = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.7, 0.3]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.7, 0.3]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let stable = engine
-        .upsert_node(1, "stable", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.6, 0.4]), ..Default::default() })
+        .upsert_node(
+            1,
+            "stable",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.6, 0.4]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let fresh = engine
-        .upsert_node(1, "shared", UpsertNodeOptions { weight: 0.8, dense_vector: Some(vec![0.95, 0.05]), ..Default::default() })
+        .upsert_node(
+            1,
+            "shared",
+            UpsertNodeOptions {
+                weight: 0.8,
+                dense_vector: Some(vec![0.95, 0.05]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let deleted = engine
-        .upsert_node(2, "deleted", UpsertNodeOptions { weight: 0.4, dense_vector: Some(vec![0.9, 0.1]), ..Default::default() })
+        .upsert_node(
+            2,
+            "deleted",
+            UpsertNodeOptions {
+                weight: 0.4,
+                dense_vector: Some(vec![0.9, 0.1]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
     engine.delete_node(deleted).unwrap();
@@ -8640,18 +11957,50 @@ fn test_vector_search_dense_fast_merge_compaction_parity() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let a = engine
-        .upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let b = engine
-        .upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.8, 0.2]), ..Default::default() })
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.8, 0.2]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let c = engine
-        .upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.6, 0.4]), ..Default::default() })
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.6, 0.4]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let d = engine
-        .upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![0.2, 0.8]), ..Default::default() })
+        .upsert_node(
+            1,
+            "d",
+            UpsertNodeOptions {
+                weight: 0.5,
+                dense_vector: Some(vec![0.2, 0.8]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -8688,10 +12037,18 @@ fn test_vector_search_dense_background_compaction_parity() {
     for segment in 0..2 {
         for index in 0..16 {
             engine
-                .upsert_node(1, &format!("s{segment}_n{index}"), UpsertNodeOptions { weight: 0.5, dense_vector: Some(vec![
-                        1.0 - (segment * 16 + index) as f32 * 0.01,
-                        (segment * 16 + index) as f32 * 0.01,
-                    ]), ..Default::default() })
+                .upsert_node(
+                    1,
+                    &format!("s{segment}_n{index}"),
+                    UpsertNodeOptions {
+                        weight: 0.5,
+                        dense_vector: Some(vec![
+                            1.0 - (segment * 16 + index) as f32 * 0.01,
+                            (segment * 16 + index) as f32 * 0.01,
+                        ]),
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
         }
         engine.flush().unwrap();
@@ -8726,54 +12083,178 @@ fn test_vector_search_dense_scope_combines_start_edge_filters_temporal_policy_an
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let start = engine
-        .upsert_node(1, "scope-start", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.70, 0.30]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-start",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.70, 0.30]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let keep = engine
-        .upsert_node(1, "scope-keep", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.96, 0.04]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-keep",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.96, 0.04]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let shadowed = engine
-        .upsert_node(1, "scope-shadowed", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.20, 0.80]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-shadowed",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.20, 0.80]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let deleted = engine
-        .upsert_node(1, "scope-deleted", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.99, 0.01]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-deleted",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.99, 0.01]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let pruned = engine
-        .upsert_node(1, "scope-pruned", UpsertNodeOptions { weight: 0.1, dense_vector: Some(vec![0.98, 0.02]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-pruned",
+            UpsertNodeOptions {
+                weight: 0.1,
+                dense_vector: Some(vec![0.98, 0.02]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let other_type = engine
-        .upsert_node(2, "scope-other-type", UpsertNodeOptions { weight: 0.95, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            2,
+            "scope-other-type",
+            UpsertNodeOptions {
+                weight: 0.95,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let wrong_edge_type = engine
-        .upsert_node(1, "scope-wrong-edge", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.97, 0.03]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-wrong-edge",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.97, 0.03]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let temporal_old = engine
-        .upsert_node(1, "scope-temporal-old", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.95, 0.05]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-temporal-old",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.95, 0.05]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let temporal_live = engine
-        .upsert_node(1, "scope-temporal-live", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.92, 0.08]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-temporal-live",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.92, 0.08]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let unreachable = engine
-        .upsert_node(1, "scope-unreachable", UpsertNodeOptions { weight: 0.95, dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-unreachable",
+            UpsertNodeOptions {
+                weight: 0.95,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     for &node_id in &[keep, shadowed, deleted, pruned, other_type] {
         engine
-            .upsert_edge(start, node_id, 10, UpsertEdgeOptions { valid_from: Some(0), valid_to: Some(10_000), ..Default::default() })
+            .upsert_edge(
+                start,
+                node_id,
+                10,
+                UpsertEdgeOptions {
+                    valid_from: Some(0),
+                    valid_to: Some(10_000),
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     engine
-        .upsert_edge(start, wrong_edge_type, 20, UpsertEdgeOptions { valid_from: Some(0), valid_to: Some(10_000), ..Default::default() })
+        .upsert_edge(
+            start,
+            wrong_edge_type,
+            20,
+            UpsertEdgeOptions {
+                valid_from: Some(0),
+                valid_to: Some(10_000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_edge(start, temporal_old, 10, UpsertEdgeOptions { valid_from: Some(0), valid_to: Some(4_000), ..Default::default() })
+        .upsert_edge(
+            start,
+            temporal_old,
+            10,
+            UpsertEdgeOptions {
+                valid_from: Some(0),
+                valid_to: Some(4_000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_edge(start, temporal_live, 10, UpsertEdgeOptions { valid_from: Some(4_500), valid_to: Some(9_000), ..Default::default() })
+        .upsert_edge(
+            start,
+            temporal_live,
+            10,
+            UpsertEdgeOptions {
+                valid_from: Some(4_500),
+                valid_to: Some(9_000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let shadowed_updated = engine
-        .upsert_node(1, "scope-shadowed", UpsertNodeOptions { weight: 0.95, dense_vector: Some(vec![0.995, 0.005]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-shadowed",
+            UpsertNodeOptions {
+                weight: 0.95,
+                dense_vector: Some(vec![0.995, 0.005]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(shadowed, shadowed_updated);
     engine.delete_node(deleted).unwrap();
@@ -8823,14 +12304,20 @@ fn test_vector_search_dense_scope_large_reachable_set_excludes_better_unreachabl
     };
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    let start = engine.upsert_node(1, "dense-scope-start", UpsertNodeOptions::default()).unwrap();
+    let start = engine
+        .upsert_node(1, "dense-scope-start", UpsertNodeOptions::default())
+        .unwrap();
     let mut reachable_ids = Vec::new();
     for index in 0..2055 {
         let node_id = engine
-            .upsert_node(1, &format!("dense-scope-r-{index}"), UpsertNodeOptions { dense_vector: Some(vec![
-                    1.0 - index as f32 * 0.0001,
-                    index as f32 * 0.0001,
-                ]), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("dense-scope-r-{index}"),
+                UpsertNodeOptions {
+                    dense_vector: Some(vec![1.0 - index as f32 * 0.0001, index as f32 * 0.0001]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         engine
             .upsert_edge(start, node_id, 10, UpsertEdgeOptions::default())
@@ -8840,7 +12327,14 @@ fn test_vector_search_dense_scope_large_reachable_set_excludes_better_unreachabl
     let mut unreachable_ids = Vec::new();
     for index in 0..16 {
         let node_id = engine
-            .upsert_node(1, &format!("dense-scope-u-{index}"), UpsertNodeOptions { dense_vector: Some(vec![1.0, index as f32 * 0.00001]), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("dense-scope-u-{index}"),
+                UpsertNodeOptions {
+                    dense_vector: Some(vec![1.0, index as f32 * 0.00001]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         unreachable_ids.push(node_id);
     }
@@ -8877,16 +12371,48 @@ fn test_vector_search_dense_scope_compaction_and_reopen_parity() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let start = engine
-        .upsert_node(1, "dense-scope-parity-start", UpsertNodeOptions { weight: 0.8, dense_vector: Some(vec![0.55, 0.45]), ..Default::default() })
+        .upsert_node(
+            1,
+            "dense-scope-parity-start",
+            UpsertNodeOptions {
+                weight: 0.8,
+                dense_vector: Some(vec![0.55, 0.45]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let stable = engine
-        .upsert_node(1, "dense-scope-stable", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.9, 0.1]), ..Default::default() })
+        .upsert_node(
+            1,
+            "dense-scope-stable",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.9, 0.1]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let shared_old = engine
-        .upsert_node(1, "dense-scope-shared", UpsertNodeOptions { weight: 0.8, dense_vector: Some(vec![0.3, 0.7]), ..Default::default() })
+        .upsert_node(
+            1,
+            "dense-scope-shared",
+            UpsertNodeOptions {
+                weight: 0.8,
+                dense_vector: Some(vec![0.3, 0.7]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let deleted = engine
-        .upsert_node(1, "dense-scope-deleted", UpsertNodeOptions { weight: 0.95, dense_vector: Some(vec![0.95, 0.05]), ..Default::default() })
+        .upsert_node(
+            1,
+            "dense-scope-deleted",
+            UpsertNodeOptions {
+                weight: 0.95,
+                dense_vector: Some(vec![0.95, 0.05]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     for &node_id in &[stable, shared_old, deleted] {
         engine
@@ -8896,7 +12422,15 @@ fn test_vector_search_dense_scope_compaction_and_reopen_parity() {
     engine.flush().unwrap();
 
     let shared_new = engine
-        .upsert_node(1, "dense-scope-shared", UpsertNodeOptions { weight: 0.95, dense_vector: Some(vec![0.99, 0.01]), ..Default::default() })
+        .upsert_node(
+            1,
+            "dense-scope-shared",
+            UpsertNodeOptions {
+                weight: 0.95,
+                dense_vector: Some(vec![0.99, 0.01]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(shared_old, shared_new);
     engine.delete_node(deleted).unwrap();
@@ -8925,59 +12459,522 @@ fn test_vector_search_dense_scope_compaction_and_reopen_parity() {
 }
 
 #[test]
+fn test_vector_search_dense_four_segment_visibility_and_ordering() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        compact_after_n_flushes: 0,
+        dense_vector: Some(DenseVectorConfig {
+            dimension: 2,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig::default(),
+        }),
+        ..DbOptions::default()
+    };
+    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    // Segment 1: A, B, C, D
+    let a = engine
+        .upsert_node(
+            1,
+            "node-a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "node-b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.8, 0.2]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "node-c",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.6, 0.4]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let d = engine
+        .upsert_node(
+            1,
+            "node-d",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.3, 0.7]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    // Segment 2: shadow A with a different vector, add E
+    let a2 = engine
+        .upsert_node(
+            1,
+            "node-a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.5, 0.5]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(a, a2);
+    let e = engine
+        .upsert_node(
+            1,
+            "node-e",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.9, 0.1]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    // Segment 3: delete B, add F
+    engine.delete_node(b).unwrap();
+    let f = engine
+        .upsert_node(
+            1,
+            "node-f",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.95, 0.05]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    // Segment 4: shadow C with a very different vector, add G (type_id=2)
+    let c2 = engine
+        .upsert_node(
+            1,
+            "node-c",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.1, 0.9]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(c, c2);
+    let _g = engine
+        .upsert_node(
+            2,
+            "node-g",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.7, 0.3]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    // Query: [1.0, 0.0], k=5, type_filter=[1]
+    // Surviving type_id=1 nodes with their newest vectors:
+    //   A: [0.5, 0.5] (shadowed in seg 2)
+    //   B: deleted (seg 3)
+    //   C: [0.1, 0.9] (shadowed in seg 4)
+    //   D: [0.3, 0.7] (original, seg 1)
+    //   E: [0.9, 0.1] (seg 2)
+    //   F: [0.95, 0.05] (seg 3)
+    //   G: type_id=2 → filtered out
+    let query = vec![1.0, 0.0];
+    let hits = engine
+        .vector_search(&dense_search_request(query.clone(), 5, Some(vec![1]), None))
+        .unwrap();
+
+    // Compute expected scores and sort by (score DESC, node_id ASC).
+    let mut expected: Vec<(u64, f32)> = vec![
+        (f, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.95, 0.05])),
+        (e, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.9, 0.1])),
+        (a, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.5, 0.5])),
+        (d, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.3, 0.7])),
+        (c, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.1, 0.9])),
+    ];
+    expected.sort_by(|(id_a, score_a), (id_b, score_b)| {
+        score_b
+            .total_cmp(score_a)
+            .then_with(|| id_a.cmp(id_b))
+    });
+
+    assert_eq!(
+        hits.len(),
+        5,
+        "expected 5 results (B deleted, G filtered), got {}",
+        hits.len()
+    );
+    for (i, (expected_id, expected_score)) in expected.iter().enumerate() {
+        assert_eq!(
+            hits[i].node_id, *expected_id,
+            "hit[{i}] node_id mismatch: got {}, expected {}",
+            hits[i].node_id, expected_id
+        );
+        assert!(
+            (hits[i].score - expected_score).abs() < 1e-6,
+            "hit[{i}] score mismatch: got {}, expected {}",
+            hits[i].score, expected_score
+        );
+    }
+}
+
+#[test]
+fn test_vector_search_sparse_four_segment_visibility_and_ordering() {
+    // 4 segments exercising shadowing, tombstones, type filter, and exact score assertions.
+    // All 4 segments contain sparse data → sparse_segment_count >= 2 → parallel path exercised.
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        compact_after_n_flushes: 0,
+        ..DbOptions::default()
+    };
+    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    // Segment 0 (oldest): A, B, C, D
+    let a = engine
+        .upsert_node(
+            1,
+            "node-a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 1.0)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let _b = engine
+        .upsert_node(
+            2,
+            "node-b",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 2.0)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = engine
+        .upsert_node(
+            1,
+            "node-c",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 3.0)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let d = engine
+        .upsert_node(
+            1,
+            "node-d",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 4.0)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    // Segment 1: shadow A with higher score, add E
+    let a2 = engine
+        .upsert_node(
+            1,
+            "node-a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 10.0)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(a, a2);
+    let e = engine
+        .upsert_node(
+            1,
+            "node-e",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 0.5)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    // Segment 2: delete C (tombstone), add F
+    engine.delete_node(c).unwrap();
+    let f = engine
+        .upsert_node(
+            1,
+            "node-f",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 1.5)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    // Segment 3 (newest): shadow D with non-overlapping sparse vector, add G
+    // Same (type_id=1, key="node-d") so this shadows D's old entry.
+    // New vector [(99, 5.0)] has zero overlap with query dim 3 → score 0.0.
+    let d2 = engine
+        .upsert_node(
+            1,
+            "node-d",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(99, 5.0)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(d, d2);
+    let g = engine
+        .upsert_node(
+            1,
+            "node-g",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 0.8)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    // Query: sparse [(3, 1.0)], k=10, type_filter=[1]
+    // Surviving type_id=1 nodes with their newest sparse vectors:
+    //   A: [(3, 10.0)] (shadowed in seg 1) → score 10.0
+    //   B: type_id=2 → filtered out
+    //   C: deleted (seg 2) → excluded
+    //   D: [(99, 5.0)] (shadowed in seg 3) → score 0.0, excluded
+    //   E: [(3, 0.5)] (seg 1) → score 0.5
+    //   F: [(3, 1.5)] (seg 2) → score 1.5
+    //   G: [(3, 0.8)] (seg 3) → score 0.8
+    let hits = engine
+        .vector_search(&sparse_search_request(vec![(3, 1.0)], 10, Some(vec![1])))
+        .unwrap();
+
+    let expected: Vec<(u64, f32)> = vec![(a, 10.0), (f, 1.5), (g, 0.8), (e, 0.5)];
+
+    assert_eq!(
+        hits.len(),
+        expected.len(),
+        "expected {} results (B filtered, C deleted, D non-overlapping), got {}",
+        expected.len(),
+        hits.len()
+    );
+    for (i, (expected_id, expected_score)) in expected.iter().enumerate() {
+        assert_eq!(
+            hits[i].node_id, *expected_id,
+            "hit[{i}] node_id mismatch: got {}, expected {}",
+            hits[i].node_id, expected_id
+        );
+        assert!(
+            (hits[i].score - expected_score).abs() < 1e-6,
+            "hit[{i}] score mismatch: got {}, expected {}",
+            hits[i].score, expected_score
+        );
+    }
+}
+
+#[test]
 fn test_vector_search_sparse_scope_combines_start_edge_filters_temporal_policy_and_shadowing() {
     let dir = TempDir::new().unwrap();
     let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let start = engine
-        .upsert_node(1, "scope-start", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 0.4)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-start",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 0.4)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let keep = engine
-        .upsert_node(1, "scope-keep", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 1.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-keep",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 1.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let shadowed = engine
-        .upsert_node(1, "scope-shadowed", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(4, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-shadowed",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(4, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let deleted = engine
-        .upsert_node(1, "scope-deleted", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 2.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-deleted",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 2.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let pruned = engine
-        .upsert_node(1, "scope-pruned", UpsertNodeOptions { weight: 0.1, sparse_vector: Some(vec![(3, 3.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-pruned",
+            UpsertNodeOptions {
+                weight: 0.1,
+                sparse_vector: Some(vec![(3, 3.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let other_type = engine
-        .upsert_node(2, "scope-other-type", UpsertNodeOptions { weight: 0.95, sparse_vector: Some(vec![(3, 4.0)]), ..Default::default() })
+        .upsert_node(
+            2,
+            "scope-other-type",
+            UpsertNodeOptions {
+                weight: 0.95,
+                sparse_vector: Some(vec![(3, 4.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let wrong_edge_type = engine
-        .upsert_node(1, "scope-wrong-edge", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 2.1)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-wrong-edge",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 2.1)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let temporal_old = engine
-        .upsert_node(1, "scope-temporal-old", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 1.9)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-temporal-old",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 1.9)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let temporal_live = engine
-        .upsert_node(1, "scope-temporal-live", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 1.2)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-temporal-live",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 1.2)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let unreachable = engine
-        .upsert_node(1, "scope-unreachable", UpsertNodeOptions { weight: 0.95, sparse_vector: Some(vec![(3, 5.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-unreachable",
+            UpsertNodeOptions {
+                weight: 0.95,
+                sparse_vector: Some(vec![(3, 5.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     for &node_id in &[keep, shadowed, deleted, pruned, other_type] {
         engine
-            .upsert_edge(start, node_id, 10, UpsertEdgeOptions { valid_from: Some(0), valid_to: Some(10_000), ..Default::default() })
+            .upsert_edge(
+                start,
+                node_id,
+                10,
+                UpsertEdgeOptions {
+                    valid_from: Some(0),
+                    valid_to: Some(10_000),
+                    ..Default::default()
+                },
+            )
             .unwrap();
     }
     engine
-        .upsert_edge(start, wrong_edge_type, 20, UpsertEdgeOptions { valid_from: Some(0), valid_to: Some(10_000), ..Default::default() })
+        .upsert_edge(
+            start,
+            wrong_edge_type,
+            20,
+            UpsertEdgeOptions {
+                valid_from: Some(0),
+                valid_to: Some(10_000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_edge(start, temporal_old, 10, UpsertEdgeOptions { valid_from: Some(0), valid_to: Some(4_000), ..Default::default() })
+        .upsert_edge(
+            start,
+            temporal_old,
+            10,
+            UpsertEdgeOptions {
+                valid_from: Some(0),
+                valid_to: Some(4_000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine
-        .upsert_edge(start, temporal_live, 10, UpsertEdgeOptions { valid_from: Some(4_500), valid_to: Some(9_000), ..Default::default() })
+        .upsert_edge(
+            start,
+            temporal_live,
+            10,
+            UpsertEdgeOptions {
+                valid_from: Some(4_500),
+                valid_to: Some(9_000),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let shadowed_updated = engine
-        .upsert_node(1, "scope-shadowed", UpsertNodeOptions { weight: 0.95, sparse_vector: Some(vec![(3, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-shadowed",
+            UpsertNodeOptions {
+                weight: 0.95,
+                sparse_vector: Some(vec![(3, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(shadowed, shadowed_updated);
     engine.delete_node(deleted).unwrap();
@@ -9021,7 +13018,14 @@ fn test_vector_search_sparse_scope_large_reachable_set_excludes_better_unreachab
     let mut reachable_ids = Vec::new();
     for index in 0..2055 {
         let node_id = engine
-            .upsert_node(1, &format!("sparse-scope-r-{index}"), UpsertNodeOptions { sparse_vector: Some(vec![(1, 1.0 - index as f32 * 0.0001)]), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("sparse-scope-r-{index}"),
+                UpsertNodeOptions {
+                    sparse_vector: Some(vec![(1, 1.0 - index as f32 * 0.0001)]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         engine
             .upsert_edge(start, node_id, 10, UpsertEdgeOptions::default())
@@ -9031,7 +13035,14 @@ fn test_vector_search_sparse_scope_large_reachable_set_excludes_better_unreachab
     let mut unreachable_ids = Vec::new();
     for index in 0..16 {
         let node_id = engine
-            .upsert_node(1, &format!("sparse-scope-u-{index}"), UpsertNodeOptions { sparse_vector: Some(vec![(1, 2.0 + index as f32)]), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("sparse-scope-u-{index}"),
+                UpsertNodeOptions {
+                    sparse_vector: Some(vec![(1, 2.0 + index as f32)]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         unreachable_ids.push(node_id);
     }
@@ -9062,16 +13073,48 @@ fn test_vector_search_sparse_scope_compaction_and_reopen_parity() {
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let start = engine
-        .upsert_node(1, "sparse-scope-parity-start", UpsertNodeOptions { weight: 0.8, sparse_vector: Some(vec![(3, 0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "sparse-scope-parity-start",
+            UpsertNodeOptions {
+                weight: 0.8,
+                sparse_vector: Some(vec![(3, 0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let stable = engine
-        .upsert_node(1, "sparse-scope-stable", UpsertNodeOptions { weight: 0.9, sparse_vector: Some(vec![(3, 1.4)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "sparse-scope-stable",
+            UpsertNodeOptions {
+                weight: 0.9,
+                sparse_vector: Some(vec![(3, 1.4)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let shared_old = engine
-        .upsert_node(1, "sparse-scope-shared", UpsertNodeOptions { weight: 0.8, sparse_vector: Some(vec![(4, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "sparse-scope-shared",
+            UpsertNodeOptions {
+                weight: 0.8,
+                sparse_vector: Some(vec![(4, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let deleted = engine
-        .upsert_node(1, "sparse-scope-deleted", UpsertNodeOptions { weight: 0.95, sparse_vector: Some(vec![(3, 1.6)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "sparse-scope-deleted",
+            UpsertNodeOptions {
+                weight: 0.95,
+                sparse_vector: Some(vec![(3, 1.6)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     for &node_id in &[stable, shared_old, deleted] {
         engine
@@ -9081,7 +13124,15 @@ fn test_vector_search_sparse_scope_compaction_and_reopen_parity() {
     engine.flush().unwrap();
 
     let shared_new = engine
-        .upsert_node(1, "sparse-scope-shared", UpsertNodeOptions { weight: 0.95, sparse_vector: Some(vec![(3, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "sparse-scope-shared",
+            UpsertNodeOptions {
+                weight: 0.95,
+                sparse_vector: Some(vec![(3, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(shared_old, shared_new);
     engine.delete_node(deleted).unwrap();
@@ -9136,40 +13187,113 @@ fn test_vector_search_scope_matches_unscoped_results_filtered_by_reachable_ids()
     let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let start = engine
-        .upsert_node(1, "scope-oracle-start", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.60, 0.40]), sparse_vector: Some(vec![(1, 0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-oracle-start",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.60, 0.40]),
+                sparse_vector: Some(vec![(1, 0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let reachable_a = engine
-        .upsert_node(1, "scope-oracle-a", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.98, 0.02]), sparse_vector: Some(vec![(1, 1.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-oracle-a",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.98, 0.02]),
+                sparse_vector: Some(vec![(1, 1.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let reachable_b_old = engine
-        .upsert_node(1, "scope-oracle-b", UpsertNodeOptions { weight: 0.8, dense_vector: Some(vec![0.20, 0.80]), sparse_vector: Some(vec![(2, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-oracle-b",
+            UpsertNodeOptions {
+                weight: 0.8,
+                dense_vector: Some(vec![0.20, 0.80]),
+                sparse_vector: Some(vec![(2, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let reachable_deleted = engine
-        .upsert_node(1, "scope-oracle-deleted", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.97, 0.03]), sparse_vector: Some(vec![(1, 2.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-oracle-deleted",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.97, 0.03]),
+                sparse_vector: Some(vec![(1, 2.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let reachable_other_type = engine
-        .upsert_node(2, "scope-oracle-type2", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![0.96, 0.04]), sparse_vector: Some(vec![(1, 1.8)]), ..Default::default() })
+        .upsert_node(
+            2,
+            "scope-oracle-type2",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![0.96, 0.04]),
+                sparse_vector: Some(vec![(1, 1.8)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let unreachable = engine
-        .upsert_node(1, "scope-oracle-unreachable", UpsertNodeOptions { weight: 0.9, dense_vector: Some(vec![1.0, 0.0]), sparse_vector: Some(vec![(1, 3.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-oracle-unreachable",
+            UpsertNodeOptions {
+                weight: 0.9,
+                dense_vector: Some(vec![1.0, 0.0]),
+                sparse_vector: Some(vec![(1, 3.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     engine
         .upsert_edge(start, reachable_a, 10, UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(reachable_a, reachable_b_old, 10, UpsertEdgeOptions::default())
+        .upsert_edge(
+            reachable_a,
+            reachable_b_old,
+            10,
+            UpsertEdgeOptions::default(),
+        )
         .unwrap();
     engine
         .upsert_edge(start, reachable_deleted, 10, UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(start, reachable_other_type, 10, UpsertEdgeOptions::default())
+        .upsert_edge(
+            start,
+            reachable_other_type,
+            10,
+            UpsertEdgeOptions::default(),
+        )
         .unwrap();
     engine.flush().unwrap();
 
     let reachable_b_new = engine
-        .upsert_node(1, "scope-oracle-b", UpsertNodeOptions { weight: 0.95, dense_vector: Some(vec![0.94, 0.06]), sparse_vector: Some(vec![(1, 1.2)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "scope-oracle-b",
+            UpsertNodeOptions {
+                weight: 0.95,
+                dense_vector: Some(vec![0.94, 0.06]),
+                sparse_vector: Some(vec![(1, 1.2)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(reachable_b_old, reachable_b_new);
     engine.delete_node(reachable_deleted).unwrap();
@@ -9177,7 +13301,15 @@ fn test_vector_search_scope_matches_unscoped_results_filtered_by_reachable_ids()
 
     let scope = vector_search_scope(start, 2, Direction::Outgoing, Some(vec![10]), None);
     let reachable_ids: std::collections::HashSet<u64> = engine
-        .traverse(start, 2, &TraverseOptions { min_depth: 0, edge_type_filter: Some(vec![10]), ..Default::default() })
+        .traverse(
+            start,
+            2,
+            &TraverseOptions {
+                min_depth: 0,
+                edge_type_filter: Some(vec![10]),
+                ..Default::default()
+            },
+        )
         .unwrap()
         .items
         .into_iter()
@@ -9185,7 +13317,12 @@ fn test_vector_search_scope_matches_unscoped_results_filtered_by_reachable_ids()
         .collect();
     assert_eq!(
         reachable_ids,
-        std::collections::HashSet::from([start, reachable_a, reachable_b_old, reachable_other_type])
+        std::collections::HashSet::from([
+            start,
+            reachable_a,
+            reachable_b_old,
+            reachable_other_type
+        ])
     );
 
     let dense_scoped = engine
@@ -9198,12 +13335,19 @@ fn test_vector_search_scope_matches_unscoped_results_filtered_by_reachable_ids()
         ))
         .unwrap();
     let dense_unscoped = engine
-        .vector_search(&dense_search_request(vec![1.0, 0.0], 16, Some(vec![1]), Some(8)))
+        .vector_search(&dense_search_request(
+            vec![1.0, 0.0],
+            16,
+            Some(vec![1]),
+            Some(8),
+        ))
         .unwrap();
     let dense_expected = filter_hits_by_scope(&dense_unscoped, &reachable_ids, 3);
     assert_vector_hits_match(&dense_scoped, &dense_expected);
     assert!(dense_scoped.iter().all(|hit| hit.node_id != unreachable));
-    assert!(dense_scoped.iter().all(|hit| hit.node_id != reachable_deleted));
+    assert!(dense_scoped
+        .iter()
+        .all(|hit| hit.node_id != reachable_deleted));
 
     let sparse_scoped = engine
         .vector_search(&scoped_sparse_search_request(
@@ -9219,7 +13363,9 @@ fn test_vector_search_scope_matches_unscoped_results_filtered_by_reachable_ids()
     let sparse_expected = filter_hits_by_scope(&sparse_unscoped, &reachable_ids, 3);
     assert_vector_hits_match(&sparse_scoped, &sparse_expected);
     assert!(sparse_scoped.iter().all(|hit| hit.node_id != unreachable));
-    assert!(sparse_scoped.iter().all(|hit| hit.node_id != reachable_deleted));
+    assert!(sparse_scoped
+        .iter()
+        .all(|hit| hit.node_id != reachable_deleted));
 }
 
 #[test]
@@ -9358,7 +13504,16 @@ fn test_v3_tombstone_overlap_stress() {
             let key = format!("node_{}", i);
             let mut props = BTreeMap::new();
             props.insert("round".into(), PropValue::Int(round as i64));
-            db.upsert_node(1, &key, UpsertNodeOptions { props, weight: 0.5, ..Default::default() }).unwrap();
+            db.upsert_node(
+                1,
+                &key,
+                UpsertNodeOptions {
+                    props,
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
         for i in 0..19u64 {
             db.upsert_edge(i + 1, i + 2, 1, UpsertEdgeOptions::default())
@@ -9388,9 +13543,7 @@ fn test_v3_tombstone_overlap_stress() {
         }
     }
 
-    let out_3 = db
-        .neighbors(3, &NeighborOptions::default())
-        .unwrap();
+    let out_3 = db.neighbors(3, &NeighborOptions::default()).unwrap();
     assert!(out_3.is_empty(), "deleted node 3 should have no neighbors");
 }
 
@@ -9405,17 +13558,43 @@ fn test_v3_policy_or_and_semantics() {
         let w = if i < 5 { 0.1 } else { 0.8 };
         let mut props = BTreeMap::new();
         props.insert("name".into(), PropValue::String(format!("t1_{}", i)));
-        db.upsert_node(1, &format!("t1_{}", i), UpsertNodeOptions { props, weight: w, ..Default::default() }).unwrap();
+        db.upsert_node(
+            1,
+            &format!("t1_{}", i),
+            UpsertNodeOptions {
+                props,
+                weight: w,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     for i in 0..10u64 {
         let mut props = BTreeMap::new();
         props.insert("name".into(), PropValue::String(format!("t2_{}", i)));
-        db.upsert_node(2, &format!("t2_{}", i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_node(
+            2,
+            &format!("t2_{}", i),
+            UpsertNodeOptions {
+                props,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     db.flush().unwrap();
 
     // Touch a node to create a second segment (compaction needs ≥2).
-    db.upsert_node(1, "t1_0", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+    db.upsert_node(
+        1,
+        "t1_0",
+        UpsertNodeOptions {
+            weight: 0.1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     db.flush().unwrap();
 
     db.set_prune_policy(
@@ -9458,11 +13637,27 @@ fn test_v3_edge_cascade_high_fanout() {
     let db_path = dir.path().join("db");
     let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    let hub = db.upsert_node(1, "hub", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+    let hub = db
+        .upsert_node(
+            1,
+            "hub",
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let mut spoke_ids = Vec::new();
     for i in 0..100u64 {
         let spoke = db
-            .upsert_node(1, &format!("spoke_{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("spoke_{}", i),
+                UpsertNodeOptions {
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         spoke_ids.push(spoke);
         db.upsert_edge(hub, spoke, 1, UpsertEdgeOptions::default())
@@ -9478,7 +13673,13 @@ fn test_v3_edge_cascade_high_fanout() {
 
     assert!(db.get_node(hub).unwrap().is_none());
     let hub_out = db
-        .neighbors(hub, &NeighborOptions { direction: Direction::Both, ..Default::default() })
+        .neighbors(
+            hub,
+            &NeighborOptions {
+                direction: Direction::Both,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert!(hub_out.is_empty(), "hub should have no neighbors");
 
@@ -9489,7 +13690,13 @@ fn test_v3_edge_cascade_high_fanout() {
             spoke
         );
         let nbrs = db
-            .neighbors(spoke, &NeighborOptions { direction: Direction::Both, ..Default::default() })
+            .neighbors(
+                spoke,
+                &NeighborOptions {
+                    direction: Direction::Both,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         for ne in &nbrs {
             assert_ne!(ne.node_id, hub, "no neighbor should be hub");
@@ -9510,19 +13717,40 @@ fn test_v3_deterministic_output() {
         for i in 0..50u64 {
             let mut props = BTreeMap::new();
             props.insert("idx".into(), PropValue::Int(i as i64));
-            db.upsert_node(i as u32 % 3 + 1, &format!("n_{}", i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() })
-                .unwrap();
+            db.upsert_node(
+                i as u32 % 3 + 1,
+                &format!("n_{}", i),
+                UpsertNodeOptions {
+                    props,
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
         for i in 0..30u64 {
-            db.upsert_edge(i + 1, (i + 5) % 50 + 1, i as u32 % 2 + 1, UpsertEdgeOptions::default())
+            db.upsert_edge(
+                i + 1,
+                (i + 5) % 50 + 1,
+                i as u32 % 2 + 1,
+                UpsertEdgeOptions::default(),
+            )
             .unwrap();
         }
         db.flush().unwrap();
         for i in 0..20u64 {
             let mut props = BTreeMap::new();
             props.insert("idx".into(), PropValue::Int(i as i64 + 100));
-            db.upsert_node(i as u32 % 3 + 1, &format!("n_{}", i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() })
-                .unwrap();
+            db.upsert_node(
+                i as u32 % 3 + 1,
+                &format!("n_{}", i),
+                UpsertNodeOptions {
+                    props,
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
         db.flush().unwrap();
         db.compact().unwrap();
@@ -9569,12 +13797,20 @@ fn test_v3_index_parity() {
         } else {
             props2.clone()
         };
-        db.upsert_node(i as u32 % 2 + 1, &format!("key_{}", i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() })
-            .unwrap();
+        db.upsert_node(
+            i as u32 % 2 + 1,
+            &format!("key_{}", i),
+            UpsertNodeOptions {
+                props,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     for i in 0..8u64 {
         db.upsert_edge(i + 1, i + 2, i as u32 % 3 + 1, UpsertEdgeOptions::default())
-        .unwrap();
+            .unwrap();
     }
     db.flush().unwrap();
 
@@ -9582,8 +13818,16 @@ fn test_v3_index_parity() {
         let mut props = BTreeMap::new();
         props.insert("color".into(), PropValue::String("green".into()));
         props.insert("updated".into(), PropValue::Bool(true));
-        db.upsert_node(i as u32 % 2 + 1, &format!("key_{}", i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() })
-            .unwrap();
+        db.upsert_node(
+            i as u32 % 2 + 1,
+            &format!("key_{}", i),
+            UpsertNodeOptions {
+                props,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     for i in 5..10u64 {
         db.upsert_edge(i + 1, 1, 2, UpsertEdgeOptions::default())
@@ -9601,8 +13845,14 @@ fn test_v3_index_parity() {
         .collect();
     let pre_neighbors: Vec<_> = (1..=10)
         .map(|i| {
-            db.neighbors(i, &NeighborOptions { direction: Direction::Both, ..Default::default() })
-                .unwrap()
+            db.neighbors(
+                i,
+                &NeighborOptions {
+                    direction: Direction::Both,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
         })
         .collect();
     let pre_type1 = db.nodes_by_type(1).unwrap();
@@ -9637,7 +13887,13 @@ fn test_v3_index_parity() {
 
     for (i, pre_neighbor) in pre_neighbors.iter().enumerate().take(10) {
         let post = db
-            .neighbors(i as u64 + 1, &NeighborOptions { direction: Direction::Both, ..Default::default() })
+            .neighbors(
+                i as u64 + 1,
+                &NeighborOptions {
+                    direction: Direction::Both,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let pre_ids: NodeIdSet = pre_neighbor.iter().map(|ne| ne.edge_id).collect();
         let post_ids: NodeIdSet = post.iter().map(|ne| ne.edge_id).collect();
@@ -9674,8 +13930,15 @@ fn test_v3_mixed_workload_stress() {
     let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     for i in 0..30u64 {
-        db.upsert_node(1, &format!("mix_{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
-            .unwrap();
+        db.upsert_node(
+            1,
+            &format!("mix_{}", i),
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     for i in 0..20u64 {
         db.upsert_edge(i + 1, i + 2, 1, UpsertEdgeOptions::default())
@@ -9689,8 +13952,16 @@ fn test_v3_mixed_workload_stress() {
     for i in 0..10u64 {
         let mut props = BTreeMap::new();
         props.insert("updated".into(), PropValue::Bool(true));
-        db.upsert_node(1, &format!("mix_{}", i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() })
-            .unwrap();
+        db.upsert_node(
+            1,
+            &format!("mix_{}", i),
+            UpsertNodeOptions {
+                props,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     db.flush().unwrap();
     db.compact().unwrap();
@@ -9698,12 +13969,27 @@ fn test_v3_mixed_workload_stress() {
     for i in 0..5u64 {
         let mut props = BTreeMap::new();
         props.insert("round3".into(), PropValue::Int(3));
-        db.upsert_node(1, &format!("mix_{}", i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() })
-            .unwrap();
+        db.upsert_node(
+            1,
+            &format!("mix_{}", i),
+            UpsertNodeOptions {
+                props,
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     for i in 30..40u64 {
-        db.upsert_node(2, &format!("new_{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
-            .unwrap();
+        db.upsert_node(
+            2,
+            &format!("new_{}", i),
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     db.flush().unwrap();
 
@@ -9743,8 +14029,15 @@ fn test_v3_cross_segment_edges() {
     let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     for i in 0..20u64 {
-        db.upsert_node(1, &format!("cs_{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
-            .unwrap();
+        db.upsert_node(
+            1,
+            &format!("cs_{}", i),
+            UpsertNodeOptions {
+                weight: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
     db.flush().unwrap();
 
@@ -9762,21 +14055,23 @@ fn test_v3_cross_segment_edges() {
 
     db.compact().unwrap();
 
-    let out_1 = db
-        .neighbors(1, &NeighborOptions::default())
-        .unwrap();
+    let out_1 = db.neighbors(1, &NeighborOptions::default()).unwrap();
     assert!(
         out_1.len() >= 2,
         "node 1 should have at least 2 outgoing edges"
     );
 
-    let out_5 = db
-        .neighbors(5, &NeighborOptions::default())
-        .unwrap();
+    let out_5 = db.neighbors(5, &NeighborOptions::default()).unwrap();
     assert!(out_5.len() >= 2, "node 5 should have outgoing to 6 and 15");
 
     let in_10 = db
-        .neighbors(10, &NeighborOptions { direction: Direction::Incoming, ..Default::default() })
+        .neighbors(
+            10,
+            &NeighborOptions {
+                direction: Direction::Incoming,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert!(
         in_10.iter().any(|ne| ne.node_id == 1),
@@ -9795,11 +14090,24 @@ fn test_v3_reopen_durability() {
         for i in 0..50u64 {
             let mut props = BTreeMap::new();
             props.insert("name".into(), PropValue::String(format!("durable_{}", i)));
-            db.upsert_node(i as u32 % 3 + 1, &format!("dur_{}", i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() })
-                .unwrap();
+            db.upsert_node(
+                i as u32 % 3 + 1,
+                &format!("dur_{}", i),
+                UpsertNodeOptions {
+                    props,
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
         for i in 0..40u64 {
-            db.upsert_edge(i + 1, (i + 3) % 50 + 1, i as u32 % 2 + 1, UpsertEdgeOptions::default())
+            db.upsert_edge(
+                i + 1,
+                (i + 3) % 50 + 1,
+                i as u32 % 2 + 1,
+                UpsertEdgeOptions::default(),
+            )
             .unwrap();
         }
         db.flush().unwrap();
@@ -9807,8 +14115,16 @@ fn test_v3_reopen_durability() {
         for i in 0..20u64 {
             let mut props = BTreeMap::new();
             props.insert("name".into(), PropValue::String(format!("updated_{}", i)));
-            db.upsert_node(i as u32 % 3 + 1, &format!("dur_{}", i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() })
-                .unwrap();
+            db.upsert_node(
+                i as u32 % 3 + 1,
+                &format!("dur_{}", i),
+                UpsertNodeOptions {
+                    props,
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
         for i in [5u64, 15, 25, 35, 45] {
             db.delete_node(i).unwrap();
@@ -9852,9 +14168,7 @@ fn test_v3_reopen_durability() {
         "key lookup should work"
     );
 
-    let nbrs = db
-        .neighbors(1, &NeighborOptions::default())
-        .unwrap();
+    let nbrs = db.neighbors(1, &NeighborOptions::default()).unwrap();
     assert!(!nbrs.is_empty(), "adjacency should work after reopen");
 
     let type1 = db.nodes_by_type(1).unwrap();
@@ -9873,21 +14187,27 @@ fn test_v3_fast_merge_index_parity() {
         for i in 0..10u64 {
             let mut props = BTreeMap::new();
             props.insert("seg".into(), PropValue::Int(seg as i64));
-            db.upsert_node((seg as u32 % 2) + 1, &format!("fm_{}_{}", seg, i), UpsertNodeOptions { props, weight: 0.5, ..Default::default() })
+            db.upsert_node(
+                (seg as u32 % 2) + 1,
+                &format!("fm_{}_{}", seg, i),
+                UpsertNodeOptions {
+                    props,
+                    weight: 0.5,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         }
         for i in 0..9u64 {
             db.upsert_edge(base + i + 1, base + i + 2, 1, UpsertEdgeOptions::default())
-            .unwrap();
+                .unwrap();
         }
         db.flush().unwrap();
     }
 
     let pre_nodes: Vec<_> = (1..=30).filter_map(|i| db.get_node(i).unwrap()).collect();
     let pre_key_0 = db.get_node_by_key(1, "fm_0_0").unwrap();
-    let pre_nbrs_1 = db
-        .neighbors(1, &NeighborOptions::default())
-        .unwrap();
+    let pre_nbrs_1 = db.neighbors(1, &NeighborOptions::default()).unwrap();
     let pre_type1 = db.nodes_by_type(1).unwrap();
 
     db.compact().unwrap();
@@ -9907,9 +14227,7 @@ fn test_v3_fast_merge_index_parity() {
         "key lookup mismatch after fast-merge"
     );
 
-    let post_nbrs_1 = db
-        .neighbors(1, &NeighborOptions::default())
-        .unwrap();
+    let post_nbrs_1 = db.neighbors(1, &NeighborOptions::default()).unwrap();
     assert_eq!(pre_nbrs_1.len(), post_nbrs_1.len(), "neighbors mismatch");
 
     let post_type1 = db.nodes_by_type(1).unwrap();
@@ -10443,6 +14761,14 @@ fn test_time_range_paged_policy_refills_past_sparse_filtered_window() {
 
 // ---- PPR tests ----
 
+fn approx_ppr_opts() -> PprOptions {
+    PprOptions {
+        algorithm: PprAlgorithm::ApproxForwardPush,
+        approx_residual_tolerance: 1e-6,
+        ..PprOptions::default()
+    }
+}
+
 #[test]
 fn test_ppr_empty_seeds() {
     let dir = TempDir::new().unwrap();
@@ -10460,7 +14786,9 @@ fn test_ppr_empty_seeds() {
 fn test_ppr_single_node_no_edges() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let n1 = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    let n1 = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
     let result = db
         .personalized_pagerank(&[n1], &PprOptions::default())
         .unwrap();
@@ -10481,9 +14809,15 @@ fn test_ppr_simple_chain() {
     // Rank should flow A > B > C
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
@@ -10526,8 +14860,12 @@ fn test_ppr_cycle_converges() {
     // A → B → A (cycle), seed = A
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(b, a, 1, UpsertEdgeOptions::default())
@@ -10560,13 +14898,27 @@ fn test_ppr_weighted_edges() {
     // C should get ~9x the rank of B from A's distribution
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
-    db.upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 9.0, ..Default::default() })
-        .unwrap();
+    db.upsert_edge(
+        a,
+        c,
+        1,
+        UpsertEdgeOptions {
+            weight: 9.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let opts = PprOptions {
         max_iterations: 100,
@@ -10602,9 +14954,15 @@ fn test_ppr_edge_type_filter() {
     // Filter to type 1 only: only B should receive rank
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(a, c, 2, UpsertEdgeOptions::default())
@@ -10644,7 +15002,9 @@ fn test_ppr_max_results() {
     // Star graph: seed → 10 nodes
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let center = db.upsert_node(1, "center", UpsertNodeOptions::default()).unwrap();
+    let center = db
+        .upsert_node(1, "center", UpsertNodeOptions::default())
+        .unwrap();
     for i in 0..10 {
         let n = db
             .upsert_node(1, &format!("n{i}"), UpsertNodeOptions::default())
@@ -10668,9 +15028,15 @@ fn test_ppr_multiple_seeds() {
     // C should get high rank from both seeds
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, c, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
@@ -10699,9 +15065,15 @@ fn test_ppr_respects_deleted_nodes() {
     // B's outgoing edges should not contribute rank to C
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
@@ -10738,7 +15110,9 @@ fn test_ppr_deleted_seed_returns_empty() {
     // Deleted seed must not appear in results
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
     db.delete_node(a).unwrap();
 
     let result = db
@@ -10772,14 +15146,20 @@ fn test_ppr_across_flush() {
     // Create graph, flush to segment, verify PPR still works
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
     // Add more in memtable
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
         .unwrap();
 
@@ -10800,9 +15180,15 @@ fn test_ppr_across_flush() {
 fn test_ppr_survives_compaction() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
@@ -10828,8 +15214,12 @@ fn test_ppr_duplicate_seeds() {
     // Duplicate seed IDs should be deduplicated
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
 
@@ -10858,9 +15248,15 @@ fn test_ppr_known_values() {
     //   rank_hop2 = d^2 * rank_seed
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
@@ -10906,6 +15302,258 @@ fn test_ppr_known_values() {
     db.close().unwrap();
 }
 
+#[test]
+fn test_ppr_approx_small_graph_matches_exact_order() {
+    let dir = TempDir::new().unwrap();
+    let mut db = open_imm(dir.path());
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .unwrap();
+    db.upsert_edge(
+        a,
+        c,
+        1,
+        UpsertEdgeOptions {
+            weight: 2.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+        .unwrap();
+
+    let exact = db
+        .personalized_pagerank(
+            &[a],
+            &PprOptions {
+                max_iterations: 200,
+                epsilon: 1e-10,
+                ..PprOptions::default()
+            },
+        )
+        .unwrap();
+    let approx = db
+        .personalized_pagerank(
+            &[a],
+            &PprOptions {
+                approx_residual_tolerance: 1e-8,
+                ..approx_ppr_opts()
+            },
+        )
+        .unwrap();
+
+    let exact_ids: Vec<u64> = exact.scores.iter().map(|(id, _)| *id).collect();
+    let approx_ids: Vec<u64> = approx.scores.iter().map(|(id, _)| *id).collect();
+    let exact_scores: std::collections::BTreeMap<u64, f64> = exact.scores.iter().copied().collect();
+    let approx_scores: std::collections::BTreeMap<u64, f64> =
+        approx.scores.iter().copied().collect();
+    assert_eq!(approx.algorithm, PprAlgorithm::ApproxForwardPush);
+    assert!(approx.approx.is_some());
+    assert_eq!(approx_ids, exact_ids);
+    let l1_error: f64 = exact_scores
+        .iter()
+        .map(|(&node_id, &exact_score)| {
+            let approx_score = approx_scores.get(&node_id).copied().unwrap_or(0.0);
+            let abs_err = (exact_score - approx_score).abs();
+            assert!(
+                abs_err < 1e-5,
+                "node {} exact={} approx={} abs_err={}",
+                node_id,
+                exact_score,
+                approx_score,
+                abs_err
+            );
+            abs_err
+        })
+        .sum();
+    assert!(l1_error < 1e-5, "L1 error too large: {}", l1_error);
+    db.close().unwrap();
+}
+
+#[test]
+fn test_ppr_approx_empty_seeds() {
+    let dir = TempDir::new().unwrap();
+    let db = open_imm(dir.path());
+
+    let result = db.personalized_pagerank(&[], &approx_ppr_opts()).unwrap();
+    assert!(result.scores.is_empty());
+    assert_eq!(result.algorithm, PprAlgorithm::ApproxForwardPush);
+    let approx = result.approx.expect("approx metadata should be present");
+    assert_eq!(approx.pushes, 0);
+    assert_eq!(approx.max_remaining_residual, 0.0);
+    db.close().unwrap();
+}
+
+#[test]
+fn test_ppr_approx_filters_deleted_seeds() {
+    let dir = TempDir::new().unwrap();
+    let mut db = open_imm(dir.path());
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .unwrap();
+    db.delete_node(a).unwrap();
+
+    let result = db.personalized_pagerank(&[a], &approx_ppr_opts()).unwrap();
+    assert!(result.scores.is_empty());
+    assert_eq!(result.algorithm, PprAlgorithm::ApproxForwardPush);
+    db.close().unwrap();
+}
+
+#[test]
+fn test_ppr_approx_edge_type_filter() {
+    let dir = TempDir::new().unwrap();
+    let mut db = open_imm(dir.path());
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .unwrap();
+    db.upsert_edge(a, c, 2, UpsertEdgeOptions::default())
+        .unwrap();
+
+    let result = db
+        .personalized_pagerank(
+            &[a],
+            &PprOptions {
+                edge_type_filter: Some(vec![1]),
+                ..approx_ppr_opts()
+            },
+        )
+        .unwrap();
+
+    let score_b = result
+        .scores
+        .iter()
+        .find(|s| s.0 == b)
+        .map(|s| s.1)
+        .unwrap_or(0.0);
+    let score_c = result
+        .scores
+        .iter()
+        .find(|s| s.0 == c)
+        .map(|s| s.1)
+        .unwrap_or(0.0);
+    assert!(score_b > 0.0);
+    assert_eq!(score_c, 0.0);
+    db.close().unwrap();
+}
+
+#[test]
+fn test_ppr_approx_respects_deleted_nodes() {
+    let dir = TempDir::new().unwrap();
+    let mut db = open_imm(dir.path());
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .unwrap();
+    db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+        .unwrap();
+    db.delete_node(b).unwrap();
+
+    let result = db.personalized_pagerank(&[a], &approx_ppr_opts()).unwrap();
+    let score_b = result
+        .scores
+        .iter()
+        .find(|s| s.0 == b)
+        .map(|s| s.1)
+        .unwrap_or(0.0);
+    let score_c = result
+        .scores
+        .iter()
+        .find(|s| s.0 == c)
+        .map(|s| s.1)
+        .unwrap_or(0.0);
+    assert_eq!(score_b, 0.0);
+    assert_eq!(score_c, 0.0);
+    db.close().unwrap();
+}
+
+#[test]
+fn test_ppr_approx_across_flush() {
+    let dir = TempDir::new().unwrap();
+    let mut db = open_imm(dir.path());
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .unwrap();
+    db.flush().unwrap();
+
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+        .unwrap();
+
+    let result = db.personalized_pagerank(&[a], &approx_ppr_opts()).unwrap();
+    assert_eq!(result.algorithm, PprAlgorithm::ApproxForwardPush);
+    assert!(result.approx.is_some());
+    assert!(result.scores.iter().any(|(id, _)| *id == a));
+    assert!(result.scores.iter().any(|(id, _)| *id == b));
+    assert!(result.scores.iter().any(|(id, _)| *id == c));
+    db.close().unwrap();
+}
+
+#[test]
+fn test_ppr_approx_survives_compaction() {
+    let dir = TempDir::new().unwrap();
+    let mut db = open_imm(dir.path());
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .unwrap();
+    db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+        .unwrap();
+    db.flush().unwrap();
+    db.upsert_edge(a, c, 1, UpsertEdgeOptions::default())
+        .unwrap();
+    db.flush().unwrap();
+    db.compact().unwrap();
+
+    let result = db.personalized_pagerank(&[a], &approx_ppr_opts()).unwrap();
+    assert_eq!(result.algorithm, PprAlgorithm::ApproxForwardPush);
+    assert!(result.scores.iter().any(|(id, _)| *id == a));
+    assert!(result.scores.iter().any(|(id, _)| *id == b));
+    assert!(result.scores.iter().any(|(id, _)| *id == c));
+    db.close().unwrap();
+}
+
 // --- export_adjacency tests ---
 
 #[test]
@@ -10922,8 +15570,12 @@ fn test_export_empty_db() {
 fn test_export_nodes_only() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(2, "b", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(2, "b", UpsertNodeOptions::default())
+        .unwrap();
     let result = db.export_adjacency(&ExportOptions::default()).unwrap();
     assert_eq!(result.node_ids.len(), 2);
     assert!(result.node_ids.contains(&a));
@@ -10936,13 +15588,35 @@ fn test_export_nodes_only() {
 fn test_export_full_graph() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-    db.upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(b, c, 1, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
         .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(
+        a,
+        b,
+        1,
+        UpsertEdgeOptions {
+            weight: 2.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.upsert_edge(
+        b,
+        c,
+        1,
+        UpsertEdgeOptions {
+            weight: 3.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     db.upsert_edge(c, a, 2, UpsertEdgeOptions::default())
         .unwrap();
 
@@ -10966,9 +15640,15 @@ fn test_export_full_graph() {
 fn test_export_node_type_filter() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(2, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(2, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(a, c, 1, UpsertEdgeOptions::default())
@@ -10995,8 +15675,12 @@ fn test_export_node_type_filter() {
 fn test_export_edge_type_filter() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(a, b, 2, UpsertEdgeOptions::default())
@@ -11018,10 +15702,22 @@ fn test_export_edge_type_filter() {
 fn test_export_include_weights_false() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    db.upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
         .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_edge(
+        a,
+        b,
+        1,
+        UpsertEdgeOptions {
+            weight: 5.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let opts = ExportOptions {
         include_weights: false,
@@ -11037,9 +15733,15 @@ fn test_export_include_weights_false() {
 fn test_export_respects_tombstones() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(a, c, 1, UpsertEdgeOptions::default())
@@ -11064,14 +15766,28 @@ fn test_export_respects_tombstones() {
 fn test_export_across_flush() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.flush().unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-    db.upsert_edge(b, c, 1, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
         .unwrap();
+    db.upsert_edge(
+        b,
+        c,
+        1,
+        UpsertEdgeOptions {
+            weight: 2.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let result = db
         .export_adjacency(&ExportOptions {
@@ -11088,12 +15804,18 @@ fn test_export_across_flush() {
 fn test_export_survives_compaction() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.flush().unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.flush().unwrap();
@@ -11133,15 +15855,37 @@ fn test_export_node_ids_sorted() {
 fn test_export_combined_filters() {
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(dir.path());
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(2, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(2, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 2, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
-        .unwrap();
-    db.upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
-        .unwrap();
+    db.upsert_edge(
+        a,
+        b,
+        2,
+        UpsertEdgeOptions {
+            weight: 2.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.upsert_edge(
+        a,
+        c,
+        1,
+        UpsertEdgeOptions {
+            weight: 3.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // node_type=1 + edge_type=1 → only edge a→b with type 1
     let opts = ExportOptions {
@@ -11163,9 +15907,15 @@ fn test_ppr_low_damping_seed_dominates() {
     // With very low damping, the seed should retain nearly all rank.
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(&dir.path().join("db"));
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
@@ -11201,9 +15951,15 @@ fn test_ppr_high_damping_spreads_rank() {
     // With high damping, rank should spread more evenly across the graph.
     let dir = TempDir::new().unwrap();
     let mut db = open_imm(&dir.path().join("db"));
-    let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-    let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let c = db
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     db.upsert_edge(a, b, 1, UpsertEdgeOptions::default())
         .unwrap();
     db.upsert_edge(b, c, 1, UpsertEdgeOptions::default())
@@ -11282,27 +16038,67 @@ fn setup_hybrid_db() -> (TempDir, DatabaseEngine, [u64; 5]) {
     // Query will be [1, 0, 0, 0]. Cosine similarity = first component.
     // Node 1: dense rank #1 (high first component), sparse rank #4
     let id1 = engine
-        .upsert_node(1, "n1", UpsertNodeOptions { dense_vector: Some(vec![0.95, 0.05, 0.05, 0.05]), sparse_vector: Some(vec![(0, 0.2), (1, 0.1)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "n1",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![0.95, 0.05, 0.05, 0.05]),
+                sparse_vector: Some(vec![(0, 0.2), (1, 0.1)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Node 2: dense rank #4, sparse rank #1 (highest sparse score)
     let id2 = engine
-        .upsert_node(1, "n2", UpsertNodeOptions { dense_vector: Some(vec![0.3, 0.5, 0.5, 0.5]), sparse_vector: Some(vec![(0, 0.9), (1, 0.8), (2, 0.7)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "n2",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![0.3, 0.5, 0.5, 0.5]),
+                sparse_vector: Some(vec![(0, 0.9), (1, 0.8), (2, 0.7)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Node 3: dense rank #2, sparse rank #2. Balanced, should rise in fusion.
     let id3 = engine
-        .upsert_node(1, "n3", UpsertNodeOptions { dense_vector: Some(vec![0.85, 0.1, 0.1, 0.1]), sparse_vector: Some(vec![(0, 0.7), (1, 0.6)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "n3",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![0.85, 0.1, 0.1, 0.1]),
+                sparse_vector: Some(vec![(0, 0.7), (1, 0.6)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Node 4: dense rank #3, sparse rank #3
     let id4 = engine
-        .upsert_node(1, "n4", UpsertNodeOptions { dense_vector: Some(vec![0.6, 0.3, 0.3, 0.3]), sparse_vector: Some(vec![(0, 0.5), (2, 0.3)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "n4",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![0.6, 0.3, 0.3, 0.3]),
+                sparse_vector: Some(vec![(0, 0.5), (2, 0.3)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Node 5: dense rank #5, sparse rank #5. Worst in both.
     let id5 = engine
-        .upsert_node(1, "n5", UpsertNodeOptions { dense_vector: Some(vec![0.1, 0.4, 0.6, 0.6]), sparse_vector: Some(vec![(1, 0.1)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "n5",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![0.1, 0.4, 0.6, 0.6]),
+                sparse_vector: Some(vec![(1, 0.1)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     engine.flush().unwrap();
@@ -11524,7 +16320,11 @@ fn test_hybrid_weighted_score_fusion_ordering() {
     // With score fusion, nodes with the best combined normalized scores win.
     // The worst node in both modalities gets 0.0 from min-max normalization.
     for hit in &results {
-        assert!(hit.score >= 0.0, "fused score should be non-negative for node {}", hit.node_id);
+        assert!(
+            hit.score >= 0.0,
+            "fused score should be non-negative for node {}",
+            hit.node_id
+        );
     }
 
     // Results should be in descending score order.
@@ -11556,13 +16356,37 @@ fn test_hybrid_weighted_score_fusion_equal_dense_scores() {
 
     // All same dense vector, different sparse scores.
     let id_a = engine
-        .upsert_node(1, "a", UpsertNodeOptions { dense_vector: Some(vec![1.0, 0.0]), sparse_vector: Some(vec![(0, 0.3)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![1.0, 0.0]),
+                sparse_vector: Some(vec![(0, 0.3)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let id_b = engine
-        .upsert_node(1, "b", UpsertNodeOptions { dense_vector: Some(vec![1.0, 0.0]), sparse_vector: Some(vec![(0, 0.9)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![1.0, 0.0]),
+                sparse_vector: Some(vec![(0, 0.9)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let id_c = engine
-        .upsert_node(1, "c", UpsertNodeOptions { dense_vector: Some(vec![1.0, 0.0]), sparse_vector: Some(vec![(0, 0.6)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![1.0, 0.0]),
+                sparse_vector: Some(vec![(0, 0.6)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
     engine.flush().unwrap();
 
@@ -11603,17 +16427,39 @@ fn test_hybrid_partial_overlap() {
 
     // Node 1: dense only (high similarity)
     engine
-        .upsert_node(1, "dense_only", UpsertNodeOptions { dense_vector: Some(vec![1.0, 0.0]), ..Default::default() })
+        .upsert_node(
+            1,
+            "dense_only",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Node 2: sparse only (high score)
     engine
-        .upsert_node(1, "sparse_only", UpsertNodeOptions { sparse_vector: Some(vec![(0, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "sparse_only",
+            UpsertNodeOptions {
+                sparse_vector: Some(vec![(0, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     // Node 3: both (moderate in each)
     engine
-        .upsert_node(1, "both", UpsertNodeOptions { dense_vector: Some(vec![0.7, 0.7]), sparse_vector: Some(vec![(0, 0.5)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "both",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![0.7, 0.7]),
+                sparse_vector: Some(vec![(0, 0.5)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     engine.flush().unwrap();
@@ -11654,7 +16500,15 @@ fn test_hybrid_with_scope() {
     let mut ids = Vec::new();
     for i in 0..4u64 {
         let id = engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { dense_vector: Some(vec![1.0, 0.0]), sparse_vector: Some(vec![(0, (i + 1) as f32 * 0.3)]), ..Default::default() })
+            .upsert_node(
+                1,
+                &format!("n{}", i),
+                UpsertNodeOptions {
+                    dense_vector: Some(vec![1.0, 0.0]),
+                    sparse_vector: Some(vec![(0, (i + 1) as f32 * 0.3)]),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         ids.push(id);
     }
@@ -11685,7 +16539,10 @@ fn test_hybrid_with_scope() {
 
     let results = engine.vector_search(&req).unwrap();
     let result_ids: Vec<u64> = results.iter().map(|h| h.node_id).collect();
-    assert!(result_ids.contains(&ids[0]), "start node should be in scope");
+    assert!(
+        result_ids.contains(&ids[0]),
+        "start node should be in scope"
+    );
     assert!(
         result_ids.contains(&ids[1]),
         "depth-1 neighbor should be in scope"
@@ -11716,11 +16573,27 @@ fn test_hybrid_type_filter() {
 
     // Type 1 = "article", type 2 = "comment".
     let id_article = engine
-        .upsert_node(1, "a", UpsertNodeOptions { dense_vector: Some(vec![1.0, 0.0]), sparse_vector: Some(vec![(0, 1.0)]), ..Default::default() })
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![1.0, 0.0]),
+                sparse_vector: Some(vec![(0, 1.0)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     engine
-        .upsert_node(2, "b", UpsertNodeOptions { dense_vector: Some(vec![0.9, 0.1]), sparse_vector: Some(vec![(0, 0.9)]), ..Default::default() })
+        .upsert_node(
+            2,
+            "b",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![0.9, 0.1]),
+                sparse_vector: Some(vec![(0, 0.9)]),
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     engine.flush().unwrap();
@@ -11807,30 +16680,110 @@ fn test_hybrid_accuracy_oracle_20_nodes() {
 
     let nodes = [
         // Group A: strong dense, weak sparse
-        TestNode { key: "a1", dense: [0.98, 0.10, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05], sparse: vec![(0, 0.1)] },
-        TestNode { key: "a2", dense: [0.92, 0.20, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10], sparse: vec![(0, 0.15), (1, 0.05)] },
-        TestNode { key: "a3", dense: [0.88, 0.25, 0.15, 0.10, 0.10, 0.05, 0.05, 0.05], sparse: vec![(2, 0.2)] },
-        TestNode { key: "a4", dense: [0.80, 0.30, 0.20, 0.15, 0.15, 0.10, 0.10, 0.10], sparse: vec![(0, 0.05), (3, 0.1)] },
+        TestNode {
+            key: "a1",
+            dense: [0.98, 0.10, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+            sparse: vec![(0, 0.1)],
+        },
+        TestNode {
+            key: "a2",
+            dense: [0.92, 0.20, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
+            sparse: vec![(0, 0.15), (1, 0.05)],
+        },
+        TestNode {
+            key: "a3",
+            dense: [0.88, 0.25, 0.15, 0.10, 0.10, 0.05, 0.05, 0.05],
+            sparse: vec![(2, 0.2)],
+        },
+        TestNode {
+            key: "a4",
+            dense: [0.80, 0.30, 0.20, 0.15, 0.15, 0.10, 0.10, 0.10],
+            sparse: vec![(0, 0.05), (3, 0.1)],
+        },
         // Group B: strong sparse, weak dense
-        TestNode { key: "b1", dense: [0.20, 0.50, 0.50, 0.40, 0.30, 0.20, 0.20, 0.20], sparse: vec![(0, 0.9), (1, 0.8), (2, 0.7)] },
-        TestNode { key: "b2", dense: [0.25, 0.45, 0.45, 0.45, 0.35, 0.25, 0.25, 0.15], sparse: vec![(0, 0.8), (1, 0.7), (2, 0.5)] },
-        TestNode { key: "b3", dense: [0.30, 0.40, 0.40, 0.40, 0.30, 0.25, 0.25, 0.25], sparse: vec![(0, 0.7), (1, 0.5), (2, 0.3)] },
-        TestNode { key: "b4", dense: [0.15, 0.55, 0.50, 0.35, 0.30, 0.25, 0.20, 0.20], sparse: vec![(0, 0.6), (2, 0.8)] },
+        TestNode {
+            key: "b1",
+            dense: [0.20, 0.50, 0.50, 0.40, 0.30, 0.20, 0.20, 0.20],
+            sparse: vec![(0, 0.9), (1, 0.8), (2, 0.7)],
+        },
+        TestNode {
+            key: "b2",
+            dense: [0.25, 0.45, 0.45, 0.45, 0.35, 0.25, 0.25, 0.15],
+            sparse: vec![(0, 0.8), (1, 0.7), (2, 0.5)],
+        },
+        TestNode {
+            key: "b3",
+            dense: [0.30, 0.40, 0.40, 0.40, 0.30, 0.25, 0.25, 0.25],
+            sparse: vec![(0, 0.7), (1, 0.5), (2, 0.3)],
+        },
+        TestNode {
+            key: "b4",
+            dense: [0.15, 0.55, 0.50, 0.35, 0.30, 0.25, 0.20, 0.20],
+            sparse: vec![(0, 0.6), (2, 0.8)],
+        },
         // Group C: balanced, good at both
-        TestNode { key: "c1", dense: [0.85, 0.20, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15], sparse: vec![(0, 0.6), (1, 0.5), (2, 0.4)] },
-        TestNode { key: "c2", dense: [0.75, 0.30, 0.25, 0.20, 0.20, 0.15, 0.15, 0.15], sparse: vec![(0, 0.5), (1, 0.6)] },
-        TestNode { key: "c3", dense: [0.70, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10, 0.10], sparse: vec![(0, 0.7), (1, 0.3), (2, 0.2)] },
-        TestNode { key: "c4", dense: [0.78, 0.28, 0.22, 0.18, 0.18, 0.14, 0.12, 0.12], sparse: vec![(0, 0.55), (1, 0.45), (2, 0.35)] },
+        TestNode {
+            key: "c1",
+            dense: [0.85, 0.20, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15],
+            sparse: vec![(0, 0.6), (1, 0.5), (2, 0.4)],
+        },
+        TestNode {
+            key: "c2",
+            dense: [0.75, 0.30, 0.25, 0.20, 0.20, 0.15, 0.15, 0.15],
+            sparse: vec![(0, 0.5), (1, 0.6)],
+        },
+        TestNode {
+            key: "c3",
+            dense: [0.70, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10, 0.10],
+            sparse: vec![(0, 0.7), (1, 0.3), (2, 0.2)],
+        },
+        TestNode {
+            key: "c4",
+            dense: [0.78, 0.28, 0.22, 0.18, 0.18, 0.14, 0.12, 0.12],
+            sparse: vec![(0, 0.55), (1, 0.45), (2, 0.35)],
+        },
         // Group D: mediocre at both (should never rank high)
-        TestNode { key: "d1", dense: [0.40, 0.40, 0.35, 0.35, 0.30, 0.30, 0.25, 0.25], sparse: vec![(0, 0.2), (3, 0.1)] },
-        TestNode { key: "d2", dense: [0.35, 0.35, 0.35, 0.35, 0.35, 0.30, 0.30, 0.25], sparse: vec![(1, 0.2), (2, 0.15)] },
-        TestNode { key: "d3", dense: [0.45, 0.38, 0.32, 0.30, 0.28, 0.28, 0.25, 0.20], sparse: vec![(0, 0.3), (1, 0.1)] },
-        TestNode { key: "d4", dense: [0.38, 0.38, 0.36, 0.34, 0.30, 0.28, 0.26, 0.24], sparse: vec![(2, 0.25)] },
+        TestNode {
+            key: "d1",
+            dense: [0.40, 0.40, 0.35, 0.35, 0.30, 0.30, 0.25, 0.25],
+            sparse: vec![(0, 0.2), (3, 0.1)],
+        },
+        TestNode {
+            key: "d2",
+            dense: [0.35, 0.35, 0.35, 0.35, 0.35, 0.30, 0.30, 0.25],
+            sparse: vec![(1, 0.2), (2, 0.15)],
+        },
+        TestNode {
+            key: "d3",
+            dense: [0.45, 0.38, 0.32, 0.30, 0.28, 0.28, 0.25, 0.20],
+            sparse: vec![(0, 0.3), (1, 0.1)],
+        },
+        TestNode {
+            key: "d4",
+            dense: [0.38, 0.38, 0.36, 0.34, 0.30, 0.28, 0.26, 0.24],
+            sparse: vec![(2, 0.25)],
+        },
         // Group E: niche, strong in one sparse dimension only
-        TestNode { key: "e1", dense: [0.50, 0.35, 0.30, 0.30, 0.30, 0.25, 0.25, 0.25], sparse: vec![(1, 0.9)] },
-        TestNode { key: "e2", dense: [0.55, 0.35, 0.28, 0.28, 0.28, 0.25, 0.25, 0.20], sparse: vec![(2, 0.95)] },
-        TestNode { key: "e3", dense: [0.48, 0.38, 0.32, 0.30, 0.28, 0.26, 0.24, 0.22], sparse: vec![(0, 0.4), (1, 0.4)] },
-        TestNode { key: "e4", dense: [0.52, 0.36, 0.30, 0.28, 0.26, 0.24, 0.24, 0.22], sparse: vec![(0, 0.3), (2, 0.4)] },
+        TestNode {
+            key: "e1",
+            dense: [0.50, 0.35, 0.30, 0.30, 0.30, 0.25, 0.25, 0.25],
+            sparse: vec![(1, 0.9)],
+        },
+        TestNode {
+            key: "e2",
+            dense: [0.55, 0.35, 0.28, 0.28, 0.28, 0.25, 0.25, 0.20],
+            sparse: vec![(2, 0.95)],
+        },
+        TestNode {
+            key: "e3",
+            dense: [0.48, 0.38, 0.32, 0.30, 0.28, 0.26, 0.24, 0.22],
+            sparse: vec![(0, 0.4), (1, 0.4)],
+        },
+        TestNode {
+            key: "e4",
+            dense: [0.52, 0.36, 0.30, 0.28, 0.26, 0.24, 0.24, 0.22],
+            sparse: vec![(0, 0.3), (2, 0.4)],
+        },
     ];
 
     // Normalise dense vectors and insert.
@@ -11962,7 +16915,11 @@ fn test_hybrid_accuracy_oracle_20_nodes() {
         .map(|e| (e.node_id, wrf_score(e.node_id, 5.0, 1.0)))
         .collect();
     oracle_dense_heavy.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let oracle_top_k_dh: Vec<u64> = oracle_dense_heavy.iter().take(k).map(|(id, _)| *id).collect();
+    let oracle_top_k_dh: Vec<u64> = oracle_dense_heavy
+        .iter()
+        .take(k)
+        .map(|(id, _)| *id)
+        .collect();
 
     let results_dh = engine
         .vector_search(&hybrid_search_request(
@@ -11996,7 +16953,11 @@ fn test_hybrid_accuracy_oracle_20_nodes() {
         .map(|e| (e.node_id, wrf_score(e.node_id, 1.0, 5.0)))
         .collect();
     oracle_sparse_heavy.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let oracle_top_k_sh: Vec<u64> = oracle_sparse_heavy.iter().take(k).map(|(id, _)| *id).collect();
+    let oracle_top_k_sh: Vec<u64> = oracle_sparse_heavy
+        .iter()
+        .take(k)
+        .map(|(id, _)| *id)
+        .collect();
 
     let results_sh = engine
         .vector_search(&hybrid_search_request(
@@ -12064,9 +17025,36 @@ fn test_hybrid_accuracy_oracle_20_nodes() {
 fn test_get_nodes_by_keys_basic() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "alice", UpsertNodeOptions { props: make_props("name", "A"), ..Default::default() }).unwrap();
-    engine.upsert_node(1, "bob", UpsertNodeOptions { props: make_props("name", "B"), ..Default::default() }).unwrap();
-    engine.upsert_node(2, "charlie", UpsertNodeOptions { props: make_props("name", "C"), ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "alice",
+            UpsertNodeOptions {
+                props: make_props("name", "A"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "bob",
+            UpsertNodeOptions {
+                props: make_props("name", "B"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            2,
+            "charlie",
+            UpsertNodeOptions {
+                props: make_props("name", "C"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let keys: Vec<(u32, &str)> = vec![(1, "alice"), (1, "bob"), (2, "charlie")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
@@ -12081,8 +17069,12 @@ fn test_get_nodes_by_keys_basic() {
 fn test_get_nodes_by_keys_mixed_found_missing() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "alice", UpsertNodeOptions::default()).unwrap();
-    let b = engine.upsert_node(1, "bob", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "alice", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node(1, "bob", UpsertNodeOptions::default())
+        .unwrap();
     engine.delete_node(b).unwrap();
 
     let keys: Vec<(u32, &str)> = vec![(1, "alice"), (1, "bob"), (1, "nonexistent")];
@@ -12098,9 +17090,13 @@ fn test_get_nodes_by_keys_mixed_found_missing() {
 fn test_get_nodes_by_keys_cross_source() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "alice", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "alice", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "bob", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "bob", UpsertNodeOptions::default())
+        .unwrap();
 
     let keys: Vec<(u32, &str)> = vec![(1, "alice"), (1, "bob")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
@@ -12123,11 +17119,47 @@ fn test_get_nodes_by_keys_empty() {
 fn test_get_nodes_by_keys_multi_segment() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "a", UpsertNodeOptions { props: make_props("seg", "1"), ..Default::default() }).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions { props: make_props("seg", "1"), ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("seg", "1"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                props: make_props("seg", "1"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "c", UpsertNodeOptions { props: make_props("seg", "2"), ..Default::default() }).unwrap();
-    engine.upsert_node(1, "d", UpsertNodeOptions { props: make_props("seg", "2"), ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "c",
+            UpsertNodeOptions {
+                props: make_props("seg", "2"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "d",
+            UpsertNodeOptions {
+                props: make_props("seg", "2"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     let keys: Vec<(u32, &str)> = vec![(1, "d"), (1, "a"), (1, "c"), (1, "b")];
@@ -12144,11 +17176,17 @@ fn test_get_nodes_by_keys_multi_segment() {
 fn test_get_nodes_by_keys_tombstone_in_newer_segment() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+    let a = engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap(); // seg 1: a, b
     engine.delete_node(a).unwrap();
-    engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap(); // seg 2: tombstone(a), c
 
     let keys: Vec<(u32, &str)> = vec![(1, "a"), (1, "b"), (1, "c")];
@@ -12163,14 +17201,36 @@ fn test_get_nodes_by_keys_tombstone_in_newer_segment() {
 fn test_get_nodes_by_keys_memtable_shadows_segment() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "old"), ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "old"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "new"), weight: 2.0, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "new"),
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let keys: Vec<(u32, &str)> = vec![(1, "a")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
     let node = results[0].as_ref().unwrap();
-    assert_eq!(node.props.get("v"), Some(&PropValue::String("new".to_string())));
+    assert_eq!(
+        node.props.get("v"),
+        Some(&PropValue::String("new".to_string()))
+    );
     assert_eq!(node.weight, 2.0);
     engine.close().unwrap();
 }
@@ -12179,7 +17239,9 @@ fn test_get_nodes_by_keys_memtable_shadows_segment() {
 fn test_get_nodes_by_keys_duplicate_keys() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
 
     let keys: Vec<(u32, &str)> = vec![(1, "a"), (1, "a"), (1, "a")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
@@ -12195,12 +17257,24 @@ fn test_get_nodes_by_keys_after_compaction() {
     let dir = TempDir::new().unwrap();
     let mut engine = DatabaseEngine::open(
         &dir.path().join("db"),
-        &DbOptions { create_if_missing: true, wal_sync_mode: WalSyncMode::Immediate, compact_after_n_flushes: 2, ..Default::default() },
-    ).unwrap();
-    engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-    engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        &DbOptions {
+            create_if_missing: true,
+            wal_sync_mode: WalSyncMode::Immediate,
+            compact_after_n_flushes: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    engine
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap();
-    engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+    engine
+        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .unwrap();
     engine.flush().unwrap(); // triggers compaction
 
     let keys: Vec<(u32, &str)> = vec![(1, "a"), (1, "b"), (1, "c")];
@@ -12214,17 +17288,38 @@ fn test_get_nodes_by_keys_after_compaction() {
 fn test_get_nodes_by_keys_delete_then_recreate() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    let old_id = engine.upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "old"), ..Default::default() }).unwrap();
+    let old_id = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "old"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
     engine.delete_node(old_id).unwrap();
-    let new_id = engine.upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "new"), ..Default::default() }).unwrap();
+    let new_id = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "new"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_ne!(old_id, new_id);
 
     let keys: Vec<(u32, &str)> = vec![(1, "a")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
     let node = results[0].as_ref().unwrap();
     assert_eq!(node.id, new_id);
-    assert_eq!(node.props.get("v"), Some(&PropValue::String("new".to_string())));
+    assert_eq!(
+        node.props.get("v"),
+        Some(&PropValue::String("new".to_string()))
+    );
     engine.close().unwrap();
 }
 
@@ -12232,8 +17327,26 @@ fn test_get_nodes_by_keys_delete_then_recreate() {
 fn test_get_nodes_by_keys_different_type_ids() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
-    engine.upsert_node(1, "x", UpsertNodeOptions { props: make_props("t", "1"), ..Default::default() }).unwrap();
-    engine.upsert_node(2, "x", UpsertNodeOptions { props: make_props("t", "2"), ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "x",
+            UpsertNodeOptions {
+                props: make_props("t", "1"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            2,
+            "x",
+            UpsertNodeOptions {
+                props: make_props("t", "2"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let keys: Vec<(u32, &str)> = vec![(1, "x"), (2, "x")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
@@ -12252,14 +17365,47 @@ fn test_get_nodes_by_keys_policy_filtering() {
     let dir = TempDir::new().unwrap();
     let mut engine = DatabaseEngine::open(
         &dir.path().join("db"),
-        &DbOptions { create_if_missing: true, wal_sync_mode: WalSyncMode::Immediate, compact_after_n_flushes: 0, ..Default::default() },
-    ).unwrap();
+        &DbOptions {
+            create_if_missing: true,
+            wal_sync_mode: WalSyncMode::Immediate,
+            compact_after_n_flushes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     // Use weight-based policy so there's no timing dependency
-    engine.upsert_node(1, "low", UpsertNodeOptions { weight: 0.05, ..Default::default() }).unwrap();
-    engine.upsert_node(1, "high", UpsertNodeOptions { weight: 5.0, ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "low",
+            UpsertNodeOptions {
+                weight: 0.05,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "high",
+            UpsertNodeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     // Prune nodes with weight <= 0.1
-    engine.set_prune_policy("low_weight", PrunePolicy { type_id: Some(1), max_age_ms: None, max_weight: Some(0.1) }).unwrap();
+    engine
+        .set_prune_policy(
+            "low_weight",
+            PrunePolicy {
+                type_id: Some(1),
+                max_age_ms: None,
+                max_weight: Some(0.1),
+            },
+        )
+        .unwrap();
 
     let keys: Vec<(u32, &str)> = vec![(1, "low"), (1, "high")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
@@ -12275,17 +17421,38 @@ fn test_get_nodes_by_keys_tombstone_prevents_fallthrough() {
     let dir = TempDir::new().unwrap();
     let mut engine = open_imm(&dir.path().join("db"));
     // seg1: "a" → old node
-    let old_id = engine.upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "seg1"), ..Default::default() }).unwrap();
+    let old_id = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "seg1"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
     // seg2: "a" → updated node (same key, same node_id via upsert)
-    engine.upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "seg2"), ..Default::default() }).unwrap();
+    engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "seg2"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
     // memtable: delete the node
     engine.delete_node(old_id).unwrap();
 
     let keys: Vec<(u32, &str)> = vec![(1, "a")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
-    assert!(results[0].is_none(), "tombstoned node must not fall through to older segment");
+    assert!(
+        results[0].is_none(),
+        "tombstoned node must not fall through to older segment"
+    );
     engine.close().unwrap();
 }
 
@@ -12295,13 +17462,12 @@ fn test_get_nodes_by_keys_immutable_tombstone_shadows_older_immutable() {
     // immutable. The scalar get_node_by_key handles this via
     // is_node_tombstoned_above_immutable; the batch path must match.
     let dir = TempDir::new().unwrap();
-    let mut engine = DatabaseEngine::open(
-        &dir.path().join("db"),
-        &DbOptions::default(),
-    ).unwrap();
+    let mut engine = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
 
     // Create node, freeze → immutable 1 (oldest, has the record)
-    let id = engine.upsert_node(1, "doomed", UpsertNodeOptions::default()).unwrap();
+    let id = engine
+        .upsert_node(1, "doomed", UpsertNodeOptions::default())
+        .unwrap();
     engine.freeze_memtable().unwrap();
 
     // Delete in active, then freeze → immutable 0 (newest, has tombstone)
@@ -12309,14 +17475,18 @@ fn test_get_nodes_by_keys_immutable_tombstone_shadows_older_immutable() {
     engine.freeze_memtable().unwrap();
 
     // Scalar path (known correct)
-    assert!(engine.get_node_by_key(1, "doomed").unwrap().is_none(),
-        "scalar get_node_by_key must hide node tombstoned in newer immutable");
+    assert!(
+        engine.get_node_by_key(1, "doomed").unwrap().is_none(),
+        "scalar get_node_by_key must hide node tombstoned in newer immutable"
+    );
 
     // Batch path (the regression target)
     let keys: Vec<(u32, &str)> = vec![(1, "doomed")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
-    assert!(results[0].is_none(),
-        "batch get_nodes_by_keys must hide node tombstoned in newer immutable");
+    assert!(
+        results[0].is_none(),
+        "batch get_nodes_by_keys must hide node tombstoned in newer immutable"
+    );
 
     engine.close().unwrap();
 }
@@ -12331,12 +17501,30 @@ fn test_get_nodes_by_keys_delete_recreate_delete_cross_segment() {
     let mut engine = open_imm(&dir.path().join("db"));
 
     // seg1: "a" → old_id
-    let old_id = engine.upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "old"), ..Default::default() }).unwrap();
+    let old_id = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "old"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     engine.flush().unwrap();
 
     // seg2: tombstone(old_id), "a" → new_id
     engine.delete_node(old_id).unwrap();
-    let new_id = engine.upsert_node(1, "a", UpsertNodeOptions { props: make_props("v", "new"), ..Default::default() }).unwrap();
+    let new_id = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: make_props("v", "new"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_ne!(old_id, new_id);
     engine.flush().unwrap();
 
@@ -12345,14 +17533,18 @@ fn test_get_nodes_by_keys_delete_recreate_delete_cross_segment() {
     engine.flush().unwrap();
 
     // Scalar path
-    assert!(engine.get_node_by_key(1, "a").unwrap().is_none(),
-        "scalar must return None for delete-recreate-delete across segments");
+    assert!(
+        engine.get_node_by_key(1, "a").unwrap().is_none(),
+        "scalar must return None for delete-recreate-delete across segments"
+    );
 
     // Batch path
     let keys: Vec<(u32, &str)> = vec![(1, "a")];
     let results = engine.get_nodes_by_keys(&keys).unwrap();
-    assert!(results[0].is_none(),
-        "batch must return None for delete-recreate-delete across segments");
+    assert!(
+        results[0].is_none(),
+        "batch must return None for delete-recreate-delete across segments"
+    );
 
     engine.close().unwrap();
 }

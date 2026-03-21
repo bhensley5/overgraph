@@ -180,6 +180,14 @@ class PyPprResult:
     scores: list[float]
     iterations: int
     converged: bool
+    algorithm: str
+    approx: PyPprApproxMeta | None
+    def __repr__(self) -> str: ...
+
+class PyPprApproxMeta:
+    residual_tolerance: float
+    pushes: int
+    max_remaining_residual: float
     def __repr__(self) -> str: ...
 
 class PyExportEdge:
@@ -446,9 +454,11 @@ class OverGraph:
         self,
         seed_node_ids: list[int],
         *,
+        algorithm: str | None = None,
         damping_factor: float | None = None,
         max_iterations: int | None = None,
         epsilon: float | None = None,
+        approx_residual_tolerance: float | None = None,
         edge_type_filter: list[int] | None = None,
         max_results: int | None = None,
     ) -> PyPprResult: ...
@@ -591,7 +601,7 @@ class AsyncOverGraph:
     async def neighbors_paged(self, node_id: int, *, direction: str = "outgoing", type_filter: list[int] | None = None, limit: int | None = None, after: int | None = None, at_epoch: int | None = None, decay_lambda: float | None = None) -> PyNeighborPageResult: ...
 
     # Analytics
-    async def personalized_pagerank(self, seed_node_ids: list[int], *, damping_factor: float | None = None, max_iterations: int | None = None, epsilon: float | None = None, edge_type_filter: list[int] | None = None, max_results: int | None = None) -> PyPprResult: ...
+    async def personalized_pagerank(self, seed_node_ids: list[int], *, algorithm: str | None = None, damping_factor: float | None = None, max_iterations: int | None = None, epsilon: float | None = None, approx_residual_tolerance: float | None = None, edge_type_filter: list[int] | None = None, max_results: int | None = None) -> PyPprResult: ...
     async def export_adjacency(self, *, node_type_filter: list[int] | None = None, edge_type_filter: list[int] | None = None, include_weights: bool = True) -> PyAdjacencyExport: ...
     async def connected_components(self, *, edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None) -> dict[int, int]: ...
     async def component_of(self, node_id: int, *, edge_type_filter: list[int] | None = None, node_type_filter: list[int] | None = None, at_epoch: int | None = None) -> list[int]: ...

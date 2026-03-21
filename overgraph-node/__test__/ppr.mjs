@@ -29,6 +29,18 @@ describe('personalizedPagerank (sync)', () => {
     assert.ok(Math.abs(r.scores[0] - 1.0) < 1e-4);
     assert.equal(r.converged, true);
   });
+
+  it('approx mode returns algorithm metadata', () => {
+    const id = db.upsertNode(1, 'approx-seed');
+    const r = db.personalizedPagerank([id], {
+      algorithm: 'approx',
+      approxResidualTolerance: 1e-6,
+    });
+    assert.equal(r.algorithm, 'approx');
+    assert.ok(r.approx);
+    assert.equal(typeof r.approx.pushes, 'number');
+    assert.equal(r.approx.residualTolerance, 1e-6);
+  });
 });
 
 describe('personalizedPagerank, graph queries', () => {
@@ -132,5 +144,15 @@ describe('personalizedPagerankAsync', () => {
     assert.equal(r.scores.length, r.nodeIds.length);
     assert.equal(typeof r.iterations, 'number');
     assert.equal(typeof r.converged, 'boolean');
+  });
+
+  it('async approximate variant exposes metadata', async () => {
+    const r = await db.personalizedPagerankAsync([a], {
+      algorithm: 'approx',
+      approxResidualTolerance: 1e-6,
+    });
+    assert.equal(r.algorithm, 'approx');
+    assert.ok(r.approx);
+    assert.equal(typeof r.approx.pushes, 'number');
   });
 });

@@ -8,11 +8,11 @@ use overgraph::{
     DatabaseEngine, DbOptions, DbStats, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
     EdgeInput, EdgeRecord, EngineError, ExportOptions, FusionMode, GraphPatch, HnswConfig,
     IsConnectedOptions, NeighborEntry, NeighborOptions, NodeIdMap, NodeInput, NodeRecord,
-    PageRequest, PageResult, PprOptions, PprResult, PropValue, PrunePolicy, PruneResult,
-    ScoringMode, ShortestPath, ShortestPathOptions, Subgraph, SubgraphOptions, TopKOptions,
-    TraversalCursor, TraversalHit, TraversalPageResult, TraverseOptions, UpsertEdgeOptions,
-    UpsertNodeOptions, VectorHit, VectorSearchMode, VectorSearchRequest, VectorSearchScope,
-    WalSyncMode,
+    PageRequest, PageResult, PprAlgorithm, PprOptions, PprResult, PropValue, PrunePolicy,
+    PruneResult, ScoringMode, ShortestPath, ShortestPathOptions, Subgraph, SubgraphOptions,
+    TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult, TraverseOptions,
+    UpsertEdgeOptions, UpsertNodeOptions, VectorHit, VectorSearchMode, VectorSearchRequest,
+    VectorSearchScope, WalSyncMode,
 };
 
 /// ThreadsafeFunction with `CalleeHandled = false` so the JS callback
@@ -919,24 +919,35 @@ impl OverGraph {
             .into_iter()
             .map(f64_to_u64)
             .collect::<Result<Vec<_>>>()?;
-        let (damping_factor, max_iterations, epsilon, edge_type_filter, max_results) =
-            match &options {
-                Some(o) => (
-                    o.damping_factor,
-                    o.max_iterations,
-                    o.epsilon,
-                    o.edge_type_filter.clone(),
-                    o.max_results,
-                ),
-                None => (None, None, None, None, None),
-            };
+        let (
+            algorithm,
+            damping_factor,
+            max_iterations,
+            epsilon,
+            approx_residual_tolerance,
+            edge_type_filter,
+            max_results,
+        ) = match &options {
+            Some(o) => (
+                o.algorithm.as_deref(),
+                o.damping_factor,
+                o.max_iterations,
+                o.epsilon,
+                o.approx_residual_tolerance,
+                o.edge_type_filter.clone(),
+                o.max_results,
+            ),
+            None => (None, None, None, None, None, None, None),
+        };
         let opts = js_ppr_options_to_ppr_options(
+            algorithm,
             &damping_factor,
             &max_iterations,
             &epsilon,
+            &approx_residual_tolerance,
             &edge_type_filter,
             &max_results,
-        );
+        )?;
         let result = with_engine_ref(self, |eng| eng.personalized_pagerank(&seeds, &opts))?;
         ppr_result_to_js(result)
     }
@@ -2109,24 +2120,35 @@ impl OverGraph {
             .into_iter()
             .map(f64_to_u64)
             .collect::<Result<Vec<_>>>()?;
-        let (damping_factor, max_iterations, epsilon, edge_type_filter, max_results) =
-            match &options {
-                Some(o) => (
-                    o.damping_factor,
-                    o.max_iterations,
-                    o.epsilon,
-                    o.edge_type_filter.clone(),
-                    o.max_results,
-                ),
-                None => (None, None, None, None, None),
-            };
+        let (
+            algorithm,
+            damping_factor,
+            max_iterations,
+            epsilon,
+            approx_residual_tolerance,
+            edge_type_filter,
+            max_results,
+        ) = match &options {
+            Some(o) => (
+                o.algorithm.as_deref(),
+                o.damping_factor,
+                o.max_iterations,
+                o.epsilon,
+                o.approx_residual_tolerance,
+                o.edge_type_filter.clone(),
+                o.max_results,
+            ),
+            None => (None, None, None, None, None, None, None),
+        };
         let opts = js_ppr_options_to_ppr_options(
+            algorithm,
             &damping_factor,
             &max_iterations,
             &epsilon,
+            &approx_residual_tolerance,
             &edge_type_filter,
             &max_results,
-        );
+        )?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.personalized_pagerank(&seeds, &opts),
@@ -2565,9 +2587,11 @@ pub struct JsFindNodesByTimeRangePagedOptions {
 
 #[napi(object)]
 pub struct JsPersonalizedPagerankOptions {
+    pub algorithm: Option<String>,
     pub damping_factor: Option<f64>,
     pub max_iterations: Option<u32>,
     pub epsilon: Option<f64>,
+    pub approx_residual_tolerance: Option<f64>,
     pub edge_type_filter: Option<Vec<u32>>,
     pub max_results: Option<u32>,
 }
@@ -2651,10 +2675,10 @@ impl From<JsDbOptions> for DbOptions {
             Some("immediate") => WalSyncMode::Immediate,
             _ => {
                 // Default to GroupCommit, but allow overriding interval
-                let interval_ms = js.group_commit_interval_ms.unwrap_or(10) as u64;
+                let interval_ms = js.group_commit_interval_ms.unwrap_or(50) as u64;
                 WalSyncMode::GroupCommit {
                     interval_ms,
-                    soft_trigger_bytes: 4 * 1024 * 1024,
+                    soft_trigger_bytes: 2 * 1024 * 1024,
                     hard_cap_bytes: 16 * 1024 * 1024,
                 }
             }
@@ -3423,6 +3447,15 @@ pub struct JsPprResult {
     pub scores: Float64Array,
     pub iterations: u32,
     pub converged: bool,
+    pub algorithm: String,
+    pub approx: Option<JsPprApproxMeta>,
+}
+
+#[napi(object)]
+pub struct JsPprApproxMeta {
+    pub residual_tolerance: f64,
+    pub pushes: f64,
+    pub max_remaining_residual: f64,
 }
 
 fn ppr_result_to_js(r: PprResult) -> Result<JsPprResult> {
@@ -3437,23 +3470,35 @@ fn ppr_result_to_js(r: PprResult) -> Result<JsPprResult> {
         scores: Float64Array::new(scores),
         iterations: r.iterations,
         converged: r.converged,
+        algorithm: ppr_algorithm_to_js(r.algorithm).to_string(),
+        approx: r.approx.map(|a| JsPprApproxMeta {
+            residual_tolerance: a.residual_tolerance,
+            pushes: a.pushes as f64,
+            max_remaining_residual: a.max_remaining_residual,
+        }),
     })
 }
 
 fn js_ppr_options_to_ppr_options(
+    algorithm: Option<&str>,
     damping_factor: &Option<f64>,
     max_iterations: &Option<u32>,
     epsilon: &Option<f64>,
+    approx_residual_tolerance: &Option<f64>,
     edge_type_filter: &Option<Vec<u32>>,
     max_results: &Option<u32>,
-) -> PprOptions {
-    PprOptions {
+) -> Result<PprOptions> {
+    let defaults = PprOptions::default();
+    Ok(PprOptions {
+        algorithm: parse_ppr_algorithm(algorithm)?,
         damping_factor: damping_factor.unwrap_or(0.85),
         max_iterations: max_iterations.unwrap_or(20),
         epsilon: epsilon.unwrap_or(1e-6),
+        approx_residual_tolerance: approx_residual_tolerance
+            .unwrap_or(defaults.approx_residual_tolerance),
         edge_type_filter: edge_type_filter.clone(),
         max_results: max_results.map(|v| v as usize),
-    }
+    })
 }
 
 // --- Export types ---
@@ -3843,6 +3888,25 @@ fn parse_fusion_mode(s: Option<&str>) -> Result<Option<FusionMode>> {
             "Invalid fusionMode '{}'. Must be 'weighted_rank', 'reciprocal_rank', or 'weighted_score'.",
             other
         ))),
+    }
+}
+
+fn parse_ppr_algorithm(s: Option<&str>) -> Result<PprAlgorithm> {
+    match s {
+        None => Ok(PprAlgorithm::ExactPowerIteration),
+        Some("exact") | Some("exact_power_iteration") => Ok(PprAlgorithm::ExactPowerIteration),
+        Some("approx") | Some("approx_forward_push") => Ok(PprAlgorithm::ApproxForwardPush),
+        Some(other) => Err(napi::Error::from_reason(format!(
+            "Invalid PPR algorithm '{}'. Must be 'exact' or 'approx'.",
+            other
+        ))),
+    }
+}
+
+fn ppr_algorithm_to_js(algorithm: PprAlgorithm) -> &'static str {
+    match algorithm {
+        PprAlgorithm::ExactPowerIteration => "exact",
+        PprAlgorithm::ApproxForwardPush => "approx",
     }
 }
 

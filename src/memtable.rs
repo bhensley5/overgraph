@@ -1,5 +1,5 @@
 use crate::types::*;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 /// An adjacency entry: one edge connecting to a neighbor.
@@ -352,17 +352,117 @@ impl Memtable {
                 }
             }
             Direction::Both => {
-                if let Some(map) = self.adj_out.get(&node_id) {
-                    collect(map, &mut results);
-                }
-                if limit == 0 || results.len() < limit {
+                if limit == 0 {
+                    let mut self_loop_edge_ids = NodeIdSet::default();
+                    if let Some(map) = self.adj_out.get(&node_id) {
+                        for entry in map.values() {
+                            if let Some(types) = type_filter {
+                                if !types.contains(&entry.type_id) {
+                                    continue;
+                                }
+                            }
+                            if self.deleted_nodes.contains_key(&entry.neighbor_id) {
+                                continue;
+                            }
+                            if entry.neighbor_id == node_id {
+                                self_loop_edge_ids.insert(entry.edge_id);
+                            }
+                            results.push(NeighborEntry {
+                                node_id: entry.neighbor_id,
+                                edge_id: entry.edge_id,
+                                edge_type_id: entry.type_id,
+                                weight: entry.weight,
+                                valid_from: entry.valid_from,
+                                valid_to: entry.valid_to,
+                            });
+                        }
+                    }
                     if let Some(map) = self.adj_in.get(&node_id) {
-                        collect(map, &mut results);
+                        for entry in map.values() {
+                            if let Some(types) = type_filter {
+                                if !types.contains(&entry.type_id) {
+                                    continue;
+                                }
+                            }
+                            if self.deleted_nodes.contains_key(&entry.neighbor_id) {
+                                continue;
+                            }
+                            if entry.neighbor_id == node_id
+                                && self_loop_edge_ids.contains(&entry.edge_id)
+                            {
+                                continue;
+                            }
+                            results.push(NeighborEntry {
+                                node_id: entry.neighbor_id,
+                                edge_id: entry.edge_id,
+                                edge_type_id: entry.type_id,
+                                weight: entry.weight,
+                                valid_from: entry.valid_from,
+                                valid_to: entry.valid_to,
+                            });
+                        }
+                    }
+                } else {
+                    let mut self_loop_edge_ids = NodeIdSet::default();
+                    if let Some(map) = self.adj_out.get(&node_id) {
+                        for entry in map.values() {
+                            if results.len() >= limit {
+                                break;
+                            }
+                            if let Some(types) = type_filter {
+                                if !types.contains(&entry.type_id) {
+                                    continue;
+                                }
+                            }
+                            if self.deleted_nodes.contains_key(&entry.neighbor_id) {
+                                continue;
+                            }
+                            if entry.neighbor_id == node_id {
+                                self_loop_edge_ids.insert(entry.edge_id);
+                            }
+                            results.push(NeighborEntry {
+                                node_id: entry.neighbor_id,
+                                edge_id: entry.edge_id,
+                                edge_type_id: entry.type_id,
+                                weight: entry.weight,
+                                valid_from: entry.valid_from,
+                                valid_to: entry.valid_to,
+                            });
+                        }
+                    }
+                    let mut remaining_raw = limit.saturating_sub(results.len());
+                    if remaining_raw > 0 {
+                        if let Some(map) = self.adj_in.get(&node_id) {
+                            for entry in map.values() {
+                                if remaining_raw == 0 {
+                                    break;
+                                }
+                                if let Some(types) = type_filter {
+                                    if !types.contains(&entry.type_id) {
+                                        continue;
+                                    }
+                                }
+                                if self.deleted_nodes.contains_key(&entry.neighbor_id) {
+                                    continue;
+                                }
+                                remaining_raw -= 1;
+                                if entry.neighbor_id == node_id
+                                    && self_loop_edge_ids.contains(&entry.edge_id)
+                                {
+                                    continue;
+                                }
+                                results.push(NeighborEntry {
+                                    node_id: entry.neighbor_id,
+                                    edge_id: entry.edge_id,
+                                    edge_type_id: entry.type_id,
+                                    weight: entry.weight,
+                                    valid_from: entry.valid_from,
+                                    valid_to: entry.valid_to,
+                                });
+                            }
+                        }
                     }
                 }
-                // Deduplicate by edge_id (self-loops appear in both adj_out and adj_in)
-                let mut seen = std::collections::HashSet::new();
-                results.retain(|e| seen.insert(e.edge_id));
             }
         }
 
@@ -444,7 +544,7 @@ impl Memtable {
                 }
             }
             Direction::Both => {
-                let mut seen = HashSet::new();
+                let mut self_loop_edge_ids = NodeIdSet::default();
                 if let Some(map) = self.adj_out.get(&node_id) {
                     for entry in map.values() {
                         if let Some(types) = type_filter {
@@ -455,7 +555,9 @@ impl Memtable {
                         if self.deleted_nodes.contains_key(&entry.neighbor_id) {
                             continue;
                         }
-                        seen.insert(entry.edge_id);
+                        if entry.neighbor_id == node_id {
+                            self_loop_edge_ids.insert(entry.edge_id);
+                        }
                         if callback(
                             entry.edge_id,
                             entry.neighbor_id,
@@ -471,15 +573,17 @@ impl Memtable {
                 }
                 if let Some(map) = self.adj_in.get(&node_id) {
                     for entry in map.values() {
-                        if seen.contains(&entry.edge_id) {
-                            continue;
-                        }
                         if let Some(types) = type_filter {
                             if !types.contains(&entry.type_id) {
                                 continue;
                             }
                         }
                         if self.deleted_nodes.contains_key(&entry.neighbor_id) {
+                            continue;
+                        }
+                        if entry.neighbor_id == node_id
+                            && self_loop_edge_ids.contains(&entry.edge_id)
+                        {
                             continue;
                         }
                         if callback(
@@ -1024,6 +1128,22 @@ mod tests {
         let neighbor_ids: Vec<u64> = both.iter().map(|e| e.node_id).collect();
         assert!(neighbor_ids.contains(&2));
         assert!(neighbor_ids.contains(&3));
+    }
+
+    #[test]
+    fn test_neighbors_both_with_limit_preserves_self_loop_budget_semantics() {
+        let mut mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
+
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 1, 10)), 0); // self-loop
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 2, 1, 10)), 0); // incoming unique
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 3, 1, 10)), 0); // incoming unique
+
+        let both = mt.neighbors(1, Direction::Both, None, 2);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].edge_id, 1);
     }
 
     #[test]

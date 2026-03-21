@@ -62,9 +62,9 @@ Node.js and Python connectors add minimal overhead. Batch operations are especia
 
 Prebuilt binaries are available for macOS (ARM + Intel), Linux (x64), and Windows (x64). No Rust toolchain required.
 
-**Rust**
+**Python**
 ```bash
-cargo add overgraph
+pip install overgraph
 ```
 
 **Node.js**
@@ -72,12 +72,84 @@ cargo add overgraph
 npm install overgraph
 ```
 
-**Python**
+**Rust**
 ```bash
-pip install overgraph
+cargo add overgraph
 ```
 
 ## Quick start
+
+### Python
+
+```python
+from overgraph import OverGraph
+
+USER = 1
+PROJECT = 2
+CREATED = 10
+
+with OverGraph.open("./my-graph", dense_vector_dimension=384) as db:
+    # Create nodes with embeddings
+    alice = db.upsert_node(USER, "user:alice",
+        props={"name": "Alice"},
+        dense_vector=[0.1] * 384,
+        sparse_vector=[(42, 0.8), (99, 0.3)])
+
+    project = db.upsert_node(PROJECT, "project:overgraph",
+        dense_vector=[0.2] * 384,
+        sparse_vector=[(42, 0.5), (150, 0.9)])
+
+    db.upsert_edge(alice, project, CREATED)
+
+    # Hybrid vector search scoped to a graph neighborhood
+    hits = db.vector_search("hybrid", k=10,
+        dense_query=[0.15] * 384,
+        sparse_query=[(42, 0.9), (99, 0.5)],
+        scope_start_node_id=alice,
+        scope_max_depth=3)
+
+    for hit in hits:
+        print(f"node {hit.node_id} score {hit.score:.4f}")
+```
+
+### Node.js
+
+```javascript
+import { OverGraph } from 'overgraph';
+
+const USER = 1;
+const PROJECT = 2;
+const CREATED = 10;
+
+const db = OverGraph.open('./my-graph', {
+  denseVector: { dimension: 384 },
+});
+
+// Create nodes with embeddings
+const alice = db.upsertNode(USER, 'user:alice', {
+  props: { name: 'Alice' },
+  denseVector: new Array(384).fill(0.1),
+  sparseVector: [{ dimension: 42, value: 0.8 }, { dimension: 99, value: 0.3 }],
+});
+
+const project = db.upsertNode(PROJECT, 'project:overgraph', {
+  denseVector: new Array(384).fill(0.2),
+  sparseVector: [{ dimension: 42, value: 0.5 }, { dimension: 150, value: 0.9 }],
+});
+
+db.upsertEdge(alice, project, CREATED);
+
+// Hybrid vector search scoped to a graph neighborhood
+const hits = db.vectorSearch('hybrid', {
+  k: 10,
+  denseQuery: new Array(384).fill(0.15),
+  sparseQuery: [{ dimension: 42, value: 0.9 }, { dimension: 99, value: 0.5 }],
+  scope: { startNodeId: alice, maxDepth: 3 },
+});
+
+hits.forEach(h => console.log(`node ${h.nodeId} score ${h.score.toFixed(4)}`));
+db.close();
+```
 
 ### Rust
 
@@ -86,13 +158,11 @@ use overgraph::*;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-// Define your schema's type IDs
 const USER: u32 = 1;
 const PROJECT: u32 = 2;
 const CREATED: u32 = 10;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open with dense vector config (384-dim, cosine similarity)
     let opts = DbOptions {
         dense_vector: Some(DenseVectorConfig {
             dimension: 384,
@@ -119,7 +189,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     })?;
 
-    // Connect them
     db.upsert_edge(alice, project, CREATED, UpsertEdgeOptions::default())?;
 
     // Hybrid vector search: dense + sparse with graph scoping
@@ -150,122 +219,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Node.js
+### Async support
 
-```javascript
-import { OverGraph } from 'overgraph';
-
-// Define your schema's type IDs
-const USER = 1;
-const PROJECT = 2;
-const CREATED = 10;
-
-// Open with dense vector config
-const db = OverGraph.open('./my-graph', {
-  denseVector: { dimension: 384, metric: 'cosine' },
-});
-
-// Create nodes with dense + sparse embeddings
-const alice = db.upsertNode(USER, 'user:alice', {
-  props: { name: 'Alice', role: 'engineer' },
-  denseVector: new Array(384).fill(0.1),
-  sparseVector: [{ dimension: 42, value: 0.8 }, { dimension: 99, value: 0.3 }],
-});
-const project = db.upsertNode(PROJECT, 'project:overgraph', {
-  props: { status: 'active' },
-  denseVector: new Array(384).fill(0.2),
-  sparseVector: [{ dimension: 42, value: 0.5 }, { dimension: 150, value: 0.9 }],
-});
-
-// Connect them
-db.upsertEdge(alice, project, CREATED, { props: { role: 'creator' } });
-
-// Hybrid vector search: dense + sparse with graph scoping
-const hits = db.vectorSearch('hybrid', {
-  denseQuery: new Array(384).fill(0.15),
-  sparseQuery: [{ dimension: 42, value: 0.9 }, { dimension: 99, value: 0.5 }],
-  k: 10,                            // required: 0 returns empty
-  typeFilter: [USER, PROJECT],       // default: undefined (no filtering)
-  efSearch: 200,                     // default: 128
-  scope: {                               // default: undefined (search all nodes)
-    startNodeId: alice,
-    maxDepth: 3,
-    direction: 'outgoing',           // default: 'outgoing'
-    edgeTypeFilter: [CREATED],        // default: undefined (all edge types)
-    atEpoch: undefined,              // default: undefined (current time)
-  },
-  denseWeight: 0.7,                  // default: 1.0
-  sparseWeight: 0.3,                 // default: 1.0
-  fusionMode: 'reciprocal-rank-fusion', // default: 'weighted-rank-fusion'
-});
-hits.forEach(h => console.log(`node ${h.nodeId} score ${h.score.toFixed(4)}`));
-
-db.close();
-```
-
-Every method has an async variant (e.g. `vectorSearchAsync`, `upsertNodeAsync`).
-
-### Python
-
-```python
-from overgraph import OverGraph
-
-# Define your schema's type IDs
-USER = 1
-PROJECT = 2
-CREATED = 10
-
-with OverGraph.open("./my-graph",
-                    dense_vector_dimension=384,
-                    dense_vector_metric="cosine") as db:
-    # Create nodes with dense + sparse embeddings
-    alice = db.upsert_node(USER, "user:alice",
-        props={"name": "Alice", "role": "engineer"},
-        dense_vector=[0.1] * 384,
-        sparse_vector=[(42, 0.8), (99, 0.3)])
-    project = db.upsert_node(PROJECT, "project:overgraph",
-        props={"status": "active"},
-        dense_vector=[0.2] * 384,
-        sparse_vector=[(42, 0.5), (150, 0.9)])
-
-    # Connect them
-    db.upsert_edge(alice, project, CREATED, props={"role": "creator"})
-
-    # Hybrid vector search: dense + sparse with graph scoping
-    hits = db.vector_search("hybrid",
-        k=10,                                    # required: 0 returns empty
-        dense_query=[0.15] * 384,
-        sparse_query=[(42, 0.9), (99, 0.5)],
-        type_filter=[USER, PROJECT],              # default: None (no filtering)
-        ef_search=200,                           # default: 128
-        scope_start_node_id=alice,               # default: None (search all nodes)
-        scope_max_depth=3,
-        scope_direction="outgoing",              # default: "outgoing"
-        scope_edge_type_filter=[CREATED],         # default: None (all edge types)
-        scope_at_epoch=None,                     # default: None (current time)
-        dense_weight=0.7,                        # default: 1.0
-        sparse_weight=0.3,                       # default: 1.0
-        fusion_mode="reciprocal-rank-fusion",    # default: "weighted-rank-fusion"
-    )
-    for hit in hits:
-        print(f"node {hit.node_id} score {hit.score:.4f}")
-```
-
-Or async:
-
-```python
-from overgraph import AsyncOverGraph
-
-async with await AsyncOverGraph.open("./my-graph",
-                                     dense_vector_dimension=384) as db:
-    alice = await db.upsert_node(USER, "user:alice",
-        props={"name": "Alice"},
-        dense_vector=[0.1] * 384,
-        sparse_vector=[(42, 0.8)])
-    hits = await db.vector_search("hybrid", k=5,
-        dense_query=[0.15] * 384,
-        sparse_query=[(42, 0.9)])
-```
+Both Python and Node.js connectors include full async variants of every API. Python provides `AsyncOverGraph` with native `asyncio` support. Node.js methods have `Async` suffixed variants (e.g. `upsertNodeAsync`, `vectorSearchAsync`).
 
 ## Features
 
@@ -290,7 +246,7 @@ async with await AsyncOverGraph.open("./my-graph",
 - **Neighbors and bounded traversal.** `neighbors()` handles 1-hop expansion; `traverse()` covers deterministic breadth-first traversal across arbitrary depth windows with optional edge-type filtering, emission-only node-type filtering, and traversal-specific pagination.
 - **Depth slices without special-case APIs.** Exact depth-2 traversals are expressed as `traverse(start, 2, min_depth=2)`, so 2-hop use cases stay available without a separate public method family.
 - **Top-K neighbors.** Get the K highest-scoring neighbors by weight, recency, or decay-adjusted score.
-- **Personalized PageRank.** Run PPR from seed nodes to find the most relevant nodes in the graph. Useful for context retrieval in RAG pipelines.
+- **Personalized PageRank.** Run PPR from seed nodes to find the most relevant nodes in the graph. Rust, Node.js, and Python expose both exact power-iteration PPR and a much faster approximate forward-push mode for seed-centric retrieval workloads.
 - **Subgraph extraction.** Pull out a connected subgraph up to N hops deep. Good for building local context windows.
 - **Shortest path.** BFS (unweighted) or bidirectional Dijkstra (weighted). `is_connected` for fast reachability checks. `all_shortest_paths` when there are ties.
 - **Connected components.** `connected_components()` returns a global WCC labelling (union-find, near-linear). `component_of(node)` returns the members of a single node's component via BFS. Both support edge-type, node-type, and temporal filters.
@@ -307,7 +263,7 @@ ID-keyed collection APIs use keyset pagination with `limit` and `after`. `traver
 
 ### Storage engine
 - **Write-ahead log.** Every mutation hits the WAL before the memtable. Crash recovery replays the WAL on startup.
-- **Configurable durability.** `Immediate` mode fsyncs every write for maximum safety. `GroupCommit` mode (default) batches fsyncs on a 10ms timer for ~20x better write throughput with at most one timer interval of data at risk.
+- **Configurable durability.** `Immediate` mode fsyncs every write for maximum safety. `GroupCommit` mode (default) batches fsyncs on a 50ms timer for ~20x better write throughput with at most one timer interval of data at risk.
 - **Background compaction.** Segments are merged automatically when thresholds are met. Compaction runs on a background thread and never blocks reads or writes. Uses metadata sidecars for fast filtered merging without full record decoding.
 - **Bulk ingest mode.** Temporarily disable auto-compaction during large write bursts with `ingest_mode()`, then call `end_ingest()` to compact accumulated segments and restore normal behavior. This favors ingest throughput over read performance during the ingest window.
 - **mmap'd reads.** Immutable segments are memory-mapped. The OS page cache handles caching. Reads never block writes.
@@ -348,15 +304,10 @@ my-graph/
 
 For a deeper dive, see the [architecture overview](docs/architecture-overview.md).
 
-Node.js keeps required arguments positional and groups optional fields in a trailing
-options object. Python expresses the same optional fields as keyword arguments.
+## Documentation
 
-## API reference
-
-- **Rust:** Run `cargo doc --open` to browse the full rustdoc. All public types and methods are documented.
-- **Node.js:** See the [TypeScript declarations](overgraph-node/index.d.ts) for the complete API surface. Every method has a sync and async variant.
-- **Python:** See the [type stubs](overgraph-python/python/overgraph/__init__.pyi) for the complete API surface. Both sync (`OverGraph`) and async (`AsyncOverGraph`) classes are available.
-- **Cross-language parity:** See [`docs/internal/architecture/API-Parity-Matrix.md`](docs/internal/architecture/API-Parity-Matrix.md) for the shared API matrix across Rust, Node.js, and Python.
+- **[overgraph.io/docs](https://overgraph.io/docs)** - full documentation, getting started guide, and API reference.
+- **[API Reference](https://overgraph.io/docs/api-reference)** - every method, parameter, type, and return value across Python, Node.js, and Rust.
 
 ## Running the benchmarks
 

@@ -492,6 +492,20 @@ class TestAsyncAnalytics:
         assert n1 in result.node_ids
 
     @pytest.mark.asyncio
+    async def test_personalized_pagerank_approx(self, async_db):
+        n1 = await async_db.upsert_node(1, "a")
+        n2 = await async_db.upsert_node(1, "b")
+        await async_db.upsert_edge(n1, n2, 10)
+        result = await async_db.personalized_pagerank(
+            [n1],
+            algorithm="approx",
+            approx_residual_tolerance=1e-6,
+        )
+        assert result.algorithm == "approx"
+        assert result.approx is not None
+        assert result.approx.residual_tolerance == 1e-6
+
+    @pytest.mark.asyncio
     async def test_export_adjacency(self, async_db):
         n1 = await async_db.upsert_node(1, "a")
         n2 = await async_db.upsert_node(1, "b")

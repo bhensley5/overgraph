@@ -5,10 +5,11 @@ use eg::{
     ComponentOptions, DatabaseEngine, DbOptions, DbStats, DegreeOptions, DenseMetric,
     DenseVectorConfig, Direction, EdgeInput, EdgeRecord, EngineError, ExportOptions, FusionMode,
     GraphPatch, HnswConfig, IsConnectedOptions, NeighborEntry, NeighborOptions, NodeIdMap,
-    NodeInput, NodeRecord, PageRequest, PprOptions, PprResult, PropValue, PrunePolicy, PruneResult,
-    ScoringMode, ShortestPath, ShortestPathOptions, Subgraph, SubgraphOptions, TopKOptions,
-    TraversalCursor, TraversalHit, TraversalPageResult, TraverseOptions, UpsertEdgeOptions,
-    UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, VectorSearchScope, WalSyncMode,
+    NodeInput, NodeRecord, PageRequest, PprAlgorithm, PprOptions, PprResult, PropValue,
+    PrunePolicy, PruneResult, ScoringMode, ShortestPath, ShortestPathOptions, Subgraph,
+    SubgraphOptions, TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult,
+    TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest,
+    VectorSearchScope, WalSyncMode,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -969,22 +970,27 @@ impl OverGraph {
 
     // --- Analytics ---
 
-    #[pyo3(signature = (seed_node_ids, *, damping_factor=None, max_iterations=None, epsilon=None, edge_type_filter=None, max_results=None))]
+    #[pyo3(signature = (seed_node_ids, *, algorithm=None, damping_factor=None, max_iterations=None, epsilon=None, approx_residual_tolerance=None, edge_type_filter=None, max_results=None))]
     fn personalized_pagerank(
         &self,
         py: Python<'_>,
         seed_node_ids: Vec<u64>,
+        algorithm: Option<&str>,
         damping_factor: Option<f64>,
         max_iterations: Option<u32>,
         epsilon: Option<f64>,
+        approx_residual_tolerance: Option<f64>,
         edge_type_filter: Option<Vec<u32>>,
         max_results: Option<usize>,
     ) -> PyResult<PyPprResult> {
         let defaults = PprOptions::default();
         let options = PprOptions {
+            algorithm: parse_ppr_algorithm(algorithm)?,
             damping_factor: damping_factor.unwrap_or(defaults.damping_factor),
             max_iterations: max_iterations.unwrap_or(defaults.max_iterations),
             epsilon: epsilon.unwrap_or(defaults.epsilon),
+            approx_residual_tolerance: approx_residual_tolerance
+                .unwrap_or(defaults.approx_residual_tolerance),
             edge_type_filter,
             max_results,
         };
@@ -1966,6 +1972,31 @@ pub struct PyPprResult {
     pub iterations: u32,
     #[pyo3(get)]
     pub converged: bool,
+    #[pyo3(get)]
+    pub algorithm: String,
+    #[pyo3(get)]
+    pub approx: Option<PyPprApproxMeta>,
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyPprApproxMeta {
+    #[pyo3(get)]
+    pub residual_tolerance: f64,
+    #[pyo3(get)]
+    pub pushes: u64,
+    #[pyo3(get)]
+    pub max_remaining_residual: f64,
+}
+
+#[pymethods]
+impl PyPprApproxMeta {
+    fn __repr__(&self) -> String {
+        format!(
+            "PprApproxMeta(residual_tolerance={}, pushes={}, max_remaining_residual={})",
+            self.residual_tolerance, self.pushes, self.max_remaining_residual
+        )
+    }
 }
 
 impl From<PprResult> for PyPprResult {
@@ -1976,6 +2007,12 @@ impl From<PprResult> for PyPprResult {
             scores,
             iterations: r.iterations,
             converged: r.converged,
+            algorithm: ppr_algorithm_to_py(r.algorithm).to_string(),
+            approx: r.approx.map(|a| PyPprApproxMeta {
+                residual_tolerance: a.residual_tolerance,
+                pushes: a.pushes,
+                max_remaining_residual: a.max_remaining_residual,
+            }),
         }
     }
 }
@@ -1984,10 +2021,11 @@ impl From<PprResult> for PyPprResult {
 impl PyPprResult {
     fn __repr__(&self) -> String {
         format!(
-            "PprResult(nodes={}, iterations={}, converged={})",
+            "PprResult(nodes={}, iterations={}, converged={}, algorithm='{}')",
             self.node_ids.len(),
             self.iterations,
-            self.converged
+            self.converged,
+            self.algorithm
         )
     }
 }
@@ -2185,10 +2223,10 @@ fn parse_db_options(d: &Bound<'_, PyDict>) -> PyResult<DbOptions> {
                     .get_item("group_commit_interval_ms")?
                     .map(|v| v.extract())
                     .transpose()?
-                    .unwrap_or(10);
+                    .unwrap_or(50);
                 WalSyncMode::GroupCommit {
                     interval_ms,
-                    soft_trigger_bytes: 4 * 1024 * 1024,
+                    soft_trigger_bytes: 2 * 1024 * 1024,
                     hard_cap_bytes: 16 * 1024 * 1024,
                 }
             } else {
@@ -2438,6 +2476,25 @@ fn parse_fusion_mode(s: Option<&str>) -> PyResult<Option<FusionMode>> {
             "Invalid fusion_mode '{}'. Must be 'weighted_rank', 'reciprocal_rank', or 'weighted_score'.",
             other
         ))),
+    }
+}
+
+fn parse_ppr_algorithm(s: Option<&str>) -> PyResult<PprAlgorithm> {
+    match s {
+        None => Ok(PprAlgorithm::ExactPowerIteration),
+        Some("exact") | Some("exact_power_iteration") => Ok(PprAlgorithm::ExactPowerIteration),
+        Some("approx") | Some("approx_forward_push") => Ok(PprAlgorithm::ApproxForwardPush),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "Invalid algorithm '{}'. Must be 'exact' or 'approx'.",
+            other
+        ))),
+    }
+}
+
+fn ppr_algorithm_to_py(algorithm: PprAlgorithm) -> &'static str {
+    match algorithm {
+        PprAlgorithm::ExactPowerIteration => "exact",
+        PprAlgorithm::ApproxForwardPush => "approx",
     }
 }
 
@@ -2704,6 +2761,7 @@ fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEdgePageResult>()?;
     m.add_class::<PyNeighborPageResult>()?;
     m.add_class::<PyTraversalPageResult>()?;
+    m.add_class::<PyPprApproxMeta>()?;
     m.add_class::<PyPprResult>()?;
     m.add_class::<PyExportEdge>()?;
     m.add_class::<PyAdjacencyExport>()?;

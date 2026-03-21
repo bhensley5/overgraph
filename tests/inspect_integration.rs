@@ -1,7 +1,6 @@
 use overgraph::{
     DatabaseEngine, DbOptions, PrunePolicy, UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
 };
-use serde_json;
 use std::process::Command;
 use tempfile::TempDir;
 
