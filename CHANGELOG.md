@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-03-21
+
+### Fixed
+- Fixed incomplete Cargo.lock that prevented crates.io publish.
+
 ## [0.4.0] - 2026-03-21
 
 ### Added
@@ -194,6 +199,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.4.1]: https://github.com/Bhensley5/overgraph/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Bhensley5/overgraph/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Bhensley5/overgraph/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Bhensley5/overgraph/compare/v0.1.0...v0.2.0

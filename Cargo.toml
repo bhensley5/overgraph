@@ -3,7 +3,7 @@ members = [".", "overgraph-node", "overgraph-python"]
 
 [package]
 name = "overgraph"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "An absurdly fast embedded graph database. Pure Rust, sub-microsecond reads."
 license = "MIT OR Apache-2.0"
