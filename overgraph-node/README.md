@@ -89,22 +89,24 @@ PROJECT = 2
 CREATED = 10
 
 with OverGraph.open("./my-graph", dense_vector_dimension=384) as db:
-    # Create nodes with embeddings
+    # Embeddings come from your model (sentence-transformers, OpenAI, etc.)
+    # dense: model.encode("Alice is an engineer") -> [f32; 384]
+    # sparse: splade.encode("Alice is an engineer") -> [(token_id, weight), ...]
     alice = db.upsert_node(USER, "user:alice",
         props={"name": "Alice"},
-        dense_vector=[0.1] * 384,
-        sparse_vector=[(42, 0.8), (99, 0.3)])
+        dense_vector=alice_embedding,
+        sparse_vector=alice_sparse)
 
     project = db.upsert_node(PROJECT, "project:overgraph",
-        dense_vector=[0.2] * 384,
-        sparse_vector=[(42, 0.5), (150, 0.9)])
+        dense_vector=project_embedding,
+        sparse_vector=project_sparse)
 
     db.upsert_edge(alice, project, CREATED)
 
     # Hybrid vector search scoped to a graph neighborhood
     hits = db.vector_search("hybrid", k=10,
-        dense_query=[0.15] * 384,
-        sparse_query=[(42, 0.9), (99, 0.5)],
+        dense_query=query_embedding,
+        sparse_query=query_sparse,
         scope_start_node_id=alice,
         scope_max_depth=3)
 
@@ -125,16 +127,18 @@ const db = OverGraph.open('./my-graph', {
   denseVector: { dimension: 384 },
 });
 
-// Create nodes with embeddings
+// Embeddings come from your model (sentence-transformers, OpenAI, etc.)
+// dense: model.encode("Alice is an engineer") -> Float32Array(384)
+// sparse: splade.encode("Alice is an engineer") -> [{ dimension, value }, ...]
 const alice = db.upsertNode(USER, 'user:alice', {
   props: { name: 'Alice' },
-  denseVector: new Array(384).fill(0.1),
-  sparseVector: [{ dimension: 42, value: 0.8 }, { dimension: 99, value: 0.3 }],
+  denseVector: aliceEmbedding,
+  sparseVector: aliceSparse,
 });
 
 const project = db.upsertNode(PROJECT, 'project:overgraph', {
-  denseVector: new Array(384).fill(0.2),
-  sparseVector: [{ dimension: 42, value: 0.5 }, { dimension: 150, value: 0.9 }],
+  denseVector: projectEmbedding,
+  sparseVector: projectSparse,
 });
 
 db.upsertEdge(alice, project, CREATED);
@@ -142,8 +146,8 @@ db.upsertEdge(alice, project, CREATED);
 // Hybrid vector search scoped to a graph neighborhood
 const hits = db.vectorSearch('hybrid', {
   k: 10,
-  denseQuery: new Array(384).fill(0.15),
-  sparseQuery: [{ dimension: 42, value: 0.9 }, { dimension: 99, value: 0.5 }],
+  denseQuery: queryEmbedding,
+  sparseQuery: querySparse,
   scope: { startNodeId: alice, maxDepth: 3 },
 });
 
@@ -173,19 +177,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut db = DatabaseEngine::open(Path::new("./my-graph"), &opts)?;
 
-    // Create nodes with dense + sparse embeddings
+    // Embeddings come from your model (sentence-transformers, OpenAI, etc.)
+    // dense: model.encode("Alice is an engineer") -> Vec<f32> with 384 dims
+    // sparse: splade.encode("Alice is an engineer") -> Vec<(u32, f32)>
     let mut props = BTreeMap::new();
     props.insert("name".into(), PropValue::String("Alice".into()));
     let alice = db.upsert_node(USER, "user:alice", UpsertNodeOptions {
         props,
-        dense_vector: Some(vec![0.1; 384]),
-        sparse_vector: Some(vec![(42, 0.8), (99, 0.3)]),
+        dense_vector: Some(alice_embedding),
+        sparse_vector: Some(alice_sparse),
         ..Default::default()
     })?;
 
     let project = db.upsert_node(PROJECT, "project:overgraph", UpsertNodeOptions {
-        dense_vector: Some(vec![0.2; 384]),
-        sparse_vector: Some(vec![(42, 0.5), (150, 0.9)]),
+        dense_vector: Some(project_embedding),
+        sparse_vector: Some(project_sparse),
         ..Default::default()
     })?;
 
@@ -194,8 +200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Hybrid vector search: dense + sparse with graph scoping
     let hits = db.vector_search(&VectorSearchRequest {
         mode: VectorSearchMode::Hybrid,
-        dense_query: Some(vec![0.15; 384]),
-        sparse_query: Some(vec![(42, 0.9), (99, 0.5)]),
+        dense_query: Some(query_embedding),
+        sparse_query: Some(query_sparse),
         k: 10,                                              // required: 0 returns empty
         type_filter: Some(vec![USER, PROJECT]),               // default: None (no filtering)
         ef_search: Some(200),                                // default: 128
@@ -243,7 +249,7 @@ Both Python and Node.js connectors include full async variants of every API. Pyt
 - **Decay scoring.** Pass a `decay_lambda` to neighbor queries and edge weights are automatically scaled by `exp(-lambda * age_hours)`. Recent connections matter more.
 
 ### Queries and traversal
-- **Neighbors and bounded traversal.** `neighbors()` handles 1-hop expansion; `traverse()` covers deterministic breadth-first traversal across arbitrary depth windows with optional edge-type filtering, emission-only node-type filtering, and traversal-specific pagination.
+- **Neighbors and bounded traversal.** `neighbors()` handles 1-hop expansion and returns normal neighbor entry collections in every connector; `traverse()` covers deterministic breadth-first traversal across arbitrary depth windows with optional edge-type filtering, emission-only node-type filtering, and traversal-specific pagination.
 - **Depth slices without special-case APIs.** Exact depth-2 traversals are expressed as `traverse(start, 2, min_depth=2)`, so 2-hop use cases stay available without a separate public method family.
 - **Top-K neighbors.** Get the K highest-scoring neighbors by weight, recency, or decay-adjusted score.
 - **Personalized PageRank.** Run PPR from seed nodes to find the most relevant nodes in the graph. Rust, Node.js, and Python expose both exact power-iteration PPR and a much faster approximate forward-push mode for seed-centric retrieval workloads.
@@ -251,7 +257,8 @@ Both Python and Node.js connectors include full async variants of every API. Pyt
 - **Shortest path.** BFS (unweighted) or bidirectional Dijkstra (weighted). `is_connected` for fast reachability checks. `all_shortest_paths` when there are ties.
 - **Connected components.** `connected_components()` returns a global WCC labelling (union-find, near-linear). `component_of(node)` returns the members of a single node's component via BFS. Both support edge-type, node-type, and temporal filters.
 - **Degree counts.** Count edges, sum weights, and compute averages without materializing neighbor lists. Batch `degrees` for bulk analysis.
-- **Property search.** Find nodes by `type_id` + property equality. Hash-indexed for O(1) lookup.
+- **Property queries.** `findNodes` and `findNodesPaged` do equality queries. `findNodesRange` and `findNodesRangePaged` do numeric range queries with exact bound and cursor semantics.
+- **Optional property indexes.** Declare equality or numeric range indexes only where they pay off. Use `ensureNodePropertyIndex`, `listNodePropertyIndexes`, and `dropNodePropertyIndex` to manage them. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
 - **Time-range queries.** Find nodes created or updated within a time window. Sorted timestamp index for efficient range scans.
 
 ### Pagination
@@ -275,7 +282,7 @@ OverGraph uses a log-structured storage engine purpose-built from scratch in pur
 
 **Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue unblocked against a fresh memtable. Each segment ships with pre-built adjacency indexes (inbound and outbound) and, when the segment contains vectors, HNSW and sparse posting-list indexes.
 
-**Read path:** Queries check the memtable first (freshest data), then merge results across immutable segments using the per-segment indexes. Because every segment carries its own adjacency index, a neighbor query is a handful of index lookups, not a scan across sorted keys. Vector search follows the same model: memtable candidates are found by exact brute-force scan, segment candidates via HNSW or posting-list indexes, then the engine merges and deduplicates across all sources. Pagination uses early termination to avoid unnecessary work.
+**Read path:** Queries check the memtable first (freshest data), then merge results across immutable segments using the per-segment indexes. Because every segment carries its own adjacency index, a neighbor query is a handful of index lookups, not a scan across sorted keys. Vector search follows the same model: memtable candidates are found by exact brute-force scan, segment candidates via HNSW or posting-list indexes, then the engine merges and deduplicates across all sources. Property equality and numeric range queries stay index-transparent too: if a matching optional property-index declaration is `Ready`, the engine uses the declaration-backed path, otherwise it falls back to a type-scoped scan through the same public API. Pagination uses early termination to avoid unnecessary work.
 
 **Compaction:** A background thread merges older segments together, applying tombstones, prune policies, and deduplication. The compaction path uses metadata sidecars to plan merges and raw-copies winning records without full deserialization, then rebuilds unified indexes from metadata. This includes rebuilding HNSW and sparse posting-list indexes for the merged output. Fewer segments after compaction means fewer index lookups per query, but even before compaction, reads are fast because every segment is self-indexed.
 

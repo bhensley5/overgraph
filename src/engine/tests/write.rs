@@ -881,3 +881,243 @@
             engine.close().unwrap();
         }
     }
+
+    #[test]
+    fn test_node_property_index_ensure_drop_list_and_conflicting_range_domains() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let eq = engine
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        assert_eq!(eq.state, SecondaryIndexState::Building);
+
+        let eq_again = engine
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        assert_eq!(eq_again.index_id, eq.index_id);
+
+        let range = engine
+            .ensure_node_property_index(
+                1,
+                "score",
+                SecondaryIndexKind::Range {
+                    domain: SecondaryIndexRangeDomain::Int,
+                },
+            )
+            .unwrap();
+        assert_eq!(range.state, SecondaryIndexState::Building);
+
+        let indexes = engine.list_node_property_indexes();
+        assert_eq!(indexes.len(), 2);
+        assert_eq!(indexes[0].prop_key, "color");
+        assert_eq!(indexes[1].prop_key, "score");
+
+        let err = engine
+            .ensure_node_property_index(
+                1,
+                "score",
+                SecondaryIndexKind::Range {
+                    domain: SecondaryIndexRangeDomain::Float,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+
+        assert!(engine
+            .drop_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap());
+        assert!(!engine
+            .drop_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap());
+
+        let indexes = engine.list_node_property_indexes();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].index_id, range.index_id);
+
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_node_property_index_retry_failed_clears_error_and_preserves_id() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let created = engine
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        engine.shutdown_secondary_index_worker();
+
+        engine
+            .with_runtime_manifest_write(|manifest| {
+                let entry = manifest
+                    .secondary_indexes
+                    .iter_mut()
+                    .find(|entry| entry.index_id == created.index_id)
+                    .unwrap();
+                entry.state = SecondaryIndexState::Failed;
+                entry.last_error = Some("boom".to_string());
+                Ok(())
+            })
+            .unwrap();
+        engine.rebuild_secondary_index_catalog().unwrap();
+
+        let retried = engine
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        assert_eq!(retried.index_id, created.index_id);
+        assert_eq!(retried.state, SecondaryIndexState::Building);
+        assert!(retried.last_error.is_none());
+
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_ensure_node_property_index_seeds_active_and_immutable_memtables() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let mut frozen_props = BTreeMap::new();
+        frozen_props.insert("status".to_string(), PropValue::String("active".to_string()));
+        frozen_props.insert("age".to_string(), PropValue::Int(30));
+        let frozen_id = engine
+            .upsert_node(
+                1,
+                "frozen",
+                UpsertNodeOptions {
+                    props: frozen_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        engine.freeze_memtable().unwrap();
+
+        let mut active_props = BTreeMap::new();
+        active_props.insert("status".to_string(), PropValue::String("active".to_string()));
+        active_props.insert("age".to_string(), PropValue::Int(35));
+        let active_id = engine
+            .upsert_node(
+                1,
+                "active",
+                UpsertNodeOptions {
+                    props: active_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mut bad_props = BTreeMap::new();
+        bad_props.insert("status".to_string(), PropValue::String("active".to_string()));
+        bad_props.insert("age".to_string(), PropValue::String("old".to_string()));
+        let bad_id = engine
+            .upsert_node(
+                1,
+                "bad",
+                UpsertNodeOptions {
+                    props: bad_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let eq = engine
+            .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+            .unwrap();
+        let range = engine
+            .ensure_node_property_index(
+                1,
+                "age",
+                SecondaryIndexKind::Range {
+                    domain: SecondaryIndexRangeDomain::Int,
+                },
+            )
+            .unwrap();
+
+        let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
+        let active_eq_ids = engine
+            .active_memtable()
+            .secondary_eq_state()
+            .get(&eq.index_id)
+            .unwrap()
+            .get(&status_hash)
+            .unwrap();
+        assert!(active_eq_ids.contains(&active_id));
+        assert!(active_eq_ids.contains(&bad_id));
+
+        let frozen_eq_ids = engine
+            .immutable_memtable(0)
+            .secondary_eq_state()
+            .get(&eq.index_id)
+            .unwrap()
+            .get(&status_hash)
+            .unwrap();
+        assert!(frozen_eq_ids.contains(&frozen_id));
+
+        let active_range = engine
+            .active_memtable()
+            .secondary_range_state()
+            .get(&range.index_id)
+            .unwrap();
+        assert!(active_range.contains(&(35u64 ^ (1u64 << 63), active_id)));
+        assert!(!active_range.iter().any(|&(_, node_id)| node_id == bad_id));
+
+        let frozen_range = engine
+            .immutable_memtable(0)
+            .secondary_range_state()
+            .get(&range.index_id)
+            .unwrap();
+        assert!(frozen_range.contains(&(30u64 ^ (1u64 << 63), frozen_id)));
+
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_secondary_index_seeding_refreshes_immutable_memtable_bytes_cache() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let mut props = BTreeMap::new();
+        props.insert("status".to_string(), PropValue::String("active".to_string()));
+        props.insert("age".to_string(), PropValue::Int(30));
+        engine
+            .upsert_node(
+                1,
+                "frozen",
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        engine.freeze_memtable().unwrap();
+
+        let before = engine.stats().immutable_memtable_bytes;
+        let info = engine
+            .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+            .unwrap();
+        let after = engine.stats().immutable_memtable_bytes;
+        let actual_after: usize = (0..engine.immutable_epoch_count())
+            .map(|idx| engine.immutable_memtable(idx).estimated_size())
+            .sum();
+        assert_eq!(after, actual_after);
+        assert!(after >= before);
+
+        engine
+            .drop_node_property_index(1, "status", SecondaryIndexKind::Equality)
+            .unwrap();
+        let after_drop = engine.stats().immutable_memtable_bytes;
+        let actual_after_drop: usize = (0..engine.immutable_epoch_count())
+            .map(|idx| engine.immutable_memtable(idx).estimated_size())
+            .sum();
+        assert_eq!(after_drop, actual_after_drop);
+        assert!(engine
+            .list_node_property_indexes()
+            .iter()
+            .all(|entry| entry.index_id != info.index_id));
+
+        engine.close().unwrap();
+    }

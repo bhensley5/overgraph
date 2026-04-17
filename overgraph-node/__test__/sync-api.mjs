@@ -278,7 +278,7 @@ describe('neighbors / traverse', () => {
     const result = db.neighbors(center); // direction defaults to outgoing
     assert.equal(typeof result.length, 'number');
     assert.equal(result.length, 2);
-    const nodeSet = new Set([result.nodeId(0), result.nodeId(1)]);
+    const nodeSet = new Set([result[0].nodeId, result[1].nodeId]);
     assert.ok(nodeSet.has(n1));
     assert.ok(nodeSet.has(n2));
   });
@@ -286,7 +286,17 @@ describe('neighbors / traverse', () => {
   it('neighbors with type filter', () => {
     const result = db.neighbors(center, { direction: 'outgoing', typeFilter: [10] });
     assert.equal(result.length, 1);
-    assert.equal(result.nodeId(0), n1);
+    assert.equal(result[0].nodeId, n1);
+  });
+
+  it('topKNeighbors returns plain neighbor entry arrays', () => {
+    const result = db.topKNeighbors(center, 2, { direction: 'outgoing', scoring: 'weight' });
+    assert.ok(Array.isArray(result));
+    assert.equal(result.length, 2);
+    assert.equal(result[0].nodeId, n2);
+    assert.equal(result[0].weight, 2);
+    assert.equal(result[1].nodeId, n1);
+    assert.equal(result[1].weight, 1);
   });
 
   it('neighbors with limit', () => {
@@ -297,7 +307,7 @@ describe('neighbors / traverse', () => {
   it('neighbors incoming', () => {
     const result = db.neighbors(n1, { direction: 'incoming' });
     assert.equal(result.length, 1);
-    assert.equal(result.nodeId(0), center);
+    assert.equal(result[0].nodeId, center);
   });
 
   it('neighbors both', () => {
@@ -336,8 +346,8 @@ describe('neighbors / traverse', () => {
     const result = db.neighbors(center, { direction: 'outgoing' });
     assert.equal(result.length, 2);
     // All weights should be numbers > 0
-    for (let i = 0; i < result.length; i++) {
-      const w = result.weight(i);
+    for (const entry of result) {
+      const w = entry.weight;
       assert.equal(typeof w, 'number');
       assert.ok(w > 0);
     }

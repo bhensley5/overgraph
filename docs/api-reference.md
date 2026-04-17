@@ -53,8 +53,17 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
   - [get_edges_by_type](#get_edges_by_type)
   - [count_nodes_by_type](#count_nodes_by_type)
   - [count_edges_by_type](#count_edges_by_type)
+- [Property Index Management](#property-index-management)
+  - [ensure_node_property_index](#ensure_node_property_index)
+  - [drop_node_property_index](#drop_node_property_index)
+  - [list_node_property_indexes](#list_node_property_indexes)
+  - [NodePropertyIndexInfo](#nodepropertyindexinfo)
+  - [PropertyRangeBound](#propertyrangebound)
+  - [PropertyRangeCursor](#propertyrangecursor)
+  - [PropertyRangePageResult](#propertyrangepageresult)
 - [Property & Time Queries](#property--time-queries)
   - [find_nodes](#find_nodes)
+  - [find_nodes_range](#find_nodes_range)
   - [find_nodes_by_time_range](#find_nodes_by_time_range)
 - [Pagination](#pagination)
   - [nodes_by_type_paged](#nodes_by_type_paged)
@@ -62,6 +71,7 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
   - [get_nodes_by_type_paged](#get_nodes_by_type_paged)
   - [get_edges_by_type_paged](#get_edges_by_type_paged)
   - [find_nodes_paged](#find_nodes_paged)
+  - [find_nodes_range_paged](#find_nodes_range_paged)
   - [find_nodes_by_time_range_paged](#find_nodes_by_time_range_paged)
 - [Neighbor Queries](#neighbor-queries)
   - [neighbors](#neighbors)
@@ -1250,7 +1260,256 @@ Returns the count of edges of a given type. Same pattern as `count_nodes_by_type
 
 ---
 
+## Property Index Management
+
+Property indexes are optional declarations on node properties. Public query methods stay the same whether or not you declare an index.
+
+Lifecycle rules:
+- `ensure_node_property_index` registers an equality or numeric range declaration and starts background build work when needed.
+- `list_node_property_indexes` exposes declaration kind, range domain, lifecycle state, and any last error.
+- `find_nodes`, `find_nodes_paged`, `find_nodes_range`, and `find_nodes_range_paged` use declaration-backed execution only when a matching declaration is `Ready`.
+- If a declaration is absent, `Building`, `Failed`, or cannot be used for a specific lookup, OverGraph falls back to the same public query API for that call.
+
+### ensure_node_property_index
+
+Ensures an optional secondary index declaration for a node property.
+
+**Rust**
+```rust
+let eq = db.ensure_node_property_index(
+    USER,
+    "role",
+    SecondaryIndexKind::Equality,
+)?;
+
+let range = db.ensure_node_property_index(
+    USER,
+    "score",
+    SecondaryIndexKind::Range {
+        domain: SecondaryIndexRangeDomain::Int,
+    },
+)?;
+```
+
+**Node.js**
+```javascript
+const eq = db.ensureNodePropertyIndex(USER, 'role', { kind: 'equality' });
+
+const range = db.ensureNodePropertyIndex(USER, 'score', {
+  kind: 'range',
+  domain: 'int',
+});
+```
+
+**Python**
+```python
+eq = db.ensure_node_property_index(USER, "role", "equality")
+
+range_info = db.ensure_node_property_index(
+    USER,
+    "score",
+    "range",
+    domain="int",
+)
+```
+
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Description |
+|-----------|------|---------|--------|----------|-------------|
+| type_id | `u32` | `number` | `int` | Yes | Restrict the declaration to this node type. |
+| prop_key | `&str` | `string` | `str` | Yes | Property key to declare. |
+| kind | `SecondaryIndexKind` | `{ kind: string, domain?: string }` | `str` plus optional `domain=` | Yes | Equality declaration or numeric range declaration. |
+
+#### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<NodePropertyIndexInfo, EngineError>` | `JsNodePropertyIndexInfo` | `PyNodePropertyIndexInfo` |
+
+The current declaration info.
+
+#### Behavior
+
+- Equality declarations use `SecondaryIndexKind::Equality`, `{ kind: 'equality' }`, or `"equality"`.
+- Range declarations use `SecondaryIndexKind::Range { domain: ... }`, `{ kind: 'range', domain: 'int' | 'uint' | 'float' }`, or `"range"` plus `domain="int" | "uint" | "float"`.
+- Re-ensuring an existing declaration returns the existing declaration info.
+- Re-ensuring a `Failed` declaration retries it by moving it back to `Building`.
+- A `(type_id, prop_key)` pair may have at most one range declaration domain. Trying to ensure the same property with a different range domain returns an error.
+- A declaration becoming `Ready` is what enables declaration-backed routing. Callers do not switch to a different query method.
+
+---
+
+### drop_node_property_index
+
+Drops an optional node-property secondary index declaration.
+
+**Rust**
+```rust
+let removed = db.drop_node_property_index(
+    USER,
+    "role",
+    SecondaryIndexKind::Equality,
+)?;
+```
+
+**Node.js**
+```javascript
+const removed = db.dropNodePropertyIndex(USER, 'role', { kind: 'equality' });
+```
+
+**Python**
+```python
+removed = db.drop_node_property_index(USER, "role", "equality")
+```
+
+#### Parameters
+
+Same parameters and kind values as [`ensure_node_property_index`](#ensure_node_property_index).
+
+#### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<bool, EngineError>` | `boolean` | `bool` |
+
+`true` if a declaration existed and was removed, `false` otherwise.
+
+#### Behavior
+
+- Dropping a declaration removes the optional declaration state and future declaration-backed routing for that property.
+- Property queries continue to work after a drop. They fall back to scan through the same public query APIs.
+
+---
+
+### list_node_property_indexes
+
+Lists all optional node-property secondary index declarations.
+
+**Rust**
+```rust
+let indexes = db.list_node_property_indexes();
+```
+
+**Node.js**
+```javascript
+const indexes = db.listNodePropertyIndexes();
+```
+
+**Python**
+```python
+indexes = db.list_node_property_indexes()
+```
+
+#### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Vec<NodePropertyIndexInfo>` | `Array<JsNodePropertyIndexInfo>` | `list[PyNodePropertyIndexInfo]` |
+
+One entry per declaration.
+
+---
+
+### NodePropertyIndexInfo
+
+User-facing declaration information returned by [`ensure_node_property_index`](#ensure_node_property_index) and [`list_node_property_indexes`](#list_node_property_indexes).
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| index_id | `u64` | `indexId: number` | `index_id: int` | Stable declaration ID. |
+| type_id | `u32` | `typeId: number` | `type_id: int` | Declared node type. |
+| prop_key | `String` | `propKey: string` | `prop_key: str` | Declared property key. |
+| kind | `SecondaryIndexKind` | `kind: string` | `kind: str` | `equality` or `range`. |
+| domain | Encoded in `SecondaryIndexKind::Range` | `domain?: string` | `domain: str \| None` | Range domain for range declarations. Omitted / `None` for equality. |
+| state | `SecondaryIndexState` | `state: string` | `state: str` | `building`, `ready`, or `failed`. |
+| last_error | `Option<String>` | `lastError?: string` | `last_error: str \| None` | Most recent build or validation failure, if any. |
+
+State meanings:
+- `building`: the declaration exists, but the declaration-backed path is not live yet.
+- `ready`: the declaration-backed path has full live coverage and may be used by matching queries.
+- `failed`: the declaration could not be built or validated. Matching queries fall back to scan until the declaration is retried or dropped.
+
+---
+
+### PropertyRangeBound
+
+Bound object for [`find_nodes_range`](#find_nodes_range) and [`find_nodes_range_paged`](#find_nodes_range_paged).
+
+**Rust**
+```rust
+let lower = PropertyRangeBound::Included(PropValue::Int(10));
+let upper = PropertyRangeBound::Excluded(PropValue::Int(20));
+```
+
+**Node.js**
+```javascript
+const lower = { value: 10, inclusive: true, domain: 'int' };
+const upper = { value: 20, inclusive: false, domain: 'int' };
+```
+
+**Python**
+```python
+lower = PyPropertyRangeBound(10, domain="int")
+upper = PyPropertyRangeBound(20, inclusive=False, domain="int")
+```
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| value | `PropValue` | `value: number` | `value: int \| float` | Numeric bound value. |
+| inclusive | Encoded by enum variant | `inclusive?: boolean` | `inclusive: bool` | Inclusive when `true`, exclusive when `false`. |
+| domain | Inferred from `PropValue` | `domain: string` | `domain: str` | Required in Node.js and Python. One of `int`, `uint`, or `float`. |
+
+Notes:
+- Range queries are domain-specific. There is no implicit coercion between `int`, `uint`, and `float`.
+- Both bounds must agree on domain. Paged range cursors must use the same domain too.
+
+---
+
+### PropertyRangeCursor
+
+Cursor object for [`find_nodes_range_paged`](#find_nodes_range_paged). The cursor key is `(value, node_id)`.
+
+**Rust**
+```rust
+PropertyRangeCursor {
+    value: PropValue::Int(20),
+    node_id: 42,
+}
+```
+
+**Node.js**
+```javascript
+{ value: 20, nodeId: 42, domain: 'int' }
+```
+
+**Python**
+```python
+PyPropertyRangeCursor(20, 42, domain="int")
+```
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| value | `PropValue` | `value: number` | `value: int \| float` | Last value returned on the previous page. |
+| node_id | `u64` | `nodeId: number` | `node_id: int` | Last node ID returned at that value. |
+| domain | Inferred from `value` | `domain: string` | `domain: str` | Required in Node.js and Python so numeric domains stay explicit. |
+
+---
+
+### PropertyRangePageResult
+
+Result object returned by [`find_nodes_range_paged`](#find_nodes_range_paged).
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| items | `Vec<u64>` | `Float64Array` | `IdArray` | Node IDs in range order for this page. |
+| next_cursor | `Option<PropertyRangeCursor>` | `nextCursor?: JsPropertyRangeCursor` | `next_cursor: PyPropertyRangeCursor \| None` | Cursor for the next page. Omitted / `None` on the last page. |
+
+---
+
 ## Property & Time Queries
+
+Equality and numeric range queries are index-transparent. Callers do not choose indexed versus fallback execution. If a matching optional declaration is `Ready`, OverGraph uses it. Otherwise it scans through the same public query method.
 
 ### find_nodes
 
@@ -1258,11 +1517,11 @@ Finds all nodes of a given type where a specific property matches a given value 
 
 **Rust**
 ```rust
-let ids = db.find_nodes(&FindNodesQuery {
-    type_id: USER,
-    prop_key: "role".into(),
-    prop_value: PropValue::String("admin".into()),
-})?;
+let ids = db.find_nodes(
+    USER,
+    "role",
+    &PropValue::String("admin".into()),
+)?;
 ```
 
 **Node.js**
@@ -1280,7 +1539,7 @@ ids = db.find_nodes(USER, "role", "admin")  # IdArray
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
 | type_id | `u32` | `number` | `int` | Yes | Restrict search to this node type. |
-| prop_key | `String` | `string` | `str` | Yes | Property key to match on. |
+| prop_key | `&str` | `string` | `str` | Yes | Property key to match on. |
 | prop_value | `PropValue` | `any` | `Any` | Yes | Exact value to match. Type must match (string "1" does not match integer 1). |
 
 #### Returns
@@ -1289,7 +1548,71 @@ ids = db.find_nodes(USER, "role", "admin")  # IdArray
 |------|---------|--------|
 | `Result<Vec<u64>, EngineError>` | `Float64Array` | `IdArray` |
 
-Matching node IDs. Uses the property index for acceleration.
+Matching node IDs. If a matching equality declaration is `Ready`, OverGraph uses the declaration-backed index path. Otherwise it scans nodes of the requested type.
+
+---
+
+### find_nodes_range
+
+Finds all nodes of a given type where a numeric property falls within a range.
+
+Results are ordered by `(property_value asc, node_id asc)`.
+
+**Rust**
+```rust
+let ids = db.find_nodes_range(
+    USER,
+    "score",
+    Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+    Some(&PropertyRangeBound::Excluded(PropValue::Int(20))),
+)?;
+```
+
+**Node.js**
+```javascript
+const ids = db.findNodesRange(
+  USER,
+  'score',
+  { value: 10, inclusive: true, domain: 'int' },
+  { value: 20, inclusive: false, domain: 'int' },
+);
+```
+
+**Python**
+```python
+ids = db.find_nodes_range(
+    USER,
+    "score",
+    PyPropertyRangeBound(10, domain="int"),
+    PyPropertyRangeBound(20, inclusive=False, domain="int"),
+)
+```
+
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Description |
+|-----------|------|---------|--------|----------|-------------|
+| type_id | `u32` | `number` | `int` | Yes | Restrict search to this node type. |
+| prop_key | `&str` | `string` | `str` | Yes | Numeric property key to query. |
+| lower | `Option<&PropertyRangeBound>` | `JsPropertyRangeBound \| null \| undefined` | `PyPropertyRangeBound \| None` | No | Lower bound. Omit for an unbounded start. |
+| upper | `Option<&PropertyRangeBound>` | `JsPropertyRangeBound \| null \| undefined` | `PyPropertyRangeBound \| None` | No | Upper bound. Omit for an unbounded end. |
+
+#### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<Vec<u64>, EngineError>` | `Float64Array` | `IdArray` |
+
+Matching node IDs in range order.
+
+#### Behavior
+
+- At least one bound is required.
+- Numeric domains are exact. `int`, `uint`, and `float` are separate query domains.
+- If both bounds are present, they must use the same domain.
+- If a matching range declaration is `Ready`, OverGraph uses the declaration-backed range path.
+- If no matching `Ready` declaration exists, OverGraph falls back to a scan of nodes of the requested type.
+- Invalid bound combinations return an error.
 
 ---
 
@@ -1328,8 +1651,10 @@ Node IDs matching the time range. Uses the timestamp index.
 All paginated methods use **keyset (cursor-based) pagination**, not offset-based. This provides stable results even when data is inserted between pages.
 
 The pattern is the same across all paginated methods:
-- Pass `limit` for the page size and `after` as the cursor (a node or edge ID).
-- The result includes `items` (the page data) and `next_cursor` (`None`/`null` when there are no more pages).
+- Pass `limit` for the page size and `after` as the cursor.
+- Most paginated methods use an ID cursor.
+- `find_nodes_range_paged` uses a structured range cursor keyed by `(value, node_id)`.
+- The result includes `items` and `next_cursor` (`None`/`null` when there are no more pages).
 
 ### nodes_by_type_paged
 
@@ -1412,7 +1737,9 @@ Paginated version of [`find_nodes`](#find_nodes).
 
 ```rust
 let page = db.find_nodes_paged(
-    &FindNodesQuery { type_id: USER, prop_key: "role".into(), prop_value: PropValue::String("admin".into()) },
+    USER,
+    "role",
+    &PropValue::String("admin".into()),
     &PageRequest { limit: Some(50), after: None },
 )?;
 ```
@@ -1424,6 +1751,74 @@ const page = db.findNodesPaged(USER, 'role', 'admin', { limit: 50 });
 ```python
 page = db.find_nodes_paged(USER, "role", "admin", limit=50)
 ```
+
+---
+
+### find_nodes_range_paged
+
+Paginated version of [`find_nodes_range`](#find_nodes_range).
+
+**Rust**
+```rust
+let page = db.find_nodes_range_paged(
+    USER,
+    "score",
+    Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+    Some(&PropertyRangeBound::Excluded(PropValue::Int(20))),
+    &PropertyRangePageRequest {
+        limit: Some(50),
+        after: None,
+    },
+)?;
+```
+
+**Node.js**
+```javascript
+const page = db.findNodesRangePaged(
+  USER,
+  'score',
+  { value: 10, inclusive: true, domain: 'int' },
+  { value: 20, inclusive: false, domain: 'int' },
+  { limit: 50 },
+);
+```
+
+**Python**
+```python
+page = db.find_nodes_range_paged(
+    USER,
+    "score",
+    PyPropertyRangeBound(10, domain="int"),
+    PyPropertyRangeBound(20, inclusive=False, domain="int"),
+    limit=50,
+)
+```
+
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Default | Description |
+|-----------|------|---------|--------|----------|---------|-------------|
+| type_id | `u32` | `number` | `int` | Yes | — | Restrict search to this node type. |
+| prop_key | `&str` | `string` | `str` | Yes | — | Numeric property key to query. |
+| lower | `Option<&PropertyRangeBound>` | `JsPropertyRangeBound \| null \| undefined` | `PyPropertyRangeBound \| None` | No | Unbounded | Lower bound. |
+| upper | `Option<&PropertyRangeBound>` | `JsPropertyRangeBound \| null \| undefined` | `PyPropertyRangeBound \| None` | No | Unbounded | Upper bound. |
+| limit | `Option<usize>` | `number` | `int` | No | Unlimited | Maximum items per page. |
+| after | `Option<PropertyRangeCursor>` | `JsPropertyRangeCursor` | `PyPropertyRangeCursor` | No | `None` | Cursor from a previous range page. Reuse the same query arguments when resuming. |
+
+#### Returns: PropertyRangePageResult
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| items | `Vec<u64>` | `Float64Array` | `IdArray` | Node IDs in range order for this page. |
+| next_cursor | `Option<PropertyRangeCursor>` | `JsPropertyRangeCursor \| null \| undefined` | `PyPropertyRangeCursor \| None` | Cursor for the next page, or no cursor on the last page. |
+
+#### Behavior
+
+- At least one bound is required.
+- Numeric domains are exact. `int`, `uint`, and `float` are separate query domains.
+- If both bounds are present, they must use the same domain.
+- When resuming with `after`, keep the same `type_id`, `prop_key`, bounds, and domain.
+- Invalid bound or cursor combinations return an error.
 
 ---
 
@@ -1470,11 +1865,9 @@ const list = db.neighbors(nodeId, {
   limit: 10,
 });
 
-for (let i = 0; i < list.length; i++) {
-  console.log(list.nodeId(i), list.edgeId(i), list.weight(i));
+for (const n of list) {
+  console.log(n.nodeId, n.edgeId, n.weight);
 }
-// Or materialize all at once:
-const arr = list.toArray();
 ```
 
 **Python**
@@ -1506,7 +1899,7 @@ for entry in entries:
 | valid_from | `i64` | `number` | `int` | Edge validity start (ms). |
 | valid_to | `i64` | `number` | `int` | Edge validity end (ms). |
 
-**Node.js `JsNeighborList`**: A lazy wrapper for performance. Access individual fields by index (`list.nodeId(i)`, `list.weight(i)`) or materialize with `list.toArray()`. Property `list.length` returns the count.
+**Node.js**: Returns `JsNeighborEntry[]` as plain objects, so you can use normal array access like `list[i].nodeId`.
 
 #### Performance
 
@@ -1520,7 +1913,8 @@ Paginated version of [`neighbors`](#neighbors).
 
 ```javascript
 let page = db.neighborsPaged(nodeId, { direction: 'outgoing', limit: 20 });
-// page.items: JsNeighborList, page.nextCursor: number | null
+// page.items: JsNeighborEntry[], page.nextCursor: number | null
+console.log(page.items[0].nodeId);
 
 // Next page:
 page = db.neighborsPaged(nodeId, { direction: 'outgoing', limit: 20, after: page.nextCursor });
@@ -1555,7 +1949,8 @@ let results = db.neighbors_batch(&[1, 2, 3], &NeighborOptions::default())?;
 **Node.js**
 ```javascript
 const results = db.neighborsBatch([1, 2, 3], { direction: 'outgoing' });
-// results: { queryNodeId: number, neighbors: JsNeighborList }[]
+// results: { queryNodeId: number, neighbors: JsNeighborEntry[] }[]
+console.log(results[0].neighbors[0].nodeId);
 ```
 
 **Python**
@@ -1599,6 +1994,7 @@ const top = db.topKNeighbors(nodeId, 5, {
   direction: 'outgoing',
   scoring: 'weight',
 });
+console.log(top[0].nodeId, top[0].weight);
 ```
 
 **Python**
@@ -2835,7 +3231,7 @@ const node = await db.getNodeAsync(42);
 
 Async methods run on the libuv thread pool. Write operations acquire an exclusive lock; read operations acquire a shared lock (allowing concurrent reads).
 
-**Available async methods:** `closeAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByTypeAsync`, `edgesByTypeAsync`, `getNodesByTypeAsync`, `getEdgesByTypeAsync`, `countNodesByTypeAsync`, `countEdgesByTypeAsync`, `nodesByTypePagedAsync`, `edgesByTypePagedAsync`, `getNodesByTypePagedAsync`, `getEdgesByTypePagedAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
+**Available async methods:** `closeAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `ensureNodePropertyIndexAsync`, `dropNodePropertyIndexAsync`, `listNodePropertyIndexesAsync`, `findNodesRangeAsync`, `findNodesRangePagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByTypeAsync`, `edgesByTypeAsync`, `getNodesByTypeAsync`, `getEdgesByTypeAsync`, `countNodesByTypeAsync`, `countEdgesByTypeAsync`, `nodesByTypePagedAsync`, `edgesByTypePagedAsync`, `getNodesByTypePagedAsync`, `getEdgesByTypePagedAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
 
 ### Python
 
@@ -2889,7 +3285,11 @@ asyncio.run(main())
 | | `get_edges_by_type` | All edge records of a type |
 | | `count_nodes_by_type` | Count nodes of a type |
 | | `count_edges_by_type` | Count edges of a type |
+| **Property Indexes** | `ensure_node_property_index` | Declare optional equality or range index |
+| | `drop_node_property_index` | Remove optional property index declaration |
+| | `list_node_property_indexes` | Inspect declaration state |
 | | `find_nodes` | Property search |
+| | `find_nodes_range` | Numeric property range search |
 | | `find_nodes_by_time_range` | Time range search |
 | **Pagination** | `*_paged` | Paginated variants |
 | **Neighbors** | `neighbors` | Immediate neighbors |

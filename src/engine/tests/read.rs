@@ -1815,6 +1815,589 @@ fn test_find_nodes_update_changes_index() {
     engine.close().unwrap();
 }
 
+#[test]
+fn test_find_nodes_fallback_routes_and_filters_latest_visible_records() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let red = PropValue::String("red".to_string());
+    let blue = PropValue::String("blue".to_string());
+
+    let mut red_props = BTreeMap::new();
+    red_props.insert("color".to_string(), red.clone());
+    let a = engine
+        .upsert_node(
+            1,
+            "seg_update",
+            UpsertNodeOptions {
+                props: red_props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "seg_keep",
+            UpsertNodeOptions {
+                props: red_props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let mut blue_props = BTreeMap::new();
+    blue_props.insert("color".to_string(), blue);
+    assert_eq!(
+        engine
+            .upsert_node(
+                1,
+                "seg_update",
+                UpsertNodeOptions {
+                    props: blue_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        a
+    );
+    let c = engine
+        .upsert_node(
+            1,
+            "imm_delete",
+            UpsertNodeOptions {
+                props: red_props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.freeze_memtable().unwrap();
+
+    let d = engine
+        .upsert_node(
+            1,
+            "active_keep",
+            UpsertNodeOptions {
+                props: red_props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            1,
+            "active_pruned",
+            UpsertNodeOptions {
+                props: red_props,
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.delete_node(c).unwrap();
+    engine
+        .set_prune_policy(
+            "light",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.5),
+                type_id: None,
+            },
+        )
+        .unwrap();
+
+    engine.reset_property_query_routes();
+    let mut results = engine.find_nodes(1, "color", &red).unwrap();
+    results.sort_unstable();
+    assert_eq!(results, vec![b, d]);
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 1);
+    assert_eq!(routes.equality_index_lookup, 0);
+
+    let page = engine
+        .find_nodes_paged(
+            1,
+            "color",
+            &red,
+            &PageRequest {
+                limit: Some(10),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.items, vec![b, d]);
+    assert!(page.next_cursor.is_none());
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 2);
+    assert_eq!(routes.equality_index_lookup, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_building_declaration_still_uses_fallback() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let red = PropValue::String("red".to_string());
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let a = engine
+        .upsert_node(
+            1,
+            "a",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = engine
+        .upsert_node(
+            1,
+            "b",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let entry = SecondaryIndexManifestEntry {
+        index_id: 1,
+        target: SecondaryIndexTarget::NodeProperty {
+            type_id: 1,
+            prop_key: "color".to_string(),
+        },
+        kind: SecondaryIndexKind::Equality,
+        state: SecondaryIndexState::Building,
+        last_error: None,
+    };
+    engine
+        .with_runtime_manifest_write(|manifest| {
+            manifest.secondary_indexes.push(entry.clone());
+            manifest.next_secondary_index_id = 2;
+            Ok(())
+        })
+        .unwrap();
+    engine.rebuild_secondary_index_catalog().unwrap();
+    engine.seed_secondary_index_entry(&entry).unwrap();
+
+    let info = engine
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|info| info.index_id == entry.index_id)
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Building);
+
+    engine.reset_property_query_routes();
+    let mut results = engine.find_nodes(1, "color", &red).unwrap();
+    results.sort_unstable();
+    assert_eq!(results, vec![a, b]);
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 1);
+    assert_eq!(routes.equality_index_lookup, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_ready_declaration_uses_index_lookup_across_sources() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let red = PropValue::String("red".to_string());
+
+    let mut seg_props = BTreeMap::new();
+    seg_props.insert("color".to_string(), red.clone());
+    let seg_id = engine
+        .upsert_node(
+            1,
+            "seg",
+            UpsertNodeOptions {
+                props: seg_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let mut imm_props = BTreeMap::new();
+    imm_props.insert("color".to_string(), red.clone());
+    let imm_id = engine
+        .upsert_node(
+            1,
+            "imm",
+            UpsertNodeOptions {
+                props: imm_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.freeze_memtable().unwrap();
+
+    let mut active_props = BTreeMap::new();
+    active_props.insert("color".to_string(), red.clone());
+    let active_id = engine
+        .upsert_node(
+            1,
+            "active",
+            UpsertNodeOptions {
+                props: active_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let info = engine
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    let ready = wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    assert_eq!(ready.index_id, info.index_id);
+
+    engine.reset_property_query_routes();
+    let results = engine.find_nodes(1, "color", &red).unwrap();
+    assert_eq!(results, vec![seg_id, imm_id, active_id]);
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    let all_page = engine
+        .find_nodes_paged(1, "color", &red, &PageRequest::default())
+        .unwrap();
+    assert_eq!(all_page.items, results);
+    assert!(all_page.next_cursor.is_none());
+
+    let first_page = engine
+        .find_nodes_paged(
+            1,
+            "color",
+            &red,
+            &PageRequest {
+                limit: Some(2),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(first_page.items, vec![seg_id, imm_id]);
+    assert_eq!(first_page.next_cursor, Some(imm_id));
+
+    let second_page = engine
+        .find_nodes_paged(
+            1,
+            "color",
+            &red,
+            &PageRequest {
+                limit: Some(2),
+                after: first_page.next_cursor,
+            },
+        )
+        .unwrap();
+    assert_eq!(second_page.items, vec![active_id]);
+    assert!(second_page.next_cursor.is_none());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 4);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let red = PropValue::String("red".to_string());
+    let blue = PropValue::String("blue".to_string());
+
+    let mut red_props = BTreeMap::new();
+    red_props.insert("color".to_string(), red.clone());
+    let node_id = engine
+        .upsert_node(
+            1,
+            "mutable",
+            UpsertNodeOptions {
+                props: red_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut blue_props = BTreeMap::new();
+    blue_props.insert("color".to_string(), blue.clone());
+    let blue_id = engine
+        .upsert_node(
+            1,
+            "blue-only",
+            UpsertNodeOptions {
+                props: blue_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    engine.flush().unwrap();
+
+    let info = engine
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    let ready = wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    assert_eq!(ready.index_id, info.index_id);
+
+    let seg_dir = crate::segment_writer::segment_dir(&db_path, engine.segments[0].segment_id);
+    let mut tampered_groups = std::collections::BTreeMap::new();
+    tampered_groups.insert(hash_prop_value(&red), vec![node_id, blue_id]);
+    crate::segment_writer::write_node_prop_eq_sidecar_to_path(
+        &crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id),
+        &tampered_groups,
+    )
+    .unwrap();
+
+    let mut updated_props = BTreeMap::new();
+    updated_props.insert("color".to_string(), blue.clone());
+    assert_eq!(
+        engine
+            .upsert_node(
+                1,
+                "mutable",
+                UpsertNodeOptions {
+                    props: updated_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        node_id
+    );
+
+    engine.reset_property_query_routes();
+    assert!(engine.find_nodes(1, "color", &red).unwrap().is_empty());
+    assert_eq!(engine.find_nodes(1, "color", &blue).unwrap(), vec![node_id]);
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 2);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_ready_declaration_respects_prune_policies() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let red = PropValue::String("red".to_string());
+    let mut red_props = BTreeMap::new();
+    red_props.insert("color".to_string(), red.clone());
+
+    let keep_id = engine
+        .upsert_node(
+            1,
+            "keep",
+            UpsertNodeOptions {
+                props: red_props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let pruned_id = engine
+        .upsert_node(
+            1,
+            "pruned",
+            UpsertNodeOptions {
+                props: red_props,
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    engine
+        .set_prune_policy(
+            "light",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.5),
+                type_id: None,
+            },
+        )
+        .unwrap();
+
+    let info = engine
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    engine.reset_property_query_routes();
+    assert_eq!(engine.find_nodes(1, "color", &red).unwrap(), vec![keep_id]);
+
+    let all_page = engine
+        .find_nodes_paged(1, "color", &red, &PageRequest::default())
+        .unwrap();
+    assert_eq!(all_page.items, vec![keep_id]);
+    assert!(all_page.next_cursor.is_none());
+
+    let first_page = engine
+        .find_nodes_paged(
+            1,
+            "color",
+            &red,
+            &PageRequest {
+                limit: Some(10),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(first_page.items, vec![keep_id]);
+    assert!(first_page.next_cursor.is_none());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 3);
+
+    assert_ne!(keep_id, pruned_id);
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_ready_declaration_keeps_revived_same_id_after_tombstone() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let red = PropValue::String("red".to_string());
+    let mut red_props = BTreeMap::new();
+    red_props.insert("color".to_string(), red.clone());
+
+    let make_node = |updated_at: i64, key: &str| NodeRecord {
+        id: 7,
+        type_id: 1,
+        key: key.to_string(),
+        props: red_props.clone(),
+        created_at: updated_at,
+        updated_at,
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+        last_write_seq: 0,
+    };
+
+    engine
+        .write_op(&WalOp::UpsertNode(make_node(1_000, "older-segment")))
+        .unwrap();
+    engine.flush().unwrap();
+
+    engine
+        .write_op(&WalOp::DeleteNode {
+            id: 7,
+            deleted_at: 2_000,
+        })
+        .unwrap();
+    engine.flush().unwrap();
+
+    engine
+        .write_op(&WalOp::UpsertNode(make_node(3_000, "revived-active")))
+        .unwrap();
+
+    let info = engine
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    engine.reset_property_query_routes();
+    assert_eq!(engine.find_nodes(1, "color", &red).unwrap(), vec![7]);
+
+    let page = engine
+        .find_nodes_paged(
+            1,
+            "color",
+            &red,
+            &PageRequest {
+                limit: Some(10),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.items, vec![7]);
+    assert!(page.next_cursor.is_none());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 2);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_ready_declaration_filters_same_id_type_change() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let red = PropValue::String("red".to_string());
+    let mut red_props = BTreeMap::new();
+    red_props.insert("color".to_string(), red.clone());
+
+    let make_node = |type_id: u32, updated_at: i64, key: &str| NodeRecord {
+        id: 9,
+        type_id,
+        key: key.to_string(),
+        props: red_props.clone(),
+        created_at: updated_at,
+        updated_at,
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+        last_write_seq: 0,
+    };
+
+    engine
+        .write_op(&WalOp::UpsertNode(make_node(1, 1_000, "type1-segment")))
+        .unwrap();
+    engine.flush().unwrap();
+
+    engine
+        .write_op(&WalOp::UpsertNode(make_node(2, 2_000, "type2-active")))
+        .unwrap();
+
+    let info = engine
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    engine.reset_property_query_routes();
+    assert!(engine.find_nodes(1, "color", &red).unwrap().is_empty());
+
+    let page = engine
+        .find_nodes_paged(
+            1,
+            "color",
+            &red,
+            &PageRequest {
+                limit: Some(10),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 2);
+
+    engine.close().unwrap();
+}
+
 // --- find_nodes_paged tests ---
 
 #[test]
@@ -2086,6 +2669,1264 @@ fn test_find_nodes_paged_with_policies() {
         )
         .unwrap();
     assert_eq!(result.items.len(), 1);
+}
+
+// --- find_nodes_range tests ---
+
+#[test]
+fn test_find_nodes_range_fallback_orders_and_paginates() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut expected = Vec::new();
+    for (key, score) in [
+        ("n5", 5),
+        ("n20a", 20),
+        ("n20b", 20),
+        ("n30", 30),
+        ("n40", 40),
+    ] {
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::Int(score));
+        let id = engine
+            .upsert_node(
+                1,
+                key,
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        expected.push((score, id));
+    }
+    let mut bad_props = BTreeMap::new();
+    bad_props.insert("score".to_string(), PropValue::String("bad".to_string()));
+    engine
+        .upsert_node(
+            1,
+            "bad",
+            UpsertNodeOptions {
+                props: bad_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let info = engine
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Building);
+
+    engine.reset_property_query_routes();
+    let lower_only = engine
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        lower_only,
+        vec![expected[1].1, expected[2].1, expected[3].1, expected[4].1]
+    );
+
+    let upper_only = engine
+        .find_nodes_range(
+            1,
+            "score",
+            None,
+            Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+        )
+        .unwrap();
+    assert_eq!(
+        upper_only,
+        vec![expected[0].1, expected[1].1, expected[2].1]
+    );
+
+    let page1 = engine
+        .find_nodes_range_paged(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            &PropertyRangePageRequest {
+                limit: Some(2),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page1.items, vec![expected[1].1, expected[2].1]);
+    assert_eq!(
+        page1.next_cursor,
+        Some(PropertyRangeCursor {
+            value: PropValue::Int(20),
+            node_id: expected[2].1,
+        })
+    );
+
+    let page2 = engine
+        .find_nodes_range_paged(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            &PropertyRangePageRequest {
+                limit: Some(2),
+                after: page1.next_cursor.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(page2.items, vec![expected[3].1]);
+    assert!(page2.next_cursor.is_none());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 4);
+    assert_eq!(routes.range_index_lookup, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_range_rejects_mixed_bound_variants_and_normalizes_zero() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    for (key, value) in [("neg_zero", -0.0), ("pos_zero", 0.0), ("one", 1.0)] {
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::Float(value));
+        engine
+            .upsert_node(
+                1,
+                key,
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    let zeros = engine
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Float(-0.0))),
+            Some(&PropertyRangeBound::Included(PropValue::Float(0.0))),
+        )
+        .unwrap();
+    assert_eq!(zeros.len(), 2);
+    assert!(zeros[0] < zeros[1]);
+
+    let err = engine
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(1))),
+            Some(&PropertyRangeBound::Included(PropValue::Float(1.0))),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidOperation(_)));
+
+    let err = engine
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Float(2.0))),
+            Some(&PropertyRangeBound::Included(PropValue::Float(1.0))),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidOperation(_)));
+
+    let err = engine
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Excluded(PropValue::Float(0.0))),
+            Some(&PropertyRangeBound::Included(PropValue::Float(0.0))),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidOperation(_)));
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_range_fallback_mixed_sources_filters_latest_visible_records() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props_a = BTreeMap::new();
+    props_a.insert("score".to_string(), PropValue::Int(20));
+    let a = engine
+        .upsert_node(
+            1,
+            "seg_update",
+            UpsertNodeOptions {
+                props: props_a,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut props_b = BTreeMap::new();
+    props_b.insert("score".to_string(), PropValue::Int(25));
+    let b = engine
+        .upsert_node(
+            1,
+            "seg_keep",
+            UpsertNodeOptions {
+                props: props_b,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let mut props_a_new = BTreeMap::new();
+    props_a_new.insert("score".to_string(), PropValue::Int(50));
+    assert_eq!(
+        engine
+            .upsert_node(
+                1,
+                "seg_update",
+                UpsertNodeOptions {
+                    props: props_a_new,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        a
+    );
+    let mut props_c = BTreeMap::new();
+    props_c.insert("score".to_string(), PropValue::Int(22));
+    let c = engine
+        .upsert_node(
+            1,
+            "imm_delete",
+            UpsertNodeOptions {
+                props: props_c,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.freeze_memtable().unwrap();
+
+    let mut props_d = BTreeMap::new();
+    props_d.insert("score".to_string(), PropValue::Int(21));
+    let d = engine
+        .upsert_node(
+            1,
+            "active_keep",
+            UpsertNodeOptions {
+                props: props_d,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut props_pruned = BTreeMap::new();
+    props_pruned.insert("score".to_string(), PropValue::Int(23));
+    engine
+        .upsert_node(
+            1,
+            "active_pruned",
+            UpsertNodeOptions {
+                props: props_pruned,
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.delete_node(c).unwrap();
+    engine
+        .set_prune_policy(
+            "light",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.5),
+                type_id: None,
+            },
+        )
+        .unwrap();
+
+    engine.reset_property_query_routes();
+    let page1 = engine
+        .find_nodes_range_paged(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            &PropertyRangePageRequest {
+                limit: Some(1),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page1.items, vec![d]);
+
+    let page2 = engine
+        .find_nodes_range_paged(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            &PropertyRangePageRequest {
+                limit: Some(1),
+                after: page1.next_cursor.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(page2.items, vec![b]);
+    assert!(page2.next_cursor.is_none());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 2);
+    assert_eq!(routes.range_index_lookup, 0);
+
+    engine.close().unwrap();
+}
+
+fn brute_force_range_oracle(
+    engine: &DatabaseEngine,
+    node_ids: &[u64],
+    type_id: u32,
+    prop_key: &str,
+    lower: Option<&PropertyRangeBound>,
+    upper: Option<&PropertyRangeBound>,
+) -> Vec<u64> {
+    let domain = DatabaseEngine::validate_property_range_bounds(lower, upper, None).unwrap();
+    let mut matches = Vec::new();
+    let nodes = engine.get_nodes_raw(node_ids).unwrap();
+    for (&node_id, node) in node_ids.iter().zip(nodes.iter()) {
+        let Some(node) = node.as_ref() else {
+            continue;
+        };
+        if node.type_id != type_id {
+            continue;
+        }
+        let Some(value) = node.props.get(prop_key) else {
+            continue;
+        };
+        if range_value_domain(value) != Some(domain)
+            || range_value_within_bounds(value, lower, upper) != Some(true)
+        {
+            continue;
+        }
+        let encoded_value = crate::memtable::encode_range_prop_value(domain, value).unwrap();
+        matches.push((encoded_value, node_id));
+    }
+    matches.sort_unstable();
+    matches.into_iter().map(|(_, node_id)| node_id).collect()
+}
+
+#[test]
+fn test_find_nodes_range_open_and_closed_intervals_match_in_fallback_and_ready_paths() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut seg_low_props = BTreeMap::new();
+    seg_low_props.insert("score".to_string(), PropValue::Int(10));
+    let seg_low = engine
+        .upsert_node(
+            1,
+            "seg-low",
+            UpsertNodeOptions {
+                props: seg_low_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut seg_high_props = BTreeMap::new();
+    seg_high_props.insert("score".to_string(), PropValue::Int(30));
+    let seg_high = engine
+        .upsert_node(
+            1,
+            "seg-high",
+            UpsertNodeOptions {
+                props: seg_high_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let mut imm_props = BTreeMap::new();
+    imm_props.insert("score".to_string(), PropValue::Int(20));
+    let imm_20 = engine
+        .upsert_node(
+            1,
+            "imm-20",
+            UpsertNodeOptions {
+                props: imm_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.freeze_memtable().unwrap();
+
+    let mut active_props = BTreeMap::new();
+    active_props.insert("score".to_string(), PropValue::Int(20));
+    let active_20 = engine
+        .upsert_node(
+            1,
+            "active-20",
+            UpsertNodeOptions {
+                props: active_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let cases = vec![
+        (
+            Some(PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(PropertyRangeBound::Included(PropValue::Int(30))),
+            vec![seg_low, imm_20, active_20, seg_high],
+        ),
+        (
+            Some(PropertyRangeBound::Excluded(PropValue::Int(10))),
+            Some(PropertyRangeBound::Included(PropValue::Int(30))),
+            vec![imm_20, active_20, seg_high],
+        ),
+        (
+            Some(PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(PropertyRangeBound::Excluded(PropValue::Int(30))),
+            vec![seg_low, imm_20, active_20],
+        ),
+        (
+            Some(PropertyRangeBound::Excluded(PropValue::Int(10))),
+            Some(PropertyRangeBound::Excluded(PropValue::Int(30))),
+            vec![imm_20, active_20],
+        ),
+        (
+            Some(PropertyRangeBound::Excluded(PropValue::Int(20))),
+            None,
+            vec![seg_high],
+        ),
+        (
+            None,
+            Some(PropertyRangeBound::Excluded(PropValue::Int(20))),
+            vec![seg_low],
+        ),
+    ];
+
+    engine.reset_property_query_routes();
+    for (lower, upper, expected) in &cases {
+        assert_eq!(
+            engine
+                .find_nodes_range(1, "score", lower.as_ref(), upper.as_ref())
+                .unwrap(),
+            *expected
+        );
+    }
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, cases.len());
+    assert_eq!(routes.range_index_lookup, 0);
+
+    let info = engine
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    engine.reset_property_query_routes();
+    for (lower, upper, expected) in &cases {
+        assert_eq!(
+            engine
+                .find_nodes_range(1, "score", lower.as_ref(), upper.as_ref())
+                .unwrap(),
+            *expected
+        );
+    }
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, cases.len());
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_range_ready_parity_matches_bruteforce_oracle_across_domains() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut all_ids = Vec::new();
+
+    let mut int_a_props = BTreeMap::new();
+    int_a_props.insert("score_i".to_string(), PropValue::Int(10));
+    all_ids.push(
+        engine
+            .upsert_node(
+                1,
+                "int-a",
+                UpsertNodeOptions {
+                    props: int_a_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    );
+    let mut int_stale_props = BTreeMap::new();
+    int_stale_props.insert("score_i".to_string(), PropValue::Int(15));
+    let int_stale = engine
+        .upsert_node(
+            1,
+            "int-stale",
+            UpsertNodeOptions {
+                props: int_stale_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    all_ids.push(int_stale);
+    let mut uint_a_props = BTreeMap::new();
+    uint_a_props.insert("score_u".to_string(), PropValue::UInt(1));
+    let uint_a = engine
+        .upsert_node(
+            1,
+            "uint-a",
+            UpsertNodeOptions {
+                props: uint_a_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    all_ids.push(uint_a);
+    let mut float_a_props = BTreeMap::new();
+    float_a_props.insert("score_f".to_string(), PropValue::Float(-0.0));
+    all_ids.push(
+        engine
+            .upsert_node(
+                1,
+                "float-a",
+                UpsertNodeOptions {
+                    props: float_a_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    );
+    let mut float_stale_props = BTreeMap::new();
+    float_stale_props.insert("score_f".to_string(), PropValue::Float(2.0));
+    let float_stale = engine
+        .upsert_node(
+            1,
+            "float-stale",
+            UpsertNodeOptions {
+                props: float_stale_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    all_ids.push(float_stale);
+    engine.flush().unwrap();
+
+    let mut int_c_props = BTreeMap::new();
+    int_c_props.insert("score_i".to_string(), PropValue::Int(20));
+    all_ids.push(
+        engine
+            .upsert_node(
+                1,
+                "int-c",
+                UpsertNodeOptions {
+                    props: int_c_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    );
+    let mut uint_b_props = BTreeMap::new();
+    uint_b_props.insert("score_u".to_string(), PropValue::UInt(3));
+    all_ids.push(
+        engine
+            .upsert_node(
+                1,
+                "uint-b",
+                UpsertNodeOptions {
+                    props: uint_b_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    );
+    let mut float_c_props = BTreeMap::new();
+    float_c_props.insert("score_f".to_string(), PropValue::Float(0.5));
+    all_ids.push(
+        engine
+            .upsert_node(
+                1,
+                "float-c",
+                UpsertNodeOptions {
+                    props: float_c_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    );
+    engine.freeze_memtable().unwrap();
+
+    let mut int_stale_new_props = BTreeMap::new();
+    int_stale_new_props.insert("score_i".to_string(), PropValue::String("bad".to_string()));
+    assert_eq!(
+        engine
+            .upsert_node(
+                1,
+                "int-stale",
+                UpsertNodeOptions {
+                    props: int_stale_new_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        int_stale
+    );
+    let mut int_d_props = BTreeMap::new();
+    int_d_props.insert("score_i".to_string(), PropValue::Int(25));
+    all_ids.push(
+        engine
+            .upsert_node(
+                1,
+                "int-d",
+                UpsertNodeOptions {
+                    props: int_d_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    );
+    engine.delete_node(uint_a).unwrap();
+    let mut uint_c_props = BTreeMap::new();
+    uint_c_props.insert("score_u".to_string(), PropValue::UInt(5));
+    all_ids.push(
+        engine
+            .upsert_node(
+                1,
+                "uint-c",
+                UpsertNodeOptions {
+                    props: uint_c_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    );
+    let mut float_stale_new_props = BTreeMap::new();
+    float_stale_new_props.insert("score_f".to_string(), PropValue::Float(f64::INFINITY));
+    assert_eq!(
+        engine
+            .upsert_node(
+                1,
+                "float-stale",
+                UpsertNodeOptions {
+                    props: float_stale_new_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        float_stale
+    );
+    let mut float_d_props = BTreeMap::new();
+    float_d_props.insert("score_f".to_string(), PropValue::Float(1.5));
+    all_ids.push(
+        engine
+            .upsert_node(
+                1,
+                "float-d",
+                UpsertNodeOptions {
+                    props: float_d_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+    );
+
+    let queries = vec![
+        (
+            "score_i",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            Some(PropertyRangeBound::Included(PropValue::Int(0))),
+            Some(PropertyRangeBound::Included(PropValue::Int(30))),
+        ),
+        (
+            "score_u",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::UInt,
+            },
+            Some(PropertyRangeBound::Included(PropValue::UInt(0))),
+            Some(PropertyRangeBound::Included(PropValue::UInt(10))),
+        ),
+        (
+            "score_f",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Float,
+            },
+            Some(PropertyRangeBound::Included(PropValue::Float(-0.0))),
+            Some(PropertyRangeBound::Included(PropValue::Float(1.5))),
+        ),
+    ];
+
+    engine.reset_property_query_routes();
+    let mut oracles = Vec::new();
+    for (prop_key, _, lower, upper) in &queries {
+        let oracle = brute_force_range_oracle(
+            &engine,
+            &all_ids,
+            1,
+            prop_key,
+            lower.as_ref(),
+            upper.as_ref(),
+        );
+        assert_eq!(
+            engine
+                .find_nodes_range(1, prop_key, lower.as_ref(), upper.as_ref())
+                .unwrap(),
+            oracle
+        );
+        oracles.push(oracle);
+    }
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, queries.len());
+    assert_eq!(routes.range_index_lookup, 0);
+
+    for (prop_key, kind, _, _) in &queries {
+        let info = engine.ensure_node_property_index(1, prop_key, kind.clone()).unwrap();
+        wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    }
+
+    engine.reset_property_query_routes();
+    for ((prop_key, _, lower, upper), oracle) in queries.iter().zip(oracles.iter()) {
+        assert_eq!(
+            engine
+                .find_nodes_range(1, prop_key, lower.as_ref(), upper.as_ref())
+                .unwrap(),
+            *oracle
+        );
+        assert_eq!(
+            engine
+                .find_nodes_range_paged(
+                    1,
+                    prop_key,
+                    lower.as_ref(),
+                    upper.as_ref(),
+                    &PropertyRangePageRequest::default(),
+                )
+                .unwrap()
+                .items,
+            *oracle
+        );
+    }
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, queries.len() * 2);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_range_ready_refills_segment_chunks_with_pruned_overrides() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    for score in 1..=80i64 {
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::Int(score));
+        engine
+            .upsert_node(
+                1,
+                &format!("seg-{score:02}"),
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    engine.flush().unwrap();
+
+    for score in 1..=60i64 {
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::Int(score));
+        engine
+            .upsert_node(
+                1,
+                &format!("seg-{score:02}"),
+                UpsertNodeOptions {
+                    props,
+                    weight: 0.1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    engine
+        .set_prune_policy(
+            "light",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.5),
+                type_id: None,
+            },
+        )
+        .unwrap();
+
+    let info = engine
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let expected_page1: Vec<u64> = (61..=70)
+        .map(|score| engine.get_node_by_key(1, &format!("seg-{score:02}")).unwrap().unwrap().id)
+        .collect();
+    let expected_page2: Vec<u64> = (71..=80)
+        .map(|score| engine.get_node_by_key(1, &format!("seg-{score:02}")).unwrap().unwrap().id)
+        .collect();
+
+    engine.reset_property_query_routes();
+    let page1 = engine
+        .find_nodes_range_paged(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(1))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(80))),
+            &PropertyRangePageRequest {
+                limit: Some(10),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page1.items, expected_page1);
+    assert_eq!(
+        page1.next_cursor,
+        Some(PropertyRangeCursor {
+            value: PropValue::Int(70),
+            node_id: *expected_page1.last().unwrap(),
+        })
+    );
+
+    let page2 = engine
+        .find_nodes_range_paged(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(1))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(80))),
+            &PropertyRangePageRequest {
+                limit: Some(10),
+                after: page1.next_cursor.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(page2.items, expected_page2);
+    assert!(page2.next_cursor.is_none());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 2);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_range_ready_declaration_routes_and_orders_across_sources() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut seg_props = BTreeMap::new();
+    seg_props.insert("score".to_string(), PropValue::Int(30));
+    let seg_id = engine
+        .upsert_node(
+            1,
+            "seg-30",
+            UpsertNodeOptions {
+                props: seg_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let mut imm_props_a = BTreeMap::new();
+    imm_props_a.insert("score".to_string(), PropValue::Int(20));
+    let imm_a = engine
+        .upsert_node(
+            1,
+            "imm-20-a",
+            UpsertNodeOptions {
+                props: imm_props_a,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut imm_props_b = BTreeMap::new();
+    imm_props_b.insert("score".to_string(), PropValue::Int(20));
+    let imm_b = engine
+        .upsert_node(
+            1,
+            "imm-20-b",
+            UpsertNodeOptions {
+                props: imm_props_b,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.freeze_memtable().unwrap();
+
+    let mut active_props = BTreeMap::new();
+    active_props.insert("score".to_string(), PropValue::Int(25));
+    let active_25 = engine
+        .upsert_node(
+            1,
+            "active-25",
+            UpsertNodeOptions {
+                props: active_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut active_props_20 = BTreeMap::new();
+    active_props_20.insert("score".to_string(), PropValue::Int(20));
+    let active_20 = engine
+        .upsert_node(
+            1,
+            "active-20",
+            UpsertNodeOptions {
+                props: active_props_20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let info = engine
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    let ready = wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    assert_eq!(ready.index_id, info.index_id);
+
+    let expected = vec![imm_a, imm_b, active_20, active_25, seg_id];
+
+    engine.reset_property_query_routes();
+    assert_eq!(
+        engine
+            .find_nodes_range(
+                1,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            )
+            .unwrap(),
+        expected
+    );
+
+    let paged_all = engine
+        .find_nodes_range_paged(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            &PropertyRangePageRequest::default(),
+        )
+        .unwrap();
+    assert_eq!(paged_all.items, expected);
+    assert!(paged_all.next_cursor.is_none());
+
+    let first_page = engine
+        .find_nodes_range_paged(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            &PropertyRangePageRequest {
+                limit: Some(2),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(first_page.items, vec![imm_a, imm_b]);
+    assert_eq!(
+        first_page.next_cursor,
+        Some(PropertyRangeCursor {
+            value: PropValue::Int(20),
+            node_id: imm_b,
+        })
+    );
+
+    let second_page = engine
+        .find_nodes_range_paged(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(20))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            &PropertyRangePageRequest {
+                limit: Some(3),
+                after: first_page.next_cursor.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(second_page.items, vec![active_20, active_25, seg_id]);
+    assert!(second_page.next_cursor.is_none());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 4);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_range_ready_declaration_hides_stale_and_incompatible_older_matches() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("score".to_string(), PropValue::Int(20));
+    let mutable_id = engine
+        .upsert_node(
+            1,
+            "mutable",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let info = engine
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let mut incompatible_props = BTreeMap::new();
+    incompatible_props.insert("score".to_string(), PropValue::String("bad".to_string()));
+    assert_eq!(
+        engine
+            .upsert_node(
+                1,
+                "mutable",
+                UpsertNodeOptions {
+                    props: incompatible_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        mutable_id
+    );
+    let mut keep_props = BTreeMap::new();
+    keep_props.insert("score".to_string(), PropValue::Int(25));
+    let keep_id = engine
+        .upsert_node(
+            1,
+            "keep",
+            UpsertNodeOptions {
+                props: keep_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    engine.reset_property_query_routes();
+    assert_eq!(
+        engine
+            .find_nodes_range(
+                1,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(0))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            )
+            .unwrap(),
+        vec![keep_id]
+    );
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 1);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_range_ready_domain_specific_uint_and_float() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut count_props_a = BTreeMap::new();
+    count_props_a.insert("count".to_string(), PropValue::UInt(5));
+    let count_a = engine
+        .upsert_node(
+            1,
+            "count-a",
+            UpsertNodeOptions {
+                props: count_props_a,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut count_props_b = BTreeMap::new();
+    count_props_b.insert("count".to_string(), PropValue::UInt(10));
+    let count_b = engine
+        .upsert_node(
+            1,
+            "count-b",
+            UpsertNodeOptions {
+                props: count_props_b,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut incompatible_count_props = BTreeMap::new();
+    incompatible_count_props.insert("count".to_string(), PropValue::Int(7));
+    engine
+        .upsert_node(
+            1,
+            "count-bad",
+            UpsertNodeOptions {
+                props: incompatible_count_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let uint_info = engine
+        .ensure_node_property_index(
+            1,
+            "count",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::UInt,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, uint_info.index_id, SecondaryIndexState::Ready);
+
+    engine.reset_property_query_routes();
+    assert_eq!(
+        engine
+            .find_nodes_range(
+                1,
+                "count",
+                Some(&PropertyRangeBound::Included(PropValue::UInt(0))),
+                Some(&PropertyRangeBound::Included(PropValue::UInt(10))),
+            )
+            .unwrap(),
+        vec![count_a, count_b]
+    );
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 1);
+
+    let mut temp_neg_zero = BTreeMap::new();
+    temp_neg_zero.insert("temp".to_string(), PropValue::Float(-0.0));
+    let neg_zero = engine
+        .upsert_node(
+            1,
+            "temp-neg-zero",
+            UpsertNodeOptions {
+                props: temp_neg_zero,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut temp_pos_zero = BTreeMap::new();
+    temp_pos_zero.insert("temp".to_string(), PropValue::Float(0.0));
+    let pos_zero = engine
+        .upsert_node(
+            1,
+            "temp-pos-zero",
+            UpsertNodeOptions {
+                props: temp_pos_zero,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut temp_one = BTreeMap::new();
+    temp_one.insert("temp".to_string(), PropValue::Float(1.5));
+    let one = engine
+        .upsert_node(
+            1,
+            "temp-one",
+            UpsertNodeOptions {
+                props: temp_one,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut temp_inf = BTreeMap::new();
+    temp_inf.insert("temp".to_string(), PropValue::Float(f64::INFINITY));
+    engine
+        .upsert_node(
+            1,
+            "temp-inf",
+            UpsertNodeOptions {
+                props: temp_inf,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let float_info = engine
+        .ensure_node_property_index(
+            1,
+            "temp",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Float,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, float_info.index_id, SecondaryIndexState::Ready);
+
+    engine.reset_property_query_routes();
+    assert_eq!(
+        engine
+            .find_nodes_range(
+                1,
+                "temp",
+                Some(&PropertyRangeBound::Included(PropValue::Float(-0.0))),
+                Some(&PropertyRangeBound::Included(PropValue::Float(1.5))),
+            )
+            .unwrap(),
+        vec![neg_zero, pos_zero, one]
+    );
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 1);
+
+    engine.close().unwrap();
 }
 
 #[test]
@@ -12602,16 +14443,29 @@ fn test_vector_search_dense_four_segment_visibility_and_ordering() {
 
     // Compute expected scores and sort by (score DESC, node_id ASC).
     let mut expected: Vec<(u64, f32)> = vec![
-        (f, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.95, 0.05])),
-        (e, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.9, 0.1])),
-        (a, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.5, 0.5])),
-        (d, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.3, 0.7])),
-        (c, crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.1, 0.9])),
+        (
+            f,
+            crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.95, 0.05]),
+        ),
+        (
+            e,
+            crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.9, 0.1]),
+        ),
+        (
+            a,
+            crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.5, 0.5]),
+        ),
+        (
+            d,
+            crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.3, 0.7]),
+        ),
+        (
+            c,
+            crate::dense_hnsw::dense_score(DenseMetric::Cosine, &query, &[0.1, 0.9]),
+        ),
     ];
     expected.sort_by(|(id_a, score_a), (id_b, score_b)| {
-        score_b
-            .total_cmp(score_a)
-            .then_with(|| id_a.cmp(id_b))
+        score_b.total_cmp(score_a).then_with(|| id_a.cmp(id_b))
     });
 
     assert_eq!(
@@ -12629,7 +14483,8 @@ fn test_vector_search_dense_four_segment_visibility_and_ordering() {
         assert!(
             (hits[i].score - expected_score).abs() < 1e-6,
             "hit[{i}] score mismatch: got {}, expected {}",
-            hits[i].score, expected_score
+            hits[i].score,
+            expected_score
         );
     }
 }
@@ -12792,7 +14647,8 @@ fn test_vector_search_sparse_four_segment_visibility_and_ordering() {
         assert!(
             (hits[i].score - expected_score).abs() < 1e-6,
             "hit[{i}] score mismatch: got {}, expected {}",
-            hits[i].score, expected_score
+            hits[i].score,
+            expected_score
         );
     }
 }

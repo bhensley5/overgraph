@@ -89,8 +89,8 @@ const WORKS_ON: u32 = 10;
 alice = db.upsert_node(USER, "alice", props={"role": "engineer"})
 bob = db.upsert_node(USER, "bob")
 project = db.upsert_node(PROJECT, "atlas",
-    dense_vector=[0.2] * 384,
-    sparse_vector=[(42, 0.5), (150, 0.9)])
+    dense_vector=project_embedding,        # from your embedding model
+    sparse_vector=project_sparse)          # from SPLADE, BGE-M3, etc.
 
 db.upsert_edge(alice, project, WORKS_ON)
 db.upsert_edge(bob, project, WORKS_ON, weight=0.5)
@@ -101,8 +101,8 @@ db.upsert_edge(bob, project, WORKS_ON, weight=0.5)
 const alice = db.upsertNode(USER, 'alice', { props: { role: 'engineer' } });
 const bob = db.upsertNode(USER, 'bob');
 const project = db.upsertNode(PROJECT, 'atlas', {
-  denseVector: new Array(384).fill(0.2),
-  sparseVector: [{ dimension: 42, value: 0.5 }, { dimension: 150, value: 0.9 }],
+  denseVector: projectEmbedding,        // from your embedding model
+  sparseVector: projectSparse,          // from SPLADE, BGE-M3, etc.
 });
 
 db.upsertEdge(alice, project, WORKS_ON);
@@ -117,8 +117,8 @@ let alice = db.upsert_node(USER, "alice", UpsertNodeOptions {
 })?;
 let bob = db.upsert_node(USER, "bob", UpsertNodeOptions::default())?;
 let project = db.upsert_node(PROJECT, "atlas", UpsertNodeOptions {
-    dense_vector: Some(vec![0.2; 384]),
-    sparse_vector: Some(vec![(42, 0.5), (150, 0.9)]),
+    dense_vector: Some(project_embedding),  // from your embedding model
+    sparse_vector: Some(project_sparse),    // from SPLADE, BGE-M3, etc.
     ..Default::default()
 })?;
 
@@ -162,9 +162,9 @@ for n in neighbors:
 
 **Node.js**
 ```javascript
-const list = db.neighbors(alice, { direction: 'outgoing' });
-for (let i = 0; i < list.length; i++) {
-  console.log(list.nodeId(i), list.weight(i));
+const neighbors = db.neighbors(alice, { direction: 'outgoing' });
+for (const n of neighbors) {
+  console.log(n.nodeId, n.weight);
 }
 ```
 
@@ -181,8 +181,8 @@ for n in &neighbors {
 **Python**
 ```python
 hits = db.vector_search("hybrid", k=10,
-    dense_query=[0.15] * 384,
-    sparse_query=[(42, 0.9), (99, 0.5)],
+    dense_query=query_embedding,
+    sparse_query=query_sparse,
     scope_start_node_id=alice,
     scope_max_depth=3)
 
@@ -194,8 +194,8 @@ for hit in hits:
 ```javascript
 const hits = db.vectorSearch('hybrid', {
   k: 10,
-  denseQuery: new Array(384).fill(0.15),
-  sparseQuery: [{ dimension: 42, value: 0.9 }, { dimension: 99, value: 0.5 }],
+  denseQuery: queryEmbedding,
+  sparseQuery: querySparse,
   scope: { startNodeId: alice, maxDepth: 3 },
 });
 
@@ -206,8 +206,8 @@ hits.forEach(h => console.log(h.nodeId, h.score));
 ```rust
 let hits = db.vector_search(&VectorSearchRequest {
     mode: VectorSearchMode::Hybrid,
-    dense_query: Some(vec![0.15; 384]),
-    sparse_query: Some(vec![(42, 0.9), (99, 0.5)]),
+    dense_query: Some(query_embedding),
+    sparse_query: Some(query_sparse),
     k: 10,
     scope: Some(VectorSearchScope {
         start_node_id: alice,
@@ -222,6 +222,48 @@ let hits = db.vector_search(&VectorSearchRequest {
 for hit in &hits {
     println!("{} {:.4}", hit.node_id, hit.score);
 }
+```
+
+## Optional: declare property indexes
+
+Property queries work without any extra setup. If a property is hot in your workload, you can declare an optional equality or numeric range index for it. OverGraph will use the declaration-backed path when the index is `Ready`, and otherwise fall back to the same public query API.
+
+**Python**
+```python
+db.ensure_node_property_index(USER, "role", "equality")
+db.ensure_node_property_index(PROJECT, "priority", "range", domain="int")
+
+user_ids = db.find_nodes(USER, "role", "engineer")
+priority_ids = db.find_nodes_range(PROJECT, "priority", lower=1, upper=5)
+```
+
+**Node.js**
+```javascript
+db.ensureNodePropertyIndex(USER, 'role', 'equality');
+db.ensureNodePropertyIndex(PROJECT, 'priority', 'range', { domain: 'int' });
+
+const userIds = db.findNodes(USER, 'role', 'engineer');
+const priorityIds = db.findNodesRange(PROJECT, 'priority', { lower: 1, upper: 5 });
+```
+
+**Rust**
+```rust
+db.ensure_node_property_index(USER, "role", SecondaryIndexKind::Equality)?;
+db.ensure_node_property_index(
+    PROJECT,
+    "priority",
+    SecondaryIndexKind::Range(SecondaryIndexRangeDomain::Int),
+)?;
+
+let user_ids = db.find_nodes(USER, "role", &PropValue::String("engineer".into()))?;
+let priority_ids = db.find_nodes_range(
+    PROJECT,
+    "priority",
+    Some(PropValue::Int(1)),
+    Some(PropValue::Int(5)),
+    true,
+    true,
+)?;
 ```
 
 ## Close

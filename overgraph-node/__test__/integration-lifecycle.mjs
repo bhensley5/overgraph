@@ -119,7 +119,7 @@ describe('Full lifecycle integration', () => {
 
     const hop2 = await db.traverseAsync(nodeIds[0], 2, { minDepth: 2, direction: 'outgoing' });
     const hop1 = await db.neighborsAsync(nodeIds[0], { direction: 'outgoing' });
-    const hop1Set = new Set(hop1.toArray().map(e => e.nodeId));
+    const hop1Set = new Set(hop1.map(e => e.nodeId));
     assert.ok(hop2.items.length > 0, 'depth-2 traversal should emit at least one hit');
     for (const hit of hop2.items) {
       assert.equal(hit.depth, 2);

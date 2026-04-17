@@ -2,6 +2,39 @@ use crate::types::*;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
+fn encode_signed_range_key(value: i64) -> u64 {
+    (value as u64) ^ (1u64 << 63)
+}
+
+fn encode_float_range_key(value: f64) -> Option<u64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let normalized = if value == 0.0 { 0.0 } else { value };
+    let bits = normalized.to_bits();
+    Some(if bits & (1u64 << 63) != 0 {
+        !bits
+    } else {
+        bits ^ (1u64 << 63)
+    })
+}
+
+pub(crate) fn encode_range_prop_value(
+    domain: SecondaryIndexRangeDomain,
+    value: &PropValue,
+) -> Option<u64> {
+    match (domain, value) {
+        (SecondaryIndexRangeDomain::Int, PropValue::Int(value)) => {
+            Some(encode_signed_range_key(*value))
+        }
+        (SecondaryIndexRangeDomain::UInt, PropValue::UInt(value)) => Some(*value),
+        (SecondaryIndexRangeDomain::Float, PropValue::Float(value)) => {
+            encode_float_range_key(*value)
+        }
+        _ => None,
+    }
+}
+
 /// An adjacency entry: one edge connecting to a neighbor.
 #[derive(Debug, Clone)]
 pub struct AdjEntry {
@@ -19,6 +52,7 @@ pub struct AdjEntry {
 /// The Memtable is rebuilt from WAL replay on open and updated in real-time
 /// during writes. It provides get-by-ID, key-based dedup, edge uniqueness,
 /// and 1-hop neighbor expansion with direction and type filtering.
+#[derive(Clone)]
 pub struct Memtable {
     /// Node records by ID.
     nodes: NodeIdMap<NodeRecord>,
@@ -43,12 +77,19 @@ pub struct Memtable {
     type_node_index: HashMap<u32, NodeIdSet>,
     /// Type index for edges: type_id → set of live edge IDs.
     type_edge_index: HashMap<u32, NodeIdSet>,
-    /// Property equality index for nodes: (type_id, key_hash, value_hash) → node IDs.
-    /// Key string is hashed to avoid String allocation on every lookup.
-    prop_node_index: HashMap<(u32, u64, u64), NodeIdSet>,
     /// Timestamp index for nodes: sorted set of (type_id, updated_at, node_id).
     /// Enables O(log N + k) range queries by time window within a type.
     time_node_index: BTreeSet<(u32, i64, u64)>,
+    /// Declaration metadata keyed by index_id.
+    secondary_index_declarations: HashMap<u64, SecondaryIndexManifestEntry>,
+    /// Equality declarations keyed by `type_id -> prop_key`.
+    secondary_eq_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
+    /// Range declarations keyed by `type_id -> prop_key`.
+    secondary_range_by_prop: HashMap<u32, HashMap<String, Vec<(u64, SecondaryIndexRangeDomain)>>>,
+    /// Equality state: `index_id -> value_hash -> node_ids`.
+    secondary_eq_state: HashMap<u64, HashMap<u64, NodeIdSet>>,
+    /// Range state: `index_id -> ordered (encoded_value, node_id)`.
+    secondary_range_state: HashMap<u64, BTreeSet<(u64, u64)>>,
 }
 
 impl Default for Memtable {
@@ -70,8 +111,12 @@ impl Memtable {
             adj_in: NodeIdMap::default(),
             type_node_index: HashMap::new(),
             type_edge_index: HashMap::new(),
-            prop_node_index: HashMap::new(),
             time_node_index: BTreeSet::new(),
+            secondary_index_declarations: HashMap::new(),
+            secondary_eq_by_prop: HashMap::new(),
+            secondary_range_by_prop: HashMap::new(),
+            secondary_eq_state: HashMap::new(),
+            secondary_range_state: HashMap::new(),
         }
     }
 
@@ -81,8 +126,10 @@ impl Memtable {
         match op {
             WalOp::UpsertNode(node) => {
                 self.deleted_nodes.remove(&node.id);
+                let old_node = self.nodes.get(&node.id).cloned();
                 // If the node already exists with a different type_id, remove from old type index
-                if let Some(old) = self.nodes.get(&node.id) {
+                if let Some(old) = old_node.as_ref() {
+                    self.remove_secondary_index_entries_for_node(old);
                     // Remove old time index entry (may differ in type_id or updated_at)
                     self.time_node_index
                         .remove(&(old.type_id, old.updated_at, old.id));
@@ -103,28 +150,11 @@ impl Memtable {
                     .entry(node.type_id)
                     .or_default()
                     .insert(node.id);
-                // Property index: remove old entries, add new
-                if let Some(old) = self.nodes.get(&node.id) {
-                    for (k, v) in &old.props {
-                        let key = (old.type_id, hash_prop_key(k), hash_prop_value(v));
-                        if let Some(set) = self.prop_node_index.get_mut(&key) {
-                            set.remove(&node.id);
-                            if set.is_empty() {
-                                self.prop_node_index.remove(&key);
-                            }
-                        }
-                    }
-                }
-                for (k, v) in &node.props {
-                    self.prop_node_index
-                        .entry((node.type_id, hash_prop_key(k), hash_prop_value(v)))
-                        .or_default()
-                        .insert(node.id);
-                }
                 self.time_node_index
                     .insert((node.type_id, node.updated_at, node.id));
                 let mut stored = node.clone();
                 stored.last_write_seq = last_write_seq;
+                self.add_secondary_index_entries_for_node(&stored);
                 self.nodes.insert(node.id, stored);
             }
             WalOp::UpsertEdge(edge) => {
@@ -193,6 +223,7 @@ impl Memtable {
             }
             WalOp::DeleteNode { id, deleted_at } => {
                 if let Some(node) = self.nodes.remove(id) {
+                    self.remove_secondary_index_entries_for_node(&node);
                     self.time_node_index
                         .remove(&(node.type_id, node.updated_at, node.id));
                     if let Some(set) = self.type_node_index.get_mut(&node.type_id) {
@@ -205,15 +236,6 @@ impl Memtable {
                         inner.remove(&node.key);
                         if inner.is_empty() {
                             self.node_key_index.remove(&node.type_id);
-                        }
-                    }
-                    for (k, v) in &node.props {
-                        let key = (node.type_id, hash_prop_key(k), hash_prop_value(v));
-                        if let Some(set) = self.prop_node_index.get_mut(&key) {
-                            set.remove(&node.id);
-                            if set.is_empty() {
-                                self.prop_node_index.remove(&key);
-                            }
                         }
                     }
                 }
@@ -261,6 +283,248 @@ impl Memtable {
                 );
             }
         }
+    }
+
+    fn add_secondary_index_entries_for_props<'a, I>(&mut self, node_id: u64, type_id: u32, props: I)
+    where
+        I: IntoIterator<Item = (&'a String, &'a PropValue)>,
+    {
+        for (prop_key, prop_value) in props {
+            if let Some(index_ids) = self
+                .secondary_eq_by_prop
+                .get(&type_id)
+                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                for &index_id in index_ids {
+                    self.secondary_eq_state
+                        .entry(index_id)
+                        .or_default()
+                        .entry(hash_prop_value(prop_value))
+                        .or_default()
+                        .insert(node_id);
+                }
+            }
+
+            if let Some(indexes) = self
+                .secondary_range_by_prop
+                .get(&type_id)
+                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                for &(index_id, domain) in indexes {
+                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                        self.secondary_range_state
+                            .entry(index_id)
+                            .or_default()
+                            .insert((encoded, node_id));
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_secondary_index_entries_for_node(&mut self, node: &NodeRecord) {
+        self.add_secondary_index_entries_for_props(node.id, node.type_id, node.props.iter());
+    }
+
+    fn seed_secondary_equality_index_for_property(
+        &mut self,
+        index_id: u64,
+        type_id: u32,
+        prop_key: &str,
+    ) {
+        let Some(node_ids) = self.type_node_index.get(&type_id) else {
+            return;
+        };
+        let mut sorted_node_ids: Vec<u64> = node_ids.iter().copied().collect();
+        sorted_node_ids.sort_unstable();
+
+        let mut staged: Vec<(u64, u64)> = Vec::new();
+        for node_id in sorted_node_ids {
+            let Some(node) = self.nodes.get(&node_id) else {
+                continue;
+            };
+            let Some(prop_value) = node.props.get(prop_key) else {
+                continue;
+            };
+            staged.push((hash_prop_value(prop_value), node_id));
+        }
+
+        let groups = self.secondary_eq_state.entry(index_id).or_default();
+        for (value_hash, node_id) in staged {
+            groups.entry(value_hash).or_default().insert(node_id);
+        }
+    }
+
+    fn seed_secondary_range_index_for_property(
+        &mut self,
+        index_id: u64,
+        type_id: u32,
+        prop_key: &str,
+        domain: SecondaryIndexRangeDomain,
+    ) {
+        let Some(node_ids) = self.type_node_index.get(&type_id) else {
+            return;
+        };
+        let mut sorted_node_ids: Vec<u64> = node_ids.iter().copied().collect();
+        sorted_node_ids.sort_unstable();
+
+        let mut staged: Vec<(u64, u64)> = Vec::new();
+        for node_id in sorted_node_ids {
+            let Some(node) = self.nodes.get(&node_id) else {
+                continue;
+            };
+            let Some(prop_value) = node.props.get(prop_key) else {
+                continue;
+            };
+            let Some(encoded) = encode_range_prop_value(domain, prop_value) else {
+                continue;
+            };
+            staged.push((encoded, node_id));
+        }
+
+        let entries = self.secondary_range_state.entry(index_id).or_default();
+        for encoded_entry in staged {
+            entries.insert(encoded_entry);
+        }
+    }
+
+    fn remove_secondary_index_entries_for_node(&mut self, node: &NodeRecord) {
+        for (prop_key, prop_value) in &node.props {
+            if let Some(index_ids) = self
+                .secondary_eq_by_prop
+                .get(&node.type_id)
+                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                let value_hash = hash_prop_value(prop_value);
+                for &index_id in index_ids {
+                    let mut remove_group = false;
+                    if let Some(groups) = self.secondary_eq_state.get_mut(&index_id) {
+                        if let Some(ids) = groups.get_mut(&value_hash) {
+                            ids.remove(&node.id);
+                            if ids.is_empty() {
+                                groups.remove(&value_hash);
+                            }
+                        }
+                        remove_group = groups.is_empty();
+                    }
+                    if remove_group {
+                        self.secondary_eq_state.remove(&index_id);
+                    }
+                }
+            }
+
+            if let Some(indexes) = self
+                .secondary_range_by_prop
+                .get(&node.type_id)
+                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                for &(index_id, domain) in indexes {
+                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                        let mut remove_group = false;
+                        if let Some(entries) = self.secondary_range_state.get_mut(&index_id) {
+                            entries.remove(&(encoded, node.id));
+                            remove_group = entries.is_empty();
+                        }
+                        if remove_group {
+                            self.secondary_range_state.remove(&index_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn register_secondary_index(&mut self, entry: &SecondaryIndexManifestEntry) {
+        if self
+            .secondary_index_declarations
+            .contains_key(&entry.index_id)
+        {
+            return;
+        }
+        self.secondary_index_declarations
+            .insert(entry.index_id, entry.clone());
+        match &entry.target {
+            SecondaryIndexTarget::NodeProperty { type_id, prop_key } => match &entry.kind {
+                SecondaryIndexKind::Equality => {
+                    self.secondary_eq_by_prop
+                        .entry(*type_id)
+                        .or_default()
+                        .entry(prop_key.clone())
+                        .or_default()
+                        .push(entry.index_id);
+                    self.secondary_eq_state.entry(entry.index_id).or_default();
+                    self.seed_secondary_equality_index_for_property(
+                        entry.index_id,
+                        *type_id,
+                        prop_key,
+                    );
+                }
+                SecondaryIndexKind::Range { domain } => {
+                    self.secondary_range_by_prop
+                        .entry(*type_id)
+                        .or_default()
+                        .entry(prop_key.clone())
+                        .or_default()
+                        .push((entry.index_id, *domain));
+                    self.secondary_range_state
+                        .entry(entry.index_id)
+                        .or_default();
+                    self.seed_secondary_range_index_for_property(
+                        entry.index_id,
+                        *type_id,
+                        prop_key,
+                        *domain,
+                    );
+                }
+            },
+        }
+    }
+
+    pub fn unregister_secondary_index(&mut self, index_id: u64) -> bool {
+        let Some(entry) = self.secondary_index_declarations.remove(&index_id) else {
+            return false;
+        };
+
+        match entry.target {
+            SecondaryIndexTarget::NodeProperty { type_id, prop_key } => match entry.kind {
+                SecondaryIndexKind::Equality => {
+                    let mut remove_type_entry = false;
+                    if let Some(by_prop) = self.secondary_eq_by_prop.get_mut(&type_id) {
+                        if let Some(index_ids) = by_prop.get_mut(&prop_key) {
+                            index_ids.retain(|&id| id != index_id);
+                            if index_ids.is_empty() {
+                                by_prop.remove(&prop_key);
+                            }
+                        }
+                        remove_type_entry = by_prop.is_empty();
+                    }
+                    if remove_type_entry {
+                        self.secondary_eq_by_prop.remove(&type_id);
+                    }
+                    self.secondary_eq_state.remove(&index_id);
+                }
+                SecondaryIndexKind::Range { domain } => {
+                    let mut remove_type_entry = false;
+                    if let Some(by_prop) = self.secondary_range_by_prop.get_mut(&type_id) {
+                        if let Some(indexes) = by_prop.get_mut(&prop_key) {
+                            indexes.retain(|&(id, existing_domain)| {
+                                id != index_id || existing_domain != domain
+                            });
+                            if indexes.is_empty() {
+                                by_prop.remove(&prop_key);
+                            }
+                        }
+                        remove_type_entry = by_prop.is_empty();
+                    }
+                    if remove_type_entry {
+                        self.secondary_range_by_prop.remove(&type_id);
+                    }
+                    self.secondary_range_state.remove(&index_id);
+                }
+            },
+        }
+
+        true
     }
 
     /// Get a node by ID (returns None if deleted or missing).
@@ -688,9 +952,16 @@ impl Memtable {
         &self.type_edge_index
     }
 
-    /// Return a reference to the property node index.
-    pub fn prop_node_index(&self) -> &HashMap<(u32, u64, u64), NodeIdSet> {
-        &self.prop_node_index
+    pub fn secondary_index_declarations(&self) -> &HashMap<u64, SecondaryIndexManifestEntry> {
+        &self.secondary_index_declarations
+    }
+
+    pub fn secondary_eq_state(&self) -> &HashMap<u64, HashMap<u64, NodeIdSet>> {
+        &self.secondary_eq_state
+    }
+
+    pub fn secondary_range_state(&self) -> &HashMap<u64, BTreeSet<(u64, u64)>> {
+        &self.secondary_range_state
     }
 
     /// Return a reference to the timestamp node index (for segment writer).
@@ -717,27 +988,48 @@ impl Memtable {
     }
 
     /// Find node IDs matching (type_id, prop_key, prop_value).
-    /// Uses the hash index for fast lookup, then post-filters to handle collisions.
+    /// Scans the memtable's type-scoped live nodes.
     pub fn find_nodes(&self, type_id: u32, prop_key: &str, prop_value: &PropValue) -> Vec<u64> {
-        let key = (
-            type_id,
-            hash_prop_key(prop_key),
-            hash_prop_value(prop_value),
-        );
-        match self.prop_node_index.get(&key) {
-            Some(ids) => ids
-                .iter()
-                .copied()
-                .filter(|id| {
-                    self.nodes
-                        .get(id)
-                        .and_then(|n| n.props.get(prop_key))
-                        .map(|v| v == prop_value)
-                        .unwrap_or(false)
-                })
-                .collect(),
-            None => Vec::new(),
-        }
+        self.type_node_index
+            .get(&type_id)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .copied()
+            .filter(|id| {
+                self.nodes
+                    .get(id)
+                    .and_then(|n| n.props.get(prop_key))
+                    .is_some_and(|value| value == prop_value)
+            })
+            .collect()
+    }
+
+    /// Find node IDs matching a declaration-scoped equality index.
+    /// Uses the declaration's hash bucket, then post-filters actual values to
+    /// suppress collisions.
+    pub fn find_secondary_eq_nodes(
+        &self,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+    ) -> Vec<u64> {
+        let value_hash = hash_prop_value(prop_value);
+        let mut ids: Vec<u64> = self
+            .secondary_eq_state
+            .get(&index_id)
+            .and_then(|groups| groups.get(&value_hash))
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .copied()
+            .filter(|id| {
+                self.nodes
+                    .get(id)
+                    .and_then(|node| node.props.get(prop_key))
+                    .is_some_and(|value| value == prop_value)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Rough estimate of memtable memory usage in bytes.
@@ -781,23 +1073,67 @@ impl Memtable {
                 .values()
                 .map(|s| s.len() * 16)
                 .sum::<usize>();
-        // Prop index: ~40 bytes per key (u32 type_id + u64 key_hash + u64 value_hash + set overhead) + 16 per ID
-        let prop_idx_size: usize = self
-            .prop_node_index
-            .values()
-            .map(|ids| 40 + ids.len() * 16)
-            .sum();
-
         // Time index: ~48 bytes per entry (tuple + BTree node overhead)
         let time_idx_size = self.time_node_index.len() * 48;
+
+        // Secondary index declarations + state: rough bookkeeping only.
+        let secondary_decl_size: usize = self
+            .secondary_index_declarations
+            .values()
+            .map(|entry| {
+                let prop_key_len = match &entry.target {
+                    SecondaryIndexTarget::NodeProperty { prop_key, .. } => prop_key.len(),
+                };
+                96 + prop_key_len + entry.last_error.as_ref().map(|msg| msg.len()).unwrap_or(0)
+            })
+            .sum();
+        let secondary_eq_lookup_size: usize = self
+            .secondary_eq_by_prop
+            .values()
+            .map(|by_prop| {
+                32 + by_prop
+                    .iter()
+                    .map(|(prop_key, index_ids)| 48 + prop_key.len() + index_ids.len() * 8)
+                    .sum::<usize>()
+            })
+            .sum();
+        let secondary_range_lookup_size: usize = self
+            .secondary_range_by_prop
+            .values()
+            .map(|by_prop| {
+                32 + by_prop
+                    .iter()
+                    .map(|(prop_key, indexes)| 48 + prop_key.len() + indexes.len() * 16)
+                    .sum::<usize>()
+            })
+            .sum();
+        let secondary_eq_state_size: usize = self
+            .secondary_eq_state
+            .values()
+            .map(|groups| {
+                32 + groups
+                    .values()
+                    .map(|ids| 32 + ids.len() * 16)
+                    .sum::<usize>()
+            })
+            .sum();
+        let secondary_range_state_size: usize = self
+            .secondary_range_state
+            .values()
+            .map(|entries| 32 + entries.len() * 16)
+            .sum();
 
         node_size
             + edge_size
             + tombstone_size
             + adj_size
             + type_idx_size
-            + prop_idx_size
             + time_idx_size
+            + secondary_decl_size
+            + secondary_eq_lookup_size
+            + secondary_range_lookup_size
+            + secondary_eq_state_size
+            + secondary_range_state_size
     }
 
     /// Remove a node from the memtable and all associated indexes.
@@ -835,10 +1171,6 @@ impl Memtable {
     /// Number of distinct type keys in the edge type index.
     fn type_edge_index_key_count(&self) -> usize {
         self.type_edge_index.len()
-    }
-    /// Number of distinct composite keys in the property node index.
-    fn prop_node_index_key_count(&self) -> usize {
-        self.prop_node_index.len()
     }
     /// Number of distinct type keys in the node key index (outer map).
     fn node_key_index_key_count(&self) -> usize {
@@ -890,6 +1222,26 @@ mod tests {
             weight: 1.0,
             valid_from: 0,
             valid_to: i64::MAX,
+            last_write_seq: 0,
+        }
+    }
+
+    fn make_node_with_props(
+        id: u64,
+        type_id: u32,
+        key: &str,
+        props: BTreeMap<String, PropValue>,
+    ) -> NodeRecord {
+        NodeRecord {
+            id,
+            type_id,
+            key: key.to_string(),
+            props,
+            created_at: 1000,
+            updated_at: 1001,
+            weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
             last_write_seq: 0,
         }
     }
@@ -1309,53 +1661,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prop_index_pruned_after_delete() {
-        let mut mt = Memtable::new();
-        let mut props = BTreeMap::new();
-        props.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "apple", props)),
-            0,
-        );
-
-        assert_eq!(mt.prop_node_index_key_count(), 1);
-
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.prop_node_index_key_count(), 0); // pruned, not just empty
-    }
-
-    #[test]
-    fn test_prop_index_pruned_on_upsert_type_change() {
-        let mut mt = Memtable::new();
-        let mut props = BTreeMap::new();
-        props.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "apple", props.clone())),
-            0,
-        );
-
-        // prop key is (type_id=1, "color", hash("red"))
-        assert_eq!(mt.prop_node_index_key_count(), 1);
-
-        // Re-upsert same node with different props. Old prop entry should be pruned
-        let mut new_props = BTreeMap::new();
-        new_props.insert("size".to_string(), PropValue::String("large".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "apple", new_props)),
-            0,
-        );
-
-        // Old (color, red) entry pruned, new (size, large) entry added
-        assert_eq!(mt.prop_node_index_key_count(), 1);
-    }
-
-    #[test]
     fn test_edge_type_index_pruned_on_type_change() {
         let mut mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
@@ -1440,26 +1745,6 @@ mod tests {
     }
 
     // --- Property index tests ---
-
-    fn make_node_with_props(
-        id: u64,
-        type_id: u32,
-        key: &str,
-        props: BTreeMap<String, PropValue>,
-    ) -> NodeRecord {
-        NodeRecord {
-            id,
-            type_id,
-            key: key.to_string(),
-            props,
-            created_at: 1000,
-            updated_at: 1001,
-            weight: 0.5,
-            dense_vector: None,
-            sparse_vector: None,
-            last_write_seq: 0,
-        }
-    }
 
     #[test]
     fn test_prop_index_basic_lookup() {
@@ -1815,5 +2100,129 @@ mod tests {
         // Second upsert of same node should update seq
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 20);
         assert_eq!(mt.get_node(1).unwrap().last_write_seq, 20);
+    }
+
+    #[test]
+    fn test_register_secondary_index_seeds_existing_nodes_and_skips_incompatible_range_values() {
+        let mut mt = Memtable::new();
+
+        let mut props1 = BTreeMap::new();
+        props1.insert(
+            "status".to_string(),
+            PropValue::String("active".to_string()),
+        );
+        props1.insert("age".to_string(), PropValue::Int(42));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props1)),
+            1,
+        );
+
+        let mut props2 = BTreeMap::new();
+        props2.insert(
+            "status".to_string(),
+            PropValue::String("active".to_string()),
+        );
+        props2.insert("age".to_string(), PropValue::String("old".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(2, 1, "b", props2)),
+            2,
+        );
+
+        mt.register_secondary_index(&SecondaryIndexManifestEntry {
+            index_id: 10,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "status".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        });
+        mt.register_secondary_index(&SecondaryIndexManifestEntry {
+            index_id: 11,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "age".to_string(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        });
+
+        let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
+        let eq_group = mt.secondary_eq_state().get(&10).unwrap();
+        let eq_ids = eq_group.get(&status_hash).unwrap();
+        assert!(eq_ids.contains(&1));
+        assert!(eq_ids.contains(&2));
+
+        let range_entries = mt.secondary_range_state().get(&11).unwrap();
+        assert!(range_entries.contains(&(encode_signed_range_key(42), 1)));
+        assert_eq!(range_entries.len(), 1);
+    }
+
+    #[test]
+    fn test_secondary_index_state_updates_on_type_change_and_delete() {
+        let mut mt = Memtable::new();
+        mt.register_secondary_index(&SecondaryIndexManifestEntry {
+            index_id: 20,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "age".to_string(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        });
+
+        let mut props = BTreeMap::new();
+        props.insert("age".to_string(), PropValue::Int(10));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props)),
+            1,
+        );
+        assert!(mt
+            .secondary_range_state()
+            .get(&20)
+            .unwrap()
+            .contains(&(encode_signed_range_key(10), 1)));
+
+        let mut props2 = BTreeMap::new();
+        props2.insert("age".to_string(), PropValue::Int(11));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 2, "a", props2)),
+            2,
+        );
+        assert!(mt
+            .secondary_range_state()
+            .get(&20)
+            .is_none_or(|entries| entries.is_empty()));
+
+        let mut props3 = BTreeMap::new();
+        props3.insert("age".to_string(), PropValue::Int(12));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props3)),
+            3,
+        );
+        assert!(mt
+            .secondary_range_state()
+            .get(&20)
+            .unwrap()
+            .contains(&(encode_signed_range_key(12), 1)));
+
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 999,
+            },
+            4,
+        );
+        assert!(mt
+            .secondary_range_state()
+            .get(&20)
+            .is_none_or(|entries| entries.is_empty()));
     }
 }

@@ -22,36 +22,8 @@ export declare class JsEdgeRecord {
   get validTo(): number
 }
 
-export declare class JsNeighborBatchEntry {
-  get queryNodeId(): number
-  /** Lazy neighbor list for this batch entry. */
-  get neighbors(): JsNeighborList
-}
-
-/**
- * Lazy sequence wrapper around neighbor entries. Data stays in Rust;
- * individual fields are only converted to JS values when accessed via
- * indexed methods. One V8 allocation regardless of result set size.
- * Arc-wrapped so parent containers (batch entries, page results) share
- * data instead of cloning the full vec on every getter access.
- */
-export declare class JsNeighborList {
-  get length(): number
-  nodeId(index: number): number
-  edgeId(index: number): number
-  edgeTypeId(index: number): number
-  weight(index: number): number
-  validFrom(index: number): number
-  validTo(index: number): number
-  /** Get a single entry as a plain object with all fields materialized. */
-  get(index: number): JsNeighborEntry
-  /** Materialize all entries as an array of plain objects. */
-  toArray(): Array<JsNeighborEntry>
-}
-
 export declare class JsNeighborPageResult {
-  /** Lazy neighbor list for this page. */
-  get items(): JsNeighborList
+  get items(): Array<JsNeighborEntry>
   get nextCursor(): number | null
 }
 
@@ -123,9 +95,9 @@ export declare class OverGraph {
   setPrunePolicyAsync(name: string, policy: JsPrunePolicy): Promise<void>
   removePrunePolicyAsync(name: string): Promise<boolean>
   listPrunePoliciesAsync(): Promise<Array<JsNamedPrunePolicy>>
-  neighbors(nodeId: number, options?: JsNeighborsOptions | undefined | null): JsNeighborList
+  neighbors(nodeId: number, options?: JsNeighborsOptions | undefined | null): Array<JsNeighborEntry>
   traverse(startNodeId: number, maxDepth: number, options?: JsTraverseOptions | undefined | null): JsTraversalPageResult
-  topKNeighbors(nodeId: number, k: number, options?: JsTopKNeighborsOptions | undefined | null): JsNeighborList
+  topKNeighbors(nodeId: number, k: number, options?: JsTopKNeighborsOptions | undefined | null): Array<JsNeighborEntry>
   extractSubgraph(startNodeId: number, maxDepth: number, options?: JsExtractSubgraphOptions | undefined | null): JsSubgraphResult
   /**
    * Batch neighbor query: fetch neighbors for multiple nodes in one call.
@@ -140,6 +112,9 @@ export declare class OverGraph {
   isConnected(from: number, to: number, options?: JsIsConnectedOptions | undefined | null): boolean
   allShortestPaths(from: number, to: number, options?: JsAllShortestPathsOptions | undefined | null): Array<JsShortestPath>
   findNodes(typeId: number, propKey: string, propValue: any): Float64Array
+  ensureNodePropertyIndex(typeId: number, propKey: string, kind: JsSecondaryIndexKind): JsNodePropertyIndexInfo
+  dropNodePropertyIndex(typeId: number, propKey: string, kind: JsSecondaryIndexKind): boolean
+  listNodePropertyIndexes(): Array<JsNodePropertyIndexInfo>
   /** Return all node IDs of a given type (unpaged). */
   nodesByType(typeId: number): Float64Array
   /** Return all edge IDs of a given type (unpaged). */
@@ -154,7 +129,9 @@ export declare class OverGraph {
   getEdgesByTypePaged(typeId: number, limit?: number | undefined | null, after?: number | undefined | null): JsEdgePageResult
   findNodesPaged(typeId: number, propKey: string, propValue: any, options?: JsFindNodesPagedOptions | undefined | null): JsIdPageResult
   findNodesByTimeRange(typeId: number, fromMs: number, toMs: number): Float64Array
+  findNodesRange(typeId: number, propKey: string, lower?: JsPropertyRangeBound | undefined | null, upper?: JsPropertyRangeBound | undefined | null): Float64Array
   findNodesByTimeRangePaged(typeId: number, fromMs: number, toMs: number, options?: JsFindNodesByTimeRangePagedOptions | undefined | null): JsIdPageResult
+  findNodesRangePaged(typeId: number, propKey: string, lower?: JsPropertyRangeBound | undefined | null, upper?: JsPropertyRangeBound | undefined | null, options?: JsFindNodesRangePagedOptions | undefined | null): JsPropertyRangePageResult
   personalizedPagerank(seedNodeIds: Array<number>, options?: JsPersonalizedPagerankOptions | undefined | null): JsPprResult
   exportAdjacency(options?: JsExportOptions | undefined | null): JsAdjacencyExport
   neighborsPaged(nodeId: number, options?: JsNeighborsPagedOptions | undefined | null): JsNeighborPageResult
@@ -197,11 +174,16 @@ export declare class OverGraph {
   invalidateEdgeAsync(id: number, validTo: number): Promise<JsEdgeRecord | null>
   graphPatchAsync(patch: JsGraphPatch): Promise<JsPatchResult>
   pruneAsync(policy: JsPrunePolicy): Promise<JsPruneResult>
-  neighborsAsync(nodeId: number, options?: JsNeighborsOptions | undefined | null): Promise<JsNeighborList>
+  neighborsAsync(nodeId: number, options?: JsNeighborsOptions | undefined | null): Promise<Array<JsNeighborEntry>>
   traverseAsync(startNodeId: number, maxDepth: number, options?: JsTraverseOptions | undefined | null): Promise<JsTraversalPageResult>
-  topKNeighborsAsync(nodeId: number, k: number, options?: JsTopKNeighborsOptions | undefined | null): Promise<JsNeighborList>
+  topKNeighborsAsync(nodeId: number, k: number, options?: JsTopKNeighborsOptions | undefined | null): Promise<Array<JsNeighborEntry>>
   extractSubgraphAsync(startNodeId: number, maxDepth: number, options?: JsExtractSubgraphOptions | undefined | null): Promise<JsSubgraphResult>
   findNodesAsync(typeId: number, propKey: string, propValue: any): Promise<Float64Array>
+  ensureNodePropertyIndexAsync(typeId: number, propKey: string, kind: JsSecondaryIndexKind): Promise<JsNodePropertyIndexInfo>
+  dropNodePropertyIndexAsync(typeId: number, propKey: string, kind: JsSecondaryIndexKind): Promise<boolean>
+  listNodePropertyIndexesAsync(): Promise<Array<JsNodePropertyIndexInfo>>
+  findNodesRangeAsync(typeId: number, propKey: string, lower?: JsPropertyRangeBound | undefined | null, upper?: JsPropertyRangeBound | undefined | null): Promise<Float64Array>
+  findNodesRangePagedAsync(typeId: number, propKey: string, lower?: JsPropertyRangeBound | undefined | null, upper?: JsPropertyRangeBound | undefined | null, options?: JsFindNodesRangePagedOptions | undefined | null): Promise<JsPropertyRangePageResult>
   getNodesByTypeAsync(typeId: number): Promise<Array<JsNodeRecord>>
   getEdgesByTypeAsync(typeId: number): Promise<Array<JsEdgeRecord>>
   countNodesByTypeAsync(typeId: number): Promise<number>
@@ -417,6 +399,11 @@ export interface JsFindNodesPagedOptions {
   after?: number
 }
 
+export interface JsFindNodesRangePagedOptions {
+  limit?: number
+  after?: JsPropertyRangeCursor
+}
+
 export interface JsGraphPatch {
   upsertNodes?: Array<JsNodeInput>
   upsertEdges?: Array<JsEdgeInput>
@@ -447,10 +434,12 @@ export interface JsNamedPrunePolicy {
   policy: JsPrunePolicy
 }
 
-/**
- * A single neighbor entry as a plain JS object.
- * Used by `JsNeighborList.get(i)` and `JsNeighborList.toArray()`.
- */
+export interface JsNeighborBatchEntry {
+  queryNodeId: number
+  neighbors: Array<JsNeighborEntry>
+}
+
+/** A single neighbor entry as a plain JS object. */
 export interface JsNeighborEntry {
   nodeId: number
   edgeId: number
@@ -493,13 +482,23 @@ export interface JsNodeInput {
   sparseVector?: Array<JsSparseEntry>
 }
 
+export interface JsNodePropertyIndexInfo {
+  indexId: number
+  typeId: number
+  propKey: string
+  kind: string
+  domain?: string
+  state: string
+  lastError?: string
+}
+
 export interface JsPatchResult {
   nodeIds: Float64Array
   edgeIds: Float64Array
 }
 
 export interface JsPersonalizedPagerankOptions {
-  algorithm?: 'exact' | 'approx'
+  algorithm?: string
   dampingFactor?: number
   maxIterations?: number
   epsilon?: number
@@ -519,8 +518,25 @@ export interface JsPprResult {
   scores: Float64Array
   iterations: number
   converged: boolean
-  algorithm: 'exact' | 'approx'
+  algorithm: string
   approx?: JsPprApproxMeta
+}
+
+export interface JsPropertyRangeBound {
+  value: number
+  inclusive?: boolean
+  domain: string
+}
+
+export interface JsPropertyRangeCursor {
+  value: number
+  nodeId: number
+  domain: string
+}
+
+export interface JsPropertyRangePageResult {
+  items: Float64Array
+  nextCursor?: JsPropertyRangeCursor
 }
 
 export interface JsPrunePolicy {
@@ -537,6 +553,11 @@ export interface JsPruneResult {
   nodesPruned: number
   /** Number of edges cascade-deleted. */
   edgesPruned: number
+}
+
+export interface JsSecondaryIndexKind {
+  kind: string
+  domain?: string
 }
 
 export interface JsShortestPath {

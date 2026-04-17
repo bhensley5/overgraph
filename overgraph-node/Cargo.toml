@@ -1,6 +1,6 @@
 [package]
 name = "overgraph-node"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 description = "Node.js native addon for OverGraph"
 

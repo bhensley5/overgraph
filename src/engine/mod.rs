@@ -1,12 +1,15 @@
 use crate::dense_hnsw::exact_dense_search_above_cutoff;
 use crate::error::EngineError;
 use crate::manifest::{default_manifest, load_manifest, load_manifest_readonly, write_manifest};
-use crate::memtable::Memtable;
+use crate::memtable::{encode_range_prop_value, Memtable};
 use crate::segment_reader::SegmentReader;
 use crate::segment_writer::{
-    segment_dir, segment_tmp_dir, write_indexes_from_metadata, write_merged_edges_dat,
-    write_merged_nodes_dat, write_segment, write_v3_edges_dat, write_v3_nodes_dat, CompactEdgeMeta,
-    CompactNodeMeta, FastMergeCopyInfo,
+    node_prop_eq_sidecar_path, node_prop_range_sidecar_path, segment_dir, segment_tmp_dir,
+    write_indexes_from_metadata_with_secondary_indexes, write_merged_edges_dat,
+    write_merged_nodes_dat, write_node_prop_eq_sidecar_to_path,
+    write_node_prop_range_sidecar_to_path, write_segment_with_secondary_indexes,
+    write_v3_edges_dat, write_v3_nodes_dat, CompactEdgeMeta, CompactNodeMeta, FastMergeCopyInfo,
+    SecondaryIndexMaintenanceReport,
 };
 use crate::source_list::SourceList;
 use crate::sparse_postings::{accumulate_sparse_posting_scores, sparse_dot_score};
@@ -19,9 +22,13 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
+
+type SecondaryIndexCatalog =
+    HashMap<u32, HashMap<String, HashMap<SecondaryIndexKind, SecondaryIndexManifestEntry>>>;
+type SecondaryIndexEntries = Vec<SecondaryIndexManifestEntry>;
 
 /// Generic K-way merge across already-sorted sources with early termination
 /// for pagination. Segment sources must be pre-sorted ascending by key.
@@ -175,6 +182,1073 @@ fn reconcile_dense_vector_manifest(
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+fn secondary_index_lookup_key(entry: &SecondaryIndexManifestEntry) -> SecondaryIndexLookupKey {
+    match &entry.target {
+        SecondaryIndexTarget::NodeProperty { type_id, prop_key } => SecondaryIndexLookupKey {
+            type_id: *type_id,
+            prop_key: prop_key.clone(),
+            kind: entry.kind.clone(),
+        },
+    }
+}
+
+fn normalize_secondary_index_manifest(manifest: &mut ManifestState) -> Result<bool, EngineError> {
+    let mut dirty = false;
+    let mut seen_ids = HashSet::new();
+    let mut seen_keys = HashSet::new();
+    let mut seen_range_targets = HashSet::new();
+    let mut max_index_id = 0u64;
+
+    for entry in &mut manifest.secondary_indexes {
+        if !seen_ids.insert(entry.index_id) {
+            return Err(EngineError::ManifestError(format!(
+                "duplicate secondary index id {} in manifest",
+                entry.index_id
+            )));
+        }
+        if !seen_keys.insert(secondary_index_lookup_key(entry)) {
+            return Err(EngineError::ManifestError(format!(
+                "duplicate secondary index declaration for {:?}",
+                entry.target
+            )));
+        }
+        if matches!(entry.kind, SecondaryIndexKind::Range { .. }) {
+            let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
+            if !seen_range_targets.insert((*type_id, prop_key.clone())) {
+                return Err(EngineError::ManifestError(format!(
+                    "duplicate range declaration for node property ({}, {})",
+                    type_id, prop_key
+                )));
+            }
+        }
+        max_index_id = max_index_id.max(entry.index_id);
+    }
+
+    let next_secondary_index_id = if max_index_id == 0 {
+        manifest.next_secondary_index_id.max(1)
+    } else {
+        manifest
+            .next_secondary_index_id
+            .max(max_index_id.saturating_add(1))
+    };
+    if next_secondary_index_id != manifest.next_secondary_index_id {
+        manifest.next_secondary_index_id = next_secondary_index_id;
+        dirty = true;
+    }
+
+    Ok(dirty)
+}
+
+fn build_secondary_index_catalog(
+    entries: &[SecondaryIndexManifestEntry],
+) -> Result<SecondaryIndexCatalog, EngineError> {
+    let mut catalog: SecondaryIndexCatalog = HashMap::with_capacity(entries.len());
+    let mut seen_range_targets = HashSet::new();
+    for entry in entries {
+        match &entry.target {
+            SecondaryIndexTarget::NodeProperty { type_id, prop_key } => {
+                if matches!(entry.kind, SecondaryIndexKind::Range { .. })
+                    && !seen_range_targets.insert((*type_id, prop_key.clone()))
+                {
+                    return Err(EngineError::ManifestError(format!(
+                        "duplicate range declaration loaded from manifest for node property ({}, {})",
+                        type_id, prop_key
+                    )));
+                }
+                let kind_map = catalog
+                    .entry(*type_id)
+                    .or_default()
+                    .entry(prop_key.clone())
+                    .or_default();
+                if kind_map.insert(entry.kind.clone(), entry.clone()).is_some() {
+                    return Err(EngineError::ManifestError(format!(
+                        "duplicate secondary index declaration loaded from manifest: {:?}",
+                        entry.target
+                    )));
+                }
+            }
+        }
+    }
+    Ok(catalog)
+}
+
+fn sync_secondary_index_runtime_state(
+    catalog_lock: &RwLock<SecondaryIndexCatalog>,
+    entries_lock: &RwLock<SecondaryIndexEntries>,
+    entries: &[SecondaryIndexManifestEntry],
+) -> Result<(), EngineError> {
+    let catalog = build_secondary_index_catalog(entries)?;
+    *catalog_lock.write().unwrap() = catalog;
+    *entries_lock.write().unwrap() = entries.to_vec();
+    Ok(())
+}
+
+fn merge_runtime_manifest_counters_from_shared(
+    manifest: &mut ManifestState,
+    next_node_id_seen: &AtomicU64,
+    next_edge_id_seen: &AtomicU64,
+    engine_seq_seen: &AtomicU64,
+) {
+    manifest.next_node_id = manifest
+        .next_node_id
+        .max(next_node_id_seen.load(Ordering::Acquire));
+    manifest.next_edge_id = manifest
+        .next_edge_id
+        .max(next_edge_id_seen.load(Ordering::Acquire));
+    manifest.next_engine_seq = manifest
+        .next_engine_seq
+        .max(engine_seq_seen.load(Ordering::Acquire));
+}
+
+fn update_secondary_index_manifest_runtime(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    next_node_id_seen: &AtomicU64,
+    next_edge_id_seen: &AtomicU64,
+    engine_seq_seen: &AtomicU64,
+    mutate: impl FnOnce(&mut ManifestState) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let _guard = manifest_write_lock.lock().unwrap();
+    let mut manifest = load_manifest_readonly(db_dir)?
+        .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
+    mutate(&mut manifest)?;
+    merge_runtime_manifest_counters_from_shared(
+        &mut manifest,
+        next_node_id_seen,
+        next_edge_id_seen,
+        engine_seq_seen,
+    );
+    write_manifest(db_dir, &manifest)?;
+    sync_secondary_index_runtime_state(catalog_lock, entries_lock, &manifest.secondary_indexes)?;
+    Ok(())
+}
+
+fn is_not_found_io_error(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::IoError(io_error) if io_error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn apply_secondary_index_failure_report(
+    manifest: &mut ManifestState,
+    report: &SecondaryIndexMaintenanceReport,
+) {
+    for (index_id, message) in &report.failed_equality_indexes {
+        if let Some(entry) = manifest
+            .secondary_indexes
+            .iter_mut()
+            .find(|entry| entry.index_id == *index_id)
+        {
+            if matches!(entry.kind, SecondaryIndexKind::Equality) {
+                entry.state = SecondaryIndexState::Failed;
+                entry.last_error = Some(message.clone());
+            }
+        }
+    }
+    for (index_id, message) in &report.failed_range_indexes {
+        if let Some(entry) = manifest
+            .secondary_indexes
+            .iter_mut()
+            .find(|entry| entry.index_id == *index_id)
+        {
+            if matches!(entry.kind, SecondaryIndexKind::Range { .. }) {
+                entry.state = SecondaryIndexState::Failed;
+                entry.last_error = Some(message.clone());
+            }
+        }
+    }
+}
+
+fn equality_index_ids_snapshot(entries: &[SecondaryIndexManifestEntry]) -> NodeIdSet {
+    entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, SecondaryIndexKind::Equality))
+        .map(|entry| entry.index_id)
+        .collect()
+}
+
+fn range_index_ids_snapshot(entries: &[SecondaryIndexManifestEntry]) -> NodeIdSet {
+    entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, SecondaryIndexKind::Range { .. }))
+        .map(|entry| entry.index_id)
+        .collect()
+}
+
+fn reconcile_background_output_equality_declarations(
+    manifest: &mut ManifestState,
+    maintained_equality_index_ids: &NodeIdSet,
+) -> Vec<u64> {
+    let mut rebuild_index_ids = Vec::new();
+    for entry in &mut manifest.secondary_indexes {
+        if !matches!(entry.kind, SecondaryIndexKind::Equality)
+            || maintained_equality_index_ids.contains(&entry.index_id)
+        {
+            continue;
+        }
+
+        match entry.state {
+            SecondaryIndexState::Failed => {}
+            SecondaryIndexState::Building => {
+                entry.last_error = None;
+                rebuild_index_ids.push(entry.index_id);
+            }
+            SecondaryIndexState::Ready => {
+                entry.state = SecondaryIndexState::Building;
+                entry.last_error = None;
+                rebuild_index_ids.push(entry.index_id);
+            }
+        }
+    }
+    rebuild_index_ids.sort_unstable();
+    rebuild_index_ids.dedup();
+    rebuild_index_ids
+}
+
+fn reconcile_background_output_range_declarations(
+    manifest: &mut ManifestState,
+    maintained_range_index_ids: &NodeIdSet,
+) -> Vec<u64> {
+    let mut rebuild_index_ids = Vec::new();
+    for entry in &mut manifest.secondary_indexes {
+        if !matches!(entry.kind, SecondaryIndexKind::Range { .. })
+            || maintained_range_index_ids.contains(&entry.index_id)
+        {
+            continue;
+        }
+
+        match entry.state {
+            SecondaryIndexState::Failed => {}
+            SecondaryIndexState::Building => {
+                entry.last_error = None;
+                rebuild_index_ids.push(entry.index_id);
+            }
+            SecondaryIndexState::Ready => {
+                entry.state = SecondaryIndexState::Building;
+                entry.last_error = None;
+                rebuild_index_ids.push(entry.index_id);
+            }
+        }
+    }
+    rebuild_index_ids.sort_unstable();
+    rebuild_index_ids.dedup();
+    rebuild_index_ids
+}
+
+fn mark_secondary_index_failed(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    next_node_id_seen: &AtomicU64,
+    next_edge_id_seen: &AtomicU64,
+    engine_seq_seen: &AtomicU64,
+    index_id: u64,
+    error: &EngineError,
+) {
+    let message = error.to_string();
+    let _ = update_secondary_index_manifest_runtime(
+        db_dir,
+        manifest_write_lock,
+        catalog_lock,
+        entries_lock,
+        next_node_id_seen,
+        next_edge_id_seen,
+        engine_seq_seen,
+        |manifest| {
+            if let Some(entry) = manifest
+                .secondary_indexes
+                .iter_mut()
+                .find(|entry| entry.index_id == index_id)
+            {
+                entry.state = SecondaryIndexState::Failed;
+                entry.last_error = Some(message.clone());
+            }
+            Ok(())
+        },
+    );
+}
+
+fn build_secondary_eq_groups_for_segment(
+    segment: &SegmentReader,
+    type_id: u32,
+    prop_key: &str,
+) -> Result<BTreeMap<u64, Vec<u64>>, EngineError> {
+    let target_key_hash = hash_prop_key(prop_key);
+    let legacy_hashes = segment.raw_node_prop_hashes_mmap();
+    let mut groups: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+
+    for index in 0..segment.node_meta_count() as usize {
+        let (
+            node_id,
+            data_offset,
+            _data_len,
+            node_type_id,
+            _updated_at,
+            _weight,
+            _key_len,
+            prop_hash_offset,
+            prop_hash_count,
+            _last_write_seq,
+        ) = segment.node_meta_at(index)?;
+        if node_type_id != type_id {
+            continue;
+        }
+
+        let mut value_hash = None;
+        if !legacy_hashes.is_empty() && prop_hash_count > 0 {
+            let base = prop_hash_offset as usize;
+            for pair_index in 0..prop_hash_count as usize {
+                let pair_off = base + pair_index * 16;
+                let pair_end = pair_off + 16;
+                if pair_end > legacy_hashes.len() {
+                    return Err(EngineError::CorruptRecord(format!(
+                        "node {} prop hash pair at offset {} exceeds source length {}",
+                        node_id,
+                        pair_off,
+                        legacy_hashes.len()
+                    )));
+                }
+                let key_hash =
+                    u64::from_le_bytes(legacy_hashes[pair_off..pair_off + 8].try_into().unwrap());
+                if key_hash != target_key_hash {
+                    continue;
+                }
+                value_hash = Some(u64::from_le_bytes(
+                    legacy_hashes[pair_off + 8..pair_off + 16]
+                        .try_into()
+                        .unwrap(),
+                ));
+                break;
+            }
+        }
+
+        if value_hash.is_none() {
+            value_hash = segment
+                .node_property_value_at_offset(node_id, data_offset, prop_key)?
+                .map(|value| hash_prop_value(&value));
+        }
+
+        if let Some(value_hash) = value_hash {
+            groups.entry(value_hash).or_default().push(node_id);
+        }
+    }
+
+    for ids in groups.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    Ok(groups)
+}
+
+fn build_secondary_range_entries_for_segment(
+    segment: &SegmentReader,
+    type_id: u32,
+    prop_key: &str,
+    domain: SecondaryIndexRangeDomain,
+) -> Result<Vec<(u64, u64)>, EngineError> {
+    let mut entries = Vec::new();
+
+    for index in 0..segment.node_meta_count() as usize {
+        let (
+            node_id,
+            data_offset,
+            _data_len,
+            node_type_id,
+            _updated_at,
+            _weight,
+            _key_len,
+            _prop_hash_offset,
+            _prop_hash_count,
+            _last_write_seq,
+        ) = segment.node_meta_at(index)?;
+        if node_type_id != type_id {
+            continue;
+        }
+
+        let Some(value) = segment.node_property_value_at_offset(node_id, data_offset, prop_key)?
+        else {
+            continue;
+        };
+        let Some(encoded_value) = encode_range_prop_value(domain, &value) else {
+            continue;
+        };
+        entries.push((encoded_value, node_id));
+    }
+
+    entries.sort_unstable();
+    entries.dedup();
+    Ok(entries)
+}
+
+fn install_secondary_eq_sidecar(
+    seg_dir: &Path,
+    index_id: u64,
+    groups: &BTreeMap<u64, Vec<u64>>,
+) -> Result<(), EngineError> {
+    let index_dir = seg_dir.join("secondary_indexes");
+    match std::fs::create_dir(&index_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let final_path = node_prop_eq_sidecar_path(seg_dir, index_id);
+    let tmp_path = index_dir.join(format!(".node_prop_eq_{}.tmp", index_id));
+    write_node_prop_eq_sidecar_to_path(&tmp_path, groups)?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    fsync_dir(&index_dir)?;
+    Ok(())
+}
+
+fn install_secondary_range_sidecar(
+    seg_dir: &Path,
+    index_id: u64,
+    entries: &[(u64, u64)],
+) -> Result<(), EngineError> {
+    let index_dir = seg_dir.join("secondary_indexes");
+    match std::fs::create_dir(&index_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let final_path = node_prop_range_sidecar_path(seg_dir, index_id);
+    let tmp_path = index_dir.join(format!(".node_prop_range_{}.tmp", index_id));
+    write_node_prop_range_sidecar_to_path(&tmp_path, entries)?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    fsync_dir(&index_dir)?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SecondaryEqBuildSnapshot {
+    dense_config: Option<DenseVectorConfig>,
+    type_id: u32,
+    prop_key: String,
+    segment_ids: Vec<u64>,
+}
+
+enum SecondaryEqCoverageStatus {
+    Covered,
+    Incomplete,
+    Failed(String),
+    Cancelled,
+}
+
+enum SecondaryEqFinalizeOutcome {
+    Applied,
+    Retry,
+    Inactive,
+}
+
+#[derive(Clone)]
+struct SecondaryRangeBuildSnapshot {
+    dense_config: Option<DenseVectorConfig>,
+    type_id: u32,
+    prop_key: String,
+    domain: SecondaryIndexRangeDomain,
+    segment_ids: Vec<u64>,
+}
+
+enum SecondaryRangeCoverageStatus {
+    Covered,
+    Incomplete,
+    Failed(String),
+    Cancelled,
+}
+
+enum SecondaryRangeFinalizeOutcome {
+    Applied,
+    Retry,
+    Inactive,
+}
+
+fn load_secondary_eq_build_snapshot(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    index_id: u64,
+) -> Result<Option<SecondaryEqBuildSnapshot>, EngineError> {
+    let _guard = manifest_write_lock.lock().unwrap();
+    let manifest = load_manifest_readonly(db_dir)?
+        .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
+    let Some(entry) = manifest
+        .secondary_indexes
+        .iter()
+        .find(|entry| entry.index_id == index_id)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    if entry.state != SecondaryIndexState::Building
+        || !matches!(entry.kind, SecondaryIndexKind::Equality)
+    {
+        return Ok(None);
+    }
+
+    let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = entry.target;
+    let mut segment_ids: Vec<u64> = manifest.segments.iter().map(|segment| segment.id).collect();
+    segment_ids.sort_unstable();
+    Ok(Some(SecondaryEqBuildSnapshot {
+        dense_config: manifest.dense_vector.clone(),
+        type_id,
+        prop_key,
+        segment_ids,
+    }))
+}
+
+fn build_secondary_eq_sidecars_for_snapshot(
+    db_dir: &Path,
+    index_id: u64,
+    snapshot: &SecondaryEqBuildSnapshot,
+    cancel: &AtomicBool,
+) -> Result<(), EngineError> {
+    for &segment_id in &snapshot.segment_ids {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let seg_path = segment_dir(db_dir, segment_id);
+        if !seg_path.exists() {
+            continue;
+        }
+
+        let segment =
+            match SegmentReader::open(&seg_path, segment_id, snapshot.dense_config.as_ref()) {
+                Ok(segment) => segment,
+                Err(error) if is_not_found_io_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+
+        match segment.validate_secondary_eq_sidecar(index_id) {
+            Ok(true) => continue,
+            Ok(false) => {
+                let groups = build_secondary_eq_groups_for_segment(
+                    &segment,
+                    snapshot.type_id,
+                    &snapshot.prop_key,
+                )?;
+                match install_secondary_eq_sidecar(&seg_path, index_id, &groups) {
+                    Ok(()) => {}
+                    Err(error) if is_not_found_io_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if is_not_found_io_error(&error) => {}
+            Err(_) => {
+                let groups = build_secondary_eq_groups_for_segment(
+                    &segment,
+                    snapshot.type_id,
+                    &snapshot.prop_key,
+                )?;
+                match install_secondary_eq_sidecar(&seg_path, index_id, &groups) {
+                    Ok(()) => {}
+                    Err(error) if is_not_found_io_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_secondary_eq_snapshot_coverage(
+    db_dir: &Path,
+    index_id: u64,
+    snapshot: &SecondaryEqBuildSnapshot,
+    cancel: &AtomicBool,
+) -> Result<SecondaryEqCoverageStatus, EngineError> {
+    let mut all_present = true;
+
+    for &segment_id in &snapshot.segment_ids {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(SecondaryEqCoverageStatus::Cancelled);
+        }
+
+        let seg_path = segment_dir(db_dir, segment_id);
+        if !seg_path.exists() {
+            all_present = false;
+            continue;
+        }
+
+        let segment =
+            match SegmentReader::open(&seg_path, segment_id, snapshot.dense_config.as_ref()) {
+                Ok(segment) => segment,
+                Err(error) if is_not_found_io_error(&error) => {
+                    all_present = false;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+        match segment.validate_secondary_eq_sidecar(index_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                all_present = false;
+            }
+            Err(error) => {
+                return Ok(SecondaryEqCoverageStatus::Failed(error.to_string()));
+            }
+        }
+    }
+
+    Ok(if all_present {
+        SecondaryEqCoverageStatus::Covered
+    } else {
+        SecondaryEqCoverageStatus::Incomplete
+    })
+}
+
+fn finalize_secondary_eq_build_snapshot(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    next_node_id_seen: &AtomicU64,
+    next_edge_id_seen: &AtomicU64,
+    engine_seq_seen: &AtomicU64,
+    index_id: u64,
+    snapshot: &SecondaryEqBuildSnapshot,
+    coverage: &SecondaryEqCoverageStatus,
+) -> Result<SecondaryEqFinalizeOutcome, EngineError> {
+    let mut outcome = SecondaryEqFinalizeOutcome::Applied;
+    update_secondary_index_manifest_runtime(
+        db_dir,
+        manifest_write_lock,
+        catalog_lock,
+        entries_lock,
+        next_node_id_seen,
+        next_edge_id_seen,
+        engine_seq_seen,
+        |manifest| {
+            let Some(entry_pos) = manifest
+                .secondary_indexes
+                .iter()
+                .position(|entry| entry.index_id == index_id)
+            else {
+                outcome = SecondaryEqFinalizeOutcome::Inactive;
+                return Ok(());
+            };
+
+            let mut current_segment_ids: Vec<u64> =
+                manifest.segments.iter().map(|segment| segment.id).collect();
+            current_segment_ids.sort_unstable();
+            if current_segment_ids != snapshot.segment_ids {
+                outcome = SecondaryEqFinalizeOutcome::Retry;
+                return Ok(());
+            }
+
+            let entry = &mut manifest.secondary_indexes[entry_pos];
+            if entry.state != SecondaryIndexState::Building
+                || !matches!(entry.kind, SecondaryIndexKind::Equality)
+            {
+                outcome = SecondaryEqFinalizeOutcome::Inactive;
+                return Ok(());
+            }
+
+            match coverage {
+                SecondaryEqCoverageStatus::Covered => {
+                    entry.state = SecondaryIndexState::Ready;
+                    entry.last_error = None;
+                }
+                SecondaryEqCoverageStatus::Incomplete => {
+                    entry.state = SecondaryIndexState::Building;
+                    entry.last_error = None;
+                }
+                SecondaryEqCoverageStatus::Failed(message) => {
+                    entry.state = SecondaryIndexState::Failed;
+                    entry.last_error = Some(message.clone());
+                }
+                SecondaryEqCoverageStatus::Cancelled => {
+                    outcome = SecondaryEqFinalizeOutcome::Inactive;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(outcome)
+}
+
+fn load_secondary_range_build_snapshot(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    index_id: u64,
+) -> Result<Option<SecondaryRangeBuildSnapshot>, EngineError> {
+    let _guard = manifest_write_lock.lock().unwrap();
+    let manifest = load_manifest_readonly(db_dir)?
+        .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
+    let Some(entry) = manifest
+        .secondary_indexes
+        .iter()
+        .find(|entry| entry.index_id == index_id)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    if entry.state != SecondaryIndexState::Building {
+        return Ok(None);
+    }
+
+    let SecondaryIndexKind::Range { domain } = entry.kind else {
+        return Ok(None);
+    };
+    let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = entry.target;
+    let mut segment_ids: Vec<u64> = manifest.segments.iter().map(|segment| segment.id).collect();
+    segment_ids.sort_unstable();
+    Ok(Some(SecondaryRangeBuildSnapshot {
+        dense_config: manifest.dense_vector.clone(),
+        type_id,
+        prop_key,
+        domain,
+        segment_ids,
+    }))
+}
+
+fn build_secondary_range_sidecars_for_snapshot(
+    db_dir: &Path,
+    index_id: u64,
+    snapshot: &SecondaryRangeBuildSnapshot,
+    cancel: &AtomicBool,
+) -> Result<(), EngineError> {
+    for &segment_id in &snapshot.segment_ids {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let seg_path = segment_dir(db_dir, segment_id);
+        if !seg_path.exists() {
+            continue;
+        }
+
+        let segment =
+            match SegmentReader::open(&seg_path, segment_id, snapshot.dense_config.as_ref()) {
+                Ok(segment) => segment,
+                Err(error) if is_not_found_io_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+
+        match segment.validate_secondary_range_sidecar(index_id) {
+            Ok(true) => continue,
+            Ok(false) => {
+                let entries = build_secondary_range_entries_for_segment(
+                    &segment,
+                    snapshot.type_id,
+                    &snapshot.prop_key,
+                    snapshot.domain,
+                )?;
+                match install_secondary_range_sidecar(&seg_path, index_id, &entries) {
+                    Ok(()) => {}
+                    Err(error) if is_not_found_io_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if is_not_found_io_error(&error) => {}
+            Err(_) => {
+                let entries = build_secondary_range_entries_for_segment(
+                    &segment,
+                    snapshot.type_id,
+                    &snapshot.prop_key,
+                    snapshot.domain,
+                )?;
+                match install_secondary_range_sidecar(&seg_path, index_id, &entries) {
+                    Ok(()) => {}
+                    Err(error) if is_not_found_io_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_secondary_range_snapshot_coverage(
+    db_dir: &Path,
+    index_id: u64,
+    snapshot: &SecondaryRangeBuildSnapshot,
+    cancel: &AtomicBool,
+) -> Result<SecondaryRangeCoverageStatus, EngineError> {
+    let mut all_present = true;
+
+    for &segment_id in &snapshot.segment_ids {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(SecondaryRangeCoverageStatus::Cancelled);
+        }
+
+        let seg_path = segment_dir(db_dir, segment_id);
+        if !seg_path.exists() {
+            all_present = false;
+            continue;
+        }
+
+        let segment =
+            match SegmentReader::open(&seg_path, segment_id, snapshot.dense_config.as_ref()) {
+                Ok(segment) => segment,
+                Err(error) if is_not_found_io_error(&error) => {
+                    all_present = false;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+        match segment.validate_secondary_range_sidecar(index_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                all_present = false;
+            }
+            Err(error) => {
+                return Ok(SecondaryRangeCoverageStatus::Failed(error.to_string()));
+            }
+        }
+    }
+
+    Ok(if all_present {
+        SecondaryRangeCoverageStatus::Covered
+    } else {
+        SecondaryRangeCoverageStatus::Incomplete
+    })
+}
+
+fn finalize_secondary_range_build_snapshot(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    next_node_id_seen: &AtomicU64,
+    next_edge_id_seen: &AtomicU64,
+    engine_seq_seen: &AtomicU64,
+    index_id: u64,
+    snapshot: &SecondaryRangeBuildSnapshot,
+    coverage: &SecondaryRangeCoverageStatus,
+) -> Result<SecondaryRangeFinalizeOutcome, EngineError> {
+    let mut outcome = SecondaryRangeFinalizeOutcome::Applied;
+    update_secondary_index_manifest_runtime(
+        db_dir,
+        manifest_write_lock,
+        catalog_lock,
+        entries_lock,
+        next_node_id_seen,
+        next_edge_id_seen,
+        engine_seq_seen,
+        |manifest| {
+            let Some(entry_pos) = manifest
+                .secondary_indexes
+                .iter()
+                .position(|entry| entry.index_id == index_id)
+            else {
+                outcome = SecondaryRangeFinalizeOutcome::Inactive;
+                return Ok(());
+            };
+
+            let mut current_segment_ids: Vec<u64> =
+                manifest.segments.iter().map(|segment| segment.id).collect();
+            current_segment_ids.sort_unstable();
+            if current_segment_ids != snapshot.segment_ids {
+                outcome = SecondaryRangeFinalizeOutcome::Retry;
+                return Ok(());
+            }
+
+            let entry = &mut manifest.secondary_indexes[entry_pos];
+            if entry.state != SecondaryIndexState::Building
+                || !matches!(entry.kind, SecondaryIndexKind::Range { .. })
+            {
+                outcome = SecondaryRangeFinalizeOutcome::Inactive;
+                return Ok(());
+            }
+
+            match coverage {
+                SecondaryRangeCoverageStatus::Covered => {
+                    entry.state = SecondaryIndexState::Ready;
+                    entry.last_error = None;
+                }
+                SecondaryRangeCoverageStatus::Incomplete => {
+                    entry.state = SecondaryIndexState::Building;
+                    entry.last_error = None;
+                }
+                SecondaryRangeCoverageStatus::Failed(message) => {
+                    entry.state = SecondaryIndexState::Failed;
+                    entry.last_error = Some(message.clone());
+                }
+                SecondaryRangeCoverageStatus::Cancelled => {
+                    outcome = SecondaryRangeFinalizeOutcome::Inactive;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(outcome)
+}
+
+fn process_secondary_index_build(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    next_node_id_seen: &AtomicU64,
+    next_edge_id_seen: &AtomicU64,
+    engine_seq_seen: &AtomicU64,
+    #[cfg(test)] build_pause: &Arc<Mutex<Option<SecondaryIndexBuildPauseHook>>>,
+    index_id: u64,
+    cancel: &AtomicBool,
+) -> Result<(), EngineError> {
+    #[cfg(test)]
+    let mut build_pause_applied = false;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        if !build_pause_applied {
+            if let Some(hook) = build_pause.lock().unwrap().take() {
+                let _ = hook.ready_tx.send(());
+                let _ = hook.release_rx.recv();
+            }
+            build_pause_applied = true;
+        }
+
+        if let Some(snapshot) =
+            load_secondary_eq_build_snapshot(db_dir, manifest_write_lock, index_id)?
+        {
+            build_secondary_eq_sidecars_for_snapshot(db_dir, index_id, &snapshot, cancel)?;
+            let coverage =
+                validate_secondary_eq_snapshot_coverage(db_dir, index_id, &snapshot, cancel)?;
+            if matches!(coverage, SecondaryEqCoverageStatus::Cancelled) {
+                return Ok(());
+            }
+
+            match finalize_secondary_eq_build_snapshot(
+                db_dir,
+                manifest_write_lock,
+                catalog_lock,
+                entries_lock,
+                next_node_id_seen,
+                next_edge_id_seen,
+                engine_seq_seen,
+                index_id,
+                &snapshot,
+                &coverage,
+            )? {
+                SecondaryEqFinalizeOutcome::Applied | SecondaryEqFinalizeOutcome::Inactive => {
+                    return Ok(())
+                }
+                SecondaryEqFinalizeOutcome::Retry => continue,
+            }
+        } else if let Some(snapshot) =
+            load_secondary_range_build_snapshot(db_dir, manifest_write_lock, index_id)?
+        {
+            build_secondary_range_sidecars_for_snapshot(db_dir, index_id, &snapshot, cancel)?;
+            let coverage =
+                validate_secondary_range_snapshot_coverage(db_dir, index_id, &snapshot, cancel)?;
+            if matches!(coverage, SecondaryRangeCoverageStatus::Cancelled) {
+                return Ok(());
+            }
+
+            match finalize_secondary_range_build_snapshot(
+                db_dir,
+                manifest_write_lock,
+                catalog_lock,
+                entries_lock,
+                next_node_id_seen,
+                next_edge_id_seen,
+                engine_seq_seen,
+                index_id,
+                &snapshot,
+                &coverage,
+            )? {
+                SecondaryRangeFinalizeOutcome::Applied
+                | SecondaryRangeFinalizeOutcome::Inactive => return Ok(()),
+                SecondaryRangeFinalizeOutcome::Retry => continue,
+            }
+        } else {
+            return Ok(());
+        }
+    }
+}
+
+fn process_secondary_index_drop_cleanup(
+    db_dir: &Path,
+    index_id: u64,
+    cancel: &AtomicBool,
+) -> Result<(), EngineError> {
+    let manifest = load_manifest_readonly(db_dir)?
+        .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
+    for segment_info in &manifest.segments {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let seg_dir = segment_dir(db_dir, segment_info.id);
+        for sidecar_path in [
+            node_prop_eq_sidecar_path(&seg_dir, index_id),
+            node_prop_range_sidecar_path(&seg_dir, index_id),
+        ] {
+            if sidecar_path.exists() {
+                let _ = std::fs::remove_file(&sidecar_path);
+                if let Some(parent) = sidecar_path.parent() {
+                    let _ = fsync_dir(parent);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bg_secondary_index_worker(
+    rx: std::sync::mpsc::Receiver<SecondaryIndexJob>,
+    cancel: Arc<AtomicBool>,
+    db_dir: PathBuf,
+    manifest_write_lock: Arc<Mutex<()>>,
+    catalog_lock: Arc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: Arc<RwLock<SecondaryIndexEntries>>,
+    next_node_id_seen: Arc<AtomicU64>,
+    next_edge_id_seen: Arc<AtomicU64>,
+    engine_seq_seen: Arc<AtomicU64>,
+    #[cfg(test)] build_pause: Arc<Mutex<Option<SecondaryIndexBuildPauseHook>>>,
+) {
+    while let Ok(job) = rx.recv() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match job {
+            SecondaryIndexJob::Build { index_id } => {
+                if let Err(error) = process_secondary_index_build(
+                    &db_dir,
+                    &manifest_write_lock,
+                    &catalog_lock,
+                    &entries_lock,
+                    next_node_id_seen.as_ref(),
+                    next_edge_id_seen.as_ref(),
+                    engine_seq_seen.as_ref(),
+                    #[cfg(test)]
+                    &build_pause,
+                    index_id,
+                    &cancel,
+                ) {
+                    mark_secondary_index_failed(
+                        &db_dir,
+                        &manifest_write_lock,
+                        &catalog_lock,
+                        &entries_lock,
+                        next_node_id_seen.as_ref(),
+                        next_edge_id_seen.as_ref(),
+                        engine_seq_seen.as_ref(),
+                        index_id,
+                        &error,
+                    );
+                }
+            }
+            SecondaryIndexJob::DropCleanup { index_id } => {
+                let _ = process_secondary_index_drop_cleanup(&db_dir, index_id, &cancel);
+            }
+            SecondaryIndexJob::Shutdown => break,
+        }
     }
 }
 
@@ -460,6 +1534,12 @@ pub struct DatabaseEngine {
     active_wal_generation_id: u64,
     /// Handle for the persistent background flush worker thread.
     bg_flush: Option<BgFlushHandle>,
+    /// Runtime declaration catalog keyed by `(type_id, prop_key, kind)`.
+    secondary_index_catalog: Arc<RwLock<SecondaryIndexCatalog>>,
+    /// Runtime declaration entries kept in sync with background state changes.
+    secondary_index_entries: Arc<RwLock<SecondaryIndexEntries>>,
+    /// Handle for the background secondary-index lifecycle worker.
+    secondary_index_bg: Option<SecondaryIndexBgHandle>,
     /// Oldest unresolved flush pipeline error. Cleared when the same epoch
     /// later publishes and is adopted successfully.
     flush_pipeline_error: Option<FlushPipelineError>,
@@ -469,9 +1549,17 @@ pub struct DatabaseEngine {
     /// Wrapped in Mutex so DatabaseEngine stays Sync for scoped threads.
     #[cfg(test)]
     flush_pause: Mutex<Option<FlushPauseHook>>,
+    #[cfg(test)]
+    flush_publish_pause: Arc<Mutex<Option<FlushPublishPauseHook>>>,
+    #[cfg(test)]
+    bg_compact_pause: Arc<Mutex<Option<BgCompactPauseHook>>>,
+    #[cfg(test)]
+    secondary_index_build_pause: Arc<Mutex<Option<SecondaryIndexBuildPauseHook>>>,
     /// One-shot failure injection flag (test only).
     #[cfg(test)]
     flush_force_error: bool,
+    #[cfg(test)]
+    property_query_routes: PropertyQueryRouteCounters,
 }
 
 /// Captured pre-mutation edge state for degree cache updates.
@@ -509,6 +1597,9 @@ struct BgCompactResult {
     old_seg_dirs: Vec<PathBuf>,
     stats: CompactionStats,
     input_segment_ids: NodeIdSet,
+    maintained_equality_index_ids: NodeIdSet,
+    maintained_range_index_ids: NodeIdSet,
+    secondary_index_report: SecondaryIndexMaintenanceReport,
 }
 
 /// Handle for the split async flush pipeline.
@@ -527,6 +1618,43 @@ struct BgFlushHandle {
     events_ready: Arc<AtomicUsize>,
     /// Number of completion events consumed by the engine thread.
     events_applied: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SecondaryIndexLookupKey {
+    type_id: u32,
+    prop_key: String,
+    kind: SecondaryIndexKind,
+}
+
+enum SecondaryIndexJob {
+    Build { index_id: u64 },
+    DropCleanup { index_id: u64 },
+    Shutdown,
+}
+
+struct SecondaryIndexBgHandle {
+    job_tx: std::sync::mpsc::Sender<SecondaryIndexJob>,
+    handle: Option<JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PropertyQueryRouteCounters {
+    equality_scan_fallback: AtomicUsize,
+    equality_index_lookup: AtomicUsize,
+    range_scan_fallback: AtomicUsize,
+    range_index_lookup: AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PropertyQueryRouteSnapshot {
+    pub equality_scan_fallback: usize,
+    pub equality_index_lookup: usize,
+    pub range_scan_fallback: usize,
+    pub range_index_lookup: usize,
 }
 
 /// Work item sent to the background build worker.
@@ -552,6 +1680,8 @@ struct BuiltFlushResult {
     seg_id: u64,
     final_dir: PathBuf,
     dense_config: Option<DenseVectorConfig>,
+    maintained_equality_index_ids: NodeIdSet,
+    maintained_range_index_ids: NodeIdSet,
 }
 
 /// Cheap foreground-only adoption payload. No disk I/O remains at this stage.
@@ -560,6 +1690,8 @@ struct PublishedFlushAdoption {
     wal_gen_to_retire: u64,
     seg_info: SegmentInfo,
     reader: SegmentReader,
+    rebuild_equality_index_ids: Vec<u64>,
+    rebuild_range_index_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,6 +1747,24 @@ struct FlushPauseHook {
     release_rx: std::sync::mpsc::Receiver<()>,
 }
 
+#[cfg(test)]
+struct FlushPublishPauseHook {
+    ready_tx: std::sync::mpsc::SyncSender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct BgCompactPauseHook {
+    ready_tx: std::sync::mpsc::SyncSender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct SecondaryIndexBuildPauseHook {
+    ready_tx: std::sync::mpsc::SyncSender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactionPath {
     FastMerge,
@@ -640,7 +1790,8 @@ impl DatabaseEngine {
             Some(m) => m,
             None => default_manifest(),
         };
-        let manifest_dirty = reconcile_dense_vector_manifest(&mut manifest, options)?;
+        let manifest_dirty = reconcile_dense_vector_manifest(&mut manifest, options)?
+            || normalize_secondary_index_manifest(&mut manifest)?;
         if created_manifest || manifest_dirty {
             write_manifest(path, &manifest)?;
         };
@@ -903,15 +2054,31 @@ impl DatabaseEngine {
             immutable_bytes_total: immutable_bytes_on_open,
             active_wal_generation_id,
             bg_flush: None,
+            secondary_index_catalog: Arc::new(RwLock::new(HashMap::new())),
+            secondary_index_entries: Arc::new(RwLock::new(Vec::new())),
+            secondary_index_bg: None,
             flush_pipeline_error: None,
             flush_pipeline_error_reported: false,
             #[cfg(test)]
             flush_pause: Mutex::new(None),
             #[cfg(test)]
+            flush_publish_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            bg_compact_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            secondary_index_build_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             flush_force_error: false,
+            #[cfg(test)]
+            property_query_routes: PropertyQueryRouteCounters::default(),
         };
 
         engine.rebuild_degree_cache()?;
+        engine.recover_secondary_index_states_on_open()?;
+        engine.rebuild_secondary_index_catalog()?;
+        engine.ensure_secondary_index_worker_if_needed();
+        engine.seed_secondary_indexes_from_manifest()?;
+        engine.schedule_building_secondary_indexes();
 
         Ok(engine)
     }
@@ -937,6 +2104,7 @@ impl DatabaseEngine {
         for event in self.shutdown_bg_flush() {
             let _ = self.process_bg_flush_event(event);
         }
+        self.shutdown_secondary_index_worker();
         let close_result = self.close_inner();
         match (first_error, close_result) {
             (Some(err), _) => Err(err),
@@ -955,6 +2123,7 @@ impl DatabaseEngine {
         for event in self.shutdown_bg_flush() {
             let _ = self.process_bg_flush_event(event);
         }
+        self.shutdown_secondary_index_worker();
         self.close_inner()?;
         self.current_flush_pipeline_error().map_or(Ok(()), Err)
     }
@@ -989,6 +2158,192 @@ impl DatabaseEngine {
         }
     }
 
+    fn secondary_index_entries_snapshot(&self) -> SecondaryIndexEntries {
+        self.secondary_index_entries.read().unwrap().clone()
+    }
+
+    fn rebuild_secondary_index_catalog(&mut self) -> Result<(), EngineError> {
+        sync_secondary_index_runtime_state(
+            &self.secondary_index_catalog,
+            &self.secondary_index_entries,
+            &self.manifest.secondary_indexes,
+        )
+    }
+
+    fn recover_secondary_index_states_on_open(&mut self) -> Result<(), EngineError> {
+        let mut dirty = false;
+        for entry in &mut self.manifest.secondary_indexes {
+            if entry.state != SecondaryIndexState::Ready {
+                continue;
+            }
+
+            for segment in &self.segments {
+                let validation = match entry.kind {
+                    SecondaryIndexKind::Equality => {
+                        segment.validate_secondary_eq_sidecar(entry.index_id)
+                    }
+                    SecondaryIndexKind::Range { .. } => {
+                        segment.validate_secondary_range_sidecar(entry.index_id)
+                    }
+                };
+                match validation {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        entry.state = SecondaryIndexState::Building;
+                        entry.last_error = None;
+                        dirty = true;
+                        break;
+                    }
+                    Err(error) => {
+                        entry.state = SecondaryIndexState::Failed;
+                        entry.last_error = Some(error.to_string());
+                        dirty = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if dirty {
+            write_manifest(&self.db_dir, &self.manifest)?;
+        }
+        Ok(())
+    }
+
+    fn seed_secondary_indexes_from_manifest(&mut self) -> Result<(), EngineError> {
+        let entries = self.secondary_index_entries_snapshot();
+        for entry in &entries {
+            self.memtable.register_secondary_index(entry);
+        }
+        for epoch in &mut self.immutable_epochs {
+            let memtable = Arc::make_mut(&mut epoch.memtable);
+            for entry in &entries {
+                memtable.register_secondary_index(entry);
+            }
+        }
+        self.refresh_immutable_bytes_total();
+        Ok(())
+    }
+
+    fn seed_secondary_index_entry(
+        &mut self,
+        entry: &SecondaryIndexManifestEntry,
+    ) -> Result<(), EngineError> {
+        self.memtable.register_secondary_index(entry);
+        for epoch in &mut self.immutable_epochs {
+            let memtable = Arc::make_mut(&mut epoch.memtable);
+            memtable.register_secondary_index(entry);
+        }
+        self.refresh_immutable_bytes_total();
+        Ok(())
+    }
+
+    fn remove_secondary_index_entry_from_memtables(
+        &mut self,
+        index_id: u64,
+    ) -> Result<(), EngineError> {
+        self.memtable.unregister_secondary_index(index_id);
+        for epoch in &mut self.immutable_epochs {
+            let memtable = Arc::make_mut(&mut epoch.memtable);
+            memtable.unregister_secondary_index(index_id);
+        }
+        self.refresh_immutable_bytes_total();
+        Ok(())
+    }
+
+    fn ensure_secondary_index_worker(&mut self) {
+        if self.secondary_index_bg.is_some() {
+            return;
+        }
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+        let db_dir = self.db_dir.clone();
+        let manifest_write_lock = Arc::clone(&self.manifest_write_lock);
+        let catalog_lock = Arc::clone(&self.secondary_index_catalog);
+        let entries_lock = Arc::clone(&self.secondary_index_entries);
+        let next_node_id_seen = Arc::clone(&self.next_node_id_seen);
+        let next_edge_id_seen = Arc::clone(&self.next_edge_id_seen);
+        let engine_seq_seen = Arc::clone(&self.engine_seq_seen);
+        #[cfg(test)]
+        let build_pause = Arc::clone(&self.secondary_index_build_pause);
+        let handle = std::thread::spawn(move || {
+            bg_secondary_index_worker(
+                job_rx,
+                cancel_clone,
+                db_dir,
+                manifest_write_lock,
+                catalog_lock,
+                entries_lock,
+                next_node_id_seen,
+                next_edge_id_seen,
+                engine_seq_seen,
+                #[cfg(test)]
+                build_pause,
+            )
+        });
+        self.secondary_index_bg = Some(SecondaryIndexBgHandle {
+            job_tx,
+            handle: Some(handle),
+            cancel,
+        });
+    }
+
+    fn ensure_secondary_index_worker_if_needed(&mut self) {
+        let has_secondary_declarations = self
+            .secondary_index_entries_snapshot()
+            .into_iter()
+            .next()
+            .is_some();
+        if has_secondary_declarations {
+            self.ensure_secondary_index_worker();
+        }
+    }
+
+    fn enqueue_secondary_index_job(&mut self, job: SecondaryIndexJob) {
+        self.ensure_secondary_index_worker();
+        if let Some(bg) = &self.secondary_index_bg {
+            let _ = bg.job_tx.send(job);
+        }
+    }
+
+    fn schedule_building_secondary_indexes(&mut self) {
+        let building_ids: Vec<u64> = self
+            .secondary_index_entries_snapshot()
+            .into_iter()
+            .filter(|entry| entry.state == SecondaryIndexState::Building)
+            .map(|entry| entry.index_id)
+            .collect();
+        for index_id in building_ids {
+            self.enqueue_secondary_index_job(SecondaryIndexJob::Build { index_id });
+        }
+    }
+
+    fn shutdown_secondary_index_worker(&mut self) {
+        if let Some(mut bg) = self.secondary_index_bg.take() {
+            bg.cancel.store(true, Ordering::Relaxed);
+            let _ = bg.job_tx.send(SecondaryIndexJob::Shutdown);
+            if let Some(handle) = bg.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn node_property_index_entry(
+        &self,
+        type_id: u32,
+        prop_key: &str,
+        kind: &SecondaryIndexKind,
+    ) -> Option<SecondaryIndexManifestEntry> {
+        self.secondary_index_catalog
+            .read()
+            .unwrap()
+            .get(&type_id)?
+            .get(prop_key)?
+            .get(kind)
+            .cloned()
+    }
+
     fn update_next_node_id_seen(&self) {
         self.next_node_id_seen
             .fetch_max(self.next_node_id, Ordering::Release);
@@ -999,21 +2354,26 @@ impl DatabaseEngine {
             .fetch_max(self.next_edge_id, Ordering::Release);
     }
 
+    fn refresh_immutable_bytes_total(&mut self) {
+        self.immutable_bytes_total = self
+            .immutable_epochs
+            .iter()
+            .map(|epoch| epoch.memtable.estimated_size())
+            .sum();
+    }
+
     fn update_engine_seq_seen(&self) {
         self.engine_seq_seen
             .fetch_max(self.engine_seq, Ordering::Release);
     }
 
     fn merge_runtime_manifest_counters(&self, manifest: &mut ManifestState) {
-        manifest.next_node_id = manifest
-            .next_node_id
-            .max(self.next_node_id_seen.load(Ordering::Acquire));
-        manifest.next_edge_id = manifest
-            .next_edge_id
-            .max(self.next_edge_id_seen.load(Ordering::Acquire));
-        manifest.next_engine_seq = manifest
-            .next_engine_seq
-            .max(self.engine_seq_seen.load(Ordering::Acquire));
+        merge_runtime_manifest_counters_from_shared(
+            manifest,
+            &self.next_node_id_seen,
+            &self.next_edge_id_seen,
+            &self.engine_seq_seen,
+        );
     }
 
     fn load_current_manifest_for_write(&self) -> Result<ManifestState, EngineError> {
@@ -1719,6 +3079,7 @@ impl DatabaseEngine {
         let build_cancel = Arc::clone(&cancel);
         let build_events_ready = Arc::clone(&events_ready);
         let build_event_tx = event_tx.clone();
+        let build_secondary_indexes = Arc::clone(&self.secondary_index_entries);
         let build_handle = std::thread::spawn(move || {
             bg_flush_build_worker(
                 work_rx,
@@ -1726,6 +3087,7 @@ impl DatabaseEngine {
                 build_event_tx,
                 build_cancel,
                 build_events_ready,
+                build_secondary_indexes,
             );
         });
 
@@ -1733,20 +3095,28 @@ impl DatabaseEngine {
         let publish_events_ready = Arc::clone(&events_ready);
         let db_dir = self.db_dir.clone();
         let manifest_write_lock = Arc::clone(&self.manifest_write_lock);
+        let publish_catalog = Arc::clone(&self.secondary_index_catalog);
+        let publish_entries = Arc::clone(&self.secondary_index_entries);
         let next_node_id_seen = Arc::clone(&self.next_node_id_seen);
         let next_edge_id_seen = Arc::clone(&self.next_edge_id_seen);
         let engine_seq_seen = Arc::clone(&self.engine_seq_seen);
+        #[cfg(test)]
+        let publish_pause = Arc::clone(&self.flush_publish_pause);
         let publish_handle = std::thread::spawn(move || {
             bg_flush_publish_worker(
                 db_dir,
                 built_rx,
                 event_tx,
                 manifest_write_lock,
+                publish_catalog,
+                publish_entries,
                 next_node_id_seen,
                 next_edge_id_seen,
                 engine_seq_seen,
                 publish_cancel,
                 publish_events_ready,
+                #[cfg(test)]
+                publish_pause,
             );
         });
 
@@ -1896,6 +3266,36 @@ impl DatabaseEngine {
         match event {
             BgFlushEvent::Adopt(adoption) => {
                 let seg_info = adoption.seg_info.clone();
+                for index_id in &adoption.rebuild_equality_index_ids {
+                    if let Some(entry) = self
+                        .manifest
+                        .secondary_indexes
+                        .iter_mut()
+                        .find(|entry| entry.index_id == *index_id)
+                    {
+                        if matches!(entry.kind, SecondaryIndexKind::Equality)
+                            && entry.state != SecondaryIndexState::Failed
+                        {
+                            entry.state = SecondaryIndexState::Building;
+                            entry.last_error = None;
+                        }
+                    }
+                }
+                for index_id in &adoption.rebuild_range_index_ids {
+                    if let Some(entry) = self
+                        .manifest
+                        .secondary_indexes
+                        .iter_mut()
+                        .find(|entry| entry.index_id == *index_id)
+                    {
+                        if matches!(entry.kind, SecondaryIndexKind::Range { .. })
+                            && entry.state != SecondaryIndexState::Failed
+                        {
+                            entry.state = SecondaryIndexState::Building;
+                            entry.last_error = None;
+                        }
+                    }
+                }
                 if !self
                     .manifest
                     .segments
@@ -1932,6 +3332,12 @@ impl DatabaseEngine {
                     self.flush_count_since_last_compact =
                         self.flush_count_since_last_compact.saturating_add(1);
                     let _ = self.maybe_schedule_bg_compact();
+                }
+                for index_id in adoption.rebuild_equality_index_ids {
+                    self.enqueue_secondary_index_job(SecondaryIndexJob::Build { index_id });
+                }
+                for index_id in adoption.rebuild_range_index_ids {
+                    self.enqueue_secondary_index_job(SecondaryIndexJob::Build { index_id });
                 }
 
                 Ok(Some(seg_info))
@@ -2063,8 +3469,11 @@ impl DatabaseEngine {
         let prune_policies: Vec<PrunePolicy> =
             self.manifest.prune_policies.values().cloned().collect();
         let dense_vector = self.manifest.dense_vector.clone();
+        let secondary_indexes = self.secondary_index_entries_snapshot();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = Arc::clone(&cancel);
+        #[cfg(test)]
+        let compact_pause = Arc::clone(&self.bg_compact_pause);
         let handle = std::thread::spawn(move || {
             bg_compact_worker(
                 db_dir,
@@ -2072,7 +3481,10 @@ impl DatabaseEngine {
                 input_segments,
                 prune_policies,
                 dense_vector,
+                secondary_indexes,
                 &cancel_clone,
+                #[cfg(test)]
+                &compact_pause,
             )
         });
 
@@ -2130,7 +3542,7 @@ impl DatabaseEngine {
     /// Apply a completed background compaction result: update manifest, swap
     /// segments, and delete old segment directories.
     fn apply_bg_compact_result(&mut self, result: BgCompactResult) -> Option<CompactionStats> {
-        let updated_manifest = {
+        let (updated_manifest, rebuild_equality_index_ids, rebuild_range_index_ids) = {
             let _guard = self.manifest_write_lock.lock().unwrap();
             let mut manifest = match self.load_current_manifest_for_write() {
                 Ok(manifest) => manifest,
@@ -2155,6 +3567,15 @@ impl DatabaseEngine {
                 .segments
                 .retain(|s| !result.input_segment_ids.contains(&s.id));
             manifest.segments.push(result.seg_info.clone());
+            apply_secondary_index_failure_report(&mut manifest, &result.secondary_index_report);
+            let rebuild_equality_index_ids = reconcile_background_output_equality_declarations(
+                &mut manifest,
+                &result.maintained_equality_index_ids,
+            );
+            let rebuild_range_index_ids = reconcile_background_output_range_declarations(
+                &mut manifest,
+                &result.maintained_range_index_ids,
+            );
             self.merge_runtime_manifest_counters(&mut manifest);
 
             if let Err(e) = write_manifest(&self.db_dir, &manifest) {
@@ -2163,10 +3584,20 @@ impl DatabaseEngine {
                 let _ = std::fs::remove_dir_all(output_dir);
                 return None;
             }
-            manifest
+            (
+                manifest,
+                rebuild_equality_index_ids,
+                rebuild_range_index_ids,
+            )
         };
 
         self.manifest = updated_manifest;
+        if let Err(error) = self.rebuild_secondary_index_catalog() {
+            eprintln!(
+                "Background compaction: secondary index runtime sync failed: {}",
+                error
+            );
+        }
         // Remove input segments, keep any new segments added by flushes during
         // background compaction (they have different IDs).
         self.segments
@@ -2184,6 +3615,13 @@ impl DatabaseEngine {
         // Rebuild degree cache. Segments changed during background compaction.
         if let Err(e) = self.rebuild_degree_cache() {
             eprintln!("Background compaction: degree cache rebuild failed: {}", e);
+        }
+
+        for index_id in rebuild_equality_index_ids {
+            self.enqueue_secondary_index_job(SecondaryIndexJob::Build { index_id });
+        }
+        for index_id in rebuild_range_index_ids {
+            self.enqueue_secondary_index_job(SecondaryIndexJob::Build { index_id });
         }
 
         let _ = self.maybe_schedule_bg_compact();
@@ -2287,6 +3725,7 @@ impl DatabaseEngine {
 
         let has_tombstones = self.segments.iter().any(|s| s.has_tombstones());
         let policies: Vec<PrunePolicy> = self.manifest.prune_policies.values().cloned().collect();
+        let secondary_indexes = self.secondary_index_entries_snapshot();
         let compaction_path =
             select_compaction_path(&self.segments, has_tombstones, !policies.is_empty());
 
@@ -2300,40 +3739,43 @@ impl DatabaseEngine {
         let tmp_dir = segment_tmp_dir(&self.db_dir, seg_id);
         let final_dir = segment_dir(&self.db_dir, seg_id);
 
-        let (seg_info, nodes_auto_pruned, edges_auto_pruned) = match compaction_path {
-            CompactionPath::FastMerge => match self.compact_fast_merge(
-                &tmp_dir,
-                seg_id,
-                callback,
-                input_segment_count,
-                total_input_nodes,
-                total_input_edges,
-            ) {
-                Ok(seg_info) => (seg_info, 0, 0),
-                Err(e) => {
-                    self.next_segment_id -= 1;
-                    let _ = std::fs::remove_dir_all(&tmp_dir);
-                    return Err(e);
-                }
-            },
-            CompactionPath::UnifiedV3 => match self.compact_standard(
-                &tmp_dir,
-                seg_id,
-                callback,
-                has_tombstones,
-                &policies,
-                input_segment_count,
-                total_input_nodes,
-                total_input_edges,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    self.next_segment_id -= 1;
-                    let _ = std::fs::remove_dir_all(&tmp_dir);
-                    return Err(e);
-                }
-            },
-        };
+        let (seg_info, nodes_auto_pruned, edges_auto_pruned, secondary_index_report) =
+            match compaction_path {
+                CompactionPath::FastMerge => match self.compact_fast_merge(
+                    &tmp_dir,
+                    seg_id,
+                    callback,
+                    &secondary_indexes,
+                    input_segment_count,
+                    total_input_nodes,
+                    total_input_edges,
+                ) {
+                    Ok((seg_info, report)) => (seg_info, 0, 0, report),
+                    Err(e) => {
+                        self.next_segment_id -= 1;
+                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                        return Err(e);
+                    }
+                },
+                CompactionPath::UnifiedV3 => match self.compact_standard(
+                    &tmp_dir,
+                    seg_id,
+                    callback,
+                    has_tombstones,
+                    &policies,
+                    &secondary_indexes,
+                    input_segment_count,
+                    total_input_nodes,
+                    total_input_edges,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        self.next_segment_id -= 1;
+                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                        return Err(e);
+                    }
+                },
+            };
 
         if let Err(e) = std::fs::rename(&tmp_dir, &final_dir) {
             self.next_segment_id -= 1;
@@ -2366,6 +3808,7 @@ impl DatabaseEngine {
             let mut manifest = self.load_current_manifest_for_write()?;
             manifest.segments.retain(|s| !old_seg_ids.contains(&s.id));
             manifest.segments.push(seg_info.clone());
+            apply_secondary_index_failure_report(&mut manifest, &secondary_index_report);
             self.merge_runtime_manifest_counters(&mut manifest);
             write_manifest(&self.db_dir, &manifest)?;
             manifest
@@ -2373,6 +3816,7 @@ impl DatabaseEngine {
 
         // Manifest is durable. Now safe to swap in-memory state
         self.manifest = new_manifest;
+        self.rebuild_secondary_index_catalog()?;
         self.segments.clear();
         self.segments.push(new_reader);
 
@@ -2406,10 +3850,11 @@ impl DatabaseEngine {
         tmp_dir: &Path,
         seg_id: u64,
         callback: &mut F,
+        secondary_indexes: &[SecondaryIndexManifestEntry],
         input_segment_count: usize,
         total_input_nodes: u64,
         total_input_edges: u64,
-    ) -> Result<SegmentInfo, EngineError>
+    ) -> Result<(SegmentInfo, SecondaryIndexMaintenanceReport), EngineError>
     where
         F: FnMut(&CompactionProgress) -> bool,
     {
@@ -2472,6 +3917,7 @@ impl DatabaseEngine {
             seg_id,
             &self.segments,
             self.manifest.dense_vector.as_ref(),
+            secondary_indexes,
         )
     }
 
@@ -2491,10 +3937,11 @@ impl DatabaseEngine {
         callback: &mut F,
         has_tombstones: bool,
         prune_policies: &[PrunePolicy],
+        secondary_indexes: &[SecondaryIndexManifestEntry],
         input_segment_count: usize,
         total_input_nodes: u64,
         total_input_edges: u64,
-    ) -> Result<(SegmentInfo, u64, u64), EngineError>
+    ) -> Result<(SegmentInfo, u64, u64, SecondaryIndexMaintenanceReport), EngineError>
     where
         F: FnMut(&CompactionProgress) -> bool,
     {
@@ -2589,15 +4036,21 @@ impl DatabaseEngine {
         let nodes_auto_pruned = plan.pruned_node_ids.len() as u64;
         let edges_auto_pruned = plan.edges_auto_pruned;
 
-        let seg_info = v3_build_output(
+        let (seg_info, secondary_index_report) = v3_build_output(
             tmp_dir,
             seg_id,
             &self.segments,
             &plan,
             self.manifest.dense_vector.as_ref(),
+            secondary_indexes,
         )?;
 
-        Ok((seg_info, nodes_auto_pruned, edges_auto_pruned))
+        Ok((
+            seg_info,
+            nodes_auto_pruned,
+            edges_auto_pruned,
+            secondary_index_report,
+        ))
     }
 
     // --- Runtime introspection ---
@@ -2766,6 +4219,7 @@ impl Drop for DatabaseEngine {
         // Best-effort: drain any completed bg flush results, then shut down worker.
         self.drain_bg_flush();
         self.shutdown_bg_flush();
+        self.shutdown_secondary_index_worker();
 
         // Best-effort: shut down sync thread and flush buffered data.
         if self.sync_thread.is_some() {
@@ -2892,8 +4346,52 @@ impl DatabaseEngine {
         self.active_wal_generation_id
     }
 
+    pub(crate) fn engine_seq_for_test(&self) -> u64 {
+        self.engine_seq
+    }
+
     pub(crate) fn active_memtable(&self) -> &Memtable {
         &self.memtable
+    }
+
+    pub(crate) fn immutable_memtable(&self, idx: usize) -> &Memtable {
+        &self.immutable_epochs[idx].memtable
+    }
+
+    pub(crate) fn property_query_route_snapshot(&self) -> PropertyQueryRouteSnapshot {
+        PropertyQueryRouteSnapshot {
+            equality_scan_fallback: self
+                .property_query_routes
+                .equality_scan_fallback
+                .load(Ordering::Relaxed),
+            equality_index_lookup: self
+                .property_query_routes
+                .equality_index_lookup
+                .load(Ordering::Relaxed),
+            range_scan_fallback: self
+                .property_query_routes
+                .range_scan_fallback
+                .load(Ordering::Relaxed),
+            range_index_lookup: self
+                .property_query_routes
+                .range_index_lookup
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn reset_property_query_routes(&self) {
+        self.property_query_routes
+            .equality_scan_fallback
+            .store(0, Ordering::Relaxed);
+        self.property_query_routes
+            .equality_index_lookup
+            .store(0, Ordering::Relaxed);
+        self.property_query_routes
+            .range_scan_fallback
+            .store(0, Ordering::Relaxed);
+        self.property_query_routes
+            .range_index_lookup
+            .store(0, Ordering::Relaxed);
     }
 
     /// Set a one-shot pause hook. Consumed by the next enqueue_flush call.
@@ -2914,12 +4412,57 @@ impl DatabaseEngine {
         (ready_rx, release_tx)
     }
 
+    pub(crate) fn set_flush_publish_pause(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self.flush_publish_pause.lock().unwrap() = Some(FlushPublishPauseHook {
+            ready_tx,
+            release_rx,
+        });
+        (ready_rx, release_tx)
+    }
+
+    pub(crate) fn set_bg_compact_pause(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self.bg_compact_pause.lock().unwrap() = Some(BgCompactPauseHook {
+            ready_tx,
+            release_rx,
+        });
+        (ready_rx, release_tx)
+    }
+
     /// Set a one-shot failure injection. The next `enqueue_flush` call will
     /// produce a BgFlushWork with `force_write_error = true`, causing the worker
     /// to return an error without writing a segment. Only affects one enqueue;
     /// subsequent enqueues are normal. Best used with a single pending epoch.
     pub(crate) fn set_flush_force_error(&mut self) {
         self.flush_force_error = true;
+    }
+
+    pub(crate) fn set_secondary_index_build_pause(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self.secondary_index_build_pause.lock().unwrap() = Some(SecondaryIndexBuildPauseHook {
+            ready_tx,
+            release_rx,
+        });
+        (ready_rx, release_tx)
     }
 
     /// Enqueue one flush (expose for tests).
@@ -2931,6 +4474,10 @@ impl DatabaseEngine {
     /// Wait for one flush result (expose for tests).
     pub(crate) fn wait_one_flush(&mut self) -> Result<Option<SegmentInfo>, EngineError> {
         self.wait_for_one_flush()
+    }
+
+    pub(crate) fn wait_for_bg_compaction(&mut self) -> Option<CompactionStats> {
+        self.wait_for_bg_compact()
     }
 
     /// Number of immutable epochs (frozen memtables, in-flight or not).
@@ -3001,6 +4548,7 @@ fn bg_flush_build_worker(
     event_tx: std::sync::mpsc::SyncSender<BgFlushEvent>,
     cancel: Arc<AtomicBool>,
     events_ready: Arc<AtomicUsize>,
+    secondary_index_entries: Arc<RwLock<SecondaryIndexEntries>>,
 ) {
     while let Ok(work) = rx.recv() {
         if cancel.load(Ordering::Relaxed) {
@@ -3035,11 +4583,34 @@ fn bg_flush_build_worker(
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let built_result = match write_segment(
+        let current_secondary_indexes = secondary_index_entries.read().unwrap().clone();
+        let maintained_equality_index_ids = equality_index_ids_snapshot(&current_secondary_indexes);
+        let maintained_range_index_ids = range_index_ids_snapshot(&current_secondary_indexes);
+        let needs_reseed = current_secondary_indexes.iter().any(|entry| {
+            !work
+                .frozen
+                .secondary_index_declarations()
+                .contains_key(&entry.index_id)
+        });
+        let reseeded_frozen = needs_reseed.then(|| {
+            let mut memtable = (*work.frozen).clone();
+            for entry in &current_secondary_indexes {
+                memtable.register_secondary_index(entry);
+            }
+            memtable
+        });
+        let frozen_ref: &Memtable = if let Some(memtable) = reseeded_frozen.as_ref() {
+            memtable
+        } else {
+            work.frozen.as_ref()
+        };
+
+        let built_result = match write_segment_with_secondary_indexes(
             &work.tmp_dir,
             work.seg_id,
-            &work.frozen,
+            frozen_ref,
             work.dense_config.as_ref(),
+            &current_secondary_indexes,
         ) {
             Ok(seg_info) => match std::fs::rename(&work.tmp_dir, &work.final_dir) {
                 Ok(()) => {
@@ -3066,6 +4637,8 @@ fn bg_flush_build_worker(
                                 seg_id: work.seg_id,
                                 final_dir: work.final_dir,
                                 dense_config: work.dense_config,
+                                maintained_equality_index_ids,
+                                maintained_range_index_ids,
                             }
                         }
                     } else {
@@ -3131,11 +4704,14 @@ fn bg_flush_publish_worker(
     rx: std::sync::mpsc::Receiver<BuiltFlushResult>,
     event_tx: std::sync::mpsc::SyncSender<BgFlushEvent>,
     manifest_write_lock: Arc<Mutex<()>>,
+    secondary_index_catalog: Arc<RwLock<SecondaryIndexCatalog>>,
+    secondary_index_entries: Arc<RwLock<SecondaryIndexEntries>>,
     next_node_id_seen: Arc<AtomicU64>,
     next_edge_id_seen: Arc<AtomicU64>,
     engine_seq_seen: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     events_ready: Arc<AtomicUsize>,
+    #[cfg(test)] publish_pause: Arc<Mutex<Option<FlushPublishPauseHook>>>,
 ) {
     while let Ok(result) = rx.recv() {
         if cancel.load(Ordering::Relaxed) {
@@ -3164,7 +4740,13 @@ fn bg_flush_publish_worker(
             }
         };
 
-        let publish_result: Result<(), EngineError> = (|| {
+        #[cfg(test)]
+        if let Some(hook) = publish_pause.lock().unwrap().take() {
+            let _ = hook.ready_tx.send(());
+            let _ = hook.release_rx.recv();
+        }
+
+        let publish_result: Result<(Vec<u64>, Vec<u64>), EngineError> = (|| {
             let _guard = manifest_write_lock.lock().unwrap();
             let mut manifest = load_manifest_readonly(&db_dir)?
                 .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
@@ -3199,24 +4781,40 @@ fn bg_flush_publish_worker(
             manifest.next_engine_seq = manifest
                 .next_engine_seq
                 .max(engine_seq_seen.load(Ordering::Acquire));
+            let rebuild_equality_index_ids = reconcile_background_output_equality_declarations(
+                &mut manifest,
+                &result.maintained_equality_index_ids,
+            );
+            let rebuild_range_index_ids = reconcile_background_output_range_declarations(
+                &mut manifest,
+                &result.maintained_range_index_ids,
+            );
             write_manifest(&db_dir, &manifest)?;
-            Ok(())
+            sync_secondary_index_runtime_state(
+                &secondary_index_catalog,
+                &secondary_index_entries,
+                &manifest.secondary_indexes,
+            )?;
+            Ok((rebuild_equality_index_ids, rebuild_range_index_ids))
         })();
 
-        if let Err(e) = publish_result {
-            send_bg_flush_event(
-                &event_tx,
-                &events_ready,
-                BgFlushEvent::Failed(FlushPipelineError {
-                    epoch_id: result.epoch_id,
-                    wal_generation_id: result.wal_gen_to_retire,
-                    stage: FlushPipelineStage::PublishManifest,
-                    message: e.to_string(),
-                }),
-            );
-            cancel.store(true, Ordering::Relaxed);
-            break;
-        }
+        let (rebuild_equality_index_ids, rebuild_range_index_ids) = match publish_result {
+            Ok(ids) => ids,
+            Err(e) => {
+                send_bg_flush_event(
+                    &event_tx,
+                    &events_ready,
+                    BgFlushEvent::Failed(FlushPipelineError {
+                        epoch_id: result.epoch_id,
+                        wal_generation_id: result.wal_gen_to_retire,
+                        stage: FlushPipelineStage::PublishManifest,
+                        message: e.to_string(),
+                    }),
+                );
+                cancel.store(true, Ordering::Relaxed);
+                break;
+            }
+        };
 
         let _ = remove_wal_generation(&db_dir, result.wal_gen_to_retire);
         send_bg_flush_event(
@@ -3227,6 +4825,8 @@ fn bg_flush_publish_worker(
                 wal_gen_to_retire: result.wal_gen_to_retire,
                 seg_info: result.seg_info,
                 reader,
+                rebuild_equality_index_ids,
+                rebuild_range_index_ids,
             }),
         );
     }
@@ -3241,9 +4841,19 @@ fn bg_compact_worker(
     input_segments: Vec<(u64, PathBuf)>,
     prune_policies: Vec<PrunePolicy>,
     dense_vector: Option<DenseVectorConfig>,
+    secondary_indexes: SecondaryIndexEntries,
     cancel: &AtomicBool,
+    #[cfg(test)] compact_pause: &Arc<Mutex<Option<BgCompactPauseHook>>>,
 ) -> Result<BgCompactResult, EngineError> {
     let compact_start = std::time::Instant::now();
+    let maintained_equality_index_ids = equality_index_ids_snapshot(&secondary_indexes);
+    let maintained_range_index_ids = range_index_ids_snapshot(&secondary_indexes);
+
+    #[cfg(test)]
+    if let Some(hook) = compact_pause.lock().unwrap().take() {
+        let _ = hook.ready_tx.send(());
+        let _ = hook.release_rx.recv();
+    }
 
     // Re-open input segments (independent mmap handles, safe to use concurrently
     // with the main thread's readers of the same files).
@@ -3265,32 +4875,41 @@ fn bg_compact_worker(
     let tmp_dir = segment_tmp_dir(&db_dir, seg_id);
     let final_dir = segment_dir(&db_dir, seg_id);
 
-    let (seg_info, nodes_auto_pruned, edges_auto_pruned) = match compaction_path {
-        CompactionPath::FastMerge => {
-            match bg_fast_merge(&segments, &tmp_dir, seg_id, dense_vector.as_ref(), cancel) {
-                Ok(seg_info) => (seg_info, 0, 0),
+    let (seg_info, nodes_auto_pruned, edges_auto_pruned, secondary_index_report) =
+        match compaction_path {
+            CompactionPath::FastMerge => {
+                match bg_fast_merge(
+                    &segments,
+                    &tmp_dir,
+                    seg_id,
+                    dense_vector.as_ref(),
+                    &secondary_indexes,
+                    cancel,
+                ) {
+                    Ok((seg_info, report)) => (seg_info, 0, 0, report),
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                        return Err(e);
+                    }
+                }
+            }
+            CompactionPath::UnifiedV3 => match bg_standard_merge(
+                &segments,
+                &tmp_dir,
+                seg_id,
+                has_tombstones,
+                &prune_policies,
+                dense_vector.as_ref(),
+                &secondary_indexes,
+                cancel,
+            ) {
+                Ok(result) => result,
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&tmp_dir);
                     return Err(e);
                 }
-            }
-        }
-        CompactionPath::UnifiedV3 => match bg_standard_merge(
-            &segments,
-            &tmp_dir,
-            seg_id,
-            has_tombstones,
-            &prune_policies,
-            dense_vector.as_ref(),
-            cancel,
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(e);
-            }
-        },
-    };
+            },
+        };
 
     // Atomic rename tmp → final
     if let Err(e) = std::fs::rename(&tmp_dir, &final_dir) {
@@ -3331,6 +4950,9 @@ fn bg_compact_worker(
         old_seg_dirs,
         stats,
         input_segment_ids,
+        maintained_equality_index_ids,
+        maintained_range_index_ids,
+        secondary_index_report,
     })
 }
 
@@ -3560,7 +5182,8 @@ fn v3_build_output(
     segments: &[SegmentReader],
     plan: &V3Plan,
     dense_config: Option<&DenseVectorConfig>,
-) -> Result<SegmentInfo, EngineError> {
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<(SegmentInfo, SecondaryIndexMaintenanceReport), EngineError> {
     std::fs::create_dir_all(tmp_dir)?;
 
     // Prepare sorted winner lists for the materializer: (id, seg_idx, data_offset, data_len)
@@ -3653,16 +5276,26 @@ fn v3_build_output(
     }
 
     // Build all secondary indexes and sidecars from metadata
-    write_indexes_from_metadata(tmp_dir, segments, &node_metas, &edge_metas, dense_config)?;
+    let secondary_index_report = write_indexes_from_metadata_with_secondary_indexes(
+        tmp_dir,
+        segments,
+        &node_metas,
+        &edge_metas,
+        dense_config,
+        secondary_indexes,
+    )?;
 
     let node_count = plan.node_winners.len() as u64;
     let edge_count = plan.edge_winners.len() as u64;
 
-    Ok(SegmentInfo {
-        id: seg_id,
-        node_count,
-        edge_count,
-    })
+    Ok((
+        SegmentInfo {
+            id: seg_id,
+            node_count,
+            edge_count,
+        },
+        secondary_index_report,
+    ))
 }
 
 fn collect_fast_merge_node_metas(
@@ -3804,7 +5437,8 @@ fn build_fast_merge_output(
     seg_id: u64,
     segments: &[SegmentReader],
     dense_config: Option<&DenseVectorConfig>,
-) -> Result<SegmentInfo, EngineError> {
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<(SegmentInfo, SecondaryIndexMaintenanceReport), EngineError> {
     std::fs::create_dir_all(tmp_dir)?;
 
     let node_copy_info = write_merged_nodes_dat(tmp_dir, segments)?;
@@ -3812,13 +5446,23 @@ fn build_fast_merge_output(
     let node_metas = collect_fast_merge_node_metas(segments, &node_copy_info)?;
     let edge_metas = collect_fast_merge_edge_metas(segments, &edge_copy_info)?;
 
-    write_indexes_from_metadata(tmp_dir, segments, &node_metas, &edge_metas, dense_config)?;
+    let secondary_index_report = write_indexes_from_metadata_with_secondary_indexes(
+        tmp_dir,
+        segments,
+        &node_metas,
+        &edge_metas,
+        dense_config,
+        secondary_indexes,
+    )?;
 
-    Ok(SegmentInfo {
-        id: seg_id,
-        node_count: node_metas.len() as u64,
-        edge_count: edge_metas.len() as u64,
-    })
+    Ok((
+        SegmentInfo {
+            id: seg_id,
+            node_count: node_metas.len() as u64,
+            edge_count: edge_metas.len() as u64,
+        },
+        secondary_index_report,
+    ))
 }
 
 /// V3 background merge: metadata-only planning + raw binary copy.
@@ -3829,19 +5473,21 @@ fn bg_fast_merge(
     tmp_dir: &Path,
     seg_id: u64,
     dense_config: Option<&DenseVectorConfig>,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
     cancel: &AtomicBool,
-) -> Result<SegmentInfo, EngineError> {
+) -> Result<(SegmentInfo, SecondaryIndexMaintenanceReport), EngineError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(EngineError::CompactionCancelled);
     }
 
-    let seg_info = build_fast_merge_output(tmp_dir, seg_id, segments, dense_config)?;
+    let result =
+        build_fast_merge_output(tmp_dir, seg_id, segments, dense_config, secondary_indexes)?;
 
     if cancel.load(Ordering::Relaxed) {
         return Err(EngineError::CompactionCancelled);
     }
 
-    Ok(seg_info)
+    Ok(result)
 }
 
 /// V3 background merge: metadata-only planning + raw binary copy.
@@ -3854,8 +5500,9 @@ fn bg_standard_merge(
     has_tombstones: bool,
     prune_policies: &[PrunePolicy],
     dense_config: Option<&DenseVectorConfig>,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
     cancel: &AtomicBool,
-) -> Result<(SegmentInfo, u64, u64), EngineError> {
+) -> Result<(SegmentInfo, u64, u64, SecondaryIndexMaintenanceReport), EngineError> {
     // Collect tombstones
     let mut deleted_nodes: NodeIdSet = NodeIdSet::default();
     let mut deleted_edges: NodeIdSet = NodeIdSet::default();
@@ -3880,9 +5527,21 @@ fn bg_standard_merge(
     let nodes_auto_pruned = plan.pruned_node_ids.len() as u64;
     let edges_auto_pruned = plan.edges_auto_pruned;
 
-    let seg_info = v3_build_output(tmp_dir, seg_id, segments, &plan, dense_config)?;
+    let (seg_info, secondary_index_report) = v3_build_output(
+        tmp_dir,
+        seg_id,
+        segments,
+        &plan,
+        dense_config,
+        secondary_indexes,
+    )?;
 
-    Ok((seg_info, nodes_auto_pruned, edges_auto_pruned))
+    Ok((
+        seg_info,
+        nodes_auto_pruned,
+        edges_auto_pruned,
+        secondary_index_report,
+    ))
 }
 
 include!("graph_ops.rs");

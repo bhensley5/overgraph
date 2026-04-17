@@ -79,7 +79,7 @@ Each segment is a directory containing:
 | `adj_in.idx` / `adj_in.dat` | Incoming adjacency index + postings |
 | `key_index.dat` | `(type_id, key)` to node_id mapping |
 | `type_index.dat` | `type_id` to sorted list of IDs |
-| `prop_index.dat` | Property equality hash index |
+| `secondary_indexes/` | Optional declared equality/range property-index sidecars |
 | `timestamp_index.dat` | Sorted `(updated_at, node_id)` pairs |
 | `tombstones.dat` | Set of deleted IDs |
 | `metadata.dat` | Sidecar with per-record metadata for fast compaction |
@@ -138,7 +138,7 @@ For operations that need to traverse from many nodes at once (PPR, subgraph extr
 
 ### Vector indexes
 
-OverGraph embeds two kinds of vector indexes directly in the storage engine, following the same per-segment immutable index model as adjacency and property indexes.
+OverGraph embeds two kinds of vector indexes directly in the storage engine, following the same per-segment immutable index model as adjacency indexes and declared property-index sidecars.
 
 **Dense HNSW index.** Each segment containing dense vectors gets an HNSW (Hierarchical Navigable Small World) graph built at flush time. The HNSW implementation is owned by OverGraph (not delegated to an external ANN library), so the on-disk format, reopen path, and segment lifecycle are fully controlled. The DB is configured with one dense vector space (fixed dimension + distance metric: cosine, Euclidean, or dot-product). HNSW parameters (`m` and `ef_construction`) are configurable.
 
@@ -201,7 +201,7 @@ Updates to the manifest are atomic: write to `manifest.tmp`, fsync, rename to `m
 
 The Node.js and Python connectors are thin wrappers around the Rust engine:
 
-- **Node.js (napi-rs):** All heavy work is dispatched to Rust via napi-rs. Async methods schedule work on the libuv thread pool and resolve JavaScript Promises. Record types use lazy getters, so property deserialization only happens when you actually access `.props`. Bulk data uses typed arrays (`Float64Array`, `BigInt64Array`) instead of JavaScript object arrays.
+- **Node.js (napi-rs):** All heavy work is dispatched to Rust via napi-rs. Async methods schedule work on the libuv thread pool and resolve JavaScript Promises. Record types use lazy getters, so property deserialization only happens when you actually access `.props`. ID-oriented bulk results use typed arrays (`Float64Array`, `BigInt64Array`), while record and neighbor APIs return normal JavaScript objects and arrays.
 
 - **Python (PyO3):** All Rust calls release the GIL via `py.allow_threads()`, so other Python threads can run while the database does its work. The async API (`AsyncOverGraph`) uses `asyncio.to_thread()` to wrap sync calls. Properties are deserialized lazily on access, same as Node.js.
 

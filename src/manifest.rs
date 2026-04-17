@@ -135,6 +135,8 @@ pub fn default_manifest() -> ManifestState {
         next_wal_generation_id: 0,
         active_wal_generation_id: 0,
         pending_flush_epochs: Vec::new(),
+        secondary_indexes: Vec::new(),
+        next_secondary_index_id: 1,
     }
 }
 
@@ -256,6 +258,8 @@ mod tests {
         assert_eq!(m.next_edge_id, 1);
         assert!(m.dense_vector.is_none());
         assert!(m.prune_policies.is_empty());
+        assert!(m.secondary_indexes.is_empty());
+        assert_eq!(m.next_secondary_index_id, 1);
     }
 
     #[test]
@@ -312,5 +316,26 @@ mod tests {
 
         assert!(!dir.path().join(MANIFEST_TMP).exists());
         assert!(dir.path().join(MANIFEST_CURRENT).exists());
+    }
+
+    #[test]
+    fn test_load_manifest_missing_secondary_index_fields_defaults_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let legacy_json = r#"{
+  "version": 1,
+  "segments": [],
+  "next_node_id": 10,
+  "next_edge_id": 20,
+  "prune_policies": {},
+  "next_engine_seq": 0,
+  "next_wal_generation_id": 0,
+  "active_wal_generation_id": 0,
+  "pending_flush_epochs": []
+}"#;
+        fs::write(dir.path().join(MANIFEST_CURRENT), legacy_json).unwrap();
+
+        let loaded = load_manifest(dir.path()).unwrap().unwrap();
+        assert!(loaded.secondary_indexes.is_empty());
+        assert_eq!(loaded.next_secondary_index_id, 0);
     }
 }

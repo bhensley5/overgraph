@@ -94,7 +94,7 @@ describe('Async non-blocking verification', () => {
     assert.ok(results[0] === null || results[0].id !== undefined);
     // findNodes
     assert.ok(results[1] instanceof Float64Array);
-    // neighbors (lazy wrapper)
+    // neighbors (plain array of entries)
     assert.equal(typeof results[2].length, 'number');
     // upsertNode
     assert.equal(typeof results[3], 'number');

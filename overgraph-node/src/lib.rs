@@ -7,12 +7,14 @@ use overgraph::{
     AdjacencyExport, AllShortestPathsOptions, CompactionPhase, CompactionStats, ComponentOptions,
     DatabaseEngine, DbOptions, DbStats, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
     EdgeInput, EdgeRecord, EngineError, ExportOptions, FusionMode, GraphPatch, HnswConfig,
-    IsConnectedOptions, NeighborEntry, NeighborOptions, NodeIdMap, NodeInput, NodeRecord,
-    PageRequest, PageResult, PprAlgorithm, PprOptions, PprResult, PropValue, PrunePolicy,
-    PruneResult, ScoringMode, ShortestPath, ShortestPathOptions, Subgraph, SubgraphOptions,
-    TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult, TraverseOptions,
-    UpsertEdgeOptions, UpsertNodeOptions, VectorHit, VectorSearchMode, VectorSearchRequest,
-    VectorSearchScope, WalSyncMode,
+    IsConnectedOptions, NeighborEntry, NeighborOptions, NodeIdMap, NodeInput,
+    NodePropertyIndexInfo, NodeRecord, PageRequest, PageResult, PprAlgorithm, PprOptions,
+    PprResult, PropValue, PropertyRangeBound, PropertyRangeCursor, PropertyRangePageRequest,
+    PropertyRangePageResult, PrunePolicy, PruneResult, ScoringMode, SecondaryIndexKind,
+    SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPath, ShortestPathOptions, Subgraph,
+    SubgraphOptions, TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult,
+    TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions, VectorHit, VectorSearchMode,
+    VectorSearchRequest, VectorSearchScope, WalSyncMode,
 };
 
 /// ThreadsafeFunction with `CalleeHandled = false` so the JS callback
@@ -404,7 +406,7 @@ impl OverGraph {
         &self,
         node_id: f64,
         options: Option<JsNeighborsOptions>,
-    ) -> Result<JsNeighborList> {
+    ) -> Result<Vec<JsNeighborEntry>> {
         let node_id = f64_to_u64(node_id)?;
         let (direction, type_filter, limit, at_epoch, decay_lambda) = match options {
             Some(o) => (
@@ -426,10 +428,8 @@ impl OverGraph {
             at_epoch,
             decay_lambda: decay,
         };
-        with_engine_ref(self, |eng| {
-            let entries = eng.neighbors(node_id, &opts)?;
-            Ok(neighbor_entries_to_js(entries))
-        })
+        let entries = with_engine_ref(self, |eng| eng.neighbors(node_id, &opts))?;
+        neighbor_entries_to_js(entries)
     }
 
     #[napi]
@@ -485,7 +485,7 @@ impl OverGraph {
         node_id: f64,
         k: u32,
         options: Option<JsTopKNeighborsOptions>,
-    ) -> Result<JsNeighborList> {
+    ) -> Result<Vec<JsNeighborEntry>> {
         let node_id = f64_to_u64(node_id)?;
         let (direction, type_filter, scoring, decay_lambda, at_epoch) = match options {
             Some(o) => (
@@ -505,10 +505,8 @@ impl OverGraph {
             scoring: scoring_mode,
             at_epoch,
         };
-        with_engine_ref(self, |eng| {
-            let entries = eng.top_k_neighbors(node_id, k as usize, &opts)?;
-            Ok(neighbor_entries_to_js(entries))
-        })
+        let entries = with_engine_ref(self, |eng| eng.top_k_neighbors(node_id, k as usize, &opts))?;
+        neighbor_entries_to_js(entries)
     }
 
     #[napi]
@@ -558,10 +556,8 @@ impl OverGraph {
             at_epoch,
             decay_lambda: decay,
         };
-        with_engine_ref(self, |eng| {
-            let map = eng.neighbors_batch(&ids, &opts)?;
-            Ok(convert_batch_result(map))
-        })
+        let map = with_engine_ref(self, |eng| eng.neighbors_batch(&ids, &opts))?;
+        convert_batch_result(map)
     }
 
     // --- Degree counts + aggregations (Phase 18a) ---
@@ -765,6 +761,42 @@ impl OverGraph {
         ids_to_float64_array(&ids)
     }
 
+    #[napi]
+    pub fn ensure_node_property_index(
+        &self,
+        type_id: u32,
+        prop_key: String,
+        kind: JsSecondaryIndexKind,
+    ) -> Result<JsNodePropertyIndexInfo> {
+        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let info = with_engine(self, |eng| {
+            eng.ensure_node_property_index(type_id, &prop_key, kind.clone())
+        })?;
+        node_property_index_info_to_js(info)
+    }
+
+    #[napi]
+    pub fn drop_node_property_index(
+        &self,
+        type_id: u32,
+        prop_key: String,
+        kind: JsSecondaryIndexKind,
+    ) -> Result<bool> {
+        let kind = js_secondary_index_kind_to_rust(kind)?;
+        with_engine(self, |eng| {
+            eng.drop_node_property_index(type_id, &prop_key, kind.clone())
+        })
+    }
+
+    #[napi]
+    pub fn list_node_property_indexes(&self) -> Result<Vec<JsNodePropertyIndexInfo>> {
+        let infos = with_engine_ref(self, |eng| Ok(eng.list_node_property_indexes()))?;
+        infos
+            .into_iter()
+            .map(node_property_index_info_to_js)
+            .collect()
+    }
+
     /// Return all node IDs of a given type (unpaged).
     #[napi]
     pub fn nodes_by_type(&self, type_id: u32) -> Result<Float64Array> {
@@ -891,6 +923,28 @@ impl OverGraph {
     }
 
     #[napi]
+    pub fn find_nodes_range(
+        &self,
+        type_id: u32,
+        prop_key: String,
+        lower: Option<JsPropertyRangeBound>,
+        upper: Option<JsPropertyRangeBound>,
+    ) -> Result<Float64Array> {
+        let lower = lower
+            .as_ref()
+            .map(js_property_range_bound_to_rust)
+            .transpose()?;
+        let upper = upper
+            .as_ref()
+            .map(js_property_range_bound_to_rust)
+            .transpose()?;
+        let ids = with_engine_ref(self, |eng| {
+            eng.find_nodes_range(type_id, &prop_key, lower.as_ref(), upper.as_ref())
+        })?;
+        ids_to_float64_array(&ids)
+    }
+
+    #[napi]
     pub fn find_nodes_by_time_range_paged(
         &self,
         type_id: u32,
@@ -907,6 +961,30 @@ impl OverGraph {
             eng.find_nodes_by_time_range_paged(type_id, from_ms, to_ms, &page)
         })?;
         id_page_to_js(raw)
+    }
+
+    #[napi]
+    pub fn find_nodes_range_paged(
+        &self,
+        type_id: u32,
+        prop_key: String,
+        lower: Option<JsPropertyRangeBound>,
+        upper: Option<JsPropertyRangeBound>,
+        options: Option<JsFindNodesRangePagedOptions>,
+    ) -> Result<JsPropertyRangePageResult> {
+        let lower = lower
+            .as_ref()
+            .map(js_property_range_bound_to_rust)
+            .transpose()?;
+        let upper = upper
+            .as_ref()
+            .map(js_property_range_bound_to_rust)
+            .transpose()?;
+        let page = make_property_range_page_request(options)?;
+        let raw = with_engine_ref(self, |eng| {
+            eng.find_nodes_range_paged(type_id, &prop_key, lower.as_ref(), upper.as_ref(), &page)
+        })?;
+        property_range_page_to_js(raw)
     }
 
     #[napi]
@@ -991,11 +1069,8 @@ impl OverGraph {
             at_epoch,
             decay_lambda: decay,
         };
-        with_engine_ref(self, |eng| {
-            Ok(neighbor_page_to_js(
-                eng.neighbors_paged(node_id, &opts, &page)?,
-            ))
-        })
+        let page = with_engine_ref(self, |eng| eng.neighbors_paged(node_id, &opts, &page))?;
+        neighbor_page_to_js(page)
     }
 
     // --- Connected Components (Phase 18d) ---
@@ -1512,12 +1587,12 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsNeighborList>")]
+    #[napi(ts_return_type = "Promise<Array<JsNeighborEntry>>")]
     pub fn neighbors_async(
         &self,
         node_id: f64,
         options: Option<JsNeighborsOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<NeighborEntry>, JsNeighborList>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Vec<NeighborEntry>, Vec<JsNeighborEntry>>>> {
         let node_id = f64_to_u64(node_id)?;
         let (direction, type_filter, limit, at_epoch, decay_lambda) = match options {
             Some(o) => (
@@ -1542,7 +1617,7 @@ impl OverGraph {
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.neighbors(node_id, &opts),
-            |entries| Ok(neighbor_entries_to_js(entries)),
+            neighbor_entries_to_js,
         )))
     }
 
@@ -1596,13 +1671,13 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsNeighborList>")]
+    #[napi(ts_return_type = "Promise<Array<JsNeighborEntry>>")]
     pub fn top_k_neighbors_async(
         &self,
         node_id: f64,
         k: u32,
         options: Option<JsTopKNeighborsOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<NeighborEntry>, JsNeighborList>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Vec<NeighborEntry>, Vec<JsNeighborEntry>>>> {
         let node_id = f64_to_u64(node_id)?;
         let (direction, type_filter, scoring, decay_lambda, at_epoch) = match options {
             Some(o) => (
@@ -1625,7 +1700,7 @@ impl OverGraph {
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.top_k_neighbors(node_id, k as usize, &opts),
-            |entries| Ok(neighbor_entries_to_js(entries)),
+            neighbor_entries_to_js,
         )))
     }
 
@@ -1667,6 +1742,104 @@ impl OverGraph {
             move |eng| eng.find_nodes(type_id, &prop_key, &pv),
             |ids| ids_to_float64_array(&ids),
         ))
+    }
+
+    #[napi(ts_return_type = "Promise<JsNodePropertyIndexInfo>")]
+    pub fn ensure_node_property_index_async(
+        &self,
+        type_id: u32,
+        prop_key: String,
+        kind: JsSecondaryIndexKind,
+    ) -> Result<AsyncTask<EngineOp<NodePropertyIndexInfo, JsNodePropertyIndexInfo>>> {
+        let kind = js_secondary_index_kind_to_rust(kind)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.ensure_node_property_index(type_id, &prop_key, kind.clone()),
+            node_property_index_info_to_js,
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn drop_node_property_index_async(
+        &self,
+        type_id: u32,
+        prop_key: String,
+        kind: JsSecondaryIndexKind,
+    ) -> Result<AsyncTask<EngineOp<bool, bool>>> {
+        let kind = js_secondary_index_kind_to_rust(kind)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.drop_node_property_index(type_id, &prop_key, kind.clone()),
+            Ok,
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<Array<JsNodePropertyIndexInfo>>")]
+    pub fn list_node_property_indexes_async(
+        &self,
+    ) -> AsyncTask<EngineReadOp<Vec<NodePropertyIndexInfo>, Vec<JsNodePropertyIndexInfo>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            |eng| Ok(eng.list_node_property_indexes()),
+            node_property_index_infos_to_js,
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<Float64Array>")]
+    pub fn find_nodes_range_async(
+        &self,
+        type_id: u32,
+        prop_key: String,
+        lower: Option<JsPropertyRangeBound>,
+        upper: Option<JsPropertyRangeBound>,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<u64>, Float64Array>>> {
+        let lower = lower
+            .as_ref()
+            .map(js_property_range_bound_to_rust)
+            .transpose()?;
+        let upper = upper
+            .as_ref()
+            .map(js_property_range_bound_to_rust)
+            .transpose()?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.find_nodes_range(type_id, &prop_key, lower.as_ref(), upper.as_ref()),
+            |ids| ids_to_float64_array(&ids),
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<JsPropertyRangePageResult>")]
+    pub fn find_nodes_range_paged_async(
+        &self,
+        type_id: u32,
+        prop_key: String,
+        lower: Option<JsPropertyRangeBound>,
+        upper: Option<JsPropertyRangeBound>,
+        options: Option<JsFindNodesRangePagedOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<PropertyRangePageResult<u64>, JsPropertyRangePageResult>>>
+    {
+        let lower = lower
+            .as_ref()
+            .map(js_property_range_bound_to_rust)
+            .transpose()?;
+        let upper = upper
+            .as_ref()
+            .map(js_property_range_bound_to_rust)
+            .transpose()?;
+        let page = make_property_range_page_request(options)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| {
+                eng.find_nodes_range_paged(
+                    type_id,
+                    &prop_key,
+                    lower.as_ref(),
+                    upper.as_ref(),
+                    &page,
+                )
+            },
+            property_range_page_to_js,
+        )))
     }
 
     #[napi(ts_return_type = "Promise<Array<JsNodeRecord>>")]
@@ -1772,7 +1945,7 @@ impl OverGraph {
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.neighbors_batch(&ids, &opts),
-            |map| Ok(convert_batch_result(map)),
+            convert_batch_result,
         )))
     }
 
@@ -2204,7 +2377,7 @@ impl OverGraph {
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.neighbors_paged(node_id, &opts, &page),
-            |pr| Ok(neighbor_page_to_js(pr)),
+            neighbor_page_to_js,
         )))
     }
 
@@ -2580,6 +2753,47 @@ pub struct JsFindNodesPagedOptions {
 }
 
 #[napi(object)]
+#[derive(Clone)]
+pub struct JsSecondaryIndexKind {
+    pub kind: String,
+    pub domain: Option<String>,
+}
+
+#[napi(object)]
+pub struct JsNodePropertyIndexInfo {
+    pub index_id: f64,
+    pub type_id: u32,
+    pub prop_key: String,
+    pub kind: String,
+    pub domain: Option<String>,
+    pub state: String,
+    pub last_error: Option<String>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct JsPropertyRangeBound {
+    pub value: f64,
+    pub inclusive: Option<bool>,
+    pub domain: String,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct JsPropertyRangeCursor {
+    pub value: f64,
+    pub node_id: f64,
+    pub domain: String,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct JsFindNodesRangePagedOptions {
+    pub limit: Option<u32>,
+    pub after: Option<JsPropertyRangeCursor>,
+}
+
+#[napi(object)]
 pub struct JsFindNodesByTimeRangePagedOptions {
     pub limit: Option<u32>,
     pub after: Option<f64>,
@@ -2940,8 +3154,8 @@ impl TryFrom<EdgeRecord> for JsEdgeRecord {
 }
 
 /// A single neighbor entry as a plain JS object.
-/// Used by `JsNeighborList.get(i)` and `JsNeighborList.toArray()`.
 #[napi(object)]
+#[derive(Clone)]
 pub struct JsNeighborEntry {
     pub node_id: f64,
     pub edge_id: f64,
@@ -2949,85 +3163,6 @@ pub struct JsNeighborEntry {
     pub weight: f64,
     pub valid_from: i64,
     pub valid_to: i64,
-}
-
-/// Lazy sequence wrapper around neighbor entries. Data stays in Rust;
-/// individual fields are only converted to JS values when accessed via
-/// indexed methods. One V8 allocation regardless of result set size.
-/// Arc-wrapped so parent containers (batch entries, page results) share
-/// data instead of cloning the full vec on every getter access.
-#[napi]
-pub struct JsNeighborList {
-    entries: Arc<Vec<NeighborEntry>>,
-}
-
-#[napi]
-impl JsNeighborList {
-    #[napi(getter)]
-    pub fn length(&self) -> u32 {
-        self.entries.len() as u32
-    }
-
-    #[napi]
-    pub fn node_id(&self, index: u32) -> Result<f64> {
-        let e = self.entry_at(index)?;
-        u64_to_f64(e.node_id)
-    }
-
-    #[napi]
-    pub fn edge_id(&self, index: u32) -> Result<f64> {
-        let e = self.entry_at(index)?;
-        u64_to_f64(e.edge_id)
-    }
-
-    #[napi]
-    pub fn edge_type_id(&self, index: u32) -> Result<u32> {
-        let e = self.entry_at(index)?;
-        Ok(e.edge_type_id)
-    }
-
-    #[napi]
-    pub fn weight(&self, index: u32) -> Result<f64> {
-        let e = self.entry_at(index)?;
-        Ok(e.weight as f64)
-    }
-
-    #[napi]
-    pub fn valid_from(&self, index: u32) -> Result<i64> {
-        let e = self.entry_at(index)?;
-        Ok(e.valid_from)
-    }
-
-    #[napi]
-    pub fn valid_to(&self, index: u32) -> Result<i64> {
-        let e = self.entry_at(index)?;
-        Ok(e.valid_to)
-    }
-
-    /// Get a single entry as a plain object with all fields materialized.
-    #[napi]
-    pub fn get(&self, index: u32) -> Result<JsNeighborEntry> {
-        let e = self.entry_at(index)?;
-        neighbor_to_js_entry(e)
-    }
-
-    /// Materialize all entries as an array of plain objects.
-    #[napi]
-    pub fn to_array(&self) -> Result<Vec<JsNeighborEntry>> {
-        self.entries.iter().map(neighbor_to_js_entry).collect()
-    }
-}
-
-impl JsNeighborList {
-    fn entry_at(&self, index: u32) -> Result<&NeighborEntry> {
-        self.entries.get(index as usize).ok_or_else(|| {
-            napi::Error::from_reason(format!(
-                "Index {} out of bounds (length {})",
-                index,
-                self.entries.len()
-            ))
-        })
-    }
 }
 
 fn neighbor_to_js_entry(e: &NeighborEntry) -> Result<JsNeighborEntry> {
@@ -3041,26 +3176,10 @@ fn neighbor_to_js_entry(e: &NeighborEntry) -> Result<JsNeighborEntry> {
     })
 }
 
-#[napi]
+#[napi(object)]
 pub struct JsNeighborBatchEntry {
-    query_id: u64,
-    neighbor_entries: Arc<Vec<NeighborEntry>>,
-}
-
-#[napi]
-impl JsNeighborBatchEntry {
-    #[napi(getter)]
-    pub fn query_node_id(&self) -> Result<f64> {
-        u64_to_f64(self.query_id)
-    }
-
-    /// Lazy neighbor list for this batch entry.
-    #[napi(getter)]
-    pub fn neighbors(&self) -> JsNeighborList {
-        JsNeighborList {
-            entries: Arc::clone(&self.neighbor_entries),
-        }
-    }
+    pub query_node_id: f64,
+    pub neighbors: Vec<JsNeighborEntry>,
 }
 
 #[napi(object)]
@@ -3281,18 +3400,15 @@ impl JsEdgePageResult {
 
 #[napi]
 pub struct JsNeighborPageResult {
-    entries: Arc<Vec<NeighborEntry>>,
+    items_vec: Vec<JsNeighborEntry>,
     cursor: Option<u64>,
 }
 
 #[napi]
 impl JsNeighborPageResult {
-    /// Lazy neighbor list for this page.
     #[napi(getter)]
-    pub fn items(&self) -> JsNeighborList {
-        JsNeighborList {
-            entries: Arc::clone(&self.entries),
-        }
+    pub fn items(&self) -> Vec<JsNeighborEntry> {
+        self.items_vec.clone()
     }
 
     #[napi(getter)]
@@ -3330,11 +3446,68 @@ fn edge_page_to_js(page: PageResult<EdgeRecord>) -> Result<JsEdgePageResult> {
     })
 }
 
-fn neighbor_page_to_js(page: PageResult<NeighborEntry>) -> JsNeighborPageResult {
-    JsNeighborPageResult {
-        entries: Arc::new(page.items),
+fn neighbor_page_to_js(page: PageResult<NeighborEntry>) -> Result<JsNeighborPageResult> {
+    Ok(JsNeighborPageResult {
+        items_vec: neighbor_entries_to_js(page.items)?,
         cursor: page.next_cursor,
-    }
+    })
+}
+
+#[napi(object)]
+pub struct JsPropertyRangePageResult {
+    pub items: Float64Array,
+    pub next_cursor: Option<JsPropertyRangeCursor>,
+}
+
+fn node_property_index_info_to_js(info: NodePropertyIndexInfo) -> Result<JsNodePropertyIndexInfo> {
+    let (kind, domain) = secondary_index_kind_to_js(&info.kind);
+    Ok(JsNodePropertyIndexInfo {
+        index_id: u64_to_f64(info.index_id)?,
+        type_id: info.type_id,
+        prop_key: info.prop_key,
+        kind,
+        domain,
+        state: secondary_index_state_to_js(info.state).to_string(),
+        last_error: info.last_error,
+    })
+}
+
+fn node_property_index_infos_to_js(
+    infos: Vec<NodePropertyIndexInfo>,
+) -> Result<Vec<JsNodePropertyIndexInfo>> {
+    infos
+        .into_iter()
+        .map(node_property_index_info_to_js)
+        .collect()
+}
+
+fn property_range_cursor_to_js(cursor: PropertyRangeCursor) -> Result<JsPropertyRangeCursor> {
+    let (value, domain) = prop_value_to_js_numeric_parts(&cursor.value)?;
+    Ok(JsPropertyRangeCursor {
+        value,
+        node_id: u64_to_f64(cursor.node_id)?,
+        domain,
+    })
+}
+
+fn js_property_range_cursor_to_rust(cursor: JsPropertyRangeCursor) -> Result<PropertyRangeCursor> {
+    let domain = parse_secondary_index_range_domain(Some(cursor.domain.as_str()))?;
+    Ok(PropertyRangeCursor {
+        value: js_numeric_to_prop_value(cursor.value, domain)?,
+        node_id: f64_to_u64(cursor.node_id)?,
+    })
+}
+
+fn property_range_page_to_js(
+    page: PropertyRangePageResult<u64>,
+) -> Result<JsPropertyRangePageResult> {
+    Ok(JsPropertyRangePageResult {
+        items: ids_to_float64_array(&page.items)?,
+        next_cursor: page
+            .next_cursor
+            .map(property_range_cursor_to_js)
+            .transpose()?,
+    })
 }
 
 fn make_page_request(limit: Option<u32>, after: Option<f64>) -> napi::Result<PageRequest> {
@@ -3342,6 +3515,19 @@ fn make_page_request(limit: Option<u32>, after: Option<f64>) -> napi::Result<Pag
     Ok(PageRequest {
         limit: limit.map(|l| l as usize),
         after: after_val,
+    })
+}
+
+fn make_property_range_page_request(
+    options: Option<JsFindNodesRangePagedOptions>,
+) -> Result<PropertyRangePageRequest> {
+    let (limit, after) = match options {
+        Some(options) => (options.limit, options.after),
+        None => (None, None),
+    };
+    Ok(PropertyRangePageRequest {
+        limit: limit.map(|value| value as usize),
+        after: after.map(js_property_range_cursor_to_rust).transpose()?,
     })
 }
 
@@ -3910,6 +4096,125 @@ fn ppr_algorithm_to_js(algorithm: PprAlgorithm) -> &'static str {
     }
 }
 
+fn parse_secondary_index_range_domain(s: Option<&str>) -> Result<SecondaryIndexRangeDomain> {
+    match s {
+        Some("int") => Ok(SecondaryIndexRangeDomain::Int),
+        Some("uint") => Ok(SecondaryIndexRangeDomain::UInt),
+        Some("float") => Ok(SecondaryIndexRangeDomain::Float),
+        Some(other) => Err(napi::Error::from_reason(format!(
+            "Invalid range domain '{}'. Must be 'int', 'uint', or 'float'.",
+            other
+        ))),
+        None => Err(napi::Error::from_reason(
+            "Range indexes require domain 'int', 'uint', or 'float'.".to_string(),
+        )),
+    }
+}
+
+fn secondary_index_domain_to_js(domain: SecondaryIndexRangeDomain) -> &'static str {
+    match domain {
+        SecondaryIndexRangeDomain::Int => "int",
+        SecondaryIndexRangeDomain::UInt => "uint",
+        SecondaryIndexRangeDomain::Float => "float",
+    }
+}
+
+fn secondary_index_state_to_js(state: SecondaryIndexState) -> &'static str {
+    match state {
+        SecondaryIndexState::Building => "building",
+        SecondaryIndexState::Ready => "ready",
+        SecondaryIndexState::Failed => "failed",
+    }
+}
+
+fn secondary_index_kind_to_js(kind: &SecondaryIndexKind) -> (String, Option<String>) {
+    match kind {
+        SecondaryIndexKind::Equality => ("equality".to_string(), None),
+        SecondaryIndexKind::Range { domain } => (
+            "range".to_string(),
+            Some(secondary_index_domain_to_js(*domain).to_string()),
+        ),
+    }
+}
+
+fn js_secondary_index_kind_to_rust(kind: JsSecondaryIndexKind) -> Result<SecondaryIndexKind> {
+    match kind.kind.as_str() {
+        "equality" => {
+            if kind.domain.is_some() {
+                return Err(napi::Error::from_reason(
+                    "Equality indexes do not accept a range domain.".to_string(),
+                ));
+            }
+            Ok(SecondaryIndexKind::Equality)
+        }
+        "range" => Ok(SecondaryIndexKind::Range {
+            domain: parse_secondary_index_range_domain(kind.domain.as_deref())?,
+        }),
+        other => Err(napi::Error::from_reason(format!(
+            "Invalid index kind '{}'. Must be 'equality' or 'range'.",
+            other
+        ))),
+    }
+}
+
+fn js_numeric_to_prop_value(value: f64, domain: SecondaryIndexRangeDomain) -> Result<PropValue> {
+    match domain {
+        SecondaryIndexRangeDomain::Int => {
+            if !value.is_finite() || value.fract() != 0.0 || value.abs() > MAX_SAFE_INTEGER {
+                return Err(napi::Error::from_reason(
+                    "Int range values must be finite safe integers.".to_string(),
+                ));
+            }
+            Ok(PropValue::Int(value as i64))
+        }
+        SecondaryIndexRangeDomain::UInt => {
+            if !(0.0..=MAX_SAFE_INTEGER).contains(&value) || value.fract() != 0.0 {
+                return Err(napi::Error::from_reason(
+                    "UInt range values must be finite non-negative safe integers.".to_string(),
+                ));
+            }
+            Ok(PropValue::UInt(value as u64))
+        }
+        SecondaryIndexRangeDomain::Float => {
+            if !value.is_finite() {
+                return Err(napi::Error::from_reason(
+                    "Float range values must be finite numbers.".to_string(),
+                ));
+            }
+            Ok(PropValue::Float(value))
+        }
+    }
+}
+
+fn prop_value_to_js_numeric_parts(value: &PropValue) -> Result<(f64, String)> {
+    match value {
+        PropValue::Int(value) => {
+            let as_f64 = *value as f64;
+            if !as_f64.is_finite() || as_f64.abs() > MAX_SAFE_INTEGER {
+                return Err(napi::Error::from_reason(
+                    "Int range values exceed JavaScript safe integer range.".to_string(),
+                ));
+            }
+            Ok((as_f64, "int".to_string()))
+        }
+        PropValue::UInt(value) => Ok((u64_to_f64(*value)?, "uint".to_string())),
+        PropValue::Float(value) if value.is_finite() => Ok((*value, "float".to_string())),
+        _ => Err(napi::Error::from_reason(
+            "Property range values must use Int, UInt, or finite Float.".to_string(),
+        )),
+    }
+}
+
+fn js_property_range_bound_to_rust(bound: &JsPropertyRangeBound) -> Result<PropertyRangeBound> {
+    let domain = parse_secondary_index_range_domain(Some(bound.domain.as_str()))?;
+    let value = js_numeric_to_prop_value(bound.value, domain)?;
+    if bound.inclusive.unwrap_or(true) {
+        Ok(PropertyRangeBound::Included(value))
+    } else {
+        Ok(PropertyRangeBound::Excluded(value))
+    }
+}
+
 fn convert_js_props(
     props: Option<HashMap<String, serde_json::Value>>,
 ) -> BTreeMap<String, PropValue> {
@@ -4185,23 +4490,23 @@ fn decode_edge_batch(buf: &[u8]) -> napi::Result<Vec<EdgeInput>> {
     Ok(inputs)
 }
 
-fn neighbor_entries_to_js(entries: Vec<NeighborEntry>) -> JsNeighborList {
-    JsNeighborList {
-        entries: Arc::new(entries),
-    }
+fn neighbor_entries_to_js(entries: Vec<NeighborEntry>) -> Result<Vec<JsNeighborEntry>> {
+    entries.iter().map(neighbor_to_js_entry).collect()
 }
 
 fn convert_batch_result(
     map: impl IntoIterator<Item = (u64, Vec<NeighborEntry>)>,
-) -> Vec<JsNeighborBatchEntry> {
+) -> Result<Vec<JsNeighborBatchEntry>> {
     let mut entries: Vec<JsNeighborBatchEntry> = map
         .into_iter()
-        .map(|(query_id, neighbors)| JsNeighborBatchEntry {
-            query_id,
-            neighbor_entries: Arc::new(neighbors),
+        .map(|(query_id, neighbors)| {
+            Ok(JsNeighborBatchEntry {
+                query_node_id: u64_to_f64(query_id)?,
+                neighbors: neighbor_entries_to_js(neighbors)?,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     // Sort by query_node_id for deterministic output
-    entries.sort_by_key(|e| e.query_id);
-    entries
+    entries.sort_by(|a, b| a.query_node_id.total_cmp(&b.query_node_id));
+    Ok(entries)
 }

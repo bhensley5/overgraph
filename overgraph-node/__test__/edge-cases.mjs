@@ -45,10 +45,8 @@ describe('neighbors, decay_lambda', () => {
 
   it('recent edge has higher adjusted weight than old edge', () => {
     const result = db.neighbors(center, { direction: 'outgoing', atEpoch: now, decayLambda: 0.01 });
-    const arr = result.toArray();
-
-    const spoke1Entry = arr.find(e => e.nodeId === spoke1);
-    const spoke2Entry = arr.find(e => e.nodeId === spoke2);
+    const spoke1Entry = result.find(e => e.nodeId === spoke1);
+    const spoke2Entry = result.find(e => e.nodeId === spoke2);
     assert.ok(spoke1Entry, 'spoke1 should be in results');
     assert.ok(spoke2Entry, 'spoke2 should be in results');
 
@@ -94,13 +92,13 @@ describe('neighbors, at_epoch temporal filtering', () => {
   it('at_epoch=2000 returns only B', () => {
     const result = db.neighbors(a, { direction: 'outgoing', atEpoch: 2000 });
     assert.equal(result.length, 1);
-    assert.equal(result.nodeId(0), b);
+    assert.equal(result[0].nodeId, b);
   });
 
   it('at_epoch=4000 returns both B and C', () => {
     const result = db.neighbors(a, { direction: 'outgoing', atEpoch: 4000 });
     assert.equal(result.length, 2);
-    const ids = new Set([result.nodeId(0), result.nodeId(1)]);
+    const ids = new Set([result[0].nodeId, result[1].nodeId]);
     assert.ok(ids.has(b));
     assert.ok(ids.has(c));
   });
@@ -108,7 +106,7 @@ describe('neighbors, at_epoch temporal filtering', () => {
   it('at_epoch=6000 returns only C (B expired)', () => {
     const result = db.neighbors(a, { direction: 'outgoing', atEpoch: 6000 });
     assert.equal(result.length, 1);
-    assert.equal(result.nodeId(0), c);
+    assert.equal(result[0].nodeId, c);
   });
 
   it('at_epoch=99999 returns neither (both expired)', () => {
@@ -363,20 +361,20 @@ describe('self-loops', () => {
   it('outgoing neighbors include self-loop', () => {
     const result = db.neighbors(a, { direction: 'outgoing' });
     assert.equal(result.length, 1);
-    assert.equal(result.nodeId(0), a);
+    assert.equal(result[0].nodeId, a);
   });
 
   it('incoming neighbors include self-loop', () => {
     const result = db.neighbors(a, { direction: 'incoming' });
     assert.equal(result.length, 1);
-    assert.equal(result.nodeId(0), a);
+    assert.equal(result[0].nodeId, a);
   });
 
   it('direction=both does not duplicate self-loop', () => {
     const result = db.neighbors(a, { direction: 'both' });
     // A self-loop should appear exactly once, not twice
     assert.equal(result.length, 1, `expected 1 neighbor for self-loop with 'both', got ${result.length}`);
-    assert.equal(result.nodeId(0), a);
+    assert.equal(result[0].nodeId, a);
   });
 });
 

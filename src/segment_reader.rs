@@ -14,12 +14,14 @@ use crate::sparse_postings::{
 };
 use crate::types::*;
 use memmap2::Mmap;
-use std::collections::BTreeMap;
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs::File;
 use std::ops::ControlFlow;
 use std::ops::Deref;
-use std::path::Path;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Segment file data, either mmap'd or an empty placeholder.
 /// Segment data files (e.g. adj_out.dat) can be 0 bytes when empty.
@@ -27,6 +29,16 @@ use std::sync::OnceLock;
 enum MappedData {
     Mmap(Mmap),
     Empty,
+}
+
+struct SecondaryEqSidecarCacheEntry {
+    data: MappedData,
+    validated: bool,
+}
+
+struct SecondaryRangeSidecarCacheEntry {
+    data: MappedData,
+    validated: bool,
 }
 
 impl Deref for MappedData {
@@ -198,6 +210,8 @@ const TOMBSTONE_ENTRY_SIZE: usize = 25; // kind (1) + id (8) + deleted_at (8) + 
 const TYPE_INDEX_ENTRY_SIZE: usize = 16; // type_id (4) + offset (8) + count (4)
 const PROP_INDEX_ENTRY_SIZE: usize = 32; // type_id (4) + key_hash (8) + value_hash (8) + offset (8) + count (4)
 const EDGE_TRIPLE_ENTRY_SIZE: usize = 28; // from (8) + to (8) + type_id (4) + edge_id (8)
+const SECONDARY_EQ_ENTRY_SIZE: usize = 20; // value_hash (8) + offset (8) + count (4)
+const SECONDARY_RANGE_ENTRY_SIZE: usize = 16; // encoded_value (8) + node_id (8)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatchReadStrategy {
@@ -409,6 +423,7 @@ pub struct SegmentReader {
     pub segment_id: u64,
     #[allow(dead_code)] // Kept for future version-dependent logic
     format_version: u32,
+    seg_dir: PathBuf,
     nodes_mmap: MappedData,
     edges_mmap: MappedData,
     adj_out_idx: MappedData,
@@ -437,6 +452,8 @@ pub struct SegmentReader {
     timestamp_index_mmap: MappedData,
     deleted_nodes: NodeIdMap<TombstoneEntry>,
     deleted_edges: NodeIdMap<TombstoneEntry>,
+    secondary_eq_sidecars: Mutex<HashMap<u64, SecondaryEqSidecarCacheEntry>>,
+    secondary_range_sidecars: Mutex<HashMap<u64, SecondaryRangeSidecarCacheEntry>>,
     node_ids: OnceLock<Box<[u64]>>,
     node_count: u64,
     edge_count: u64,
@@ -570,6 +587,7 @@ impl SegmentReader {
         Ok(SegmentReader {
             segment_id,
             format_version,
+            seg_dir: seg_dir.to_path_buf(),
             nodes_mmap,
             edges_mmap,
             adj_out_idx,
@@ -596,6 +614,8 @@ impl SegmentReader {
             timestamp_index_mmap,
             deleted_nodes,
             deleted_edges,
+            secondary_eq_sidecars: Mutex::new(HashMap::new()),
+            secondary_range_sidecars: Mutex::new(HashMap::new()),
             node_ids: OnceLock::new(),
             node_count,
             edge_count,
@@ -2214,6 +2234,270 @@ impl SegmentReader {
         Ok(Vec::new())
     }
 
+    fn secondary_eq_sidecar_path(&self, index_id: u64) -> PathBuf {
+        self.seg_dir
+            .join("secondary_indexes")
+            .join(format!("node_prop_eq_{}.dat", index_id))
+    }
+
+    fn secondary_range_sidecar_path(&self, index_id: u64) -> PathBuf {
+        self.seg_dir
+            .join("secondary_indexes")
+            .join(format!("node_prop_range_{}.dat", index_id))
+    }
+
+    fn with_secondary_eq_sidecar<T>(
+        &self,
+        index_id: u64,
+        callback: impl FnOnce(&[u8]) -> Result<T, EngineError>,
+    ) -> Result<Option<T>, EngineError> {
+        let path = self.secondary_eq_sidecar_path(index_id);
+        if !path.exists() {
+            self.secondary_eq_sidecars.lock().unwrap().remove(&index_id);
+            return Ok(None);
+        }
+
+        let mut cache = self.secondary_eq_sidecars.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(index_id) {
+            let data = match mmap_file(&path) {
+                Ok(data) => data,
+                Err(EngineError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            entry.insert(
+                SecondaryEqSidecarCacheEntry {
+                    data,
+                    validated: false,
+                },
+            );
+        }
+
+        let validation_error = {
+            let entry = cache
+                .get_mut(&index_id)
+                .expect("secondary equality sidecar cache entry must exist");
+            if entry.validated {
+                None
+            } else {
+                match validate_secondary_eq_sidecar_data(&entry.data) {
+                    Ok(()) => {
+                        entry.validated = true;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            }
+        };
+        if let Some(error) = validation_error {
+            cache.remove(&index_id);
+            return Err(error);
+        }
+
+        let data = &cache
+            .get(&index_id)
+            .expect("secondary equality sidecar cache entry must exist")
+            .data[..];
+        Ok(Some(callback(data)?))
+    }
+
+    fn with_secondary_range_sidecar<T>(
+        &self,
+        index_id: u64,
+        callback: impl FnOnce(&[u8]) -> Result<T, EngineError>,
+    ) -> Result<Option<T>, EngineError> {
+        let path = self.secondary_range_sidecar_path(index_id);
+        if !path.exists() {
+            self.secondary_range_sidecars
+                .lock()
+                .unwrap()
+                .remove(&index_id);
+            return Ok(None);
+        }
+
+        let mut cache = self.secondary_range_sidecars.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(index_id) {
+            let data = match mmap_file(&path) {
+                Ok(data) => data,
+                Err(EngineError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            entry.insert(
+                SecondaryRangeSidecarCacheEntry {
+                    data,
+                    validated: false,
+                },
+            );
+        }
+
+        let validation_error = {
+            let entry = cache
+                .get_mut(&index_id)
+                .expect("secondary range sidecar cache entry must exist");
+            if entry.validated {
+                None
+            } else {
+                match validate_secondary_range_sidecar_data(&entry.data) {
+                    Ok(()) => {
+                        entry.validated = true;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            }
+        };
+        if let Some(error) = validation_error {
+            cache.remove(&index_id);
+            return Err(error);
+        }
+
+        let data = &cache
+            .get(&index_id)
+            .expect("secondary range sidecar cache entry must exist")
+            .data[..];
+        Ok(Some(callback(data)?))
+    }
+
+    pub(crate) fn validate_secondary_eq_sidecar(&self, index_id: u64) -> Result<bool, EngineError> {
+        match self.with_secondary_eq_sidecar(index_id, validate_secondary_eq_sidecar_data)? {
+            Some(()) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_nodes_by_secondary_eq_index(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+    ) -> Result<Vec<u64>, EngineError> {
+        match self.find_nodes_by_secondary_eq_index_if_present(index_id, value_hash)? {
+            Some(result) => Ok(result),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) fn find_nodes_by_secondary_eq_index_if_present(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+    ) -> Result<Option<Vec<u64>>, EngineError> {
+        self.with_secondary_eq_sidecar(index_id, |data| {
+            find_nodes_in_secondary_eq_sidecar(data, &self.deleted_nodes, value_hash)
+        })
+    }
+
+    pub(crate) fn for_each_secondary_eq_group<F>(
+        &self,
+        index_id: u64,
+        mut callback: F,
+    ) -> Result<bool, EngineError>
+    where
+        F: FnMut(u64, &[u64]) -> Result<(), EngineError>,
+    {
+        match self.with_secondary_eq_sidecar(index_id, |data| {
+            let count = read_u64_at(data, 0)? as usize;
+            let idx_start = 8;
+            for index in 0..count {
+                let entry_off = idx_start + index * SECONDARY_EQ_ENTRY_SIZE;
+                let value_hash = read_u64_at(data, entry_off)?;
+                let offset = read_u64_at(data, entry_off + 8)? as usize;
+                let id_count = read_u32_at(data, entry_off + 16)? as usize;
+                let mut ids = Vec::with_capacity(id_count);
+                for id_index in 0..id_count {
+                    ids.push(read_u64_at(data, offset + id_index * 8)?);
+                }
+                callback(value_hash, &ids)?;
+            }
+            Ok(())
+        })? {
+            Some(()) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) fn validate_secondary_range_sidecar(
+        &self,
+        index_id: u64,
+    ) -> Result<bool, EngineError> {
+        match self.with_secondary_range_sidecar(index_id, validate_secondary_range_sidecar_data)? {
+            Some(()) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_nodes_by_secondary_range_index_if_present(
+        &self,
+        index_id: u64,
+        lower: Option<(u64, bool)>,
+        upper: Option<(u64, bool)>,
+        after: Option<(u64, u64)>,
+    ) -> Result<Option<Vec<(u64, u64)>>, EngineError> {
+        self.find_nodes_by_secondary_range_index_if_present_limited(
+            index_id, lower, upper, after, None,
+        )
+    }
+
+    pub(crate) fn find_nodes_by_secondary_range_index_if_present_limited(
+        &self,
+        index_id: u64,
+        lower: Option<(u64, bool)>,
+        upper: Option<(u64, bool)>,
+        after: Option<(u64, u64)>,
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<(u64, u64)>>, EngineError> {
+        self.with_secondary_range_sidecar(index_id, |data| {
+            find_nodes_in_secondary_range_sidecar(
+                data,
+                &self.deleted_nodes,
+                lower,
+                upper,
+                after,
+                limit,
+            )
+        })
+    }
+
+    pub(crate) fn for_each_secondary_range_entry<F>(
+        &self,
+        index_id: u64,
+        mut callback: F,
+    ) -> Result<bool, EngineError>
+    where
+        F: FnMut(u64, u64) -> Result<(), EngineError>,
+    {
+        match self.with_secondary_range_sidecar(index_id, |data| {
+            let count = read_u64_at(data, 0)? as usize;
+            for index in 0..count {
+                let entry_off = 8 + index * SECONDARY_RANGE_ENTRY_SIZE;
+                let encoded_value = read_u64_at(data, entry_off)?;
+                let node_id = read_u64_at(data, entry_off + 8)?;
+                callback(encoded_value, node_id)?;
+            }
+            Ok(())
+        })? {
+            Some(()) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) fn node_property_value_at_offset(
+        &self,
+        node_id: u64,
+        data_offset: u64,
+        prop_key: &str,
+    ) -> Result<Option<PropValue>, EngineError> {
+        decode_node_property_at(&self.nodes_mmap, data_offset as usize, node_id, prop_key)
+    }
+
     // --- Internal binary search methods ---
 
     /// Binary search the node index for a given node_id.
@@ -3093,6 +3377,320 @@ fn mmap_file(path: &Path) -> Result<MappedData, EngineError> {
     Ok(MappedData::Mmap(mmap))
 }
 
+fn validate_secondary_eq_sidecar_data(data: &[u8]) -> Result<(), EngineError> {
+    if data.len() < 8 {
+        return Err(EngineError::CorruptRecord(
+            "secondary equality sidecar missing header".into(),
+        ));
+    }
+
+    let count = read_u64_at(data, 0)? as usize;
+    let idx_bytes = count
+        .checked_mul(SECONDARY_EQ_ENTRY_SIZE)
+        .and_then(|bytes| bytes.checked_add(8))
+        .ok_or_else(|| {
+            EngineError::CorruptRecord("secondary equality sidecar index overflow".into())
+        })?;
+    if idx_bytes > data.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "secondary equality sidecar index length {} exceeds file length {}",
+            idx_bytes,
+            data.len()
+        )));
+    }
+
+    let mut prev_value_hash = None;
+    let mut prev_end = idx_bytes;
+    for index in 0..count {
+        let entry_off = 8 + index * SECONDARY_EQ_ENTRY_SIZE;
+        let value_hash = read_u64_at(data, entry_off)?;
+        let offset = read_u64_at(data, entry_off + 8)? as usize;
+        let id_count = read_u32_at(data, entry_off + 16)? as usize;
+        let end = offset
+            .checked_add(id_count.checked_mul(8).ok_or_else(|| {
+                EngineError::CorruptRecord("secondary equality sidecar group overflow".into())
+            })?)
+            .ok_or_else(|| {
+                EngineError::CorruptRecord("secondary equality sidecar group end overflow".into())
+            })?;
+        if offset < idx_bytes || end > data.len() {
+            return Err(EngineError::CorruptRecord(format!(
+                "secondary equality sidecar group {} range [{}, {}) exceeds file length {}",
+                index,
+                offset,
+                end,
+                data.len()
+            )));
+        }
+        if let Some(previous) = prev_value_hash {
+            if value_hash <= previous {
+                return Err(EngineError::CorruptRecord(format!(
+                    "secondary equality sidecar value hashes are not strictly increasing at group {}",
+                    index
+                )));
+            }
+        }
+        if offset < prev_end {
+            return Err(EngineError::CorruptRecord(format!(
+                "secondary equality sidecar group {} range [{}, {}) overlaps a previous group",
+                index, offset, end
+            )));
+        }
+        let mut previous_node_id = None;
+        for id_index in 0..id_count {
+            let node_id = read_u64_at(data, offset + id_index * 8)?;
+            if let Some(previous) = previous_node_id {
+                if node_id <= previous {
+                    return Err(EngineError::CorruptRecord(format!(
+                        "secondary equality sidecar group {} node IDs are not strictly increasing",
+                        index
+                    )));
+                }
+            }
+            previous_node_id = Some(node_id);
+        }
+        prev_value_hash = Some(value_hash);
+        prev_end = end;
+    }
+
+    Ok(())
+}
+
+fn validate_secondary_range_sidecar_data(data: &[u8]) -> Result<(), EngineError> {
+    if data.len() < 8 {
+        return Err(EngineError::CorruptRecord(
+            "secondary range sidecar missing header".into(),
+        ));
+    }
+
+    let count = read_u64_at(data, 0)? as usize;
+    let entries_bytes = count
+        .checked_mul(SECONDARY_RANGE_ENTRY_SIZE)
+        .and_then(|bytes| bytes.checked_add(8))
+        .ok_or_else(|| {
+            EngineError::CorruptRecord("secondary range sidecar index overflow".into())
+        })?;
+    if entries_bytes != data.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "secondary range sidecar length {} does not match expected fixed-width length {}",
+            data.len(),
+            entries_bytes
+        )));
+    }
+
+    let mut previous = None;
+    for index in 0..count {
+        let entry_off = 8 + index * SECONDARY_RANGE_ENTRY_SIZE;
+        let current = (
+            read_u64_at(data, entry_off)?,
+            read_u64_at(data, entry_off + 8)?,
+        );
+        if let Some(prev) = previous {
+            if current <= prev {
+                return Err(EngineError::CorruptRecord(format!(
+                    "secondary range sidecar entries are not strictly increasing at entry {}",
+                    index
+                )));
+            }
+        }
+        previous = Some(current);
+    }
+
+    Ok(())
+}
+
+fn find_nodes_in_secondary_eq_sidecar(
+    data: &[u8],
+    deleted_nodes: &NodeIdMap<TombstoneEntry>,
+    value_hash: u64,
+) -> Result<Vec<u64>, EngineError> {
+    let count = read_u64_at(data, 0)? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let entry_off = 8 + mid * SECONDARY_EQ_ENTRY_SIZE;
+        let entry_value_hash = read_u64_at(data, entry_off)?;
+        match entry_value_hash.cmp(&value_hash) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => {
+                let offset = read_u64_at(data, entry_off + 8)? as usize;
+                let id_count = read_u32_at(data, entry_off + 16)? as usize;
+                let mut result = Vec::with_capacity(id_count);
+                for index in 0..id_count {
+                    let node_id = read_u64_at(data, offset + index * 8)?;
+                    if !deleted_nodes.contains_key(&node_id) {
+                        result.push(node_id);
+                    }
+                }
+                return Ok(result);
+            }
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn secondary_range_sidecar_lower_bound(
+    data: &[u8],
+    target: (u64, u64),
+    strict: bool,
+) -> Result<usize, EngineError> {
+    let count = read_u64_at(data, 0)? as usize;
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let entry_off = 8 + mid * SECONDARY_RANGE_ENTRY_SIZE;
+        let current = (
+            read_u64_at(data, entry_off)?,
+            read_u64_at(data, entry_off + 8)?,
+        );
+        let ordering = current.cmp(&target);
+        if ordering == std::cmp::Ordering::Less || (strict && ordering == std::cmp::Ordering::Equal)
+        {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+fn find_nodes_in_secondary_range_sidecar(
+    data: &[u8],
+    deleted_nodes: &NodeIdMap<TombstoneEntry>,
+    lower: Option<(u64, bool)>,
+    upper: Option<(u64, bool)>,
+    after: Option<(u64, u64)>,
+    limit: Option<usize>,
+) -> Result<Vec<(u64, u64)>, EngineError> {
+    let count = read_u64_at(data, 0)? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut start: Option<((u64, u64), bool)> = None;
+    if let Some((encoded_value, inclusive)) = lower {
+        let candidate = if inclusive {
+            ((encoded_value, 0), false)
+        } else {
+            ((encoded_value, u64::MAX), true)
+        };
+        start = Some(candidate);
+    }
+    if let Some(after) = after {
+        let candidate = (after, true);
+        start = Some(match start {
+            Some(existing) if existing.0 > candidate.0 => existing,
+            Some(existing) if existing.0 < candidate.0 => candidate,
+            Some(existing) => (existing.0, existing.1 || candidate.1),
+            None => candidate,
+        });
+    }
+
+    let start_index = if let Some((target, strict)) = start {
+        secondary_range_sidecar_lower_bound(data, target, strict)?
+    } else {
+        0
+    };
+
+    let mut results = Vec::new();
+    for index in start_index..count {
+        let entry_off = 8 + index * SECONDARY_RANGE_ENTRY_SIZE;
+        let encoded_value = read_u64_at(data, entry_off)?;
+        let node_id = read_u64_at(data, entry_off + 8)?;
+        if let Some((upper_value, inclusive)) = upper {
+            if encoded_value > upper_value || (!inclusive && encoded_value == upper_value) {
+                break;
+            }
+        }
+        if !deleted_nodes.contains_key(&node_id) {
+            results.push((encoded_value, node_id));
+            if limit.is_some_and(|limit| results.len() >= limit) {
+                break;
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+struct PropLookupSeed<'a> {
+    target: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for PropLookupSeed<'_> {
+    type Value = Option<PropValue>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(PropLookupVisitor {
+            target: self.target,
+        })
+    }
+}
+
+struct PropLookupVisitor<'a> {
+    target: &'a str,
+}
+
+impl<'de> Visitor<'de> for PropLookupVisitor<'_> {
+    type Value = Option<PropValue>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a node property map")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut found = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == self.target {
+                found = Some(map.next_value()?);
+            } else {
+                let _: IgnoredAny = map.next_value()?;
+            }
+        }
+        Ok(found)
+    }
+}
+
+fn decode_node_property_at(
+    data: &[u8],
+    offset: usize,
+    id: u64,
+    prop_key: &str,
+) -> Result<Option<PropValue>, EngineError> {
+    let _type_id = read_u32_at(data, offset)?;
+    let key_len = read_u16_at(data, offset + 4)? as usize;
+    let _key_bytes = read_bytes_at(data, offset + 6, key_len)?;
+
+    let pos = offset + 6 + key_len;
+    let props_len = read_u32_at(data, pos + 20)? as usize;
+    let props_bytes = read_bytes_at(data, pos + 24, props_len)?;
+    let mut deserializer = rmp_serde::Deserializer::from_read_ref(props_bytes);
+    PropLookupSeed { target: prop_key }
+        .deserialize(&mut deserializer)
+        .map_err(|error| {
+            EngineError::CorruptRecord(format!(
+                "node {} targeted props decode at offset {}: {}",
+                id,
+                pos + 24,
+                error
+            ))
+        })
+}
+
 fn validate_node_vector_sidecars(
     segment_id: u64,
     vector_meta: &[u8],
@@ -3721,6 +4319,98 @@ pub(crate) mod tests {
         (dir, reader)
     }
 
+    fn write_legacy_prop_index(seg_dir: &Path, groups: &[(u32, u64, u64, Vec<u64>)]) {
+        use std::fs::File;
+        use std::io::{BufWriter, Write};
+
+        let mut groups = groups.to_vec();
+        groups.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+
+        let path = seg_dir.join("prop_index.dat");
+        let file = File::create(path).unwrap();
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(&(groups.len() as u64).to_le_bytes())
+            .unwrap();
+
+        let data_start = 8 + groups.len() * PROP_INDEX_ENTRY_SIZE;
+        let mut data_offset = data_start as u64;
+        for (type_id, key_hash, value_hash, ids) in &groups {
+            writer.write_all(&type_id.to_le_bytes()).unwrap();
+            writer.write_all(&key_hash.to_le_bytes()).unwrap();
+            writer.write_all(&value_hash.to_le_bytes()).unwrap();
+            writer.write_all(&data_offset.to_le_bytes()).unwrap();
+            writer.write_all(&(ids.len() as u32).to_le_bytes()).unwrap();
+            data_offset += (ids.len() * 8) as u64;
+        }
+
+        for (_, _, _, ids) in &groups {
+            for id in ids {
+                writer.write_all(&id.to_le_bytes()).unwrap();
+            }
+        }
+
+        writer.flush().unwrap();
+        writer.get_ref().sync_all().unwrap();
+    }
+
+    fn write_and_open_with_legacy_prop_index(
+        mt: &Memtable,
+        groups: &[(u32, u64, u64, Vec<u64>)],
+    ) -> (tempfile::TempDir, SegmentReader) {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        crate::segment_writer::write_segment(&seg_dir, 1, mt, None).unwrap();
+        write_legacy_prop_index(&seg_dir, groups);
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        (dir, reader)
+    }
+
+    fn write_and_open_with_secondary_eq_sidecar(
+        mt: &Memtable,
+        entry: &SecondaryIndexManifestEntry,
+    ) -> (tempfile::TempDir, SegmentReader) {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = mt.clone();
+        mt.register_secondary_index(entry);
+        crate::segment_writer::write_segment_with_secondary_indexes(
+            &seg_dir,
+            1,
+            &mt,
+            None,
+            std::slice::from_ref(entry),
+        )
+        .unwrap();
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        (dir, reader)
+    }
+
+    fn write_and_open_with_secondary_range_sidecar(
+        mt: &Memtable,
+        entry: &SecondaryIndexManifestEntry,
+    ) -> (tempfile::TempDir, SegmentReader) {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mut mt = mt.clone();
+        mt.register_secondary_index(entry);
+        crate::segment_writer::write_segment_with_secondary_indexes(
+            &seg_dir,
+            1,
+            &mt,
+            None,
+            std::slice::from_ref(entry),
+        )
+        .unwrap();
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        (dir, reader)
+    }
+
     fn dense_config(dimension: u32) -> DenseVectorConfig {
         DenseVectorConfig {
             dimension,
@@ -4226,7 +4916,7 @@ pub(crate) mod tests {
     // --- Property index roundtrip ---
 
     #[test]
-    fn test_prop_index_roundtrip() {
+    fn test_legacy_prop_index_roundtrip() {
         use crate::types::{hash_prop_key, hash_prop_value};
 
         let mut mt = Memtable::new();
@@ -4285,11 +4975,18 @@ pub(crate) mod tests {
             0,
         );
 
-        let (_dir, reader) = write_and_open(&mt);
-
-        // Query for red nodes
         let key_hash = hash_prop_key("color");
         let val_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let val_hash_green = hash_prop_value(&PropValue::String("green".to_string()));
+        let (_dir, reader) = write_and_open_with_legacy_prop_index(
+            &mt,
+            &[
+                (1, key_hash, val_hash, vec![1, 2]),
+                (1, key_hash, val_hash_green, vec![3]),
+            ],
+        );
+
+        // Query for red nodes
         let mut reds = reader
             .find_nodes_by_prop_hash(1, key_hash, val_hash)
             .unwrap();
@@ -4297,7 +4994,6 @@ pub(crate) mod tests {
         assert_eq!(reds, vec![1, 2]);
 
         // Query for green nodes
-        let val_hash_green = hash_prop_value(&PropValue::String("green".to_string()));
         let greens = reader
             .find_nodes_by_prop_hash(1, key_hash, val_hash_green)
             .unwrap();
@@ -4318,7 +5014,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_prop_index_excludes_tombstoned() {
+    fn test_legacy_prop_index_excludes_tombstoned() {
         use crate::types::{hash_prop_key, hash_prop_value};
 
         let mut mt = Memtable::new();
@@ -4365,16 +5061,361 @@ pub(crate) mod tests {
             0,
         );
 
-        let (_dir, reader) = write_and_open(&mt);
-
         let key_hash = hash_prop_key("tag");
         let val_hash = hash_prop_value(&PropValue::String("x".to_string()));
+        let (_dir, reader) =
+            write_and_open_with_legacy_prop_index(&mt, &[(1, key_hash, val_hash, vec![1, 2])]);
 
         // Node 2 is tombstoned, so only node 1 should be returned
         let results = reader
             .find_nodes_by_prop_hash(1, key_hash, val_hash)
             .unwrap();
         assert_eq!(results, vec![1]);
+    }
+
+    #[test]
+    fn test_secondary_eq_sidecar_roundtrip() {
+        use crate::types::hash_prop_value;
+
+        let mut mt = Memtable::new();
+
+        let mut props1 = BTreeMap::new();
+        props1.insert("color".to_string(), PropValue::String("red".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "apple".to_string(),
+                props: props1,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+
+        let mut props2 = BTreeMap::new();
+        props2.insert("color".to_string(), PropValue::String("red".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 2,
+                type_id: 1,
+                key: "cherry".to_string(),
+                props: props2,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+
+        let mut props3 = BTreeMap::new();
+        props3.insert("color".to_string(), PropValue::String("green".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 3,
+                type_id: 1,
+                key: "lime".to_string(),
+                props: props3,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 41,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        };
+        let (_dir, reader) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
+
+        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let green_hash = hash_prop_value(&PropValue::String("green".to_string()));
+        let mut reds = reader
+            .find_nodes_by_secondary_eq_index(entry.index_id, red_hash)
+            .unwrap();
+        reds.sort_unstable();
+        assert_eq!(reds, vec![1, 2]);
+        assert_eq!(
+            reader
+                .find_nodes_by_secondary_eq_index(entry.index_id, green_hash)
+                .unwrap(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn test_secondary_eq_sidecar_cache_reloads_after_validation_failure_and_repair() {
+        use crate::types::hash_prop_value;
+
+        let mut mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String("red".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "apple".to_string(),
+                props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 51,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        };
+        let (dir, reader) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
+        let seg_dir = dir.path().join("seg_0001");
+        let sidecar_path = seg_dir
+            .join("secondary_indexes")
+            .join(format!("node_prop_eq_{}.dat", entry.index_id));
+        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+
+        let corrupt_path = seg_dir.join("secondary_indexes").join(".corrupt_eq.dat");
+        std::fs::write(&corrupt_path, [1u8, 2, 3]).unwrap();
+        std::fs::rename(&corrupt_path, &sidecar_path).unwrap();
+
+        assert!(reader
+            .validate_secondary_eq_sidecar(entry.index_id)
+            .is_err());
+
+        let repaired_path = seg_dir.join("secondary_indexes").join(".repaired_eq.dat");
+        let mut repaired_groups = BTreeMap::new();
+        repaired_groups.insert(red_hash, vec![1]);
+        crate::segment_writer::write_node_prop_eq_sidecar_to_path(&repaired_path, &repaired_groups)
+            .unwrap();
+        std::fs::rename(&repaired_path, &sidecar_path).unwrap();
+
+        assert_eq!(
+            reader
+                .find_nodes_by_secondary_eq_index(entry.index_id, red_hash)
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn test_secondary_eq_sidecar_lookup_uses_validated_cache() {
+        use crate::types::hash_prop_value;
+
+        let mut mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String("red".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "apple".to_string(),
+                props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 52,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        };
+        let (dir, reader) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
+        let seg_dir = dir.path().join("seg_0001");
+        let sidecar_path = seg_dir
+            .join("secondary_indexes")
+            .join(format!("node_prop_eq_{}.dat", entry.index_id));
+        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+
+        assert_eq!(
+            reader
+                .find_nodes_by_secondary_eq_index(entry.index_id, red_hash)
+                .unwrap(),
+            vec![1]
+        );
+
+        let corrupt_path = seg_dir.join("secondary_indexes").join(".corrupt_eq.dat");
+        std::fs::write(&corrupt_path, [1u8, 2, 3]).unwrap();
+        std::fs::rename(&corrupt_path, &sidecar_path).unwrap();
+
+        assert_eq!(
+            reader
+                .find_nodes_by_secondary_eq_index(entry.index_id, red_hash)
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn test_validate_secondary_eq_sidecar_rejects_unsorted_node_ids() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(&28u64.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        match validate_secondary_eq_sidecar_data(&data) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("node IDs are not strictly increasing"));
+            }
+            other => panic!(
+                "expected corrupt secondary equality sidecar, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_validate_secondary_eq_sidecar_rejects_overlapping_group_ranges() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u64.to_le_bytes());
+
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(&48u64.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
+
+        data.extend_from_slice(&8u64.to_le_bytes());
+        data.extend_from_slice(&56u64.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&3u64.to_le_bytes());
+
+        match validate_secondary_eq_sidecar_data(&data) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("overlaps a previous group"));
+            }
+            other => panic!(
+                "expected corrupt secondary equality sidecar, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_secondary_range_sidecar_cache_reloads_after_validation_failure_and_repair() {
+        let mut mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::Int(10));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "apple".to_string(),
+                props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 61,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        };
+        let (dir, reader) = write_and_open_with_secondary_range_sidecar(&mt, &entry);
+        let seg_dir = dir.path().join("seg_0001");
+        let sidecar_path = seg_dir
+            .join("secondary_indexes")
+            .join(format!("node_prop_range_{}.dat", entry.index_id));
+
+        let corrupt_path = seg_dir.join("secondary_indexes").join(".corrupt_range.dat");
+        std::fs::write(&corrupt_path, [1u8, 2, 3]).unwrap();
+        std::fs::rename(&corrupt_path, &sidecar_path).unwrap();
+
+        assert!(reader
+            .validate_secondary_range_sidecar(entry.index_id)
+            .is_err());
+
+        let repaired_path = seg_dir
+            .join("secondary_indexes")
+            .join(".repaired_range.dat");
+        crate::segment_writer::write_node_prop_range_sidecar_to_path(
+            &repaired_path,
+            &[(10u64 ^ (1u64 << 63), 1)],
+        )
+        .unwrap();
+        std::fs::rename(&repaired_path, &sidecar_path).unwrap();
+
+        assert_eq!(
+            reader
+                .find_nodes_by_secondary_range_index_if_present(
+                    entry.index_id,
+                    Some((10u64 ^ (1u64 << 63), true)),
+                    Some((10u64 ^ (1u64 << 63), true)),
+                    None,
+                )
+                .unwrap(),
+            Some(vec![(10u64 ^ (1u64 << 63), 1)])
+        );
+    }
+
+    #[test]
+    fn test_validate_secondary_range_sidecar_rejects_unsorted_entries() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&(11u64 ^ (1u64 << 63)).to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&(10u64 ^ (1u64 << 63)).to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        match validate_secondary_range_sidecar_data(&data) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("not strictly increasing"));
+            }
+            other => panic!("expected corrupt secondary range sidecar, got {:?}", other),
+        }
     }
 
     // --- Weight preservation in adjacency postings ---
@@ -5107,7 +6148,7 @@ pub(crate) mod tests {
         assert_eq!(updated_at, 2000);
         assert!((weight - 0.75).abs() < f32::EPSILON);
         assert_eq!(key_len, 5); // "alice"
-        assert_eq!(phc, 2); // 2 props: "name", "score"
+        assert_eq!(phc, 0); // CP2 stops emitting legacy property hash counts for new segments.
 
         // Second entry: node_id=2
         let (nid2, _, _, tid2, _, _, key_len2, _, phc2, _) = reader.node_meta_at(1).unwrap();
