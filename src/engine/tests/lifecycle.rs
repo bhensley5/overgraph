@@ -12737,7 +12737,10 @@ fn test_legacy_property_hash_backfill_and_compaction_parity() {
         .unwrap();
     db.flush().unwrap();
 
-    let first_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let first_seg_id = db.segments[0].segment_id;
+    db.close().unwrap();
+
+    let first_seg_dir = segment_dir(&db_path, first_seg_id);
     install_legacy_property_hash_sidecars(
         &first_seg_dir,
         &[(first_id, 1, vec![("color".to_string(), red.clone())])],
@@ -12745,6 +12748,7 @@ fn test_legacy_property_hash_backfill_and_compaction_parity() {
     assert!(first_seg_dir.join("prop_index.dat").exists());
     assert!(first_seg_dir.join("node_prop_hashes.dat").exists());
 
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = db
         .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
         .unwrap();
