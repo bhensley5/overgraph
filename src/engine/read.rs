@@ -24,6 +24,182 @@ impl PartialOrd for SparseTopKEntry {
     }
 }
 
+fn normalized_range_float(value: f64) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    Some(if value == 0.0 { 0.0 } else { value })
+}
+
+fn range_value_domain(value: &PropValue) -> Option<SecondaryIndexRangeDomain> {
+    match value {
+        PropValue::Int(_) => Some(SecondaryIndexRangeDomain::Int),
+        PropValue::UInt(_) => Some(SecondaryIndexRangeDomain::UInt),
+        PropValue::Float(value) if value.is_finite() => Some(SecondaryIndexRangeDomain::Float),
+        _ => None,
+    }
+}
+
+fn compare_range_values(left: &PropValue, right: &PropValue) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (PropValue::Int(left), PropValue::Int(right)) => Some(left.cmp(right)),
+        (PropValue::UInt(left), PropValue::UInt(right)) => Some(left.cmp(right)),
+        (PropValue::Float(left), PropValue::Float(right)) => {
+            Some(normalized_range_float(*left)?.total_cmp(&normalized_range_float(*right)?))
+        }
+        _ => None,
+    }
+}
+
+fn compare_range_cursor_to_candidate(
+    cursor: &PropertyRangeCursor,
+    value: &PropValue,
+    node_id: u64,
+) -> Option<std::cmp::Ordering> {
+    compare_range_values(&cursor.value, value).map(|ordering| {
+        if ordering == std::cmp::Ordering::Equal {
+            cursor.node_id.cmp(&node_id)
+        } else {
+            ordering
+        }
+    })
+}
+
+fn range_value_matches_bound(value: &PropValue, bound: &PropertyRangeBound) -> Option<bool> {
+    let ordering = compare_range_values(value, bound.value())?;
+    Some(match bound {
+        PropertyRangeBound::Included(_) => ordering != std::cmp::Ordering::Less,
+        PropertyRangeBound::Excluded(_) => ordering == std::cmp::Ordering::Greater,
+    })
+}
+
+fn range_value_within_bounds(
+    value: &PropValue,
+    lower: Option<&PropertyRangeBound>,
+    upper: Option<&PropertyRangeBound>,
+) -> Option<bool> {
+    if let Some(lower) = lower {
+        if !range_value_matches_bound(value, lower)? {
+            return Some(false);
+        }
+    }
+    if let Some(upper) = upper {
+        let ordering = compare_range_values(value, upper.value())?;
+        let in_upper = match upper {
+            PropertyRangeBound::Included(_) => ordering != std::cmp::Ordering::Greater,
+            PropertyRangeBound::Excluded(_) => ordering == std::cmp::Ordering::Less,
+        };
+        if !in_upper {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn encode_range_sort_key(domain: SecondaryIndexRangeDomain, value: &PropValue) -> Option<u64> {
+    crate::memtable::encode_range_prop_value(domain, value)
+}
+
+#[derive(Clone, Debug)]
+struct RangeScanMatch {
+    encoded_value: u64,
+    value: PropValue,
+    node_id: u64,
+}
+
+impl PartialEq for RangeScanMatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.encoded_value == other.encoded_value && self.node_id == other.node_id
+    }
+}
+
+impl Eq for RangeScanMatch {}
+
+impl Ord for RangeScanMatch {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.encoded_value
+            .cmp(&other.encoded_value)
+            .then_with(|| self.node_id.cmp(&other.node_id))
+    }
+}
+
+impl PartialOrd for RangeScanMatch {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+enum ReadyRangeSourceStep {
+    Entry((u64, u64)),
+    Exhausted,
+    MissingSidecar,
+}
+
+enum ReadyRangeSourceKind<'a> {
+    Iter(Box<dyn Iterator<Item = (u64, u64)> + 'a>),
+    Segment {
+        segment: &'a SegmentReader,
+        index_id: u64,
+        lower: Option<(u64, bool)>,
+        upper: Option<(u64, bool)>,
+        after: Option<(u64, u64)>,
+        buffer: Vec<(u64, u64)>,
+        offset: usize,
+        chunk_size: usize,
+    },
+}
+
+struct ReadyRangeSource<'a> {
+    kind: ReadyRangeSourceKind<'a>,
+}
+
+type ReadyEqualitySourceIds = (Vec<u64>, Vec<Vec<u64>>, NodeIdSet);
+
+impl ReadyRangeSource<'_> {
+    fn next_entry(&mut self) -> Result<ReadyRangeSourceStep, EngineError> {
+        match &mut self.kind {
+            ReadyRangeSourceKind::Iter(iter) => Ok(iter
+                .next()
+                .map(ReadyRangeSourceStep::Entry)
+                .unwrap_or(ReadyRangeSourceStep::Exhausted)),
+            ReadyRangeSourceKind::Segment {
+                segment,
+                index_id,
+                lower,
+                upper,
+                after,
+                buffer,
+                offset,
+                chunk_size,
+            } => loop {
+                if *offset < buffer.len() {
+                    let entry = buffer[*offset];
+                    *offset += 1;
+                    return Ok(ReadyRangeSourceStep::Entry(entry));
+                }
+
+                let Some(entries) = segment.find_nodes_by_secondary_range_index_if_present_limited(
+                    *index_id,
+                    *lower,
+                    *upper,
+                    *after,
+                    Some(*chunk_size),
+                )?
+                else {
+                    return Ok(ReadyRangeSourceStep::MissingSidecar);
+                };
+                if entries.is_empty() {
+                    return Ok(ReadyRangeSourceStep::Exhausted);
+                }
+
+                *after = entries.last().copied();
+                *buffer = entries;
+                *offset = 0;
+            },
+        }
+    }
+}
+
 // --- Hybrid fusion constants and functions ---
 
 /// Smoothing constant for reciprocal rank fusion (Cormack et al., 2009).
@@ -177,6 +353,27 @@ impl DatabaseEngine {
         }
     }
 
+    fn ready_equality_node_matches(
+        node: Option<&NodeRecord>,
+        type_id: u32,
+        prop_key: &str,
+        prop_value: &PropValue,
+    ) -> bool {
+        let Some(node) = node else {
+            return false;
+        };
+        if node.type_id != type_id
+            || !node
+                .props
+                .get(prop_key)
+                .map(|value| value == prop_value)
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        true
+    }
+
     /// Return the subset of `node_ids` visible to public read APIs: existing,
     /// not tombstoned, and not excluded by any read-time prune policy.
     fn visible_node_ids(
@@ -209,6 +406,1014 @@ impl DatabaseEngine {
     ) -> Result<bool, EngineError> {
         let visible = self.visible_node_ids(&[from, to], policy_cutoffs)?;
         Ok(visible.contains(&from) && visible.contains(&to))
+    }
+
+    fn record_equality_scan_fallback_route(&self) {
+        #[cfg(test)]
+        self.property_query_routes
+            .equality_scan_fallback
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_equality_index_lookup_route(&self) {
+        #[cfg(test)]
+        self.property_query_routes
+            .equality_index_lookup
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_range_scan_fallback_route(&self) {
+        #[cfg(test)]
+        self.property_query_routes
+            .range_scan_fallback
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_range_index_lookup_route(&self) {
+        #[cfg(test)]
+        self.property_query_routes
+            .range_index_lookup
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn degrade_ready_equality_index_after_sidecar_failure(
+        &self,
+        index_id: u64,
+        error: Option<&EngineError>,
+    ) {
+        let next_state = if error.is_some_and(|error| !is_not_found_io_error(error)) {
+            SecondaryIndexState::Failed
+        } else {
+            SecondaryIndexState::Building
+        };
+        let next_last_error = if next_state == SecondaryIndexState::Failed {
+            error.map(ToString::to_string)
+        } else {
+            None
+        };
+
+        let Some(current_entry) = self
+            .secondary_index_entries_snapshot()
+            .into_iter()
+            .find(|entry| entry.index_id == index_id)
+        else {
+            return;
+        };
+        if !matches!(current_entry.kind, SecondaryIndexKind::Equality) {
+            return;
+        }
+        let should_queue_build = next_state == SecondaryIndexState::Building
+            && current_entry.state != SecondaryIndexState::Building;
+        if current_entry.state == next_state && current_entry.last_error == next_last_error {
+            return;
+        }
+
+        let _ = update_secondary_index_manifest_runtime(
+            &self.db_dir,
+            &self.manifest_write_lock,
+            &self.secondary_index_catalog,
+            &self.secondary_index_entries,
+            &self.next_node_id_seen,
+            &self.next_edge_id_seen,
+            &self.engine_seq_seen,
+            |manifest| {
+                if let Some(entry) = manifest
+                    .secondary_indexes
+                    .iter_mut()
+                    .find(|entry| entry.index_id == index_id)
+                {
+                    if matches!(entry.kind, SecondaryIndexKind::Equality) {
+                        entry.state = next_state;
+                        entry.last_error = next_last_error.clone();
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        if should_queue_build {
+            if let Some(bg) = &self.secondary_index_bg {
+                let _ = bg.job_tx.send(SecondaryIndexJob::Build { index_id });
+            }
+        }
+    }
+
+    fn ready_equality_verified_node_ids(
+        &self,
+        merged_ids: &[u64],
+        memtable_verified: &NodeIdSet,
+        type_id: u32,
+        prop_key: &str,
+        prop_value: &PropValue,
+    ) -> Result<NodeIdSet, EngineError> {
+        let mut visible =
+            NodeIdSet::with_capacity_and_hasher(merged_ids.len(), Default::default());
+        let segment_candidates: Vec<u64> = merged_ids
+            .iter()
+            .copied()
+            .filter(|id| !memtable_verified.contains(id))
+            .collect();
+        for &id in merged_ids {
+            if memtable_verified.contains(&id) {
+                visible.insert(id);
+            }
+        }
+        if segment_candidates.is_empty() {
+            return Ok(visible);
+        }
+
+        let batch_results = self.get_nodes_raw(&segment_candidates)?;
+        for (id, node) in segment_candidates
+            .into_iter()
+            .zip(batch_results.into_iter())
+        {
+            if Self::ready_equality_node_matches(node.as_ref(), type_id, prop_key, prop_value) {
+                visible.insert(id);
+            }
+        }
+        Ok(visible)
+    }
+
+    fn ready_equality_source_ids(
+        &self,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+    ) -> Result<Option<ReadyEqualitySourceIds>, EngineError> {
+        let memtable_ids = self
+            .memtable
+            .find_secondary_eq_nodes(index_id, prop_key, prop_value);
+        let mut memtable_verified: NodeIdSet = memtable_ids.iter().copied().collect();
+        let mut deleted_above: NodeIdSet =
+            self.memtable.deleted_nodes().keys().copied().collect();
+        let value_hash = hash_prop_value(prop_value);
+        let mut segment_ids: Vec<Vec<u64>> =
+            Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
+
+        for epoch in &self.immutable_epochs {
+            let ids: Vec<u64> = epoch
+                .memtable
+                .find_secondary_eq_nodes(index_id, prop_key, prop_value)
+                .into_iter()
+                .filter(|id| !deleted_above.contains(id))
+                .collect();
+            memtable_verified.extend(ids.iter().copied());
+            segment_ids.push(ids);
+            deleted_above.extend(epoch.memtable.deleted_nodes().keys().copied());
+        }
+
+        for seg in &self.segments {
+            let ids = match seg.find_nodes_by_secondary_eq_index_if_present(index_id, value_hash)
+            {
+                Ok(Some(ids)) => ids,
+                Ok(None) => {
+                    self.degrade_ready_equality_index_after_sidecar_failure(index_id, None);
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.degrade_ready_equality_index_after_sidecar_failure(index_id, Some(&error));
+                    return Ok(None);
+                }
+            };
+            let ids: Vec<u64> = ids
+                .into_iter()
+                .filter(|id| !deleted_above.contains(id))
+                .collect();
+            segment_ids.push(ids);
+            deleted_above.extend(seg.deleted_node_ids());
+        }
+
+        Ok(Some((memtable_ids, segment_ids, memtable_verified)))
+    }
+
+    fn degrade_ready_range_index_after_sidecar_failure(
+        &self,
+        index_id: u64,
+        error: Option<&EngineError>,
+    ) {
+        let next_state = if error.is_some_and(|error| !is_not_found_io_error(error)) {
+            SecondaryIndexState::Failed
+        } else {
+            SecondaryIndexState::Building
+        };
+        let next_last_error = if next_state == SecondaryIndexState::Failed {
+            error.map(ToString::to_string)
+        } else {
+            None
+        };
+
+        let Some(current_entry) = self
+            .secondary_index_entries_snapshot()
+            .into_iter()
+            .find(|entry| entry.index_id == index_id)
+        else {
+            return;
+        };
+        if !matches!(current_entry.kind, SecondaryIndexKind::Range { .. }) {
+            return;
+        }
+        let should_queue_build = next_state == SecondaryIndexState::Building
+            && current_entry.state != SecondaryIndexState::Building;
+        if current_entry.state == next_state && current_entry.last_error == next_last_error {
+            return;
+        }
+
+        let _ = update_secondary_index_manifest_runtime(
+            &self.db_dir,
+            &self.manifest_write_lock,
+            &self.secondary_index_catalog,
+            &self.secondary_index_entries,
+            &self.next_node_id_seen,
+            &self.next_edge_id_seen,
+            &self.engine_seq_seen,
+            |manifest| {
+                if let Some(entry) = manifest
+                    .secondary_indexes
+                    .iter_mut()
+                    .find(|entry| entry.index_id == index_id)
+                {
+                    if matches!(entry.kind, SecondaryIndexKind::Range { .. }) {
+                        entry.state = next_state;
+                        entry.last_error = next_last_error.clone();
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        if should_queue_build {
+            if let Some(bg) = &self.secondary_index_bg {
+                let _ = bg.job_tx.send(SecondaryIndexJob::Build { index_id });
+            }
+        }
+    }
+
+    fn nodes_by_type_paged_unfiltered(
+        &self,
+        type_id: u32,
+        page: &PageRequest,
+    ) -> Result<PageResult<u64>, EngineError> {
+        let (deleted, _) = self.collect_tombstones();
+        let memtable_ids = self.memtable.nodes_by_type(type_id);
+        let mut segment_ids: Vec<Vec<u64>> =
+            Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
+        for epoch in &self.immutable_epochs {
+            segment_ids.push(epoch.memtable.nodes_by_type(type_id));
+        }
+        for seg in &self.segments {
+            segment_ids.push(seg.nodes_by_type(type_id)?);
+        }
+        Ok(merge_type_ids_paged(
+            memtable_ids,
+            segment_ids,
+            &deleted,
+            page,
+        ))
+    }
+
+    fn scan_nodes_by_type_filtered<F>(
+        &self,
+        type_id: u32,
+        start_after: Option<u64>,
+        chunk_limit: usize,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        mut visitor: F,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(u64, &NodeRecord) -> Result<ControlFlow<()>, EngineError>,
+    {
+        let mut cursor = start_after;
+        let chunk_limit = chunk_limit.max(1);
+
+        loop {
+            let chunk = self.nodes_by_type_paged_unfiltered(
+                type_id,
+                &PageRequest {
+                    limit: Some(chunk_limit),
+                    after: cursor,
+                },
+            )?;
+            if chunk.items.is_empty() {
+                return Ok(());
+            }
+
+            let nodes = self.get_nodes_raw(&chunk.items)?;
+            for (&node_id, node) in chunk.items.iter().zip(nodes.iter()) {
+                let Some(node) = node.as_ref() else {
+                    continue;
+                };
+                if node.type_id != type_id {
+                    continue;
+                }
+                if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
+                    continue;
+                }
+                if visitor(node_id, node)?.is_break() {
+                    return Ok(());
+                }
+            }
+
+            let Some(next_cursor) = chunk.next_cursor else {
+                return Ok(());
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+
+    fn validate_property_range_bounds(
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+        cursor: Option<&PropertyRangeCursor>,
+    ) -> Result<SecondaryIndexRangeDomain, EngineError> {
+        let mut domain = None;
+
+        for value in lower.into_iter().map(PropertyRangeBound::value) {
+            let current = range_value_domain(value).ok_or_else(|| {
+                EngineError::InvalidOperation(
+                    "property range bounds must use Int, UInt, or finite Float values".into(),
+                )
+            })?;
+            if let Some(existing) = domain {
+                if existing != current {
+                    return Err(EngineError::InvalidOperation(
+                        "property range bounds must use the same PropValue variant".into(),
+                    ));
+                }
+            } else {
+                domain = Some(current);
+            }
+        }
+
+        for value in upper.into_iter().map(PropertyRangeBound::value) {
+            let current = range_value_domain(value).ok_or_else(|| {
+                EngineError::InvalidOperation(
+                    "property range bounds must use Int, UInt, or finite Float values".into(),
+                )
+            })?;
+            if let Some(existing) = domain {
+                if existing != current {
+                    return Err(EngineError::InvalidOperation(
+                        "property range bounds must use the same PropValue variant".into(),
+                    ));
+                }
+            } else {
+                domain = Some(current);
+            }
+        }
+
+        let domain = domain.ok_or_else(|| {
+            EngineError::InvalidOperation(
+                "property range queries require at least one lower or upper bound".into(),
+            )
+        })?;
+
+        if let Some(cursor) = cursor {
+            let cursor_domain = range_value_domain(&cursor.value).ok_or_else(|| {
+                EngineError::InvalidOperation(
+                    "property range cursor must use Int, UInt, or finite Float values".into(),
+                )
+            })?;
+            if cursor_domain != domain {
+                return Err(EngineError::InvalidOperation(
+                    "property range cursor must use the same PropValue variant as the bounds"
+                        .into(),
+                ));
+            }
+        }
+
+        if let (Some(lower), Some(upper)) = (lower, upper) {
+            match compare_range_values(lower.value(), upper.value()) {
+                Some(std::cmp::Ordering::Greater) => {
+                    return Err(EngineError::InvalidOperation(
+                        "property range lower bound must be <= upper bound".into(),
+                    ));
+                }
+                Some(std::cmp::Ordering::Equal)
+                    if !(lower.is_inclusive() && upper.is_inclusive()) =>
+                {
+                    return Err(EngineError::InvalidOperation(
+                        "property range bounds must not describe an empty interval".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(domain)
+    }
+
+    fn find_nodes_scan_fallback(
+        &self,
+        type_id: u32,
+        prop_key: &str,
+        prop_value: &PropValue,
+    ) -> Result<Vec<u64>, EngineError> {
+        let policy_cutoffs = self.query_policy_cutoffs();
+        let mut results = Vec::new();
+        self.scan_nodes_by_type_filtered(
+            type_id,
+            None,
+            256,
+            policy_cutoffs.as_ref(),
+            |node_id, node| {
+                if node
+                    .props
+                    .get(prop_key)
+                    .is_some_and(|value| value == prop_value)
+                {
+                    results.push(node_id);
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(results)
+    }
+
+    fn find_nodes_paged_scan_fallback(
+        &self,
+        type_id: u32,
+        prop_key: &str,
+        prop_value: &PropValue,
+        page: &PageRequest,
+    ) -> Result<PageResult<u64>, EngineError> {
+        let limit = page.limit.unwrap_or(0);
+        let chunk_limit = match page.limit {
+            Some(limit) if limit > 0 => limit.saturating_mul(4).max(limit),
+            _ => 256,
+        };
+        let policy_cutoffs = self.query_policy_cutoffs();
+
+        if limit == 0 {
+            let mut items = Vec::new();
+            self.scan_nodes_by_type_filtered(
+                type_id,
+                page.after,
+                chunk_limit,
+                policy_cutoffs.as_ref(),
+                |node_id, node| {
+                    if node
+                        .props
+                        .get(prop_key)
+                        .is_some_and(|value| value == prop_value)
+                    {
+                        items.push(node_id);
+                    }
+                    Ok(ControlFlow::Continue(()))
+                },
+            )?;
+            return Ok(PageResult {
+                items,
+                next_cursor: None,
+            });
+        }
+
+        let mut items = Vec::with_capacity(limit);
+        let mut next_cursor = None;
+        self.scan_nodes_by_type_filtered(
+            type_id,
+            page.after,
+            chunk_limit,
+            policy_cutoffs.as_ref(),
+            |node_id, node| {
+                if node
+                    .props
+                    .get(prop_key)
+                    .is_some_and(|value| value == prop_value)
+                {
+                    items.push(node_id);
+                    if items.len() >= limit {
+                        next_cursor = Some(node_id);
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(PageResult { items, next_cursor })
+    }
+
+    fn find_nodes_ready_equality_index(
+        &self,
+        type_id: u32,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+    ) -> Result<Option<Vec<u64>>, EngineError> {
+        Ok(self
+            .find_nodes_paged_ready_equality_index(
+                type_id,
+                index_id,
+                prop_key,
+                prop_value,
+                &PageRequest::default(),
+            )?
+            .map(|page| page.items))
+    }
+
+    fn find_nodes_paged_ready_equality_index(
+        &self,
+        type_id: u32,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+        page: &PageRequest,
+    ) -> Result<Option<PageResult<u64>>, EngineError> {
+        let Some((memtable_ids, segment_ids, memtable_verified)) =
+            self.ready_equality_source_ids(index_id, prop_key, prop_value)?
+        else {
+            return Ok(None);
+        };
+
+        let deleted = NodeIdSet::default();
+        let limit = page.limit.unwrap_or(0);
+        if limit == 0 {
+            let all_page = PageRequest {
+                limit: None,
+                after: page.after,
+            };
+            let merged = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &all_page);
+            let visible = self.ready_equality_verified_node_ids(
+                &merged.items,
+                &memtable_verified,
+                type_id,
+                prop_key,
+                prop_value,
+            )?;
+            let excluded = self.policy_excluded_node_ids(&merged.items)?;
+            let items: Vec<u64> = merged
+                .items
+                .into_iter()
+                .filter(|id| visible.contains(id) && !excluded.contains(id))
+                .collect();
+            Ok(Some(PageResult {
+                items,
+                next_cursor: None,
+            }))
+        } else {
+            let chunk_limit = limit.saturating_mul(4).max(limit);
+            let mut collected = Vec::with_capacity(limit);
+            let mut cursor = page.after;
+
+            loop {
+                let chunk_page = PageRequest {
+                    limit: Some(chunk_limit),
+                    after: cursor,
+                };
+                let merged = merge_type_ids_paged(
+                    memtable_ids.clone(),
+                    segment_ids.clone(),
+                    &deleted,
+                    &chunk_page,
+                );
+                if merged.items.is_empty() {
+                    return Ok(Some(PageResult {
+                        items: collected,
+                        next_cursor: None,
+                    }));
+                }
+
+                let visible = self.ready_equality_verified_node_ids(
+                    &merged.items,
+                    &memtable_verified,
+                    type_id,
+                    prop_key,
+                    prop_value,
+                )?;
+                let excluded = self.policy_excluded_node_ids(&merged.items)?;
+                for id in merged.items {
+                    if visible.contains(&id) && !excluded.contains(&id) {
+                        collected.push(id);
+                        if collected.len() >= limit {
+                            return Ok(Some(PageResult {
+                                items: collected,
+                                next_cursor: Some(id),
+                            }));
+                        }
+                    }
+                    cursor = Some(id);
+                }
+
+                if merged.next_cursor.is_none() {
+                    return Ok(Some(PageResult {
+                        items: collected,
+                        next_cursor: None,
+                    }));
+                }
+            }
+        }
+    }
+
+    fn ready_range_node_value(
+        node: Option<&NodeRecord>,
+        type_id: u32,
+        prop_key: &str,
+        domain: SecondaryIndexRangeDomain,
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Option<PropValue> {
+        let node = node?;
+        if node.type_id != type_id
+            || policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node))
+        {
+            return None;
+        }
+
+        let value = node.props.get(prop_key)?;
+        if range_value_domain(value) != Some(domain)
+            || range_value_within_bounds(value, lower, upper) != Some(true)
+        {
+            return None;
+        }
+
+        Some(value.clone())
+    }
+
+    fn encode_property_range_bound(
+        domain: SecondaryIndexRangeDomain,
+        bound: Option<&PropertyRangeBound>,
+    ) -> Option<(u64, bool)> {
+        bound.map(|bound| {
+            (
+                encode_range_sort_key(domain, bound.value())
+                    .expect("validated property range bounds must encode"),
+                bound.is_inclusive(),
+            )
+        })
+    }
+
+    fn encode_property_range_cursor(
+        domain: SecondaryIndexRangeDomain,
+        cursor: Option<&PropertyRangeCursor>,
+    ) -> Option<(u64, u64)> {
+        cursor.map(|cursor| {
+            (
+                encode_range_sort_key(domain, &cursor.value)
+                    .expect("validated property range cursor must encode"),
+                cursor.node_id,
+            )
+        })
+    }
+
+    fn range_seek_start(
+        lower: Option<(u64, bool)>,
+        after: Option<(u64, u64)>,
+    ) -> Option<((u64, u64), bool)> {
+        let mut start = lower.map(|(encoded_value, inclusive)| {
+            if inclusive {
+                ((encoded_value, 0), false)
+            } else {
+                ((encoded_value, u64::MAX), true)
+            }
+        });
+        if let Some(after) = after {
+            let after_start = (after, true);
+            start = Some(match start {
+                Some(existing) if existing.0 > after_start.0 => existing,
+                Some(existing) if existing.0 < after_start.0 => after_start,
+                Some(existing) => (existing.0, existing.1 || after_start.1),
+                None => after_start,
+            });
+        }
+        start
+    }
+
+    fn ready_range_chunk_limit(limit: usize) -> usize {
+        if limit == 0 {
+            512
+        } else {
+            limit.saturating_mul(4).max(limit).max(64)
+        }
+    }
+
+    fn record_ready_range_memtable_owners(
+        owners: &mut NodeIdMap<usize>,
+        source_idx: usize,
+        memtable: &Memtable,
+    ) {
+        for node_id in memtable.deleted_nodes().keys().copied() {
+            owners.entry(node_id).or_insert(source_idx);
+        }
+        for node_id in memtable.nodes().keys().copied() {
+            owners.entry(node_id).or_insert(source_idx);
+        }
+    }
+
+    fn record_ready_range_segment_owners(
+        owners: &mut NodeIdMap<usize>,
+        source_idx: usize,
+        segment: &SegmentReader,
+    ) -> Result<(), EngineError> {
+        for node_id in segment.deleted_node_id_iter() {
+            owners.entry(node_id).or_insert(source_idx);
+        }
+        for &node_id in segment.node_ids()? {
+            owners.entry(node_id).or_insert(source_idx);
+        }
+        Ok(())
+    }
+
+    fn ready_range_memtable_source<'a>(
+        memtable: &'a Memtable,
+        index_id: u64,
+        lower: Option<(u64, bool)>,
+        upper: Option<(u64, bool)>,
+        after: Option<(u64, u64)>,
+    ) -> ReadyRangeSource<'a> {
+        use std::ops::Bound;
+
+        let upper_bound = upper;
+        let iter: Box<dyn Iterator<Item = (u64, u64)> + 'a> =
+            if let Some(entries) = memtable.secondary_range_state().get(&index_id) {
+                let in_upper_bound = move |entry: &(u64, u64)| {
+                    upper_bound.is_none_or(|(upper_value, inclusive)| {
+                        entry.0 < upper_value || (inclusive && entry.0 == upper_value)
+                    })
+                };
+
+                match Self::range_seek_start(lower, after) {
+                    Some((target, strict)) => {
+                        let bound = if strict {
+                            Bound::Excluded(target)
+                        } else {
+                            Bound::Included(target)
+                        };
+                        Box::new(
+                            entries
+                                .range((bound, Bound::Unbounded))
+                                .copied()
+                                .take_while(in_upper_bound),
+                        )
+                    }
+                    None => Box::new(entries.iter().copied().take_while(in_upper_bound)),
+                }
+            } else {
+                Box::new(std::iter::empty())
+            };
+
+        ReadyRangeSource {
+            kind: ReadyRangeSourceKind::Iter(iter),
+        }
+    }
+
+    fn ready_range_segment_source<'a>(
+        segment: &'a SegmentReader,
+        index_id: u64,
+        lower: Option<(u64, bool)>,
+        upper: Option<(u64, bool)>,
+        after: Option<(u64, u64)>,
+        chunk_size: usize,
+    ) -> ReadyRangeSource<'a> {
+        ReadyRangeSource {
+            kind: ReadyRangeSourceKind::Segment {
+                segment,
+                index_id,
+                lower,
+                upper,
+                after,
+                buffer: Vec::new(),
+                offset: 0,
+                chunk_size: chunk_size.max(1),
+            },
+        }
+    }
+
+    fn ready_range_candidate_hidden(
+        owners: &NodeIdMap<usize>,
+        source_idx: usize,
+        node_id: u64,
+    ) -> bool {
+        owners
+            .get(&node_id)
+            .is_some_and(|owner_idx| *owner_idx < source_idx)
+    }
+
+    fn find_nodes_paged_ready_range_index(
+        &self,
+        type_id: u32,
+        index_id: u64,
+        prop_key: &str,
+        domain: SecondaryIndexRangeDomain,
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+        page: &PropertyRangePageRequest,
+    ) -> Result<Option<PropertyRangePageResult<u64>>, EngineError> {
+        let lower_encoded = Self::encode_property_range_bound(domain, lower);
+        let upper_encoded = Self::encode_property_range_bound(domain, upper);
+        let after_encoded = Self::encode_property_range_cursor(domain, page.after.as_ref());
+        let policy_cutoffs = self.query_policy_cutoffs();
+        let limit = page.limit.unwrap_or(0);
+        let chunk_limit = Self::ready_range_chunk_limit(limit);
+        let target_visible = if limit == 0 {
+            usize::MAX
+        } else {
+            limit.saturating_add(1)
+        };
+
+        let mut owners = NodeIdMap::default();
+        let mut sources = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
+        Self::record_ready_range_memtable_owners(&mut owners, sources.len(), &self.memtable);
+        sources.push(Self::ready_range_memtable_source(
+            &self.memtable,
+            index_id,
+            lower_encoded,
+            upper_encoded,
+            after_encoded,
+        ));
+        for epoch in &self.immutable_epochs {
+            Self::record_ready_range_memtable_owners(
+                &mut owners,
+                sources.len(),
+                epoch.memtable.as_ref(),
+            );
+            sources.push(Self::ready_range_memtable_source(
+                epoch.memtable.as_ref(),
+                index_id,
+                lower_encoded,
+                upper_encoded,
+                after_encoded,
+            ));
+        }
+        for seg in &self.segments {
+            Self::record_ready_range_segment_owners(&mut owners, sources.len(), seg)?;
+            sources.push(Self::ready_range_segment_source(
+                seg,
+                index_id,
+                lower_encoded,
+                upper_encoded,
+                after_encoded,
+                chunk_limit,
+            ));
+        }
+
+        let mut heap: BinaryHeap<Reverse<((u64, u64), usize)>> =
+            BinaryHeap::with_capacity(sources.len());
+        for (source_idx, source) in sources.iter_mut().enumerate() {
+            match source.next_entry() {
+                Ok(ReadyRangeSourceStep::Entry(entry)) => {
+                    heap.push(Reverse((entry, source_idx)));
+                }
+                Ok(ReadyRangeSourceStep::Exhausted) => {}
+                Ok(ReadyRangeSourceStep::MissingSidecar) => {
+                    self.degrade_ready_range_index_after_sidecar_failure(index_id, None);
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.degrade_ready_range_index_after_sidecar_failure(index_id, Some(&error));
+                    return Ok(None);
+                }
+            }
+        }
+
+        let mut visible = Vec::new();
+        let mut pending = Vec::with_capacity(chunk_limit);
+        let hydrate_pending = |pending: &mut Vec<(u64, u64)>,
+                               visible: &mut Vec<(u64, PropertyRangeCursor)>|
+         -> Result<(), EngineError> {
+            if pending.is_empty() {
+                return Ok(());
+            }
+
+            let node_ids: Vec<u64> = pending.iter().map(|&(_, node_id)| node_id).collect();
+            let hydrated = self.get_nodes_raw(&node_ids)?;
+            for ((_, node_id), node) in pending.iter().zip(hydrated.into_iter()) {
+                if visible.len() >= target_visible {
+                    break;
+                }
+                let Some(value) = Self::ready_range_node_value(
+                    node.as_ref(),
+                    type_id,
+                    prop_key,
+                    domain,
+                    lower,
+                    upper,
+                    policy_cutoffs.as_ref(),
+                ) else {
+                    continue;
+                };
+                visible.push((
+                    *node_id,
+                    PropertyRangeCursor {
+                        value,
+                        node_id: *node_id,
+                    },
+                ));
+            }
+            pending.clear();
+            Ok(())
+        };
+
+        while visible.len() < target_visible {
+            let Some(Reverse((entry, source_idx))) = heap.pop() else {
+                break;
+            };
+
+            match sources[source_idx].next_entry() {
+                Ok(ReadyRangeSourceStep::Entry(next_entry)) => {
+                    heap.push(Reverse((next_entry, source_idx)));
+                }
+                Ok(ReadyRangeSourceStep::Exhausted) => {}
+                Ok(ReadyRangeSourceStep::MissingSidecar) => {
+                    self.degrade_ready_range_index_after_sidecar_failure(index_id, None);
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.degrade_ready_range_index_after_sidecar_failure(index_id, Some(&error));
+                    return Ok(None);
+                }
+            }
+
+            if Self::ready_range_candidate_hidden(&owners, source_idx, entry.1) {
+                continue;
+            }
+
+            pending.push(entry);
+            if pending.len() >= chunk_limit {
+                hydrate_pending(&mut pending, &mut visible)?;
+            }
+        }
+        if visible.len() < target_visible {
+            hydrate_pending(&mut pending, &mut visible)?;
+        }
+
+        if limit == 0 {
+            return Ok(Some(PropertyRangePageResult {
+                items: visible.into_iter().map(|(node_id, _)| node_id).collect(),
+                next_cursor: None,
+            }));
+        }
+
+        let has_more = visible.len() > limit;
+        let selected = &visible[..visible.len().min(limit)];
+        Ok(Some(PropertyRangePageResult {
+            items: selected.iter().map(|(node_id, _)| *node_id).collect(),
+            next_cursor: if has_more {
+                selected.last().map(|(_, cursor)| cursor.clone())
+            } else {
+                None
+            },
+        }))
+    }
+
+    fn collect_property_range_scan_matches(
+        &self,
+        type_id: u32,
+        prop_key: &str,
+        domain: SecondaryIndexRangeDomain,
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+        after: Option<&PropertyRangeCursor>,
+        max_results: Option<usize>,
+    ) -> Result<Vec<RangeScanMatch>, EngineError> {
+        let policy_cutoffs = self.query_policy_cutoffs();
+        let mut matches = Vec::new();
+        let mut bounded: Option<BinaryHeap<RangeScanMatch>> =
+            max_results.map(|_| BinaryHeap::new());
+        self.scan_nodes_by_type_filtered(
+            type_id,
+            None,
+            256,
+            policy_cutoffs.as_ref(),
+            |node_id, node| {
+                let Some(value) = node.props.get(prop_key) else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                if range_value_domain(value) != Some(domain) {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                if range_value_within_bounds(value, lower, upper) != Some(true) {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                if after.is_some_and(|cursor| {
+                    compare_range_cursor_to_candidate(cursor, value, node_id)
+                        != Some(std::cmp::Ordering::Less)
+                }) {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let Some(encoded_value) = encode_range_sort_key(domain, value) else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                let entry = RangeScanMatch {
+                    encoded_value,
+                    value: value.clone(),
+                    node_id,
+                };
+                if let Some(heap) = bounded.as_mut() {
+                    heap.push(entry);
+                    if heap.len() > max_results.unwrap_or(usize::MAX) {
+                        heap.pop();
+                    }
+                } else {
+                    matches.push(entry);
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        if let Some(heap) = bounded {
+            matches = heap.into_vec();
+        }
+        matches.sort_unstable();
+        Ok(matches)
     }
 
     // --- Read APIs (multi-source: memtable → segments newest-first) ---
@@ -557,9 +1762,7 @@ impl DatabaseEngine {
         let cutoff_score = cutoff.score;
         let cutoff_node_id = cutoff.node_id;
 
-        let per_segment_hits: Vec<Result<Vec<(u64, f32)>, EngineError>> = if work_items.len()
-            <= 1
-        {
+        let per_segment_hits: Vec<Result<Vec<(u64, f32)>, EngineError>> = if work_items.len() <= 1 {
             // Single non-exhausted segment: skip rayon overhead.
             work_items
                 .iter()
@@ -815,6 +2018,7 @@ impl DatabaseEngine {
             } else {
                 // Multi-segment parallel path: collect per-segment results then reduce.
                 let user_ef = request.ef_search;
+                #[allow(clippy::type_complexity)]
                 let per_segment_results: Vec<
                     Result<(Vec<(u64, f32)>, bool), EngineError>,
                 > = crate::parallel::engine_cpu_install(|| {
@@ -827,14 +2031,10 @@ impl DatabaseEngine {
                                 return Ok((Vec::new(), true));
                             }
                             let is_exhausted = limit >= *point_count;
-                            let ef_search = user_ef
-                                .unwrap_or(fetch_limit)
-                                .max(limit)
-                                .min(*point_count);
+                            let ef_search =
+                                user_ef.unwrap_or(fetch_limit).max(limit).min(*point_count);
                             let hits = if let Some(scope) = scope_ids {
-                                segment.search_dense_hnsw_scoped(
-                                    query, ef_search, limit, scope,
-                                )?
+                                segment.search_dense_hnsw_scoped(query, ef_search, limit, scope)?
                             } else {
                                 segment.search_dense_hnsw(query, ef_search, limit)?
                             };
@@ -1070,8 +2270,7 @@ impl DatabaseEngine {
                     self.segments
                         .par_iter()
                         .map(|segment| {
-                            let cap =
-                                (segment.node_count() as usize / 4).max(16);
+                            let cap = (segment.node_count() as usize / 4).max(16);
                             let mut scores = NodeIdMap::with_capacity_and_hasher(
                                 cap,
                                 NodeIdBuildHasher::default(),
@@ -1720,44 +2919,15 @@ impl DatabaseEngine {
         type_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        // Build global deleted set (cross-source tombstones)
-        let mut deleted: NodeIdSet = self.memtable.deleted_nodes().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted.extend(epoch.memtable.deleted_nodes().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted.extend(seg.deleted_node_ids());
-        }
-
-        // Collect sources
-        let memtable_ids = self.memtable.nodes_by_type(type_id);
-        let mut segment_ids: Vec<Vec<u64>> =
-            Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
-        for epoch in &self.immutable_epochs {
-            segment_ids.push(epoch.memtable.nodes_by_type(type_id));
-        }
-        for seg in &self.segments {
-            segment_ids.push(seg.nodes_by_type(type_id)?);
-        }
-
+        let unfiltered = self.nodes_by_type_paged_unfiltered(type_id, page)?;
         if self.manifest.prune_policies.is_empty() {
             // Fast path: merge with early termination, no policy filtering needed
-            Ok(merge_type_ids_paged(
-                memtable_ids,
-                segment_ids,
-                &deleted,
-                page,
-            ))
+            Ok(unfiltered)
         } else {
             let limit = page.limit.unwrap_or(0);
             if limit == 0 {
-                let all_page = PageRequest {
-                    limit: None,
-                    after: page.after,
-                };
-                let all = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &all_page);
-                let excluded = self.policy_excluded_node_ids(&all.items)?;
-                let mut items = all.items;
+                let excluded = self.policy_excluded_node_ids(&unfiltered.items)?;
+                let mut items = unfiltered.items;
                 if !excluded.is_empty() {
                     items.retain(|id| !excluded.contains(id));
                 }
@@ -1775,12 +2945,7 @@ impl DatabaseEngine {
                         limit: Some(chunk_limit),
                         after: cursor,
                     };
-                    let chunk = merge_type_ids_paged(
-                        memtable_ids.clone(),
-                        segment_ids.clone(),
-                        &deleted,
-                        &chunk_page,
-                    );
+                    let chunk = self.nodes_by_type_paged_unfiltered(type_id, &chunk_page)?;
                     if chunk.items.is_empty() {
                         return Ok(PageResult {
                             items: collected,
@@ -1895,64 +3060,22 @@ impl DatabaseEngine {
         prop_key: &str,
         prop_value: &PropValue,
     ) -> Result<Vec<u64>, EngineError> {
-        // Collect all deleted node IDs across sources
-        let mut deleted: NodeIdSet = self.memtable.deleted_nodes().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted.extend(epoch.memtable.deleted_nodes().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted.extend(seg.deleted_node_ids());
-        }
-
-        let mut seen = NodeIdSet::default();
-        let mut results = Vec::new();
-
-        // Memtable first (already post-filtered)
-        for id in self.memtable.find_nodes(type_id, prop_key, prop_value) {
-            if !deleted.contains(&id) && seen.insert(id) {
-                results.push(id);
+        let ready_entry =
+            self.node_property_index_entry(type_id, prop_key, &SecondaryIndexKind::Equality);
+        if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
+            if let Some(results) =
+                self.find_nodes_ready_equality_index(type_id, entry.index_id, prop_key, prop_value)?
+            {
+                self.record_equality_index_lookup_route();
+                Ok(results)
+            } else {
+                self.record_equality_scan_fallback_route();
+                self.find_nodes_scan_fallback(type_id, prop_key, prop_value)
             }
+        } else {
+            self.record_equality_scan_fallback_route();
+            self.find_nodes_scan_fallback(type_id, prop_key, prop_value)
         }
-
-        // Immutable memtables (newest-first, already post-filtered)
-        for epoch in &self.immutable_epochs {
-            for id in epoch.memtable.find_nodes(type_id, prop_key, prop_value) {
-                if !deleted.contains(&id) && seen.insert(id) {
-                    results.push(id);
-                }
-            }
-        }
-
-        // Segments newest-first: get candidates by hash, then verify against
-        // latest-wins version (not segment-local) to avoid stale matches when
-        // a newer source has updated the property to a non-matching value.
-        let key_hash = hash_prop_key(prop_key);
-        let value_hash = hash_prop_value(prop_value);
-
-        for seg in &self.segments {
-            for id in seg.find_nodes_by_prop_hash(type_id, key_hash, value_hash)? {
-                if !deleted.contains(&id) && seen.insert(id) {
-                    if let Some(node) = self.get_node_raw(id)? {
-                        if node
-                            .props
-                            .get(prop_key)
-                            .map(|v| v == prop_value)
-                            .unwrap_or(false)
-                        {
-                            results.push(id);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Policy filtering: batch-fetch nodes and exclude matches.
-        let excluded = self.policy_excluded_node_ids(&results)?;
-        if !excluded.is_empty() {
-            results.retain(|id| !excluded.contains(id));
-        }
-
-        Ok(results)
     }
 
     /// Paginated version of `find_nodes`. Returns a page of node IDs matching
@@ -1970,152 +3093,118 @@ impl DatabaseEngine {
         prop_value: &PropValue,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        // Build global deleted set
-        let mut deleted: NodeIdSet = self.memtable.deleted_nodes().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted.extend(epoch.memtable.deleted_nodes().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted.extend(seg.deleted_node_ids());
-        }
-
-        // Collect candidate IDs from sources (sorted within each source)
-        let memtable_ids = self.memtable.find_nodes(type_id, prop_key, prop_value);
-        let key_hash = hash_prop_key(prop_key);
-        let value_hash = hash_prop_value(prop_value);
-        // Immutable memtable find_nodes results go into segment_ids
-        // (prepended before actual segments since they are newer)
-        let mut segment_ids: Vec<Vec<u64>> =
-            Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
-        for epoch in &self.immutable_epochs {
-            segment_ids.push(epoch.memtable.find_nodes(type_id, prop_key, prop_value));
-        }
-        for seg in &self.segments {
-            segment_ids.push(seg.find_nodes_by_prop_hash(type_id, key_hash, value_hash)?);
-        }
-
-        // Reuse the already-computed memtable_ids + immutable find_nodes results
-        // instead of calling find_nodes() a second time on each source.
-        let mut memtable_verified: NodeIdSet = memtable_ids.iter().copied().collect();
-        for ids in &segment_ids[..self.immutable_epochs.len()] {
-            memtable_verified.extend(ids.iter().copied());
-        }
-        let limit = page.limit.unwrap_or(0);
-        if limit == 0 {
-            let all_page = PageRequest {
-                limit: None,
-                after: page.after,
-            };
-            let merged = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &all_page);
-            let mut visible: NodeIdSet =
-                NodeIdSet::with_capacity_and_hasher(merged.items.len(), Default::default());
-            let segment_candidates: Vec<u64> = merged
-                .items
-                .iter()
-                .copied()
-                .filter(|id| !memtable_verified.contains(id))
-                .collect();
-            let batch_results = self.get_nodes_raw(&segment_candidates)?;
-            for id in merged.items.iter().copied() {
-                if memtable_verified.contains(&id) {
-                    visible.insert(id);
-                }
+        let ready_entry =
+            self.node_property_index_entry(type_id, prop_key, &SecondaryIndexKind::Equality);
+        if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
+            if let Some(result) = self.find_nodes_paged_ready_equality_index(
+                type_id,
+                entry.index_id,
+                prop_key,
+                prop_value,
+                page,
+            )? {
+                self.record_equality_index_lookup_route();
+                Ok(result)
+            } else {
+                self.record_equality_scan_fallback_route();
+                self.find_nodes_paged_scan_fallback(type_id, prop_key, prop_value, page)
             }
-            for (id, node) in segment_candidates
-                .into_iter()
-                .zip(batch_results.into_iter())
-            {
-                let keep = node
-                    .as_ref()
-                    .and_then(|n| n.props.get(prop_key))
-                    .map(|v| v == prop_value)
-                    .unwrap_or(false);
-                if keep {
-                    visible.insert(id);
-                }
-            }
-
-            let excluded = self.policy_excluded_node_ids(&merged.items)?;
-            let items = merged
-                .items
-                .into_iter()
-                .filter(|id| visible.contains(id) && !excluded.contains(id))
-                .collect();
-            Ok(PageResult {
-                items,
-                next_cursor: None,
-            })
         } else {
-            let chunk_limit = limit.saturating_mul(4).max(limit);
-            let mut collected = Vec::with_capacity(limit);
-            let mut cursor = page.after;
+            self.record_equality_scan_fallback_route();
+            self.find_nodes_paged_scan_fallback(type_id, prop_key, prop_value, page)
+        }
+    }
 
-            loop {
-                let chunk_page = PageRequest {
-                    limit: Some(chunk_limit),
-                    after: cursor,
+    /// Find node IDs whose property value falls within the given numeric bounds.
+    ///
+    /// Results are ordered by `(property_value asc, node_id asc)`.
+    pub fn find_nodes_range(
+        &self,
+        type_id: u32,
+        prop_key: &str,
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+    ) -> Result<Vec<u64>, EngineError> {
+        Ok(self
+            .find_nodes_range_paged(
+                type_id,
+                prop_key,
+                lower,
+                upper,
+                &PropertyRangePageRequest::default(),
+            )?
+            .items)
+    }
+
+    /// Paginated version of `find_nodes_range`.
+    pub fn find_nodes_range_paged(
+        &self,
+        type_id: u32,
+        prop_key: &str,
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+        page: &PropertyRangePageRequest,
+    ) -> Result<PropertyRangePageResult<u64>, EngineError> {
+        let domain = Self::validate_property_range_bounds(lower, upper, page.after.as_ref())?;
+        let ready_entry = self.node_property_index_entry(
+            type_id,
+            prop_key,
+            &SecondaryIndexKind::Range { domain },
+        );
+        if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
+            if let Some(result) = self.find_nodes_paged_ready_range_index(
+                type_id,
+                entry.index_id,
+                prop_key,
+                domain,
+                lower,
+                upper,
+                page,
+            )? {
+                self.record_range_index_lookup_route();
+                return Ok(result);
+            }
+        }
+
+        self.record_range_scan_fallback_route();
+        match page.limit {
+            Some(limit) if limit > 0 => {
+                let matches = self.collect_property_range_scan_matches(
+                    type_id,
+                    prop_key,
+                    domain,
+                    lower,
+                    upper,
+                    page.after.as_ref(),
+                    Some(limit.saturating_add(1)),
+                )?;
+                let has_more = matches.len() > limit;
+                let selected = &matches[..matches.len().min(limit)];
+                let items = selected.iter().map(|entry| entry.node_id).collect();
+                let next_cursor = if has_more {
+                    selected.last().map(|entry| PropertyRangeCursor {
+                        value: entry.value.clone(),
+                        node_id: entry.node_id,
+                    })
+                } else {
+                    None
                 };
-                let merged = merge_type_ids_paged(
-                    memtable_ids.clone(),
-                    segment_ids.clone(),
-                    &deleted,
-                    &chunk_page,
-                );
-                if merged.items.is_empty() {
-                    return Ok(PageResult {
-                        items: collected,
-                        next_cursor: None,
-                    });
-                }
-
-                let segment_candidates: Vec<u64> = merged
-                    .items
-                    .iter()
-                    .copied()
-                    .filter(|id| !memtable_verified.contains(id))
-                    .collect();
-                let batch_results = self.get_nodes_raw(&segment_candidates)?;
-                let mut visible: NodeIdSet =
-                    NodeIdSet::with_capacity_and_hasher(merged.items.len(), Default::default());
-                for id in merged.items.iter().copied() {
-                    if memtable_verified.contains(&id) {
-                        visible.insert(id);
-                    }
-                }
-                for (id, node) in segment_candidates
-                    .into_iter()
-                    .zip(batch_results.into_iter())
-                {
-                    let keep = node
-                        .as_ref()
-                        .and_then(|n| n.props.get(prop_key))
-                        .map(|v| v == prop_value)
-                        .unwrap_or(false);
-                    if keep {
-                        visible.insert(id);
-                    }
-                }
-
-                let excluded = self.policy_excluded_node_ids(&merged.items)?;
-                for id in merged.items {
-                    if visible.contains(&id) && !excluded.contains(&id) {
-                        collected.push(id);
-                        if collected.len() >= limit {
-                            return Ok(PageResult {
-                                items: collected,
-                                next_cursor: Some(id),
-                            });
-                        }
-                    }
-                    cursor = Some(id);
-                }
-
-                if merged.next_cursor.is_none() {
-                    return Ok(PageResult {
-                        items: collected,
-                        next_cursor: None,
-                    });
-                }
+                Ok(PropertyRangePageResult { items, next_cursor })
+            }
+            _ => {
+                let matches = self.collect_property_range_scan_matches(
+                    type_id,
+                    prop_key,
+                    domain,
+                    lower,
+                    upper,
+                    page.after.as_ref(),
+                    None,
+                )?;
+                Ok(PropertyRangePageResult {
+                    items: matches.into_iter().map(|entry| entry.node_id).collect(),
+                    next_cursor: None,
+                })
             }
         }
     }

@@ -1,5 +1,7 @@
 // Lifecycle tests: open/close, WAL, flush, compaction, restart, group commit, backpressure.
 
+type LegacyNode = (u64, u32, Vec<(String, PropValue)>);
+
 fn traverse_depth_two(
     engine: &DatabaseEngine,
     start: u64,
@@ -26,6 +28,98 @@ fn traverse_depth_two(
         )
         .unwrap()
         .items
+}
+
+fn wait_for_property_index_state(
+    engine: &DatabaseEngine,
+    index_id: u64,
+    expected_state: SecondaryIndexState,
+) -> NodePropertyIndexInfo {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(info) = engine
+            .list_node_property_indexes()
+            .into_iter()
+            .find(|info| info.index_id == index_id)
+        {
+            if info.state == expected_state {
+                return info;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for property index {} to reach {:?}; current indexes: {:?}",
+            index_id,
+            expected_state,
+            engine.list_node_property_indexes()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn install_legacy_property_hash_sidecars(
+    seg_dir: &std::path::Path,
+    nodes: &[LegacyNode],
+) {
+    const LEGACY_NODE_META_ENTRY_SIZE: usize = 60;
+    const LEGACY_PROP_INDEX_ENTRY_SIZE: usize = 32;
+
+    let mut sorted_nodes = nodes.to_vec();
+    sorted_nodes.sort_unstable_by_key(|(node_id, _, _)| *node_id);
+
+    let mut node_meta = std::fs::read(seg_dir.join("node_meta.dat")).unwrap();
+    let node_count = u64::from_le_bytes(node_meta[0..8].try_into().unwrap()) as usize;
+    assert_eq!(node_count, sorted_nodes.len());
+
+    let mut prop_hash_bytes = Vec::new();
+    let mut prop_hash_offset = 0u64;
+    let mut prop_groups: BTreeMap<(u32, u64, u64), Vec<u64>> = BTreeMap::new();
+
+    for (index, (node_id, type_id, props)) in sorted_nodes.iter().enumerate() {
+        let entry_off = 8 + index * LEGACY_NODE_META_ENTRY_SIZE;
+        let prop_hash_count = props.len() as u32;
+        node_meta[entry_off + 38..entry_off + 46].copy_from_slice(&prop_hash_offset.to_le_bytes());
+        node_meta[entry_off + 46..entry_off + 50].copy_from_slice(&prop_hash_count.to_le_bytes());
+
+        for (key, value) in props {
+            let key_hash = hash_prop_key(key);
+            let value_hash = hash_prop_value(value);
+            prop_hash_bytes.extend_from_slice(&key_hash.to_le_bytes());
+            prop_hash_bytes.extend_from_slice(&value_hash.to_le_bytes());
+            prop_groups
+                .entry((*type_id, key_hash, value_hash))
+                .or_default()
+                .push(*node_id);
+            prop_hash_offset += 16;
+        }
+    }
+
+    for ids in prop_groups.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+
+    std::fs::write(seg_dir.join("node_meta.dat"), node_meta).unwrap();
+    std::fs::write(seg_dir.join("node_prop_hashes.dat"), prop_hash_bytes).unwrap();
+
+    let mut prop_index = Vec::new();
+    prop_index.extend_from_slice(&(prop_groups.len() as u64).to_le_bytes());
+    let data_start = 8 + prop_groups.len() as u64 * LEGACY_PROP_INDEX_ENTRY_SIZE as u64;
+    let mut data_offset = data_start;
+    for ((type_id, key_hash, value_hash), ids) in &prop_groups {
+        prop_index.extend_from_slice(&type_id.to_le_bytes());
+        prop_index.extend_from_slice(&key_hash.to_le_bytes());
+        prop_index.extend_from_slice(&value_hash.to_le_bytes());
+        prop_index.extend_from_slice(&data_offset.to_le_bytes());
+        prop_index.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        data_offset += ids.len() as u64 * 8;
+    }
+    for ids in prop_groups.values() {
+        for node_id in ids {
+            prop_index.extend_from_slice(&node_id.to_le_bytes());
+        }
+    }
+    std::fs::write(seg_dir.join("prop_index.dat"), prop_index).unwrap();
 }
 
 // --- Low-level write_op API tests ---
@@ -2698,19 +2792,26 @@ fn assert_segment_common_artifacts_match(left_dir: &std::path::Path, right_dir: 
         "node_type_index.dat",
         "edge_type_index.dat",
         "edge_triple_index.dat",
-        "prop_index.dat",
         "timestamp_index.dat",
         "adj_out.idx",
         "adj_out.dat",
         "adj_in.idx",
         "adj_in.dat",
         "tombstones.dat",
-        "node_prop_hashes.dat",
     ] {
         assert_eq!(
             std::fs::read(left_dir.join(filename)).unwrap(),
             std::fs::read(right_dir.join(filename)).unwrap(),
             "{} mismatch",
+            filename
+        );
+    }
+
+    for filename in ["prop_index.dat", "node_prop_hashes.dat"] {
+        assert_eq!(
+            left_dir.join(filename).exists(),
+            right_dir.join(filename).exists(),
+            "{} presence mismatch",
             filename
         );
     }
@@ -2732,6 +2833,38 @@ fn assert_segment_common_artifacts_match(left_dir: &std::path::Path, right_dir: 
                 std::fs::read(right_dir.join(filename)).unwrap(),
                 "{} mismatch",
                 filename
+            );
+        }
+    }
+
+    let left_secondary = left_dir.join(crate::segment_writer::SECONDARY_INDEX_DIRNAME);
+    let right_secondary = right_dir.join(crate::segment_writer::SECONDARY_INDEX_DIRNAME);
+    assert_eq!(
+        left_secondary.exists(),
+        right_secondary.exists(),
+        "secondary index directory presence mismatch"
+    );
+    if left_secondary.exists() {
+        let mut left_entries: Vec<_> = std::fs::read_dir(&left_secondary)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let mut right_entries: Vec<_> = std::fs::read_dir(&right_secondary)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        left_entries.sort_unstable();
+        right_entries.sort_unstable();
+        assert_eq!(
+            left_entries, right_entries,
+            "secondary index file set mismatch"
+        );
+        for name in left_entries {
+            assert_eq!(
+                std::fs::read(left_secondary.join(&name)).unwrap(),
+                std::fs::read(right_secondary.join(&name)).unwrap(),
+                "secondary index file {:?} mismatch",
+                name
             );
         }
     }
@@ -11691,4 +11824,1717 @@ fn test_async_flush_latency_profile() {
             0.0
         }
     );
+}
+
+#[test]
+fn test_property_index_manifest_reopens_and_reseeds_active_memtable() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let index_id;
+
+    {
+        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        index_id = db
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap()
+            .index_id;
+        db.close().unwrap();
+    }
+
+    {
+        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let indexes = db.list_node_property_indexes();
+        assert_eq!(indexes.len(), 1);
+        let info = wait_for_property_index_state(&db, index_id, SecondaryIndexState::Ready);
+        assert_eq!(info.index_id, index_id);
+        assert!(db
+            .active_memtable()
+            .secondary_index_declarations()
+            .contains_key(&index_id));
+
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String("red".to_string()));
+        let node_id = db
+            .upsert_node(
+                1,
+                "a",
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let status_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let eq_ids = db
+            .active_memtable()
+            .secondary_eq_state()
+            .get(&index_id)
+            .unwrap()
+            .get(&status_hash)
+            .unwrap();
+        assert!(eq_ids.contains(&node_id));
+
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn test_ensure_property_index_while_flush_in_flight_preserves_manifest_and_seeding() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        memtable_flush_threshold: 0,
+        compact_after_n_flushes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert(
+        "status".to_string(),
+        PropValue::String("active".to_string()),
+    );
+    let node_id = db
+        .upsert_node(
+            1,
+            "frozen",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.freeze_memtable().unwrap();
+
+    let (ready_rx, release_tx) = db.set_flush_pause();
+    db.enqueue_one_flush().unwrap();
+    ready_rx.recv().unwrap();
+
+    let info = db
+        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Building);
+    let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
+    let frozen_eq_ids = db
+        .immutable_memtable(0)
+        .secondary_eq_state()
+        .get(&info.index_id)
+        .unwrap()
+        .get(&status_hash)
+        .unwrap();
+    assert!(frozen_eq_ids.contains(&node_id));
+    assert_eq!(db.manifest().secondary_indexes.len(), 1);
+
+    release_tx.send(()).unwrap();
+    assert!(db.wait_one_flush().unwrap().is_some());
+    let ready = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert_eq!(ready.index_id, info.index_id);
+    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    assert!(crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id).exists());
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+            .unwrap(),
+        vec![node_id]
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+    db.close().unwrap();
+
+    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let ready = wait_for_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
+    assert_eq!(ready.index_id, info.index_id);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_ready_property_index_downgrades_when_flush_publish_missed_declaration_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        memtable_flush_threshold: 0,
+        compact_after_n_flushes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert(
+        "status".to_string(),
+        PropValue::String("active".to_string()),
+    );
+    let node_id = db
+        .upsert_node(
+            1,
+            "frozen",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.freeze_memtable().unwrap();
+
+    let (publish_ready_rx, publish_release_tx) = db.set_flush_publish_pause();
+    db.enqueue_one_flush().unwrap();
+    publish_ready_rx.recv().unwrap();
+
+    let info = db
+        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let (repair_ready_rx, repair_release_tx) = db.set_secondary_index_build_pause();
+    publish_release_tx.send(()).unwrap();
+    assert!(db.wait_one_flush().unwrap().is_some());
+    repair_ready_rx.recv().unwrap();
+
+    let building = db
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(building.state, SecondaryIndexState::Building);
+
+    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(!sidecar_path.exists());
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+            .unwrap(),
+        vec![node_id]
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 1);
+    assert_eq!(routes.equality_index_lookup, 0);
+
+    repair_release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+            .unwrap(),
+        vec![node_id]
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        memtable_flush_threshold: 0,
+        compact_after_n_flushes: 1,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    let active = PropValue::String("active".to_string());
+    let (compact_ready_rx, compact_release_tx) = db.set_bg_compact_pause();
+    let mut first_props = BTreeMap::new();
+    first_props.insert("status".to_string(), active.clone());
+    let node_a = db
+        .upsert_node(
+            1,
+            "seg_a",
+            UpsertNodeOptions {
+                props: first_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let mut second_props = BTreeMap::new();
+    second_props.insert("status".to_string(), active.clone());
+    let node_b = db
+        .upsert_node(
+            1,
+            "seg_b",
+            UpsertNodeOptions {
+                props: second_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+    compact_ready_rx.recv().unwrap();
+    assert_eq!(db.segment_count(), 2);
+
+    let expected_ids = vec![node_a, node_b];
+
+    let info = db
+        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let (repair_ready_rx, repair_release_tx) = db.set_secondary_index_build_pause();
+    compact_release_tx.send(()).unwrap();
+    assert!(db.wait_for_bg_compaction().is_some());
+    repair_ready_rx.recv().unwrap();
+
+    let building = db
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(building.state, SecondaryIndexState::Building);
+    assert_eq!(db.segment_count(), 1);
+
+    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(!sidecar_path.exists());
+
+    db.reset_property_query_routes();
+    let mut results = db
+        .find_nodes(1, "status", &PropValue::String("active".to_string()))
+        .unwrap();
+    results.sort_unstable();
+    assert_eq!(results, expected_ids);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 1);
+    assert_eq!(routes.equality_index_lookup, 0);
+
+    repair_release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+            .unwrap(),
+        expected_ids
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+
+    {
+        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let mut color_props = BTreeMap::new();
+        color_props.insert("color".to_string(), PropValue::String("red".to_string()));
+        let color_id = db
+            .upsert_node(
+                1,
+                "color",
+                UpsertNodeOptions {
+                    props: color_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut score_props = BTreeMap::new();
+        score_props.insert("score".to_string(), PropValue::Int(10));
+        let score_id = db
+            .upsert_node(
+                1,
+                "score",
+                UpsertNodeOptions {
+                    props: score_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let eq = db
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        let range = db
+            .ensure_node_property_index(
+                1,
+                "score",
+                SecondaryIndexKind::Range {
+                    domain: SecondaryIndexRangeDomain::Int,
+                },
+            )
+            .unwrap();
+        db.with_runtime_manifest_write(|manifest| {
+            for entry in &mut manifest.secondary_indexes {
+                if entry.index_id == eq.index_id {
+                    entry.state = SecondaryIndexState::Failed;
+                    entry.last_error = Some("eq failed".to_string());
+                } else if entry.index_id == range.index_id {
+                    entry.state = SecondaryIndexState::Failed;
+                    entry.last_error = Some("range failed".to_string());
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        db.rebuild_secondary_index_catalog().unwrap();
+
+        assert_eq!(
+            db.find_nodes(1, "color", &PropValue::String("red".to_string()))
+                .unwrap(),
+            vec![color_id]
+        );
+        assert_eq!(
+            db.find_nodes_range(
+                1,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            )
+            .unwrap(),
+            vec![score_id]
+        );
+
+        db.close().unwrap();
+    }
+
+    {
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let indexes = db.list_node_property_indexes();
+        assert_eq!(indexes.len(), 2);
+        assert!(
+            indexes
+                .iter()
+                .all(|info| info.state == SecondaryIndexState::Failed),
+            "{indexes:?}"
+        );
+        assert!(indexes
+            .iter()
+            .any(|info| info.last_error.as_deref() == Some("eq failed")));
+        assert!(indexes
+            .iter()
+            .any(|info| info.last_error.as_deref() == Some("range failed")));
+
+        db.reset_property_query_routes();
+        assert_eq!(
+            db.find_nodes(1, "color", &PropValue::String("red".to_string()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.find_nodes_range(
+                1,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let routes = db.property_query_route_snapshot();
+        assert_eq!(routes.equality_scan_fallback, 1);
+        assert_eq!(routes.range_scan_fallback, 1);
+        assert_eq!(routes.equality_index_lookup, 0);
+        assert_eq!(routes.range_index_lookup, 0);
+
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn test_zero_declaration_flush_and_compaction_skip_equality_artifacts() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    for key in ["a", "b"] {
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String("red".to_string()));
+        db.upsert_node(
+            1,
+            key,
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    db.flush().unwrap();
+    let first_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    assert!(!first_seg_dir.join("prop_index.dat").exists());
+    assert!(!first_seg_dir.join("node_prop_hashes.dat").exists());
+    assert!(!first_seg_dir
+        .join(crate::segment_writer::SECONDARY_INDEX_DIRNAME)
+        .exists());
+
+    for key in ["c", "d"] {
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String("blue".to_string()));
+        db.upsert_node(
+            1,
+            key,
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    db.flush().unwrap();
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    assert!(!compacted_seg_dir.join("prop_index.dat").exists());
+    assert!(!compacted_seg_dir.join("node_prop_hashes.dat").exists());
+    assert!(!compacted_seg_dir
+        .join(crate::segment_writer::SECONDARY_INDEX_DIRNAME)
+        .exists());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_equality_index_backfills_existing_segments_and_compaction_preserves_sidecars() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let red = PropValue::String("red".to_string());
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let first_id = db
+        .upsert_node(
+            1,
+            "first",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let first_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let first_sidecar =
+        crate::segment_writer::node_prop_eq_sidecar_path(&first_seg_dir, info.index_id);
+    assert!(first_sidecar.exists());
+
+    let second_id = db
+        .upsert_node(
+            1,
+            "second",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+    for segment in &db.segments {
+        let seg_dir = segment_dir(&db_path, segment.segment_id);
+        let sidecar_path =
+            crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+        assert!(sidecar_path.exists());
+    }
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let compacted_sidecar =
+        crate::segment_writer::node_prop_eq_sidecar_path(&compacted_seg_dir, info.index_id);
+    assert!(compacted_sidecar.exists());
+    assert!(!compacted_seg_dir.join("prop_index.dat").exists());
+    assert!(!compacted_seg_dir.join("node_prop_hashes.dat").exists());
+
+    db.reset_property_query_routes();
+    let mut ids = db.find_nodes(1, "color", &red).unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![first_id, second_id]);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_missing_equality_sidecar_reopens_and_repairs_to_ready() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let index_id;
+    let seg_id;
+
+    {
+        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), red.clone());
+        db.upsert_node(
+            1,
+            "repair-me",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.flush().unwrap();
+
+        let info = db
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+        index_id = info.index_id;
+        seg_id = db.segments[0].segment_id;
+        db.close().unwrap();
+    }
+
+    let seg_dir = segment_dir(&db_path, seg_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, index_id);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    assert!(!sidecar_path.exists());
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+    assert_eq!(
+        reopened
+            .find_nodes(1, "color", &PropValue::String("red".to_string()))
+            .unwrap()
+            .len(),
+        1
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_corrupt_equality_sidecar_reopens_failed_and_queries_fallback() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let index_id;
+    let seg_id;
+    let red = PropValue::String("red".to_string());
+
+    {
+        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), red.clone());
+        let node_id = db
+            .upsert_node(
+                1,
+                "broken",
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        db.flush().unwrap();
+
+        let info = db
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+        index_id = info.index_id;
+        seg_id = db.segments[0].segment_id;
+        assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+        db.close().unwrap();
+    }
+
+    let seg_dir = segment_dir(&db_path, seg_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, index_id);
+    std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let info = reopened
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|info| info.index_id == index_id)
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Failed);
+    assert!(info.last_error.is_some());
+
+    reopened.reset_property_query_routes();
+    assert_eq!(reopened.find_nodes(1, "color", &red).unwrap().len(), 1);
+    let routes = reopened.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 1);
+    assert_eq!(routes.equality_index_lookup, 0);
+
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let blue = PropValue::String("blue".to_string());
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let node_id = db
+        .upsert_node(
+            1,
+            "repair-live",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    assert!(!sidecar_path.exists());
+
+    let mut unrelated_props = BTreeMap::new();
+    unrelated_props.insert("color".to_string(), blue.clone());
+    let unrelated_id = db
+        .upsert_node(
+            1,
+            "live-counter-node",
+            UpsertNodeOptions {
+                props: unrelated_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.upsert_edge(
+        node_id,
+        unrelated_id,
+        7,
+        UpsertEdgeOptions {
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected_after_degrade = (
+        db.next_node_id(),
+        db.next_edge_id(),
+        db.engine_seq_for_test(),
+    );
+
+    let (repair_ready_rx, repair_release_tx) = db.set_secondary_index_build_pause();
+    db.reset_property_query_routes();
+    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    repair_ready_rx.recv().unwrap();
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 1);
+    assert_eq!(routes.equality_index_lookup, 0);
+
+    let manifest_after_degrade = crate::manifest::load_manifest_readonly(&db_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manifest_after_degrade.next_node_id,
+        expected_after_degrade.0
+    );
+    assert_eq!(
+        manifest_after_degrade.next_edge_id,
+        expected_after_degrade.1
+    );
+    assert_eq!(
+        manifest_after_degrade.next_engine_seq,
+        expected_after_degrade.2
+    );
+
+    let mut later_props = BTreeMap::new();
+    later_props.insert("color".to_string(), blue);
+    let later_id = db
+        .upsert_node(
+            1,
+            "repair-counter-node",
+            UpsertNodeOptions {
+                props: later_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.upsert_edge(
+        node_id,
+        later_id,
+        8,
+        UpsertEdgeOptions {
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected_after_repair = (
+        db.next_node_id(),
+        db.next_edge_id(),
+        db.engine_seq_for_test(),
+    );
+
+    repair_release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+
+    let manifest_after_repair = crate::manifest::load_manifest_readonly(&db_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest_after_repair.next_node_id, expected_after_repair.0);
+    assert_eq!(manifest_after_repair.next_edge_id, expected_after_repair.1);
+    assert_eq!(
+        manifest_after_repair.next_engine_seq,
+        expected_after_repair.2
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_corrupt_equality_sidecar_while_open_queries_fallback_and_marks_failed() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let node_id = db
+        .upsert_node(
+            1,
+            "fail-live",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
+
+    db.reset_property_query_routes();
+    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 1);
+    assert_eq!(routes.equality_index_lookup, 0);
+
+    let failed = db
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(failed.state, SecondaryIndexState::Failed);
+    assert!(failed.last_error.is_some());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_compaction_with_corrupt_ready_sidecar_succeeds_and_marks_failed() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let first_id = db
+        .upsert_node(
+            1,
+            "first",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let second_id = db
+        .upsert_node(
+            1,
+            "second",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+
+    let failed = db
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(failed.state, SecondaryIndexState::Failed);
+    assert!(failed.last_error.is_some());
+
+    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let compacted_sidecar =
+        crate::segment_writer::node_prop_eq_sidecar_path(&compacted_seg_dir, info.index_id);
+    assert!(compacted_sidecar.exists());
+
+    db.reset_property_query_routes();
+    let mut ids = db.find_nodes(1, "color", &red).unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![first_id, second_id]);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 1);
+    assert_eq!(routes.equality_index_lookup, 0);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_legacy_property_hash_backfill_and_compaction_parity() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let first_id = db
+        .upsert_node(
+            1,
+            "legacy-first",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let first_seg_id = db.segments[0].segment_id;
+    db.close().unwrap();
+
+    let first_seg_dir = segment_dir(&db_path, first_seg_id);
+    install_legacy_property_hash_sidecars(
+        &first_seg_dir,
+        &[(first_id, 1, vec![("color".to_string(), red.clone())])],
+    );
+    assert!(first_seg_dir.join("prop_index.dat").exists());
+    assert!(first_seg_dir.join("node_prop_hashes.dat").exists());
+
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    let first_sidecar =
+        crate::segment_writer::node_prop_eq_sidecar_path(&first_seg_dir, info.index_id);
+    assert!(first_sidecar.exists());
+
+    let second_id = db
+        .upsert_node(
+            1,
+            "legacy-second",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let compacted_sidecar =
+        crate::segment_writer::node_prop_eq_sidecar_path(&compacted_seg_dir, info.index_id);
+    assert!(compacted_sidecar.exists());
+
+    db.reset_property_query_routes();
+    let mut ids = db.find_nodes(1, "color", &red).unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![first_id, second_id]);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_equality_backfill_survives_compaction_during_build() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    for key in ["first", "second"] {
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), red.clone());
+        db.upsert_node(
+            1,
+            key,
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.flush().unwrap();
+    }
+
+    let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+
+    release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    db.reset_property_query_routes();
+    assert_eq!(db.find_nodes(1, "color", &red).unwrap().len(), 2);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        memtable_flush_threshold: 0,
+        compact_after_n_flushes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("score".to_string(), PropValue::Int(10));
+    let node_id = db
+        .upsert_node(
+            1,
+            "frozen-range",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.freeze_memtable().unwrap();
+
+    let (ready_rx, release_tx) = db.set_flush_pause();
+    db.enqueue_one_flush().unwrap();
+    ready_rx.recv().unwrap();
+
+    let info = db
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Building);
+    let frozen_range = db
+        .immutable_memtable(0)
+        .secondary_range_state()
+        .get(&info.index_id)
+        .unwrap();
+    assert!(frozen_range.contains(&(10u64 ^ (1u64 << 63), node_id)));
+
+    release_tx.send(()).unwrap();
+    assert!(db.wait_one_flush().unwrap().is_some());
+    let ready = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert_eq!(ready.index_id, info.index_id);
+    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    assert!(crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id).exists());
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap(),
+        vec![node_id]
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 1);
+    db.close().unwrap();
+
+    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let ready = wait_for_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
+    assert_eq!(ready.index_id, info.index_id);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_ready_property_range_index_downgrades_when_flush_publish_missed_declaration_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        memtable_flush_threshold: 0,
+        compact_after_n_flushes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("score".to_string(), PropValue::Int(10));
+    let node_id = db
+        .upsert_node(
+            1,
+            "frozen-range",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.freeze_memtable().unwrap();
+
+    let (publish_ready_rx, publish_release_tx) = db.set_flush_publish_pause();
+    db.enqueue_one_flush().unwrap();
+    publish_ready_rx.recv().unwrap();
+
+    let info = db
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let (repair_ready_rx, repair_release_tx) = db.set_secondary_index_build_pause();
+    publish_release_tx.send(()).unwrap();
+    assert!(db.wait_one_flush().unwrap().is_some());
+    repair_ready_rx.recv().unwrap();
+
+    let building = db
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(building.state, SecondaryIndexState::Building);
+
+    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    let sidecar_path =
+        crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
+    assert!(!sidecar_path.exists());
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap(),
+        vec![node_id]
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 1);
+    assert_eq!(routes.range_index_lookup, 0);
+
+    repair_release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap(),
+        vec![node_id]
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_missing_range_sidecar_reopens_and_repairs_to_ready() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let index_id;
+    let seg_id;
+
+    {
+        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::Int(10));
+        db.upsert_node(
+            1,
+            "repair-me-range",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.flush().unwrap();
+
+        let info = db
+            .ensure_node_property_index(
+                1,
+                "score",
+                SecondaryIndexKind::Range {
+                    domain: SecondaryIndexRangeDomain::Int,
+                },
+            )
+            .unwrap();
+        wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+        index_id = info.index_id;
+        seg_id = db.segments[0].segment_id;
+        db.close().unwrap();
+    }
+
+    let seg_dir = segment_dir(&db_path, seg_id);
+    let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, index_id);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    assert!(!sidecar_path.exists());
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+    assert_eq!(
+        reopened
+            .find_nodes_range(
+                1,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let index_id;
+    let seg_id;
+
+    {
+        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::Int(10));
+        let node_id = db
+            .upsert_node(
+                1,
+                "broken-range",
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        db.flush().unwrap();
+
+        let info = db
+            .ensure_node_property_index(
+                1,
+                "score",
+                SecondaryIndexKind::Range {
+                    domain: SecondaryIndexRangeDomain::Int,
+                },
+            )
+            .unwrap();
+        wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+        index_id = info.index_id;
+        seg_id = db.segments[0].segment_id;
+        assert_eq!(
+            db.find_nodes_range(
+                1,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            )
+            .unwrap(),
+            vec![node_id]
+        );
+        db.close().unwrap();
+    }
+
+    let seg_dir = segment_dir(&db_path, seg_id);
+    let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, index_id);
+    std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let info = reopened
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|info| info.index_id == index_id)
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Failed);
+    assert!(info.last_error.is_some());
+
+    reopened.reset_property_query_routes();
+    assert_eq!(
+        reopened
+            .find_nodes_range(
+                1,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    let routes = reopened.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 1);
+    assert_eq!(routes.range_index_lookup, 0);
+
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("score".to_string(), PropValue::Int(10));
+    let node_id = db
+        .upsert_node(
+            1,
+            "repair-live-range",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    assert!(!sidecar_path.exists());
+
+    let unrelated_id = db
+        .upsert_node(
+            1,
+            "live-counter-range",
+            UpsertNodeOptions {
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.upsert_edge(
+        node_id,
+        unrelated_id,
+        7,
+        UpsertEdgeOptions {
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected_after_degrade = (
+        db.next_node_id(),
+        db.next_edge_id(),
+        db.engine_seq_for_test(),
+    );
+
+    let (repair_ready_rx, repair_release_tx) = db.set_secondary_index_build_pause();
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap(),
+        vec![node_id]
+    );
+    repair_ready_rx.recv().unwrap();
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 1);
+    assert_eq!(routes.range_index_lookup, 0);
+
+    let manifest_after_degrade = crate::manifest::load_manifest_readonly(&db_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest_after_degrade.next_node_id, expected_after_degrade.0);
+    assert_eq!(manifest_after_degrade.next_edge_id, expected_after_degrade.1);
+    assert_eq!(manifest_after_degrade.next_engine_seq, expected_after_degrade.2);
+
+    let later_id = db
+        .upsert_node(
+            1,
+            "repair-counter-range",
+            UpsertNodeOptions {
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.upsert_edge(
+        node_id,
+        later_id,
+        8,
+        UpsertEdgeOptions {
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected_after_repair = (
+        db.next_node_id(),
+        db.next_edge_id(),
+        db.engine_seq_for_test(),
+    );
+
+    repair_release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+
+    let manifest_after_repair = crate::manifest::load_manifest_readonly(&db_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest_after_repair.next_node_id, expected_after_repair.0);
+    assert_eq!(manifest_after_repair.next_edge_id, expected_after_repair.1);
+    assert_eq!(manifest_after_repair.next_engine_seq, expected_after_repair.2);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("score".to_string(), PropValue::Int(10));
+    let node_id = db
+        .upsert_node(
+            1,
+            "corrupt-live-range",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
+    std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
+
+    let unrelated_id = db
+        .upsert_node(
+            1,
+            "failed-counter-range",
+            UpsertNodeOptions {
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.upsert_edge(
+        node_id,
+        unrelated_id,
+        9,
+        UpsertEdgeOptions {
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected_after_degrade = (
+        db.next_node_id(),
+        db.next_edge_id(),
+        db.engine_seq_for_test(),
+    );
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap(),
+        vec![node_id]
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 1);
+    assert_eq!(routes.range_index_lookup, 0);
+
+    let failed = db
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(failed.state, SecondaryIndexState::Failed);
+    assert!(failed.last_error.is_some());
+
+    let manifest_after_degrade = crate::manifest::load_manifest_readonly(&db_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest_after_degrade.next_node_id, expected_after_degrade.0);
+    assert_eq!(manifest_after_degrade.next_edge_id, expected_after_degrade.1);
+    assert_eq!(manifest_after_degrade.next_engine_seq, expected_after_degrade.2);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("score".to_string(), PropValue::Int(10));
+    let first_id = db
+        .upsert_node(
+            1,
+            "first-range",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let second_id = db
+        .upsert_node(
+            1,
+            "second-range",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
+    std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+
+    let failed = db
+        .list_node_property_indexes()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(failed.state, SecondaryIndexState::Failed);
+    assert!(failed.last_error.is_some());
+
+    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let compacted_sidecar =
+        crate::segment_writer::node_prop_range_sidecar_path(&compacted_seg_dir, info.index_id);
+    assert!(compacted_sidecar.exists());
+
+    db.reset_property_query_routes();
+    let mut ids = db
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![first_id, second_id]);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 1);
+    assert_eq!(routes.range_index_lookup, 0);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_range_backfill_survives_compaction_during_build() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    for key in ["first-range", "second-range"] {
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::Int(10));
+        db.upsert_node(
+            1,
+            key,
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.flush().unwrap();
+    }
+
+    let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
+    let info = db
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+
+    release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_open_rejects_conflicting_range_declarations_for_same_property() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    let mut manifest = crate::manifest::default_manifest();
+    manifest.secondary_indexes = vec![
+        SecondaryIndexManifestEntry {
+            index_id: 1,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        },
+        SecondaryIndexManifestEntry {
+            index_id: 2,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Float,
+            },
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        },
+    ];
+    manifest.next_secondary_index_id = 3;
+    crate::manifest::write_manifest(&db_path, &manifest).unwrap();
+
+    match DatabaseEngine::open(&db_path, &DbOptions::default()) {
+        Err(EngineError::ManifestError(_)) => {}
+        Err(other) => panic!("expected ManifestError, got {}", other),
+        Ok(_) => panic!("expected conflicting range declarations to fail on open"),
+    }
 }

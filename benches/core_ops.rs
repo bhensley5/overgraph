@@ -1,12 +1,13 @@
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use overgraph::{
     AllShortestPathsOptions, DatabaseEngine, DbOptions, DegreeOptions, Direction, EdgeInput,
     ExportOptions, IsConnectedOptions, NeighborOptions, NodeInput, PageRequest, PprAlgorithm,
-    PprOptions, PropValue, PrunePolicy, ShortestPathOptions, TopKOptions, TraverseOptions,
-    UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
+    PprOptions, PropValue, PropertyRangeBound, PrunePolicy, SecondaryIndexKind,
+    SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPathOptions, TopKOptions,
+    TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
 };
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temp_db() -> (tempfile::TempDir, DatabaseEngine) {
     let dir = tempfile::tempdir().unwrap();
@@ -423,8 +424,35 @@ fn bench_find_nodes(c: &mut Criterion) {
         });
     });
 
+    c.bench_function("find_nodes_1000_declared", |b| {
+        let (_dir, mut engine) = temp_db();
+        let eq = engine
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        wait_for_property_index_state(&engine, eq.index_id, SecondaryIndexState::Ready);
+        build_find_graph(&mut engine);
+        let val = PropValue::String("red".to_string());
+        b.iter(|| {
+            engine.find_nodes(1, "color", &val).unwrap();
+        });
+    });
+
     c.bench_function("find_nodes_1000_segment", |b| {
         let (_dir, mut engine) = temp_db();
+        build_find_graph(&mut engine);
+        engine.flush().unwrap();
+        let val = PropValue::String("red".to_string());
+        b.iter(|| {
+            engine.find_nodes(1, "color", &val).unwrap();
+        });
+    });
+
+    c.bench_function("find_nodes_1000_segment_declared", |b| {
+        let (_dir, mut engine) = temp_db();
+        let eq = engine
+            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        wait_for_property_index_state(&engine, eq.index_id, SecondaryIndexState::Ready);
         build_find_graph(&mut engine);
         engine.flush().unwrap();
         let val = PropValue::String("red".to_string());
@@ -515,6 +543,307 @@ fn make_bench_props(i: u64) -> BTreeMap<String, PropValue> {
         PropValue::String(format!("conversation_{}", i / 100)),
     );
     props
+}
+
+const PROPERTY_EQ_DECLARED_KEY: &str = "status";
+const PROPERTY_EQ_FALLBACK_KEY: &str = "region";
+const PROPERTY_RANGE_DECLARED_KEY: &str = "score";
+const PROPERTY_RANGE_FALLBACK_KEY: &str = "priority";
+const PROPERTY_EQ_DECLARED_MATCH: &str = "active";
+const PROPERTY_EQ_FALLBACK_MATCH: &str = "region_03";
+const PROPERTY_QUERY_NODE_COUNT: usize = 20_000;
+const PROPERTY_FLUSH_NODE_COUNT: usize = 5_000;
+const PROPERTY_COMPACTION_SEGMENTS: u64 = 4;
+const PROPERTY_COMPACTION_NODES_PER_SEGMENT: u64 = 2_500;
+
+fn wait_for_property_index_state(
+    engine: &DatabaseEngine,
+    index_id: u64,
+    expected_state: SecondaryIndexState,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if engine
+            .list_node_property_indexes()
+            .into_iter()
+            .any(|info| info.index_id == index_id && info.state == expected_state)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for property index {} to reach {:?}; current indexes: {:?}",
+            index_id,
+            expected_state,
+            engine.list_node_property_indexes()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn ensure_property_query_declarations(engine: &mut DatabaseEngine) {
+    let eq = engine
+        .ensure_node_property_index(1, PROPERTY_EQ_DECLARED_KEY, SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(engine, eq.index_id, SecondaryIndexState::Ready);
+
+    let range = engine
+        .ensure_node_property_index(
+            1,
+            PROPERTY_RANGE_DECLARED_KEY,
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(engine, range.index_id, SecondaryIndexState::Ready);
+}
+
+fn make_property_index_bench_props(i: u64) -> BTreeMap<String, PropValue> {
+    let mut props = make_bench_props(i);
+    let status = if i.is_multiple_of(20) {
+        PROPERTY_EQ_DECLARED_MATCH
+    } else {
+        "inactive"
+    };
+    props.insert(
+        PROPERTY_EQ_DECLARED_KEY.to_string(),
+        PropValue::String(status.to_string()),
+    );
+    props.insert(
+        PROPERTY_EQ_FALLBACK_KEY.to_string(),
+        PropValue::String(format!("region_{:02}", i % 16)),
+    );
+    props.insert(
+        PROPERTY_RANGE_DECLARED_KEY.to_string(),
+        PropValue::Int((i % 1000) as i64),
+    );
+    props.insert(
+        PROPERTY_RANGE_FALLBACK_KEY.to_string(),
+        PropValue::Int(((i * 7) % 1000) as i64),
+    );
+    props
+}
+
+fn make_property_query_nodes(prefix: &str, start: u64, count: usize) -> Vec<NodeInput> {
+    (0..count as u64)
+        .map(|offset| {
+            let i = start + offset;
+            NodeInput {
+                type_id: 1,
+                key: format!("{}_{}", prefix, i),
+                props: make_property_index_bench_props(i),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            }
+        })
+        .collect()
+}
+
+fn property_bench_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        edge_uniqueness: true,
+        compact_after_n_flushes: 0,
+        ..DbOptions::default()
+    };
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    (dir, engine)
+}
+
+fn build_property_query_engine() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, mut engine) = property_bench_db();
+    ensure_property_query_declarations(&mut engine);
+    let nodes = make_property_query_nodes("query", 0, PROPERTY_QUERY_NODE_COUNT);
+    engine.batch_upsert_nodes(&nodes).unwrap();
+    engine.flush().unwrap();
+    (dir, engine)
+}
+
+fn build_property_flush_engine(with_declarations: bool) -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, mut engine) = property_bench_db();
+    if with_declarations {
+        ensure_property_query_declarations(&mut engine);
+    }
+    let nodes = make_property_query_nodes("flush", 0, PROPERTY_FLUSH_NODE_COUNT);
+    engine.batch_upsert_nodes(&nodes).unwrap();
+    (dir, engine)
+}
+
+fn build_property_compaction_engine(
+    with_declarations: bool,
+) -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, mut engine) = property_bench_db();
+    if with_declarations {
+        ensure_property_query_declarations(&mut engine);
+    }
+    for segment in 0..PROPERTY_COMPACTION_SEGMENTS {
+        let start = segment * PROPERTY_COMPACTION_NODES_PER_SEGMENT;
+        let nodes = make_property_query_nodes(
+            &format!("seg{}", segment),
+            start,
+            PROPERTY_COMPACTION_NODES_PER_SEGMENT as usize,
+        );
+        engine.batch_upsert_nodes(&nodes).unwrap();
+        engine.flush().unwrap();
+    }
+    (dir, engine)
+}
+
+fn bench_property_indexes(c: &mut Criterion) {
+    let declared_eq_value = PropValue::String(PROPERTY_EQ_DECLARED_MATCH.to_string());
+    let fallback_eq_value = PropValue::String(PROPERTY_EQ_FALLBACK_MATCH.to_string());
+    let declared_range_lower = PropertyRangeBound::Included(PropValue::Int(200));
+    let declared_range_upper = PropertyRangeBound::Included(PropValue::Int(299));
+    let fallback_range_lower = PropertyRangeBound::Included(PropValue::Int(400));
+    let fallback_range_upper = PropertyRangeBound::Included(PropValue::Int(499));
+
+    let mut query_group = c.benchmark_group("property_index_queries");
+    query_group.sample_size(20);
+
+    query_group.bench_function("equality_declared", |b| {
+        let (_dir, engine) = build_property_query_engine();
+        b.iter(|| {
+            black_box(
+                engine
+                    .find_nodes(1, PROPERTY_EQ_DECLARED_KEY, &declared_eq_value)
+                    .unwrap(),
+            );
+        });
+    });
+
+    query_group.bench_function("equality_fallback_scan", |b| {
+        let (_dir, engine) = build_property_query_engine();
+        b.iter(|| {
+            black_box(
+                engine
+                    .find_nodes(1, PROPERTY_EQ_FALLBACK_KEY, &fallback_eq_value)
+                    .unwrap(),
+            );
+        });
+    });
+
+    query_group.bench_function("range_declared", |b| {
+        let (_dir, engine) = build_property_query_engine();
+        b.iter(|| {
+            black_box(
+                engine
+                    .find_nodes_range(
+                        1,
+                        PROPERTY_RANGE_DECLARED_KEY,
+                        Some(&declared_range_lower),
+                        Some(&declared_range_upper),
+                    )
+                    .unwrap(),
+            );
+        });
+    });
+
+    query_group.bench_function("range_fallback_scan", |b| {
+        let (_dir, engine) = build_property_query_engine();
+        b.iter(|| {
+            black_box(
+                engine
+                    .find_nodes_range(
+                        1,
+                        PROPERTY_RANGE_FALLBACK_KEY,
+                        Some(&fallback_range_lower),
+                        Some(&fallback_range_upper),
+                    )
+                    .unwrap(),
+            );
+        });
+    });
+
+    query_group.bench_function("mixed_declared_and_fallback", |b| {
+        let (_dir, engine) = build_property_query_engine();
+        b.iter(|| {
+            black_box(
+                engine
+                    .find_nodes(1, PROPERTY_EQ_DECLARED_KEY, &declared_eq_value)
+                    .unwrap(),
+            );
+            black_box(
+                engine
+                    .find_nodes(1, PROPERTY_EQ_FALLBACK_KEY, &fallback_eq_value)
+                    .unwrap(),
+            );
+            black_box(
+                engine
+                    .find_nodes_range(
+                        1,
+                        PROPERTY_RANGE_DECLARED_KEY,
+                        Some(&declared_range_lower),
+                        Some(&declared_range_upper),
+                    )
+                    .unwrap(),
+            );
+            black_box(
+                engine
+                    .find_nodes_range(
+                        1,
+                        PROPERTY_RANGE_FALLBACK_KEY,
+                        Some(&fallback_range_lower),
+                        Some(&fallback_range_upper),
+                    )
+                    .unwrap(),
+            );
+        });
+    });
+
+    query_group.finish();
+
+    let mut flush_group = c.benchmark_group("property_index_flush");
+    flush_group.sample_size(10);
+
+    flush_group.bench_function("zero_declarations", |b| {
+        b.iter_batched(
+            || build_property_flush_engine(false),
+            |(_dir, mut engine)| {
+                engine.flush().unwrap();
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    flush_group.bench_function("equality_and_range_declarations", |b| {
+        b.iter_batched(
+            || build_property_flush_engine(true),
+            |(_dir, mut engine)| {
+                engine.flush().unwrap();
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    flush_group.finish();
+
+    let mut compact_group = c.benchmark_group("property_index_compact");
+    compact_group.sample_size(10);
+
+    compact_group.bench_function("zero_declarations", |b| {
+        b.iter_batched(
+            || build_property_compaction_engine(false),
+            |(_dir, mut engine)| {
+                black_box(engine.compact().unwrap());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    compact_group.bench_function("equality_and_range_declarations", |b| {
+        b.iter_batched(
+            || build_property_compaction_engine(true),
+            |(_dir, mut engine)| {
+                black_box(engine.compact().unwrap());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    compact_group.finish();
 }
 
 fn bench_compact(c: &mut Criterion) {
@@ -2518,6 +2847,7 @@ criterion_group!(
     bench_neighbors_with_pit,
     bench_find_nodes,
     bench_flush,
+    bench_property_indexes,
     bench_batch_upsert_nodes,
     bench_compact,
     bench_group_commit,

@@ -50,7 +50,7 @@ describe('neighborsBatch (sync)', () => {
     assert.equal(results[0].queryNodeId, n2);
     // n2 has 1 incoming neighbor (n1)
     assert.equal(results[0].neighbors.length, 1);
-    assert.equal(results[0].neighbors.nodeId(0), n1);
+    assert.equal(results[0].neighbors[0].nodeId, n1);
   });
 
   it('respects type filter', () => {
@@ -58,7 +58,7 @@ describe('neighborsBatch (sync)', () => {
     assert.equal(results.length, 1);
     // n1 has 1 outgoing edge of type 10 (to n2)
     assert.equal(results[0].neighbors.length, 1);
-    assert.equal(results[0].neighbors.nodeId(0), n2);
+    assert.equal(results[0].neighbors[0].nodeId, n2);
   });
 
   it('handles empty input', () => {
@@ -83,12 +83,12 @@ describe('neighborsBatch (sync)', () => {
     const batchN2 = batchResults.find(r => r.queryNodeId === n2);
 
     // Compare node IDs (as sorted arrays)
-    const batchN1Ids = batchN1.neighbors.toArray().map(e => e.nodeId).sort();
-    const indivN1Ids = n1Individual.toArray().map(e => e.nodeId).sort();
+    const batchN1Ids = batchN1.neighbors.map(e => e.nodeId).sort();
+    const indivN1Ids = n1Individual.map(e => e.nodeId).sort();
     assert.deepEqual(batchN1Ids, indivN1Ids);
 
-    const batchN2Ids = batchN2.neighbors.toArray().map(e => e.nodeId).sort();
-    const indivN2Ids = n2Individual.toArray().map(e => e.nodeId).sort();
+    const batchN2Ids = batchN2.neighbors.map(e => e.nodeId).sort();
+    const indivN2Ids = n2Individual.map(e => e.nodeId).sort();
     assert.deepEqual(batchN2Ids, indivN2Ids);
   });
 });

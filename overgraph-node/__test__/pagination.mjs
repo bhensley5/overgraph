@@ -194,13 +194,13 @@ describe('neighborsPaged', () => {
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('returns lazy page with nextCursor', () => {
+  it('returns array page with nextCursor', () => {
     const page = db.neighborsPaged(center, { direction: 'outgoing', limit: 4 });
     assert.equal(page.items.length, 4);
-    assert.equal(typeof page.items.nodeId(0), 'number');
-    assert.equal(typeof page.items.edgeId(0), 'number');
-    assert.equal(typeof page.items.edgeTypeId(0), 'number');
-    assert.equal(typeof page.items.weight(0), 'number');
+    assert.equal(typeof page.items[0].nodeId, 'number');
+    assert.equal(typeof page.items[0].edgeId, 'number');
+    assert.equal(typeof page.items[0].edgeTypeId, 'number');
+    assert.equal(typeof page.items[0].weight, 'number');
     assert.ok(page.nextCursor != null);
     assert.equal(typeof page.nextCursor, 'number');
   });
@@ -211,9 +211,7 @@ describe('neighborsPaged', () => {
     for (;;) {
       const page = db.neighborsPaged(center, { direction: 'outgoing', limit: 4, after: cursor ?? undefined });
       const items = page.items;
-      for (let i = 0; i < items.length; i++) {
-        allEdgeIds.push(items.edgeId(i));
-      }
+      allEdgeIds.push(...items.map(item => item.edgeId));
       cursor = page.nextCursor;
       if (cursor == null) break;
     }
@@ -402,7 +400,7 @@ describe('pagination async variants', () => {
     assert.equal(page.nextCursor, undefined);
   });
 
-  it('neighborsPagedAsync returns lazy result', async () => {
+  it('neighborsPagedAsync returns array result', async () => {
     const page = await db.neighborsPagedAsync(db.findNodes(1, 'tag', 'a')[0], { direction: 'outgoing', limit: 10 });
     assert.equal(typeof page.items.length, 'number');
     assert.equal(page.nextCursor, null);

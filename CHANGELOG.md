@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-16
+
+### Added
+
+#### Optional Property Indexes
+- **Opt-in property index declarations.** Property indexing is now declaration-backed instead of always-on. Register equality or numeric range indexes only where they pay off with `ensure_node_property_index`, inspect lifecycle/error state with `list_node_property_indexes`, and remove declarations with `drop_node_property_index`.
+- **Index-transparent query routing.** Public query APIs stay stable: when a matching property-index declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same type-scoped public query path.
+- **Cross-language parity.** Property-index declaration and inspection APIs are available across Rust, Node.js, and Python, including async connector coverage.
+
+#### Numeric Range Property Indexes
+- **Range indexes for numeric properties.** Added optional node-property range indexes for `int`, `uint`, and `float` domains.
+- **Range query APIs.** Added range-query and paged range-query APIs across Rust, Node.js, and Python with declaration-aware routing, flush/compaction parity, and restart/recovery coverage.
+
+### Changed
+
+#### Node.js Neighbor Return Shape
+- **Neighbor-returning APIs now use plain objects.** In the Node.js connector, `neighbors()`, `neighborsPaged()`, `neighborsBatch()`, and `topKNeighbors()` now return normal `JsNeighborEntry` object arrays rather than wrapper list types, so results can be accessed with standard array/object syntax like `list[i].nodeId`.
+- The same plain-object shape now applies to the corresponding async Node.js APIs.
+
 ## [0.4.1] - 2026-03-21
 
 ### Fixed
@@ -199,6 +218,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.5.0]: https://github.com/Bhensley5/overgraph/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Bhensley5/overgraph/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Bhensley5/overgraph/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Bhensley5/overgraph/compare/v0.2.0...v0.3.0

@@ -759,7 +759,7 @@ describe('read-time policy filtering, neighbors', () => {
     // After policy: only c visible
     result = db.neighbors(a, { direction: 'outgoing' });
     assert.equal(result.length, 1);
-    assert.equal(result.nodeId(0), c);
+    assert.equal(result[0].nodeId, c);
   });
 });
 

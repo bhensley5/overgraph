@@ -664,6 +664,151 @@ impl DatabaseEngine {
             .collect()
     }
 
+    fn node_property_index_info(entry: &SecondaryIndexManifestEntry) -> NodePropertyIndexInfo {
+        match &entry.target {
+            SecondaryIndexTarget::NodeProperty { type_id, prop_key } => NodePropertyIndexInfo {
+                index_id: entry.index_id,
+                type_id: *type_id,
+                prop_key: prop_key.clone(),
+                kind: entry.kind.clone(),
+                state: entry.state,
+                last_error: entry.last_error.clone(),
+            },
+        }
+    }
+
+    pub fn ensure_node_property_index(
+        &mut self,
+        type_id: u32,
+        prop_key: &str,
+        kind: SecondaryIndexKind,
+    ) -> Result<NodePropertyIndexInfo, EngineError> {
+        enum EnsureOutcome {
+            Existing,
+            New,
+            Retry,
+        }
+
+        let prop_key = prop_key.to_string();
+        let (entry, outcome) = self.with_runtime_manifest_write(|manifest| {
+            if matches!(&kind, SecondaryIndexKind::Range { .. }) {
+                for existing in &manifest.secondary_indexes {
+                    let SecondaryIndexTarget::NodeProperty {
+                        type_id: existing_type_id,
+                        prop_key: existing_prop_key,
+                    } = &existing.target;
+                    if *existing_type_id == type_id
+                        && existing_prop_key == &prop_key
+                        && matches!(existing.kind, SecondaryIndexKind::Range { .. })
+                        && existing.kind != kind
+                    {
+                        return Err(EngineError::InvalidOperation(format!(
+                            "property index ({}, {}) already has a range declaration with a different domain",
+                            type_id, prop_key
+                        )));
+                    }
+                }
+            }
+
+            if let Some(existing) = manifest.secondary_indexes.iter_mut().find(|entry| {
+                entry.target
+                    == SecondaryIndexTarget::NodeProperty {
+                        type_id,
+                        prop_key: prop_key.clone(),
+                    }
+                    && entry.kind == kind
+            }) {
+                if existing.state == SecondaryIndexState::Failed {
+                    existing.state = SecondaryIndexState::Building;
+                    existing.last_error = None;
+                    return Ok((existing.clone(), EnsureOutcome::Retry));
+                }
+                return Ok((existing.clone(), EnsureOutcome::Existing));
+            }
+
+            let entry = SecondaryIndexManifestEntry {
+                index_id: manifest.next_secondary_index_id,
+                target: SecondaryIndexTarget::NodeProperty {
+                    type_id,
+                    prop_key: prop_key.clone(),
+                },
+                kind: kind.clone(),
+                state: SecondaryIndexState::Building,
+                last_error: None,
+            };
+            manifest.next_secondary_index_id = manifest.next_secondary_index_id.saturating_add(1);
+            manifest.secondary_indexes.push(entry.clone());
+            Ok((entry, EnsureOutcome::New))
+        })?;
+
+        self.rebuild_secondary_index_catalog()?;
+        match outcome {
+            EnsureOutcome::Existing => {}
+            EnsureOutcome::New => {
+                self.seed_secondary_index_entry(&entry)?;
+                self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
+                    index_id: entry.index_id,
+                });
+            }
+            EnsureOutcome::Retry => {
+                self.remove_secondary_index_entry_from_memtables(entry.index_id)?;
+                self.seed_secondary_index_entry(&entry)?;
+                self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
+                    index_id: entry.index_id,
+                });
+            }
+        }
+
+        Ok(Self::node_property_index_info(&entry))
+    }
+
+    pub fn drop_node_property_index(
+        &mut self,
+        type_id: u32,
+        prop_key: &str,
+        kind: SecondaryIndexKind,
+    ) -> Result<bool, EngineError> {
+        let prop_key = prop_key.to_string();
+        let removed = self.with_runtime_manifest_write(|manifest| {
+            let idx = manifest.secondary_indexes.iter().position(|entry| {
+                entry.target
+                    == SecondaryIndexTarget::NodeProperty {
+                        type_id,
+                        prop_key: prop_key.clone(),
+                    }
+                    && entry.kind == kind
+            });
+            Ok(idx.map(|idx| manifest.secondary_indexes.remove(idx)))
+        })?;
+
+        let Some(entry) = removed else {
+            return Ok(false);
+        };
+
+        self.rebuild_secondary_index_catalog()?;
+        self.remove_secondary_index_entry_from_memtables(entry.index_id)?;
+        self.enqueue_secondary_index_job(SecondaryIndexJob::DropCleanup {
+            index_id: entry.index_id,
+        });
+        Ok(true)
+    }
+
+    pub fn list_node_property_indexes(&self) -> Vec<NodePropertyIndexInfo> {
+        let mut indexes: Vec<NodePropertyIndexInfo> = self
+            .secondary_index_entries_snapshot()
+            .iter()
+            .map(Self::node_property_index_info)
+            .collect();
+        indexes.sort_unstable_by(|left, right| {
+            left.type_id
+                .cmp(&right.type_id)
+                .then_with(|| left.prop_key.cmp(&right.prop_key))
+                .then_with(|| format!("{:?}", left.kind).cmp(&format!("{:?}", right.kind)))
+                .then_with(|| left.index_id.cmp(&right.index_id))
+        });
+        indexes
+    }
+
     // --- Segment-aware dedup lookups (for upsert) ---
 
     /// Look up a node by (type_id, key) across memtable + segments.

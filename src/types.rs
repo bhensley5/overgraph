@@ -381,6 +381,97 @@ pub struct PageResult<T> {
     pub next_cursor: Option<u64>,
 }
 
+/// Range domain for an optional secondary index declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SecondaryIndexRangeDomain {
+    Int,
+    UInt,
+    Float,
+}
+
+/// Kind of optional secondary index declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SecondaryIndexKind {
+    Equality,
+    Range { domain: SecondaryIndexRangeDomain },
+}
+
+/// Target for an optional secondary index declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SecondaryIndexTarget {
+    NodeProperty { type_id: u32, prop_key: String },
+}
+
+/// Lifecycle state for an optional secondary index declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SecondaryIndexState {
+    Building,
+    Ready,
+    Failed,
+}
+
+/// Persisted manifest entry for an optional secondary index declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryIndexManifestEntry {
+    pub index_id: u64,
+    pub target: SecondaryIndexTarget,
+    pub kind: SecondaryIndexKind,
+    pub state: SecondaryIndexState,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+/// User-facing information about a node-property optional secondary index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePropertyIndexInfo {
+    pub index_id: u64,
+    pub type_id: u32,
+    pub prop_key: String,
+    pub kind: SecondaryIndexKind,
+    pub state: SecondaryIndexState,
+    pub last_error: Option<String>,
+}
+
+/// Bound for a property range query.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyRangeBound {
+    Included(PropValue),
+    Excluded(PropValue),
+}
+
+impl PropertyRangeBound {
+    pub fn value(&self) -> &PropValue {
+        match self {
+            PropertyRangeBound::Included(value) | PropertyRangeBound::Excluded(value) => value,
+        }
+    }
+
+    pub fn is_inclusive(&self) -> bool {
+        matches!(self, PropertyRangeBound::Included(_))
+    }
+}
+
+/// Cursor for property-range pagination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PropertyRangeCursor {
+    pub value: PropValue,
+    pub node_id: u64,
+}
+
+/// Request parameters for property-range pagination.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PropertyRangePageRequest {
+    pub limit: Option<usize>,
+    pub after: Option<PropertyRangeCursor>,
+}
+
+/// Result page for property-range queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyRangePageResult<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<PropertyRangeCursor>,
+}
+
 /// WAL operation types.
 #[derive(Debug, Clone)]
 pub enum WalOp {
@@ -446,6 +537,12 @@ pub struct ManifestState {
     /// Flush epochs that are in-flight (frozen or published but not yet retired).
     #[serde(default)]
     pub pending_flush_epochs: Vec<FlushEpochMeta>,
+    /// Optional secondary index declarations.
+    #[serde(default)]
+    pub secondary_indexes: Vec<SecondaryIndexManifestEntry>,
+    /// Next declaration ID to allocate.
+    #[serde(default)]
+    pub next_secondary_index_id: u64,
 }
 
 /// State of a flush epoch in the manifest.
@@ -1349,6 +1446,8 @@ mod tests {
             next_wal_generation_id: 0,
             active_wal_generation_id: 0,
             pending_flush_epochs: Vec::new(),
+            secondary_indexes: Vec::new(),
+            next_secondary_index_id: 1,
         };
         let json = serde_json::to_string(&state).unwrap();
         let loaded: ManifestState = serde_json::from_str(&json).unwrap();

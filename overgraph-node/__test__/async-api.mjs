@@ -117,12 +117,29 @@ describe('async delete + neighbors + find', () => {
     const c = await db.upsertNodeAsync(1, 'center');
     const n1 = await db.upsertNodeAsync(1, 'nbr1');
     const n2 = await db.upsertNodeAsync(1, 'nbr2');
-    await db.upsertEdgeAsync(c, n1, 10);
-    await db.upsertEdgeAsync(c, n2, 10);
+    await db.upsertEdgeAsync(c, n1, 10, { weight: 1 });
+    await db.upsertEdgeAsync(c, n2, 10, { weight: 2 });
 
     const result = await db.neighborsAsync(c, { direction: 'outgoing' });
+    assert.ok(Array.isArray(result));
     assert.equal(typeof result.length, 'number');
     assert.equal(result.length, 2);
+  });
+
+  it('topKNeighborsAsync returns plain neighbor entry arrays', async () => {
+    const c = await db.upsertNodeAsync(1, 'topk-center');
+    const n1 = await db.upsertNodeAsync(1, 'topk-nbr1');
+    const n2 = await db.upsertNodeAsync(1, 'topk-nbr2');
+    await db.upsertEdgeAsync(c, n1, 10, { weight: 1 });
+    await db.upsertEdgeAsync(c, n2, 10, { weight: 2 });
+
+    const result = await db.topKNeighborsAsync(c, 2, { direction: 'outgoing', scoring: 'weight' });
+    assert.ok(Array.isArray(result));
+    assert.equal(result.length, 2);
+    assert.equal(result[0].nodeId, n2);
+    assert.equal(result[0].weight, 2);
+    assert.equal(result[1].nodeId, n1);
+    assert.equal(result[1].weight, 1);
   });
 
   it('traverseAsync returns 2nd-hop nodes', async () => {

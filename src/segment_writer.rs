@@ -1,6 +1,6 @@
 use crate::dense_hnsw::{write_dense_hnsw_index_from_points, DensePointInput};
 use crate::error::EngineError;
-use crate::memtable::{AdjEntry, Memtable};
+use crate::memtable::{encode_range_prop_value, AdjEntry, Memtable};
 use crate::parallel::engine_cpu_try_join;
 use crate::segment_reader::SegmentReader;
 use crate::sparse_postings::write_sparse_posting_files;
@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 // --- Binary write helpers (little-endian) ---
 
@@ -52,6 +53,7 @@ pub(crate) const NODE_VECTOR_META_FILENAME: &str = "node_vector_meta.dat";
 pub(crate) const NODE_DENSE_VECTOR_BLOB_FILENAME: &str = "node_dense_vectors.dat";
 pub(crate) const NODE_SPARSE_VECTOR_BLOB_FILENAME: &str = "node_sparse_vectors.dat";
 pub(crate) const NODE_VECTOR_META_ENTRY_SIZE: usize = 28;
+pub(crate) const SECONDARY_INDEX_DIRNAME: &str = "secondary_indexes";
 const NODE_VECTOR_FLAG_DENSE: u8 = 0b0000_0001;
 const NODE_VECTOR_FLAG_SPARSE: u8 = 0b0000_0010;
 
@@ -63,18 +65,33 @@ const NODE_INDEX_ENTRY_SIZE: u64 = 16;
 const EDGE_INDEX_ENTRY_SIZE: u64 = 16;
 /// Size of a type index entry: type_id (4) + offset (8) + count (4) = 16 bytes
 const TYPE_INDEX_ENTRY_SIZE: u64 = 16;
-/// Size of a prop index entry: type_id (4) + key_hash (8) + value_hash (8) + offset (8) + count (4) = 32 bytes
-const PROP_INDEX_ENTRY_SIZE: u64 = 32;
-/// Size of a property hash pair in node_prop_hashes.dat: key_hash (8) + value_hash (8) = 16 bytes
-const PROP_HASH_PAIR_SIZE: u64 = 16;
+const SECONDARY_EQ_ENTRY_SIZE: u64 = 20;
 const DENSE_VECTOR_VALUE_SIZE: u64 = 4;
 const SPARSE_VECTOR_ENTRY_SIZE: u64 = 8;
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SecondaryIndexMaintenanceReport {
+    pub failed_equality_indexes: Vec<(u64, String)>,
+    pub failed_range_indexes: Vec<(u64, String)>,
+}
+
+pub(crate) fn secondary_indexes_dir(seg_dir: &Path) -> PathBuf {
+    seg_dir.join(SECONDARY_INDEX_DIRNAME)
+}
+
+pub(crate) fn node_prop_eq_sidecar_path(seg_dir: &Path, index_id: u64) -> PathBuf {
+    secondary_indexes_dir(seg_dir).join(format!("node_prop_eq_{}.dat", index_id))
+}
+
+pub(crate) fn node_prop_range_sidecar_path(seg_dir: &Path, index_id: u64) -> PathBuf {
+    secondary_indexes_dir(seg_dir).join(format!("node_prop_range_{}.dat", index_id))
+}
 
 /// Write all segment files for a frozen memtable into the given directory.
 ///
 /// Creates: nodes.dat, edges.dat, adj_out.idx, adj_out.dat, adj_in.idx,
 /// adj_in.dat, key_index.dat, node_type_index.dat, edge_type_index.dat,
-/// prop_index.dat, edge_triple_index.dat, tombstones.dat
+/// edge_triple_index.dat, tombstones.dat, and any declared secondary sidecars
 ///
 /// IMPORTANT: Two index-writing paths exist and must stay in sync:
 ///   1. This function (flush path, builds indexes from Memtable)
@@ -87,6 +104,16 @@ pub fn write_segment(
     memtable: &Memtable,
     dense_config: Option<&DenseVectorConfig>,
 ) -> Result<SegmentInfo, EngineError> {
+    write_segment_with_secondary_indexes(seg_dir, segment_id, memtable, dense_config, &[])
+}
+
+pub(crate) fn write_segment_with_secondary_indexes(
+    seg_dir: &Path,
+    segment_id: u64,
+    memtable: &Memtable,
+    dense_config: Option<&DenseVectorConfig>,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<SegmentInfo, EngineError> {
     fs::create_dir_all(seg_dir)?;
 
     let nodes = memtable.nodes();
@@ -98,7 +125,8 @@ pub fn write_segment(
         || {
             write_key_index(seg_dir, nodes)?;
             write_type_index(seg_dir, "node_type_index", memtable.type_node_index())?;
-            write_prop_index(seg_dir, memtable.prop_node_index())?;
+            write_declared_equality_sidecars(seg_dir, memtable, secondary_indexes)?;
+            write_declared_range_sidecars(seg_dir, memtable, secondary_indexes)?;
             write_timestamp_index(seg_dir, memtable.time_node_index())?;
             Ok(())
         },
@@ -143,6 +171,121 @@ where
 {
     let _ = engine_cpu_try_join(node_branch, edge_branch)?;
     let _ = engine_cpu_try_join(vector_branch, sparse_branch)?;
+    Ok(())
+}
+
+pub(crate) fn write_node_prop_eq_sidecar_to_path(
+    path: &Path,
+    groups: &BTreeMap<u64, Vec<u64>>,
+) -> Result<(), EngineError> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    let entry_count = groups.len() as u64;
+    write_u64(&mut writer, entry_count)?;
+
+    let data_start = 8 + entry_count * SECONDARY_EQ_ENTRY_SIZE;
+    let mut data_offset = data_start;
+    for (&value_hash, ids) in groups {
+        write_u64(&mut writer, value_hash)?;
+        write_u64(&mut writer, data_offset)?;
+        write_u32(&mut writer, ids.len() as u32)?;
+        data_offset += ids.len() as u64 * 8;
+    }
+
+    for ids in groups.values() {
+        for &node_id in ids {
+            write_u64(&mut writer, node_id)?;
+        }
+    }
+
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn write_node_prop_range_sidecar_to_path(
+    path: &Path,
+    entries: &[(u64, u64)],
+) -> Result<(), EngineError> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    write_u64(&mut writer, entries.len() as u64)?;
+    for &(encoded_value, node_id) in entries {
+        write_u64(&mut writer, encoded_value)?;
+        write_u64(&mut writer, node_id)?;
+    }
+
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
+}
+
+fn write_declared_equality_sidecars(
+    seg_dir: &Path,
+    memtable: &Memtable,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<(), EngineError> {
+    let eq_entries: Vec<&SecondaryIndexManifestEntry> = secondary_indexes
+        .iter()
+        .filter(|entry| matches!(entry.kind, SecondaryIndexKind::Equality))
+        .collect();
+    if eq_entries.is_empty() {
+        return Ok(());
+    }
+
+    let index_dir = secondary_indexes_dir(seg_dir);
+    fs::create_dir_all(&index_dir)?;
+
+    for entry in eq_entries {
+        let mut groups = BTreeMap::new();
+        if let Some(values) = memtable.secondary_eq_state().get(&entry.index_id) {
+            for (&value_hash, ids) in values {
+                let mut sorted_ids: Vec<u64> = ids.iter().copied().collect();
+                sorted_ids.sort_unstable();
+                groups.insert(value_hash, sorted_ids);
+            }
+        }
+        write_node_prop_eq_sidecar_to_path(
+            &node_prop_eq_sidecar_path(seg_dir, entry.index_id),
+            &groups,
+        )?;
+    }
+
+    fsync_dir(&index_dir)?;
+    Ok(())
+}
+
+fn write_declared_range_sidecars(
+    seg_dir: &Path,
+    memtable: &Memtable,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<(), EngineError> {
+    let range_entries: Vec<&SecondaryIndexManifestEntry> = secondary_indexes
+        .iter()
+        .filter(|entry| matches!(entry.kind, SecondaryIndexKind::Range { .. }))
+        .collect();
+    if range_entries.is_empty() {
+        return Ok(());
+    }
+
+    let index_dir = secondary_indexes_dir(seg_dir);
+    fs::create_dir_all(&index_dir)?;
+
+    for entry in range_entries {
+        let sidecar_entries: Vec<(u64, u64)> = memtable
+            .secondary_range_state()
+            .get(&entry.index_id)
+            .map(|entries| entries.iter().copied().collect())
+            .unwrap_or_default();
+        write_node_prop_range_sidecar_to_path(
+            &node_prop_range_sidecar_path(seg_dir, entry.index_id),
+            &sidecar_entries,
+        )?;
+    }
+
+    fsync_dir(&index_dir)?;
     Ok(())
 }
 
@@ -472,67 +615,6 @@ fn write_type_index(
     Ok(())
 }
 
-/// prop_index.dat format:
-/// [entry_count: u64]
-/// [index: entry_count × (type_id: u32, key_hash: u64, value_hash: u64, offset: u64, count: u32),
-///   sorted by (type_id, key_hash, value_hash)]
-/// [data: packed u64 node IDs per group, grouped contiguously]
-fn write_prop_index(
-    seg_dir: &Path,
-    prop_index: &HashMap<(u32, u64, u64), NodeIdSet>,
-) -> Result<(), EngineError> {
-    let path = seg_dir.join("prop_index.dat");
-    let file = File::create(&path)?;
-    let mut w = BufWriter::new(file);
-
-    // Keys are already (type_id, key_hash, value_hash). Collect into sorted map.
-    let mut disk_groups: BTreeMap<(u32, u64, u64), Vec<u64>> = BTreeMap::new();
-    for ((type_id, key_hash, value_hash), ids) in prop_index {
-        if ids.is_empty() {
-            continue;
-        }
-        let entry = disk_groups
-            .entry((*type_id, *key_hash, *value_hash))
-            .or_default();
-        entry.extend(ids.iter().copied());
-    }
-
-    // Sort IDs within each group and dedup
-    for ids in disk_groups.values_mut() {
-        ids.sort_unstable();
-        ids.dedup();
-    }
-
-    let entry_count = disk_groups.len() as u64;
-    write_u64(&mut w, entry_count)?;
-
-    // Data section starts after header + index
-    let data_start = 8 + entry_count * PROP_INDEX_ENTRY_SIZE;
-    let mut data_offset = data_start;
-
-    // Write index entries (BTreeMap is sorted by key)
-    for ((type_id, key_hash, value_hash), ids) in &disk_groups {
-        let count = ids.len() as u32;
-        write_u32(&mut w, *type_id)?;
-        write_u64(&mut w, *key_hash)?;
-        write_u64(&mut w, *value_hash)?;
-        write_u64(&mut w, data_offset)?;
-        write_u32(&mut w, count)?;
-        data_offset += count as u64 * 8;
-    }
-
-    // Write data section (packed u64 node IDs)
-    for ids in disk_groups.values() {
-        for &id in ids {
-            write_u64(&mut w, id)?;
-        }
-    }
-
-    w.flush()?;
-    w.get_ref().sync_all()?;
-    Ok(())
-}
-
 /// edge_triple_index.dat format:
 /// [count: u64]
 /// [entries: count × (from: u64, to: u64, type_id: u32, edge_id: u64), sorted by (from, to, type_id)]
@@ -684,7 +766,7 @@ fn encode_edge_record_into(buf: &mut Vec<u8>, edge: &EdgeRecord) -> Result<(), E
 
 // --- V5 metadata sidecar writers ---
 
-/// Write all three V5 sidecar files: node_meta.dat, edge_meta.dat, node_prop_hashes.dat.
+/// Write metadata sidecars for node and edge records.
 ///
 /// `node_data` and `edge_data` are (id, data_offset, data_len) tuples sorted by id,
 /// matching the actual byte positions in nodes.dat/edges.dat.
@@ -695,7 +777,7 @@ pub(crate) fn write_sidecars(
     nodes: &NodeIdMap<NodeRecord>,
     edges: &NodeIdMap<EdgeRecord>,
 ) -> Result<Vec<DensePointInput>, EngineError> {
-    write_node_meta_and_prop_hashes(seg_dir, node_data, nodes)?;
+    write_node_meta(seg_dir, node_data, nodes)?;
     let dense_points = write_node_vector_sidecars(seg_dir, node_data, nodes)?;
     write_edge_meta(seg_dir, edge_data, edges)?;
     Ok(dense_points)
@@ -711,37 +793,23 @@ pub(crate) fn write_sidecars(
 ///   prop_hash_offset: u64, prop_hash_count: u32,
 ///   last_write_seq: u64, reserved: u16
 ///
-/// Also writes node_prop_hashes.dat (interlinked via prop_hash_offset/count).
-fn write_node_meta_and_prop_hashes(
+fn write_node_meta(
     seg_dir: &Path,
     node_data: &[(u64, u64, u32)],
     nodes: &NodeIdMap<NodeRecord>,
 ) -> Result<(), EngineError> {
     let meta_path = seg_dir.join("node_meta.dat");
-    let hash_path = seg_dir.join("node_prop_hashes.dat");
 
     let meta_file = File::create(&meta_path)?;
-    let hash_file = File::create(&hash_path)?;
     let mut meta_w = BufWriter::new(meta_file);
-    let mut hash_w = BufWriter::new(hash_file);
 
     let count = node_data.len() as u64;
     write_u64(&mut meta_w, count)?;
-
-    let mut prop_hash_offset: u64 = 0;
 
     for &(node_id, data_offset, data_len) in node_data {
         let node = nodes.get(&node_id).ok_or_else(|| {
             EngineError::CorruptRecord(format!("node {} not found for sidecar", node_id))
         })?;
-
-        // Compute property hashes
-        let prop_hashes: Vec<(u64, u64)> = node
-            .props
-            .iter()
-            .map(|(k, v)| (hash_prop_key(k), hash_prop_value(v)))
-            .collect();
-        let prop_hash_count = prop_hashes.len() as u32;
 
         // Write node_meta entry (60 bytes)
         write_u64(&mut meta_w, node_id)?;
@@ -751,23 +819,14 @@ fn write_node_meta_and_prop_hashes(
         meta_w.write_all(&node.updated_at.to_le_bytes())?;
         meta_w.write_all(&node.weight.to_le_bytes())?;
         write_u16(&mut meta_w, node.key.len() as u16)?;
-        write_u64(&mut meta_w, prop_hash_offset)?;
-        write_u32(&mut meta_w, prop_hash_count)?;
+        write_u64(&mut meta_w, 0)?;
+        write_u32(&mut meta_w, 0)?;
         write_u64(&mut meta_w, node.last_write_seq)?;
         write_u16(&mut meta_w, 0)?; // reserved
-
-        // Write property hash pairs
-        for &(key_hash, value_hash) in &prop_hashes {
-            write_u64(&mut hash_w, key_hash)?;
-            write_u64(&mut hash_w, value_hash)?;
-        }
-        prop_hash_offset += prop_hash_count as u64 * PROP_HASH_PAIR_SIZE;
     }
 
     meta_w.flush()?;
     meta_w.get_ref().sync_all()?;
-    hash_w.flush()?;
-    hash_w.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -1378,7 +1437,9 @@ pub(crate) struct CompactNodeMeta {
     pub updated_at: i64,
     pub weight: f32,
     pub key_len: u16,
+    #[allow(dead_code)]
     pub prop_hash_offset: u64,
+    #[allow(dead_code)]
     pub prop_hash_count: u32,
     pub dense_vector_offset: u64,
     pub dense_vector_len: u32,
@@ -1409,11 +1470,12 @@ pub(crate) struct CompactEdgeMeta {
 ///
 /// IMPORTANT: Two index-writing paths exist and must stay in sync:
 ///   1. `write_segment()` (flush path, builds indexes from Memtable)
-///   2. `write_indexes_from_metadata()` [this fn] (compaction path, builds from sidecars)
+///   2. `write_indexes_from_metadata_with_secondary_indexes()` [this fn] (compaction path)
 ///
 /// If you add a new index type, you MUST add it to BOTH paths.
 ///
 /// `node_metas` and `edge_metas` must be sorted by ID.
+#[allow(dead_code)]
 pub(crate) fn write_indexes_from_metadata(
     seg_dir: &Path,
     segments: &[SegmentReader],
@@ -1421,11 +1483,52 @@ pub(crate) fn write_indexes_from_metadata(
     edge_metas: &[CompactEdgeMeta],
     dense_config: Option<&DenseVectorConfig>,
 ) -> Result<(), EngineError> {
+    let _ = write_indexes_from_metadata_with_secondary_indexes(
+        seg_dir,
+        segments,
+        node_metas,
+        edge_metas,
+        dense_config,
+        &[],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
+    seg_dir: &Path,
+    segments: &[SegmentReader],
+    node_metas: &[CompactNodeMeta],
+    edge_metas: &[CompactEdgeMeta],
+    dense_config: Option<&DenseVectorConfig>,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<SecondaryIndexMaintenanceReport, EngineError> {
+    let report = Arc::new(Mutex::new(SecondaryIndexMaintenanceReport::default()));
+    let node_report = Arc::clone(&report);
     run_index_fanout(
         || {
             write_key_index_from_meta(seg_dir, segments, node_metas)?;
             write_node_type_index_from_meta(seg_dir, node_metas)?;
-            write_prop_index_from_meta(seg_dir, segments, node_metas)?;
+            let branch_report = write_declared_equality_sidecars_from_metadata(
+                seg_dir,
+                segments,
+                node_metas,
+                secondary_indexes,
+            )?;
+            node_report
+                .lock()
+                .unwrap()
+                .failed_equality_indexes
+                .extend(branch_report.failed_equality_indexes);
+            let branch_report = write_declared_range_sidecars_from_metadata(
+                seg_dir,
+                segments,
+                node_metas,
+                secondary_indexes,
+            )?;
+            let mut report = node_report.lock().unwrap();
+            report
+                .failed_range_indexes
+                .extend(branch_report.failed_range_indexes);
             write_timestamp_index_from_meta(seg_dir, node_metas)?;
             Ok(())
         },
@@ -1446,7 +1549,8 @@ pub(crate) fn write_indexes_from_metadata(
     )?;
     write_format_version(seg_dir)?;
     fsync_dir(seg_dir)?;
-    Ok(())
+    let final_report = report.lock().unwrap().clone();
+    Ok(final_report)
 }
 
 /// key_index.dat from metadata: read key bytes via partial header parse from source segments.
@@ -1698,78 +1802,269 @@ fn write_adjacency_from_meta(
     Ok(())
 }
 
-/// prop_index.dat from metadata: reads property hash pairs from source segments.
-fn write_prop_index_from_meta(
-    seg_dir: &Path,
+fn build_secondary_eq_groups_from_source_sidecars(
     segments: &[SegmentReader],
     node_metas: &[CompactNodeMeta],
-) -> Result<(), EngineError> {
-    let path = seg_dir.join("prop_index.dat");
-    let file = File::create(&path)?;
-    let mut w = BufWriter::new(file);
+    index_id: u64,
+    type_id: u32,
+) -> Result<BTreeMap<u64, Vec<u64>>, EngineError> {
+    let winner_sources: HashMap<u64, usize> = node_metas
+        .iter()
+        .filter(|meta| meta.type_id == type_id)
+        .map(|meta| (meta.node_id, meta.src_seg_idx))
+        .collect();
+    let mut groups: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
 
-    // Build grouped mapping: (type_id, key_hash, value_hash) -> [node_ids]
-    let mut disk_groups: BTreeMap<(u32, u64, u64), Vec<u64>> = BTreeMap::new();
-
-    for nm in node_metas {
-        if nm.prop_hash_count == 0 {
-            continue;
-        }
-        let src_hashes = segments[nm.src_seg_idx].raw_node_prop_hashes_mmap();
-        let base = nm.prop_hash_offset as usize;
-        for j in 0..nm.prop_hash_count as usize {
-            let pair_off = base + j * 16;
-            let end = pair_off + 16;
-            if end > src_hashes.len() {
-                return Err(EngineError::CorruptRecord(format!(
-                    "node {} prop hash pair at offset {} exceeds source length {}",
-                    nm.node_id,
-                    pair_off,
-                    src_hashes.len()
-                )));
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        seg.for_each_secondary_eq_group(index_id, |value_hash, ids| {
+            let group = groups.entry(value_hash).or_default();
+            for &node_id in ids {
+                if winner_sources.get(&node_id) == Some(&seg_idx) {
+                    group.push(node_id);
+                }
             }
-            let key_hash =
-                u64::from_le_bytes(src_hashes[pair_off..pair_off + 8].try_into().unwrap());
-            let value_hash =
-                u64::from_le_bytes(src_hashes[pair_off + 8..pair_off + 16].try_into().unwrap());
-            disk_groups
-                .entry((nm.type_id, key_hash, value_hash))
-                .or_default()
-                .push(nm.node_id);
-        }
+            Ok(())
+        })?;
     }
 
-    // Sort and dedup IDs within each group
-    for ids in disk_groups.values_mut() {
+    for ids in groups.values_mut() {
         ids.sort_unstable();
         ids.dedup();
     }
 
-    let entry_count = disk_groups.len() as u64;
-    write_u64(&mut w, entry_count)?;
+    Ok(groups)
+}
 
-    let data_start = 8 + entry_count * PROP_INDEX_ENTRY_SIZE;
-    let mut data_offset = data_start;
+fn build_secondary_eq_groups_from_targeted_decode(
+    segments: &[SegmentReader],
+    node_metas: &[CompactNodeMeta],
+    type_id: u32,
+    prop_key: &str,
+) -> Result<BTreeMap<u64, Vec<u64>>, EngineError> {
+    let mut groups: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
 
-    for (&(type_id, key_hash, value_hash), ids) in &disk_groups {
-        let count = ids.len() as u32;
-        write_u32(&mut w, type_id)?;
-        write_u64(&mut w, key_hash)?;
-        write_u64(&mut w, value_hash)?;
-        write_u64(&mut w, data_offset)?;
-        write_u32(&mut w, count)?;
-        data_offset += count as u64 * 8;
-    }
-
-    for ids in disk_groups.values() {
-        for &id in ids {
-            write_u64(&mut w, id)?;
+    for meta in node_metas.iter().filter(|meta| meta.type_id == type_id) {
+        if let Some(value) = segments[meta.src_seg_idx].node_property_value_at_offset(
+            meta.node_id,
+            meta.src_data_offset,
+            prop_key,
+        )? {
+            groups
+                .entry(hash_prop_value(&value))
+                .or_default()
+                .push(meta.node_id);
         }
     }
 
-    w.flush()?;
-    w.get_ref().sync_all()?;
-    Ok(())
+    for ids in groups.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+
+    Ok(groups)
+}
+
+fn build_secondary_range_entries_from_source_sidecars(
+    segments: &[SegmentReader],
+    node_metas: &[CompactNodeMeta],
+    index_id: u64,
+    type_id: u32,
+) -> Result<Vec<(u64, u64)>, EngineError> {
+    let winner_sources: HashMap<u64, usize> = node_metas
+        .iter()
+        .filter(|meta| meta.type_id == type_id)
+        .map(|meta| (meta.node_id, meta.src_seg_idx))
+        .collect();
+    let mut entries = Vec::new();
+
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        seg.for_each_secondary_range_entry(index_id, |encoded_value, node_id| {
+            if winner_sources.get(&node_id) == Some(&seg_idx) {
+                entries.push((encoded_value, node_id));
+            }
+            Ok(())
+        })?;
+    }
+
+    entries.sort_unstable();
+    entries.dedup();
+    Ok(entries)
+}
+
+fn build_secondary_range_entries_from_targeted_decode(
+    segments: &[SegmentReader],
+    node_metas: &[CompactNodeMeta],
+    type_id: u32,
+    prop_key: &str,
+    domain: SecondaryIndexRangeDomain,
+) -> Result<Vec<(u64, u64)>, EngineError> {
+    let mut entries = Vec::new();
+
+    for meta in node_metas.iter().filter(|meta| meta.type_id == type_id) {
+        let Some(value) = segments[meta.src_seg_idx].node_property_value_at_offset(
+            meta.node_id,
+            meta.src_data_offset,
+            prop_key,
+        )?
+        else {
+            continue;
+        };
+        let Some(encoded_value) = encode_range_prop_value(domain, &value) else {
+            continue;
+        };
+        entries.push((encoded_value, meta.node_id));
+    }
+
+    entries.sort_unstable();
+    entries.dedup();
+    Ok(entries)
+}
+
+fn write_declared_equality_sidecars_from_metadata(
+    seg_dir: &Path,
+    segments: &[SegmentReader],
+    node_metas: &[CompactNodeMeta],
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<SecondaryIndexMaintenanceReport, EngineError> {
+    let eq_entries: Vec<&SecondaryIndexManifestEntry> = secondary_indexes
+        .iter()
+        .filter(|entry| matches!(entry.kind, SecondaryIndexKind::Equality))
+        .collect();
+    if eq_entries.is_empty() {
+        return Ok(SecondaryIndexMaintenanceReport::default());
+    }
+
+    let index_dir = secondary_indexes_dir(seg_dir);
+    fs::create_dir_all(&index_dir)?;
+    let mut report = SecondaryIndexMaintenanceReport::default();
+
+    for entry in eq_entries {
+        let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
+        let mut failure_message = None;
+        let use_source_sidecars = if entry.state == SecondaryIndexState::Failed {
+            false
+        } else {
+            let mut all_present = true;
+            for seg in segments {
+                match seg.validate_secondary_eq_sidecar(entry.index_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        all_present = false;
+                        break;
+                    }
+                    Err(error) => {
+                        all_present = false;
+                        if entry.state == SecondaryIndexState::Ready {
+                            failure_message = Some(error.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+            all_present
+        };
+
+        let groups = if use_source_sidecars {
+            build_secondary_eq_groups_from_source_sidecars(
+                segments,
+                node_metas,
+                entry.index_id,
+                *type_id,
+            )?
+        } else {
+            build_secondary_eq_groups_from_targeted_decode(
+                segments, node_metas, *type_id, prop_key,
+            )?
+        };
+
+        if let Some(message) = failure_message {
+            report
+                .failed_equality_indexes
+                .push((entry.index_id, message));
+        }
+
+        write_node_prop_eq_sidecar_to_path(
+            &node_prop_eq_sidecar_path(seg_dir, entry.index_id),
+            &groups,
+        )?;
+    }
+
+    fsync_dir(&index_dir)?;
+    Ok(report)
+}
+
+fn write_declared_range_sidecars_from_metadata(
+    seg_dir: &Path,
+    segments: &[SegmentReader],
+    node_metas: &[CompactNodeMeta],
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<SecondaryIndexMaintenanceReport, EngineError> {
+    let range_entries: Vec<&SecondaryIndexManifestEntry> = secondary_indexes
+        .iter()
+        .filter(|entry| matches!(entry.kind, SecondaryIndexKind::Range { .. }))
+        .collect();
+    if range_entries.is_empty() {
+        return Ok(SecondaryIndexMaintenanceReport::default());
+    }
+
+    let index_dir = secondary_indexes_dir(seg_dir);
+    fs::create_dir_all(&index_dir)?;
+    let mut report = SecondaryIndexMaintenanceReport::default();
+
+    for entry in range_entries {
+        let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
+        let SecondaryIndexKind::Range { domain } = entry.kind else {
+            continue;
+        };
+        let mut failure_message = None;
+        let use_source_sidecars = if entry.state == SecondaryIndexState::Failed {
+            false
+        } else {
+            let mut all_present = true;
+            for seg in segments {
+                match seg.validate_secondary_range_sidecar(entry.index_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        all_present = false;
+                        break;
+                    }
+                    Err(error) => {
+                        all_present = false;
+                        if entry.state == SecondaryIndexState::Ready {
+                            failure_message = Some(error.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+            all_present
+        };
+
+        let sidecar_entries = if use_source_sidecars {
+            build_secondary_range_entries_from_source_sidecars(
+                segments,
+                node_metas,
+                entry.index_id,
+                *type_id,
+            )?
+        } else {
+            build_secondary_range_entries_from_targeted_decode(
+                segments, node_metas, *type_id, prop_key, domain,
+            )?
+        };
+
+        if let Some(message) = failure_message {
+            report.failed_range_indexes.push((entry.index_id, message));
+        }
+
+        write_node_prop_range_sidecar_to_path(
+            &node_prop_range_sidecar_path(seg_dir, entry.index_id),
+            &sidecar_entries,
+        )?;
+    }
+
+    fsync_dir(&index_dir)?;
+    Ok(report)
 }
 
 /// timestamp_index.dat from metadata.
@@ -1813,26 +2108,21 @@ fn write_empty_tombstones(seg_dir: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Write output sidecars (node_meta.dat, edge_meta.dat, node_prop_hashes.dat) from metadata.
+/// Write output metadata sidecars from compaction metadata.
 fn write_sidecars_from_meta(
     seg_dir: &Path,
     segments: &[SegmentReader],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
 ) -> Result<Vec<DensePointInput>, EngineError> {
-    // node_meta.dat + node_prop_hashes.dat
+    // node_meta.dat
     let meta_path = seg_dir.join("node_meta.dat");
-    let hash_path = seg_dir.join("node_prop_hashes.dat");
 
     let meta_file = File::create(&meta_path)?;
-    let hash_file = File::create(&hash_path)?;
     let mut meta_w = BufWriter::new(meta_file);
-    let mut hash_w = BufWriter::new(hash_file);
 
     let count = node_metas.len() as u64;
     write_u64(&mut meta_w, count)?;
-
-    let mut new_prop_hash_offset: u64 = 0;
 
     for nm in node_metas {
         // Write node_meta entry with updated data_offset and prop_hash_offset (60 bytes)
@@ -1843,35 +2133,14 @@ fn write_sidecars_from_meta(
         meta_w.write_all(&nm.updated_at.to_le_bytes())?;
         meta_w.write_all(&nm.weight.to_le_bytes())?;
         write_u16(&mut meta_w, nm.key_len)?;
-        write_u64(&mut meta_w, new_prop_hash_offset)?;
-        write_u32(&mut meta_w, nm.prop_hash_count)?;
+        write_u64(&mut meta_w, 0)?;
+        write_u32(&mut meta_w, 0)?;
         write_u64(&mut meta_w, nm.last_write_seq)?;
         write_u16(&mut meta_w, 0)?; // reserved
-
-        // Copy property hash pairs from source segment
-        if nm.prop_hash_count > 0 {
-            let src_hashes = segments[nm.src_seg_idx].raw_node_prop_hashes_mmap();
-            let base = nm.prop_hash_offset as usize;
-            let len = nm.prop_hash_count as usize * PROP_HASH_PAIR_SIZE as usize;
-            let end = base + len;
-            if end > src_hashes.len() {
-                return Err(EngineError::CorruptRecord(format!(
-                    "node {} prop hash range [{}, {}) exceeds source length {}",
-                    nm.node_id,
-                    base,
-                    end,
-                    src_hashes.len()
-                )));
-            }
-            hash_w.write_all(&src_hashes[base..end])?;
-            new_prop_hash_offset += len as u64;
-        }
     }
 
     meta_w.flush()?;
     meta_w.get_ref().sync_all()?;
-    hash_w.flush()?;
-    hash_w.get_ref().sync_all()?;
 
     let dense_points = write_node_vector_sidecars_from_meta(seg_dir, segments, node_metas)?;
 
@@ -2551,12 +2820,13 @@ mod tests {
         assert!(seg_dir.join("format.ver").exists());
         assert!(seg_dir.join("node_type_index.dat").exists());
         assert!(seg_dir.join("edge_type_index.dat").exists());
-        assert!(seg_dir.join("prop_index.dat").exists());
         assert!(seg_dir.join("edge_triple_index.dat").exists());
         // V5 sidecar files
         assert!(seg_dir.join("node_meta.dat").exists());
         assert!(seg_dir.join("edge_meta.dat").exists());
-        assert!(seg_dir.join("node_prop_hashes.dat").exists());
+        assert!(!seg_dir.join("prop_index.dat").exists());
+        assert!(!seg_dir.join("node_prop_hashes.dat").exists());
+        assert!(!seg_dir.join(SECONDARY_INDEX_DIRNAME).exists());
         assert!(!seg_dir.join(NODE_VECTOR_META_FILENAME).exists());
         assert!(!seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME).exists());
         assert!(!seg_dir.join(NODE_SPARSE_VECTOR_BLOB_FILENAME).exists());
@@ -2808,7 +3078,7 @@ mod tests {
         assert_eq!(node_data[0].0, 1);
         assert_eq!(node_data[1].0, 2);
 
-        write_node_meta_and_prop_hashes(dir.path(), &node_data, &nodes).unwrap();
+        write_node_meta(dir.path(), &node_data, &nodes).unwrap();
 
         let meta = fs::read(dir.path().join("node_meta.dat")).unwrap();
         let count = u64::from_le_bytes(meta[0..8].try_into().unwrap());
@@ -2829,9 +3099,9 @@ mod tests {
         let key_len = u16::from_le_bytes(meta[off + 36..off + 38].try_into().unwrap());
         assert_eq!(key_len, 5); // "alice"
 
-        // Node 1 has 2 props ("name", "score"), node 2 has 0
+        // CP2 stops emitting legacy property hash metadata for new segments.
         let prop_hash_count = u32::from_le_bytes(meta[off + 46..off + 50].try_into().unwrap());
-        assert_eq!(prop_hash_count, 2);
+        assert_eq!(prop_hash_count, 0);
 
         // Second entry (node_id=2)
         let off2 = 8 + 60; // NODE_META_ENTRY_SIZE = 60
@@ -2841,11 +3111,7 @@ mod tests {
         assert_eq!(type_id2, 2);
         let prop_hash_count2 = u32::from_le_bytes(meta[off2 + 46..off2 + 50].try_into().unwrap());
         assert_eq!(prop_hash_count2, 0);
-
-        // Verify prop hashes file
-        let hashes = fs::read(dir.path().join("node_prop_hashes.dat")).unwrap();
-        // Node 1: 2 props × 16 bytes = 32 bytes, node 2: 0 props
-        assert_eq!(hashes.len(), 32);
+        assert!(!dir.path().join("node_prop_hashes.dat").exists());
     }
 
     #[test]
@@ -2896,8 +3162,99 @@ mod tests {
 
         let emeta = fs::read(dir.path().join("edge_meta.dat")).unwrap();
         assert_eq!(u64::from_le_bytes(emeta[0..8].try_into().unwrap()), 0);
+        assert!(!dir.path().join("node_prop_hashes.dat").exists());
+    }
 
-        let hashes = fs::read(dir.path().join("node_prop_hashes.dat")).unwrap();
-        assert_eq!(hashes.len(), 0);
+    #[test]
+    fn test_write_segment_with_declared_equality_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+
+        let mut mt = Memtable::new();
+        let mut red_props = BTreeMap::new();
+        red_props.insert("color".to_string(), PropValue::String("red".to_string()));
+        let mut green_props = BTreeMap::new();
+        green_props.insert("color".to_string(), PropValue::String("green".to_string()));
+
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "apple".to_string(),
+                props: red_props.clone(),
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 2,
+                type_id: 1,
+                key: "berry".to_string(),
+                props: red_props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 3,
+                type_id: 1,
+                key: "lime".to_string(),
+                props: green_props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 7,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        };
+        mt.register_secondary_index(&entry);
+
+        write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, std::slice::from_ref(&entry))
+            .unwrap();
+
+        assert!(!seg_dir.join("prop_index.dat").exists());
+        assert!(!seg_dir.join("node_prop_hashes.dat").exists());
+        assert!(node_prop_eq_sidecar_path(&seg_dir, entry.index_id).exists());
+
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let green_hash = hash_prop_value(&PropValue::String("green".to_string()));
+
+        let mut reds = reader
+            .find_nodes_by_secondary_eq_index(entry.index_id, red_hash)
+            .unwrap();
+        reds.sort_unstable();
+        assert_eq!(reds, vec![1, 2]);
+        assert_eq!(
+            reader
+                .find_nodes_by_secondary_eq_index(entry.index_id, green_hash)
+                .unwrap(),
+            vec![3]
+        );
     }
 }

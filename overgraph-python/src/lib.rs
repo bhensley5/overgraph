@@ -5,15 +5,17 @@ use eg::{
     ComponentOptions, DatabaseEngine, DbOptions, DbStats, DegreeOptions, DenseMetric,
     DenseVectorConfig, Direction, EdgeInput, EdgeRecord, EngineError, ExportOptions, FusionMode,
     GraphPatch, HnswConfig, IsConnectedOptions, NeighborEntry, NeighborOptions, NodeIdMap,
-    NodeInput, NodeRecord, PageRequest, PprAlgorithm, PprOptions, PprResult, PropValue,
-    PrunePolicy, PruneResult, ScoringMode, ShortestPath, ShortestPathOptions, Subgraph,
+    NodeInput, NodePropertyIndexInfo, NodeRecord, PageRequest, PprAlgorithm, PprOptions, PprResult,
+    PropValue, PropertyRangeBound, PropertyRangeCursor, PropertyRangePageRequest,
+    PropertyRangePageResult, PrunePolicy, PruneResult, ScoringMode, SecondaryIndexKind,
+    SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPath, ShortestPathOptions, Subgraph,
     SubgraphOptions, TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult,
     TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest,
     VectorSearchScope, WalSyncMode,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyList};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -308,6 +310,48 @@ impl OverGraph {
         })
     }
 
+    #[pyo3(signature = (type_id, prop_key, kind, *, domain=None))]
+    fn ensure_node_property_index(
+        &self,
+        py: Python<'_>,
+        type_id: u32,
+        prop_key: String,
+        kind: &str,
+        domain: Option<&str>,
+    ) -> PyResult<PyNodePropertyIndexInfo> {
+        let kind = parse_secondary_index_kind(kind, domain)?;
+        with_engine(self, py, move |eng| {
+            Ok(PyNodePropertyIndexInfo::from(
+                eng.ensure_node_property_index(type_id, &prop_key, kind.clone())?,
+            ))
+        })
+    }
+
+    #[pyo3(signature = (type_id, prop_key, kind, *, domain=None))]
+    fn drop_node_property_index(
+        &self,
+        py: Python<'_>,
+        type_id: u32,
+        prop_key: String,
+        kind: &str,
+        domain: Option<&str>,
+    ) -> PyResult<bool> {
+        let kind = parse_secondary_index_kind(kind, domain)?;
+        with_engine(self, py, move |eng| {
+            eng.drop_node_property_index(type_id, &prop_key, kind.clone())
+        })
+    }
+
+    fn list_node_property_indexes(&self, py: Python<'_>) -> PyResult<Vec<PyNodePropertyIndexInfo>> {
+        with_engine_ref(self, py, |eng| {
+            Ok(eng
+                .list_node_property_indexes()
+                .into_iter()
+                .map(PyNodePropertyIndexInfo::from)
+                .collect())
+        })
+    }
+
     fn nodes_by_type(&self, py: Python<'_>, type_id: u32) -> PyResult<IdArray> {
         with_engine_ref(self, py, move |eng| {
             Ok(IdArray {
@@ -362,6 +406,29 @@ impl OverGraph {
         with_engine_ref(self, py, move |eng| {
             Ok(IdArray {
                 ids: Arc::new(eng.find_nodes_by_time_range(type_id, from_ms, to_ms)?),
+            })
+        })
+    }
+
+    #[pyo3(signature = (type_id, prop_key, lower=None, upper=None))]
+    fn find_nodes_range(
+        &self,
+        py: Python<'_>,
+        type_id: u32,
+        prop_key: String,
+        lower: Option<PyPropertyRangeBound>,
+        upper: Option<PyPropertyRangeBound>,
+    ) -> PyResult<IdArray> {
+        let lower = lower.map(PropertyRangeBound::from);
+        let upper = upper.map(PropertyRangeBound::from);
+        with_engine_ref(self, py, move |eng| {
+            Ok(IdArray {
+                ids: Arc::new(eng.find_nodes_range(
+                    type_id,
+                    &prop_key,
+                    lower.as_ref(),
+                    upper.as_ref(),
+                )?),
             })
         })
     }
@@ -933,6 +1000,36 @@ impl OverGraph {
         })
     }
 
+    #[pyo3(signature = (type_id, prop_key, lower=None, upper=None, *, limit=None, after=None))]
+    fn find_nodes_range_paged(
+        &self,
+        py: Python<'_>,
+        type_id: u32,
+        prop_key: String,
+        lower: Option<PyPropertyRangeBound>,
+        upper: Option<PyPropertyRangeBound>,
+        limit: Option<usize>,
+        after: Option<PyPropertyRangeCursor>,
+    ) -> PyResult<PyPropertyRangePageResult> {
+        let lower = lower.map(PropertyRangeBound::from);
+        let upper = upper.map(PropertyRangeBound::from);
+        let page = PropertyRangePageRequest {
+            limit,
+            after: after.map(PropertyRangeCursor::from),
+        };
+        with_engine_ref(self, py, move |eng| {
+            Ok(PyPropertyRangePageResult::from(
+                eng.find_nodes_range_paged(
+                    type_id,
+                    &prop_key,
+                    lower.as_ref(),
+                    upper.as_ref(),
+                    &page,
+                )?,
+            ))
+        })
+    }
+
     #[pyo3(signature = (node_id, *, direction="outgoing", type_filter=None, limit=None, after=None, at_epoch=None, decay_lambda=None))]
     fn neighbors_paged(
         &self,
@@ -1409,6 +1506,183 @@ impl PyVectorHit {
             "VectorHit(node_id={}, score={:.4})",
             self.node_id, self.score
         )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyNodePropertyIndexInfo {
+    #[pyo3(get)]
+    pub index_id: u64,
+    #[pyo3(get)]
+    pub type_id: u32,
+    #[pyo3(get)]
+    pub prop_key: String,
+    #[pyo3(get)]
+    pub kind: String,
+    #[pyo3(get)]
+    pub domain: Option<String>,
+    #[pyo3(get)]
+    pub state: String,
+    #[pyo3(get)]
+    pub last_error: Option<String>,
+}
+
+impl From<NodePropertyIndexInfo> for PyNodePropertyIndexInfo {
+    fn from(info: NodePropertyIndexInfo) -> Self {
+        let (kind, domain) = secondary_index_kind_to_py(&info.kind);
+        PyNodePropertyIndexInfo {
+            index_id: info.index_id,
+            type_id: info.type_id,
+            prop_key: info.prop_key,
+            kind: kind.to_string(),
+            domain: domain.map(str::to_string),
+            state: secondary_index_state_to_py(info.state).to_string(),
+            last_error: info.last_error,
+        }
+    }
+}
+
+#[pymethods]
+impl PyNodePropertyIndexInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "NodePropertyIndexInfo(index_id={}, type_id={}, prop_key='{}', kind='{}', domain={:?}, state='{}')",
+            self.index_id, self.type_id, self.prop_key, self.kind, self.domain, self.state
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyPropertyRangeBound {
+    value_internal: PropValue,
+    #[pyo3(get)]
+    pub inclusive: bool,
+}
+
+impl From<PyPropertyRangeBound> for PropertyRangeBound {
+    fn from(bound: PyPropertyRangeBound) -> Self {
+        if bound.inclusive {
+            PropertyRangeBound::Included(bound.value_internal)
+        } else {
+            PropertyRangeBound::Excluded(bound.value_internal)
+        }
+    }
+}
+
+impl From<PropertyRangeBound> for PyPropertyRangeBound {
+    fn from(bound: PropertyRangeBound) -> Self {
+        match bound {
+            PropertyRangeBound::Included(value_internal) => PyPropertyRangeBound {
+                value_internal,
+                inclusive: true,
+            },
+            PropertyRangeBound::Excluded(value_internal) => PyPropertyRangeBound {
+                value_internal,
+                inclusive: false,
+            },
+        }
+    }
+}
+
+#[pymethods]
+impl PyPropertyRangeBound {
+    #[new]
+    #[pyo3(signature = (value, *, inclusive=true, domain))]
+    fn new(value: &Bound<'_, pyo3::PyAny>, inclusive: bool, domain: &str) -> PyResult<Self> {
+        let domain = parse_secondary_index_range_domain(domain)?;
+        Ok(PyPropertyRangeBound {
+            value_internal: py_numeric_to_prop_value(value.py(), value, domain)?,
+            inclusive,
+        })
+    }
+
+    #[getter]
+    fn value(&self, py: Python<'_>) -> PyResult<PyObject> {
+        prop_value_to_py_obj(py, &self.value_internal)
+    }
+
+    #[getter]
+    fn domain(&self) -> PyResult<String> {
+        Ok(range_domain_to_py(range_domain_from_prop_value(
+            &self.value_internal,
+            "property range bound",
+        )?)
+        .to_string())
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        let value = Python::with_gil(|py| prop_value_debug_repr(py, &self.value_internal))?;
+        Ok(format!(
+            "PropertyRangeBound(value={}, inclusive={}, domain='{}')",
+            value,
+            self.inclusive,
+            self.domain()?
+        ))
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyPropertyRangeCursor {
+    value_internal: PropValue,
+    #[pyo3(get)]
+    pub node_id: u64,
+}
+
+impl From<PyPropertyRangeCursor> for PropertyRangeCursor {
+    fn from(cursor: PyPropertyRangeCursor) -> Self {
+        PropertyRangeCursor {
+            value: cursor.value_internal,
+            node_id: cursor.node_id,
+        }
+    }
+}
+
+impl From<PropertyRangeCursor> for PyPropertyRangeCursor {
+    fn from(cursor: PropertyRangeCursor) -> Self {
+        PyPropertyRangeCursor {
+            value_internal: cursor.value,
+            node_id: cursor.node_id,
+        }
+    }
+}
+
+#[pymethods]
+impl PyPropertyRangeCursor {
+    #[new]
+    #[pyo3(signature = (value, node_id, *, domain))]
+    fn new(value: &Bound<'_, pyo3::PyAny>, node_id: u64, domain: &str) -> PyResult<Self> {
+        let domain = parse_secondary_index_range_domain(domain)?;
+        Ok(PyPropertyRangeCursor {
+            value_internal: py_numeric_to_prop_value(value.py(), value, domain)?,
+            node_id,
+        })
+    }
+
+    #[getter]
+    fn value(&self, py: Python<'_>) -> PyResult<PyObject> {
+        prop_value_to_py_obj(py, &self.value_internal)
+    }
+
+    #[getter]
+    fn domain(&self) -> PyResult<String> {
+        Ok(range_domain_to_py(range_domain_from_prop_value(
+            &self.value_internal,
+            "property range cursor",
+        )?)
+        .to_string())
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        let value = Python::with_gil(|py| prop_value_debug_repr(py, &self.value_internal))?;
+        Ok(format!(
+            "PropertyRangeCursor(value={}, node_id={}, domain='{}')",
+            value,
+            self.node_id,
+            self.domain()?
+        ))
     }
 }
 
@@ -1914,6 +2188,49 @@ impl PyNeighborPageResult {
 
 #[pyclass]
 #[derive(Clone)]
+pub struct PyPropertyRangePageResult {
+    #[pyo3(get)]
+    pub items: IdArray,
+    next_cursor: Option<PyPropertyRangeCursor>,
+}
+
+impl From<PropertyRangePageResult<u64>> for PyPropertyRangePageResult {
+    fn from(result: PropertyRangePageResult<u64>) -> Self {
+        PyPropertyRangePageResult {
+            items: IdArray {
+                ids: Arc::new(result.items),
+            },
+            next_cursor: result.next_cursor.map(PyPropertyRangeCursor::from),
+        }
+    }
+}
+
+#[pymethods]
+impl PyPropertyRangePageResult {
+    #[getter]
+    fn next_cursor(&self) -> Option<PyPropertyRangeCursor> {
+        self.next_cursor.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PropertyRangePageResult(count={}, has_next={})",
+            self.items.ids.len(),
+            self.next_cursor.is_some()
+        )
+    }
+
+    fn __len__(&self) -> usize {
+        self.items.ids.len()
+    }
+
+    fn __bool__(&self) -> bool {
+        !self.items.ids.is_empty()
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
 pub struct PyTraversalPageResult {
     items: Vec<PyTraversalHit>,
     next_cursor: Option<PyTraversalCursor>,
@@ -2165,6 +2482,111 @@ fn props_to_py(py: Python<'_>, props: &BTreeMap<String, PropValue>) -> PyResult<
         dict.set_item(k, prop_value_to_py_obj(py, v)?)?;
     }
     Ok(dict.into_any().unbind())
+}
+
+fn prop_value_debug_repr(py: Python<'_>, value: &PropValue) -> PyResult<String> {
+    prop_value_to_py_obj(py, value)?
+        .bind(py)
+        .repr()?
+        .extract()
+}
+
+fn parse_secondary_index_range_domain(domain: &str) -> PyResult<SecondaryIndexRangeDomain> {
+    match domain {
+        "int" => Ok(SecondaryIndexRangeDomain::Int),
+        "uint" => Ok(SecondaryIndexRangeDomain::UInt),
+        "float" => Ok(SecondaryIndexRangeDomain::Float),
+        other => Err(PyValueError::new_err(format!(
+            "Invalid range domain '{}'. Must be 'int', 'uint', or 'float'.",
+            other
+        ))),
+    }
+}
+
+fn range_domain_to_py(domain: SecondaryIndexRangeDomain) -> &'static str {
+    match domain {
+        SecondaryIndexRangeDomain::Int => "int",
+        SecondaryIndexRangeDomain::UInt => "uint",
+        SecondaryIndexRangeDomain::Float => "float",
+    }
+}
+
+fn secondary_index_state_to_py(state: SecondaryIndexState) -> &'static str {
+    match state {
+        SecondaryIndexState::Building => "building",
+        SecondaryIndexState::Ready => "ready",
+        SecondaryIndexState::Failed => "failed",
+    }
+}
+
+fn secondary_index_kind_to_py(kind: &SecondaryIndexKind) -> (&'static str, Option<&'static str>) {
+    match kind {
+        SecondaryIndexKind::Equality => ("equality", None),
+        SecondaryIndexKind::Range { domain } => ("range", Some(range_domain_to_py(*domain))),
+    }
+}
+
+fn parse_secondary_index_kind(kind: &str, domain: Option<&str>) -> PyResult<SecondaryIndexKind> {
+    match kind {
+        "equality" => {
+            if domain.is_some() {
+                return Err(PyValueError::new_err(
+                    "equality indexes do not accept a range domain",
+                ));
+            }
+            Ok(SecondaryIndexKind::Equality)
+        }
+        "range" => Ok(SecondaryIndexKind::Range {
+            domain: parse_secondary_index_range_domain(domain.ok_or_else(|| {
+                PyValueError::new_err("range indexes require domain='int', 'uint', or 'float'")
+            })?)?,
+        }),
+        other => Err(PyValueError::new_err(format!(
+            "Invalid index kind '{}'. Must be 'equality' or 'range'.",
+            other
+        ))),
+    }
+}
+
+fn range_domain_from_prop_value(
+    value: &PropValue,
+    context: &str,
+) -> PyResult<SecondaryIndexRangeDomain> {
+    match value {
+        PropValue::Int(_) => Ok(SecondaryIndexRangeDomain::Int),
+        PropValue::UInt(_) => Ok(SecondaryIndexRangeDomain::UInt),
+        PropValue::Float(value) if value.is_finite() => Ok(SecondaryIndexRangeDomain::Float),
+        _ => Err(PyValueError::new_err(format!(
+            "{} must use Int, UInt, or finite Float values",
+            context
+        ))),
+    }
+}
+
+fn py_numeric_to_prop_value(
+    _py: Python<'_>,
+    obj: &Bound<'_, pyo3::PyAny>,
+    domain: SecondaryIndexRangeDomain,
+) -> PyResult<PropValue> {
+    if obj.is_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(
+            "property range values must be numeric, not bool",
+        ));
+    }
+
+    match domain {
+        SecondaryIndexRangeDomain::Int => Ok(PropValue::Int(obj.extract::<i64>()?)),
+        SecondaryIndexRangeDomain::UInt => Ok(PropValue::UInt(obj.extract::<u64>()?)),
+        SecondaryIndexRangeDomain::Float => {
+            let value = obj.extract::<f64>()?;
+            if !value.is_finite() {
+                return Err(PyValueError::new_err(
+                    "property range float values must be finite",
+                ));
+            }
+            Ok(PropValue::Float(value))
+        }
+    }
 }
 
 fn convert_py_props(
@@ -2748,6 +3170,9 @@ fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNeighborEntry>()?;
     m.add_class::<PyTraversalHit>()?;
     m.add_class::<PyVectorHit>()?;
+    m.add_class::<PyNodePropertyIndexInfo>()?;
+    m.add_class::<PyPropertyRangeBound>()?;
+    m.add_class::<PyPropertyRangeCursor>()?;
     m.add_class::<PyTraversalCursor>()?;
     m.add_class::<PyShortestPath>()?;
     m.add_class::<PySubgraph>()?;
@@ -2760,6 +3185,7 @@ fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNodePageResult>()?;
     m.add_class::<PyEdgePageResult>()?;
     m.add_class::<PyNeighborPageResult>()?;
+    m.add_class::<PyPropertyRangePageResult>()?;
     m.add_class::<PyTraversalPageResult>()?;
     m.add_class::<PyPprApproxMeta>()?;
     m.add_class::<PyPprResult>()?;

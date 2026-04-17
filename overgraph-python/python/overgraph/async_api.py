@@ -18,10 +18,14 @@ from .overgraph import (
     PyNamedPrunePolicy,
     PyNeighborEntry,
     PyNeighborPageResult,
+    PyNodePropertyIndexInfo,
     PyNodePageResult,
     PyNodeRecord,
     PyPatchResult,
     PyPprResult,
+    PyPropertyRangeBound,
+    PyPropertyRangeCursor,
+    PyPropertyRangePageResult,
     PyPruneResult,
     PySegmentInfo,
     PyShortestPath,
@@ -146,6 +150,41 @@ class AsyncOverGraph:
     async def find_nodes(self, type_id: int, prop_key: str, prop_value: Any) -> IdArray:
         return await asyncio.to_thread(self._db.find_nodes, type_id, prop_key, prop_value)
 
+    async def ensure_node_property_index(
+        self,
+        type_id: int,
+        prop_key: str,
+        kind: str,
+        *,
+        domain: str | None = None,
+    ) -> PyNodePropertyIndexInfo:
+        return await asyncio.to_thread(
+            self._db.ensure_node_property_index,
+            type_id,
+            prop_key,
+            kind,
+            domain=domain,
+        )
+
+    async def drop_node_property_index(
+        self,
+        type_id: int,
+        prop_key: str,
+        kind: str,
+        *,
+        domain: str | None = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._db.drop_node_property_index,
+            type_id,
+            prop_key,
+            kind,
+            domain=domain,
+        )
+
+    async def list_node_property_indexes(self) -> list[PyNodePropertyIndexInfo]:
+        return await asyncio.to_thread(self._db.list_node_property_indexes)
+
     async def nodes_by_type(self, type_id: int) -> IdArray:
         return await asyncio.to_thread(self._db.nodes_by_type, type_id)
 
@@ -169,6 +208,17 @@ class AsyncOverGraph:
     ) -> IdArray:
         return await asyncio.to_thread(
             self._db.find_nodes_by_time_range, type_id, from_ms, to_ms
+        )
+
+    async def find_nodes_range(
+        self,
+        type_id: int,
+        prop_key: str,
+        lower: PyPropertyRangeBound | None = None,
+        upper: PyPropertyRangeBound | None = None,
+    ) -> IdArray:
+        return await asyncio.to_thread(
+            self._db.find_nodes_range, type_id, prop_key, lower, upper
         )
 
     # --- Traversal ---
@@ -486,6 +536,26 @@ class AsyncOverGraph:
         return await asyncio.to_thread(
             self._db.find_nodes_by_time_range_paged, type_id, from_ms, to_ms,
             limit=limit, after=after,
+        )
+
+    async def find_nodes_range_paged(
+        self,
+        type_id: int,
+        prop_key: str,
+        lower: PyPropertyRangeBound | None = None,
+        upper: PyPropertyRangeBound | None = None,
+        *,
+        limit: int | None = None,
+        after: PyPropertyRangeCursor | None = None,
+    ) -> PyPropertyRangePageResult:
+        return await asyncio.to_thread(
+            self._db.find_nodes_range_paged,
+            type_id,
+            prop_key,
+            lower,
+            upper,
+            limit=limit,
+            after=after,
         )
 
     async def neighbors_paged(
