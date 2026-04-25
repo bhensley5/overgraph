@@ -10,7 +10,7 @@ OverGraph is an embedded, in-process Rust graph database designed for high-perfo
 
 | Operation | Rust p95 | Node.js p95 | Python p95 | Rust ops/s | Node ops/s | Python ops/s |
 |---|---:|---:|---:|---:|---:|---:|
-| **Point read** (get_node) | 0.21 us | 1.00 us | 0.46 us | 5,502,063 | 1,345,510 | 2,770,851 |
+| **Point read** (get_node) | 0.034 us | 0.824 us | 0.284 us | 29,411,765 | 1,213,592 | 3,521,127 |
 | **Write node** (upsert_node) | 2.2 us | 3.4 us | 2.5 us | 807,436 | 477,603 | 641,735 |
 | **Write node fixed** (upsert_node_fixed_key) | 1.3 us | 1.8 us | 1.5 us | 961,019 | 565,048 | 713,203 |
 | **Write edge** (upsert_edge) | 2.6 us | 2.6 us | 2.7 us | 668,717 | 628,082 | 631,149 |
@@ -21,7 +21,7 @@ OverGraph is an embedded, in-process Rust graph database designed for high-perfo
 | **Time-range scan** | 134.7 us | 141.4 us | 187.8 us | 8,298 | 7,427 | 5,611 |
 | **PageRank** (500 nodes) | 254.5 us | 250.0 us | 301.6 us | 4,256 | 4,333 | 3,486 |
 | **Export adjacency** (1K nodes, 5K edges) | 517.7 us | 560.4 us | 522.3 us | 2,122 | 1,946 | 2,049 |
-| **Batch write** (100 nodes) | 236.0 us | 366.3 us | 180.3 us | 624,605 | 423,387 | 646,152 |
+| **Batch write** (100 nodes) | 77.261 us | 207.561 us | 21.561 us | 1,294,314 | 481,786 | 4,638,004 |
 | **Flush to disk** | 183.9 ms | 164.8 ms | 162.1 ms | 9 | 9 | 9 |
 
 ## Medium Profile (100K nodes / 500K edges)
@@ -66,9 +66,9 @@ OverGraph is an embedded, in-process Rust graph database designed for high-perfo
 
 ### Sub-microsecond point reads
 
-The Rust core reads a node in **200-210 nanoseconds**, which translates to 5-7 million lookups per second on a single thread. At this latency, you're bounded by CPU cache access time, not software overhead. Even through the Node.js FFI layer, point reads complete in under 1 microsecond.
+The Rust core reads a node in **34 nanoseconds**, which translates to about 29 million lookups per second on a single thread. At this latency, you're bounded by CPU cache access time, not software overhead. Even through the Node.js FFI layer, point reads complete in under 1 microsecond.
 
-For perspective: Neo4j point reads are typically 50-200 microseconds (network + JVM overhead). A single OverGraph point read is **200-1000x faster**. Even compared to embedded alternatives like SQLite with graph queries (5-50 microseconds), OverGraph is **20-400x faster**.
+For perspective: Neo4j point reads are typically 50-200 microseconds (network + JVM overhead). A single OverGraph point read is **1,400-5,800x faster**. Even compared to embedded alternatives like SQLite with graph queries (5-50 microseconds), OverGraph is **140-1,400x faster**.
 
 ### Near-memory-speed traversals
 
@@ -84,7 +84,7 @@ The new fixed-state write benchmarks isolate pure write cost from memtable growt
 
 Growth writes (unique key per iteration, memtable growing) run at **2-2.2 microseconds**, still **700-800K ops/s** in Rust. The difference between fixed and growth p95 is the BTreeMap lookup cost as the memtable grows.
 
-Batch writes reach **576K nodes/s** in Rust and 428-519K/s through the connectors at 1M-node scale. This is competitive with dedicated bulk-load tools in systems orders of magnitude larger.
+Batch writes reach **1.29M nodes/s** in Rust and 482K-4.64M/s through the connectors. This is competitive with dedicated bulk-load tools in systems orders of magnitude larger.
 
 For comparison: Neo4j write throughput is typically 5-20K/s; DGraph achieves 10-50K/s. OverGraph sustains **5-20x higher write throughput** with durable commits.
 
@@ -100,7 +100,7 @@ Both language connectors achieve near-parity with Rust on most operations:
 
 | Operation | Node.js overhead | Python overhead |
 |---|---:|---:|
-| Point reads (get_node) | 4-5x | 2-2.4x |
+| Point reads (get_node) | 24.2x | 8.4x |
 | Fixed-state writes (upsert_node_fixed_key) | 1.4-1.8x | 1.2-1.5x |
 | Traversals (neighbors) | 1.5-2.7x | 1.3-2.8x |
 | Graph export (adjacency) | 1.0-1.1x | 1.0-1.2x |
@@ -108,7 +108,7 @@ Both language connectors achieve near-parity with Rust on most operations:
 | Growth writes (upsert_node) | 1.5-2.0x | 1.1-1.3x |
 | Flush (disk sync) | ~1.0x | ~1.0x |
 
-The only scenario with meaningful connector overhead is `get_node`, where the absolute Rust latency is so small (~26ns) that any FFI boundary crossing is proportionally significant. In absolute terms, a Node.js point read still completes in under 1 microsecond, fast enough that your application could perform **thousands of graph lookups** in the time budget of a single LLM API call.
+The only scenario with meaningful connector overhead is `get_node`, where the absolute Rust latency is so small (~34ns) that any FFI boundary crossing is proportionally significant. In absolute terms, a Node.js point read still completes in under 1 microsecond, fast enough that your application could perform **thousands of graph lookups** in the time budget of a single LLM API call.
 
 The fixed-state write benchmarks (S-CRUD-004, S-CRUD-005) cleanly isolate FFI overhead from memtable growth noise. Node.js adds 0.5-0.7 microseconds of fixed overhead per write call; Python adds 0.2-0.4 microseconds.
 
@@ -116,7 +116,7 @@ The fixed-state write benchmarks (S-CRUD-004, S-CRUD-005) cleanly isolate FFI ov
 
 A key design goal was that core operations should not degrade as the dataset grows. The numbers confirm this:
 
-- `get_node` stays at ~26ns from 10K to 1M nodes. **Constant time.**
+- `get_node` stays at ~34ns from 10K to 1M nodes. **Constant time.**
 - `neighbors` stays at 2.1-3.7 microseconds regardless of graph size; the adjacency index provides O(1) access.
 - Fixed-state writes stay at 0.4-1.3 microseconds across all scales. **Pure in-memory cost, scale-independent.**
 - Growth write latency is stable at 2-2.8 microseconds across all scales.

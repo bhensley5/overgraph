@@ -47,7 +47,7 @@ fn test_inspect_with_data() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..10 {
         db.upsert_node(1, &format!("node_{}", i), UpsertNodeOptions::default())
@@ -95,7 +95,7 @@ fn test_inspect_multiple_segments() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..5 {
         db.upsert_node(1, &format!("batch1_{}", i), UpsertNodeOptions::default())
@@ -134,7 +134,7 @@ fn test_inspect_with_prune_policies() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     db.set_prune_policy(
         "old_memories",
@@ -172,7 +172,7 @@ fn test_inspect_json_with_data() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..5 {
         db.upsert_node(1, &format!("node_{}", i), UpsertNodeOptions::default())

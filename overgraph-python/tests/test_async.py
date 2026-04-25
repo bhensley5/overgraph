@@ -1,5 +1,6 @@
 """Tests for AsyncOverGraph wrapper."""
 
+import asyncio
 import os
 import shutil
 import tempfile
@@ -160,6 +161,82 @@ class TestAsyncBatch:
             ],
         })
         assert len(result.node_ids) == 2
+
+
+class TestAsyncTransactions:
+    @pytest.mark.asyncio
+    async def test_async_stage_read_and_commit(self, async_db):
+        txn = await async_db.begin_write_txn()
+        await txn.stage(
+            [
+                {
+                    "op": "upsert_node",
+                    "alias": "alice",
+                    "type_id": 1,
+                    "key": "alice",
+                    "props": {"name": "Alice"},
+                },
+                {"op": "upsert_node", "alias": "bob", "type_id": 1, "key": "bob"},
+                {
+                    "op": "upsert_edge",
+                    "alias": "knows",
+                    "from": {"local": "alice"},
+                    "to": {"local": "bob"},
+                    "type_id": 7,
+                },
+            ]
+        )
+
+        staged = await txn.get_node({"local": "alice"})
+        assert staged is not None
+        assert staged["id"] is None
+        assert staged["props"]["name"] == "Alice"
+
+        result = await txn.commit()
+        assert result.node_aliases["alice"] == result.node_ids[0]
+        assert result.node_aliases["bob"] == result.node_ids[1]
+        assert result.edge_aliases["knows"] == result.edge_ids[0]
+        assert await async_db.get_node(result.node_aliases["alice"]) is not None
+
+    @pytest.mark.asyncio
+    async def test_async_builders_and_rollback(self, async_db):
+        txn = await async_db.begin_write_txn()
+        alice = await txn.upsert_node_as("alice", 1, "alice", props={"mood": "staged"})
+        bob = await txn.upsert_node_as("bob", 1, "bob")
+        await txn.upsert_edge_as("knows", alice, bob, 9)
+
+        staged = await txn.get_node_by_key(1, "alice")
+        assert staged is not None
+        assert staged["props"]["mood"] == "staged"
+
+        await txn.rollback()
+        assert await async_db.get_node_by_key(1, "alice") is None
+
+    @pytest.mark.asyncio
+    async def test_async_transaction_operations_preserve_call_order(self, async_db):
+        txn = await async_db.begin_write_txn()
+        stage_task = asyncio.create_task(
+            txn.stage(
+                [
+                    {
+                        "op": "upsert_node",
+                        "alias": "queued",
+                        "type_id": 1,
+                        "key": "queued",
+                    }
+                ]
+            )
+        )
+        read_task = asyncio.create_task(txn.get_node({"local": "queued"}))
+        commit_task = asyncio.create_task(txn.commit())
+
+        await stage_task
+        staged = await read_task
+        result = await commit_task
+
+        assert staged is not None
+        assert staged["local"] == "queued"
+        assert result.node_aliases["queued"] == result.node_ids[0]
 
 
 class TestAsyncQueries:

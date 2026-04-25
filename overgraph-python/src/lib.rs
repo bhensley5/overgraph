@@ -10,15 +10,16 @@ use eg::{
     PropertyRangePageResult, PrunePolicy, PruneResult, ScoringMode, SecondaryIndexKind,
     SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPath, ShortestPathOptions, Subgraph,
     SubgraphOptions, TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult,
-    TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest,
-    VectorSearchScope, WalSyncMode,
+    TraverseOptions, TxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef,
+    TxnNodeView, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest,
+    VectorSearchScope, WalSyncMode, WriteTxn,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 // ============================================================
 // Error type
@@ -48,21 +49,17 @@ struct InnerDb {
 
 #[pyclass]
 pub struct OverGraph {
-    inner: Arc<RwLock<Option<InnerDb>>>,
+    inner: Arc<Mutex<Option<InnerDb>>>,
 }
 
 /// Execute a closure with mutable engine access, releasing the GIL.
 fn with_engine<F, T>(db: &OverGraph, py: Python<'_>, f: F) -> PyResult<T>
 where
-    F: FnOnce(&mut DatabaseEngine) -> Result<T, EngineError> + Send,
+    F: FnOnce(&DatabaseEngine) -> Result<T, EngineError> + Send,
     T: Send,
 {
-    let inner = db.inner.clone();
-    py.allow_threads(move || {
-        let mut guard = inner.write().map_err(lock_err)?;
-        let db = guard.as_mut().ok_or_else(closed_err)?;
-        f(&mut db.engine).map_err(to_py_err)
-    })
+    let engine = clone_engine_handle(&db.inner)?;
+    py.allow_threads(move || f(&engine).map_err(to_py_err))
 }
 
 /// Execute a closure with shared engine access, releasing the GIL.
@@ -71,12 +68,14 @@ where
     F: FnOnce(&DatabaseEngine) -> Result<T, EngineError> + Send,
     T: Send,
 {
-    let inner = db.inner.clone();
-    py.allow_threads(move || {
-        let guard = inner.read().map_err(lock_err)?;
-        let db = guard.as_ref().ok_or_else(closed_err)?;
-        f(&db.engine).map_err(to_py_err)
-    })
+    let engine = clone_engine_handle(&db.inner)?;
+    py.allow_threads(move || f(&engine).map_err(to_py_err))
+}
+
+fn clone_engine_handle(inner: &Arc<Mutex<Option<InnerDb>>>) -> PyResult<DatabaseEngine> {
+    let guard = inner.lock().map_err(lock_err)?;
+    let db = guard.as_ref().ok_or_else(closed_err)?;
+    Ok(db.engine.clone())
 }
 
 #[pymethods]
@@ -92,7 +91,7 @@ impl OverGraph {
         };
         let engine = DatabaseEngine::open(Path::new(path), &opts).map_err(to_py_err)?;
         Ok(OverGraph {
-            inner: Arc::new(RwLock::new(Some(InnerDb { engine }))),
+            inner: Arc::new(Mutex::new(Some(InnerDb { engine }))),
         })
     }
 
@@ -100,12 +99,15 @@ impl OverGraph {
     fn close(&self, py: Python<'_>, force: bool) -> PyResult<()> {
         let inner = self.inner.clone();
         py.allow_threads(move || {
-            let mut guard = inner.write().map_err(lock_err)?;
-            if let Some(db) = guard.take() {
+            let engine = {
+                let mut guard = inner.lock().map_err(lock_err)?;
+                guard.take().map(|db| db.engine)
+            };
+            if let Some(engine) = engine {
                 if force {
-                    db.engine.close_fast().map_err(to_py_err)?;
+                    engine.close_fast().map_err(to_py_err)?;
                 } else {
-                    db.engine.close().map_err(to_py_err)?;
+                    engine.close().map_err(to_py_err)?;
                 }
             }
             Ok(())
@@ -129,7 +131,7 @@ impl OverGraph {
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<PyDbStats> {
-        with_engine_ref(self, py, |eng| Ok(PyDbStats::from(eng.stats())))
+        with_engine_ref(self, py, |eng| Ok(PyDbStats::from(eng.stats()?)))
     }
 
     // --- Single CRUD ---
@@ -293,6 +295,13 @@ impl OverGraph {
         })
     }
 
+    fn begin_write_txn(&self, py: Python<'_>) -> PyResult<PyWriteTxn> {
+        let txn = with_engine_ref(self, py, |eng| eng.begin_write_txn())?;
+        Ok(PyWriteTxn {
+            inner: Arc::new(Mutex::new(Some(txn))),
+        })
+    }
+
     // --- Queries ---
 
     fn find_nodes(
@@ -345,7 +354,7 @@ impl OverGraph {
     fn list_node_property_indexes(&self, py: Python<'_>) -> PyResult<Vec<PyNodePropertyIndexInfo>> {
         with_engine_ref(self, py, |eng| {
             Ok(eng
-                .list_node_property_indexes()
+                .list_node_property_indexes()?
                 .into_iter()
                 .map(PyNodePropertyIndexInfo::from)
                 .collect())
@@ -807,7 +816,7 @@ impl OverGraph {
     fn list_prune_policies(&self, py: Python<'_>) -> PyResult<Vec<PyNamedPrunePolicy>> {
         with_engine_ref(self, py, |eng| {
             Ok(eng
-                .list_prune_policies()
+                .list_prune_policies()?
                 .into_iter()
                 .map(|(name, policy)| PyNamedPrunePolicy {
                     name,
@@ -836,10 +845,7 @@ impl OverGraph {
     }
 
     fn ingest_mode(&self, py: Python<'_>) -> PyResult<()> {
-        with_engine(self, py, |eng| {
-            eng.ingest_mode();
-            Ok(())
-        })
+        with_engine(self, py, |eng| eng.ingest_mode())
     }
 
     fn end_ingest(&self, py: Python<'_>) -> PyResult<Option<PyCompactionStats>> {
@@ -859,7 +865,7 @@ impl OverGraph {
         py: Python<'_>,
         callback: PyObject,
     ) -> PyResult<Option<PyCompactionStats>> {
-        let inner = self.inner.clone();
+        let engine = clone_engine_handle(&self.inner)?;
         let captured_err: Arc<std::sync::Mutex<Option<PyErr>>> =
             Arc::new(std::sync::Mutex::new(None));
         let err_clone = captured_err.clone();
@@ -867,10 +873,7 @@ impl OverGraph {
         // for callback invocations. Use a closure that acquires the GIL
         // only when calling the Python callback.
         let engine_result = py.allow_threads(move || {
-            let mut guard = inner.write().map_err(lock_err)?;
-            let db = guard.as_mut().ok_or_else(closed_err)?;
-            let result = db
-                .engine
+            let result = engine
                 .compact_with_progress(|progress| {
                     Python::with_gil(|py| {
                         let py_progress = PyCompactionProgress::from(progress);
@@ -1221,6 +1224,211 @@ impl OverGraph {
     }
 }
 
+#[pyclass]
+pub struct PyWriteTxn {
+    inner: Arc<Mutex<Option<WriteTxn>>>,
+}
+
+#[pymethods]
+impl PyWriteTxn {
+    #[pyo3(signature = (type_id, key, *, props=None, weight=1.0, dense_vector=None, sparse_vector=None))]
+    fn upsert_node(
+        &self,
+        py: Python<'_>,
+        type_id: u32,
+        key: String,
+        props: Option<&Bound<'_, PyDict>>,
+        weight: f64,
+        dense_vector: Option<Vec<f32>>,
+        sparse_vector: Option<Vec<(u32, f32)>>,
+    ) -> PyResult<PyObject> {
+        let options = UpsertNodeOptions {
+            props: convert_py_props(py, props)?,
+            weight: weight as f32,
+            dense_vector,
+            sparse_vector,
+        };
+        with_py_txn(&self.inner, |txn| {
+            txn.upsert_node(type_id, &key, options).map_err(to_py_err)
+        })?;
+        txn_node_ref_to_py(py, TxnNodeRef::Key { type_id, key })
+    }
+
+    #[pyo3(signature = (alias, type_id, key, *, props=None, weight=1.0, dense_vector=None, sparse_vector=None))]
+    fn upsert_node_as(
+        &self,
+        py: Python<'_>,
+        alias: String,
+        type_id: u32,
+        key: String,
+        props: Option<&Bound<'_, PyDict>>,
+        weight: f64,
+        dense_vector: Option<Vec<f32>>,
+        sparse_vector: Option<Vec<(u32, f32)>>,
+    ) -> PyResult<PyObject> {
+        let options = UpsertNodeOptions {
+            props: convert_py_props(py, props)?,
+            weight: weight as f32,
+            dense_vector,
+            sparse_vector,
+        };
+        with_py_txn(&self.inner, |txn| {
+            txn.upsert_node_as(&alias, type_id, &key, options)
+                .map_err(to_py_err)
+                .and_then(|r| txn_node_ref_to_py(py, r))
+        })
+    }
+
+    #[pyo3(signature = (from_ref, to_ref, type_id, *, props=None, weight=1.0, valid_from=None, valid_to=None))]
+    fn upsert_edge(
+        &self,
+        py: Python<'_>,
+        from_ref: &Bound<'_, PyDict>,
+        to_ref: &Bound<'_, PyDict>,
+        type_id: u32,
+        props: Option<&Bound<'_, PyDict>>,
+        weight: f64,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+    ) -> PyResult<PyObject> {
+        let from = parse_txn_node_ref(from_ref)?;
+        let to = parse_txn_node_ref(to_ref)?;
+        let options = UpsertEdgeOptions {
+            props: convert_py_props(py, props)?,
+            weight: weight as f32,
+            valid_from,
+            valid_to,
+        };
+        with_py_txn(&self.inner, |txn| {
+            txn.upsert_edge(from.clone(), to.clone(), type_id, options)
+                .map_err(to_py_err)
+        })?;
+        txn_edge_ref_to_py(py, TxnEdgeRef::Triple { from, to, type_id })
+    }
+
+    #[pyo3(signature = (alias, from_ref, to_ref, type_id, *, props=None, weight=1.0, valid_from=None, valid_to=None))]
+    fn upsert_edge_as(
+        &self,
+        py: Python<'_>,
+        alias: String,
+        from_ref: &Bound<'_, PyDict>,
+        to_ref: &Bound<'_, PyDict>,
+        type_id: u32,
+        props: Option<&Bound<'_, PyDict>>,
+        weight: f64,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+    ) -> PyResult<PyObject> {
+        let from = parse_txn_node_ref(from_ref)?;
+        let to = parse_txn_node_ref(to_ref)?;
+        let options = UpsertEdgeOptions {
+            props: convert_py_props(py, props)?,
+            weight: weight as f32,
+            valid_from,
+            valid_to,
+        };
+        with_py_txn(&self.inner, |txn| {
+            txn.upsert_edge_as(&alias, from, to, type_id, options)
+                .map_err(to_py_err)
+                .and_then(|r| txn_edge_ref_to_py(py, r))
+        })
+    }
+
+    fn delete_node(&self, target: &Bound<'_, PyDict>) -> PyResult<()> {
+        let target = parse_txn_node_ref(target)?;
+        with_py_txn(&self.inner, |txn| {
+            txn.delete_node(target).map_err(to_py_err)
+        })
+    }
+
+    fn delete_edge(&self, target: &Bound<'_, PyDict>) -> PyResult<()> {
+        let target = parse_txn_edge_ref(target)?;
+        with_py_txn(&self.inner, |txn| {
+            txn.delete_edge(target).map_err(to_py_err)
+        })
+    }
+
+    fn invalidate_edge(&self, target: &Bound<'_, PyDict>, valid_to: i64) -> PyResult<()> {
+        let target = parse_txn_edge_ref(target)?;
+        with_py_txn(&self.inner, |txn| {
+            txn.invalidate_edge(target, valid_to).map_err(to_py_err)
+        })
+    }
+
+    fn stage(&self, py: Python<'_>, operations: &Bound<'_, PyList>) -> PyResult<()> {
+        let intents = parse_txn_operations(py, operations)?;
+        with_py_txn(&self.inner, |txn| {
+            txn.stage_intents(intents).map_err(to_py_err)
+        })
+    }
+
+    fn get_node(&self, py: Python<'_>, target: &Bound<'_, PyDict>) -> PyResult<Option<PyObject>> {
+        let target = parse_txn_node_ref(target)?;
+        with_py_txn_ref(&self.inner, |txn| {
+            txn.get_node(target)
+                .map_err(to_py_err)?
+                .map(|v| txn_node_view_to_py(py, v))
+                .transpose()
+        })
+    }
+
+    fn get_edge(&self, py: Python<'_>, target: &Bound<'_, PyDict>) -> PyResult<Option<PyObject>> {
+        let target = parse_txn_edge_ref(target)?;
+        with_py_txn_ref(&self.inner, |txn| {
+            txn.get_edge(target)
+                .map_err(to_py_err)?
+                .map(|v| txn_edge_view_to_py(py, v))
+                .transpose()
+        })
+    }
+
+    fn get_node_by_key(
+        &self,
+        py: Python<'_>,
+        type_id: u32,
+        key: String,
+    ) -> PyResult<Option<PyObject>> {
+        with_py_txn_ref(&self.inner, |txn| {
+            txn.get_node_by_key(type_id, &key)
+                .map_err(to_py_err)?
+                .map(|v| txn_node_view_to_py(py, v))
+                .transpose()
+        })
+    }
+
+    fn get_edge_by_triple(
+        &self,
+        py: Python<'_>,
+        from_ref: &Bound<'_, PyDict>,
+        to_ref: &Bound<'_, PyDict>,
+        type_id: u32,
+    ) -> PyResult<Option<PyObject>> {
+        let from = parse_txn_node_ref(from_ref)?;
+        let to = parse_txn_node_ref(to_ref)?;
+        with_py_txn_ref(&self.inner, |txn| {
+            txn.get_edge_by_triple(from, to, type_id)
+                .map_err(to_py_err)?
+                .map(|v| txn_edge_view_to_py(py, v))
+                .transpose()
+        })
+    }
+
+    fn commit(&self, py: Python<'_>) -> PyResult<PyTxnCommitResult> {
+        let mut txn = {
+            let mut guard = self.inner.lock().map_err(lock_err)?;
+            guard
+                .take()
+                .ok_or_else(|| OverGraphError::new_err(EngineError::TxnClosed.to_string()))?
+        };
+        let result = py.allow_threads(move || txn.commit()).map_err(to_py_err)?;
+        Ok(PyTxnCommitResult::from(result))
+    }
+
+    fn rollback(&self) -> PyResult<()> {
+        with_py_txn_take(&self.inner, |txn| txn.rollback().map_err(to_py_err))
+    }
+}
+
 // ============================================================
 // Python-facing types
 // ============================================================
@@ -1408,6 +1616,57 @@ impl PyPatchResult {
     fn __repr__(&self) -> String {
         format!(
             "PatchResult(nodes={}, edges={})",
+            self.node_ids.len(),
+            self.edge_ids.len()
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyTxnCommitResult {
+    #[pyo3(get)]
+    pub node_ids: Vec<u64>,
+    #[pyo3(get)]
+    pub edge_ids: Vec<u64>,
+    #[pyo3(get)]
+    pub node_aliases: HashMap<String, u64>,
+    #[pyo3(get)]
+    pub edge_aliases: HashMap<String, u64>,
+}
+
+impl From<TxnCommitResult> for PyTxnCommitResult {
+    fn from(result: TxnCommitResult) -> Self {
+        let node_aliases = result
+            .local_node_ids
+            .into_iter()
+            .filter_map(|(local, id)| match local {
+                TxnLocalRef::Alias(alias) => Some((alias, id)),
+                TxnLocalRef::Slot(_) => None,
+            })
+            .collect();
+        let edge_aliases = result
+            .local_edge_ids
+            .into_iter()
+            .filter_map(|(local, id)| match local {
+                TxnLocalRef::Alias(alias) => Some((alias, id)),
+                TxnLocalRef::Slot(_) => None,
+            })
+            .collect();
+        PyTxnCommitResult {
+            node_ids: result.node_ids,
+            edge_ids: result.edge_ids,
+            node_aliases,
+            edge_aliases,
+        }
+    }
+}
+
+#[pymethods]
+impl PyTxnCommitResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "TxnCommitResult(nodes={}, edges={})",
             self.node_ids.len(),
             self.edge_ids.len()
         )
@@ -2485,10 +2744,7 @@ fn props_to_py(py: Python<'_>, props: &BTreeMap<String, PropValue>) -> PyResult<
 }
 
 fn prop_value_debug_repr(py: Python<'_>, value: &PropValue) -> PyResult<String> {
-    prop_value_to_py_obj(py, value)?
-        .bind(py)
-        .repr()?
-        .extract()
+    prop_value_to_py_obj(py, value)?.bind(py).repr()?.extract()
 }
 
 fn parse_secondary_index_range_domain(domain: &str) -> PyResult<SecondaryIndexRangeDomain> {
@@ -2604,6 +2860,290 @@ fn convert_py_props(
             Ok(map)
         }
     }
+}
+
+fn with_py_txn<F, T>(inner: &Arc<Mutex<Option<WriteTxn>>>, f: F) -> PyResult<T>
+where
+    F: FnOnce(&mut WriteTxn) -> PyResult<T>,
+{
+    let mut guard = inner.lock().map_err(lock_err)?;
+    let txn = guard
+        .as_mut()
+        .ok_or_else(|| OverGraphError::new_err(EngineError::TxnClosed.to_string()))?;
+    f(txn)
+}
+
+fn with_py_txn_ref<F, T>(inner: &Arc<Mutex<Option<WriteTxn>>>, f: F) -> PyResult<T>
+where
+    F: FnOnce(&WriteTxn) -> PyResult<T>,
+{
+    let guard = inner.lock().map_err(lock_err)?;
+    let txn = guard
+        .as_ref()
+        .ok_or_else(|| OverGraphError::new_err(EngineError::TxnClosed.to_string()))?;
+    f(txn)
+}
+
+fn with_py_txn_take<F, T>(inner: &Arc<Mutex<Option<WriteTxn>>>, f: F) -> PyResult<T>
+where
+    F: FnOnce(&mut WriteTxn) -> PyResult<T>,
+{
+    let mut txn = {
+        let mut guard = inner.lock().map_err(lock_err)?;
+        guard
+            .take()
+            .ok_or_else(|| OverGraphError::new_err(EngineError::TxnClosed.to_string()))?
+    };
+    f(&mut txn)
+}
+
+fn parse_txn_node_ref(d: &Bound<'_, PyDict>) -> PyResult<TxnNodeRef> {
+    let id = d.get_item("id")?;
+    let type_id = d.get_item("type_id")?;
+    let key = d.get_item("key")?;
+    let local = d.get_item("local")?;
+    let has_id = id.is_some();
+    let has_key = type_id.is_some() || key.is_some();
+    let has_local = local.is_some();
+    match (has_id, has_key, has_local) {
+        (true, false, false) => Ok(TxnNodeRef::Id(id.unwrap().extract()?)),
+        (false, true, false) => Ok(TxnNodeRef::Key {
+            type_id: type_id
+                .ok_or_else(|| PyValueError::new_err("node key ref requires type_id"))?
+                .extract()?,
+            key: key
+                .ok_or_else(|| PyValueError::new_err("node key ref requires key"))?
+                .extract()?,
+        }),
+        (false, false, true) => Ok(TxnNodeRef::Local(TxnLocalRef::Alias(
+            local.unwrap().extract()?,
+        ))),
+        _ => Err(PyValueError::new_err(
+            "node ref must be exactly one of {'id'}, {'type_id', 'key'}, or {'local'}",
+        )),
+    }
+}
+
+fn parse_txn_edge_ref(d: &Bound<'_, PyDict>) -> PyResult<TxnEdgeRef> {
+    let id = d.get_item("id")?;
+    let from = d.get_item("from")?;
+    let to = d.get_item("to")?;
+    let type_id = d.get_item("type_id")?;
+    let local = d.get_item("local")?;
+    let has_id = id.is_some();
+    let has_triple = from.is_some() || to.is_some() || type_id.is_some();
+    let has_local = local.is_some();
+    match (has_id, has_triple, has_local) {
+        (true, false, false) => Ok(TxnEdgeRef::Id(id.unwrap().extract()?)),
+        (false, true, false) => {
+            let from = from.ok_or_else(|| PyValueError::new_err("edge ref requires from"))?;
+            let to = to.ok_or_else(|| PyValueError::new_err("edge ref requires to"))?;
+            Ok(TxnEdgeRef::Triple {
+                from: parse_txn_node_ref(from.downcast::<PyDict>()?)?,
+                to: parse_txn_node_ref(to.downcast::<PyDict>()?)?,
+                type_id: type_id
+                    .ok_or_else(|| PyValueError::new_err("edge ref requires type_id"))?
+                    .extract()?,
+            })
+        }
+        (false, false, true) => Ok(TxnEdgeRef::Local(TxnLocalRef::Alias(
+            local.unwrap().extract()?,
+        ))),
+        _ => Err(PyValueError::new_err(
+            "edge ref must be exactly one of {'id'}, {'from', 'to', 'type_id'}, or {'local'}",
+        )),
+    }
+}
+
+fn txn_node_ref_to_py(py: Python<'_>, value: TxnNodeRef) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    match value {
+        TxnNodeRef::Id(id) => dict.set_item("id", id)?,
+        TxnNodeRef::Key { type_id, key } => {
+            dict.set_item("type_id", type_id)?;
+            dict.set_item("key", key)?;
+        }
+        TxnNodeRef::Local(local) => {
+            dict.set_item("local", txn_local_ref_to_py(local))?;
+        }
+    }
+    Ok(dict.into())
+}
+
+fn txn_edge_ref_to_py(py: Python<'_>, value: TxnEdgeRef) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    match value {
+        TxnEdgeRef::Id(id) => dict.set_item("id", id)?,
+        TxnEdgeRef::Triple { from, to, type_id } => {
+            dict.set_item("from", txn_node_ref_to_py(py, from)?)?;
+            dict.set_item("to", txn_node_ref_to_py(py, to)?)?;
+            dict.set_item("type_id", type_id)?;
+        }
+        TxnEdgeRef::Local(local) => {
+            dict.set_item("local", txn_local_ref_to_py(local))?;
+        }
+    }
+    Ok(dict.into())
+}
+
+fn txn_local_ref_to_py(local: TxnLocalRef) -> Option<String> {
+    match local {
+        TxnLocalRef::Alias(alias) => Some(alias),
+        TxnLocalRef::Slot(_) => None,
+    }
+}
+
+fn txn_node_view_to_py(py: Python<'_>, view: TxnNodeView) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", view.id)?;
+    dict.set_item("local", view.local.and_then(txn_local_ref_to_py))?;
+    dict.set_item("type_id", view.type_id)?;
+    dict.set_item("key", view.key)?;
+    dict.set_item("props", props_to_py(py, &view.props)?)?;
+    dict.set_item("created_at", view.created_at)?;
+    dict.set_item("updated_at", view.updated_at)?;
+    dict.set_item("weight", view.weight as f64)?;
+    dict.set_item(
+        "dense_vector",
+        view.dense_vector
+            .map(|v| v.into_iter().map(|x| x as f64).collect::<Vec<_>>()),
+    )?;
+    dict.set_item("sparse_vector", view.sparse_vector)?;
+    Ok(dict.into())
+}
+
+fn txn_edge_view_to_py(py: Python<'_>, view: TxnEdgeView) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", view.id)?;
+    dict.set_item("local", view.local.and_then(txn_local_ref_to_py))?;
+    dict.set_item("from", txn_node_ref_to_py(py, view.from)?)?;
+    dict.set_item("to", txn_node_ref_to_py(py, view.to)?)?;
+    dict.set_item("type_id", view.type_id)?;
+    dict.set_item("props", props_to_py(py, &view.props)?)?;
+    dict.set_item("created_at", view.created_at)?;
+    dict.set_item("updated_at", view.updated_at)?;
+    dict.set_item("weight", view.weight as f64)?;
+    dict.set_item("valid_from", view.valid_from)?;
+    dict.set_item("valid_to", view.valid_to)?;
+    Ok(dict.into())
+}
+
+fn parse_txn_operations(py: Python<'_>, list: &Bound<'_, PyList>) -> PyResult<Vec<TxnIntent>> {
+    let mut intents = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let op = item.downcast::<PyDict>()?;
+        let op_name: String = op
+            .get_item("op")?
+            .ok_or_else(|| PyValueError::new_err("transaction operation missing 'op'"))?
+            .extract()?;
+        let intent = match op_name.as_str() {
+            "upsert_node" => TxnIntent::UpsertNode {
+                alias: op.get_item("alias")?.map(|v| v.extract()).transpose()?,
+                type_id: op
+                    .get_item("type_id")?
+                    .ok_or_else(|| PyValueError::new_err("upsert_node requires type_id"))?
+                    .extract()?,
+                key: op
+                    .get_item("key")?
+                    .ok_or_else(|| PyValueError::new_err("upsert_node requires key"))?
+                    .extract()?,
+                options: UpsertNodeOptions {
+                    props: match op.get_item("props")? {
+                        Some(v) if !v.is_none() => {
+                            convert_py_props(py, Some(v.downcast::<PyDict>()?))?
+                        }
+                        _ => BTreeMap::new(),
+                    },
+                    weight: op
+                        .get_item("weight")?
+                        .map(|v| v.extract::<f64>())
+                        .transpose()?
+                        .unwrap_or(1.0) as f32,
+                    dense_vector: op
+                        .get_item("dense_vector")?
+                        .map(|v| v.extract())
+                        .transpose()?,
+                    sparse_vector: op
+                        .get_item("sparse_vector")?
+                        .map(|v| v.extract())
+                        .transpose()?,
+                },
+            },
+            "upsert_edge" => TxnIntent::UpsertEdge {
+                alias: op.get_item("alias")?.map(|v| v.extract()).transpose()?,
+                from: parse_txn_node_ref(
+                    op.get_item("from")?
+                        .ok_or_else(|| PyValueError::new_err("upsert_edge requires from"))?
+                        .downcast::<PyDict>()?,
+                )?,
+                to: parse_txn_node_ref(
+                    op.get_item("to")?
+                        .ok_or_else(|| PyValueError::new_err("upsert_edge requires to"))?
+                        .downcast::<PyDict>()?,
+                )?,
+                type_id: op
+                    .get_item("type_id")?
+                    .ok_or_else(|| PyValueError::new_err("upsert_edge requires type_id"))?
+                    .extract()?,
+                options: UpsertEdgeOptions {
+                    props: match op.get_item("props")? {
+                        Some(v) if !v.is_none() => {
+                            convert_py_props(py, Some(v.downcast::<PyDict>()?))?
+                        }
+                        _ => BTreeMap::new(),
+                    },
+                    weight: op
+                        .get_item("weight")?
+                        .map(|v| v.extract::<f64>())
+                        .transpose()?
+                        .unwrap_or(1.0) as f32,
+                    valid_from: op
+                        .get_item("valid_from")?
+                        .and_then(|v| if v.is_none() { None } else { Some(v) })
+                        .map(|v| v.extract())
+                        .transpose()?,
+                    valid_to: op
+                        .get_item("valid_to")?
+                        .and_then(|v| if v.is_none() { None } else { Some(v) })
+                        .map(|v| v.extract())
+                        .transpose()?,
+                },
+            },
+            "delete_node" => TxnIntent::DeleteNode {
+                target: parse_txn_node_ref(
+                    op.get_item("target")?
+                        .ok_or_else(|| PyValueError::new_err("delete_node requires target"))?
+                        .downcast::<PyDict>()?,
+                )?,
+            },
+            "delete_edge" => TxnIntent::DeleteEdge {
+                target: parse_txn_edge_ref(
+                    op.get_item("target")?
+                        .ok_or_else(|| PyValueError::new_err("delete_edge requires target"))?
+                        .downcast::<PyDict>()?,
+                )?,
+            },
+            "invalidate_edge" => TxnIntent::InvalidateEdge {
+                target: parse_txn_edge_ref(
+                    op.get_item("target")?
+                        .ok_or_else(|| PyValueError::new_err("invalidate_edge requires target"))?
+                        .downcast::<PyDict>()?,
+                )?,
+                valid_to: op
+                    .get_item("valid_to")?
+                    .ok_or_else(|| PyValueError::new_err("invalidate_edge requires valid_to"))?
+                    .extract()?,
+            },
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "invalid transaction op '{}'",
+                    other
+                )));
+            }
+        };
+        intents.push(intent);
+    }
+    Ok(intents)
 }
 
 // ============================================================
@@ -3163,10 +3703,12 @@ fn decode_edge_batch_py(buf: &[u8]) -> PyResult<Vec<EdgeInput>> {
 #[pymodule]
 fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OverGraph>()?;
+    m.add_class::<PyWriteTxn>()?;
     m.add_class::<PyDbStats>()?;
     m.add_class::<PyNodeRecord>()?;
     m.add_class::<PyEdgeRecord>()?;
     m.add_class::<PyPatchResult>()?;
+    m.add_class::<PyTxnCommitResult>()?;
     m.add_class::<PyNeighborEntry>()?;
     m.add_class::<PyTraversalHit>()?;
     m.add_class::<PyVectorHit>()?;

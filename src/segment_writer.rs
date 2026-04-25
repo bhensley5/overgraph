@@ -1,3 +1,7 @@
+use crate::degree_cache::{
+    write_folded_degree_delta_sidecar_from_sidecars, write_sorted_degree_delta_sidecar,
+    DegreeOverlaySnapshot, DEGREE_DELTA_FILENAME,
+};
 use crate::dense_hnsw::{write_dense_hnsw_index_from_points, DensePointInput};
 use crate::error::EngineError;
 use crate::memtable::{encode_range_prop_value, AdjEntry, Memtable};
@@ -98,52 +102,135 @@ pub(crate) fn node_prop_range_sidecar_path(seg_dir: &Path, index_id: u64) -> Pat
 ///   2. `write_indexes_from_metadata()` (compaction path, builds from sidecars)
 ///
 /// If you add a new index type, you MUST add it to BOTH paths.
-pub fn write_segment(
+#[allow(dead_code)]
+pub(crate) fn write_segment(
+    seg_dir: &Path,
+    segment_id: u64,
+    memtable: &Memtable,
+    dense_config: Option<&DenseVectorConfig>,
+    degree_overlay: &DegreeOverlaySnapshot,
+) -> Result<SegmentInfo, EngineError> {
+    write_segment_with_secondary_indexes(
+        seg_dir,
+        segment_id,
+        memtable,
+        dense_config,
+        degree_overlay,
+        &[],
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn write_segment_with_secondary_indexes(
+    seg_dir: &Path,
+    segment_id: u64,
+    memtable: &Memtable,
+    dense_config: Option<&DenseVectorConfig>,
+    degree_overlay: &DegreeOverlaySnapshot,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<SegmentInfo, EngineError> {
+    write_segment_with_degree_overlay_and_secondary_indexes(
+        seg_dir,
+        segment_id,
+        memtable,
+        dense_config,
+        degree_overlay,
+        secondary_indexes,
+    )
+}
+
+pub(crate) fn write_segment_with_degree_overlay_and_secondary_indexes(
+    seg_dir: &Path,
+    segment_id: u64,
+    memtable: &Memtable,
+    dense_config: Option<&DenseVectorConfig>,
+    degree_overlay: &DegreeOverlaySnapshot,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<SegmentInfo, EngineError> {
+    write_segment_inner(
+        seg_dir,
+        segment_id,
+        memtable,
+        dense_config,
+        Some(degree_overlay),
+        secondary_indexes,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn write_segment_without_degree_sidecar_for_test(
     seg_dir: &Path,
     segment_id: u64,
     memtable: &Memtable,
     dense_config: Option<&DenseVectorConfig>,
 ) -> Result<SegmentInfo, EngineError> {
-    write_segment_with_secondary_indexes(seg_dir, segment_id, memtable, dense_config, &[])
+    write_segment_inner(seg_dir, segment_id, memtable, dense_config, None, &[])
 }
 
-pub(crate) fn write_segment_with_secondary_indexes(
+#[cfg(test)]
+pub(crate) fn write_segment_without_degree_sidecar_with_secondary_indexes_for_test(
     seg_dir: &Path,
     segment_id: u64,
     memtable: &Memtable,
     dense_config: Option<&DenseVectorConfig>,
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> Result<SegmentInfo, EngineError> {
+    write_segment_inner(
+        seg_dir,
+        segment_id,
+        memtable,
+        dense_config,
+        None,
+        secondary_indexes,
+    )
+}
+
+fn write_segment_inner(
+    seg_dir: &Path,
+    segment_id: u64,
+    memtable: &Memtable,
+    dense_config: Option<&DenseVectorConfig>,
+    degree_overlay: Option<&DegreeOverlaySnapshot>,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<SegmentInfo, EngineError> {
     fs::create_dir_all(seg_dir)?;
 
     let nodes = memtable.nodes();
     let edges = memtable.edges();
+    let degree_entries = degree_overlay.map(DegreeOverlaySnapshot::sorted_entries);
 
-    let node_data = write_nodes_dat(seg_dir, nodes)?;
-    let edge_data = write_edges_dat(seg_dir, edges)?;
+    let node_data = write_nodes_dat(seg_dir, &nodes)?;
+    let edge_data = write_edges_dat(seg_dir, &edges)?;
     run_index_fanout(
         || {
-            write_key_index(seg_dir, nodes)?;
-            write_type_index(seg_dir, "node_type_index", memtable.type_node_index())?;
+            write_key_index(seg_dir, &nodes)?;
+            write_type_index(seg_dir, "node_type_index", &memtable.type_node_index())?;
             write_declared_equality_sidecars(seg_dir, memtable, secondary_indexes)?;
             write_declared_range_sidecars(seg_dir, memtable, secondary_indexes)?;
-            write_timestamp_index(seg_dir, memtable.time_node_index())?;
+            write_timestamp_index(seg_dir, &memtable.time_node_index())?;
             Ok(())
         },
         || {
-            write_adjacency_index(seg_dir, "adj_out", memtable.adj_out())?;
-            write_adjacency_index(seg_dir, "adj_in", memtable.adj_in())?;
-            write_type_index(seg_dir, "edge_type_index", memtable.type_edge_index())?;
-            write_edge_triple_index(seg_dir, edges)?;
-            write_tombstones(seg_dir, memtable.deleted_nodes(), memtable.deleted_edges())?;
+            write_adjacency_index(seg_dir, "adj_out", &memtable.adj_out())?;
+            write_adjacency_index(seg_dir, "adj_in", &memtable.adj_in())?;
+            write_type_index(seg_dir, "edge_type_index", &memtable.type_edge_index())?;
+            write_edge_triple_index(seg_dir, &edges)?;
+            write_tombstones(
+                seg_dir,
+                &memtable.deleted_nodes(),
+                &memtable.deleted_edges(),
+            )?;
+            if let Some(entries) = degree_entries.as_ref() {
+                write_sorted_degree_delta_sidecar(&seg_dir.join(DEGREE_DELTA_FILENAME), entries)?;
+            }
             Ok(())
         },
         || {
-            let dense_points = write_sidecars(seg_dir, &node_data, &edge_data, nodes, edges)?;
+            let dense_points = write_sidecars(seg_dir, &node_data, &edge_data, &nodes, &edges)?;
             write_dense_hnsw_index_from_points(seg_dir, dense_config, dense_points)?;
             Ok(())
         },
-        || write_sparse_posting_index(seg_dir, nodes),
+        || write_sparse_posting_index(seg_dir, &nodes),
     )?;
     write_format_version(seg_dir)?;
 
@@ -1044,7 +1131,7 @@ pub(crate) struct FastMergeCopyInfo {
 /// merged `data_offset` values directly from sidecars without a second data scan.
 pub(crate) fn write_merged_nodes_dat(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
 ) -> Result<Vec<FastMergeCopyInfo>, EngineError> {
     let path = seg_dir.join("nodes.dat");
     let file = File::create(&path)?;
@@ -1178,7 +1265,7 @@ pub(crate) fn write_merged_nodes_dat(
 /// merged `data_offset` values directly from sidecars without a second data scan.
 pub(crate) fn write_merged_edges_dat(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
 ) -> Result<Vec<FastMergeCopyInfo>, EngineError> {
     let path = seg_dir.join("edges.dat");
     let file = File::create(&path)?;
@@ -1317,7 +1404,7 @@ pub(crate) fn write_merged_edges_dat(
 /// for sidecar writing.
 pub(crate) fn write_v3_nodes_dat(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     winners: &[(u64, usize, u64, u32)],
 ) -> Result<Vec<(u64, u64, u32)>, EngineError> {
     let path = seg_dir.join("nodes.dat");
@@ -1377,7 +1464,7 @@ pub(crate) fn write_v3_nodes_dat(
 /// Returns Vec of `(edge_id, new_data_offset, data_len)` matching the output file.
 pub(crate) fn write_v3_edges_dat(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     winners: &[(u64, usize, u64, u32)],
 ) -> Result<Vec<(u64, u64, u32)>, EngineError> {
     let path = seg_dir.join("edges.dat");
@@ -1478,7 +1565,7 @@ pub(crate) struct CompactEdgeMeta {
 #[allow(dead_code)]
 pub(crate) fn write_indexes_from_metadata(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
     dense_config: Option<&DenseVectorConfig>,
@@ -1489,6 +1576,7 @@ pub(crate) fn write_indexes_from_metadata(
         node_metas,
         edge_metas,
         dense_config,
+        true,
         &[],
     )?;
     Ok(())
@@ -1496,10 +1584,11 @@ pub(crate) fn write_indexes_from_metadata(
 
 pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
     dense_config: Option<&DenseVectorConfig>,
+    write_degree_sidecar: bool,
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> Result<SecondaryIndexMaintenanceReport, EngineError> {
     let report = Arc::new(Mutex::new(SecondaryIndexMaintenanceReport::default()));
@@ -1538,6 +1627,14 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
             write_edge_type_index_from_meta(seg_dir, edge_metas)?;
             write_edge_triple_index_from_meta(seg_dir, edge_metas)?;
             write_empty_tombstones(seg_dir)?;
+            if write_degree_sidecar {
+                if let Some(sidecars) = degree_sidecars_for_segments(segments) {
+                    write_folded_degree_delta_sidecar_from_sidecars(
+                        &seg_dir.join(DEGREE_DELTA_FILENAME),
+                        &sidecars,
+                    )?;
+                }
+            }
             Ok(())
         },
         || {
@@ -1553,10 +1650,19 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
     Ok(final_report)
 }
 
+fn degree_sidecars_for_segments(
+    segments: &[Arc<SegmentReader>],
+) -> Option<Vec<&crate::degree_cache::DegreeSidecar>> {
+    segments
+        .iter()
+        .map(|segment| segment.degree_delta_sidecar())
+        .collect()
+}
+
 /// key_index.dat from metadata: read key bytes via partial header parse from source segments.
 fn write_key_index_from_meta(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
 ) -> Result<(), EngineError> {
     let path = seg_dir.join("key_index.dat");
@@ -1803,7 +1909,7 @@ fn write_adjacency_from_meta(
 }
 
 fn build_secondary_eq_groups_from_source_sidecars(
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     index_id: u64,
     type_id: u32,
@@ -1836,7 +1942,7 @@ fn build_secondary_eq_groups_from_source_sidecars(
 }
 
 fn build_secondary_eq_groups_from_targeted_decode(
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     type_id: u32,
     prop_key: &str,
@@ -1865,7 +1971,7 @@ fn build_secondary_eq_groups_from_targeted_decode(
 }
 
 fn build_secondary_range_entries_from_source_sidecars(
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     index_id: u64,
     type_id: u32,
@@ -1892,7 +1998,7 @@ fn build_secondary_range_entries_from_source_sidecars(
 }
 
 fn build_secondary_range_entries_from_targeted_decode(
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     type_id: u32,
     prop_key: &str,
@@ -1922,7 +2028,7 @@ fn build_secondary_range_entries_from_targeted_decode(
 
 fn write_declared_equality_sidecars_from_metadata(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> Result<SecondaryIndexMaintenanceReport, EngineError> {
@@ -1995,7 +2101,7 @@ fn write_declared_equality_sidecars_from_metadata(
 
 fn write_declared_range_sidecars_from_metadata(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> Result<SecondaryIndexMaintenanceReport, EngineError> {
@@ -2111,7 +2217,7 @@ fn write_empty_tombstones(seg_dir: &Path) -> Result<(), EngineError> {
 /// Write output metadata sidecars from compaction metadata.
 fn write_sidecars_from_meta(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
 ) -> Result<Vec<DensePointInput>, EngineError> {
@@ -2174,7 +2280,7 @@ fn write_sidecars_from_meta(
 
 fn write_node_vector_sidecars_from_meta(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
 ) -> Result<Vec<DensePointInput>, EngineError> {
     let has_dense = node_metas.iter().any(|nm| nm.dense_vector_len > 0);
@@ -2326,7 +2432,7 @@ fn write_sparse_posting_index(
 
 fn write_sparse_posting_index_from_meta(
     seg_dir: &Path,
-    segments: &[SegmentReader],
+    segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
 ) -> Result<(), EngineError> {
     let mut groups: BTreeMap<u32, Vec<(u64, f32)>> = BTreeMap::new();
@@ -2383,6 +2489,41 @@ fn sort_sparse_posting_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::degree_cache::DegreeDelta;
+
+    fn write_segment(
+        seg_dir: &Path,
+        segment_id: u64,
+        memtable: &Memtable,
+        dense_config: Option<&DenseVectorConfig>,
+    ) -> Result<SegmentInfo, EngineError> {
+        let degree_overlay = DegreeOverlaySnapshot::empty();
+        super::write_segment(
+            seg_dir,
+            segment_id,
+            memtable,
+            dense_config,
+            degree_overlay.as_ref(),
+        )
+    }
+
+    fn write_segment_with_secondary_indexes(
+        seg_dir: &Path,
+        segment_id: u64,
+        memtable: &Memtable,
+        dense_config: Option<&DenseVectorConfig>,
+        secondary_indexes: &[SecondaryIndexManifestEntry],
+    ) -> Result<SegmentInfo, EngineError> {
+        let degree_overlay = DegreeOverlaySnapshot::empty();
+        super::write_segment_with_secondary_indexes(
+            seg_dir,
+            segment_id,
+            memtable,
+            dense_config,
+            degree_overlay.as_ref(),
+            secondary_indexes,
+        )
+    }
 
     fn make_node(id: u64, type_id: u32, key: &str) -> NodeRecord {
         NodeRecord {
@@ -2791,7 +2932,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
         mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
@@ -2839,6 +2980,57 @@ mod tests {
     }
 
     #[test]
+    fn test_write_segment_degree_sidecar_overlay_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 2);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 3);
+
+        let mut deltas = NodeIdMap::default();
+        deltas.insert(1, DegreeDelta::add_valid_edge(1, 2, 1.0));
+        deltas.insert(2, DegreeDelta::add_valid_edge_incoming(1.0));
+        let overlay = DegreeOverlaySnapshot::from_flat(deltas);
+
+        write_segment_with_degree_overlay_and_secondary_indexes(
+            &seg_dir,
+            1,
+            &mt,
+            None,
+            overlay.as_ref(),
+            &[],
+        )
+        .unwrap();
+
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        assert!(reader.degree_delta_available());
+        assert_eq!(reader.degree_delta(1).unwrap().out_degree, 1);
+        assert_eq!(reader.degree_delta(2).unwrap().in_degree, 1);
+        assert_eq!(reader.degree_delta(99).unwrap(), DegreeDelta::ZERO);
+    }
+
+    #[test]
+    fn test_segment_reader_tolerates_missing_and_corrupt_degree_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
+        write_segment_without_degree_sidecar_for_test(&seg_dir, 1, &mt, None).unwrap();
+
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        assert!(!reader.degree_delta_available());
+        assert!(reader.get_node(1).unwrap().is_some());
+
+        std::fs::write(seg_dir.join(DEGREE_DELTA_FILENAME), b"not a degree sidecar").unwrap();
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        assert!(!reader.degree_delta_available());
+        assert!(reader.get_node(1).unwrap().is_some());
+    }
+
+    #[test]
     fn test_write_segment_empty_memtable() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
@@ -2858,7 +3050,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let mut node = make_node(1, 1, "alice");
         node.dense_vector = Some(vec![0.1, 0.2, 0.3]);
         node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
@@ -2894,7 +3086,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let mut node = make_node(1, 1, "sparse");
         node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
         mt.apply_op(&WalOp::UpsertNode(node), 0);
@@ -3170,7 +3362,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let mut red_props = BTreeMap::new();
         red_props.insert("color".to_string(), PropValue::String("red".to_string()));
         let mut green_props = BTreeMap::new();

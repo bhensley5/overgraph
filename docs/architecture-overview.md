@@ -48,7 +48,7 @@ WAL records use a simple `[length: u32][crc32: u32][payload: bytes]` format. The
 ### Sync modes
 
 - **Immediate:** Every write fsyncs the WAL. Maximum durability, ~4ms per write (dominated by disk latency).
-- **GroupCommit (default):** A background thread fsyncs the WAL on a timer (default 10ms). Writes return as soon as they hit the OS buffer. This gives ~20x better throughput at the cost of up to one timer interval of data at risk on a hard crash. You can call `sync()` manually to force an fsync at any point.
+- **GroupCommit (default):** A background thread fsyncs the WAL on a timer (default 50ms). Writes return as soon as they hit the OS buffer. This gives ~20x better throughput at the cost of up to one timer interval of data at risk on a hard crash. You can call `sync()` manually to force an fsync at any point.
 
 ## Read path
 
@@ -57,7 +57,7 @@ Reads check multiple sources and merge them:
 1. **Memtable** (freshest data, always checked first)
 2. **Immutable segments** (scanned newest to oldest)
 
-For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we stop at the first source that has the record. For collection queries (`neighbors`, `find_nodes`, `nodes_by_type`), we merge results from all sources using a K-way merge with a min-heap. For aggregation queries (`degree`, `sum_edge_weights`, `avg_edge_weight`), we walk adjacency postings with a callback instead of materializing results, counting and accumulating in-place.
+For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we stop at the first source that has the record. For collection queries (`neighbors`, `find_nodes`, `nodes_by_type`), we merge results from all sources using a K-way merge with a min-heap. For eligible aggregation queries (`degree`, `degrees`, `sum_edge_weights`, `avg_edge_weight` with no type filter, no explicit epoch, no active prune policy, and valid degree sidecars on all visible segments), reads sum published degree overlays plus per-segment `degree_delta.dat` sidecars without walking adjacency. Filtered, temporal, prune-policy, temporal-edge, or sidecar-unavailable cases fall back to the adjacency walk path.
 
 Tombstones (from `delete_node` / `delete_edge`) are applied during the merge. Prune policies are also evaluated at read time, so a registered policy takes effect immediately without waiting for compaction.
 
@@ -67,7 +67,7 @@ All collection queries support keyset pagination via `limit` + `after`. The `aft
 
 ## Segments
 
-When the memtable exceeds a size threshold (default 32MB), it gets frozen and flushed to disk as a new segment. A fresh memtable is allocated for incoming writes, so the flush never blocks the write path.
+When the memtable exceeds a size threshold (default 128MB), it gets frozen and flushed to disk as a new segment. A fresh memtable is allocated for incoming writes, so the flush never blocks the write path.
 
 Each segment is a directory containing:
 
@@ -83,6 +83,7 @@ Each segment is a directory containing:
 | `timestamp_index.dat` | Sorted `(updated_at, node_id)` pairs |
 | `tombstones.dat` | Set of deleted IDs |
 | `metadata.dat` | Sidecar with per-record metadata for fast compaction |
+| `degree_delta.dat` | Optional signed degree delta sidecar for degree/weight fast paths |
 | `node_dense_vectors.dat` | Dense vector blob (present only when segment has vectors) |
 | `node_sparse_vectors.dat` | Sparse vector blob (present only when segment has vectors) |
 | `dense_hnsw_graph.dat` | HNSW graph index for dense ANN search |
@@ -111,11 +112,11 @@ Looking up neighbors is a binary search in the index followed by a sequential sc
 
 ### Degree counts and aggregations
 
-Sometimes you just need "how many edges does this node have?" or "what's the total weight?" without materializing the full neighbor list. The `degree()`, `sum_edge_weights()`, and `avg_edge_weight()` methods use a callback-based iteration over adjacency postings: they decode each posting to extract the edge ID (for dedup across sources) and weight (for aggregation), but never allocate a `Vec<NeighborEntry>`. The only allocation is a `HashSet<u64>` for edge dedup.
+Sometimes you just need "how many edges does this node have?" or "what's the total weight?" without materializing the full neighbor list. For common unfiltered, non-temporal reads, `degree()`, `degrees()`, `sum_edge_weights()`, and `avg_edge_weight()` use published degree state instead of walking adjacency postings.
 
-This means `degree()` costs O(postings) time with O(unique edges) memory, regardless of how many neighbors a node has. Weight is embedded directly in the adjacency postings (as f32), so aggregations come free during the same decode pass without edge record hydration.
+Each segment may include a validated `degree_delta.dat` sidecar with signed per-node degree and weight deltas. Active and frozen WAL/memtable contributions are published with each `ReadView` as immutable overlays. Eligible degree-family reads sum the active overlay, frozen overlays, and visible segment sidecars, so the work is bounded by visible source count rather than neighbor count.
 
-When prune policies are active, the degree methods track per-neighbor-id stats during the walk, then batch-check neighbor IDs against policies and subtract excluded neighbors. Same pattern as `neighbors()`, same consistency guarantees.
+Filtered reads, explicit `at_epoch` reads, active prune policies, temporal-edge cases, and segments with missing or corrupt degree sidecars fall back to the adjacency walk path. That fallback uses the same visibility rules as `neighbors()` and preserves the old consistency guarantees.
 
 ### Shortest path algorithms
 
@@ -193,9 +194,11 @@ Updates to the manifest are atomic: write to `manifest.tmp`, fsync, rename to `m
 
 ## Concurrency model
 
-- **Single writer.** All writes are serialized through a mutex-protected WAL + memtable path. This keeps the write path simple and correct. For an embedded database, write serialization is not a bottleneck because there's no network latency to hide.
-- **Concurrent readers.** Immutable segments are safe for concurrent reads via mmap. The memtable is read under the same mutex, but reads are fast (HashMap lookups).
-- **Background threads.** Flush and compaction run on separate threads. They never hold the write mutex except for the brief moment of swapping the manifest.
+- **Cloneable shared handles.** `DatabaseEngine` is a lightweight handle over shared process-local runtime state. Clones share the same coordinator, WAL, published read state, lifecycle workers, and close barrier.
+- **Serialized commits.** Public write APIs and explicit transaction commits enter an internal commit/lifecycle coordinator. The coordinator orders WAL append, memtable apply, snapshot publication, flush adoption, compaction adoption, and close barriers so there is one authoritative mutation path.
+- **Published read views.** Public reads capture the current `ReadView` snapshot at call start and run without holding the coordinator. A read view contains the active memtable snapshot, frozen memtables, visible segment readers, manifest-visible read metadata, and published degree overlays.
+- **Process-local scope.** Multiple handles cloned from one open database are safe inside one process. Opening the same database directory independently from multiple processes is not supported.
+- **Background workers.** Flush and compaction still run on background threads, but their completed outputs are adopted through the coordinator before becoming visible to new read views.
 
 ## FFI connectors
 

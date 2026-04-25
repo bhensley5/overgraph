@@ -7,7 +7,7 @@ fn test_full_graph_query_patterns() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("graph_db");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Create 20 nodes across 3 types
     let mut node_ids = Vec::new();
@@ -25,7 +25,7 @@ fn test_full_graph_query_patterns() {
             .unwrap();
         node_ids.push(id);
     }
-    assert_eq!(engine.node_count(), 20);
+    assert_eq!(engine.node_count().unwrap(), 20);
 
     // Create 50 edges across 2 types
     // Type 10: "knows" edges, chain pattern (0->1->2->...->19)
@@ -71,7 +71,7 @@ fn test_full_graph_query_patterns() {
             .unwrap();
         edge_ids.push(eid);
     }
-    assert_eq!(engine.edge_count(), 50);
+    assert_eq!(engine.edge_count().unwrap(), 50);
 
     // --- Verify get-by-ID ---
     for &id in &node_ids {
@@ -154,15 +154,15 @@ fn test_full_graph_query_patterns() {
 
     // --- Delete a node and verify cascade ---
     // node_ids[1] has incident edges: 0->1 (knows), 1->2 (knows), 1->4 (references)
-    let edge_count_before = engine.edge_count();
+    let edge_count_before = engine.edge_count().unwrap();
     engine.delete_node(node_ids[1]).unwrap();
     assert!(engine.get_node(node_ids[1]).unwrap().is_none());
-    assert_eq!(engine.node_count(), 19);
+    assert_eq!(engine.node_count().unwrap(), 19);
 
     // Cascade-deleted incident edges
     assert!(engine.get_edge(edge_ids[0]).unwrap().is_none()); // 0->1 knows
     assert!(engine.get_edge(edge_ids[1]).unwrap().is_none()); // 1->2 knows
-    assert_eq!(engine.edge_count(), edge_count_before - 3); // 3 incident edges gone
+    assert_eq!(engine.edge_count().unwrap(), edge_count_before - 3); // 3 incident edges gone
 
     // Node 0's "knows" neighbor (node 1) should be gone from results
     let knows_after = engine
@@ -196,7 +196,7 @@ fn test_graph_state_survives_restart() {
 
     // --- Build graph, delete some items, close ---
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         node_a = engine
             .upsert_node(
@@ -347,7 +347,7 @@ fn test_graph_state_survives_restart() {
         assert_eq!(typed.len(), 2); // both ab and ac are type 10
 
         // Upsert dedup still works after replay
-        let mut engine = engine; // need mut for upsert
+        let engine = engine; // need mut for upsert
         let a_again = engine
             .upsert_node(
                 1,
@@ -359,7 +359,7 @@ fn test_graph_state_survives_restart() {
             )
             .unwrap();
         assert_eq!(a_again, node_a);
-        assert_eq!(engine.node_count(), 3); // no new node
+        assert_eq!(engine.node_count().unwrap(), 3); // no new node
 
         // New allocation doesn't collide
         let node_e = engine
@@ -380,7 +380,7 @@ fn test_graph_state_survives_restart() {
     // --- Third open for stability ---
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert_eq!(engine.node_count(), 4); // a, b, c, e (d still deleted)
+        assert_eq!(engine.node_count().unwrap(), 4); // a, b, c, e (d still deleted)
         assert!(engine.get_node(node_d).unwrap().is_none());
         engine.close().unwrap();
     }

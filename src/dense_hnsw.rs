@@ -1907,7 +1907,10 @@ fn read_u64_at(data: &[u8], offset: usize) -> Result<u64, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment_writer::{write_segment, NODE_DENSE_VECTOR_BLOB_FILENAME};
+    use crate::segment_writer::{
+        write_segment_without_degree_sidecar_for_test as write_segment,
+        NODE_DENSE_VECTOR_BLOB_FILENAME,
+    };
     use crate::types::NodeIdSet;
     use crate::types::{DenseMetric, HnswConfig, NodeRecord, WalOp, DEFAULT_DENSE_EF_SEARCH};
     use crate::{memtable::Memtable, types::DenseVectorConfig};
@@ -2109,7 +2112,7 @@ mod tests {
             hnsw: HnswConfig { m, ef_construction },
         };
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         for (index, values) in dataset.iter().enumerate() {
             mt.apply_op(
                 &WalOp::UpsertNode(node(
@@ -2249,13 +2252,154 @@ mod tests {
         }
     }
 
+    fn valid_dense_hnsw_files() -> (DenseVectorConfig, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let config = DenseVectorConfig {
+            dimension: 2,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig {
+                m: 8,
+                ef_construction: 64,
+            },
+        };
+
+        let mt = Memtable::new();
+        for (index, values) in [
+            vec![1.0, 0.0],
+            vec![0.95, 0.05],
+            vec![0.0, 1.0],
+            vec![0.05, 0.95],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mt.apply_op(
+                &WalOp::UpsertNode(node((index + 1) as u64, &format!("valid-n{index}"), values)),
+                0,
+            );
+        }
+
+        write_segment(&seg_dir, 1, &mt, Some(&config)).unwrap();
+        (
+            config,
+            fs::read(seg_dir.join(DENSE_HNSW_META_FILENAME)).unwrap(),
+            fs::read(seg_dir.join(DENSE_HNSW_GRAPH_FILENAME)).unwrap(),
+            fs::read(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME)).unwrap(),
+        )
+    }
+
+    fn first_neighbor_offset(meta: &[u8], graph: &[u8]) -> (DenseHnswHeader, usize) {
+        let header = read_header(meta).unwrap();
+        for index in 0..header.point_count as usize {
+            let point = read_point_meta(meta, index).unwrap();
+            let mut cursor = point.level_offset as usize;
+            for _ in 0..=point.max_level as usize {
+                let neighbor_count = read_u16_at(graph, cursor).unwrap() as usize;
+                let neighbor_base = cursor + 4;
+                if neighbor_count > 0 {
+                    return (header, neighbor_base);
+                }
+                cursor = neighbor_base + neighbor_count * 4;
+            }
+        }
+        panic!("expected at least one neighbor entry in valid HNSW graph");
+    }
+
+    #[test]
+    fn test_validate_dense_hnsw_rejects_truncated_metadata() {
+        let (config, mut meta, graph, dense_blob) = valid_dense_hnsw_files();
+        meta.truncate(DENSE_HNSW_HEADER_SIZE - 1);
+
+        match validate_dense_hnsw_files(&meta, &graph, dense_blob.len(), 4, Some(&config)) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("too short"));
+            }
+            other => panic!("expected truncated metadata error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_dense_hnsw_rejects_invalid_magic() {
+        let (config, mut meta, graph, dense_blob) = valid_dense_hnsw_files();
+        meta[0..4].copy_from_slice(b"BAD!");
+
+        match validate_dense_hnsw_files(&meta, &graph, dense_blob.len(), 4, Some(&config)) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("invalid magic"));
+            }
+            other => panic!("expected invalid magic error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_dense_hnsw_rejects_invalid_version() {
+        let (config, mut meta, graph, dense_blob) = valid_dense_hnsw_files();
+        meta[4..8].copy_from_slice(&(DENSE_HNSW_VERSION + 1).to_le_bytes());
+
+        match validate_dense_hnsw_files(&meta, &graph, dense_blob.len(), 4, Some(&config)) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("unsupported"));
+            }
+            other => panic!("expected invalid version error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_dense_hnsw_rejects_out_of_range_neighbor() {
+        let (config, meta, mut graph, dense_blob) = valid_dense_hnsw_files();
+        let (header, neighbor_offset) = first_neighbor_offset(&meta, &graph);
+        graph[neighbor_offset..neighbor_offset + 4]
+            .copy_from_slice(&(header.point_count as u32).to_le_bytes());
+
+        match validate_dense_hnsw_files(
+            &meta,
+            &graph,
+            dense_blob.len(),
+            header.point_count as usize,
+            Some(&config),
+        ) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("out-of-range neighbor"));
+            }
+            other => panic!("expected out-of-range neighbor error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_dense_hnsw_rejects_noncontiguous_level_offset() {
+        let (config, mut meta, graph, dense_blob) = valid_dense_hnsw_files();
+        let level_offset_off = DENSE_HNSW_HEADER_SIZE + DENSE_HNSW_POINT_META_SIZE + 16;
+        meta[level_offset_off..level_offset_off + 8].copy_from_slice(&1u64.to_le_bytes());
+
+        match validate_dense_hnsw_files(&meta, &graph, dense_blob.len(), 4, Some(&config)) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("level offset"));
+            }
+            other => panic!("expected level offset error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_dense_hnsw_rejects_trailing_graph_bytes() {
+        let (config, meta, mut graph, dense_blob) = valid_dense_hnsw_files();
+        graph.push(0);
+
+        match validate_dense_hnsw_files(&meta, &graph, dense_blob.len(), 4, Some(&config)) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("trailing or unreferenced bytes"));
+            }
+            other => panic!("expected trailing graph bytes error, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_dense_hnsw_writer_produces_high_quality_graph() {
         // Concurrent HNSW build is non-deterministic (insertion order varies),
         // so we verify quality rather than byte-identical output.
         let config = dense_config(3);
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         for index in 0..64 {
             let x = 1.0 - index as f32 * 0.01;
             let y = index as f32 * 0.01;
@@ -2337,7 +2481,7 @@ mod tests {
             },
         };
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         for index in 0..12 {
             mt.apply_op(
                 &WalOp::UpsertNode(node(
@@ -2381,7 +2525,7 @@ mod tests {
             },
         };
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         for index in 0..256 {
             let x = 1.0 - index as f32 * 0.0025;
             let y = index as f32 * 0.0025;
@@ -2548,7 +2692,7 @@ mod tests {
             },
         };
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(
             &WalOp::UpsertNode(node(7, "winner-on-tie", vec![1.0, 0.0])),
             0,
@@ -2657,7 +2801,7 @@ mod tests {
         // Verify the built graph can answer a representative query without panicking.
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_invariants");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         for index in 0..point_count {
             let values: Vec<f32> = (0..8)
                 .map(|dim| ((index * 7 + dim * 13) as f32).sin())

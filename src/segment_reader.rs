@@ -1,3 +1,4 @@
+use crate::degree_cache::{DegreeDelta, DegreeSidecar, DEGREE_DELTA_FILENAME};
 use crate::dense_hnsw::{
     dense_score_from_bytes, load_dense_hnsw_query_points, search_dense_hnsw_scoped_with_points,
     search_dense_hnsw_with_points, validate_dense_hnsw_files, DenseHnswHeader, DenseQueryPoint,
@@ -448,6 +449,7 @@ pub struct SegmentReader {
     dense_hnsw_points: Vec<DenseQueryPoint>,
     sparse_posting_index_mmap: MappedData,
     sparse_postings_mmap: MappedData,
+    degree_delta: Option<DegreeSidecar>,
     // Timestamp range index
     timestamp_index_mmap: MappedData,
     deleted_nodes: NodeIdMap<TombstoneEntry>,
@@ -475,6 +477,7 @@ impl SegmentReader {
         let dense_hnsw_graph_path = seg_dir.join(DENSE_HNSW_GRAPH_FILENAME);
         let sparse_posting_index_path = seg_dir.join(SPARSE_POSTING_INDEX_FILENAME);
         let sparse_postings_path = seg_dir.join(SPARSE_POSTINGS_FILENAME);
+        let degree_delta_path = seg_dir.join(DEGREE_DELTA_FILENAME);
         let nodes_mmap = mmap_file(&seg_dir.join("nodes.dat"))?;
         let edges_mmap = mmap_file(&seg_dir.join("edges.dat"))?;
         let adj_out_idx = mmap_file(&seg_dir.join("adj_out.idx"))?;
@@ -497,6 +500,7 @@ impl SegmentReader {
         let dense_hnsw_graph_mmap = mmap_file_optional(&dense_hnsw_graph_path)?;
         let sparse_posting_index_mmap = mmap_file_optional(&sparse_posting_index_path)?;
         let sparse_postings_mmap = mmap_file_optional(&sparse_postings_path)?;
+        let degree_delta = DegreeSidecar::open_optional(&degree_delta_path);
         let timestamp_index_mmap = mmap_file(&seg_dir.join("timestamp_index.dat"))?;
 
         let (deleted_nodes, deleted_edges) = load_tombstones(&seg_dir.join("tombstones.dat"))?;
@@ -611,6 +615,7 @@ impl SegmentReader {
             dense_hnsw_points,
             sparse_posting_index_mmap,
             sparse_postings_mmap,
+            degree_delta,
             timestamp_index_mmap,
             deleted_nodes,
             deleted_edges,
@@ -659,12 +664,12 @@ impl SegmentReader {
 
     /// Get the fixed-width edge fields needed for engine-side cache updates
     /// without decoding properties.
-    /// Returns (from, to, created_at, weight, valid_from, valid_to).
+    /// Returns (from, to, created_at, updated_at, weight, valid_from, valid_to).
     #[allow(clippy::type_complexity)]
     pub(crate) fn get_edge_core(
         &self,
         id: u64,
-    ) -> Result<Option<(u64, u64, i64, f32, i64, i64)>, EngineError> {
+    ) -> Result<Option<(u64, u64, i64, i64, f32, i64, i64)>, EngineError> {
         if self.deleted_edges.contains_key(&id) {
             return Ok(None);
         }
@@ -676,10 +681,13 @@ impl SegmentReader {
         let from = read_u64_at(data, offset)?;
         let to = read_u64_at(data, offset + 8)?;
         let created_at = read_i64_at(data, offset + 20)?;
+        let updated_at = read_i64_at(data, offset + 28)?;
         let weight = read_f32_at(data, offset + 36)?;
         let valid_from = read_i64_at(data, offset + 40)?;
         let valid_to = read_i64_at(data, offset + 48)?;
-        Ok(Some((from, to, created_at, weight, valid_from, valid_to)))
+        Ok(Some((
+            from, to, created_at, updated_at, weight, valid_from, valid_to,
+        )))
     }
 
     /// Look up a node by (type_id, key). Returns None if not found or tombstoned.
@@ -1645,6 +1653,20 @@ impl SegmentReader {
         self.edge_count
     }
 
+    pub(crate) fn degree_delta_available(&self) -> bool {
+        self.degree_delta.is_some()
+    }
+
+    pub(crate) fn degree_delta(&self, node_id: u64) -> Option<DegreeDelta> {
+        self.degree_delta
+            .as_ref()
+            .map(|sidecar| sidecar.lookup(node_id))
+    }
+
+    pub(crate) fn degree_delta_sidecar(&self) -> Option<&DegreeSidecar> {
+        self.degree_delta.as_ref()
+    }
+
     /// Returns true if this segment contains any tombstones (deleted nodes or edges).
     pub fn has_tombstones(&self) -> bool {
         !self.deleted_nodes.is_empty() || !self.deleted_edges.is_empty()
@@ -2268,12 +2290,10 @@ impl SegmentReader {
                 }
                 Err(error) => return Err(error),
             };
-            entry.insert(
-                SecondaryEqSidecarCacheEntry {
-                    data,
-                    validated: false,
-                },
-            );
+            entry.insert(SecondaryEqSidecarCacheEntry {
+                data,
+                validated: false,
+            });
         }
 
         let validation_error = {
@@ -2329,12 +2349,10 @@ impl SegmentReader {
                 }
                 Err(error) => return Err(error),
             };
-            entry.insert(
-                SecondaryRangeSidecarCacheEntry {
-                    data,
-                    validated: false,
-                },
-            );
+            entry.insert(SecondaryRangeSidecarCacheEntry {
+                data,
+                validated: false,
+            });
         }
 
         let validation_error = {
@@ -4238,7 +4256,7 @@ fn sparse_dot_score_from_blob(
 pub(crate) mod tests {
     use super::*;
     use crate::memtable::Memtable;
-    use crate::segment_writer::write_segment;
+    use crate::segment_writer::write_segment_without_degree_sidecar_for_test as write_segment;
 
     /// Test-only wrapper to expose read_varint_at for cross-module varint tests.
     pub fn read_varint_at_pub(data: &[u8], offset: usize) -> (u64, usize) {
@@ -4365,7 +4383,8 @@ pub(crate) mod tests {
     ) -> (tempfile::TempDir, SegmentReader) {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        crate::segment_writer::write_segment(&seg_dir, 1, mt, None).unwrap();
+        crate::segment_writer::write_segment_without_degree_sidecar_for_test(&seg_dir, 1, mt, None)
+            .unwrap();
         write_legacy_prop_index(&seg_dir, groups);
         let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
         (dir, reader)
@@ -4377,9 +4396,9 @@ pub(crate) mod tests {
     ) -> (tempfile::TempDir, SegmentReader) {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = mt.clone();
+        let mt = mt.clone();
         mt.register_secondary_index(entry);
-        crate::segment_writer::write_segment_with_secondary_indexes(
+        crate::segment_writer::write_segment_without_degree_sidecar_with_secondary_indexes_for_test(
             &seg_dir,
             1,
             &mt,
@@ -4397,9 +4416,9 @@ pub(crate) mod tests {
     ) -> (tempfile::TempDir, SegmentReader) {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = mt.clone();
+        let mt = mt.clone();
         mt.register_secondary_index(entry);
-        crate::segment_writer::write_segment_with_secondary_indexes(
+        crate::segment_writer::write_segment_without_degree_sidecar_with_secondary_indexes_for_test(
             &seg_dir,
             1,
             &mt,
@@ -4409,6 +4428,17 @@ pub(crate) mod tests {
         .unwrap();
         let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
         (dir, reader)
+    }
+
+    fn write_sparse_segment(nodes: Vec<NodeRecord>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mt = Memtable::new();
+        for (seq, node) in nodes.into_iter().enumerate() {
+            mt.apply_op(&WalOp::UpsertNode(node), seq as u64);
+        }
+        write_segment(&seg_dir, 1, &mt, None).unwrap();
+        (dir, seg_dir)
     }
 
     fn dense_config(dimension: u32) -> DenseVectorConfig {
@@ -4470,7 +4500,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_node_found() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(42, 1, "alice")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
@@ -4484,7 +4514,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_node_not_found() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
@@ -4493,7 +4523,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_node_with_properties() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "alice")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
@@ -4511,7 +4541,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_node_with_vectors() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(3);
         let mut node = make_node(7, 1, "vector");
         node.dense_vector = Some(vec![0.1, 0.2, 0.3]);
@@ -4526,7 +4556,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_all_nodes_hydrates_mixed_vectors() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(2);
         let mut with_vectors = make_node(1, 1, "with_vectors");
         with_vectors.dense_vector = Some(vec![0.5, 0.6]);
@@ -4544,7 +4574,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_node_tombstoned() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
         mt.apply_op(
             &WalOp::DeleteNode {
@@ -4563,7 +4593,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_get_edge_found() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertEdge(make_edge(100, 1, 2, 10)), 0);
 
         let (_dir, reader) = write_and_open(&mt);
@@ -4585,7 +4615,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_node_by_key_found() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(3, 2, "alice")), 0); // different type
@@ -4603,7 +4633,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_node_by_key_not_found() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
@@ -4615,7 +4645,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_neighbors_outgoing() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
@@ -4633,7 +4663,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_neighbors_incoming() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
         mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
@@ -4646,7 +4676,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_neighbors_with_type_filter() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
@@ -4678,7 +4708,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_neighbors_with_limit() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "hub")), 0);
         for i in 2..=6 {
             mt.apply_op(&WalOp::UpsertNode(make_node(i, 1, &format!("n{}", i))), 0);
@@ -4696,7 +4726,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_neighbors_both_with_limit_preserves_self_loop_budget_semantics() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
@@ -4713,7 +4743,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_neighbors_no_adjacency() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "lonely")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
@@ -4723,7 +4753,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_for_each_adj_posting_breaks_early() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         for id in 1..=4 {
             mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))), 0);
         }
@@ -4751,7 +4781,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_for_each_adj_posting_batch_breaks_early() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         for id in 1..=4 {
             mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))), 0);
         }
@@ -4798,7 +4828,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_binary_search_many_nodes() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         for i in 1..=100 {
             mt.apply_op(&WalOp::UpsertNode(make_node(i, 1, &format!("n{}", i))), 0);
         }
@@ -4818,7 +4848,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_binary_search_key_index_many() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         for i in 1..=50 {
             mt.apply_op(
                 &WalOp::UpsertNode(make_node(i, (i % 3) as u32 + 1, &format!("key_{:04}", i))),
@@ -4841,7 +4871,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_full_segment_roundtrip() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
 
         // Build a small graph
         for i in 1..=5 {
@@ -4919,7 +4949,7 @@ pub(crate) mod tests {
     fn test_legacy_prop_index_roundtrip() {
         use crate::types::{hash_prop_key, hash_prop_value};
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
 
         let mut props1 = BTreeMap::new();
         props1.insert("color".to_string(), PropValue::String("red".to_string()));
@@ -5017,7 +5047,7 @@ pub(crate) mod tests {
     fn test_legacy_prop_index_excludes_tombstoned() {
         use crate::types::{hash_prop_key, hash_prop_value};
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
 
         let mut props = BTreeMap::new();
         props.insert("tag".to_string(), PropValue::String("x".to_string()));
@@ -5077,7 +5107,7 @@ pub(crate) mod tests {
     fn test_secondary_eq_sidecar_roundtrip() {
         use crate::types::hash_prop_value;
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
 
         let mut props1 = BTreeMap::new();
         props1.insert("color".to_string(), PropValue::String("red".to_string()));
@@ -5164,7 +5194,7 @@ pub(crate) mod tests {
     fn test_secondary_eq_sidecar_cache_reloads_after_validation_failure_and_repair() {
         use crate::types::hash_prop_value;
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
         mt.apply_op(
@@ -5227,7 +5257,7 @@ pub(crate) mod tests {
     fn test_secondary_eq_sidecar_lookup_uses_validated_cache() {
         use crate::types::hash_prop_value;
 
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
         mt.apply_op(
@@ -5304,6 +5334,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_validate_secondary_eq_sidecar_rejects_missing_header() {
+        match validate_secondary_eq_sidecar_data(&[1u8, 2, 3]) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("missing header"));
+            }
+            other => panic!(
+                "expected corrupt secondary equality sidecar, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_validate_secondary_eq_sidecar_rejects_index_length_past_eof() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(&28u64.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        match validate_secondary_eq_sidecar_data(&data) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("index length"));
+            }
+            other => panic!(
+                "expected corrupt secondary equality sidecar, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_validate_secondary_eq_sidecar_rejects_non_increasing_value_hashes() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u64.to_le_bytes());
+
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(&48u64.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(&56u64.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+
+        match validate_secondary_eq_sidecar_data(&data) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("value hashes are not strictly increasing"));
+            }
+            other => panic!(
+                "expected corrupt secondary equality sidecar, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_validate_secondary_eq_sidecar_rejects_group_past_eof() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(&28u64.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        match validate_secondary_eq_sidecar_data(&data) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("exceeds file length"));
+            }
+            other => panic!(
+                "expected corrupt secondary equality sidecar, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
     fn test_validate_secondary_eq_sidecar_rejects_overlapping_group_ranges() {
         let mut data = Vec::new();
         data.extend_from_slice(&2u64.to_le_bytes());
@@ -5333,7 +5442,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_secondary_range_sidecar_cache_reloads_after_validation_failure_and_repair() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("score".to_string(), PropValue::Int(10));
         mt.apply_op(
@@ -5402,6 +5511,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_validate_secondary_range_sidecar_rejects_missing_header() {
+        match validate_secondary_range_sidecar_data(&[1u8, 2, 3]) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("missing header"));
+            }
+            other => panic!("expected corrupt secondary range sidecar, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_secondary_range_sidecar_rejects_length_mismatch() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&(10u64 ^ (1u64 << 63)).to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.push(0xFF);
+
+        match validate_secondary_range_sidecar_data(&data) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("does not match expected fixed-width length"));
+            }
+            other => panic!("expected corrupt secondary range sidecar, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_validate_secondary_range_sidecar_rejects_unsorted_entries() {
         let mut data = Vec::new();
         data.extend_from_slice(&2u64.to_le_bytes());
@@ -5422,7 +5557,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_neighbor_weight_preserved_in_segment() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
@@ -5487,7 +5622,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_edge_triple_index_roundtrip() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
@@ -5517,7 +5652,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_edge_triple_index_excludes_tombstoned() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
         mt.apply_op(&WalOp::UpsertEdge(make_edge(100, 1, 2, 10)), 0);
@@ -5718,7 +5853,7 @@ pub(crate) mod tests {
     fn test_open_rejects_orphan_vector_blob() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "plain")), 0);
         write_segment(&seg_dir, 1, &mt, None).unwrap();
 
@@ -5737,7 +5872,7 @@ pub(crate) mod tests {
     fn test_open_rejects_vector_metadata_count_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = DenseVectorConfig {
             dimension: 2,
             metric: DenseMetric::Cosine,
@@ -5764,7 +5899,7 @@ pub(crate) mod tests {
     fn test_open_rejects_vector_blob_with_trailing_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(2);
         let mut node = make_node(1, 1, "vector");
         node.dense_vector = Some(vec![0.1, 0.2]);
@@ -5785,7 +5920,7 @@ pub(crate) mod tests {
     fn test_open_exposes_dense_hnsw_header_for_dense_segments() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(3);
 
         let mut first = make_node(1, 1, "a");
@@ -5819,7 +5954,7 @@ pub(crate) mod tests {
     fn test_open_rejects_missing_dense_hnsw_files_for_dense_segments() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(3);
 
         let mut first = make_node(1, 1, "a");
@@ -5844,7 +5979,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_open_keeps_dense_hnsw_empty_for_vectorless_segments() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "plain")), 0);
 
         let (_dir, reader) = write_and_open(&mt);
@@ -5858,7 +5993,7 @@ pub(crate) mod tests {
     fn test_open_rejects_dense_hnsw_files_in_v6_segment() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(2);
         let mut node = make_node(1, 1, "vector");
         node.dense_vector = Some(vec![0.1, 0.2]);
@@ -5884,7 +6019,7 @@ pub(crate) mod tests {
     fn test_open_rejects_dense_hnsw_metric_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(2);
         let mut node = make_node(1, 1, "vector");
         node.dense_vector = Some(vec![0.1, 0.2]);
@@ -5914,7 +6049,7 @@ pub(crate) mod tests {
     fn test_open_rejects_missing_sparse_posting_files_for_sparse_segments() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
 
         let mut node = make_node(1, 1, "sparse");
         node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
@@ -5939,7 +6074,7 @@ pub(crate) mod tests {
     fn test_open_rejects_sparse_posting_files_in_v7_segment() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
 
         let mut node = make_node(1, 1, "sparse");
         node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
@@ -5963,7 +6098,7 @@ pub(crate) mod tests {
     fn test_open_rejects_sparse_vectors_in_v7_segment_without_postings() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
 
         let mut node = make_node(1, 1, "sparse");
         node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
@@ -5991,7 +6126,7 @@ pub(crate) mod tests {
     fn test_open_rejects_sparse_posting_parity_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
 
         let mut node = make_node(1, 1, "sparse");
         node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
@@ -6017,10 +6152,82 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_open_rejects_sparse_vector_blob_with_negative_weight() {
+        let mut node = make_node(1, 1, "sparse-negative");
+        node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
+        let (_dir, seg_dir) = write_sparse_segment(vec![node]);
+
+        let sparse_blob_path =
+            seg_dir.join(crate::segment_writer::NODE_SPARSE_VECTOR_BLOB_FILENAME);
+        let mut sparse_blob = std::fs::read(&sparse_blob_path).unwrap();
+        sparse_blob[4..8].copy_from_slice(&(-1.5f32).to_le_bytes());
+        std::fs::write(&sparse_blob_path, sparse_blob).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, None).err().unwrap();
+        assert!(
+            err.to_string().contains("has negative weight"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_sparse_postings_missing_expected_dimension() {
+        let mut node = make_node(1, 1, "sparse-missing-dim");
+        node.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
+        let (_dir, seg_dir) = write_sparse_segment(vec![node]);
+
+        let index_path = seg_dir.join(crate::sparse_postings::SPARSE_POSTING_INDEX_FILENAME);
+        let mut index = std::fs::read(&index_path).unwrap();
+        index[24..28].copy_from_slice(&9u32.to_le_bytes());
+        std::fs::write(&index_path, index).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, None).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("sparse posting files are missing dimension 7 from sparse vectors"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_sparse_posting_count_mismatch() {
+        let mut first = make_node(1, 1, "sparse-count-a");
+        first.sparse_vector = Some(vec![(2, 1.5), (7, 0.25)]);
+        let mut second = make_node(2, 1, "sparse-count-b");
+        second.sparse_vector = Some(vec![(2, 0.5)]);
+        let (_dir, seg_dir) = write_sparse_segment(vec![first, second]);
+
+        let index_path = seg_dir.join(crate::sparse_postings::SPARSE_POSTING_INDEX_FILENAME);
+        let postings_path = seg_dir.join(crate::sparse_postings::SPARSE_POSTINGS_FILENAME);
+
+        let mut index = std::fs::read(&index_path).unwrap();
+        index[20..24].copy_from_slice(&1u32.to_le_bytes());
+        index[28..36].copy_from_slice(&12u64.to_le_bytes());
+        std::fs::write(&index_path, index).unwrap();
+
+        let postings = std::fs::read(&postings_path).unwrap();
+        let mut rebuilt_postings = Vec::with_capacity(24);
+        rebuilt_postings.extend_from_slice(&postings[0..12]);
+        rebuilt_postings.extend_from_slice(&postings[24..36]);
+        std::fs::write(&postings_path, rebuilt_postings).unwrap();
+
+        let err = SegmentReader::open(&seg_dir, 1, None).err().unwrap();
+        assert!(
+            err.to_string().contains(
+                "sparse posting dimension 2 count 1 does not match sparse vector payload count 2"
+            ),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_open_rejects_dense_hnsw_hnsw_param_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(2);
         let mut node = make_node(1, 1, "vector");
         node.dense_vector = Some(vec![0.1, 0.2]);
@@ -6050,7 +6257,7 @@ pub(crate) mod tests {
     fn test_open_rejects_dense_hnsw_dimension_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(2);
         let mut node = make_node(1, 1, "vector");
         node.dense_vector = Some(vec![0.1, 0.2]);
@@ -6081,7 +6288,7 @@ pub(crate) mod tests {
     fn test_open_rejects_dense_hnsw_ef_construction_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(2);
         let mut node = make_node(1, 1, "vector");
         node.dense_vector = Some(vec![0.1, 0.2]);
@@ -6112,7 +6319,7 @@ pub(crate) mod tests {
     fn test_open_rejects_dense_hnsw_without_dense_config() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         let dense_config = dense_config(2);
         let mut node = make_node(1, 1, "vector");
         node.dense_vector = Some(vec![0.1, 0.2]);
@@ -6132,7 +6339,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_sidecar_node_meta_roundtrip() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 1, "alice")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bob")), 0);
 
@@ -6160,7 +6367,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_sidecar_edge_meta_roundtrip() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
         mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 0);
@@ -6183,7 +6390,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_sidecar_data_offset_matches_nodes_dat() {
-        let mut mt = Memtable::new();
+        let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bb")), 0);
 

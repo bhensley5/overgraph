@@ -425,7 +425,7 @@ fn bench_vector_non_vector_parity(c: &mut Criterion) {
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let inputs: Vec<NodeInput> = (0..2000)
             .map(|i| NodeInput {
                 type_id: 1,
@@ -453,7 +453,7 @@ fn bench_vector_non_vector_parity(c: &mut Criterion) {
             dense_vector: Some(dense_bench_config(32)),
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let inputs: Vec<NodeInput> = (0..2000)
             .map(|i| NodeInput {
                 type_id: 1,
@@ -480,7 +480,7 @@ fn bench_vector_non_vector_parity(c: &mut Criterion) {
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let plain_inputs: Vec<NodeInput> = (0..1000)
             .map(|i| NodeInput {
                 type_id: 1,
@@ -529,7 +529,7 @@ fn bench_vector_search_dense(c: &mut Criterion) {
             dense_vector: Some(dense_bench_config(64)),
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let cluster_count = 24usize;
         let points_per_cluster = 384usize;
         let inputs: Vec<NodeInput> = (0..cluster_count)
@@ -562,7 +562,7 @@ fn bench_vector_search_dense(c: &mut Criterion) {
             dense_vector: Some(dense_bench_config(64)),
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
 
         let cluster_count = 24usize;
         let points_per_cluster = 128usize;
@@ -597,6 +597,48 @@ fn bench_vector_search_dense(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("memtable_clustered_filtered_k10_default", |b| {
+        let opts = DbOptions {
+            create_if_missing: true,
+            edge_uniqueness: true,
+            compact_after_n_flushes: 0,
+            dense_vector: Some(dense_bench_config(64)),
+            ..DbOptions::default()
+        };
+        let (_dir, engine) = temp_db_with_opts(opts);
+
+        let cluster_count = 24usize;
+        let points_per_cluster = 128usize;
+        for batch_index in 0..3usize {
+            let batch_type = if batch_index == 0 { 1 } else { 2 };
+            let inputs: Vec<NodeInput> = (0..cluster_count)
+                .flat_map(|cluster| {
+                    (0..points_per_cluster).map(move |member| NodeInput {
+                        type_id: batch_type,
+                        key: format!("mt{batch_index}_c{cluster}_n{member}"),
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        dense_vector: Some(clustered_dense_vector(
+                            64,
+                            (cluster + batch_index * 3) % cluster_count,
+                            member + batch_index * 10_000,
+                            cluster_count,
+                        )),
+                        sparse_vector: None,
+                    })
+                })
+                .collect();
+            engine.batch_upsert_nodes(&inputs).unwrap();
+        }
+
+        let mut request = dense_query_request(clustered_query_vector(64, 3, 9, cluster_count), 10);
+        request.type_filter = Some(vec![1]);
+
+        b.iter(|| {
+            black_box(engine.vector_search(black_box(&request)).unwrap());
+        });
+    });
+
     group.bench_function("single_segment_patterned_5000x32_k10_legacy_shape", |b| {
         let opts = DbOptions {
             create_if_missing: true,
@@ -604,7 +646,7 @@ fn bench_vector_search_dense(c: &mut Criterion) {
             dense_vector: Some(dense_bench_config(32)),
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let inputs: Vec<NodeInput> = (0..5000)
             .map(|i| NodeInput {
                 type_id: 1,
@@ -641,7 +683,7 @@ fn bench_vector_search_sparse(c: &mut Criterion) {
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let cluster_count = 24usize;
         let points_per_cluster = 384usize;
         let inputs = clustered_sparse_inputs(cluster_count, points_per_cluster, 4096, 12);
@@ -661,7 +703,7 @@ fn bench_vector_search_sparse(c: &mut Criterion) {
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let inputs = uniform_sparse_inputs(9_216, 4096, 12);
         engine.batch_upsert_nodes(&inputs).unwrap();
         engine.flush().unwrap();
@@ -680,7 +722,7 @@ fn bench_vector_search_sparse(c: &mut Criterion) {
             compact_after_n_flushes: 0,
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let cluster_count = 24usize;
         let dimension_count = 4096u32;
         let nnz = 12usize;
@@ -692,6 +734,41 @@ fn bench_vector_search_sparse(c: &mut Criterion) {
             clustered_sparse_multisegment_inputs_b(1_536, dimension_count, cluster_count, nnz);
         engine.batch_upsert_nodes(&inputs_b).unwrap();
         engine.flush().unwrap();
+
+        let request = sparse_query_request_with_type_filter(
+            clustered_sparse_query(dimension_count, 3, 11, cluster_count, nnz),
+            10,
+            Some(vec![1]),
+        );
+        b.iter(|| {
+            black_box(engine.vector_search(black_box(&request)).unwrap());
+        });
+    });
+
+    group.bench_function("memtable_clustered_filtered_k10", |b| {
+        let opts = DbOptions {
+            create_if_missing: true,
+            edge_uniqueness: true,
+            compact_after_n_flushes: 0,
+            ..DbOptions::default()
+        };
+        let (_dir, engine) = temp_db_with_opts(opts);
+        let cluster_count = 24usize;
+        let dimension_count = 4096u32;
+        let nnz = 12usize;
+
+        let mut inputs_a =
+            clustered_sparse_multisegment_inputs_a(1_536, dimension_count, cluster_count, nnz);
+        let mut inputs_b =
+            clustered_sparse_multisegment_inputs_b(1_536, dimension_count, cluster_count, nnz);
+        for input in &mut inputs_a {
+            input.key = format!("mem_a_{}", input.key);
+        }
+        for input in &mut inputs_b {
+            input.key = format!("mem_b_{}", input.key);
+        }
+        engine.batch_upsert_nodes(&inputs_a).unwrap();
+        engine.batch_upsert_nodes(&inputs_b).unwrap();
 
         let request = sparse_query_request_with_type_filter(
             clustered_sparse_query(dimension_count, 3, 11, cluster_count, nnz),
@@ -718,12 +795,12 @@ fn bench_sparse_build(c: &mut Criterion) {
                     edge_uniqueness: true,
                     ..DbOptions::default()
                 };
-                let (_dir, mut engine) = temp_db_with_opts(opts);
+                let (_dir, engine) = temp_db_with_opts(opts);
                 let inputs = clustered_sparse_inputs(24, 384, 4096, 12);
                 engine.batch_upsert_nodes(&inputs).unwrap();
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 black_box(engine.flush().unwrap());
             },
             BatchSize::PerIteration,
@@ -739,7 +816,7 @@ fn bench_sparse_build(c: &mut Criterion) {
                     compact_after_n_flushes: 0,
                     ..DbOptions::default()
                 };
-                let (_dir, mut engine) = temp_db_with_opts(opts);
+                let (_dir, engine) = temp_db_with_opts(opts);
                 let cluster_count = 24usize;
                 let dimension_count = 4096u32;
                 let nnz = 12usize;
@@ -756,7 +833,7 @@ fn bench_sparse_build(c: &mut Criterion) {
                 }
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 black_box(engine.compact().unwrap());
             },
             BatchSize::PerIteration,
@@ -829,7 +906,7 @@ fn bench_vector_search_hybrid(c: &mut Criterion) {
             dense_vector: Some(dense_bench_config(64)),
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let cluster_count = 24usize;
         let points_per_cluster = 384usize;
         let inputs = clustered_hybrid_inputs(cluster_count, points_per_cluster, 64, 4096, 12);
@@ -855,7 +932,7 @@ fn bench_vector_search_hybrid(c: &mut Criterion) {
             dense_vector: Some(dense_bench_config(64)),
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let cluster_count = 24usize;
         let points_per_cluster = 384usize;
         let inputs = clustered_hybrid_inputs(cluster_count, points_per_cluster, 64, 4096, 12);
@@ -882,7 +959,7 @@ fn bench_vector_search_hybrid(c: &mut Criterion) {
             dense_vector: Some(dense_bench_config(64)),
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let cluster_count = 24usize;
         let points_per_cluster = 128usize;
         for segment_index in 0..3usize {
@@ -927,6 +1004,58 @@ fn bench_vector_search_hybrid(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("memtable_hybrid_filtered_k10", |b| {
+        let opts = DbOptions {
+            create_if_missing: true,
+            edge_uniqueness: true,
+            compact_after_n_flushes: 0,
+            dense_vector: Some(dense_bench_config(64)),
+            ..DbOptions::default()
+        };
+        let (_dir, engine) = temp_db_with_opts(opts);
+        let cluster_count = 24usize;
+        let points_per_cluster = 128usize;
+        for batch_index in 0..3usize {
+            let batch_type = if batch_index == 0 { 1 } else { 2 };
+            let inputs: Vec<NodeInput> = (0..cluster_count)
+                .flat_map(|cluster| {
+                    (0..points_per_cluster).map(move |member| NodeInput {
+                        type_id: batch_type,
+                        key: format!("mt{batch_index}_h{cluster}_n{member}"),
+                        props: BTreeMap::new(),
+                        weight: 1.0,
+                        dense_vector: Some(clustered_dense_vector(
+                            64,
+                            (cluster + batch_index * 3) % cluster_count,
+                            member + batch_index * 10_000,
+                            cluster_count,
+                        )),
+                        sparse_vector: Some(clustered_sparse_vector(
+                            4096,
+                            (cluster + batch_index * 3) % cluster_count,
+                            member + batch_index * 10_000,
+                            cluster_count,
+                            12,
+                        )),
+                    })
+                })
+                .collect();
+            engine.batch_upsert_nodes(&inputs).unwrap();
+        }
+
+        let mut request = hybrid_query_request(
+            clustered_query_vector(64, 3, 9, cluster_count),
+            clustered_sparse_query(4096, 3, 9, cluster_count, 12),
+            10,
+            None,
+        );
+        request.type_filter = Some(vec![1]);
+
+        b.iter(|| {
+            black_box(engine.vector_search(black_box(&request)).unwrap());
+        });
+    });
+
     group.finish();
 }
 
@@ -941,7 +1070,7 @@ fn bench_vector_search_scoped(c: &mut Criterion) {
             dense_vector: Some(dense_bench_config(64)),
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let cluster_count = 8usize;
         let spokes_per_cluster = 62usize;
         let total_spokes = cluster_count * spokes_per_cluster;
@@ -1014,7 +1143,7 @@ fn bench_vector_search_scoped(c: &mut Criterion) {
             dense_vector: Some(dense_bench_config(64)),
             ..DbOptions::default()
         };
-        let (_dir, mut engine) = temp_db_with_opts(opts);
+        let (_dir, engine) = temp_db_with_opts(opts);
         let cluster_count = 8usize;
         let spokes_per_cluster = 62usize;
         let total_spokes = cluster_count * spokes_per_cluster;
@@ -1140,7 +1269,7 @@ fn bench_dense_build(c: &mut Criterion) {
                     dense_vector: Some(dense_bench_config(64)),
                     ..DbOptions::default()
                 };
-                let (_dir, mut engine) = temp_db_with_opts(opts);
+                let (_dir, engine) = temp_db_with_opts(opts);
                 let cluster_count = 24usize;
                 let points_per_cluster = 384usize;
                 let inputs: Vec<NodeInput> = (0..cluster_count)
@@ -1163,7 +1292,7 @@ fn bench_dense_build(c: &mut Criterion) {
                 engine.batch_upsert_nodes(&inputs).unwrap();
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 black_box(engine.flush().unwrap());
             },
             BatchSize::PerIteration,
@@ -1180,7 +1309,7 @@ fn bench_dense_build(c: &mut Criterion) {
                     dense_vector: Some(dense_bench_config(64)),
                     ..DbOptions::default()
                 };
-                let (_dir, mut engine) = temp_db_with_opts(opts);
+                let (_dir, engine) = temp_db_with_opts(opts);
                 let cluster_count = 24usize;
                 for segment_index in 0..3usize {
                     let inputs = clustered_dense_overlap_segment_inputs(
@@ -1194,7 +1323,7 @@ fn bench_dense_build(c: &mut Criterion) {
                 }
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 black_box(engine.compact().unwrap());
             },
             BatchSize::PerIteration,

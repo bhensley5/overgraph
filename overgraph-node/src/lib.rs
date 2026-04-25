@@ -13,8 +13,9 @@ use overgraph::{
     PropertyRangePageResult, PrunePolicy, PruneResult, ScoringMode, SecondaryIndexKind,
     SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPath, ShortestPathOptions, Subgraph,
     SubgraphOptions, TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult,
-    TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions, VectorHit, VectorSearchMode,
-    VectorSearchRequest, VectorSearchScope, WalSyncMode,
+    TraverseOptions, TxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef,
+    TxnNodeView, UpsertEdgeOptions, UpsertNodeOptions, VectorHit, VectorSearchMode,
+    VectorSearchRequest, VectorSearchScope, WalSyncMode, WriteTxn,
 };
 
 /// ThreadsafeFunction with `CalleeHandled = false` so the JS callback
@@ -28,7 +29,7 @@ type ProgressTsfn = napi::threadsafe_function::ThreadsafeFunction<
 >;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 
 // ============================================================
 // Core wrapper
@@ -40,7 +41,7 @@ struct InnerDb {
 
 #[napi]
 pub struct OverGraph {
-    inner: Arc<RwLock<Option<InnerDb>>>,
+    inner: Arc<Mutex<Option<InnerDb>>>,
 }
 
 #[napi]
@@ -53,24 +54,27 @@ impl OverGraph {
         let engine = DatabaseEngine::open(Path::new(&path), &opts)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         Ok(OverGraph {
-            inner: Arc::new(RwLock::new(Some(InnerDb { engine }))),
+            inner: Arc::new(Mutex::new(Some(InnerDb { engine }))),
         })
     }
 
     #[napi]
     pub fn close(&self, options: Option<JsCloseOptions>) -> Result<()> {
         let force = options.as_ref().and_then(|o| o.force).unwrap_or(false);
-        let mut guard = self
-            .inner
-            .write()
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        if let Some(db) = guard.take() {
+        let engine = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            guard.take().map(|db| db.engine)
+        };
+        if let Some(engine) = engine {
             if force {
-                db.engine
+                engine
                     .close_fast()
                     .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             } else {
-                db.engine
+                engine
                     .close()
                     .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             }
@@ -287,6 +291,21 @@ impl OverGraph {
         })
     }
 
+    #[napi]
+    pub fn begin_write_txn(&self) -> Result<JsWriteTxn> {
+        let txn = with_engine_ref(self, |eng| eng.begin_write_txn())?;
+        Ok(write_txn_to_js(txn))
+    }
+
+    #[napi(ts_return_type = "Promise<JsWriteTxn>")]
+    pub fn begin_write_txn_async(&self) -> AsyncTask<EngineReadOp<WriteTxn, JsWriteTxn>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            |eng| eng.begin_write_txn(),
+            |txn| Ok(write_txn_to_js(txn)),
+        ))
+    }
+
     // --- Retention / Forgetting ---
 
     #[napi]
@@ -329,7 +348,7 @@ impl OverGraph {
     pub fn list_prune_policies(&self) -> Result<Vec<JsNamedPrunePolicy>> {
         with_engine_ref(self, |eng| {
             Ok(eng
-                .list_prune_policies()
+                .list_prune_policies()?
                 .into_iter()
                 .map(|(name, p)| JsNamedPrunePolicy {
                     name,
@@ -382,7 +401,7 @@ impl OverGraph {
     ) -> Result<AsyncTask<EngineReadOp<Vec<(String, PrunePolicy)>, Vec<JsNamedPrunePolicy>>>> {
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| Ok(eng.list_prune_policies()),
+            move |eng| eng.list_prune_policies(),
             |policies| {
                 Ok(policies
                     .into_iter()
@@ -790,7 +809,7 @@ impl OverGraph {
 
     #[napi]
     pub fn list_node_property_indexes(&self) -> Result<Vec<JsNodePropertyIndexInfo>> {
-        let infos = with_engine_ref(self, |eng| Ok(eng.list_node_property_indexes()))?;
+        let infos = with_engine_ref(self, |eng| eng.list_node_property_indexes())?;
         infos
             .into_iter()
             .map(node_property_index_info_to_js)
@@ -1203,10 +1222,7 @@ impl OverGraph {
 
     #[napi]
     pub fn ingest_mode(&self) -> Result<()> {
-        with_engine(self, |eng| {
-            eng.ingest_mode();
-            Ok(())
-        })
+        with_engine(self, |eng| eng.ingest_mode())
     }
 
     #[napi]
@@ -1259,7 +1275,7 @@ impl OverGraph {
 
     #[napi]
     pub fn stats(&self) -> Result<JsDbStats> {
-        with_engine_ref(self, |eng| Ok(eng.stats().into()))
+        with_engine_ref(self, |eng| Ok(eng.stats()?.into()))
     }
 
     // ============================
@@ -1279,7 +1295,7 @@ impl OverGraph {
     pub fn stats_async(&self) -> AsyncTask<EngineReadOp<DbStats, JsDbStats>> {
         AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            |eng| Ok(eng.stats()),
+            |eng| eng.stats(),
             |s| Ok(s.into()),
         ))
     }
@@ -1780,7 +1796,7 @@ impl OverGraph {
     ) -> AsyncTask<EngineReadOp<Vec<NodePropertyIndexInfo>, Vec<JsNodePropertyIndexInfo>>> {
         AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            |eng| Ok(eng.list_node_property_indexes()),
+            |eng| eng.list_node_property_indexes(),
             node_property_index_infos_to_js,
         ))
     }
@@ -2528,10 +2544,7 @@ impl OverGraph {
     pub fn ingest_mode_async(&self) -> AsyncTask<EngineOp<(), ()>> {
         AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            |eng| {
-                eng.ingest_mode();
-                Ok(())
-            },
+            |eng| eng.ingest_mode(),
             |_| Ok(()),
         ))
     }
@@ -2574,6 +2587,441 @@ impl OverGraph {
             db: self.inner.clone(),
             tsfn: callback,
         })
+    }
+}
+
+#[napi(js_name = "WriteTxn")]
+pub struct JsWriteTxn {
+    inner: Arc<Mutex<Option<WriteTxn>>>,
+    async_order: Arc<TxnAsyncOrder>,
+}
+
+struct TxnAsyncOrder {
+    state: Mutex<TxnAsyncState>,
+    cvar: Condvar,
+}
+
+struct TxnAsyncState {
+    next_ticket: u64,
+    serving_ticket: u64,
+}
+
+impl TxnAsyncOrder {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(TxnAsyncState {
+                next_ticket: 0,
+                serving_ticket: 0,
+            }),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn reserve_ticket(&self) -> Result<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.checked_add(1).ok_or_else(|| {
+            napi::Error::from_reason("transaction async queue overflow".to_string())
+        })?;
+        Ok(ticket)
+    }
+
+    fn wait_turn(self: &Arc<Self>, ticket: u64) -> Result<TxnAsyncTurn> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        while state.serving_ticket != ticket {
+            state = self
+                .cvar
+                .wait(state)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        }
+        Ok(TxnAsyncTurn {
+            order: self.clone(),
+        })
+    }
+
+    fn finish_turn(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.serving_ticket = state.serving_ticket.saturating_add(1);
+            self.cvar.notify_all();
+        }
+    }
+}
+
+struct TxnAsyncTurn {
+    order: Arc<TxnAsyncOrder>,
+}
+
+impl Drop for TxnAsyncTurn {
+    fn drop(&mut self) {
+        self.order.finish_turn();
+    }
+}
+
+fn write_txn_to_js(txn: WriteTxn) -> JsWriteTxn {
+    JsWriteTxn {
+        inner: Arc::new(Mutex::new(Some(txn))),
+        async_order: Arc::new(TxnAsyncOrder::new()),
+    }
+}
+
+#[napi]
+impl JsWriteTxn {
+    #[napi]
+    pub fn upsert_node(
+        &self,
+        type_id: u32,
+        key: String,
+        options: Option<JsUpsertNodeOptions>,
+    ) -> Result<JsTxnNodeRef> {
+        with_txn(&self.inner, |txn| {
+            txn.upsert_node(type_id, &key, js_upsert_node_options(options))
+        })?;
+        Ok(JsTxnNodeRef {
+            id: None,
+            type_id: Some(type_id),
+            key: Some(key),
+            local: None,
+        })
+    }
+
+    #[napi]
+    pub fn upsert_node_as(
+        &self,
+        alias: String,
+        type_id: u32,
+        key: String,
+        options: Option<JsUpsertNodeOptions>,
+    ) -> Result<JsTxnNodeRef> {
+        let node_ref = with_txn(&self.inner, |txn| {
+            txn.upsert_node_as(&alias, type_id, &key, js_upsert_node_options(options))
+        })?;
+        txn_node_ref_to_js(node_ref)
+    }
+
+    #[napi]
+    pub fn upsert_edge(
+        &self,
+        from: JsTxnNodeRef,
+        to: JsTxnNodeRef,
+        type_id: u32,
+        options: Option<JsUpsertEdgeOptions>,
+    ) -> Result<JsTxnEdgeRef> {
+        let from_rust = js_txn_node_ref_to_rust(from.clone())?;
+        let to_rust = js_txn_node_ref_to_rust(to.clone())?;
+        with_txn(&self.inner, |txn| {
+            txn.upsert_edge(from_rust, to_rust, type_id, js_upsert_edge_options(options))
+        })?;
+        Ok(JsTxnEdgeRef {
+            id: None,
+            from: Some(from),
+            to: Some(to),
+            type_id: Some(type_id),
+            local: None,
+        })
+    }
+
+    #[napi]
+    pub fn upsert_edge_as(
+        &self,
+        alias: String,
+        from: JsTxnNodeRef,
+        to: JsTxnNodeRef,
+        type_id: u32,
+        options: Option<JsUpsertEdgeOptions>,
+    ) -> Result<JsTxnEdgeRef> {
+        let from = js_txn_node_ref_to_rust(from)?;
+        let to = js_txn_node_ref_to_rust(to)?;
+        let edge_ref = with_txn(&self.inner, |txn| {
+            txn.upsert_edge_as(&alias, from, to, type_id, js_upsert_edge_options(options))
+        })?;
+        txn_edge_ref_to_js(edge_ref)
+    }
+
+    #[napi]
+    pub fn delete_node(&self, target: JsTxnNodeRef) -> Result<()> {
+        let target = js_txn_node_ref_to_rust(target)?;
+        with_txn(&self.inner, |txn| txn.delete_node(target))
+    }
+
+    #[napi]
+    pub fn delete_edge(&self, target: JsTxnEdgeRef) -> Result<()> {
+        let target = js_txn_edge_ref_to_rust(target)?;
+        with_txn(&self.inner, |txn| txn.delete_edge(target))
+    }
+
+    #[napi]
+    pub fn invalidate_edge(&self, target: JsTxnEdgeRef, valid_to: i64) -> Result<()> {
+        let target = js_txn_edge_ref_to_rust(target)?;
+        with_txn(&self.inner, |txn| txn.invalidate_edge(target, valid_to))
+    }
+
+    #[napi]
+    pub fn stage(&self, operations: Vec<JsTxnOperation>) -> Result<()> {
+        let intents = operations
+            .into_iter()
+            .map(js_txn_operation_to_rust)
+            .collect::<Result<Vec<_>>>()?;
+        with_txn(&self.inner, |txn| txn.stage_intents(intents))
+    }
+
+    #[napi]
+    pub fn get_node(&self, target: JsTxnNodeRef) -> Result<Option<JsTxnNodeView>> {
+        let target = js_txn_node_ref_to_rust(target)?;
+        let view = with_txn_ref(&self.inner, |txn| txn.get_node(target))?;
+        view.map(txn_node_view_to_js).transpose()
+    }
+
+    #[napi]
+    pub fn get_edge(&self, target: JsTxnEdgeRef) -> Result<Option<JsTxnEdgeView>> {
+        let target = js_txn_edge_ref_to_rust(target)?;
+        let view = with_txn_ref(&self.inner, |txn| txn.get_edge(target))?;
+        view.map(txn_edge_view_to_js).transpose()
+    }
+
+    #[napi]
+    pub fn get_node_by_key(&self, type_id: u32, key: String) -> Result<Option<JsTxnNodeView>> {
+        let view = with_txn_ref(&self.inner, |txn| txn.get_node_by_key(type_id, &key))?;
+        view.map(txn_node_view_to_js).transpose()
+    }
+
+    #[napi]
+    pub fn get_edge_by_triple(
+        &self,
+        from: JsTxnNodeRef,
+        to: JsTxnNodeRef,
+        type_id: u32,
+    ) -> Result<Option<JsTxnEdgeView>> {
+        let from = js_txn_node_ref_to_rust(from)?;
+        let to = js_txn_node_ref_to_rust(to)?;
+        let view = with_txn_ref(&self.inner, |txn| txn.get_edge_by_triple(from, to, type_id))?;
+        view.map(txn_edge_view_to_js).transpose()
+    }
+
+    #[napi]
+    pub fn commit(&self) -> Result<JsTxnCommitResult> {
+        let result = with_txn_take(&self.inner, |txn| txn.commit())?;
+        txn_commit_result_to_js(result)
+    }
+
+    #[napi]
+    pub fn rollback(&self) -> Result<()> {
+        with_txn_take(&self.inner, |txn| txn.rollback())
+    }
+
+    #[napi(ts_return_type = "Promise<JsTxnNodeRef>")]
+    pub fn upsert_node_async(
+        &self,
+        type_id: u32,
+        key: String,
+        options: Option<JsUpsertNodeOptions>,
+    ) -> Result<AsyncTask<TxnAsyncOp<JsTxnNodeRef, JsTxnNodeRef>>> {
+        let opts = js_upsert_node_options(options);
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| {
+                txn.upsert_node(type_id, &key, opts)?;
+                Ok(JsTxnNodeRef {
+                    id: None,
+                    type_id: Some(type_id),
+                    key: Some(key),
+                    local: None,
+                })
+            },
+            napi_identity,
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<JsTxnNodeRef>")]
+    pub fn upsert_node_as_async(
+        &self,
+        alias: String,
+        type_id: u32,
+        key: String,
+        options: Option<JsUpsertNodeOptions>,
+    ) -> Result<AsyncTask<TxnAsyncOp<TxnNodeRef, JsTxnNodeRef>>> {
+        let opts = js_upsert_node_options(options);
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.upsert_node_as(&alias, type_id, &key, opts),
+            txn_node_ref_to_js,
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<JsTxnEdgeRef>")]
+    pub fn upsert_edge_async(
+        &self,
+        from: JsTxnNodeRef,
+        to: JsTxnNodeRef,
+        type_id: u32,
+        options: Option<JsUpsertEdgeOptions>,
+    ) -> Result<AsyncTask<TxnAsyncOp<JsTxnEdgeRef, JsTxnEdgeRef>>> {
+        let from_rust = js_txn_node_ref_to_rust(from.clone())?;
+        let to_rust = js_txn_node_ref_to_rust(to.clone())?;
+        let opts = js_upsert_edge_options(options);
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| {
+                txn.upsert_edge(from_rust, to_rust, type_id, opts)?;
+                Ok(JsTxnEdgeRef {
+                    id: None,
+                    from: Some(from),
+                    to: Some(to),
+                    type_id: Some(type_id),
+                    local: None,
+                })
+            },
+            napi_identity,
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<JsTxnEdgeRef>")]
+    pub fn upsert_edge_as_async(
+        &self,
+        alias: String,
+        from: JsTxnNodeRef,
+        to: JsTxnNodeRef,
+        type_id: u32,
+        options: Option<JsUpsertEdgeOptions>,
+    ) -> Result<AsyncTask<TxnAsyncOp<TxnEdgeRef, JsTxnEdgeRef>>> {
+        let from = js_txn_node_ref_to_rust(from)?;
+        let to = js_txn_node_ref_to_rust(to)?;
+        let opts = js_upsert_edge_options(options);
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.upsert_edge_as(&alias, from, to, type_id, opts),
+            txn_edge_ref_to_js,
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn delete_node_async(&self, target: JsTxnNodeRef) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
+        let target = js_txn_node_ref_to_rust(target)?;
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.delete_node(target),
+            |_| Ok(()),
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn delete_edge_async(&self, target: JsTxnEdgeRef) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
+        let target = js_txn_edge_ref_to_rust(target)?;
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.delete_edge(target),
+            |_| Ok(()),
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn invalidate_edge_async(
+        &self,
+        target: JsTxnEdgeRef,
+        valid_to: i64,
+    ) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
+        let target = js_txn_edge_ref_to_rust(target)?;
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.invalidate_edge(target, valid_to),
+            |_| Ok(()),
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn stage_async(
+        &self,
+        operations: Vec<JsTxnOperation>,
+    ) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
+        let intents = operations
+            .into_iter()
+            .map(js_txn_operation_to_rust)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.stage_intents(intents),
+            |_| Ok(()),
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<JsTxnNodeView | null>")]
+    pub fn get_node_async(
+        &self,
+        target: JsTxnNodeRef,
+    ) -> Result<AsyncTask<TxnAsyncOp<Option<TxnNodeView>, Option<JsTxnNodeView>>>> {
+        let target = js_txn_node_ref_to_rust(target)?;
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.get_node(target),
+            |view| view.map(txn_node_view_to_js).transpose(),
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<JsTxnEdgeView | null>")]
+    pub fn get_edge_async(
+        &self,
+        target: JsTxnEdgeRef,
+    ) -> Result<AsyncTask<TxnAsyncOp<Option<TxnEdgeView>, Option<JsTxnEdgeView>>>> {
+        let target = js_txn_edge_ref_to_rust(target)?;
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.get_edge(target),
+            |view| view.map(txn_edge_view_to_js).transpose(),
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<JsTxnNodeView | null>")]
+    pub fn get_node_by_key_async(
+        &self,
+        type_id: u32,
+        key: String,
+    ) -> Result<AsyncTask<TxnAsyncOp<Option<TxnNodeView>, Option<JsTxnNodeView>>>> {
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.get_node_by_key(type_id, &key),
+            |view| view.map(txn_node_view_to_js).transpose(),
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<JsTxnEdgeView | null>")]
+    pub fn get_edge_by_triple_async(
+        &self,
+        from: JsTxnNodeRef,
+        to: JsTxnNodeRef,
+        type_id: u32,
+    ) -> Result<AsyncTask<TxnAsyncOp<Option<TxnEdgeView>, Option<JsTxnEdgeView>>>> {
+        let from = js_txn_node_ref_to_rust(from)?;
+        let to = js_txn_node_ref_to_rust(to)?;
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.get_edge_by_triple(from, to, type_id),
+            |view| view.map(txn_edge_view_to_js).transpose(),
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<JsTxnCommitResult>")]
+    pub fn commit_async(
+        &self,
+    ) -> Result<AsyncTask<TxnAsyncTakeOp<TxnCommitResult, JsTxnCommitResult>>> {
+        Ok(AsyncTask::new(TxnAsyncTakeOp::new(
+            self,
+            |txn| txn.commit(),
+            txn_commit_result_to_js,
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn rollback_async(&self) -> Result<AsyncTask<TxnAsyncTakeOp<(), ()>>> {
+        Ok(AsyncTask::new(TxnAsyncTakeOp::new(
+            self,
+            |txn| txn.rollback(),
+            |_| Ok(()),
+        )?))
     }
 }
 
@@ -2972,6 +3420,90 @@ impl From<JsNodeInput> for NodeInput {
 pub struct JsSparseEntry {
     pub dimension: u32,
     pub value: f64,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct JsTxnNodeRef {
+    pub id: Option<f64>,
+    pub type_id: Option<u32>,
+    pub key: Option<String>,
+    pub local: Option<String>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct JsTxnEdgeRef {
+    pub id: Option<f64>,
+    pub from: Option<JsTxnNodeRef>,
+    pub to: Option<JsTxnNodeRef>,
+    pub type_id: Option<u32>,
+    pub local: Option<String>,
+}
+
+#[napi(object)]
+pub struct JsTxnOperation {
+    pub op: String,
+    pub alias: Option<String>,
+    pub type_id: Option<u32>,
+    pub key: Option<String>,
+    pub props: Option<HashMap<String, serde_json::Value>>,
+    pub weight: Option<f64>,
+    pub dense_vector: Option<Vec<f64>>,
+    pub sparse_vector: Option<Vec<JsSparseEntry>>,
+    pub from: Option<JsTxnNodeRef>,
+    pub to: Option<JsTxnNodeRef>,
+    pub target: Option<JsTxnEdgeOrNodeRef>,
+    pub valid_from: Option<i64>,
+    pub valid_to: Option<i64>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct JsTxnEdgeOrNodeRef {
+    pub id: Option<f64>,
+    pub type_id: Option<u32>,
+    pub key: Option<String>,
+    pub local: Option<String>,
+    pub from: Option<JsTxnNodeRef>,
+    pub to: Option<JsTxnNodeRef>,
+}
+
+#[napi(object)]
+pub struct JsTxnNodeView {
+    pub id: Option<f64>,
+    pub local: Option<String>,
+    pub type_id: u32,
+    pub key: String,
+    pub props: HashMap<String, serde_json::Value>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub weight: f64,
+    pub dense_vector: Option<Vec<f64>>,
+    pub sparse_vector: Option<Vec<JsSparseEntry>>,
+}
+
+#[napi(object)]
+pub struct JsTxnEdgeView {
+    pub id: Option<f64>,
+    pub local: Option<String>,
+    pub from: JsTxnNodeRef,
+    pub to: JsTxnNodeRef,
+    pub type_id: u32,
+    pub props: HashMap<String, serde_json::Value>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub weight: f64,
+    pub valid_from: Option<i64>,
+    pub valid_to: Option<i64>,
+}
+
+#[napi(object)]
+pub struct JsTxnCommitResult {
+    pub node_ids: Float64Array,
+    pub edge_ids: Float64Array,
+    pub node_aliases: HashMap<String, f64>,
+    pub edge_aliases: HashMap<String, f64>,
 }
 
 #[napi(object)]
@@ -3796,17 +4328,17 @@ fn js_patch_to_rust(patch: JsGraphPatch) -> napi::Result<GraphPatch> {
 // ============================================================
 
 /// Generic async task for write operations: runs on the libuv thread pool
-/// with an exclusive (write) lock on the engine.
+/// using a cloned shared engine handle, without holding the wrapper lock.
 pub struct EngineOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
-    db: Arc<RwLock<Option<InnerDb>>>,
-    op: Option<Box<dyn FnOnce(&mut DatabaseEngine) -> std::result::Result<T, EngineError> + Send>>,
+    db: Arc<Mutex<Option<InnerDb>>>,
+    op: Option<Box<dyn FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError> + Send>>,
     convert: fn(T) -> napi::Result<J>,
 }
 
 impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> EngineOp<T, J> {
     fn new(
-        db: Arc<RwLock<Option<InnerDb>>>,
-        op: impl FnOnce(&mut DatabaseEngine) -> std::result::Result<T, EngineError> + Send + 'static,
+        db: Arc<Mutex<Option<InnerDb>>>,
+        op: impl FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError> + Send + 'static,
         convert: fn(T) -> napi::Result<J>,
     ) -> Self {
         Self {
@@ -3825,14 +4357,8 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for EngineOp<T
         let op = self.op.take().ok_or_else(|| {
             napi::Error::from_reason("EngineOp::compute called twice".to_string())
         })?;
-        let mut guard = self
-            .db
-            .write()
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        let inner = guard
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("Database is closed".to_string()))?;
-        op(&mut inner.engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+        let engine = clone_engine_handle(&self.db)?;
+        op(&engine).map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
     fn resolve(&mut self, _env: Env, output: T) -> napi::Result<J> {
@@ -3841,16 +4367,16 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for EngineOp<T
 }
 
 /// Generic async task for read-only operations: runs on the libuv thread pool
-/// with a shared (read) lock on the engine, allowing concurrent reads.
+/// using a cloned shared engine handle, without holding the wrapper lock.
 pub struct EngineReadOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
-    db: Arc<RwLock<Option<InnerDb>>>,
+    db: Arc<Mutex<Option<InnerDb>>>,
     op: Option<Box<dyn FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError> + Send>>,
     convert: fn(T) -> napi::Result<J>,
 }
 
 impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> EngineReadOp<T, J> {
     fn new(
-        db: Arc<RwLock<Option<InnerDb>>>,
+        db: Arc<Mutex<Option<InnerDb>>>,
         op: impl FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError> + Send + 'static,
         convert: fn(T) -> napi::Result<J>,
     ) -> Self {
@@ -3870,14 +4396,8 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for EngineRead
         let op = self.op.take().ok_or_else(|| {
             napi::Error::from_reason("EngineReadOp::compute called twice".to_string())
         })?;
-        let guard = self
-            .db
-            .read()
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        let inner = guard
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("Database is closed".to_string()))?;
-        op(&inner.engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+        let engine = clone_engine_handle(&self.db)?;
+        op(&engine).map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
     fn resolve(&mut self, _env: Env, output: T) -> napi::Result<J> {
@@ -3887,7 +4407,7 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for EngineRead
 
 /// Close task: takes ownership of the engine to call close(self) or close_fast(self).
 pub struct CloseOp {
-    db: Arc<RwLock<Option<InnerDb>>>,
+    db: Arc<Mutex<Option<InnerDb>>>,
     force: bool,
 }
 
@@ -3896,15 +4416,18 @@ impl Task for CloseOp {
     type JsValue = ();
 
     fn compute(&mut self) -> napi::Result<()> {
-        let mut guard = self
-            .db
-            .write()
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        if let Some(db) = guard.take() {
+        let engine = {
+            let mut guard = self
+                .db
+                .lock()
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            guard.take().map(|db| db.engine)
+        };
+        if let Some(engine) = engine {
             let result = if self.force {
-                db.engine.close_fast()
+                engine.close_fast()
             } else {
-                db.engine.close()
+                engine.close()
             };
             result.map_err(|e| napi::Error::from_reason(e.to_string()))?;
         }
@@ -3920,7 +4443,7 @@ impl Task for CloseOp {
 /// sends progress updates to the JS main thread via ThreadsafeFunction.
 /// Progress callback is fire-and-forget (void return, no cancellation).
 pub struct CompactProgressOp {
-    db: Arc<RwLock<Option<InnerDb>>>,
+    db: Arc<Mutex<Option<InnerDb>>>,
     tsfn: ProgressTsfn,
 }
 
@@ -3929,16 +4452,9 @@ impl Task for CompactProgressOp {
     type JsValue = Option<JsCompactionStats>;
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        let mut guard = self
-            .db
-            .write()
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        let inner = guard
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("Database is closed".to_string()))?;
-
+        let engine = clone_engine_handle(&self.db)?;
         let tsfn = &self.tsfn;
-        let result = inner.engine.compact_with_progress(|progress| {
+        let result = engine.compact_with_progress(|progress| {
             let js_progress = JsCompactionProgress {
                 phase: match progress.phase {
                     CompactionPhase::CollectingTombstones => "collecting_tombstones".to_string(),
@@ -3964,36 +4480,462 @@ impl Task for CompactProgressOp {
     }
 }
 
+/// Async task for stateful transaction operations. Tickets preserve JS call order
+/// even when libuv schedules multiple operations on the same transaction in parallel.
+pub struct TxnAsyncOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
+    inner: Arc<Mutex<Option<WriteTxn>>>,
+    order: Arc<TxnAsyncOrder>,
+    ticket: u64,
+    op: Option<Box<dyn FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError> + Send>>,
+    convert: fn(T) -> napi::Result<J>,
+}
+
+impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> TxnAsyncOp<T, J> {
+    fn new(
+        txn: &JsWriteTxn,
+        op: impl FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError> + Send + 'static,
+        convert: fn(T) -> napi::Result<J>,
+    ) -> Result<Self> {
+        let ticket = txn.async_order.reserve_ticket()?;
+        Ok(Self {
+            inner: txn.inner.clone(),
+            order: txn.async_order.clone(),
+            ticket,
+            op: Some(Box::new(op)),
+            convert,
+        })
+    }
+}
+
+impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for TxnAsyncOp<T, J> {
+    type Output = T;
+    type JsValue = J;
+
+    fn compute(&mut self) -> napi::Result<T> {
+        let _turn = self.order.wait_turn(self.ticket)?;
+        let op = self.op.take().ok_or_else(|| {
+            napi::Error::from_reason("TxnAsyncOp::compute called twice".to_string())
+        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let txn = guard
+            .as_mut()
+            .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?;
+        op(txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: T) -> napi::Result<J> {
+        (self.convert)(output)
+    }
+}
+
+/// Async task for transaction operations that consume the transaction handle.
+pub struct TxnAsyncTakeOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
+    inner: Arc<Mutex<Option<WriteTxn>>>,
+    order: Arc<TxnAsyncOrder>,
+    ticket: u64,
+    op: Option<Box<dyn FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError> + Send>>,
+    convert: fn(T) -> napi::Result<J>,
+}
+
+impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> TxnAsyncTakeOp<T, J> {
+    fn new(
+        txn: &JsWriteTxn,
+        op: impl FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError> + Send + 'static,
+        convert: fn(T) -> napi::Result<J>,
+    ) -> Result<Self> {
+        let ticket = txn.async_order.reserve_ticket()?;
+        Ok(Self {
+            inner: txn.inner.clone(),
+            order: txn.async_order.clone(),
+            ticket,
+            op: Some(Box::new(op)),
+            convert,
+        })
+    }
+}
+
+impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for TxnAsyncTakeOp<T, J> {
+    type Output = T;
+    type JsValue = J;
+
+    fn compute(&mut self) -> napi::Result<T> {
+        let _turn = self.order.wait_turn(self.ticket)?;
+        let op = self.op.take().ok_or_else(|| {
+            napi::Error::from_reason("TxnAsyncTakeOp::compute called twice".to_string())
+        })?;
+        let mut txn = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            guard
+                .take()
+                .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?
+        };
+        op(&mut txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: T) -> napi::Result<J> {
+        (self.convert)(output)
+    }
+}
+
 // ============================================================
 // Helpers
 // ============================================================
 
+fn napi_identity<T>(value: T) -> Result<T> {
+    Ok(value)
+}
+
 fn with_engine<F, T>(db: &OverGraph, f: F) -> Result<T>
 where
-    F: FnOnce(&mut DatabaseEngine) -> std::result::Result<T, EngineError>,
+    F: FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError>,
 {
-    let mut guard = db
-        .inner
-        .write()
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-    let inner = guard
-        .as_mut()
-        .ok_or_else(|| napi::Error::from_reason("Database is closed".to_string()))?;
-    f(&mut inner.engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+    let engine = clone_engine_handle(&db.inner)?;
+    f(&engine).map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 fn with_engine_ref<F, T>(db: &OverGraph, f: F) -> Result<T>
 where
     F: FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError>,
 {
+    let engine = clone_engine_handle(&db.inner)?;
+    f(&engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+fn clone_engine_handle(db: &Arc<Mutex<Option<InnerDb>>>) -> Result<DatabaseEngine> {
     let guard = db
-        .inner
-        .read()
+        .lock()
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
     let inner = guard
         .as_ref()
         .ok_or_else(|| napi::Error::from_reason("Database is closed".to_string()))?;
-    f(&inner.engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+    Ok(inner.engine.clone())
+}
+
+fn with_txn<F, T>(inner: &Arc<Mutex<Option<WriteTxn>>>, f: F) -> Result<T>
+where
+    F: FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError>,
+{
+    let mut guard = inner
+        .lock()
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    let txn = guard
+        .as_mut()
+        .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?;
+    f(txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+fn with_txn_ref<F, T>(inner: &Arc<Mutex<Option<WriteTxn>>>, f: F) -> Result<T>
+where
+    F: FnOnce(&WriteTxn) -> std::result::Result<T, EngineError>,
+{
+    let guard = inner
+        .lock()
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    let txn = guard
+        .as_ref()
+        .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?;
+    f(txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+fn with_txn_take<F, T>(inner: &Arc<Mutex<Option<WriteTxn>>>, f: F) -> Result<T>
+where
+    F: FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError>,
+{
+    let mut txn = {
+        let mut guard = inner
+            .lock()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        guard
+            .take()
+            .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?
+    };
+    f(&mut txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+fn js_upsert_node_options(options: Option<JsUpsertNodeOptions>) -> UpsertNodeOptions {
+    let (props, weight, dense_vector, sparse_vector) = match options {
+        Some(o) => (o.props, o.weight, o.dense_vector, o.sparse_vector),
+        None => (None, None, None, None),
+    };
+    UpsertNodeOptions {
+        props: convert_js_props(props),
+        weight: weight.unwrap_or(1.0) as f32,
+        dense_vector: dense_vector.map(|dv| dv.into_iter().map(|x| x as f32).collect()),
+        sparse_vector: sparse_vector.map(|sv| {
+            sv.into_iter()
+                .map(|e| (e.dimension, e.value as f32))
+                .collect()
+        }),
+    }
+}
+
+fn js_upsert_edge_options(options: Option<JsUpsertEdgeOptions>) -> UpsertEdgeOptions {
+    let (props, weight, valid_from, valid_to) = match options {
+        Some(o) => (o.props, o.weight, o.valid_from, o.valid_to),
+        None => (None, None, None, None),
+    };
+    UpsertEdgeOptions {
+        props: convert_js_props(props),
+        weight: weight.unwrap_or(1.0) as f32,
+        valid_from,
+        valid_to,
+    }
+}
+
+fn js_txn_node_ref_to_rust(value: JsTxnNodeRef) -> Result<TxnNodeRef> {
+    let has_id = value.id.is_some();
+    let has_key = value.type_id.is_some() || value.key.is_some();
+    let has_local = value.local.is_some();
+    match (has_id, has_key, has_local) {
+        (true, false, false) => Ok(TxnNodeRef::Id(f64_to_u64(value.id.unwrap())?)),
+        (false, true, false) => Ok(TxnNodeRef::Key {
+            type_id: value.type_id.ok_or_else(|| {
+                napi::Error::from_reason("node key ref requires typeId".to_string())
+            })?,
+            key: value
+                .key
+                .ok_or_else(|| napi::Error::from_reason("node key ref requires key".to_string()))?,
+        }),
+        (false, false, true) => Ok(TxnNodeRef::Local(TxnLocalRef::Alias(value.local.unwrap()))),
+        _ => Err(napi::Error::from_reason(
+            "node ref must be exactly one of { id }, { typeId, key }, or { local }".to_string(),
+        )),
+    }
+}
+
+fn js_txn_edge_ref_to_rust(value: JsTxnEdgeRef) -> Result<TxnEdgeRef> {
+    let has_id = value.id.is_some();
+    let has_triple = value.from.is_some() || value.to.is_some() || value.type_id.is_some();
+    let has_local = value.local.is_some();
+    match (has_id, has_triple, has_local) {
+        (true, false, false) => Ok(TxnEdgeRef::Id(f64_to_u64(value.id.unwrap())?)),
+        (false, true, false) => Ok(TxnEdgeRef::Triple {
+            from: js_txn_node_ref_to_rust(value.from.ok_or_else(|| {
+                napi::Error::from_reason("edge triple ref requires from".to_string())
+            })?)?,
+            to: js_txn_node_ref_to_rust(value.to.ok_or_else(|| {
+                napi::Error::from_reason("edge triple ref requires to".to_string())
+            })?)?,
+            type_id: value.type_id.ok_or_else(|| {
+                napi::Error::from_reason("edge triple ref requires typeId".to_string())
+            })?,
+        }),
+        (false, false, true) => Ok(TxnEdgeRef::Local(TxnLocalRef::Alias(value.local.unwrap()))),
+        _ => Err(napi::Error::from_reason(
+            "edge ref must be exactly one of { id }, { from, to, typeId }, or { local }"
+                .to_string(),
+        )),
+    }
+}
+
+fn txn_node_ref_to_js(value: TxnNodeRef) -> Result<JsTxnNodeRef> {
+    match value {
+        TxnNodeRef::Id(id) => Ok(JsTxnNodeRef {
+            id: Some(u64_to_f64(id)?),
+            type_id: None,
+            key: None,
+            local: None,
+        }),
+        TxnNodeRef::Key { type_id, key } => Ok(JsTxnNodeRef {
+            id: None,
+            type_id: Some(type_id),
+            key: Some(key),
+            local: None,
+        }),
+        TxnNodeRef::Local(local) => Ok(JsTxnNodeRef {
+            id: None,
+            type_id: None,
+            key: None,
+            local: txn_local_ref_to_js(local),
+        }),
+    }
+}
+
+fn txn_edge_ref_to_js(value: TxnEdgeRef) -> Result<JsTxnEdgeRef> {
+    match value {
+        TxnEdgeRef::Id(id) => Ok(JsTxnEdgeRef {
+            id: Some(u64_to_f64(id)?),
+            from: None,
+            to: None,
+            type_id: None,
+            local: None,
+        }),
+        TxnEdgeRef::Triple { from, to, type_id } => Ok(JsTxnEdgeRef {
+            id: None,
+            from: Some(txn_node_ref_to_js(from)?),
+            to: Some(txn_node_ref_to_js(to)?),
+            type_id: Some(type_id),
+            local: None,
+        }),
+        TxnEdgeRef::Local(local) => Ok(JsTxnEdgeRef {
+            id: None,
+            from: None,
+            to: None,
+            type_id: None,
+            local: txn_local_ref_to_js(local),
+        }),
+    }
+}
+
+fn txn_local_ref_to_js(local: TxnLocalRef) -> Option<String> {
+    match local {
+        TxnLocalRef::Alias(alias) => Some(alias),
+        TxnLocalRef::Slot(_) => None,
+    }
+}
+
+fn txn_node_view_to_js(view: TxnNodeView) -> Result<JsTxnNodeView> {
+    Ok(JsTxnNodeView {
+        id: view.id.map(u64_to_f64).transpose()?,
+        local: view.local.and_then(txn_local_ref_to_js),
+        type_id: view.type_id,
+        key: view.key,
+        props: props_to_json(view.props),
+        created_at: view.created_at,
+        updated_at: view.updated_at,
+        weight: view.weight as f64,
+        dense_vector: view
+            .dense_vector
+            .map(|v| v.into_iter().map(|x| x as f64).collect()),
+        sparse_vector: view.sparse_vector.map(|v| {
+            v.into_iter()
+                .map(|(dimension, value)| JsSparseEntry {
+                    dimension,
+                    value: value as f64,
+                })
+                .collect()
+        }),
+    })
+}
+
+fn txn_edge_view_to_js(view: TxnEdgeView) -> Result<JsTxnEdgeView> {
+    Ok(JsTxnEdgeView {
+        id: view.id.map(u64_to_f64).transpose()?,
+        local: view.local.and_then(txn_local_ref_to_js),
+        from: txn_node_ref_to_js(view.from)?,
+        to: txn_node_ref_to_js(view.to)?,
+        type_id: view.type_id,
+        props: props_to_json(view.props),
+        created_at: view.created_at,
+        updated_at: view.updated_at,
+        weight: view.weight as f64,
+        valid_from: view.valid_from,
+        valid_to: view.valid_to,
+    })
+}
+
+fn js_txn_operation_to_rust(op: JsTxnOperation) -> Result<TxnIntent> {
+    match op.op.as_str() {
+        "upsertNode" => Ok(TxnIntent::UpsertNode {
+            alias: op.alias,
+            type_id: op.type_id.ok_or_else(|| {
+                napi::Error::from_reason("upsertNode requires typeId".to_string())
+            })?,
+            key: op
+                .key
+                .ok_or_else(|| napi::Error::from_reason("upsertNode requires key".to_string()))?,
+            options: UpsertNodeOptions {
+                props: convert_js_props(op.props),
+                weight: op.weight.unwrap_or(1.0) as f32,
+                dense_vector: op
+                    .dense_vector
+                    .map(|v| v.into_iter().map(|x| x as f32).collect()),
+                sparse_vector: op.sparse_vector.map(|v| {
+                    v.into_iter()
+                        .map(|e| (e.dimension, e.value as f32))
+                        .collect()
+                }),
+            },
+        }),
+        "upsertEdge" => {
+            Ok(TxnIntent::UpsertEdge {
+                alias: op.alias,
+                from: js_txn_node_ref_to_rust(op.from.ok_or_else(|| {
+                    napi::Error::from_reason("upsertEdge requires from".to_string())
+                })?)?,
+                to: js_txn_node_ref_to_rust(op.to.ok_or_else(|| {
+                    napi::Error::from_reason("upsertEdge requires to".to_string())
+                })?)?,
+                type_id: op.type_id.ok_or_else(|| {
+                    napi::Error::from_reason("upsertEdge requires typeId".to_string())
+                })?,
+                options: UpsertEdgeOptions {
+                    props: convert_js_props(op.props),
+                    weight: op.weight.unwrap_or(1.0) as f32,
+                    valid_from: op.valid_from,
+                    valid_to: op.valid_to,
+                },
+            })
+        }
+        "deleteNode" => Ok(TxnIntent::DeleteNode {
+            target: js_txn_node_ref_to_rust(txn_target_as_node(op.target)?)?,
+        }),
+        "deleteEdge" => Ok(TxnIntent::DeleteEdge {
+            target: js_txn_edge_ref_to_rust(txn_target_as_edge(op.target)?)?,
+        }),
+        "invalidateEdge" => Ok(TxnIntent::InvalidateEdge {
+            target: js_txn_edge_ref_to_rust(txn_target_as_edge(op.target)?)?,
+            valid_to: op.valid_to.ok_or_else(|| {
+                napi::Error::from_reason("invalidateEdge requires validTo".to_string())
+            })?,
+        }),
+        other => Err(napi::Error::from_reason(format!(
+            "invalid transaction op '{}'",
+            other
+        ))),
+    }
+}
+
+fn txn_target_as_node(target: Option<JsTxnEdgeOrNodeRef>) -> Result<JsTxnNodeRef> {
+    let target = target.ok_or_else(|| napi::Error::from_reason("operation requires target"))?;
+    Ok(JsTxnNodeRef {
+        id: target.id,
+        type_id: target.type_id,
+        key: target.key,
+        local: target.local,
+    })
+}
+
+fn txn_target_as_edge(target: Option<JsTxnEdgeOrNodeRef>) -> Result<JsTxnEdgeRef> {
+    let target = target.ok_or_else(|| napi::Error::from_reason("operation requires target"))?;
+    Ok(JsTxnEdgeRef {
+        id: target.id,
+        from: target.from,
+        to: target.to,
+        type_id: target.type_id,
+        local: target.local,
+    })
+}
+
+fn txn_commit_result_to_js(result: TxnCommitResult) -> Result<JsTxnCommitResult> {
+    let node_aliases = result
+        .local_node_ids
+        .into_iter()
+        .filter_map(|(local, id)| match local {
+            TxnLocalRef::Alias(alias) => Some(u64_to_f64(id).map(|id| (alias, id))),
+            TxnLocalRef::Slot(_) => None,
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    let edge_aliases = result
+        .local_edge_ids
+        .into_iter()
+        .filter_map(|(local, id)| match local {
+            TxnLocalRef::Alias(alias) => Some(u64_to_f64(id).map(|id| (alias, id))),
+            TxnLocalRef::Slot(_) => None,
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    Ok(JsTxnCommitResult {
+        node_ids: ids_to_float64_array(&result.node_ids)?,
+        edge_ids: ids_to_float64_array(&result.edge_ids)?,
+        node_aliases,
+        edge_aliases,
+    })
 }
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0; // 2^53 - 1

@@ -162,7 +162,7 @@ fn bench_sustained_writes_threshold(c: &mut Criterion) {
     group.bench_function("sync_baseline", |b| {
         b.iter_batched(
             || temp_db_with_opts(sync_opts()),
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
                         .upsert_node(1, &format!("n{}", i), write_opts(i))
@@ -179,7 +179,7 @@ fn bench_sustained_writes_threshold(c: &mut Criterion) {
     group.bench_function("async_auto_flush", |b| {
         b.iter_batched(
             || temp_db_with_opts(async_opts()),
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
                         .upsert_node(1, &format!("n{}", i), write_opts(i))
@@ -205,7 +205,7 @@ fn bench_writes_with_queued_epochs(c: &mut Criterion) {
     group.bench_function("sync_baseline", |b| {
         b.iter_batched(
             || {
-                let (_dir, mut engine) = temp_db_with_opts(sync_opts());
+                let (_dir, engine) = temp_db_with_opts(sync_opts());
                 for j in 0..2000u64 {
                     engine
                         .upsert_node(1, &format!("pre_{}", j), write_opts(j))
@@ -216,7 +216,7 @@ fn bench_writes_with_queued_epochs(c: &mut Criterion) {
                 }
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     let k = 2000 + i;
                     engine
@@ -234,7 +234,7 @@ fn bench_writes_with_queued_epochs(c: &mut Criterion) {
     group.bench_function("async_auto_flush", |b| {
         b.iter_batched(
             || {
-                let (_dir, mut engine) = temp_db_with_opts(async_opts());
+                let (_dir, engine) = temp_db_with_opts(async_opts());
                 for j in 0..2000u64 {
                     engine
                         .upsert_node(1, &format!("pre_{}", j), write_opts(j))
@@ -242,7 +242,7 @@ fn bench_writes_with_queued_epochs(c: &mut Criterion) {
                 }
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     let k = 2000 + i;
                     engine
@@ -273,7 +273,7 @@ fn bench_mixed_writes_reads(c: &mut Criterion) {
                 let ids = pre_populate_plain(&mut engine, 1000);
                 (_dir, engine, ids)
             },
-            |(_dir, mut engine, ids)| {
+            |(_dir, engine, ids)| {
                 for i in 0..BURST_SIZE {
                     engine
                         .upsert_node(1, &format!("w{}", i), write_opts(i))
@@ -295,7 +295,7 @@ fn bench_mixed_writes_reads(c: &mut Criterion) {
                 let ids = pre_populate_plain(&mut engine, 1000);
                 (_dir, engine, ids)
             },
-            |(_dir, mut engine, ids)| {
+            |(_dir, engine, ids)| {
                 for i in 0..BURST_SIZE {
                     engine
                         .upsert_node(1, &format!("w{}", i), write_opts(i))
@@ -347,7 +347,7 @@ fn bench_mixed_writes_dense_vector(c: &mut Criterion) {
                 pre_populate_dense(&mut engine, 1000, dim);
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
                         .upsert_node(1, &format!("w{}", i), write_opts(i))
@@ -371,7 +371,7 @@ fn bench_mixed_writes_dense_vector(c: &mut Criterion) {
                 pre_populate_dense(&mut engine, 1000, dim);
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
                         .upsert_node(1, &format!("w{}", i), write_opts(i))
@@ -415,7 +415,7 @@ fn bench_mixed_writes_sparse_vector(c: &mut Criterion) {
                 pre_populate_sparse(&mut engine, 1000, 8);
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
                         .upsert_node(1, &format!("w{}", i), write_opts(i))
@@ -437,7 +437,7 @@ fn bench_mixed_writes_sparse_vector(c: &mut Criterion) {
                 pre_populate_sparse(&mut engine, 1000, 8);
                 (_dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
                         .upsert_node(1, &format!("w{}", i), write_opts(i))

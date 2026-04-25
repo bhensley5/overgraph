@@ -1,30 +1,94 @@
 // Write operations: upsert, delete, batch, patch, prune.
 // This file is include!()'d into mod.rs. All items share the engine module scope.
 
-impl DatabaseEngine {
-    // --- High-level graph APIs ---
+impl EngineCore {
+    fn commit_core_write_plan(
+        &mut self,
+        plan: CoreWritePlan,
+    ) -> (Result<CoreWriteReply, EngineError>, PublishImpact) {
+        let mut publish_impact = PublishImpact::NoPublish;
 
-    /// Upsert a node. If a node with the same (type_id, key) exists, updates it.
-    /// Otherwise allocates a new ID. Returns the node ID.
-    ///
-    /// ```no_run
-    /// # use overgraph::*;
-    /// # use std::path::Path;
-    /// # let mut db = DatabaseEngine::open(Path::new("./db"), &DbOptions::default()).unwrap();
-    /// let id = db.upsert_node(1, "user:alice", UpsertNodeOptions::default()).unwrap();
-    /// ```
-    pub fn upsert_node(
+        let result = (|| -> Result<CoreWriteReply, EngineError> {
+            match plan.ops.as_slice() {
+                [] => {}
+                [op] => self.append_and_apply_one_normalized(op)?,
+                _ => self.append_and_apply_normalized(&plan.ops)?,
+            }
+            if !plan.ops.is_empty() {
+                publish_impact = PublishImpact::SnapshotOnly;
+            }
+
+            if plan.track_ids {
+                for op in &plan.ops {
+                    self.track_id(op);
+                }
+            }
+
+            if plan.auto_flush {
+                let (auto_flush_result, auto_flush_impact) = self.maybe_auto_flush();
+                publish_impact = publish_impact.combine(auto_flush_impact);
+                auto_flush_result?;
+            }
+
+            Ok(plan.reply)
+        })();
+
+        (result, publish_impact)
+    }
+
+    fn plan_core_write(&mut self, request: &CoreWriteRequest) -> Result<CoreWritePlan, EngineError> {
+        match request {
+            CoreWriteRequest::UpsertNode {
+                type_id,
+                key,
+                options,
+            } => self.plan_upsert_node(*type_id, key, options),
+            CoreWriteRequest::UpsertEdge {
+                from,
+                to,
+                type_id,
+                options,
+            } => self.plan_upsert_edge(*from, *to, *type_id, options),
+            CoreWriteRequest::BatchUpsertNodes { inputs } => self.plan_batch_upsert_nodes(inputs),
+            CoreWriteRequest::BatchUpsertEdges { inputs } => self.plan_batch_upsert_edges(inputs),
+            CoreWriteRequest::DeleteNode { id } => self.plan_delete_node(*id),
+            CoreWriteRequest::DeleteEdge { id } => self.plan_delete_edge(*id),
+            CoreWriteRequest::InvalidateEdge { id, valid_to } => {
+                self.plan_invalidate_edge(*id, *valid_to)
+            }
+            #[cfg(test)]
+            CoreWriteRequest::WriteOp { op } => self.plan_write_op(op),
+            #[cfg(test)]
+            CoreWriteRequest::WriteOpBatch { ops } => self.plan_write_op_batch(ops),
+            CoreWriteRequest::GraphPatch { patch } => self.plan_graph_patch(patch),
+            CoreWriteRequest::TxnCommit { request } => self.plan_txn_commit(request),
+            CoreWriteRequest::Prune { policy } => self.plan_prune(policy),
+            CoreWriteRequest::SetPrunePolicy { .. }
+            | CoreWriteRequest::RemovePrunePolicy { .. }
+            | CoreWriteRequest::EnsureNodePropertyIndex { .. }
+            | CoreWriteRequest::DropNodePropertyIndex { .. }
+            | CoreWriteRequest::ApplySecondaryIndexReadFollowup { .. }
+            | CoreWriteRequest::Sync
+            | CoreWriteRequest::Flush
+            | CoreWriteRequest::IngestMode
+            | CoreWriteRequest::EndIngest
+            | CoreWriteRequest::Compact => Err(EngineError::InvalidOperation(
+                "request does not use the planner write path".to_string(),
+            )),
+        }
+    }
+
+    fn plan_upsert_node(
         &mut self,
         type_id: u32,
         key: &str,
-        options: UpsertNodeOptions,
-    ) -> Result<u64, EngineError> {
-        self.maybe_backpressure_flush()?;
+        options: &UpsertNodeOptions,
+    ) -> Result<CoreWritePlan, EngineError> {
         let now = now_millis();
-        let (dense_vector, sparse_vector) = normalize_owned_node_vectors_for_write(
+        let (dense_vector, sparse_vector) = normalize_node_vectors_for_write(
             self.manifest.dense_vector.as_ref(),
-            options.dense_vector,
-            options.sparse_vector,
+            options.dense_vector.as_ref(),
+            options.sparse_vector.as_ref(),
         )?;
 
         let (id, created_at) = match self.find_existing_node(type_id, key)? {
@@ -41,7 +105,7 @@ impl DatabaseEngine {
             id,
             type_id,
             key: key.to_string(),
-            props: options.props,
+            props: options.props.clone(),
             created_at,
             updated_at: now,
             weight: options.weight,
@@ -50,30 +114,21 @@ impl DatabaseEngine {
             last_write_seq: 0,
         };
 
-        let op = WalOp::UpsertNode(node);
-        self.append_and_apply_one_normalized(&op)?;
-        self.maybe_auto_flush()?;
-        Ok(id)
+        Ok(CoreWritePlan {
+            ops: vec![WalOp::UpsertNode(node)],
+            reply: CoreWriteReply::U64(id),
+            auto_flush: true,
+            track_ids: false,
+        })
     }
 
-    /// Upsert an edge. If edge_uniqueness is enabled and an edge with the same
-    /// (from, to, type_id) exists, updates it. Otherwise allocates a new ID.
-    /// Returns the edge ID.
-    ///
-    /// ```no_run
-    /// # use overgraph::*;
-    /// # use std::path::Path;
-    /// # let mut db = DatabaseEngine::open(Path::new("./db"), &DbOptions::default()).unwrap();
-    /// let eid = db.upsert_edge(1, 2, 1, UpsertEdgeOptions::default()).unwrap();
-    /// ```
-    pub fn upsert_edge(
+    fn plan_upsert_edge(
         &mut self,
         from: u64,
         to: u64,
         type_id: u32,
-        options: UpsertEdgeOptions,
-    ) -> Result<u64, EngineError> {
-        self.maybe_backpressure_flush()?;
+        options: &UpsertEdgeOptions,
+    ) -> Result<CoreWritePlan, EngineError> {
         let now = now_millis();
 
         let (id, created_at) = if self.edge_uniqueness {
@@ -98,7 +153,7 @@ impl DatabaseEngine {
             from,
             to,
             type_id,
-            props: options.props,
+            props: options.props.clone(),
             created_at,
             updated_at: now,
             weight: options.weight,
@@ -107,20 +162,18 @@ impl DatabaseEngine {
             last_write_seq: 0,
         };
 
-        let op = WalOp::UpsertEdge(edge);
-        self.append_and_apply_one_normalized(&op)?;
-        self.maybe_auto_flush()?;
-        Ok(id)
+        Ok(CoreWritePlan {
+            ops: vec![WalOp::UpsertEdge(edge)],
+            reply: CoreWriteReply::U64(id),
+            auto_flush: true,
+            track_ids: false,
+        })
     }
 
-    /// Batch upsert nodes with a single fsync. Returns IDs in input order.
-    /// Handles dedup within the batch and against existing memtable state.
-    pub fn batch_upsert_nodes(&mut self, inputs: &[NodeInput]) -> Result<Vec<u64>, EngineError> {
-        self.maybe_backpressure_flush()?;
+    fn plan_batch_upsert_nodes(&mut self, inputs: &[NodeInput]) -> Result<CoreWritePlan, EngineError> {
         let now = now_millis();
         let mut ops = Vec::with_capacity(inputs.len());
         let mut ids = Vec::with_capacity(inputs.len());
-        // Track allocations within this batch for dedup
         let mut batch_keys: HashMap<(u32, String), (u64, i64)> = HashMap::new();
 
         for input in inputs {
@@ -132,7 +185,6 @@ impl DatabaseEngine {
             let key_tuple = (input.type_id, input.key.clone());
 
             let (id, created_at) = if let Some(&(id, created_at)) = batch_keys.get(&key_tuple) {
-                // Already allocated in this batch, update
                 (id, created_at)
             } else if let Some((id, created_at)) =
                 self.find_existing_node(input.type_id, &input.key)?
@@ -162,19 +214,18 @@ impl DatabaseEngine {
             ids.push(id);
         }
 
-        self.append_and_apply_normalized(&ops)?;
-
-        self.maybe_auto_flush()?;
-        Ok(ids)
+        Ok(CoreWritePlan {
+            ops,
+            reply: CoreWriteReply::VecU64(ids),
+            auto_flush: true,
+            track_ids: false,
+        })
     }
 
-    /// Batch upsert edges with a single fsync. Returns IDs in input order.
-    pub fn batch_upsert_edges(&mut self, inputs: &[EdgeInput]) -> Result<Vec<u64>, EngineError> {
-        self.maybe_backpressure_flush()?;
+    fn plan_batch_upsert_edges(&mut self, inputs: &[EdgeInput]) -> Result<CoreWritePlan, EngineError> {
         let now = now_millis();
         let mut ops = Vec::with_capacity(inputs.len());
         let mut ids = Vec::with_capacity(inputs.len());
-        // Track allocations within this batch for uniqueness
         let mut batch_triples: HashMap<(u64, u64, u32), (u64, i64)> = HashMap::new();
 
         for input in inputs {
@@ -220,23 +271,17 @@ impl DatabaseEngine {
             ids.push(id);
         }
 
-        self.append_and_apply_normalized(&ops)?;
-
-        self.maybe_auto_flush()?;
-        Ok(ids)
+        Ok(CoreWritePlan {
+            ops,
+            reply: CoreWriteReply::VecU64(ids),
+            auto_flush: true,
+            track_ids: false,
+        })
     }
 
-    /// Delete a node by ID. Cascade-deletes all incident edges (memtable + segments),
-    /// then writes the node tombstone. Single fsync at the end.
-    pub fn delete_node(&mut self, id: u64) -> Result<(), EngineError> {
-        self.maybe_backpressure_flush()?;
+    fn plan_delete_node(&mut self, id: u64) -> Result<CoreWritePlan, EngineError> {
         let now = now_millis();
-
-        // Collect ALL incident edge IDs across memtable + segments.
-        // Uses neighbors_raw to see edges to policy-excluded nodes too.
         let incident = self.neighbors_raw(id, Direction::Both, None, 0, None, None, None)?;
-
-        // Build all ops: edge deletes first, then node delete
         let mut ops = Vec::with_capacity(incident.len() + 1);
         for entry in &incident {
             ops.push(WalOp::DeleteEdge {
@@ -249,38 +294,37 @@ impl DatabaseEngine {
             deleted_at: now,
         });
 
-        self.append_and_apply_normalized(&ops)?;
-        self.maybe_auto_flush()?;
-        Ok(())
+        Ok(CoreWritePlan {
+            ops,
+            reply: CoreWriteReply::Unit,
+            auto_flush: true,
+            track_ids: false,
+        })
     }
 
-    /// Delete an edge by ID. Writes a tombstone to WAL. Idempotent: deleting
-    /// a nonexistent or already-deleted edge writes a tombstone but is not an error.
-    pub fn delete_edge(&mut self, id: u64) -> Result<(), EngineError> {
-        self.maybe_backpressure_flush()?;
-        let op = WalOp::DeleteEdge {
-            id,
-            deleted_at: now_millis(),
-        };
-        self.append_and_apply_one_normalized(&op)?;
-        self.maybe_auto_flush()?;
-        Ok(())
+    fn plan_delete_edge(&mut self, id: u64) -> Result<CoreWritePlan, EngineError> {
+        Ok(CoreWritePlan {
+            ops: vec![WalOp::DeleteEdge {
+                id,
+                deleted_at: now_millis(),
+            }],
+            reply: CoreWriteReply::Unit,
+            auto_flush: true,
+            track_ids: false,
+        })
     }
 
-    /// Invalidate an edge by closing its validity window. Sets valid_to on the edge.
-    /// The edge remains in the database (not tombstoned) but is excluded from
-    /// current-time neighbor queries. Returns the updated EdgeRecord, or None
-    /// if the edge doesn't exist.
-    pub fn invalidate_edge(
-        &mut self,
-        id: u64,
-        valid_to: i64,
-    ) -> Result<Option<EdgeRecord>, EngineError> {
-        self.maybe_backpressure_flush()?;
-        // Look up the current edge record
+    fn plan_invalidate_edge(&mut self, id: u64, valid_to: i64) -> Result<CoreWritePlan, EngineError> {
         let edge = match self.get_edge(id)? {
-            Some(e) => e,
-            None => return Ok(None),
+            Some(edge) => edge,
+            None => {
+                return Ok(CoreWritePlan {
+                    ops: Vec::new(),
+                    reply: CoreWriteReply::OptionEdge(None),
+                    auto_flush: true,
+                    track_ids: false,
+                });
+            }
         };
 
         let updated = EdgeRecord {
@@ -289,24 +333,43 @@ impl DatabaseEngine {
             ..edge
         };
 
-        let op = WalOp::UpsertEdge(updated.clone());
-        self.append_and_apply_one_normalized(&op)?;
-        self.maybe_auto_flush()?;
-        Ok(Some(updated))
+        Ok(CoreWritePlan {
+            ops: vec![WalOp::UpsertEdge(updated.clone())],
+            reply: CoreWriteReply::OptionEdge(Some(updated)),
+            auto_flush: true,
+            track_ids: false,
+        })
     }
 
-    /// Atomic graph patch: apply a mix of node upserts, edge upserts, edge
-    /// invalidations, and deletes in a single WAL batch. Deterministic ordering:
-    /// node upserts → edge upserts → edge invalidations → edge deletes → node deletes.
-    ///
-    /// Node deletes cascade: incident edges are automatically deleted.
-    /// Returns allocated IDs for upserted nodes and edges (input order preserved).
-    pub fn graph_patch(&mut self, patch: &GraphPatch) -> Result<PatchResult, EngineError> {
-        self.maybe_backpressure_flush()?;
+    #[cfg(test)]
+    fn plan_write_op(&mut self, op: &WalOp) -> Result<CoreWritePlan, EngineError> {
+        let normalized = normalize_wal_op_for_write(self.manifest.dense_vector.as_ref(), op)?;
+        Ok(CoreWritePlan {
+            ops: vec![normalized],
+            reply: CoreWriteReply::Unit,
+            auto_flush: false,
+            track_ids: true,
+        })
+    }
+
+    #[cfg(test)]
+    fn plan_write_op_batch(&mut self, ops: &[WalOp]) -> Result<CoreWritePlan, EngineError> {
+        let normalized_ops: Vec<WalOp> = ops
+            .iter()
+            .map(|op| normalize_wal_op_for_write(self.manifest.dense_vector.as_ref(), op))
+            .collect::<Result<_, _>>()?;
+        Ok(CoreWritePlan {
+            ops: normalized_ops,
+            reply: CoreWriteReply::Unit,
+            auto_flush: false,
+            track_ids: true,
+        })
+    }
+
+    fn plan_graph_patch(&mut self, patch: &GraphPatch) -> Result<CoreWritePlan, EngineError> {
         let now = now_millis();
         let mut ops: Vec<WalOp> = Vec::new();
 
-        // --- 1. Node upserts (same dedup as batch_upsert_nodes) ---
         let mut node_ids = Vec::with_capacity(patch.upsert_nodes.len());
         let mut batch_keys: HashMap<(u32, String), (u64, i64)> = HashMap::new();
 
@@ -345,7 +408,6 @@ impl DatabaseEngine {
             node_ids.push(id);
         }
 
-        // --- 2. Edge upserts (same dedup as batch_upsert_edges) ---
         let mut edge_ids = Vec::with_capacity(patch.upsert_edges.len());
         let mut batch_triples: HashMap<(u64, u64, u32), (u64, i64)> = HashMap::new();
 
@@ -389,10 +451,8 @@ impl DatabaseEngine {
             edge_ids.push(id);
         }
 
-        // --- 3. Edge invalidations (batch read) ---
         if !patch.invalidate_edges.is_empty() {
             let inv_ids: Vec<u64> = patch.invalidate_edges.iter().map(|&(id, _)| id).collect();
-            // get_edges has no policy filtering (edges are unfiltered); safe for write path
             let inv_edges = self.get_edges(&inv_ids)?;
             for (&(_, valid_to), opt_edge) in patch.invalidate_edges.iter().zip(inv_edges) {
                 if let Some(edge) = opt_edge {
@@ -405,7 +465,6 @@ impl DatabaseEngine {
             }
         }
 
-        // --- 4. Edge deletes ---
         for &eid in &patch.delete_edge_ids {
             ops.push(WalOp::DeleteEdge {
                 id: eid,
@@ -413,9 +472,6 @@ impl DatabaseEngine {
             });
         }
 
-        // --- 5. Node deletes (cascade incident edges across all sources) ---
-        // Uses neighbors_raw to see edges to policy-excluded nodes too.
-        // Pre-compute tombstones once for the entire loop.
         let patch_tombstones = if patch.delete_node_ids.is_empty() {
             None
         } else {
@@ -436,28 +492,20 @@ impl DatabaseEngine {
             });
         }
 
-        // --- Single WAL batch ---
-        self.append_and_apply_normalized(&ops)?;
-        self.maybe_auto_flush()?;
-
-        Ok(PatchResult { node_ids, edge_ids })
+        Ok(CoreWritePlan {
+            ops,
+            reply: CoreWriteReply::PatchResult(PatchResult { node_ids, edge_ids }),
+            auto_flush: true,
+            track_ids: false,
+        })
     }
 
-    // --- Retention / Forgetting ---
-
-    /// Prune nodes matching the given policy, cascade-deleting their incident edges.
-    /// All matching criteria combine with AND logic. At least one of `max_age_ms` or
-    /// `max_weight` must be set to prevent accidental mass deletion. All deletes are
-    /// applied in a single WAL batch for atomicity.
-    pub fn prune(&mut self, policy: &PrunePolicy) -> Result<PruneResult, EngineError> {
-        // Require at least one substantive filter
+    fn plan_prune(&mut self, policy: &PrunePolicy) -> Result<CoreWritePlan, EngineError> {
         if policy.max_age_ms.is_none() && policy.max_weight.is_none() {
             return Err(EngineError::InvalidOperation(
                 "Prune policy must set at least max_age_ms or max_weight".to_string(),
             ));
         }
-
-        // Reject nonsensical negative age threshold
         if let Some(age) = policy.max_age_ms {
             if age <= 0 {
                 return Err(EngineError::InvalidOperation(
@@ -466,21 +514,20 @@ impl DatabaseEngine {
             }
         }
 
-        self.maybe_backpressure_flush()?;
         let now = now_millis();
-
-        // Collect all node IDs that match the prune policy
         let targets = self.collect_prune_targets(policy, now)?;
-
         if targets.is_empty() {
-            return Ok(PruneResult {
-                nodes_pruned: 0,
-                edges_pruned: 0,
+            return Ok(CoreWritePlan {
+                ops: Vec::new(),
+                reply: CoreWriteReply::PruneResult(PruneResult {
+                    nodes_pruned: 0,
+                    edges_pruned: 0,
+                }),
+                auto_flush: true,
+                track_ids: false,
             });
         }
 
-        // Build WAL ops: cascade-delete incident edges, then delete nodes.
-        // Dedup edge deletes in case two pruned nodes share an edge.
         let mut ops = Vec::new();
         let mut edges_seen = NodeIdSet::default();
         let prune_tombstones = self.collect_tombstones();
@@ -509,15 +556,14 @@ impl DatabaseEngine {
             });
         }
 
-        let nodes_pruned = targets.len() as u64;
-        let edges_pruned = edges_seen.len() as u64;
-
-        self.append_and_apply_normalized(&ops)?;
-        self.maybe_auto_flush()?;
-
-        Ok(PruneResult {
-            nodes_pruned,
-            edges_pruned,
+        Ok(CoreWritePlan {
+            ops,
+            reply: CoreWriteReply::PruneResult(PruneResult {
+                nodes_pruned: targets.len() as u64,
+                edges_pruned: edges_seen.len() as u64,
+            }),
+            auto_flush: true,
+            track_ids: false,
         })
     }
 
@@ -550,9 +596,9 @@ impl DatabaseEngine {
             // (newest-first), then segments (newest-first), dedup by ID.
             // Flat tombstone set is safe here: monotonic ID allocation guarantees
             // tombstoned IDs are never re-upserted, so source precedence doesn't matter.
-            let mut deleted: NodeIdSet = self.memtable.deleted_nodes().keys().copied().collect();
+            let mut deleted = self.memtable.collect_deleted_nodes_at(u64::MAX);
             for epoch in &self.immutable_epochs {
-                deleted.extend(epoch.memtable.deleted_nodes().keys().copied());
+                deleted.extend(epoch.memtable.collect_deleted_nodes_at(u64::MAX));
             }
             for seg in &self.segments {
                 deleted.extend(seg.deleted_node_ids());
@@ -562,21 +608,27 @@ impl DatabaseEngine {
             let mut targets = Vec::new();
 
             // Active memtable nodes (freshest)
-            for node in self.memtable.nodes().values() {
-                if !deleted.contains(&node.id) && seen.insert(node.id)
-                    && Self::matches_prune_criteria(node, age_cutoff, policy.max_weight) {
-                        targets.push(node.id);
-                    }
-            }
+            let _ = self.memtable.for_each_visible_node_at(u64::MAX, &mut |node| {
+                if !deleted.contains(&node.id)
+                    && seen.insert(node.id)
+                    && Self::matches_prune_criteria(node, age_cutoff, policy.max_weight)
+                {
+                    targets.push(node.id);
+                }
+                ControlFlow::Continue(())
+            });
 
             // Immutable memtable nodes (newest-first)
             for epoch in &self.immutable_epochs {
-                for node in epoch.memtable.nodes().values() {
-                    if !deleted.contains(&node.id) && seen.insert(node.id)
-                        && Self::matches_prune_criteria(node, age_cutoff, policy.max_weight) {
-                            targets.push(node.id);
-                        }
-                }
+                let _ = epoch.memtable.for_each_visible_node_at(u64::MAX, &mut |node| {
+                    if !deleted.contains(&node.id)
+                        && seen.insert(node.id)
+                        && Self::matches_prune_criteria(node, age_cutoff, policy.max_weight)
+                    {
+                        targets.push(node.id);
+                    }
+                    ControlFlow::Continue(())
+                });
             }
 
             // Segment nodes (newest segments first, skip already-seen)
@@ -617,7 +669,11 @@ impl DatabaseEngine {
     /// Register a named prune policy. Persisted in the manifest and applied
     /// automatically during compaction. Multiple named policies are allowed;
     /// a node matching ANY policy is pruned (OR across policies, AND within).
-    pub fn set_prune_policy(&mut self, name: &str, policy: PrunePolicy) -> Result<(), EngineError> {
+    pub fn set_prune_policy(
+        &mut self,
+        name: &str,
+        policy: PrunePolicy,
+    ) -> Result<PublishImpact, EngineError> {
         // Validate: at least one substantive filter
         if policy.max_age_ms.is_none() && policy.max_weight.is_none() {
             return Err(EngineError::InvalidOperation(
@@ -638,21 +694,48 @@ impl DatabaseEngine {
                 ));
             }
         }
+
+        if self
+            .manifest
+            .prune_policies
+            .get(name)
+            .is_some_and(|existing| {
+                existing.max_age_ms == policy.max_age_ms
+                    && existing.max_weight == policy.max_weight
+                    && existing.type_id == policy.type_id
+            })
+        {
+            return Ok(PublishImpact::NoPublish);
+        }
+
         let name = name.to_string();
         self.with_runtime_manifest_write(|manifest| {
             manifest.prune_policies.insert(name, policy);
             Ok(())
         })?;
-        Ok(())
+        Ok(PublishImpact::RebuildSources)
     }
 
     /// Remove a named prune policy. Returns true if it existed.
-    pub fn remove_prune_policy(&mut self, name: &str) -> Result<bool, EngineError> {
+    pub fn remove_prune_policy(
+        &mut self,
+        name: &str,
+    ) -> Result<(bool, PublishImpact), EngineError> {
+        if !self.manifest.prune_policies.contains_key(name) {
+            return Ok((false, PublishImpact::NoPublish));
+        }
         let name = name.to_string();
         let removed = self.with_runtime_manifest_write(|manifest| {
             Ok(manifest.prune_policies.remove(&name).is_some())
         })?;
-        Ok(removed)
+        Ok((
+            removed,
+            if removed {
+                PublishImpact::RebuildSources
+            } else {
+                PublishImpact::NoPublish
+            },
+        ))
     }
 
     /// List all registered prune policies.
@@ -682,7 +765,7 @@ impl DatabaseEngine {
         type_id: u32,
         prop_key: &str,
         kind: SecondaryIndexKind,
-    ) -> Result<NodePropertyIndexInfo, EngineError> {
+    ) -> Result<(NodePropertyIndexInfo, PublishImpact), EngineError> {
         enum EnsureOutcome {
             Existing,
             New,
@@ -741,25 +824,28 @@ impl DatabaseEngine {
             Ok((entry, EnsureOutcome::New))
         })?;
 
-        self.rebuild_secondary_index_catalog()?;
-        match outcome {
-            EnsureOutcome::Existing => {}
+        let publish_impact = match outcome {
+            EnsureOutcome::Existing => PublishImpact::NoPublish,
             EnsureOutcome::New => {
+                self.rebuild_secondary_index_catalog()?;
                 self.seed_secondary_index_entry(&entry)?;
                 self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
                     index_id: entry.index_id,
                 });
+                PublishImpact::RebuildSources
             }
             EnsureOutcome::Retry => {
+                self.rebuild_secondary_index_catalog()?;
                 self.remove_secondary_index_entry_from_memtables(entry.index_id)?;
                 self.seed_secondary_index_entry(&entry)?;
                 self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
                     index_id: entry.index_id,
                 });
+                PublishImpact::RebuildSources
             }
-        }
+        };
 
-        Ok(Self::node_property_index_info(&entry))
+        Ok((Self::node_property_index_info(&entry), publish_impact))
     }
 
     pub fn drop_node_property_index(
@@ -767,7 +853,7 @@ impl DatabaseEngine {
         type_id: u32,
         prop_key: &str,
         kind: SecondaryIndexKind,
-    ) -> Result<bool, EngineError> {
+    ) -> Result<(bool, PublishImpact), EngineError> {
         let prop_key = prop_key.to_string();
         let removed = self.with_runtime_manifest_write(|manifest| {
             let idx = manifest.secondary_indexes.iter().position(|entry| {
@@ -782,7 +868,7 @@ impl DatabaseEngine {
         })?;
 
         let Some(entry) = removed else {
-            return Ok(false);
+            return Ok((false, PublishImpact::NoPublish));
         };
 
         self.rebuild_secondary_index_catalog()?;
@@ -790,7 +876,7 @@ impl DatabaseEngine {
         self.enqueue_secondary_index_job(SecondaryIndexJob::DropCleanup {
             index_id: entry.index_id,
         });
-        Ok(true)
+        Ok((true, PublishImpact::RebuildSources))
     }
 
     pub fn list_node_property_indexes(&self) -> Vec<NodePropertyIndexInfo> {

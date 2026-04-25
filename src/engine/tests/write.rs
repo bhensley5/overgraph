@@ -7,7 +7,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let id1 = engine
             .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
@@ -15,7 +15,7 @@
         let id2 = engine.upsert_node(1, "bob", UpsertNodeOptions { weight: 0.6, ..Default::default() }).unwrap();
 
         assert_ne!(id1, id2);
-        assert_eq!(engine.node_count(), 2);
+        assert_eq!(engine.node_count().unwrap(), 2);
         assert_eq!(engine.get_node(id1).unwrap().unwrap().key, "alice");
         assert_eq!(engine.get_node(id2).unwrap().unwrap().key, "bob");
 
@@ -27,7 +27,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let mut props_v1 = BTreeMap::new();
         props_v1.insert("version".to_string(), PropValue::Int(1));
@@ -39,7 +39,7 @@
 
         // Same (type_id, key) → same ID, updated fields
         assert_eq!(id1, id2);
-        assert_eq!(engine.node_count(), 1);
+        assert_eq!(engine.node_count().unwrap(), 1);
 
         let node = engine.get_node(id1).unwrap().unwrap();
         assert_eq!(node.props.get("version"), Some(&PropValue::Int(2)));
@@ -53,7 +53,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let node_id = engine.upsert_node(1, "alice", UpsertNodeOptions::default()).unwrap();
 
         let node = engine.get_node(node_id).unwrap().unwrap();
@@ -76,7 +76,7 @@
 
         let node_id;
         {
-            let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+            let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
             node_id = engine
                 .upsert_node(
                     1,
@@ -107,7 +107,7 @@
     fn test_upsert_node_dense_vector_requires_config() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let err = engine
             .upsert_node(
@@ -136,7 +136,7 @@
             }),
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         let err = engine
             .upsert_node(
@@ -165,7 +165,7 @@
             }),
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         engine
             .write_op(&WalOp::UpsertNode(NodeRecord {
@@ -204,7 +204,7 @@
         let alice_id;
         let bob_id;
         {
-            let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+            let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
             let ids = engine
                 .batch_upsert_nodes(&[
                     NodeInput {
@@ -260,7 +260,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let id1 = engine
             .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
@@ -271,7 +271,7 @@
 
         // Different type_id → different nodes
         assert_ne!(id1, id2);
-        assert_eq!(engine.node_count(), 2);
+        assert_eq!(engine.node_count().unwrap(), 2);
 
         engine.close().unwrap();
     }
@@ -281,7 +281,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let mut ids = Vec::new();
         for i in 0..10 {
@@ -305,7 +305,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let n1 = engine
             .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
@@ -316,7 +316,7 @@
             .upsert_edge(n1, n2, 10, UpsertEdgeOptions::default())
             .unwrap();
 
-        assert_eq!(engine.edge_count(), 1);
+        assert_eq!(engine.edge_count().unwrap(), 1);
         let edge = engine.get_edge(e1).unwrap().unwrap();
         assert_eq!(edge.from, n1);
         assert_eq!(edge.to, n2);
@@ -330,7 +330,7 @@
         let db_path = dir.path().join("testdb");
 
         // Default: edge_uniqueness = false
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let e1 = engine
             .upsert_edge(1, 2, 10, UpsertEdgeOptions::default())
@@ -341,7 +341,7 @@
 
         // Without uniqueness: creates separate edges
         assert_ne!(e1, e2);
-        assert_eq!(engine.edge_count(), 2);
+        assert_eq!(engine.edge_count().unwrap(), 2);
 
         engine.close().unwrap();
     }
@@ -355,7 +355,7 @@
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         let e1 = engine
             .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
@@ -366,7 +366,7 @@
 
         // With uniqueness: same triple → same ID, updated weight
         assert_eq!(e1, e2);
-        assert_eq!(engine.edge_count(), 1);
+        assert_eq!(engine.edge_count().unwrap(), 1);
         assert!((engine.get_edge(e1).unwrap().unwrap().weight - 0.9).abs() < f32::EPSILON);
 
         // Different triple → new edge
@@ -374,7 +374,7 @@
             .upsert_edge(1, 2, 20, UpsertEdgeOptions::default())
             .unwrap();
         assert_ne!(e1, e3);
-        assert_eq!(engine.edge_count(), 2);
+        assert_eq!(engine.edge_count().unwrap(), 2);
 
         engine.close().unwrap();
     }
@@ -384,7 +384,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let inputs: Vec<NodeInput> = (0..1000)
             .map(|i| NodeInput {
@@ -399,7 +399,7 @@
 
         let ids = engine.batch_upsert_nodes(&inputs).unwrap();
         assert_eq!(ids.len(), 1000);
-        assert_eq!(engine.node_count(), 1000);
+        assert_eq!(engine.node_count().unwrap(), 1000);
 
         // All queryable
         for (i, &id) in ids.iter().enumerate() {
@@ -415,7 +415,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Pre-insert a node
         let pre_id = engine
@@ -454,7 +454,7 @@
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[1], pre_id); // "existing" reuses pre-existing ID
         assert_eq!(ids[0], ids[2]); // "new1" appears twice → same ID
-        assert_eq!(engine.node_count(), 2); // "existing" + "new1"
+        assert_eq!(engine.node_count().unwrap(), 2); // "existing" + "new1"
 
         engine.close().unwrap();
     }
@@ -464,7 +464,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let inputs: Vec<EdgeInput> = (0..100)
             .map(|i| EdgeInput {
@@ -480,7 +480,7 @@
 
         let ids = engine.batch_upsert_edges(&inputs).unwrap();
         assert_eq!(ids.len(), 100);
-        assert_eq!(engine.edge_count(), 100);
+        assert_eq!(engine.edge_count().unwrap(), 100);
 
         engine.close().unwrap();
     }
@@ -492,7 +492,7 @@
 
         let (id1, id2, eid);
         {
-            let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             id1 = engine
                 .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
                 .unwrap();
@@ -504,7 +504,7 @@
         }
 
         {
-            let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             // close() flushes to segments; verify via cross-source lookup
             assert_eq!(engine.get_nodes_by_type(1).unwrap().len(), 2);
             assert_eq!(engine.get_node(id1).unwrap().unwrap().key, "alice");
@@ -532,7 +532,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let id1 = engine
             .upsert_node(1, "alice", UpsertNodeOptions { weight: 0.5, ..Default::default() })
@@ -561,7 +561,7 @@
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         // Pre-insert an edge
         let pre_id = engine
@@ -603,7 +603,7 @@
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[1], pre_id); // reuses pre-existing ID
         assert_eq!(ids[0], ids[2]); // within-batch dedup
-        assert_eq!(engine.edge_count(), 2); // pre-existing + one new
+        assert_eq!(engine.edge_count().unwrap(), 2); // pre-existing + one new
 
         engine.close().unwrap();
     }
@@ -616,7 +616,7 @@
         let last_node_id;
         let last_edge_id;
         {
-            let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             for i in 0..10 {
                 engine
                     .upsert_node(1, &format!("n:{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
@@ -627,15 +627,15 @@
                     .upsert_edge(i, i + 1, 10, UpsertEdgeOptions::default())
                     .unwrap();
             }
-            last_node_id = engine.next_node_id();
-            last_edge_id = engine.next_edge_id();
+            last_node_id = engine.next_node_id().unwrap();
+            last_edge_id = engine.next_edge_id().unwrap();
             engine.close().unwrap();
         }
 
         {
             let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-            assert!(engine.next_node_id() >= last_node_id);
-            assert!(engine.next_edge_id() >= last_edge_id);
+            assert!(engine.next_node_id().unwrap() >= last_node_id);
+            assert!(engine.next_edge_id().unwrap() >= last_edge_id);
             engine.close().unwrap();
         }
     }
@@ -647,7 +647,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -676,7 +676,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -705,7 +705,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -732,7 +732,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let hub = engine.upsert_node(1, "hub", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         for i in 0..10 {
@@ -757,7 +757,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -768,7 +768,7 @@
         engine.delete_node(b).unwrap();
 
         assert!(engine.get_node(b).unwrap().is_none());
-        assert_eq!(engine.node_count(), 1);
+        assert_eq!(engine.node_count().unwrap(), 1);
 
         // b excluded from a's neighbors (node tombstone filtering)
         let out = engine
@@ -784,7 +784,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -795,7 +795,7 @@
         engine.delete_edge(eid).unwrap();
 
         assert!(engine.get_edge(eid).unwrap().is_none());
-        assert_eq!(engine.edge_count(), 0);
+        assert_eq!(engine.edge_count().unwrap(), 0);
         assert!(engine
             .neighbors(a, &NeighborOptions::default())
             .unwrap()
@@ -811,7 +811,7 @@
 
         let (a, b, eid);
         {
-            let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
             b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
             eid = engine
@@ -844,7 +844,7 @@
 
         let (a, b, c);
         {
-            let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
             b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
             c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -886,7 +886,7 @@
     fn test_node_property_index_ensure_drop_list_and_conflicting_range_domains() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let eq = engine
             .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
@@ -909,7 +909,7 @@
             .unwrap();
         assert_eq!(range.state, SecondaryIndexState::Building);
 
-        let indexes = engine.list_node_property_indexes();
+        let indexes = engine.list_node_property_indexes().unwrap();
         assert_eq!(indexes.len(), 2);
         assert_eq!(indexes[0].prop_key, "color");
         assert_eq!(indexes[1].prop_key, "score");
@@ -932,7 +932,7 @@
             .drop_node_property_index(1, "color", SecondaryIndexKind::Equality)
             .unwrap());
 
-        let indexes = engine.list_node_property_indexes();
+        let indexes = engine.list_node_property_indexes().unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].index_id, range.index_id);
 
@@ -943,7 +943,7 @@
     fn test_node_property_index_retry_failed_clears_error_and_preserves_id() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let created = engine
             .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
@@ -978,7 +978,7 @@
     fn test_ensure_node_property_index_seeds_active_and_immutable_memtables() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let mut frozen_props = BTreeMap::new();
         frozen_props.insert("status".to_string(), PropValue::String("active".to_string()));
@@ -1037,9 +1037,9 @@
             .unwrap();
 
         let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
-        let active_eq_ids = engine
-            .active_memtable()
-            .secondary_eq_state()
+        let active_memtable = engine.active_memtable();
+        let active_eq_state = active_memtable.secondary_eq_state();
+        let active_eq_ids = active_eq_state
             .get(&eq.index_id)
             .unwrap()
             .get(&status_hash)
@@ -1047,26 +1047,26 @@
         assert!(active_eq_ids.contains(&active_id));
         assert!(active_eq_ids.contains(&bad_id));
 
-        let frozen_eq_ids = engine
-            .immutable_memtable(0)
-            .secondary_eq_state()
+        let frozen_memtable = engine.immutable_memtable(0);
+        let frozen_eq_state = frozen_memtable.secondary_eq_state();
+        let frozen_eq_ids = frozen_eq_state
             .get(&eq.index_id)
             .unwrap()
             .get(&status_hash)
             .unwrap();
         assert!(frozen_eq_ids.contains(&frozen_id));
 
-        let active_range = engine
-            .active_memtable()
-            .secondary_range_state()
+        let active_memtable = engine.active_memtable();
+        let active_range_state = active_memtable.secondary_range_state();
+        let active_range = active_range_state
             .get(&range.index_id)
             .unwrap();
         assert!(active_range.contains(&(35u64 ^ (1u64 << 63), active_id)));
         assert!(!active_range.iter().any(|&(_, node_id)| node_id == bad_id));
 
-        let frozen_range = engine
-            .immutable_memtable(0)
-            .secondary_range_state()
+        let frozen_memtable = engine.immutable_memtable(0);
+        let frozen_range_state = frozen_memtable.secondary_range_state();
+        let frozen_range = frozen_range_state
             .get(&range.index_id)
             .unwrap();
         assert!(frozen_range.contains(&(30u64 ^ (1u64 << 63), frozen_id)));
@@ -1078,7 +1078,7 @@
     fn test_secondary_index_seeding_refreshes_immutable_memtable_bytes_cache() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("status".to_string(), PropValue::String("active".to_string()));
@@ -1095,11 +1095,11 @@
             .unwrap();
         engine.freeze_memtable().unwrap();
 
-        let before = engine.stats().immutable_memtable_bytes;
+        let before = engine.stats().unwrap().immutable_memtable_bytes;
         let info = engine
             .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
             .unwrap();
-        let after = engine.stats().immutable_memtable_bytes;
+        let after = engine.stats().unwrap().immutable_memtable_bytes;
         let actual_after: usize = (0..engine.immutable_epoch_count())
             .map(|idx| engine.immutable_memtable(idx).estimated_size())
             .sum();
@@ -1109,13 +1109,13 @@
         engine
             .drop_node_property_index(1, "status", SecondaryIndexKind::Equality)
             .unwrap();
-        let after_drop = engine.stats().immutable_memtable_bytes;
+        let after_drop = engine.stats().unwrap().immutable_memtable_bytes;
         let actual_after_drop: usize = (0..engine.immutable_epoch_count())
             .map(|idx| engine.immutable_memtable(idx).estimated_size())
             .sum();
         assert_eq!(after_drop, actual_after_drop);
         assert!(engine
-            .list_node_property_indexes()
+            .list_node_property_indexes().unwrap()
             .iter()
             .all(|entry| entry.index_id != info.index_id));
 

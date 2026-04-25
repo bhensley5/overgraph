@@ -583,3 +583,5 @@ module.exports.JsNodePageResult = nativeBinding.JsNodePageResult
 module.exports.JsNodeRecord = nativeBinding.JsNodeRecord
 module.exports.JsSubgraphResult = nativeBinding.JsSubgraphResult
 module.exports.OverGraph = nativeBinding.OverGraph
+module.exports.WriteTxn = nativeBinding.WriteTxn
+module.exports.JsWriteTxn = nativeBinding.JsWriteTxn

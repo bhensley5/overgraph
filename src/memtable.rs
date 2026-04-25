@@ -1,6 +1,7 @@
 use crate::types::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
+use std::sync::RwLock;
 
 fn encode_signed_range_key(value: i64) -> u64 {
     (value as u64) ^ (1u64 << 63)
@@ -46,50 +47,924 @@ pub struct AdjEntry {
     pub valid_to: i64,
 }
 
-/// In-memory graph state. Holds live nodes, edges, tombstones, dedup indexes,
-/// and adjacency lists for neighbor queries.
-///
-/// The Memtable is rebuilt from WAL replay on open and updated in real-time
-/// during writes. It provides get-by-ID, key-based dedup, edge uniqueness,
-/// and 1-hop neighbor expansion with direction and type filtering.
-#[derive(Clone)]
-pub struct Memtable {
-    /// Node records by ID.
-    nodes: NodeIdMap<NodeRecord>,
-    /// Edge records by ID.
-    edges: NodeIdMap<EdgeRecord>,
-    /// Deleted node IDs with tombstone entry (deletion timestamp + last_write_seq).
-    deleted_nodes: NodeIdMap<TombstoneEntry>,
-    /// Deleted edge IDs with tombstone entry (deletion timestamp + last_write_seq).
-    deleted_edges: NodeIdMap<TombstoneEntry>,
-    /// type_id → (key → node_id) for upsert dedup.
-    /// Two-level map avoids String allocation on every lookup.
-    node_key_index: HashMap<u32, HashMap<String, u64>>,
-    /// (from, to, type_id) → edge_id for uniqueness enforcement.
-    /// Always populated regardless of the engine's edge_uniqueness flag,
-    /// so the memtable can answer triple lookups without knowing config.
-    edge_triple_index: HashMap<(u64, u64, u32), u64>,
-    /// Outgoing adjacency: node_id → (edge_id → AdjEntry). HashMap for O(1) upsert.
-    adj_out: NodeIdMap<NodeIdMap<AdjEntry>>,
-    /// Incoming adjacency: node_id → (edge_id → AdjEntry). HashMap for O(1) upsert.
-    adj_in: NodeIdMap<NodeIdMap<AdjEntry>>,
-    /// Type index for nodes: type_id → set of live node IDs.
-    type_node_index: HashMap<u32, NodeIdSet>,
-    /// Type index for edges: type_id → set of live edge IDs.
-    type_edge_index: HashMap<u32, NodeIdSet>,
-    /// Timestamp index for nodes: sorted set of (type_id, updated_at, node_id).
-    /// Enables O(log N + k) range queries by time window within a type.
-    time_node_index: BTreeSet<(u32, i64, u64)>,
-    /// Declaration metadata keyed by index_id.
+#[derive(Debug, Clone)]
+struct SlotVersion<T> {
+    write_seq: u64,
+    value: T,
+}
+
+#[derive(Debug, Clone)]
+struct VersionedSlot<T> {
+    head: SlotVersion<T>,
+    history: Option<Vec<SlotVersion<T>>>,
+}
+
+impl<T: Clone> VersionedSlot<T> {
+    fn new(write_seq: u64, value: T) -> Self {
+        Self {
+            head: SlotVersion { write_seq, value },
+            history: None,
+        }
+    }
+
+    fn replace(&mut self, write_seq: u64, value: T) {
+        if self.head.write_seq == write_seq {
+            self.head.value = value;
+            return;
+        }
+        self.history
+            .get_or_insert_with(Vec::new)
+            .push(self.head.clone());
+        self.head = SlotVersion { write_seq, value };
+    }
+
+    fn current(&self) -> &T {
+        &self.head.value
+    }
+
+    fn at(&self, snapshot_seq: u64) -> Option<&T> {
+        if self.head.write_seq <= snapshot_seq {
+            return Some(&self.head.value);
+        }
+        self.history
+            .as_ref()?
+            .iter()
+            .rev()
+            .find_map(|version| (version.write_seq <= snapshot_seq).then_some(&version.value))
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RecordState<T> {
+    Live(T),
+    Tombstone(TombstoneEntry),
+}
+
+type VersionedRecordSlot<T> = VersionedSlot<RecordState<T>>;
+type LookupSlot<V> = VersionedSlot<Option<V>>;
+type MembershipSlot<T> = VersionedSlot<Option<T>>;
+type SecondaryEqMemberState = HashMap<u64, NodeIdMap<MembershipSlot<()>>>;
+type SecondaryEqState = HashMap<u64, SecondaryEqMemberState>;
+type SecondaryRangeState = HashMap<u64, BTreeMap<(u64, u64), MembershipSlot<()>>>;
+
+fn apply_size_delta(total: &mut usize, before: usize, after: usize) {
+    if after >= before {
+        *total += after - before;
+    } else {
+        *total -= before - after;
+    }
+}
+
+fn estimate_node_record_slot(slot: &VersionedRecordSlot<NodeRecord>) -> usize {
+    Memtable::estimate_slot(slot, |state| match state {
+        RecordState::Live(node) => Memtable::estimate_node_record(node),
+        RecordState::Tombstone(_) => 16,
+    })
+}
+
+fn estimate_edge_record_slot(slot: &VersionedRecordSlot<EdgeRecord>) -> usize {
+    Memtable::estimate_slot(slot, |state| match state {
+        RecordState::Live(edge) => Memtable::estimate_edge_record(edge),
+        RecordState::Tombstone(_) => 16,
+    })
+}
+
+fn estimate_lookup_slot(slot: &LookupSlot<u64>) -> usize {
+    Memtable::estimate_slot(slot, |_| 16)
+}
+
+fn estimate_membership_slot(slot: &MembershipSlot<()>) -> usize {
+    Memtable::estimate_slot(slot, |_| 8)
+}
+
+fn estimate_adj_slot(slot: &MembershipSlot<AdjEntry>) -> usize {
+    Memtable::estimate_slot(slot, |_| 48)
+}
+
+fn estimate_secondary_decl_entry(entry: &SecondaryIndexManifestEntry) -> usize {
+    let prop_key_len = match &entry.target {
+        SecondaryIndexTarget::NodeProperty { prop_key, .. } => prop_key.len(),
+    };
+    96 + prop_key_len + entry.last_error.as_ref().map(|msg| msg.len()).unwrap_or(0)
+}
+
+fn estimate_secondary_eq_lookup_entry(prop_key: &str, index_ids: &[u64]) -> usize {
+    48 + prop_key.len() + index_ids.len() * 8
+}
+
+fn estimate_secondary_range_lookup_entry(
+    prop_key: &str,
+    indexes: &[(u64, SecondaryIndexRangeDomain)],
+) -> usize {
+    48 + prop_key.len() + indexes.len() * 16
+}
+
+fn estimate_secondary_eq_state_groups(groups: &SecondaryEqMemberState) -> usize {
+    groups
+        .values()
+        .map(|members| {
+            members
+                .values()
+                .map(estimate_membership_slot)
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+fn estimate_secondary_range_state_entries(
+    entries: &BTreeMap<(u64, u64), MembershipSlot<()>>,
+) -> usize {
+    entries.values().map(estimate_membership_slot).sum()
+}
+
+#[derive(Clone, Default)]
+struct MemtableState {
+    estimated_bytes: usize,
+    nodes: NodeIdMap<VersionedRecordSlot<NodeRecord>>,
+    edges: NodeIdMap<VersionedRecordSlot<EdgeRecord>>,
+    node_tombstones: NodeIdMap<MembershipSlot<()>>,
+    edge_tombstones: NodeIdMap<MembershipSlot<()>>,
+    node_key_index: HashMap<u32, HashMap<String, LookupSlot<u64>>>,
+    edge_triple_index: HashMap<(u64, u64, u32), LookupSlot<u64>>,
+    adj_out: NodeIdMap<NodeIdMap<MembershipSlot<AdjEntry>>>,
+    adj_in: NodeIdMap<NodeIdMap<MembershipSlot<AdjEntry>>>,
+    type_node_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
+    type_edge_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
+    time_node_index: BTreeMap<(u32, i64, u64), MembershipSlot<()>>,
     secondary_index_declarations: HashMap<u64, SecondaryIndexManifestEntry>,
-    /// Equality declarations keyed by `type_id -> prop_key`.
     secondary_eq_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
-    /// Range declarations keyed by `type_id -> prop_key`.
     secondary_range_by_prop: HashMap<u32, HashMap<String, Vec<(u64, SecondaryIndexRangeDomain)>>>,
-    /// Equality state: `index_id -> value_hash -> node_ids`.
-    secondary_eq_state: HashMap<u64, HashMap<u64, NodeIdSet>>,
-    /// Range state: `index_id -> ordered (encoded_value, node_id)`.
-    secondary_range_state: HashMap<u64, BTreeSet<(u64, u64)>>,
+    secondary_eq_state: SecondaryEqState,
+    secondary_range_state: SecondaryRangeState,
+}
+
+fn slot_option_current<T: Clone>(slot: &VersionedSlot<Option<T>>) -> Option<&T> {
+    slot.current().as_ref()
+}
+
+fn slot_option_at<T: Clone>(slot: &VersionedSlot<Option<T>>, snapshot_seq: u64) -> Option<&T> {
+    slot.at(snapshot_seq)?.as_ref()
+}
+
+fn slot_option_visible<T: Clone>(slot: &VersionedSlot<Option<T>>, snapshot_seq: u64) -> bool {
+    slot.at(snapshot_seq).is_some_and(Option::is_some)
+}
+
+fn record_current<T: Clone>(slot: &VersionedRecordSlot<T>) -> Option<&T> {
+    match slot.current() {
+        RecordState::Live(value) => Some(value),
+        RecordState::Tombstone(_) => None,
+    }
+}
+
+fn record_at<T: Clone>(
+    slot: &VersionedRecordSlot<T>,
+    snapshot_seq: u64,
+) -> Option<&RecordState<T>> {
+    slot.at(snapshot_seq)
+}
+
+fn current_adj_map(
+    source: &NodeIdMap<NodeIdMap<MembershipSlot<AdjEntry>>>,
+) -> NodeIdMap<NodeIdMap<AdjEntry>> {
+    let mut result = NodeIdMap::default();
+    for (&owner_id, entries) in source {
+        let mut visible = NodeIdMap::default();
+        for (&member_id, slot) in entries {
+            if let Some(entry) = slot_option_current(slot) {
+                visible.insert(member_id, entry.clone());
+            }
+        }
+        if !visible.is_empty() {
+            result.insert(owner_id, visible);
+        }
+    }
+    result
+}
+
+fn current_type_index(
+    source: &HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
+) -> HashMap<u32, NodeIdSet> {
+    let mut result = HashMap::new();
+    for (&type_id, members) in source {
+        let mut visible = NodeIdSet::default();
+        for (&member_id, slot) in members {
+            if slot_option_current(slot).is_some() {
+                visible.insert(member_id);
+            }
+        }
+        if !visible.is_empty() {
+            result.insert(type_id, visible);
+        }
+    }
+    result
+}
+
+fn current_secondary_eq_state(source: &SecondaryEqState) -> HashMap<u64, HashMap<u64, NodeIdSet>> {
+    let mut result = HashMap::new();
+    for (&index_id, groups) in source {
+        let mut visible_groups = HashMap::new();
+        for (&value_hash, members) in groups {
+            let mut visible = NodeIdSet::default();
+            for (&node_id, slot) in members {
+                if slot_option_current(slot).is_some() {
+                    visible.insert(node_id);
+                }
+            }
+            if !visible.is_empty() {
+                visible_groups.insert(value_hash, visible);
+            }
+        }
+        if !visible_groups.is_empty() {
+            result.insert(index_id, visible_groups);
+        }
+    }
+    result
+}
+
+fn current_secondary_range_state(
+    source: &SecondaryRangeState,
+) -> HashMap<u64, BTreeSet<(u64, u64)>> {
+    let mut result = HashMap::new();
+    for (&index_id, entries) in source {
+        let mut visible = BTreeSet::new();
+        for (&key, slot) in entries {
+            if slot_option_current(slot).is_some() {
+                visible.insert(key);
+            }
+        }
+        if !visible.is_empty() {
+            result.insert(index_id, visible);
+        }
+    }
+    result
+}
+
+fn current_time_index(
+    source: &BTreeMap<(u32, i64, u64), MembershipSlot<()>>,
+) -> BTreeSet<(u32, i64, u64)> {
+    source
+        .iter()
+        .filter_map(|(&key, slot)| slot_option_current(slot).map(|_| key))
+        .collect()
+}
+
+impl MemtableState {
+    fn set_node_state(&mut self, id: u64, state: RecordState<NodeRecord>, write_seq: u64) {
+        match self.nodes.get_mut(&id) {
+            Some(slot) => {
+                let before = estimate_node_record_slot(slot);
+                slot.replace(write_seq, state);
+                let after = estimate_node_record_slot(slot);
+                apply_size_delta(&mut self.estimated_bytes, before, after);
+            }
+            None => {
+                let slot = VersionedSlot::new(write_seq, state);
+                self.estimated_bytes += estimate_node_record_slot(&slot);
+                self.nodes.insert(id, slot);
+            }
+        }
+    }
+
+    fn set_edge_state(&mut self, id: u64, state: RecordState<EdgeRecord>, write_seq: u64) {
+        match self.edges.get_mut(&id) {
+            Some(slot) => {
+                let before = estimate_edge_record_slot(slot);
+                slot.replace(write_seq, state);
+                let after = estimate_edge_record_slot(slot);
+                apply_size_delta(&mut self.estimated_bytes, before, after);
+            }
+            None => {
+                let slot = VersionedSlot::new(write_seq, state);
+                self.estimated_bytes += estimate_edge_record_slot(&slot);
+                self.edges.insert(id, slot);
+            }
+        }
+    }
+
+    fn set_node_key(&mut self, type_id: u32, key: &str, value: Option<u64>, write_seq: u64) {
+        let by_key = self.node_key_index.entry(type_id).or_default();
+        if let Some(slot) = by_key.get_mut(key) {
+            let before = estimate_lookup_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_lookup_slot(slot);
+            apply_size_delta(&mut self.estimated_bytes, before, after);
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            self.estimated_bytes += key.len() + estimate_lookup_slot(&slot);
+            by_key.insert(key.to_string(), slot);
+        }
+    }
+
+    fn set_edge_triple(
+        &mut self,
+        from: u64,
+        to: u64,
+        type_id: u32,
+        value: Option<u64>,
+        write_seq: u64,
+    ) {
+        if let Some(slot) = self.edge_triple_index.get_mut(&(from, to, type_id)) {
+            let before = estimate_lookup_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_lookup_slot(slot);
+            apply_size_delta(&mut self.estimated_bytes, before, after);
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            self.estimated_bytes += estimate_lookup_slot(&slot);
+            self.edge_triple_index.insert((from, to, type_id), slot);
+        }
+    }
+
+    fn set_adj_slot(
+        map: &mut NodeIdMap<NodeIdMap<MembershipSlot<AdjEntry>>>,
+        owner_id: u64,
+        member_id: u64,
+        value: Option<AdjEntry>,
+        write_seq: u64,
+    ) -> (usize, usize) {
+        let members = map.entry(owner_id).or_default();
+        if let Some(slot) = members.get_mut(&member_id) {
+            let before = estimate_adj_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_adj_slot(slot);
+            (before, after)
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            let after = estimate_adj_slot(&slot);
+            members.insert(member_id, slot);
+            (0, after)
+        }
+    }
+
+    fn set_type_slot(
+        map: &mut HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
+        type_id: u32,
+        member_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) -> (usize, usize) {
+        let value = present.then_some(());
+        let members = map.entry(type_id).or_default();
+        if let Some(slot) = members.get_mut(&member_id) {
+            let before = estimate_membership_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_membership_slot(slot);
+            (before, after)
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            let after = estimate_membership_slot(&slot);
+            members.insert(member_id, slot);
+            (0, after)
+        }
+    }
+
+    fn set_sparse_membership_slot(
+        map: &mut NodeIdMap<MembershipSlot<()>>,
+        member_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) -> (usize, usize) {
+        let value = present.then_some(());
+        match map.get_mut(&member_id) {
+            Some(slot) => {
+                let before = estimate_membership_slot(slot);
+                slot.replace(write_seq, value);
+                let after = estimate_membership_slot(slot);
+                (before, after)
+            }
+            None => {
+                if present {
+                    let slot = VersionedSlot::new(write_seq, value);
+                    let after = estimate_membership_slot(&slot);
+                    map.insert(member_id, slot);
+                    (0, after)
+                } else {
+                    (0, 0)
+                }
+            }
+        }
+    }
+
+    fn set_time_slot(&mut self, key: (u32, i64, u64), present: bool, write_seq: u64) {
+        let value = present.then_some(());
+        if let Some(slot) = self.time_node_index.get_mut(&key) {
+            let before = estimate_membership_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_membership_slot(slot);
+            apply_size_delta(&mut self.estimated_bytes, before, after);
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            self.estimated_bytes += estimate_membership_slot(&slot);
+            self.time_node_index.insert(key, slot);
+        }
+    }
+
+    fn set_secondary_eq_slot_in(
+        state: &mut SecondaryEqState,
+        index_id: u64,
+        value_hash: u64,
+        node_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) -> (usize, usize) {
+        let value = present.then_some(());
+        let members = state
+            .entry(index_id)
+            .or_default()
+            .entry(value_hash)
+            .or_default();
+        if let Some(slot) = members.get_mut(&node_id) {
+            let before = estimate_membership_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_membership_slot(slot);
+            (before, after)
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            let after = estimate_membership_slot(&slot);
+            members.insert(node_id, slot);
+            (0, after)
+        }
+    }
+
+    fn set_secondary_range_slot_in(
+        state: &mut SecondaryRangeState,
+        index_id: u64,
+        encoded: u64,
+        node_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) -> (usize, usize) {
+        let value = present.then_some(());
+        let entries = state.entry(index_id).or_default();
+        if let Some(slot) = entries.get_mut(&(encoded, node_id)) {
+            let before = estimate_membership_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_membership_slot(slot);
+            (before, after)
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            let after = estimate_membership_slot(&slot);
+            entries.insert((encoded, node_id), slot);
+            (0, after)
+        }
+    }
+
+    fn set_node_type_slot(&mut self, type_id: u32, member_id: u64, present: bool, write_seq: u64) {
+        let (before, after) = Self::set_type_slot(
+            &mut self.type_node_index,
+            type_id,
+            member_id,
+            present,
+            write_seq,
+        );
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+    }
+
+    fn set_edge_type_slot(&mut self, type_id: u32, member_id: u64, present: bool, write_seq: u64) {
+        let (before, after) = Self::set_type_slot(
+            &mut self.type_edge_index,
+            type_id,
+            member_id,
+            present,
+            write_seq,
+        );
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+    }
+
+    fn set_adj_out_slot(
+        &mut self,
+        owner_id: u64,
+        member_id: u64,
+        value: Option<AdjEntry>,
+        write_seq: u64,
+    ) {
+        let (before, after) =
+            Self::set_adj_slot(&mut self.adj_out, owner_id, member_id, value, write_seq);
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+    }
+
+    fn set_adj_in_slot(
+        &mut self,
+        owner_id: u64,
+        member_id: u64,
+        value: Option<AdjEntry>,
+        write_seq: u64,
+    ) {
+        let (before, after) =
+            Self::set_adj_slot(&mut self.adj_in, owner_id, member_id, value, write_seq);
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+    }
+
+    fn set_node_tombstone_slot(&mut self, member_id: u64, present: bool, write_seq: u64) {
+        let _ = Self::set_sparse_membership_slot(
+            &mut self.node_tombstones,
+            member_id,
+            present,
+            write_seq,
+        );
+    }
+
+    fn set_edge_tombstone_slot(&mut self, member_id: u64, present: bool, write_seq: u64) {
+        let _ = Self::set_sparse_membership_slot(
+            &mut self.edge_tombstones,
+            member_id,
+            present,
+            write_seq,
+        );
+    }
+
+    fn set_secondary_eq_slot(
+        &mut self,
+        index_id: u64,
+        value_hash: u64,
+        node_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) {
+        let (before, after) = Self::set_secondary_eq_slot_in(
+            &mut self.secondary_eq_state,
+            index_id,
+            value_hash,
+            node_id,
+            present,
+            write_seq,
+        );
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+    }
+
+    fn set_secondary_range_slot(
+        &mut self,
+        index_id: u64,
+        encoded: u64,
+        node_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) {
+        let (before, after) = Self::set_secondary_range_slot_in(
+            &mut self.secondary_range_state,
+            index_id,
+            encoded,
+            node_id,
+            present,
+            write_seq,
+        );
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+    }
+
+    #[cfg(test)]
+    fn recompute_estimated_size(&self) -> usize {
+        let node_size: usize = self.nodes.values().map(estimate_node_record_slot).sum();
+        let edge_size: usize = self.edges.values().map(estimate_edge_record_slot).sum();
+        let node_key_size: usize = self
+            .node_key_index
+            .values()
+            .map(|keys| {
+                keys.iter()
+                    .map(|(key, slot)| key.len() + estimate_lookup_slot(slot))
+                    .sum::<usize>()
+            })
+            .sum();
+        let edge_triple_size: usize = self
+            .edge_triple_index
+            .values()
+            .map(estimate_lookup_slot)
+            .sum();
+        let adj_out_size: usize = self
+            .adj_out
+            .values()
+            .map(|entries| entries.values().map(estimate_adj_slot).sum::<usize>())
+            .sum();
+        let adj_in_size: usize = self
+            .adj_in
+            .values()
+            .map(|entries| entries.values().map(estimate_adj_slot).sum::<usize>())
+            .sum();
+        let type_idx_size: usize = self
+            .type_node_index
+            .values()
+            .map(|members| {
+                members
+                    .values()
+                    .map(estimate_membership_slot)
+                    .sum::<usize>()
+            })
+            .sum::<usize>()
+            + self
+                .type_edge_index
+                .values()
+                .map(|members| {
+                    members
+                        .values()
+                        .map(estimate_membership_slot)
+                        .sum::<usize>()
+                })
+                .sum::<usize>();
+        let time_idx_size: usize = self
+            .time_node_index
+            .values()
+            .map(estimate_membership_slot)
+            .sum();
+        let secondary_decl_size: usize = self
+            .secondary_index_declarations
+            .values()
+            .map(estimate_secondary_decl_entry)
+            .sum();
+        let secondary_eq_lookup_size: usize = self
+            .secondary_eq_by_prop
+            .values()
+            .map(|by_prop| {
+                by_prop
+                    .iter()
+                    .map(|(prop_key, index_ids)| {
+                        estimate_secondary_eq_lookup_entry(prop_key, index_ids)
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        let secondary_range_lookup_size: usize = self
+            .secondary_range_by_prop
+            .values()
+            .map(|by_prop| {
+                by_prop
+                    .iter()
+                    .map(|(prop_key, indexes)| {
+                        estimate_secondary_range_lookup_entry(prop_key, indexes)
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        let secondary_eq_state_size: usize = self
+            .secondary_eq_state
+            .values()
+            .map(|groups| {
+                groups
+                    .values()
+                    .map(|members| {
+                        members
+                            .values()
+                            .map(estimate_membership_slot)
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        let secondary_range_state_size: usize = self
+            .secondary_range_state
+            .values()
+            .map(|entries| {
+                entries
+                    .values()
+                    .map(estimate_membership_slot)
+                    .sum::<usize>()
+            })
+            .sum();
+
+        node_size
+            + edge_size
+            + node_key_size
+            + edge_triple_size
+            + adj_out_size
+            + adj_in_size
+            + type_idx_size
+            + time_idx_size
+            + secondary_decl_size
+            + secondary_eq_lookup_size
+            + secondary_range_lookup_size
+            + secondary_eq_state_size
+            + secondary_range_state_size
+    }
+
+    fn current_node(&self, id: u64) -> Option<&NodeRecord> {
+        record_current(self.nodes.get(&id)?)
+    }
+
+    fn current_edge(&self, id: u64) -> Option<&EdgeRecord> {
+        record_current(self.edges.get(&id)?)
+    }
+
+    fn current_edge_triple_id(&self, from: u64, to: u64, type_id: u32) -> Option<u64> {
+        self.edge_triple_index
+            .get(&(from, to, type_id))
+            .and_then(slot_option_current)
+            .copied()
+    }
+
+    fn node_at(&self, id: u64, snapshot_seq: u64) -> Option<&NodeRecord> {
+        match record_at(self.nodes.get(&id)?, snapshot_seq)? {
+            RecordState::Live(node) => Some(node),
+            RecordState::Tombstone(_) => None,
+        }
+    }
+
+    fn edge_at(&self, id: u64, snapshot_seq: u64) -> Option<&EdgeRecord> {
+        match record_at(self.edges.get(&id)?, snapshot_seq)? {
+            RecordState::Live(edge) => Some(edge),
+            RecordState::Tombstone(_) => None,
+        }
+    }
+
+    fn node_deleted_at(&self, id: u64, snapshot_seq: u64) -> bool {
+        self.node_tombstones
+            .get(&id)
+            .is_some_and(|slot| slot_option_visible(slot, snapshot_seq))
+    }
+
+    fn edge_deleted_at(&self, id: u64, snapshot_seq: u64) -> bool {
+        self.edge_tombstones
+            .get(&id)
+            .is_some_and(|slot| slot_option_visible(slot, snapshot_seq))
+    }
+
+    fn node_tombstone_current(&self, id: u64) -> Option<TombstoneEntry> {
+        self.node_tombstones
+            .get(&id)
+            .and_then(slot_option_current)
+            .and_then(|_| {
+                match self
+                    .nodes
+                    .get(&id)
+                    .and_then(|slot| record_at(slot, u64::MAX))
+                {
+                    Some(RecordState::Tombstone(entry)) => Some(*entry),
+                    _ => None,
+                }
+            })
+    }
+
+    fn edge_tombstone_current(&self, id: u64) -> Option<TombstoneEntry> {
+        self.edge_tombstones
+            .get(&id)
+            .and_then(slot_option_current)
+            .and_then(|_| {
+                match self
+                    .edges
+                    .get(&id)
+                    .and_then(|slot| record_at(slot, u64::MAX))
+                {
+                    Some(RecordState::Tombstone(entry)) => Some(*entry),
+                    _ => None,
+                }
+            })
+    }
+
+    fn add_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
+        let eq_by_prop = &self.secondary_eq_by_prop;
+        let range_by_prop = &self.secondary_range_by_prop;
+        let mut eq_actions = Vec::new();
+        let mut range_actions = Vec::new();
+        for (prop_key, prop_value) in &node.props {
+            if let Some(index_ids) = eq_by_prop
+                .get(&node.type_id)
+                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                let value_hash = hash_prop_value(prop_value);
+                for &index_id in index_ids {
+                    eq_actions.push((index_id, value_hash));
+                }
+            }
+
+            if let Some(indexes) = range_by_prop
+                .get(&node.type_id)
+                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                for &(index_id, domain) in indexes {
+                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                        range_actions.push((index_id, encoded));
+                    }
+                }
+            }
+        }
+        for (index_id, value_hash) in eq_actions {
+            self.set_secondary_eq_slot(index_id, value_hash, node.id, true, write_seq);
+        }
+        for (index_id, encoded) in range_actions {
+            self.set_secondary_range_slot(index_id, encoded, node.id, true, write_seq);
+        }
+    }
+
+    fn remove_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
+        let eq_by_prop = &self.secondary_eq_by_prop;
+        let range_by_prop = &self.secondary_range_by_prop;
+        let mut eq_actions = Vec::new();
+        let mut range_actions = Vec::new();
+        for (prop_key, prop_value) in &node.props {
+            if let Some(index_ids) = eq_by_prop
+                .get(&node.type_id)
+                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                let value_hash = hash_prop_value(prop_value);
+                for &index_id in index_ids {
+                    eq_actions.push((index_id, value_hash));
+                }
+            }
+
+            if let Some(indexes) = range_by_prop
+                .get(&node.type_id)
+                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                for &(index_id, domain) in indexes {
+                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                        range_actions.push((index_id, encoded));
+                    }
+                }
+            }
+        }
+        for (index_id, value_hash) in eq_actions {
+            self.set_secondary_eq_slot(index_id, value_hash, node.id, false, write_seq);
+        }
+        for (index_id, encoded) in range_actions {
+            self.set_secondary_range_slot(index_id, encoded, node.id, false, write_seq);
+        }
+    }
+
+    fn sync_secondary_index_entries_for_node_upsert(
+        &mut self,
+        old_node: Option<&NodeRecord>,
+        new_node: &NodeRecord,
+        write_seq: u64,
+    ) {
+        let Some(old_node) = old_node else {
+            self.add_secondary_index_entries_for_node(new_node, write_seq);
+            return;
+        };
+
+        if old_node.type_id != new_node.type_id {
+            self.remove_secondary_index_entries_for_node(old_node, write_seq);
+            self.add_secondary_index_entries_for_node(new_node, write_seq);
+            return;
+        }
+
+        let eq_by_prop = &self.secondary_eq_by_prop;
+        let range_by_prop = &self.secondary_range_by_prop;
+        let mut eq_actions = Vec::new();
+        let mut range_actions = Vec::new();
+
+        if let Some(by_prop) = eq_by_prop.get(&new_node.type_id) {
+            for (prop_key, index_ids) in by_prop {
+                let old_value = old_node.props.get(prop_key.as_str());
+                let new_value = new_node.props.get(prop_key.as_str());
+                if old_value == new_value {
+                    continue;
+                }
+                if let Some(old_value) = old_value {
+                    let value_hash = hash_prop_value(old_value);
+                    for &index_id in index_ids {
+                        eq_actions.push((index_id, value_hash, old_node.id, false));
+                    }
+                }
+                if let Some(new_value) = new_value {
+                    let value_hash = hash_prop_value(new_value);
+                    for &index_id in index_ids {
+                        eq_actions.push((index_id, value_hash, new_node.id, true));
+                    }
+                }
+            }
+        }
+
+        if let Some(by_prop) = range_by_prop.get(&new_node.type_id) {
+            for (prop_key, indexes) in by_prop {
+                let old_value = old_node.props.get(prop_key.as_str());
+                let new_value = new_node.props.get(prop_key.as_str());
+                if old_value == new_value {
+                    continue;
+                }
+                for &(index_id, domain) in indexes {
+                    if let Some(encoded) =
+                        old_value.and_then(|value| encode_range_prop_value(domain, value))
+                    {
+                        range_actions.push((index_id, encoded, old_node.id, false));
+                    }
+                    if let Some(encoded) =
+                        new_value.and_then(|value| encode_range_prop_value(domain, value))
+                    {
+                        range_actions.push((index_id, encoded, new_node.id, true));
+                    }
+                }
+            }
+        }
+        for (index_id, value_hash, node_id, present) in eq_actions {
+            self.set_secondary_eq_slot(index_id, value_hash, node_id, present, write_seq);
+        }
+        for (index_id, encoded, node_id, present) in range_actions {
+            self.set_secondary_range_slot(index_id, encoded, node_id, present, write_seq);
+        }
+    }
+}
+
+/// In-memory graph state. The current head and optional per-entry history live
+/// under one memtable-wide `RwLock`, so active and frozen epochs share the same
+/// authoritative MVCC substrate.
+pub struct Memtable {
+    state: RwLock<MemtableState>,
+}
+
+impl Clone for Memtable {
+    fn clone(&self) -> Self {
+        Self {
+            state: RwLock::new(self.state.read().unwrap().clone()),
+        }
+    }
 }
 
 impl Default for Memtable {
@@ -100,498 +975,693 @@ impl Default for Memtable {
 
 impl Memtable {
     pub fn new() -> Self {
-        Memtable {
-            nodes: NodeIdMap::default(),
-            edges: NodeIdMap::default(),
-            deleted_nodes: NodeIdMap::default(),
-            deleted_edges: NodeIdMap::default(),
-            node_key_index: HashMap::new(),
-            edge_triple_index: HashMap::new(),
-            adj_out: NodeIdMap::default(),
-            adj_in: NodeIdMap::default(),
-            type_node_index: HashMap::new(),
-            type_edge_index: HashMap::new(),
-            time_node_index: BTreeSet::new(),
-            secondary_index_declarations: HashMap::new(),
-            secondary_eq_by_prop: HashMap::new(),
-            secondary_range_by_prop: HashMap::new(),
-            secondary_eq_state: HashMap::new(),
-            secondary_range_state: HashMap::new(),
+        Self {
+            state: RwLock::new(MemtableState::default()),
         }
     }
 
-    /// Apply a WAL operation to the memtable. Updates all indexes.
-    /// `last_write_seq` is the engine-assigned monotonic sequence for this op.
-    pub fn apply_op(&mut self, op: &WalOp, last_write_seq: u64) {
+    pub(crate) fn apply_op(&self, op: &WalOp, last_write_seq: u64) {
+        let mut state = self.state.write().unwrap();
         match op {
             WalOp::UpsertNode(node) => {
-                self.deleted_nodes.remove(&node.id);
-                let old_node = self.nodes.get(&node.id).cloned();
-                // If the node already exists with a different type_id, remove from old type index
+                let old_node = state.current_node(node.id).cloned();
+                let was_deleted = state.node_deleted_at(node.id, u64::MAX);
                 if let Some(old) = old_node.as_ref() {
-                    self.remove_secondary_index_entries_for_node(old);
-                    // Remove old time index entry (may differ in type_id or updated_at)
-                    self.time_node_index
-                        .remove(&(old.type_id, old.updated_at, old.id));
+                    if old.type_id != node.type_id || old.key != node.key {
+                        state.set_node_key(old.type_id, &old.key, None, last_write_seq);
+                    }
                     if old.type_id != node.type_id {
-                        if let Some(set) = self.type_node_index.get_mut(&old.type_id) {
-                            set.remove(&node.id);
-                            if set.is_empty() {
-                                self.type_node_index.remove(&old.type_id);
-                            }
-                        }
+                        state.set_node_type_slot(old.type_id, old.id, false, last_write_seq);
+                    }
+                    if old.type_id != node.type_id || old.updated_at != node.updated_at {
+                        state.set_time_slot(
+                            (old.type_id, old.updated_at, old.id),
+                            false,
+                            last_write_seq,
+                        );
                     }
                 }
-                self.node_key_index
-                    .entry(node.type_id)
-                    .or_default()
-                    .insert(node.key.clone(), node.id);
-                self.type_node_index
-                    .entry(node.type_id)
-                    .or_default()
-                    .insert(node.id);
-                self.time_node_index
-                    .insert((node.type_id, node.updated_at, node.id));
+
                 let mut stored = node.clone();
                 stored.last_write_seq = last_write_seq;
-                self.add_secondary_index_entries_for_node(&stored);
-                self.nodes.insert(node.id, stored);
+                state.set_node_key(node.type_id, &node.key, Some(node.id), last_write_seq);
+                state.set_node_type_slot(node.type_id, node.id, true, last_write_seq);
+                state.set_time_slot(
+                    (node.type_id, node.updated_at, node.id),
+                    true,
+                    last_write_seq,
+                );
+                state.sync_secondary_index_entries_for_node_upsert(
+                    old_node.as_ref(),
+                    &stored,
+                    last_write_seq,
+                );
+                if was_deleted {
+                    state.set_node_tombstone_slot(node.id, false, last_write_seq);
+                }
+                state.set_node_state(node.id, RecordState::Live(stored), last_write_seq);
             }
             WalOp::UpsertEdge(edge) => {
-                self.deleted_edges.remove(&edge.id);
-
-                // If edge already exists, handle type index and adjacency cleanup
-                if let Some(old) = self.edges.get(&edge.id) {
+                let old_edge = state.current_edge(edge.id).cloned();
+                let was_deleted = state.edge_deleted_at(edge.id, u64::MAX);
+                if let Some(old) = old_edge.as_ref() {
+                    if (old.from != edge.from || old.to != edge.to || old.type_id != edge.type_id)
+                        && state.current_edge_triple_id(old.from, old.to, old.type_id)
+                            == Some(old.id)
+                    {
+                        state.set_edge_triple(old.from, old.to, old.type_id, None, last_write_seq);
+                    }
                     if old.type_id != edge.type_id {
-                        if let Some(set) = self.type_edge_index.get_mut(&old.type_id) {
-                            set.remove(&edge.id);
-                            if set.is_empty() {
-                                self.type_edge_index.remove(&old.type_id);
-                            }
-                        }
+                        state.set_edge_type_slot(old.type_id, old.id, false, last_write_seq);
                     }
                     if old.from != edge.from || old.to != edge.to {
-                        if let Some(map) = self.adj_out.get_mut(&old.from) {
-                            map.remove(&edge.id);
-                            if map.is_empty() {
-                                self.adj_out.remove(&old.from);
-                            }
-                        }
-                        if let Some(map) = self.adj_in.get_mut(&old.to) {
-                            map.remove(&edge.id);
-                            if map.is_empty() {
-                                self.adj_in.remove(&old.to);
-                            }
-                        }
+                        state.set_adj_out_slot(old.from, old.id, None, last_write_seq);
+                        state.set_adj_in_slot(old.to, old.id, None, last_write_seq);
                     }
                 }
 
-                self.edge_triple_index
-                    .insert((edge.from, edge.to, edge.type_id), edge.id);
+                let adj_out_entry = AdjEntry {
+                    edge_id: edge.id,
+                    type_id: edge.type_id,
+                    neighbor_id: edge.to,
+                    weight: edge.weight,
+                    valid_from: edge.valid_from,
+                    valid_to: edge.valid_to,
+                };
+                let adj_in_entry = AdjEntry {
+                    edge_id: edge.id,
+                    type_id: edge.type_id,
+                    neighbor_id: edge.from,
+                    weight: edge.weight,
+                    valid_from: edge.valid_from,
+                    valid_to: edge.valid_to,
+                };
 
-                // Update adjacency. O(1) insert/update via HashMap keyed by edge_id
-                self.adj_out.entry(edge.from).or_default().insert(
-                    edge.id,
-                    AdjEntry {
-                        edge_id: edge.id,
-                        type_id: edge.type_id,
-                        neighbor_id: edge.to,
-                        weight: edge.weight,
-                        valid_from: edge.valid_from,
-                        valid_to: edge.valid_to,
-                    },
-                );
-                self.adj_in.entry(edge.to).or_default().insert(
-                    edge.id,
-                    AdjEntry {
-                        edge_id: edge.id,
-                        type_id: edge.type_id,
-                        neighbor_id: edge.from,
-                        weight: edge.weight,
-                        valid_from: edge.valid_from,
-                        valid_to: edge.valid_to,
-                    },
-                );
+                let current_triple_id =
+                    state.current_edge_triple_id(edge.from, edge.to, edge.type_id);
+                let should_update_triple = match old_edge.as_ref() {
+                    Some(old)
+                        if old.from == edge.from
+                            && old.to == edge.to
+                            && old.type_id == edge.type_id =>
+                    {
+                        current_triple_id.is_none_or(|current_id| current_id == edge.id)
+                    }
+                    _ => true,
+                };
+                if should_update_triple {
+                    state.set_edge_triple(
+                        edge.from,
+                        edge.to,
+                        edge.type_id,
+                        Some(edge.id),
+                        last_write_seq,
+                    );
+                }
+                state.set_adj_out_slot(edge.from, edge.id, Some(adj_out_entry), last_write_seq);
+                state.set_adj_in_slot(edge.to, edge.id, Some(adj_in_entry), last_write_seq);
+                state.set_edge_type_slot(edge.type_id, edge.id, true, last_write_seq);
 
-                self.type_edge_index
-                    .entry(edge.type_id)
-                    .or_default()
-                    .insert(edge.id);
                 let mut stored = edge.clone();
                 stored.last_write_seq = last_write_seq;
-                self.edges.insert(edge.id, stored);
+                if was_deleted {
+                    state.set_edge_tombstone_slot(edge.id, false, last_write_seq);
+                }
+                state.set_edge_state(edge.id, RecordState::Live(stored), last_write_seq);
             }
             WalOp::DeleteNode { id, deleted_at } => {
-                if let Some(node) = self.nodes.remove(id) {
-                    self.remove_secondary_index_entries_for_node(&node);
-                    self.time_node_index
-                        .remove(&(node.type_id, node.updated_at, node.id));
-                    if let Some(set) = self.type_node_index.get_mut(&node.type_id) {
-                        set.remove(&node.id);
-                        if set.is_empty() {
-                            self.type_node_index.remove(&node.type_id);
-                        }
-                    }
-                    if let Some(inner) = self.node_key_index.get_mut(&node.type_id) {
-                        inner.remove(&node.key);
-                        if inner.is_empty() {
-                            self.node_key_index.remove(&node.type_id);
-                        }
-                    }
+                if let Some(node) = state.current_node(*id).cloned() {
+                    state.set_node_key(node.type_id, &node.key, None, last_write_seq);
+                    state.set_node_type_slot(node.type_id, node.id, false, last_write_seq);
+                    state.set_time_slot(
+                        (node.type_id, node.updated_at, node.id),
+                        false,
+                        last_write_seq,
+                    );
+                    state.remove_secondary_index_entries_for_node(&node, last_write_seq);
                 }
-                // Clean up adjacency lists owned by this node (prevents memory leak)
-                self.adj_out.remove(id);
-                self.adj_in.remove(id);
-                self.deleted_nodes.insert(
+                state.set_node_state(
                     *id,
-                    TombstoneEntry {
+                    RecordState::Tombstone(TombstoneEntry {
                         deleted_at: *deleted_at,
                         last_write_seq,
-                    },
+                    }),
+                    last_write_seq,
                 );
+                state.set_node_tombstone_slot(*id, true, last_write_seq);
             }
             WalOp::DeleteEdge { id, deleted_at } => {
-                if let Some(edge) = self.edges.remove(id) {
-                    self.edge_triple_index
-                        .remove(&(edge.from, edge.to, edge.type_id));
-                    if let Some(set) = self.type_edge_index.get_mut(&edge.type_id) {
-                        set.remove(&edge.id);
-                        if set.is_empty() {
-                            self.type_edge_index.remove(&edge.type_id);
-                        }
+                if let Some(edge) = state.current_edge(*id).cloned() {
+                    if state.current_edge_triple_id(edge.from, edge.to, edge.type_id) == Some(*id) {
+                        state.set_edge_triple(
+                            edge.from,
+                            edge.to,
+                            edge.type_id,
+                            None,
+                            last_write_seq,
+                        );
                     }
-                    // Remove from adjacency lists
-                    if let Some(map) = self.adj_out.get_mut(&edge.from) {
-                        map.remove(&edge.id);
-                        if map.is_empty() {
-                            self.adj_out.remove(&edge.from);
-                        }
-                    }
-                    if let Some(map) = self.adj_in.get_mut(&edge.to) {
-                        map.remove(&edge.id);
-                        if map.is_empty() {
-                            self.adj_in.remove(&edge.to);
-                        }
-                    }
+                    state.set_edge_type_slot(edge.type_id, edge.id, false, last_write_seq);
+                    state.set_adj_out_slot(edge.from, edge.id, None, last_write_seq);
+                    state.set_adj_in_slot(edge.to, edge.id, None, last_write_seq);
                 }
-                self.deleted_edges.insert(
+                state.set_edge_state(
                     *id,
-                    TombstoneEntry {
+                    RecordState::Tombstone(TombstoneEntry {
                         deleted_at: *deleted_at,
                         last_write_seq,
-                    },
+                    }),
+                    last_write_seq,
                 );
+                state.set_edge_tombstone_slot(*id, true, last_write_seq);
             }
         }
     }
 
-    fn add_secondary_index_entries_for_props<'a, I>(&mut self, node_id: u64, type_id: u32, props: I)
-    where
-        I: IntoIterator<Item = (&'a String, &'a PropValue)>,
-    {
-        for (prop_key, prop_value) in props {
-            if let Some(index_ids) = self
-                .secondary_eq_by_prop
-                .get(&type_id)
-                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                for &index_id in index_ids {
-                    self.secondary_eq_state
-                        .entry(index_id)
-                        .or_default()
-                        .entry(hash_prop_value(prop_value))
-                        .or_default()
-                        .insert(node_id);
-                }
-            }
-
-            if let Some(indexes) = self
-                .secondary_range_by_prop
-                .get(&type_id)
-                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                for &(index_id, domain) in indexes {
-                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
-                        self.secondary_range_state
-                            .entry(index_id)
-                            .or_default()
-                            .insert((encoded, node_id));
-                    }
-                }
-            }
-        }
-    }
-
-    fn add_secondary_index_entries_for_node(&mut self, node: &NodeRecord) {
-        self.add_secondary_index_entries_for_props(node.id, node.type_id, node.props.iter());
-    }
-
-    fn seed_secondary_equality_index_for_property(
-        &mut self,
-        index_id: u64,
-        type_id: u32,
-        prop_key: &str,
-    ) {
-        let Some(node_ids) = self.type_node_index.get(&type_id) else {
-            return;
-        };
-        let mut sorted_node_ids: Vec<u64> = node_ids.iter().copied().collect();
-        sorted_node_ids.sort_unstable();
-
-        let mut staged: Vec<(u64, u64)> = Vec::new();
-        for node_id in sorted_node_ids {
-            let Some(node) = self.nodes.get(&node_id) else {
-                continue;
-            };
-            let Some(prop_value) = node.props.get(prop_key) else {
-                continue;
-            };
-            staged.push((hash_prop_value(prop_value), node_id));
-        }
-
-        let groups = self.secondary_eq_state.entry(index_id).or_default();
-        for (value_hash, node_id) in staged {
-            groups.entry(value_hash).or_default().insert(node_id);
-        }
-    }
-
-    fn seed_secondary_range_index_for_property(
-        &mut self,
-        index_id: u64,
-        type_id: u32,
-        prop_key: &str,
-        domain: SecondaryIndexRangeDomain,
-    ) {
-        let Some(node_ids) = self.type_node_index.get(&type_id) else {
-            return;
-        };
-        let mut sorted_node_ids: Vec<u64> = node_ids.iter().copied().collect();
-        sorted_node_ids.sort_unstable();
-
-        let mut staged: Vec<(u64, u64)> = Vec::new();
-        for node_id in sorted_node_ids {
-            let Some(node) = self.nodes.get(&node_id) else {
-                continue;
-            };
-            let Some(prop_value) = node.props.get(prop_key) else {
-                continue;
-            };
-            let Some(encoded) = encode_range_prop_value(domain, prop_value) else {
-                continue;
-            };
-            staged.push((encoded, node_id));
-        }
-
-        let entries = self.secondary_range_state.entry(index_id).or_default();
-        for encoded_entry in staged {
-            entries.insert(encoded_entry);
-        }
-    }
-
-    fn remove_secondary_index_entries_for_node(&mut self, node: &NodeRecord) {
-        for (prop_key, prop_value) in &node.props {
-            if let Some(index_ids) = self
-                .secondary_eq_by_prop
-                .get(&node.type_id)
-                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                let value_hash = hash_prop_value(prop_value);
-                for &index_id in index_ids {
-                    let mut remove_group = false;
-                    if let Some(groups) = self.secondary_eq_state.get_mut(&index_id) {
-                        if let Some(ids) = groups.get_mut(&value_hash) {
-                            ids.remove(&node.id);
-                            if ids.is_empty() {
-                                groups.remove(&value_hash);
-                            }
-                        }
-                        remove_group = groups.is_empty();
-                    }
-                    if remove_group {
-                        self.secondary_eq_state.remove(&index_id);
-                    }
-                }
-            }
-
-            if let Some(indexes) = self
-                .secondary_range_by_prop
-                .get(&node.type_id)
-                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                for &(index_id, domain) in indexes {
-                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
-                        let mut remove_group = false;
-                        if let Some(entries) = self.secondary_range_state.get_mut(&index_id) {
-                            entries.remove(&(encoded, node.id));
-                            remove_group = entries.is_empty();
-                        }
-                        if remove_group {
-                            self.secondary_range_state.remove(&index_id);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn register_secondary_index(&mut self, entry: &SecondaryIndexManifestEntry) {
-        if self
+    pub fn register_secondary_index(&self, entry: &SecondaryIndexManifestEntry) {
+        let mut state = self.state.write().unwrap();
+        if state
             .secondary_index_declarations
             .contains_key(&entry.index_id)
         {
             return;
         }
-        self.secondary_index_declarations
+        state
+            .secondary_index_declarations
             .insert(entry.index_id, entry.clone());
+        state.estimated_bytes += estimate_secondary_decl_entry(entry);
         match &entry.target {
             SecondaryIndexTarget::NodeProperty { type_id, prop_key } => match &entry.kind {
                 SecondaryIndexKind::Equality => {
-                    self.secondary_eq_by_prop
-                        .entry(*type_id)
-                        .or_default()
-                        .entry(prop_key.clone())
-                        .or_default()
-                        .push(entry.index_id);
-                    self.secondary_eq_state.entry(entry.index_id).or_default();
-                    self.seed_secondary_equality_index_for_property(
-                        entry.index_id,
-                        *type_id,
-                        prop_key,
-                    );
+                    let (lookup_before, lookup_after) = {
+                        let by_prop = state.secondary_eq_by_prop.entry(*type_id).or_default();
+                        match by_prop.get_mut(prop_key) {
+                            Some(index_ids) => {
+                                let before =
+                                    estimate_secondary_eq_lookup_entry(prop_key, index_ids);
+                                index_ids.push(entry.index_id);
+                                let after = estimate_secondary_eq_lookup_entry(prop_key, index_ids);
+                                (before, after)
+                            }
+                            None => {
+                                let index_ids = vec![entry.index_id];
+                                let after =
+                                    estimate_secondary_eq_lookup_entry(prop_key, &index_ids);
+                                by_prop.insert(prop_key.clone(), index_ids);
+                                (0, after)
+                            }
+                        }
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                    state.secondary_eq_state.entry(entry.index_id).or_default();
+                    let mut seeded = Vec::new();
+                    for slot in state.nodes.values() {
+                        let Some(node) = record_current(slot) else {
+                            continue;
+                        };
+                        if node.type_id != *type_id {
+                            continue;
+                        }
+                        let Some(prop_value) = node.props.get(prop_key) else {
+                            continue;
+                        };
+                        seeded.push((hash_prop_value(prop_value), node.id, node.last_write_seq));
+                    }
+                    for (value_hash, node_id, write_seq) in seeded {
+                        state.set_secondary_eq_slot(
+                            entry.index_id,
+                            value_hash,
+                            node_id,
+                            true,
+                            write_seq,
+                        );
+                    }
                 }
                 SecondaryIndexKind::Range { domain } => {
-                    self.secondary_range_by_prop
-                        .entry(*type_id)
-                        .or_default()
-                        .entry(prop_key.clone())
-                        .or_default()
-                        .push((entry.index_id, *domain));
-                    self.secondary_range_state
+                    let (lookup_before, lookup_after) = {
+                        let by_prop = state.secondary_range_by_prop.entry(*type_id).or_default();
+                        match by_prop.get_mut(prop_key) {
+                            Some(indexes) => {
+                                let before =
+                                    estimate_secondary_range_lookup_entry(prop_key, indexes);
+                                indexes.push((entry.index_id, *domain));
+                                let after =
+                                    estimate_secondary_range_lookup_entry(prop_key, indexes);
+                                (before, after)
+                            }
+                            None => {
+                                let indexes = vec![(entry.index_id, *domain)];
+                                let after =
+                                    estimate_secondary_range_lookup_entry(prop_key, &indexes);
+                                by_prop.insert(prop_key.clone(), indexes);
+                                (0, after)
+                            }
+                        }
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                    state
+                        .secondary_range_state
                         .entry(entry.index_id)
                         .or_default();
-                    self.seed_secondary_range_index_for_property(
-                        entry.index_id,
-                        *type_id,
-                        prop_key,
-                        *domain,
-                    );
+                    let mut seeded = Vec::new();
+                    for slot in state.nodes.values() {
+                        let Some(node) = record_current(slot) else {
+                            continue;
+                        };
+                        if node.type_id != *type_id {
+                            continue;
+                        }
+                        let Some(prop_value) = node.props.get(prop_key) else {
+                            continue;
+                        };
+                        let Some(encoded) = encode_range_prop_value(*domain, prop_value) else {
+                            continue;
+                        };
+                        seeded.push((encoded, node.id, node.last_write_seq));
+                    }
+                    for (encoded, node_id, write_seq) in seeded {
+                        state.set_secondary_range_slot(
+                            entry.index_id,
+                            encoded,
+                            node_id,
+                            true,
+                            write_seq,
+                        );
+                    }
                 }
             },
         }
     }
 
-    pub fn unregister_secondary_index(&mut self, index_id: u64) -> bool {
-        let Some(entry) = self.secondary_index_declarations.remove(&index_id) else {
+    pub fn unregister_secondary_index(&self, index_id: u64) -> bool {
+        let mut state = self.state.write().unwrap();
+        let Some(entry) = state.secondary_index_declarations.remove(&index_id) else {
             return false;
         };
-
+        state.estimated_bytes = state
+            .estimated_bytes
+            .saturating_sub(estimate_secondary_decl_entry(&entry));
         match entry.target {
             SecondaryIndexTarget::NodeProperty { type_id, prop_key } => match entry.kind {
                 SecondaryIndexKind::Equality => {
-                    let mut remove_type_entry = false;
-                    if let Some(by_prop) = self.secondary_eq_by_prop.get_mut(&type_id) {
-                        if let Some(index_ids) = by_prop.get_mut(&prop_key) {
-                            index_ids.retain(|&id| id != index_id);
-                            if index_ids.is_empty() {
+                    let (lookup_before, lookup_after, remove_type_entry) = {
+                        let mut delta = (0, 0);
+                        let mut remove_type_entry = false;
+                        if let Some(by_prop) = state.secondary_eq_by_prop.get_mut(&type_id) {
+                            let mut remove_prop_entry = false;
+                            if let Some(index_ids) = by_prop.get_mut(&prop_key) {
+                                delta.0 = estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
+                                index_ids.retain(|&id| id != index_id);
+                                if index_ids.is_empty() {
+                                    remove_prop_entry = true;
+                                } else {
+                                    delta.1 =
+                                        estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
+                                }
+                            }
+                            if remove_prop_entry {
                                 by_prop.remove(&prop_key);
                             }
+                            remove_type_entry = by_prop.is_empty();
                         }
-                        remove_type_entry = by_prop.is_empty();
-                    }
+                        (delta.0, delta.1, remove_type_entry)
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
                     if remove_type_entry {
-                        self.secondary_eq_by_prop.remove(&type_id);
+                        state.secondary_eq_by_prop.remove(&type_id);
                     }
-                    self.secondary_eq_state.remove(&index_id);
+                    if let Some(groups) = state.secondary_eq_state.remove(&index_id) {
+                        state.estimated_bytes = state
+                            .estimated_bytes
+                            .saturating_sub(estimate_secondary_eq_state_groups(&groups));
+                    }
                 }
                 SecondaryIndexKind::Range { domain } => {
-                    let mut remove_type_entry = false;
-                    if let Some(by_prop) = self.secondary_range_by_prop.get_mut(&type_id) {
-                        if let Some(indexes) = by_prop.get_mut(&prop_key) {
-                            indexes.retain(|&(id, existing_domain)| {
-                                id != index_id || existing_domain != domain
-                            });
-                            if indexes.is_empty() {
+                    let (lookup_before, lookup_after, remove_type_entry) = {
+                        let mut delta = (0, 0);
+                        let mut remove_type_entry = false;
+                        if let Some(by_prop) = state.secondary_range_by_prop.get_mut(&type_id) {
+                            let mut remove_prop_entry = false;
+                            if let Some(indexes) = by_prop.get_mut(&prop_key) {
+                                delta.0 = estimate_secondary_range_lookup_entry(&prop_key, indexes);
+                                indexes.retain(|&(id, existing_domain)| {
+                                    id != index_id || existing_domain != domain
+                                });
+                                if indexes.is_empty() {
+                                    remove_prop_entry = true;
+                                } else {
+                                    delta.1 =
+                                        estimate_secondary_range_lookup_entry(&prop_key, indexes);
+                                }
+                            }
+                            if remove_prop_entry {
                                 by_prop.remove(&prop_key);
                             }
+                            remove_type_entry = by_prop.is_empty();
                         }
-                        remove_type_entry = by_prop.is_empty();
-                    }
+                        (delta.0, delta.1, remove_type_entry)
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
                     if remove_type_entry {
-                        self.secondary_range_by_prop.remove(&type_id);
+                        state.secondary_range_by_prop.remove(&type_id);
                     }
-                    self.secondary_range_state.remove(&index_id);
+                    if let Some(entries) = state.secondary_range_state.remove(&index_id) {
+                        state.estimated_bytes = state
+                            .estimated_bytes
+                            .saturating_sub(estimate_secondary_range_state_entries(&entries));
+                    }
                 }
             },
         }
-
         true
     }
 
-    /// Get a node by ID (returns None if deleted or missing).
-    pub fn get_node(&self, id: u64) -> Option<&NodeRecord> {
-        if self.deleted_nodes.contains_key(&id) {
-            return None;
-        }
-        self.nodes.get(&id)
+    pub(crate) fn get_node_at(&self, id: u64, snapshot_seq: u64) -> Option<NodeRecord> {
+        let state = self.state.read().unwrap();
+        state.node_at(id, snapshot_seq).cloned()
     }
 
-    /// Get an edge by ID (returns None if deleted or missing).
-    pub fn get_edge(&self, id: u64) -> Option<&EdgeRecord> {
-        if self.deleted_edges.contains_key(&id) {
-            return None;
+    pub(crate) fn visit_nodes_sorted_at<F>(
+        &self,
+        sorted_ids: &[u64],
+        snapshot_seq: u64,
+        remaining: &mut Vec<u64>,
+        callback: &mut F,
+    ) where
+        F: FnMut(u64, &NodeRecord),
+    {
+        let state = self.state.read().unwrap();
+        for &id in sorted_ids {
+            if state.node_deleted_at(id, snapshot_seq) {
+                continue;
+            }
+            if let Some(node) = state.node_at(id, snapshot_seq) {
+                callback(id, node);
+            } else {
+                remaining.push(id);
+            }
         }
-        self.edges.get(&id)
     }
 
-    /// Look up a node by (type_id, key) for upsert dedup.
-    /// Returns None if the node has been deleted (defensive tombstone check).
-    pub fn node_by_key(&self, type_id: u32, key: &str) -> Option<&NodeRecord> {
-        let id = self.node_key_index.get(&type_id)?.get(key)?;
-        if self.deleted_nodes.contains_key(id) {
-            return None;
-        }
-        self.nodes.get(id)
+    pub(crate) fn get_edge_at(&self, id: u64, snapshot_seq: u64) -> Option<EdgeRecord> {
+        let state = self.state.read().unwrap();
+        state.edge_at(id, snapshot_seq).cloned()
     }
 
-    /// Look up an edge by (from, to, type_id) for uniqueness enforcement.
-    /// Returns None if the edge has been deleted (defensive tombstone check).
-    pub fn edge_by_triple(&self, from: u64, to: u64, type_id: u32) -> Option<&EdgeRecord> {
-        let id = self.edge_triple_index.get(&(from, to, type_id))?;
-        if self.deleted_edges.contains_key(id) {
-            return None;
-        }
-        self.edges.get(id)
+    pub(crate) fn get_edge_core_at(
+        &self,
+        id: u64,
+        snapshot_seq: u64,
+    ) -> Option<(u64, u64, i64, i64, f32, i64, i64)> {
+        let state = self.state.read().unwrap();
+        let edge = state.edge_at(id, snapshot_seq)?;
+        Some((
+            edge.from,
+            edge.to,
+            edge.created_at,
+            edge.updated_at,
+            edge.weight,
+            edge.valid_from,
+            edge.valid_to,
+        ))
     }
 
-    /// Query neighbors of a node with direction, optional type filter, and limit.
-    /// Excludes deleted nodes from results. Returns empty if the queried node is deleted.
-    /// Limit of 0 means no limit.
-    pub fn neighbors(
+    pub(crate) fn batch_get_nodes_at(
+        &self,
+        lookups: &[(usize, u64)],
+        snapshot_seq: u64,
+        results: &mut [Option<NodeRecord>],
+    ) -> Vec<(usize, u64)> {
+        #[derive(Clone, Copy)]
+        enum CachedLookup {
+            Live(usize),
+            Tombstone,
+            Miss,
+        }
+
+        if lookups.is_empty() {
+            return Vec::new();
+        }
+
+        let state = self.state.read().unwrap();
+        let mut cache =
+            NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
+        let mut remaining = Vec::with_capacity(lookups.len());
+
+        for &(orig_idx, id) in lookups {
+            match cache.get(&id).copied() {
+                Some(CachedLookup::Live(cached_idx)) => {
+                    results[orig_idx] = results[cached_idx].clone();
+                }
+                Some(CachedLookup::Tombstone) => {}
+                Some(CachedLookup::Miss) => remaining.push((orig_idx, id)),
+                None => {
+                    let outcome = match state.nodes.get(&id) {
+                        Some(slot) => match record_at(slot, snapshot_seq) {
+                            Some(RecordState::Live(node)) => {
+                                results[orig_idx] = Some(node.clone());
+                                CachedLookup::Live(orig_idx)
+                            }
+                            Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
+                            None => CachedLookup::Miss,
+                        },
+                        None => CachedLookup::Miss,
+                    };
+                    cache.insert(id, outcome);
+                    if matches!(outcome, CachedLookup::Miss) {
+                        remaining.push((orig_idx, id));
+                    }
+                }
+            }
+        }
+
+        remaining
+    }
+
+    pub(crate) fn batch_get_edges_at(
+        &self,
+        lookups: &[(usize, u64)],
+        snapshot_seq: u64,
+        results: &mut [Option<EdgeRecord>],
+    ) -> Vec<(usize, u64)> {
+        #[derive(Clone, Copy)]
+        enum CachedLookup {
+            Live(usize),
+            Tombstone,
+            Miss,
+        }
+
+        if lookups.is_empty() {
+            return Vec::new();
+        }
+
+        let state = self.state.read().unwrap();
+        let mut cache =
+            NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
+        let mut remaining = Vec::with_capacity(lookups.len());
+
+        for &(orig_idx, id) in lookups {
+            match cache.get(&id).copied() {
+                Some(CachedLookup::Live(cached_idx)) => {
+                    results[orig_idx] = results[cached_idx].clone();
+                }
+                Some(CachedLookup::Tombstone) => {}
+                Some(CachedLookup::Miss) => remaining.push((orig_idx, id)),
+                None => {
+                    let outcome = match state.edges.get(&id) {
+                        Some(slot) => match record_at(slot, snapshot_seq) {
+                            Some(RecordState::Live(edge)) => {
+                                results[orig_idx] = Some(edge.clone());
+                                CachedLookup::Live(orig_idx)
+                            }
+                            Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
+                            None => CachedLookup::Miss,
+                        },
+                        None => CachedLookup::Miss,
+                    };
+                    cache.insert(id, outcome);
+                    if matches!(outcome, CachedLookup::Miss) {
+                        remaining.push((orig_idx, id));
+                    }
+                }
+            }
+        }
+
+        remaining
+    }
+
+    pub(crate) fn is_node_deleted_at(&self, id: u64, snapshot_seq: u64) -> bool {
+        let state = self.state.read().unwrap();
+        state.node_deleted_at(id, snapshot_seq)
+    }
+
+    pub(crate) fn is_edge_deleted_at(&self, id: u64, snapshot_seq: u64) -> bool {
+        let state = self.state.read().unwrap();
+        state.edge_deleted_at(id, snapshot_seq)
+    }
+
+    pub(crate) fn node_tombstone_at(&self, id: u64, snapshot_seq: u64) -> Option<TombstoneEntry> {
+        let state = self.state.read().unwrap();
+        state
+            .nodes
+            .get(&id)
+            .and_then(|slot| match record_at(slot, snapshot_seq) {
+                Some(RecordState::Tombstone(entry)) => Some(*entry),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn edge_tombstone_at(&self, id: u64, snapshot_seq: u64) -> Option<TombstoneEntry> {
+        let state = self.state.read().unwrap();
+        state
+            .edges
+            .get(&id)
+            .and_then(|slot| match record_at(slot, snapshot_seq) {
+                Some(RecordState::Tombstone(entry)) => Some(*entry),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn node_by_key_at(
+        &self,
+        type_id: u32,
+        key: &str,
+        snapshot_seq: u64,
+    ) -> Option<NodeRecord> {
+        let state = self.state.read().unwrap();
+        let node_id = *slot_option_at(state.node_key_index.get(&type_id)?.get(key)?, snapshot_seq)?;
+        state.node_at(node_id, snapshot_seq).cloned()
+    }
+
+    pub(crate) fn edge_by_triple_at(
+        &self,
+        from: u64,
+        to: u64,
+        type_id: u32,
+        snapshot_seq: u64,
+    ) -> Option<EdgeRecord> {
+        let state = self.state.read().unwrap();
+        let edge_id = *slot_option_at(
+            state.edge_triple_index.get(&(from, to, type_id))?,
+            snapshot_seq,
+        )?;
+        state.edge_at(edge_id, snapshot_seq).cloned()
+    }
+
+    pub(crate) fn for_each_visible_node_at<F>(
+        &self,
+        snapshot_seq: u64,
+        callback: &mut F,
+    ) -> ControlFlow<()>
+    where
+        F: FnMut(&NodeRecord) -> ControlFlow<()>,
+    {
+        let state = self.state.read().unwrap();
+        for slot in state.nodes.values() {
+            let Some(RecordState::Live(node)) = record_at(slot, snapshot_seq) else {
+                continue;
+            };
+            if callback(node).is_break() {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    pub(crate) fn visible_nodes_by_type(&self, type_id: u32, snapshot_seq: u64) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let mut ids = Vec::new();
+        if let Some(members) = state.type_node_index.get(&type_id) {
+            for (&node_id, slot) in members {
+                if slot_option_visible(slot, snapshot_seq) {
+                    ids.push(node_id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn visible_edges_by_type(&self, type_id: u32, snapshot_seq: u64) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let mut ids = Vec::new();
+        if let Some(members) = state.type_edge_index.get(&type_id) {
+            for (&edge_id, slot) in members {
+                if slot_option_visible(slot, snapshot_seq) {
+                    ids.push(edge_id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn visible_nodes_by_time_range(
+        &self,
+        type_id: u32,
+        from_ms: i64,
+        to_ms: i64,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        if from_ms > to_ms {
+            return Vec::new();
+        }
+        let state = self.state.read().unwrap();
+        use std::ops::Bound;
+        let start = (type_id, from_ms, 0u64);
+        let end = (type_id, to_ms, u64::MAX);
+        let mut ids = state
+            .time_node_index
+            .range((Bound::Included(start), Bound::Included(end)))
+            .filter_map(|(&(entry_type, _, node_id), slot)| {
+                (entry_type == type_id && slot_option_visible(slot, snapshot_seq))
+                    .then_some(node_id)
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn neighbors_at(
         &self,
         node_id: u64,
         direction: Direction,
         type_filter: Option<&[u32]>,
         limit: usize,
+        snapshot_seq: u64,
     ) -> Vec<NeighborEntry> {
-        // Querying neighbors of a deleted node returns nothing
-        if self.deleted_nodes.contains_key(&node_id) {
+        let state = self.state.read().unwrap();
+        if state.node_deleted_at(node_id, snapshot_seq) {
             return Vec::new();
         }
 
         let mut results = Vec::new();
-
-        let collect = |map: &NodeIdMap<AdjEntry>, results: &mut Vec<NeighborEntry>| {
-            for entry in map.values() {
+        let mut self_loop_edge_ids = NodeIdSet::default();
+        let mut collect = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
+                           dedupe_self_loops: bool,
+                           results: &mut Vec<NeighborEntry>| {
+            let Some(map) = map else {
+                return;
+            };
+            for slot in map.values() {
                 if limit > 0 && results.len() >= limit {
                     break;
                 }
-                if let Some(types) = type_filter {
-                    if !types.contains(&entry.type_id) {
+                let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                    continue;
+                };
+                if type_filter.is_some_and(|types| !types.contains(&entry.type_id)) {
+                    continue;
+                }
+                if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
+                    continue;
+                }
+                if dedupe_self_loops && entry.neighbor_id == node_id {
+                    if !self_loop_edge_ids.insert(entry.edge_id) {
                         continue;
                     }
-                }
-                if self.deleted_nodes.contains_key(&entry.neighbor_id) {
-                    continue;
+                } else if entry.neighbor_id == node_id {
+                    self_loop_edge_ids.insert(entry.edge_id);
                 }
                 results.push(NeighborEntry {
                     node_id: entry.neighbor_id,
@@ -606,136 +1676,299 @@ impl Memtable {
 
         match direction {
             Direction::Outgoing => {
-                if let Some(map) = self.adj_out.get(&node_id) {
-                    collect(map, &mut results);
-                }
+                collect(state.adj_out.get(&node_id), false, &mut results);
             }
             Direction::Incoming => {
-                if let Some(map) = self.adj_in.get(&node_id) {
-                    collect(map, &mut results);
-                }
+                collect(state.adj_in.get(&node_id), false, &mut results);
             }
             Direction::Both => {
-                if limit == 0 {
-                    let mut self_loop_edge_ids = NodeIdSet::default();
-                    if let Some(map) = self.adj_out.get(&node_id) {
-                        for entry in map.values() {
-                            if let Some(types) = type_filter {
-                                if !types.contains(&entry.type_id) {
-                                    continue;
-                                }
-                            }
-                            if self.deleted_nodes.contains_key(&entry.neighbor_id) {
-                                continue;
-                            }
-                            if entry.neighbor_id == node_id {
-                                self_loop_edge_ids.insert(entry.edge_id);
-                            }
-                            results.push(NeighborEntry {
-                                node_id: entry.neighbor_id,
-                                edge_id: entry.edge_id,
-                                edge_type_id: entry.type_id,
-                                weight: entry.weight,
-                                valid_from: entry.valid_from,
-                                valid_to: entry.valid_to,
-                            });
-                        }
-                    }
-                    if let Some(map) = self.adj_in.get(&node_id) {
-                        for entry in map.values() {
-                            if let Some(types) = type_filter {
-                                if !types.contains(&entry.type_id) {
-                                    continue;
-                                }
-                            }
-                            if self.deleted_nodes.contains_key(&entry.neighbor_id) {
-                                continue;
-                            }
-                            if entry.neighbor_id == node_id
-                                && self_loop_edge_ids.contains(&entry.edge_id)
-                            {
-                                continue;
-                            }
-                            results.push(NeighborEntry {
-                                node_id: entry.neighbor_id,
-                                edge_id: entry.edge_id,
-                                edge_type_id: entry.type_id,
-                                weight: entry.weight,
-                                valid_from: entry.valid_from,
-                                valid_to: entry.valid_to,
-                            });
-                        }
-                    }
-                } else {
-                    let mut self_loop_edge_ids = NodeIdSet::default();
-                    if let Some(map) = self.adj_out.get(&node_id) {
-                        for entry in map.values() {
-                            if results.len() >= limit {
-                                break;
-                            }
-                            if let Some(types) = type_filter {
-                                if !types.contains(&entry.type_id) {
-                                    continue;
-                                }
-                            }
-                            if self.deleted_nodes.contains_key(&entry.neighbor_id) {
-                                continue;
-                            }
-                            if entry.neighbor_id == node_id {
-                                self_loop_edge_ids.insert(entry.edge_id);
-                            }
-                            results.push(NeighborEntry {
-                                node_id: entry.neighbor_id,
-                                edge_id: entry.edge_id,
-                                edge_type_id: entry.type_id,
-                                weight: entry.weight,
-                                valid_from: entry.valid_from,
-                                valid_to: entry.valid_to,
-                            });
-                        }
-                    }
-                    let mut remaining_raw = limit.saturating_sub(results.len());
-                    if remaining_raw > 0 {
-                        if let Some(map) = self.adj_in.get(&node_id) {
-                            for entry in map.values() {
-                                if remaining_raw == 0 {
-                                    break;
-                                }
-                                if let Some(types) = type_filter {
-                                    if !types.contains(&entry.type_id) {
-                                        continue;
-                                    }
-                                }
-                                if self.deleted_nodes.contains_key(&entry.neighbor_id) {
-                                    continue;
-                                }
-                                remaining_raw -= 1;
-                                if entry.neighbor_id == node_id
-                                    && self_loop_edge_ids.contains(&entry.edge_id)
-                                {
-                                    continue;
-                                }
-                                results.push(NeighborEntry {
-                                    node_id: entry.neighbor_id,
-                                    edge_id: entry.edge_id,
-                                    edge_type_id: entry.type_id,
-                                    weight: entry.weight,
-                                    valid_from: entry.valid_from,
-                                    valid_to: entry.valid_to,
-                                });
-                            }
-                        }
-                    }
-                }
+                collect(state.adj_out.get(&node_id), false, &mut results);
+                collect(state.adj_in.get(&node_id), true, &mut results);
             }
         }
 
         results
     }
 
-    /// Batch neighbor query: collect neighbors for multiple node IDs.
-    /// Memtable is HashMap-based so per-node lookups are O(1); this method
-    /// batches them into a single `NodeIdMap` result for the engine merge layer.
+    pub(crate) fn incident_edges_at(
+        &self,
+        node_id: u64,
+        direction: Direction,
+        type_filter: Option<&[u32]>,
+        snapshot_seq: u64,
+    ) -> Vec<NeighborEntry> {
+        let state = self.state.read().unwrap();
+        if state.node_deleted_at(node_id, snapshot_seq) {
+            return Vec::new();
+        }
+
+        let mut results = Vec::new();
+        let mut self_loop_edge_ids = NodeIdSet::default();
+        let mut collect = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
+                           dedupe_self_loops: bool,
+                           results: &mut Vec<NeighborEntry>| {
+            let Some(map) = map else {
+                return;
+            };
+            for slot in map.values() {
+                let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                    continue;
+                };
+                if type_filter.is_some_and(|types| !types.contains(&entry.type_id)) {
+                    continue;
+                }
+                if dedupe_self_loops && entry.neighbor_id == node_id {
+                    if !self_loop_edge_ids.insert(entry.edge_id) {
+                        continue;
+                    }
+                } else if entry.neighbor_id == node_id {
+                    self_loop_edge_ids.insert(entry.edge_id);
+                }
+                results.push(NeighborEntry {
+                    node_id: entry.neighbor_id,
+                    edge_id: entry.edge_id,
+                    edge_type_id: entry.type_id,
+                    weight: entry.weight,
+                    valid_from: entry.valid_from,
+                    valid_to: entry.valid_to,
+                });
+            }
+        };
+
+        match direction {
+            Direction::Outgoing => {
+                collect(state.adj_out.get(&node_id), false, &mut results);
+            }
+            Direction::Incoming => {
+                collect(state.adj_in.get(&node_id), false, &mut results);
+            }
+            Direction::Both => {
+                collect(state.adj_out.get(&node_id), false, &mut results);
+                collect(state.adj_in.get(&node_id), true, &mut results);
+            }
+        }
+
+        results
+    }
+
+    pub(crate) fn for_each_adj_entry_at<F>(
+        &self,
+        node_id: u64,
+        direction: Direction,
+        type_filter: Option<&[u32]>,
+        snapshot_seq: u64,
+        callback: &mut F,
+    ) -> ControlFlow<()>
+    where
+        F: FnMut(u64, u64, f32, i64, i64) -> ControlFlow<()>,
+    {
+        let state = self.state.read().unwrap();
+        if state.node_deleted_at(node_id, snapshot_seq) {
+            return ControlFlow::Continue(());
+        }
+
+        let mut self_loop_edge_ids = NodeIdSet::default();
+        let mut visit = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
+                         dedupe_self_loops: bool| {
+            let Some(map) = map else {
+                return ControlFlow::Continue(());
+            };
+            for slot in map.values() {
+                let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                    continue;
+                };
+                if type_filter.is_some_and(|types| !types.contains(&entry.type_id)) {
+                    continue;
+                }
+                if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
+                    continue;
+                }
+                if dedupe_self_loops && entry.neighbor_id == node_id {
+                    if !self_loop_edge_ids.insert(entry.edge_id) {
+                        continue;
+                    }
+                } else if entry.neighbor_id == node_id {
+                    self_loop_edge_ids.insert(entry.edge_id);
+                }
+                if callback(
+                    entry.edge_id,
+                    entry.neighbor_id,
+                    entry.weight,
+                    entry.valid_from,
+                    entry.valid_to,
+                )
+                .is_break()
+                {
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        };
+
+        match direction {
+            Direction::Outgoing => visit(state.adj_out.get(&node_id), false),
+            Direction::Incoming => visit(state.adj_in.get(&node_id), false),
+            Direction::Both => {
+                visit(state.adj_out.get(&node_id), false)?;
+                visit(state.adj_in.get(&node_id), true)
+            }
+        }
+    }
+
+    pub(crate) fn visible_types(&self, snapshot_seq: u64) -> Vec<u32> {
+        let state = self.state.read().unwrap();
+        let mut types = Vec::new();
+        for (&type_id, members) in &state.type_node_index {
+            if members
+                .values()
+                .any(|slot| slot_option_visible(slot, snapshot_seq))
+            {
+                types.push(type_id);
+            }
+        }
+        types.sort_unstable();
+        types
+    }
+
+    pub(crate) fn find_secondary_eq_nodes_at(
+        &self,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let value_hash = hash_prop_value(prop_value);
+        let mut ids = Vec::new();
+        if let Some(groups) = state.secondary_eq_state.get(&index_id) {
+            if let Some(group) = groups.get(&value_hash) {
+                for (&node_id, slot) in group {
+                    if !slot_option_visible(slot, snapshot_seq) {
+                        continue;
+                    }
+                    let Some(node) = state.node_at(node_id, snapshot_seq) else {
+                        continue;
+                    };
+                    if node
+                        .props
+                        .get(prop_key)
+                        .is_some_and(|value| value == prop_value)
+                    {
+                        ids.push(node_id);
+                    }
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn visible_secondary_range_entries(
+        &self,
+        index_id: u64,
+        lower: Option<(u64, bool)>,
+        upper: Option<(u64, bool)>,
+        after: Option<(u64, u64)>,
+        snapshot_seq: u64,
+    ) -> Vec<(u64, u64)> {
+        use std::ops::Bound;
+
+        let state = self.state.read().unwrap();
+        let Some(entries) = state.secondary_range_state.get(&index_id) else {
+            return Vec::new();
+        };
+
+        let mut start = lower.map(|(value, inclusive)| {
+            if inclusive {
+                ((value, 0), false)
+            } else {
+                ((value, u64::MAX), true)
+            }
+        });
+        if let Some(cursor) = after {
+            let cursor_start = (cursor, true);
+            start = Some(match start {
+                Some(existing) if existing.0 > cursor_start.0 => existing,
+                Some(existing) if existing.0 < cursor_start.0 => cursor_start,
+                Some(existing) => (existing.0, existing.1 || cursor_start.1),
+                None => cursor_start,
+            });
+        }
+
+        let start = match start {
+            Some((target, strict)) => {
+                if strict {
+                    Bound::Excluded(target)
+                } else {
+                    Bound::Included(target)
+                }
+            }
+            None => Bound::Unbounded,
+        };
+
+        entries
+            .range((start, Bound::Unbounded))
+            .filter_map(|(&(encoded, node_id), slot)| {
+                if upper.is_some_and(|(upper_value, inclusive)| {
+                    encoded > upper_value || (!inclusive && encoded == upper_value)
+                }) {
+                    return None;
+                }
+                slot_option_visible(slot, snapshot_seq).then_some((encoded, node_id))
+            })
+            .collect()
+    }
+
+    pub(crate) fn collect_deleted_nodes_at(&self, snapshot_seq: u64) -> NodeIdSet {
+        let state = self.state.read().unwrap();
+        let mut deleted = NodeIdSet::default();
+        for (&node_id, slot) in &state.node_tombstones {
+            if slot_option_visible(slot, snapshot_seq) {
+                deleted.insert(node_id);
+            }
+        }
+        deleted
+    }
+
+    pub(crate) fn collect_deleted_edges_at(&self, snapshot_seq: u64) -> NodeIdSet {
+        let state = self.state.read().unwrap();
+        let mut deleted = NodeIdSet::default();
+        for (&edge_id, slot) in &state.edge_tombstones {
+            if slot_option_visible(slot, snapshot_seq) {
+                deleted.insert(edge_id);
+            }
+        }
+        deleted
+    }
+
+    /// Current-head helpers below keep the existing memtable-facing API shape
+    /// for writer planning, flush, stats, and tests.
+    pub fn get_node(&self, id: u64) -> Option<NodeRecord> {
+        self.get_node_at(id, u64::MAX)
+    }
+
+    pub fn get_edge(&self, id: u64) -> Option<EdgeRecord> {
+        self.get_edge_at(id, u64::MAX)
+    }
+
+    pub fn node_by_key(&self, type_id: u32, key: &str) -> Option<NodeRecord> {
+        self.node_by_key_at(type_id, key, u64::MAX)
+    }
+
+    pub fn edge_by_triple(&self, from: u64, to: u64, type_id: u32) -> Option<EdgeRecord> {
+        self.edge_by_triple_at(from, to, type_id, u64::MAX)
+    }
+
+    pub fn neighbors(
+        &self,
+        node_id: u64,
+        direction: Direction,
+        type_filter: Option<&[u32]>,
+        limit: usize,
+    ) -> Vec<NeighborEntry> {
+        self.neighbors_at(node_id, direction, type_filter, limit, u64::MAX)
+    }
+
     pub fn neighbors_batch(
         &self,
         node_ids: &[u64],
@@ -752,11 +1985,23 @@ impl Memtable {
         results
     }
 
-    /// Iterate adjacency entries for a node, calling the callback for each valid
-    /// (non-tombstoned, type-matching) entry. Used by degree/weight aggregation
-    /// to avoid materializing `Vec<NeighborEntry>`.
-    ///
-    /// Callback receives `(edge_id, neighbor_id, weight, valid_from, valid_to)`.
+    pub(crate) fn neighbors_batch_at(
+        &self,
+        node_ids: &[u64],
+        direction: Direction,
+        type_filter: Option<&[u32]>,
+        snapshot_seq: u64,
+    ) -> NodeIdMap<Vec<NeighborEntry>> {
+        let mut results = NodeIdMap::default();
+        for &nid in node_ids {
+            let entries = self.neighbors_at(nid, direction, type_filter, 0, snapshot_seq);
+            if !entries.is_empty() {
+                results.insert(nid, entries);
+            }
+        }
+        results
+    }
+
     pub fn for_each_adj_entry<F>(
         &self,
         node_id: u64,
@@ -767,426 +2012,237 @@ impl Memtable {
     where
         F: FnMut(u64, u64, f32, i64, i64) -> ControlFlow<()>,
     {
-        if self.deleted_nodes.contains_key(&node_id) {
-            return ControlFlow::Continue(());
-        }
-
-        let visit = |map: &NodeIdMap<AdjEntry>, cb: &mut F| -> ControlFlow<()> {
-            for entry in map.values() {
-                if let Some(types) = type_filter {
-                    if !types.contains(&entry.type_id) {
-                        continue;
-                    }
-                }
-                if self.deleted_nodes.contains_key(&entry.neighbor_id) {
-                    continue;
-                }
-                if cb(
-                    entry.edge_id,
-                    entry.neighbor_id,
-                    entry.weight,
-                    entry.valid_from,
-                    entry.valid_to,
-                )
-                .is_break()
-                {
-                    return ControlFlow::Break(());
-                }
-            }
-            ControlFlow::Continue(())
-        };
-
-        match direction {
-            Direction::Outgoing => {
-                if let Some(map) = self.adj_out.get(&node_id) {
-                    visit(map, callback)?;
-                }
-            }
-            Direction::Incoming => {
-                if let Some(map) = self.adj_in.get(&node_id) {
-                    visit(map, callback)?;
-                }
-            }
-            Direction::Both => {
-                let mut self_loop_edge_ids = NodeIdSet::default();
-                if let Some(map) = self.adj_out.get(&node_id) {
-                    for entry in map.values() {
-                        if let Some(types) = type_filter {
-                            if !types.contains(&entry.type_id) {
-                                continue;
-                            }
-                        }
-                        if self.deleted_nodes.contains_key(&entry.neighbor_id) {
-                            continue;
-                        }
-                        if entry.neighbor_id == node_id {
-                            self_loop_edge_ids.insert(entry.edge_id);
-                        }
-                        if callback(
-                            entry.edge_id,
-                            entry.neighbor_id,
-                            entry.weight,
-                            entry.valid_from,
-                            entry.valid_to,
-                        )
-                        .is_break()
-                        {
-                            return ControlFlow::Break(());
-                        }
-                    }
-                }
-                if let Some(map) = self.adj_in.get(&node_id) {
-                    for entry in map.values() {
-                        if let Some(types) = type_filter {
-                            if !types.contains(&entry.type_id) {
-                                continue;
-                            }
-                        }
-                        if self.deleted_nodes.contains_key(&entry.neighbor_id) {
-                            continue;
-                        }
-                        if entry.neighbor_id == node_id
-                            && self_loop_edge_ids.contains(&entry.edge_id)
-                        {
-                            continue;
-                        }
-                        if callback(
-                            entry.edge_id,
-                            entry.neighbor_id,
-                            entry.weight,
-                            entry.valid_from,
-                            entry.valid_to,
-                        )
-                        .is_break()
-                        {
-                            return ControlFlow::Break(());
-                        }
-                    }
-                }
-            }
-        }
-
-        ControlFlow::Continue(())
+        self.for_each_adj_entry_at(node_id, direction, type_filter, u64::MAX, callback)
     }
 
-    /// Return edge IDs incident to a node (outgoing + incoming).
-    /// Used by the engine for cascade-delete.
     pub fn incident_edge_ids(&self, node_id: u64) -> Vec<u64> {
+        let state = self.state.read().unwrap();
         let mut ids = Vec::new();
-        if let Some(map) = self.adj_out.get(&node_id) {
-            ids.extend(map.keys());
+        if let Some(map) = state.adj_out.get(&node_id) {
+            for (&edge_id, slot) in map {
+                if slot_option_current(slot).is_some() {
+                    ids.push(edge_id);
+                }
+            }
         }
-        if let Some(map) = self.adj_in.get(&node_id) {
-            ids.extend(map.keys());
+        if let Some(map) = state.adj_in.get(&node_id) {
+            for (&edge_id, slot) in map {
+                if slot_option_current(slot).is_some() {
+                    ids.push(edge_id);
+                }
+            }
         }
         ids.sort_unstable();
         ids.dedup();
         ids
     }
 
-    /// Count of live nodes (excluding tombstoned).
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        let state = self.state.read().unwrap();
+        state
+            .nodes
+            .values()
+            .filter(|slot| record_current(slot).is_some())
+            .count()
     }
 
-    /// Count of live edges (excluding tombstoned).
     pub fn edge_count(&self) -> usize {
-        self.edges.len()
+        let state = self.state.read().unwrap();
+        state
+            .edges
+            .values()
+            .filter(|slot| record_current(slot).is_some())
+            .count()
     }
 
-    // --- Segment flush accessors ---
-
-    /// Return a reference to all live node records.
-    pub fn nodes(&self) -> &NodeIdMap<NodeRecord> {
-        &self.nodes
+    pub fn nodes(&self) -> NodeIdMap<NodeRecord> {
+        let state = self.state.read().unwrap();
+        state
+            .nodes
+            .iter()
+            .filter_map(|(&id, slot)| record_current(slot).map(|node| (id, node.clone())))
+            .collect()
     }
 
-    /// Return a reference to all live edge records.
-    pub fn edges(&self) -> &NodeIdMap<EdgeRecord> {
-        &self.edges
+    pub fn edges(&self) -> NodeIdMap<EdgeRecord> {
+        let state = self.state.read().unwrap();
+        state
+            .edges
+            .iter()
+            .filter_map(|(&id, slot)| record_current(slot).map(|edge| (id, edge.clone())))
+            .collect()
     }
 
-    /// Return a reference to the deleted node tombstone entries.
-    pub fn deleted_nodes(&self) -> &NodeIdMap<TombstoneEntry> {
-        &self.deleted_nodes
+    pub fn deleted_nodes(&self) -> NodeIdMap<TombstoneEntry> {
+        let state = self.state.read().unwrap();
+        state
+            .node_tombstones
+            .iter()
+            .filter_map(|(&id, _)| state.node_tombstone_current(id).map(|entry| (id, entry)))
+            .collect()
     }
 
-    /// Return a reference to the deleted edge tombstone entries.
-    pub fn deleted_edges(&self) -> &NodeIdMap<TombstoneEntry> {
-        &self.deleted_edges
+    pub fn deleted_edges(&self) -> NodeIdMap<TombstoneEntry> {
+        let state = self.state.read().unwrap();
+        state
+            .edge_tombstones
+            .iter()
+            .filter_map(|(&id, _)| state.edge_tombstone_current(id).map(|entry| (id, entry)))
+            .collect()
     }
 
-    /// Return a reference to the outgoing adjacency map.
-    pub fn adj_out(&self) -> &NodeIdMap<NodeIdMap<AdjEntry>> {
-        &self.adj_out
+    pub fn adj_out(&self) -> NodeIdMap<NodeIdMap<AdjEntry>> {
+        let state = self.state.read().unwrap();
+        current_adj_map(&state.adj_out)
     }
 
-    /// Return a reference to the incoming adjacency map.
-    pub fn adj_in(&self) -> &NodeIdMap<NodeIdMap<AdjEntry>> {
-        &self.adj_in
+    pub fn adj_in(&self) -> NodeIdMap<NodeIdMap<AdjEntry>> {
+        let state = self.state.read().unwrap();
+        current_adj_map(&state.adj_in)
     }
 
-    /// Return live node IDs for a given type_id.
     pub fn nodes_by_type(&self, type_id: u32) -> Vec<u64> {
-        self.type_node_index
-            .get(&type_id)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default()
+        self.visible_nodes_by_type(type_id, u64::MAX)
     }
 
-    /// Return live edge IDs for a given type_id.
     pub fn edges_by_type(&self, type_id: u32) -> Vec<u64> {
-        self.type_edge_index
-            .get(&type_id)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default()
+        self.visible_edges_by_type(type_id, u64::MAX)
     }
 
-    /// Return a reference to the node type index.
-    pub fn type_node_index(&self) -> &HashMap<u32, NodeIdSet> {
-        &self.type_node_index
+    pub fn type_node_index(&self) -> HashMap<u32, NodeIdSet> {
+        let state = self.state.read().unwrap();
+        current_type_index(&state.type_node_index)
     }
 
-    /// Return a reference to the edge type index.
-    pub fn type_edge_index(&self) -> &HashMap<u32, NodeIdSet> {
-        &self.type_edge_index
+    pub fn type_edge_index(&self) -> HashMap<u32, NodeIdSet> {
+        let state = self.state.read().unwrap();
+        current_type_index(&state.type_edge_index)
     }
 
-    pub fn secondary_index_declarations(&self) -> &HashMap<u64, SecondaryIndexManifestEntry> {
-        &self.secondary_index_declarations
+    pub fn secondary_index_declarations(&self) -> HashMap<u64, SecondaryIndexManifestEntry> {
+        let state = self.state.read().unwrap();
+        state.secondary_index_declarations.clone()
     }
 
-    pub fn secondary_eq_state(&self) -> &HashMap<u64, HashMap<u64, NodeIdSet>> {
-        &self.secondary_eq_state
+    pub fn secondary_eq_state(&self) -> HashMap<u64, HashMap<u64, NodeIdSet>> {
+        let state = self.state.read().unwrap();
+        current_secondary_eq_state(&state.secondary_eq_state)
     }
 
-    pub fn secondary_range_state(&self) -> &HashMap<u64, BTreeSet<(u64, u64)>> {
-        &self.secondary_range_state
+    pub fn secondary_range_state(&self) -> HashMap<u64, BTreeSet<(u64, u64)>> {
+        let state = self.state.read().unwrap();
+        current_secondary_range_state(&state.secondary_range_state)
     }
 
-    /// Return a reference to the timestamp node index (for segment writer).
-    pub fn time_node_index(&self) -> &BTreeSet<(u32, i64, u64)> {
-        &self.time_node_index
+    pub fn time_node_index(&self) -> BTreeSet<(u32, i64, u64)> {
+        let state = self.state.read().unwrap();
+        current_time_index(&state.time_node_index)
     }
 
-    /// Return node IDs matching a time range for a given type_id.
-    /// Results are sorted by node_id (for K-way merge compatibility).
     pub fn nodes_by_time_range(&self, type_id: u32, from_ms: i64, to_ms: i64) -> Vec<u64> {
-        if from_ms > to_ms {
-            return Vec::new();
-        }
-        use std::ops::Bound;
-        let start = (type_id, from_ms, 0u64);
-        let end = (type_id, to_ms, u64::MAX);
-        let mut ids: Vec<u64> = self
-            .time_node_index
-            .range((Bound::Included(start), Bound::Included(end)))
-            .map(|&(_, _, node_id)| node_id)
-            .collect();
-        ids.sort_unstable();
-        ids
+        self.visible_nodes_by_time_range(type_id, from_ms, to_ms, u64::MAX)
     }
 
-    /// Find node IDs matching (type_id, prop_key, prop_value).
-    /// Scans the memtable's type-scoped live nodes.
     pub fn find_nodes(&self, type_id: u32, prop_key: &str, prop_value: &PropValue) -> Vec<u64> {
-        self.type_node_index
-            .get(&type_id)
+        self.visible_nodes_by_type(type_id, u64::MAX)
             .into_iter()
-            .flat_map(|ids| ids.iter())
-            .copied()
             .filter(|id| {
-                self.nodes
-                    .get(id)
-                    .and_then(|n| n.props.get(prop_key))
-                    .is_some_and(|value| value == prop_value)
+                self.get_node(*id)
+                    .and_then(|node| node.props.get(prop_key).cloned())
+                    .is_some_and(|value| value == *prop_value)
             })
             .collect()
     }
 
-    /// Find node IDs matching a declaration-scoped equality index.
-    /// Uses the declaration's hash bucket, then post-filters actual values to
-    /// suppress collisions.
     pub fn find_secondary_eq_nodes(
         &self,
         index_id: u64,
         prop_key: &str,
         prop_value: &PropValue,
     ) -> Vec<u64> {
-        let value_hash = hash_prop_value(prop_value);
-        let mut ids: Vec<u64> = self
-            .secondary_eq_state
-            .get(&index_id)
-            .and_then(|groups| groups.get(&value_hash))
-            .into_iter()
-            .flat_map(|ids| ids.iter())
-            .copied()
-            .filter(|id| {
-                self.nodes
-                    .get(id)
-                    .and_then(|node| node.props.get(prop_key))
-                    .is_some_and(|value| value == prop_value)
-            })
-            .collect();
-        ids.sort_unstable();
-        ids
+        self.find_secondary_eq_nodes_at(index_id, prop_key, prop_value, u64::MAX)
     }
 
-    /// Rough estimate of memtable memory usage in bytes.
-    /// Used to trigger flush when the memtable grows too large.
+    fn estimate_node_record(node: &NodeRecord) -> usize {
+        let dense_bytes = node
+            .dense_vector
+            .as_ref()
+            .map(|values| values.len() * std::mem::size_of::<f32>())
+            .unwrap_or(0);
+        let sparse_bytes = node
+            .sparse_vector
+            .as_ref()
+            .map(|values| values.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<f32>()))
+            .unwrap_or(0);
+        120 + node.key.len() + node.props.len() * 80 + dense_bytes + sparse_bytes
+    }
+
+    fn estimate_edge_record(edge: &EdgeRecord) -> usize {
+        100 + edge.props.len() * 80
+    }
+
+    fn estimate_slot<T>(slot: &VersionedSlot<T>, value_size: impl Fn(&T) -> usize) -> usize {
+        let history_size = slot
+            .history
+            .as_ref()
+            .map(|history| {
+                history
+                    .iter()
+                    .map(|version| 8 + value_size(&version.value))
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        8 + value_size(&slot.head.value) + history_size
+    }
+
     pub fn estimated_size(&self) -> usize {
-        // Per node: ~120 bytes base + key + props overhead
-        let node_size: usize = self
-            .nodes
-            .values()
-            .map(|n| {
-                let dense_bytes = n
-                    .dense_vector
-                    .as_ref()
-                    .map(|values| values.len() * std::mem::size_of::<f32>())
-                    .unwrap_or(0);
-                let sparse_bytes = n
-                    .sparse_vector
-                    .as_ref()
-                    .map(|values| {
-                        values.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<f32>())
-                    })
-                    .unwrap_or(0);
-                120 + n.key.len() + n.props.len() * 80 + dense_bytes + sparse_bytes
-            })
-            .sum();
-        // Per edge: ~100 bytes base + props overhead
-        let edge_size: usize = self.edges.values().map(|e| 100 + e.props.len() * 80).sum();
-        // Tombstones: ~16 bytes each
-        let tombstone_size = (self.deleted_nodes.len() + self.deleted_edges.len()) * 16;
-        // Adjacency: ~48 bytes per entry (AdjEntry + HashMap overhead)
-        let adj_size: usize = self.adj_out.values().map(|m| m.len() * 48).sum::<usize>()
-            + self.adj_in.values().map(|m| m.len() * 48).sum::<usize>();
-        // Type indexes: ~16 bytes per entry (u64 + hash overhead)
-        let type_idx_size: usize = self
-            .type_node_index
-            .values()
-            .map(|s| s.len() * 16)
-            .sum::<usize>()
-            + self
-                .type_edge_index
-                .values()
-                .map(|s| s.len() * 16)
-                .sum::<usize>();
-        // Time index: ~48 bytes per entry (tuple + BTree node overhead)
-        let time_idx_size = self.time_node_index.len() * 48;
-
-        // Secondary index declarations + state: rough bookkeeping only.
-        let secondary_decl_size: usize = self
-            .secondary_index_declarations
-            .values()
-            .map(|entry| {
-                let prop_key_len = match &entry.target {
-                    SecondaryIndexTarget::NodeProperty { prop_key, .. } => prop_key.len(),
-                };
-                96 + prop_key_len + entry.last_error.as_ref().map(|msg| msg.len()).unwrap_or(0)
-            })
-            .sum();
-        let secondary_eq_lookup_size: usize = self
-            .secondary_eq_by_prop
-            .values()
-            .map(|by_prop| {
-                32 + by_prop
-                    .iter()
-                    .map(|(prop_key, index_ids)| 48 + prop_key.len() + index_ids.len() * 8)
-                    .sum::<usize>()
-            })
-            .sum();
-        let secondary_range_lookup_size: usize = self
-            .secondary_range_by_prop
-            .values()
-            .map(|by_prop| {
-                32 + by_prop
-                    .iter()
-                    .map(|(prop_key, indexes)| 48 + prop_key.len() + indexes.len() * 16)
-                    .sum::<usize>()
-            })
-            .sum();
-        let secondary_eq_state_size: usize = self
-            .secondary_eq_state
-            .values()
-            .map(|groups| {
-                32 + groups
-                    .values()
-                    .map(|ids| 32 + ids.len() * 16)
-                    .sum::<usize>()
-            })
-            .sum();
-        let secondary_range_state_size: usize = self
-            .secondary_range_state
-            .values()
-            .map(|entries| 32 + entries.len() * 16)
-            .sum();
-
-        node_size
-            + edge_size
-            + tombstone_size
-            + adj_size
-            + type_idx_size
-            + time_idx_size
-            + secondary_decl_size
-            + secondary_eq_lookup_size
-            + secondary_range_lookup_size
-            + secondary_eq_state_size
-            + secondary_range_state_size
+        let state = self.state.read().unwrap();
+        state.estimated_bytes
     }
 
-    /// Remove a node from the memtable and all associated indexes.
-    /// Used during compaction to strip auto-pruned nodes without generating tombstones.
-    /// Returns true if the memtable is empty (no live or deleted records).
+    #[cfg(test)]
+    fn estimated_size_full_for_test(&self) -> usize {
+        let state = self.state.read().unwrap();
+        state.recompute_estimated_size()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-            && self.edges.is_empty()
-            && self.deleted_nodes.is_empty()
-            && self.deleted_edges.is_empty()
+        let state = self.state.read().unwrap();
+        state.nodes.is_empty() && state.edges.is_empty()
     }
 
-    /// Maximum node ID across live and deleted records. Returns 0 if empty.
     pub fn max_node_id(&self) -> u64 {
-        let live_max = self.nodes.keys().max().copied().unwrap_or(0);
-        let deleted_max = self.deleted_nodes.keys().max().copied().unwrap_or(0);
-        live_max.max(deleted_max)
+        let state = self.state.read().unwrap();
+        state.nodes.keys().max().copied().unwrap_or(0)
     }
 
-    /// Maximum edge ID across live and deleted records. Returns 0 if empty.
     pub fn max_edge_id(&self) -> u64 {
-        let live_max = self.edges.keys().max().copied().unwrap_or(0);
-        let deleted_max = self.deleted_edges.keys().max().copied().unwrap_or(0);
-        live_max.max(deleted_max)
+        let state = self.state.read().unwrap();
+        state.edges.keys().max().copied().unwrap_or(0)
     }
 }
 
-// Test-only helpers for inspecting internal index state.
 #[cfg(test)]
 impl Memtable {
-    /// Number of distinct type keys in the node type index.
     fn type_node_index_key_count(&self) -> usize {
-        self.type_node_index.len()
+        self.type_node_index().len()
     }
-    /// Number of distinct type keys in the edge type index.
-    fn type_edge_index_key_count(&self) -> usize {
-        self.type_edge_index.len()
-    }
-    /// Number of distinct type keys in the node key index (outer map).
+
     fn node_key_index_key_count(&self) -> usize {
-        self.node_key_index.len()
+        let state = self.state.read().unwrap();
+        state
+            .node_key_index
+            .iter()
+            .filter(|(_, by_key)| {
+                by_key
+                    .values()
+                    .any(|slot| slot_option_current(slot).is_some())
+            })
+            .count()
     }
-    /// Number of node IDs with outgoing adjacency entries.
-    fn adj_out_key_count(&self) -> usize {
-        self.adj_out.len()
-    }
-    /// Number of node IDs with incoming adjacency entries.
-    fn adj_in_key_count(&self) -> usize {
-        self.adj_in.len()
-    }
-    /// Number of entries in the timestamp node index.
+
     fn time_node_index_len(&self) -> usize {
-        self.time_node_index.len()
+        self.time_node_index().len()
     }
 }
 
@@ -1207,6 +2263,13 @@ mod tests {
             dense_vector: None,
             sparse_vector: None,
             last_write_seq: 0,
+        }
+    }
+
+    fn make_node_at(id: u64, type_id: u32, key: &str, updated_at: i64) -> NodeRecord {
+        NodeRecord {
+            updated_at,
+            ..make_node(id, type_id, key)
         }
     }
 
@@ -1233,996 +2296,379 @@ mod tests {
         props: BTreeMap<String, PropValue>,
     ) -> NodeRecord {
         NodeRecord {
-            id,
-            type_id,
-            key: key.to_string(),
             props,
-            created_at: 1000,
-            updated_at: 1001,
-            weight: 0.5,
-            dense_vector: None,
-            sparse_vector: None,
-            last_write_seq: 0,
+            ..make_node(id, type_id, key)
         }
     }
 
     #[test]
-    fn test_basic_insert_and_get() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
+    fn current_head_compatibility_still_works() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 2);
 
-        assert_eq!(mt.node_count(), 1);
-        assert_eq!(mt.edge_count(), 1);
         assert_eq!(mt.get_node(1).unwrap().key, "alice");
         assert_eq!(mt.get_edge(1).unwrap().from, 1);
-    }
-
-    #[test]
-    fn test_node_key_index() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
-
         assert_eq!(mt.node_by_key(1, "alice").unwrap().id, 1);
-        assert_eq!(mt.node_by_key(1, "bob").unwrap().id, 2);
-        assert!(mt.node_by_key(1, "charlie").is_none());
-        assert!(mt.node_by_key(2, "alice").is_none()); // different type_id
-    }
-
-    #[test]
-    fn test_edge_triple_index() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 2, 20)), 0); // different type
-
         assert_eq!(mt.edge_by_triple(1, 2, 10).unwrap().id, 1);
-        assert_eq!(mt.edge_by_triple(1, 2, 20).unwrap().id, 2);
-        assert!(mt.edge_by_triple(1, 2, 30).is_none());
     }
 
     #[test]
-    fn test_upsert_overwrites_key_index() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
+    fn snapshot_reads_keep_old_node_versions() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 10);
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice_v2")), 20);
 
-        // Same (type_id, key) with same ID, update
-        let mut updated = make_node(1, 1, "alice");
-        updated.weight = 0.99;
-        mt.apply_op(&WalOp::UpsertNode(updated), 0);
-
-        assert_eq!(mt.node_count(), 1);
-        assert!((mt.get_node(1).unwrap().weight - 0.99).abs() < f32::EPSILON);
-        assert_eq!(mt.node_by_key(1, "alice").unwrap().id, 1);
-    }
-
-    #[test]
-    fn test_delete_removes_from_indexes() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        mt.apply_op(
-            &WalOp::DeleteEdge {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-
-        assert!(mt.get_node(1).is_none());
-        assert!(mt.get_edge(1).is_none());
-        assert!(mt.node_by_key(1, "alice").is_none());
-        assert!(mt.edge_by_triple(1, 2, 10).is_none());
-        assert_eq!(mt.node_count(), 0);
-        assert_eq!(mt.edge_count(), 0);
-    }
-
-    #[test]
-    fn test_max_ids() {
-        let mut mt = Memtable::new();
-        assert_eq!(mt.max_node_id(), 0);
-        assert_eq!(mt.max_edge_id(), 0);
-
-        mt.apply_op(&WalOp::UpsertNode(make_node(42, 1, "high")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(99, 1, 2, 10)), 0);
-
-        assert_eq!(mt.max_node_id(), 42);
-        assert_eq!(mt.max_edge_id(), 99);
-
-        // Delete: max should still reflect deleted IDs
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 42,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.max_node_id(), 42); // still 42 from deleted_nodes
-    }
-
-    #[test]
-    fn test_re_upsert_after_delete() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert!(mt.get_node(1).is_none());
-
-        // Re-upsert with same ID
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice_v2")), 0);
+        assert_eq!(mt.get_node_at(1, 10).unwrap().key, "alice");
+        assert_eq!(mt.get_node_at(1, 19).unwrap().key, "alice");
+        assert_eq!(mt.get_node_at(1, 20).unwrap().key, "alice_v2");
         assert_eq!(mt.get_node(1).unwrap().key, "alice_v2");
-        assert_eq!(mt.node_by_key(1, "alice_v2").unwrap().id, 1);
-    }
-
-    // --- Adjacency and neighbor tests ---
-
-    #[test]
-    fn test_adjacency_built_on_edge_insert() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-
-        // Node 1 has outgoing to node 2
-        let out = mt.neighbors(1, Direction::Outgoing, None, 0);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].node_id, 2);
-        assert_eq!(out[0].edge_id, 1);
-        assert_eq!(out[0].edge_type_id, 10);
-
-        // Node 2 has incoming from node 1
-        let inc = mt.neighbors(2, Direction::Incoming, None, 0);
-        assert_eq!(inc.len(), 1);
-        assert_eq!(inc[0].node_id, 1);
-
-        // Node 1 has no incoming
-        assert!(mt.neighbors(1, Direction::Incoming, None, 0).is_empty());
-        // Node 2 has no outgoing
-        assert!(mt.neighbors(2, Direction::Outgoing, None, 0).is_empty());
     }
 
     #[test]
-    fn test_for_each_adj_entry_breaks_early() {
-        let mut mt = Memtable::new();
-        for id in 1..=4 {
-            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))), 0);
-        }
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 4, 10)), 0);
-
-        let mut seen = 0usize;
-        let flow = mt.for_each_adj_entry(
-            1,
-            Direction::Outgoing,
-            None,
-            &mut |_edge_id, _neighbor_id, _weight, _valid_from, _valid_to| {
-                seen += 1;
-                ControlFlow::Break(())
-            },
-        );
-
-        assert!(matches!(flow, ControlFlow::Break(())));
-        assert_eq!(seen, 1);
-    }
-
-    #[test]
-    fn test_neighbors_with_type_filter() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0); // type 10
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 20)), 0); // type 20
-
-        // No filter → both
-        let all = mt.neighbors(1, Direction::Outgoing, None, 0);
-        assert_eq!(all.len(), 2);
-
-        // Filter type 10 only
-        let typed = mt.neighbors(1, Direction::Outgoing, Some(&[10]), 0);
-        assert_eq!(typed.len(), 1);
-        assert_eq!(typed[0].node_id, 2);
-
-        // Filter type 20 only
-        let typed = mt.neighbors(1, Direction::Outgoing, Some(&[20]), 0);
-        assert_eq!(typed.len(), 1);
-        assert_eq!(typed[0].node_id, 3);
-
-        // Filter non-existent type
-        let typed = mt.neighbors(1, Direction::Outgoing, Some(&[99]), 0);
-        assert!(typed.is_empty());
-    }
-
-    #[test]
-    fn test_neighbors_with_limit() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "hub")), 0);
-        for i in 2..=6 {
-            mt.apply_op(&WalOp::UpsertNode(make_node(i, 1, &format!("n{}", i))), 0);
-            mt.apply_op(&WalOp::UpsertEdge(make_edge(i - 1, 1, i, 10)), 0);
-        }
-
-        // 5 outgoing edges, limit to 3
-        let limited = mt.neighbors(1, Direction::Outgoing, None, 3);
-        assert_eq!(limited.len(), 3);
-
-        // Limit 0 means no limit
-        let all = mt.neighbors(1, Direction::Outgoing, None, 0);
-        assert_eq!(all.len(), 5);
-    }
-
-    #[test]
-    fn test_neighbors_both_direction() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0); // 1→2
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 3, 1, 10)), 0); // 3→1
-
-        // Node 1: outgoing to 2, incoming from 3
-        let both = mt.neighbors(1, Direction::Both, None, 0);
-        assert_eq!(both.len(), 2);
-        let neighbor_ids: Vec<u64> = both.iter().map(|e| e.node_id).collect();
-        assert!(neighbor_ids.contains(&2));
-        assert!(neighbor_ids.contains(&3));
-    }
-
-    #[test]
-    fn test_neighbors_both_with_limit_preserves_self_loop_budget_semantics() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
-
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 1, 10)), 0); // self-loop
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 2, 1, 10)), 0); // incoming unique
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 3, 1, 10)), 0); // incoming unique
-
-        let both = mt.neighbors(1, Direction::Both, None, 2);
-        assert_eq!(both.len(), 1);
-        assert_eq!(both[0].edge_id, 1);
-    }
-
-    #[test]
-    fn test_delete_edge_removes_from_adjacency() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-
-        assert_eq!(mt.neighbors(1, Direction::Outgoing, None, 0).len(), 1);
-
-        mt.apply_op(
-            &WalOp::DeleteEdge {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-
-        assert!(mt.neighbors(1, Direction::Outgoing, None, 0).is_empty());
-        assert!(mt.neighbors(2, Direction::Incoming, None, 0).is_empty());
-    }
-
-    #[test]
-    fn test_deleted_node_excluded_from_neighbors() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 3, 10)), 0);
-
-        assert_eq!(mt.neighbors(1, Direction::Outgoing, None, 0).len(), 2);
-
-        // Delete node 2. Edge still exists but node 2 should be excluded
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 2,
-                deleted_at: 9999,
-            },
-            0,
-        );
-
-        let out = mt.neighbors(1, Direction::Outgoing, None, 0);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].node_id, 3);
-    }
-
-    #[test]
-    fn test_adjacency_idempotent_on_edge_upsert() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 0);
-
-        // Upsert same edge twice (simulates WAL replay)
-        let mut edge = make_edge(1, 1, 2, 10);
-        mt.apply_op(&WalOp::UpsertEdge(edge.clone()), 0);
-        edge.weight = 0.9;
-        mt.apply_op(&WalOp::UpsertEdge(edge), 0);
-
-        // Should have exactly 1 adjacency entry, not 2
-        let out = mt.neighbors(1, Direction::Outgoing, None, 0);
-        assert_eq!(out.len(), 1);
-        assert!((out[0].weight - 0.9).abs() < f32::EPSILON); // weight updated
-    }
-
-    // --- Type index tests ---
-
-    #[test]
-    fn test_type_node_index_basic() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(3, 2, "charlie")), 0);
-
-        let mut type1: Vec<u64> = mt.nodes_by_type(1);
-        type1.sort();
-        assert_eq!(type1, vec![1, 2]);
-        assert_eq!(mt.nodes_by_type(2), vec![3]);
-        assert!(mt.nodes_by_type(99).is_empty());
-    }
-
-    #[test]
-    fn test_type_edge_index_basic() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 2, 3, 20)), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 3, 4, 10)), 0);
-
-        let mut type10: Vec<u64> = mt.edges_by_type(10);
-        type10.sort();
-        assert_eq!(type10, vec![1, 3]);
-        assert_eq!(mt.edges_by_type(20), vec![2]);
-        assert!(mt.edges_by_type(99).is_empty());
-    }
-
-    #[test]
-    fn test_type_index_updated_on_delete() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-
+    fn delete_preserves_older_visible_version() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 5);
         mt.apply_op(
             &WalOp::DeleteNode {
                 id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.nodes_by_type(1), vec![2]);
-
-        mt.apply_op(
-            &WalOp::DeleteEdge {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert!(mt.edges_by_type(10).is_empty());
-    }
-
-    #[test]
-    fn test_empty_index_sets_pruned_after_deletes() {
-        let mut mt = Memtable::new();
-        // Two nodes of different types, one edge
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bob")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-
-        assert_eq!(mt.type_node_index_key_count(), 2); // type 1 + type 2
-        assert_eq!(mt.type_edge_index_key_count(), 1); // type 10
-
-        // Delete all members of type 1. Internal map entry should be pruned
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.type_node_index_key_count(), 1); // only type 2 remains
-
-        // Delete the edge. Edge type map entry should be pruned
-        mt.apply_op(
-            &WalOp::DeleteEdge {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.type_edge_index_key_count(), 0);
-
-        // Delete remaining node
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 2,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.type_node_index_key_count(), 0);
-    }
-
-    #[test]
-    fn test_edge_type_index_pruned_on_type_change() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-
-        assert_eq!(mt.type_edge_index_key_count(), 1); // type 10
-
-        // Re-upsert edge with different type. Old type entry should be pruned
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 20)), 0);
-        assert_eq!(mt.type_edge_index_key_count(), 1); // only type 20, not both
-        assert!(mt.edges_by_type(10).is_empty());
-        assert_eq!(mt.edges_by_type(20), vec![1]);
-    }
-
-    #[test]
-    fn test_node_key_index_pruned_after_delete() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bob")), 0);
-
-        assert_eq!(mt.node_key_index_key_count(), 2); // type 1 + type 2
-
-        // Delete only member of type 1. Inner map should be pruned
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.node_key_index_key_count(), 1); // only type 2
-
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 2,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.node_key_index_key_count(), 0);
-    }
-
-    #[test]
-    fn test_adjacency_lists_pruned_after_edge_delete() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-
-        assert_eq!(mt.adj_out_key_count(), 1); // node 1 has outgoing
-        assert_eq!(mt.adj_in_key_count(), 1); // node 2 has incoming
-
-        // Delete the edge. Adjacency entries should be pruned
-        mt.apply_op(
-            &WalOp::DeleteEdge {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.adj_out_key_count(), 0);
-        assert_eq!(mt.adj_in_key_count(), 0);
-    }
-
-    #[test]
-    fn test_type_index_re_upsert_after_delete() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert!(mt.nodes_by_type(1).is_empty());
-
-        // Re-upsert, should reappear in type index
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice_v2")), 0);
-        assert_eq!(mt.nodes_by_type(1), vec![1]);
-    }
-
-    // --- Property index tests ---
-
-    #[test]
-    fn test_prop_index_basic_lookup() {
-        let mut mt = Memtable::new();
-        let mut props = BTreeMap::new();
-        props.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "apple", props.clone())),
-            0,
-        );
-
-        let mut props2 = BTreeMap::new();
-        props2.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(2, 1, "cherry", props2)),
-            0,
-        );
-
-        let mut props3 = BTreeMap::new();
-        props3.insert("color".to_string(), PropValue::String("green".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(3, 1, "lime", props3)),
-            0,
-        );
-
-        // Find red nodes of type 1
-        let mut reds = mt.find_nodes(1, "color", &PropValue::String("red".to_string()));
-        reds.sort();
-        assert_eq!(reds, vec![1, 2]);
-
-        // Find green nodes of type 1
-        let greens = mt.find_nodes(1, "color", &PropValue::String("green".to_string()));
-        assert_eq!(greens, vec![3]);
-
-        // Non-existent value
-        assert!(mt
-            .find_nodes(1, "color", &PropValue::String("blue".to_string()))
-            .is_empty());
-
-        // Non-existent key
-        assert!(mt
-            .find_nodes(1, "shape", &PropValue::String("round".to_string()))
-            .is_empty());
-
-        // Wrong type_id
-        assert!(mt
-            .find_nodes(2, "color", &PropValue::String("red".to_string()))
-            .is_empty());
-    }
-
-    #[test]
-    fn test_prop_index_updated_on_upsert() {
-        let mut mt = Memtable::new();
-        let mut props = BTreeMap::new();
-        props.insert(
-            "status".to_string(),
-            PropValue::String("active".to_string()),
-        );
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "item", props)),
-            0,
-        );
-
-        assert_eq!(
-            mt.find_nodes(1, "status", &PropValue::String("active".to_string()))
-                .len(),
-            1
-        );
-
-        // Update: change status to "inactive"
-        let mut props2 = BTreeMap::new();
-        props2.insert(
-            "status".to_string(),
-            PropValue::String("inactive".to_string()),
-        );
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "item", props2)),
-            0,
-        );
-
-        // Old value gone, new value present
-        assert!(mt
-            .find_nodes(1, "status", &PropValue::String("active".to_string()))
-            .is_empty());
-        assert_eq!(
-            mt.find_nodes(1, "status", &PropValue::String("inactive".to_string())),
-            vec![1]
-        );
-    }
-
-    #[test]
-    fn test_prop_index_cleaned_on_delete() {
-        let mut mt = Memtable::new();
-        let mut props = BTreeMap::new();
-        props.insert("color".to_string(), PropValue::String("red".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "apple", props)),
-            0,
-        );
-
-        assert_eq!(
-            mt.find_nodes(1, "color", &PropValue::String("red".to_string()))
-                .len(),
-            1
-        );
-
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-
-        assert!(mt
-            .find_nodes(1, "color", &PropValue::String("red".to_string()))
-            .is_empty());
-    }
-
-    #[test]
-    fn test_prop_index_multiple_props_per_node() {
-        let mut mt = Memtable::new();
-        let mut props = BTreeMap::new();
-        props.insert("color".to_string(), PropValue::String("red".to_string()));
-        props.insert("size".to_string(), PropValue::Int(42));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "item", props)),
-            0,
-        );
-
-        assert_eq!(
-            mt.find_nodes(1, "color", &PropValue::String("red".to_string())),
-            vec![1]
-        );
-        assert_eq!(mt.find_nodes(1, "size", &PropValue::Int(42)), vec![1]);
-        assert!(mt.find_nodes(1, "size", &PropValue::Int(99)).is_empty());
-    }
-
-    #[test]
-    fn test_prop_index_re_upsert_after_delete() {
-        let mut mt = Memtable::new();
-        let mut props = BTreeMap::new();
-        props.insert("tag".to_string(), PropValue::String("a".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "item", props)),
-            0,
-        );
-
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert!(mt
-            .find_nodes(1, "tag", &PropValue::String("a".to_string()))
-            .is_empty());
-
-        // Re-upsert with different value
-        let mut props2 = BTreeMap::new();
-        props2.insert("tag".to_string(), PropValue::String("b".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "item_v2", props2)),
-            0,
-        );
-
-        assert!(mt
-            .find_nodes(1, "tag", &PropValue::String("a".to_string()))
-            .is_empty());
-        assert_eq!(
-            mt.find_nodes(1, "tag", &PropValue::String("b".to_string())),
-            vec![1]
-        );
-    }
-
-    #[test]
-    fn test_estimated_size_includes_type_indexes() {
-        let mut mt = Memtable::new();
-        let size_empty = mt.estimated_size();
-
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bob")), 0);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 0);
-
-        let size_with_data = mt.estimated_size();
-        assert!(size_with_data > size_empty);
-
-        // The type index contributes: 2 node types × 1 entry × 16 + 1 edge type × 1 entry × 16 = 48
-        // Verify type index adds non-trivial overhead by checking it's larger
-        // than just nodes + edges + adjacency alone would suggest
-        assert!(
-            size_with_data >= 48,
-            "estimated_size should include type index overhead"
-        );
-    }
-
-    #[test]
-    fn test_estimated_size_includes_vector_bytes() {
-        let mut mt = Memtable::new();
-        let base = mt.estimated_size();
-
-        let mut node = make_node(1, 1, "vector-node");
-        node.dense_vector = Some(vec![0.1, 0.2, 0.3, 0.4]);
-        node.sparse_vector = Some(vec![(1, 1.0), (9, 2.0)]);
-        mt.apply_op(&WalOp::UpsertNode(node), 0);
-
-        let sized = mt.estimated_size();
-        let expected_vector_bytes = 4 * std::mem::size_of::<f32>()
-            + 2 * (std::mem::size_of::<u32>() + std::mem::size_of::<f32>());
-        assert!(
-            sized >= base + expected_vector_bytes,
-            "estimated_size should account for dense and sparse vector payload bytes"
-        );
-    }
-
-    fn make_node_at(id: u64, type_id: u32, key: &str, updated_at: i64) -> NodeRecord {
-        NodeRecord {
-            id,
-            type_id,
-            key: key.to_string(),
-            props: BTreeMap::new(),
-            created_at: 1000,
-            updated_at,
-            weight: 0.5,
-            dense_vector: None,
-            sparse_vector: None,
-            last_write_seq: 0,
-        }
-    }
-
-    #[test]
-    fn test_time_index_insert_and_query() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(2, 1, "b", 200)), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(3, 2, "c", 150)), 0);
-
-        assert_eq!(mt.time_node_index_len(), 3);
-
-        // All type-1 nodes in full range
-        let ids = mt.nodes_by_time_range(1, 0, 300);
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&2));
-
-        // Only type-2
-        let ids2 = mt.nodes_by_time_range(2, 0, 300);
-        assert_eq!(ids2.len(), 1);
-        assert!(ids2.contains(&3));
-    }
-
-    #[test]
-    fn test_time_index_range_boundaries() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(2, 1, "b", 200)), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(3, 1, "c", 300)), 0);
-
-        // Inclusive boundaries
-        assert_eq!(mt.nodes_by_time_range(1, 100, 300).len(), 3);
-        assert_eq!(mt.nodes_by_time_range(1, 100, 200).len(), 2);
-        assert_eq!(mt.nodes_by_time_range(1, 200, 200).len(), 1);
-
-        // Empty range
-        assert_eq!(mt.nodes_by_time_range(1, 250, 250).len(), 0);
-
-        // Inverted range returns empty
-        assert_eq!(mt.nodes_by_time_range(1, 300, 100).len(), 0);
-    }
-
-    #[test]
-    fn test_time_index_update_moves_entry() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)), 0);
-        assert_eq!(mt.nodes_by_time_range(1, 50, 150).len(), 1);
-        assert_eq!(mt.nodes_by_time_range(1, 150, 300).len(), 0);
-
-        // Update node with new timestamp
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 200)), 0);
-        assert_eq!(mt.time_node_index_len(), 1); // no duplicate
-        assert_eq!(mt.nodes_by_time_range(1, 50, 150).len(), 0); // old range empty
-        assert_eq!(mt.nodes_by_time_range(1, 150, 300).len(), 1); // new range has it
-    }
-
-    #[test]
-    fn test_time_index_delete_removes_entry() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)), 0);
-        mt.apply_op(&WalOp::UpsertNode(make_node_at(2, 1, "b", 200)), 0);
-        assert_eq!(mt.time_node_index_len(), 2);
-
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
-            },
-            0,
-        );
-        assert_eq!(mt.time_node_index_len(), 1);
-        assert_eq!(mt.nodes_by_time_range(1, 0, 300).len(), 1);
-        assert!(mt.nodes_by_time_range(1, 0, 300).contains(&2));
-    }
-
-    // --- CP1: last_write_seq tests ---
-
-    #[test]
-    fn test_apply_op_stores_last_write_seq() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 10);
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 1)), 11);
-
-        assert_eq!(mt.get_node(1).unwrap().last_write_seq, 10);
-        assert_eq!(mt.get_edge(1).unwrap().last_write_seq, 11);
-    }
-
-    #[test]
-    fn test_tombstone_carries_seq() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 5);
-        mt.apply_op(
-            &WalOp::DeleteNode {
-                id: 1,
-                deleted_at: 9999,
+                deleted_at: 123,
             },
             6,
         );
 
-        let ts = mt.deleted_nodes().get(&1).unwrap();
-        assert_eq!(ts.deleted_at, 9999);
-        assert_eq!(ts.last_write_seq, 6);
+        assert!(mt.get_node(1).is_none());
+        assert_eq!(mt.get_node_at(1, 5).unwrap().key, "alice");
+        assert!(mt.get_node_at(1, 6).is_none());
+        assert!(mt.is_node_deleted_at(1, 6));
+        assert!(!mt.is_node_deleted_at(1, 5));
+        assert_eq!(mt.deleted_nodes().get(&1).unwrap().last_write_seq, 6);
+    }
 
-        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 1)), 7);
+    #[test]
+    fn deleted_node_membership_is_snapshot_correct_across_resurrection() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 20,
+            },
+            2,
+        );
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice_v2")), 3);
+
+        assert!(mt.collect_deleted_nodes_at(1).is_empty());
+        assert_eq!(mt.collect_deleted_nodes_at(2), NodeIdSet::from_iter([1]));
+        assert!(mt.collect_deleted_nodes_at(3).is_empty());
+        assert!(mt.deleted_nodes().is_empty());
+        assert!(!mt.is_node_deleted_at(3, 3));
+        assert_eq!(mt.get_node_at(1, 1).unwrap().key, "alice");
+        assert_eq!(mt.get_node_at(1, 3).unwrap().key, "alice_v2");
+    }
+
+    #[test]
+    fn deleted_edge_membership_is_snapshot_correct_across_resurrection() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(9, 1, 2, 7)), 1);
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 9,
+                deleted_at: 20,
+            },
+            2,
+        );
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(9, 1, 3, 7)), 3);
+
+        assert!(mt.collect_deleted_edges_at(1).is_empty());
+        assert_eq!(mt.collect_deleted_edges_at(2), NodeIdSet::from_iter([9]));
+        assert!(mt.collect_deleted_edges_at(3).is_empty());
+        assert!(mt.deleted_edges().is_empty());
+        assert!(!mt.is_edge_deleted_at(9, 3));
+        assert_eq!(mt.get_edge_at(9, 3).unwrap().to, 3);
+    }
+
+    #[test]
+    fn key_reuse_is_snapshot_correct() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 100,
+            },
+            2,
+        );
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "alice")), 3);
+
+        assert_eq!(mt.node_by_key_at(1, "alice", 1).unwrap().id, 1);
+        assert!(mt.node_by_key_at(1, "alice", 2).is_none());
+        assert_eq!(mt.node_by_key_at(1, "alice", 3).unwrap().id, 2);
+        assert_eq!(mt.node_by_key(1, "alice").unwrap().id, 2);
+    }
+
+    #[test]
+    fn adjacency_and_type_memberships_are_snapshot_aware() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 2);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 3);
         mt.apply_op(
             &WalOp::DeleteEdge {
                 id: 1,
-                deleted_at: 8888,
+                deleted_at: 200,
             },
-            8,
+            4,
         );
 
-        let ts = mt.deleted_edges().get(&1).unwrap();
-        assert_eq!(ts.deleted_at, 8888);
-        assert_eq!(ts.last_write_seq, 8);
+        assert_eq!(mt.visible_edges_by_type(10, 3), vec![1]);
+        assert!(mt.visible_edges_by_type(10, 4).is_empty());
+        let before_delete = mt.neighbors_at(1, Direction::Outgoing, None, 0, 3);
+        assert_eq!(before_delete.len(), 1);
+        assert_eq!(before_delete[0].node_id, 2);
+        assert!(mt
+            .neighbors_at(1, Direction::Outgoing, None, 0, 4)
+            .is_empty());
     }
 
     #[test]
-    fn test_upsert_updates_last_write_seq() {
-        let mut mt = Memtable::new();
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 10);
-        assert_eq!(mt.get_node(1).unwrap().last_write_seq, 10);
+    fn time_membership_history_is_snapshot_correct() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)), 1);
+        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 200)), 2);
 
-        // Second upsert of same node should update seq
-        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 20);
-        assert_eq!(mt.get_node(1).unwrap().last_write_seq, 20);
+        assert_eq!(mt.visible_nodes_by_time_range(1, 50, 150, 1), vec![1]);
+        assert!(mt.visible_nodes_by_time_range(1, 50, 150, 2).is_empty());
+        assert_eq!(mt.visible_nodes_by_time_range(1, 150, 250, 2), vec![1]);
     }
 
     #[test]
-    fn test_register_secondary_index_seeds_existing_nodes_and_skips_incompatible_range_values() {
-        let mut mt = Memtable::new();
-
-        let mut props1 = BTreeMap::new();
-        props1.insert(
-            "status".to_string(),
-            PropValue::String("active".to_string()),
-        );
-        props1.insert("age".to_string(), PropValue::Int(42));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props1)),
-            1,
-        );
-
-        let mut props2 = BTreeMap::new();
-        props2.insert(
-            "status".to_string(),
-            PropValue::String("active".to_string()),
-        );
-        props2.insert("age".to_string(), PropValue::String("old".to_string()));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(2, 1, "b", props2)),
-            2,
-        );
-
-        mt.register_secondary_index(&SecondaryIndexManifestEntry {
+    fn secondary_eq_membership_history_is_snapshot_correct() {
+        let mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("name".into(), PropValue::String("alice".into()));
+        let entry = SecondaryIndexManifestEntry {
             index_id: 10,
             target: SecondaryIndexTarget::NodeProperty {
                 type_id: 1,
-                prop_key: "status".to_string(),
+                prop_key: "name".into(),
             },
             kind: SecondaryIndexKind::Equality,
-            state: SecondaryIndexState::Building,
+            state: SecondaryIndexState::Ready,
             last_error: None,
-        });
-        mt.register_secondary_index(&SecondaryIndexManifestEntry {
-            index_id: 11,
-            target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
-                prop_key: "age".to_string(),
-            },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
-            state: SecondaryIndexState::Building,
-            last_error: None,
-        });
-
-        let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
-        let eq_group = mt.secondary_eq_state().get(&10).unwrap();
-        let eq_ids = eq_group.get(&status_hash).unwrap();
-        assert!(eq_ids.contains(&1));
-        assert!(eq_ids.contains(&2));
-
-        let range_entries = mt.secondary_range_state().get(&11).unwrap();
-        assert!(range_entries.contains(&(encode_signed_range_key(42), 1)));
-        assert_eq!(range_entries.len(), 1);
-    }
-
-    #[test]
-    fn test_secondary_index_state_updates_on_type_change_and_delete() {
-        let mut mt = Memtable::new();
-        mt.register_secondary_index(&SecondaryIndexManifestEntry {
-            index_id: 20,
-            target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
-                prop_key: "age".to_string(),
-            },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
-            state: SecondaryIndexState::Building,
-            last_error: None,
-        });
-
-        let mut props = BTreeMap::new();
-        props.insert("age".to_string(), PropValue::Int(10));
+        };
+        mt.register_secondary_index(&entry);
         mt.apply_op(
             &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props)),
             1,
         );
-        assert!(mt
-            .secondary_range_state()
-            .get(&20)
-            .unwrap()
-            .contains(&(encode_signed_range_key(10), 1)));
 
-        let mut props2 = BTreeMap::new();
-        props2.insert("age".to_string(), PropValue::Int(11));
+        let mut next_props = BTreeMap::new();
+        next_props.insert("name".into(), PropValue::String("bob".into()));
         mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 2, "a", props2)),
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", next_props)),
             2,
         );
-        assert!(mt
-            .secondary_range_state()
-            .get(&20)
-            .is_none_or(|entries| entries.is_empty()));
 
-        let mut props3 = BTreeMap::new();
-        props3.insert("age".to_string(), PropValue::Int(12));
-        mt.apply_op(
-            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props3)),
-            3,
+        assert_eq!(
+            mt.find_secondary_eq_nodes_at(10, "name", &PropValue::String("alice".into()), 1),
+            vec![1]
         );
         assert!(mt
-            .secondary_range_state()
-            .get(&20)
-            .unwrap()
-            .contains(&(encode_signed_range_key(12), 1)));
+            .find_secondary_eq_nodes_at(10, "name", &PropValue::String("alice".into()), 2)
+            .is_empty());
+        assert_eq!(
+            mt.find_secondary_eq_nodes_at(10, "name", &PropValue::String("bob".into()), 2),
+            vec![1]
+        );
+    }
 
+    #[test]
+    fn same_write_seq_replace_overwrites_head_in_place() {
+        let mut slot = VersionedSlot::new(1, 10u64);
+        slot.replace(2, 20);
+        slot.replace(2, 30);
+
+        assert_eq!(*slot.current(), 30);
+        assert_eq!(slot.at(1), Some(&10));
+        assert_eq!(slot.at(2), Some(&30));
+        assert_eq!(slot.history.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn unchanged_indexed_props_do_not_accumulate_secondary_history() {
+        let mt = Memtable::new();
+        let eq_entry = SecondaryIndexManifestEntry {
+            index_id: 10,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "name".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let range_entry = SecondaryIndexManifestEntry {
+            index_id: 11,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "age".into(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&range_entry);
+
+        let mut props = BTreeMap::new();
+        props.insert("name".into(), PropValue::String("alice".into()));
+        props.insert("age".into(), PropValue::Int(42));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props.clone())),
+            1,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props)),
+            2,
+        );
+
+        let state = mt.state.read().unwrap();
+        let eq_slot = state
+            .secondary_eq_state
+            .get(&10)
+            .and_then(|groups| groups.get(&hash_prop_value(&PropValue::String("alice".into()))))
+            .and_then(|members| members.get(&1))
+            .unwrap();
+        assert!(eq_slot.history.is_none());
+        assert_eq!(eq_slot.head.write_seq, 1);
+        assert_eq!(slot_option_current(eq_slot), Some(&()));
+
+        let encoded_age =
+            encode_range_prop_value(SecondaryIndexRangeDomain::Int, &PropValue::Int(42)).unwrap();
+        let range_slot = state
+            .secondary_range_state
+            .get(&11)
+            .and_then(|entries| entries.get(&(encoded_age, 1)))
+            .unwrap();
+        assert!(range_slot.history.is_none());
+        assert_eq!(range_slot.head.write_seq, 1);
+        assert_eq!(slot_option_current(range_slot), Some(&()));
+    }
+
+    #[test]
+    fn estimated_size_grows_with_history() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
+        let initial = mt.estimated_size();
+        assert_eq!(initial, mt.estimated_size_full_for_test());
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 2);
+        let after_overwrite = mt.estimated_size();
+        assert_eq!(after_overwrite, mt.estimated_size_full_for_test());
+
+        assert!(after_overwrite > initial);
+    }
+
+    #[test]
+    fn estimated_size_matches_full_recompute_after_mvcc_churn() {
+        let mt = Memtable::new();
+
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+
+        let mut props = BTreeMap::new();
+        props.insert("name".into(), PropValue::String("alice".into()));
+        props.insert("age".into(), PropValue::Int(42));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "alice", props)),
+            2,
+        );
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "bob")), 3);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 7)), 4);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 50,
+            },
+            5,
+        );
         mt.apply_op(
             &WalOp::DeleteNode {
                 id: 1,
-                deleted_at: 999,
+                deleted_at: 60,
             },
-            4,
+            6,
         );
-        assert!(mt
-            .secondary_range_state()
-            .get(&20)
-            .is_none_or(|entries| entries.is_empty()));
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+    }
+
+    #[test]
+    fn estimated_size_matches_full_recompute_after_secondary_index_registration() {
+        let mt = Memtable::new();
+
+        let mut props = BTreeMap::new();
+        props.insert("name".into(), PropValue::String("alice".into()));
+        props.insert("age".into(), PropValue::Int(42));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "alice", props)),
+            1,
+        );
+
+        let eq_entry = SecondaryIndexManifestEntry {
+            index_id: 10,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "name".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let range_entry = SecondaryIndexManifestEntry {
+            index_id: 11,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "age".into(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+
+        mt.register_secondary_index(&eq_entry);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+        mt.register_secondary_index(&range_entry);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+        mt.unregister_secondary_index(10);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+        mt.unregister_secondary_index(11);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+    }
+
+    #[test]
+    fn current_helpers_track_visible_key_counts() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 10,
+            },
+            2,
+        );
+
+        assert_eq!(mt.node_key_index_key_count(), 0);
+        assert_eq!(mt.type_node_index_key_count(), 0);
+        assert_eq!(mt.time_node_index_len(), 0);
+        assert!(mt.get_node(1).is_none());
+        assert_eq!(mt.max_node_id(), 1);
     }
 }

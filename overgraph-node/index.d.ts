@@ -88,6 +88,8 @@ export declare class OverGraph {
   deleteEdge(id: number): void
   invalidateEdge(id: number, validTo: number): JsEdgeRecord | null
   graphPatch(patch: JsGraphPatch): JsPatchResult
+  beginWriteTxn(): JsWriteTxn
+  beginWriteTxnAsync(): Promise<JsWriteTxn>
   prune(policy: JsPrunePolicy): JsPruneResult
   setPrunePolicy(name: string, policy: JsPrunePolicy): void
   removePrunePolicy(name: string): boolean
@@ -224,6 +226,38 @@ export declare class OverGraph {
    */
   compactWithProgressAsync(callback: (progress: JsCompactionProgress) => void): Promise<JsCompactionStats | null>
 }
+
+export declare class WriteTxn {
+  upsertNode(typeId: number, key: string, options?: JsUpsertNodeOptions | undefined | null): JsTxnNodeRef
+  upsertNodeAs(alias: string, typeId: number, key: string, options?: JsUpsertNodeOptions | undefined | null): JsTxnNodeRef
+  upsertEdge(from: JsTxnNodeRef, to: JsTxnNodeRef, typeId: number, options?: JsUpsertEdgeOptions | undefined | null): JsTxnEdgeRef
+  upsertEdgeAs(alias: string, from: JsTxnNodeRef, to: JsTxnNodeRef, typeId: number, options?: JsUpsertEdgeOptions | undefined | null): JsTxnEdgeRef
+  deleteNode(target: JsTxnNodeRef): void
+  deleteEdge(target: JsTxnEdgeRef): void
+  invalidateEdge(target: JsTxnEdgeRef, validTo: number): void
+  stage(operations: Array<JsTxnOperation>): void
+  getNode(target: JsTxnNodeRef): JsTxnNodeView | null
+  getEdge(target: JsTxnEdgeRef): JsTxnEdgeView | null
+  getNodeByKey(typeId: number, key: string): JsTxnNodeView | null
+  getEdgeByTriple(from: JsTxnNodeRef, to: JsTxnNodeRef, typeId: number): JsTxnEdgeView | null
+  commit(): JsTxnCommitResult
+  rollback(): void
+  upsertNodeAsync(typeId: number, key: string, options?: JsUpsertNodeOptions | undefined | null): Promise<JsTxnNodeRef>
+  upsertNodeAsAsync(alias: string, typeId: number, key: string, options?: JsUpsertNodeOptions | undefined | null): Promise<JsTxnNodeRef>
+  upsertEdgeAsync(from: JsTxnNodeRef, to: JsTxnNodeRef, typeId: number, options?: JsUpsertEdgeOptions | undefined | null): Promise<JsTxnEdgeRef>
+  upsertEdgeAsAsync(alias: string, from: JsTxnNodeRef, to: JsTxnNodeRef, typeId: number, options?: JsUpsertEdgeOptions | undefined | null): Promise<JsTxnEdgeRef>
+  deleteNodeAsync(target: JsTxnNodeRef): Promise<void>
+  deleteEdgeAsync(target: JsTxnEdgeRef): Promise<void>
+  invalidateEdgeAsync(target: JsTxnEdgeRef, validTo: number): Promise<void>
+  stageAsync(operations: Array<JsTxnOperation>): Promise<void>
+  getNodeAsync(target: JsTxnNodeRef): Promise<JsTxnNodeView | null>
+  getEdgeAsync(target: JsTxnEdgeRef): Promise<JsTxnEdgeView | null>
+  getNodeByKeyAsync(typeId: number, key: string): Promise<JsTxnNodeView | null>
+  getEdgeByTripleAsync(from: JsTxnNodeRef, to: JsTxnNodeRef, typeId: number): Promise<JsTxnEdgeView | null>
+  commitAsync(): Promise<JsTxnCommitResult>
+  rollbackAsync(): Promise<void>
+}
+export type JsWriteTxn = WriteTxn
 
 export interface JsAdjacencyExport {
   nodeIds: Float64Array
@@ -620,6 +654,80 @@ export interface JsTraverseOptions {
   decayLambda?: number
   limit?: number
   cursor?: JsTraversalCursor
+}
+
+export interface JsTxnCommitResult {
+  nodeIds: Float64Array
+  edgeIds: Float64Array
+  nodeAliases: Record<string, number>
+  edgeAliases: Record<string, number>
+}
+
+export interface JsTxnEdgeOrNodeRef {
+  id?: number
+  typeId?: number
+  key?: string
+  local?: string
+  from?: JsTxnNodeRef
+  to?: JsTxnNodeRef
+}
+
+export interface JsTxnEdgeRef {
+  id?: number
+  from?: JsTxnNodeRef
+  to?: JsTxnNodeRef
+  typeId?: number
+  local?: string
+}
+
+export interface JsTxnEdgeView {
+  id?: number
+  local?: string
+  from: JsTxnNodeRef
+  to: JsTxnNodeRef
+  typeId: number
+  props: Record<string, any>
+  createdAt?: number
+  updatedAt?: number
+  weight: number
+  validFrom?: number
+  validTo?: number
+}
+
+export interface JsTxnNodeRef {
+  id?: number
+  typeId?: number
+  key?: string
+  local?: string
+}
+
+export interface JsTxnNodeView {
+  id?: number
+  local?: string
+  typeId: number
+  key: string
+  props: Record<string, any>
+  createdAt?: number
+  updatedAt?: number
+  weight: number
+  denseVector?: Array<number>
+  sparseVector?: Array<JsSparseEntry>
+}
+
+export interface JsTxnOperation {
+  op: string
+  alias?: string
+  typeId?: number
+  key?: string
+  props?: Record<string, any>
+  weight?: number
+  denseVector?: Array<number>
+  sparseVector?: Array<JsSparseEntry>
+  from?: JsTxnNodeRef
+  to?: JsTxnNodeRef
+  target?: JsTxnEdgeOrNodeRef
+  validFrom?: number
+  validTo?: number
 }
 
 export interface JsUpsertEdgeOptions {
