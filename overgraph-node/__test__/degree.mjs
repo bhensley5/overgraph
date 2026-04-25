@@ -1,12 +1,19 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { OverGraph } from '../index.js';
 
 function freshDb(tmpDir, name) {
   return OverGraph.open(join(tmpDir, name));
+}
+
+function degreeSidecarPaths(dbPath) {
+  const segmentsDir = join(dbPath, 'segments');
+  return readdirSync(segmentsDir)
+    .filter(name => name.startsWith('seg_'))
+    .map(name => join(segmentsDir, name, 'degree_delta.dat'));
 }
 
 describe('degree (sync)', () => {
@@ -207,6 +214,62 @@ describe('degrees batch (sync)', () => {
     const at250 = db2.degrees([x], { direction: 'outgoing', atEpoch: 250 });
     assert.equal(at250.length, 0);
     db2.close();
+  });
+});
+
+describe('degree sidecar persistence (sync)', () => {
+  it('preserves degree-family results across flush, compaction, and reopen', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-degree-sidecar-'));
+    const dbPath = join(tmpDir, 'sidecar');
+    let db = OverGraph.open(dbPath);
+
+    const a = db.upsertNode(1, 'a');
+    const b = db.upsertNode(1, 'b');
+    const c = db.upsertNode(1, 'c');
+    db.upsertEdge(a, b, 10, { weight: 2.0 });
+    db.flush();
+    db.upsertEdge(a, c, 10, { weight: 4.0 });
+    db.flush();
+    db.compact();
+
+    assert.equal(db.degree(a), 2);
+    assert.ok(Math.abs(db.sumEdgeWeights(a) - 6.0) < 1e-6);
+    assert.ok(Math.abs(db.avgEdgeWeight(a) - 3.0) < 1e-6);
+    assert.equal(db.degrees([a, b, c]).find(r => r.nodeId === a)?.degree, 2);
+    db.close();
+
+    db = OverGraph.open(dbPath);
+    assert.equal(db.degree(a), 2);
+    assert.ok(Math.abs(db.sumEdgeWeights(a) - 6.0) < 1e-6);
+    assert.ok(Math.abs(db.avgEdgeWeight(a) - 3.0) < 1e-6);
+    assert.equal(db.degrees([a, b, c]).find(r => r.nodeId === a)?.degree, 2);
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('falls back when a degree sidecar is corrupt', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-degree-corrupt-'));
+    const dbPath = join(tmpDir, 'corrupt');
+    let db = OverGraph.open(dbPath);
+
+    const a = db.upsertNode(1, 'a');
+    const b = db.upsertNode(1, 'b');
+    db.upsertEdge(a, b, 10, { weight: 5.0 });
+    db.flush();
+    db.close();
+
+    const sidecars = degreeSidecarPaths(dbPath);
+    assert.equal(sidecars.length, 1);
+    writeFileSync(sidecars[0], Buffer.from('not a degree sidecar'));
+
+    db = OverGraph.open(dbPath);
+    assert.equal(db.degree(a), 1);
+    assert.ok(Math.abs(db.sumEdgeWeights(a) - 5.0) < 1e-6);
+    assert.ok(Math.abs(db.avgEdgeWeight(a) - 5.0) < 1e-6);
+    assert.equal(db.degrees([a, b]).find(r => r.nodeId === a)?.degree, 1);
+    assert.equal(db.neighbors(a).length, 1);
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 });
 

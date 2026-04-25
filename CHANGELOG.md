@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-25
+
+### Added
+
+#### Shared Handles And Concurrent Reads
+- **Cloneable database handles.** `DatabaseEngine` is now a lightweight cloneable handle over shared process-local runtime state, so multiple callers in one process can share one open database family safely.
+- **Published read views.** Public reads now capture immutable call-scoped snapshots instead of reading through the live writer state, improving read stability during concurrent writes, flushes, compactions, and close operations.
+- **Coordinated lifecycle operations.** Writes, flush adoption, compaction adoption, sync, and close now route through one shared coordinator with close-aware sequencing.
+
+#### Explicit Write Transactions
+- **Public write transaction API.** Added explicit `begin_write_txn()` / `beginWriteTxn()` / `begin_write_txn()` transaction handles across Rust, Node.js, and Python.
+- **Ordered local staging.** Transactions support local node and edge aliases, ordered staging, bounded point reads, read-own-writes, rollback, and atomic commit.
+- **Conflict detection.** Transaction commits use optimistic write-target conflict detection. A conflict prevents the whole commit, with no partial WAL append or partial publication.
+- **Async connector parity.** Node.js and Python expose transaction APIs through both sync and async surfaces.
+
+#### Published Degree Fast Path
+- **Degree sidecars.** New segment-level `degree_delta.dat` sidecars store signed degree and edge-weight deltas for fast degree-family reads.
+- **Published degree overlays.** Active and frozen WAL/memtable contributions are published with each read view as immutable in-memory overlays.
+- **Fast degree-family reads.** Eligible `degree`, `degrees`, `sum_edge_weights`, and `avg_edge_weight` calls now sum published overlays plus segment sidecars instead of walking adjacency.
+
+### Changed
+
+- **Write APIs use the shared coordinator.** Existing implicit write APIs keep their public shape while sharing the same internal commit path used by explicit transactions.
+- **Degree fallback remains conservative.** Filtered, temporal, prune-policy, temporal-edge, and sidecar-unavailable degree-family reads fall back to the existing adjacency walk path.
+- **Segment directories may include optional degree sidecars.** Databases with older segments that lack `degree_delta.dat` can still read through fallback paths where the segment format is otherwise supported. No migration or sidecar backfill is performed.
+
+### Fixed
+
+- **Read and lifecycle race hardening.** Snapshot publication, background flush adoption, background compaction adoption, and close behavior were hardened around concurrent readers and shared handles.
+- **Degree correctness across source states.** Degree-family results now preserve parity across active memtables, frozen memtables, flushed segments, compaction, corrupt or missing degree sidecars, reopen, and connector calls.
+
 ## [0.5.0] - 2026-04-16
 
 ### Added
@@ -218,6 +249,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.6.0]: https://github.com/bhensley5/overgraph/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Bhensley5/overgraph/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Bhensley5/overgraph/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Bhensley5/overgraph/compare/v0.3.0...v0.4.0

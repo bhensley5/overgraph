@@ -11,7 +11,7 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // --- Batch 1: 10k nodes ---
     let mut node_ids = Vec::with_capacity(10_000);
@@ -66,7 +66,7 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
     // --- Force flush ---
     let seg_info = engine.flush().unwrap();
     assert!(seg_info.is_some());
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     // --- Batch 2: 500 more nodes + 1000 edges in memtable ---
     let batch2: Vec<overgraph::NodeInput> = (10_000..10_500)
@@ -171,7 +171,7 @@ fn test_flush_close_reopen_reads_from_segments() {
     let edge_ab;
     let edge_bc;
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Build a small graph
         node_a = engine
@@ -231,7 +231,7 @@ fn test_flush_close_reopen_reads_from_segments() {
 
         // Flush everything to a segment
         engine.flush().unwrap();
-        assert_eq!(engine.segment_count(), 1);
+        assert_eq!(engine.segment_count().unwrap(), 1);
 
         // Add post-flush data (stays in WAL for replay on reopen)
         let _node_d = engine
@@ -252,7 +252,7 @@ fn test_flush_close_reopen_reads_from_segments() {
     // to a second segment.
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert_eq!(engine.segment_count(), 2);
+        assert_eq!(engine.segment_count().unwrap(), 2);
 
         // Segment data accessible
         let alice = engine.get_node(node_a).unwrap().unwrap();
@@ -314,7 +314,7 @@ fn test_multi_segment_survives_reopen() {
     let id_b;
     let id_c;
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Segment 1
         id_a = engine
@@ -379,7 +379,7 @@ fn test_multi_segment_survives_reopen() {
             )
             .unwrap();
 
-        assert_eq!(engine.segment_count(), 2);
+        assert_eq!(engine.segment_count().unwrap(), 2);
         engine.close().unwrap();
     }
 
@@ -388,7 +388,7 @@ fn test_multi_segment_survives_reopen() {
         // close() flushes remaining memtable (3rd flush), which triggers
         // auto-compact (compact_after_n_flushes=3 default). Result: 1 segment.
         assert!(
-            engine.segment_count() >= 1,
+            engine.segment_count().unwrap() >= 1,
             "data should be in segments after close"
         );
 

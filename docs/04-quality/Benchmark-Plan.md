@@ -80,6 +80,9 @@ Graph shapes for each profile:
 | `S-CRUD-003` | `get_node` | required | required | required |
 | `S-CRUD-004` | `upsert_node_fixed_key` | required | required | required |
 | `S-CRUD-005` | `upsert_edge_fixed_triple` | required | required | required |
+| `S-TXN-001` | explicit write transaction commit, 4/16/64 staged intents | required | required | required |
+| `S-TXN-002` | explicit transaction conflict-heavy same-target writes | required | required | required |
+| `S-TXN-003` | connector ordered `stage(operations)` payload parsing | not used | required | required |
 | `S-TRAV-001` | `neighbors` profile-scaled fan-out | required | required | required |
 | `S-TRAV-002` | `traverse` exact depth-2 slice (memtable continuity baseline) | required | required | required |
 | `S-TRAV-003` | `degree` | required | required | required |

@@ -474,7 +474,7 @@ pub struct PropertyRangePageResult<T> {
 
 /// WAL operation types.
 #[derive(Debug, Clone)]
-pub enum WalOp {
+pub(crate) enum WalOp {
     UpsertNode(NodeRecord),
     UpsertEdge(EdgeRecord),
     DeleteNode { id: u64, deleted_at: i64 },
@@ -484,7 +484,7 @@ pub enum WalOp {
 /// Operation type tags for binary encoding.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum OpTag {
+pub(crate) enum OpTag {
     UpsertNode = 1,
     UpsertEdge = 2,
     DeleteNode = 3,
@@ -492,7 +492,7 @@ pub enum OpTag {
 }
 
 impl OpTag {
-    pub fn from_u8(v: u8) -> Option<OpTag> {
+    pub(crate) fn from_u8(v: u8) -> Option<OpTag> {
         match v {
             1 => Some(OpTag::UpsertNode),
             2 => Some(OpTag::UpsertEdge),
@@ -684,6 +684,119 @@ impl Default for UpsertEdgeOptions {
             weight: 1.0,
             valid_from: None,
             valid_to: None,
+        }
+    }
+}
+
+/// Process-local reference assigned to an intent staged in a write transaction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TxnLocalRef {
+    Slot(u32),
+    Alias(String),
+}
+
+/// Reference to a node target inside a write transaction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TxnNodeRef {
+    Id(u64),
+    Key { type_id: u32, key: String },
+    Local(TxnLocalRef),
+}
+
+/// Reference to an edge target inside a write transaction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TxnEdgeRef {
+    Id(u64),
+    Triple {
+        from: TxnNodeRef,
+        to: TxnNodeRef,
+        type_id: u32,
+    },
+    Local(TxnLocalRef),
+}
+
+/// Ordered logical write intent staged by a write transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TxnIntent {
+    UpsertNode {
+        alias: Option<String>,
+        type_id: u32,
+        key: String,
+        options: UpsertNodeOptions,
+    },
+    UpsertEdge {
+        alias: Option<String>,
+        from: TxnNodeRef,
+        to: TxnNodeRef,
+        type_id: u32,
+        options: UpsertEdgeOptions,
+    },
+    DeleteNode {
+        target: TxnNodeRef,
+    },
+    DeleteEdge {
+        target: TxnEdgeRef,
+    },
+    InvalidateEdge {
+        target: TxnEdgeRef,
+        valid_to: i64,
+    },
+}
+
+/// Node view returned by bounded write-transaction reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TxnNodeView {
+    pub id: Option<u64>,
+    pub local: Option<TxnLocalRef>,
+    pub type_id: u32,
+    pub key: String,
+    pub props: BTreeMap<String, PropValue>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub weight: f32,
+    pub dense_vector: Option<DenseVector>,
+    pub sparse_vector: Option<SparseVector>,
+}
+
+/// Edge view returned by bounded write-transaction reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TxnEdgeView {
+    pub id: Option<u64>,
+    pub local: Option<TxnLocalRef>,
+    pub from: TxnNodeRef,
+    pub to: TxnNodeRef,
+    pub type_id: u32,
+    pub props: BTreeMap<String, PropValue>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub weight: f32,
+    pub valid_from: Option<i64>,
+    pub valid_to: Option<i64>,
+}
+
+/// Result returned by a successful write-transaction commit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TxnCommitResult {
+    pub node_ids: Vec<u64>,
+    pub edge_ids: Vec<u64>,
+    pub local_node_ids: BTreeMap<TxnLocalRef, u64>,
+    pub local_edge_ids: BTreeMap<TxnLocalRef, u64>,
+}
+
+impl TxnCommitResult {
+    pub fn node_id(&self, target: &TxnNodeRef) -> Option<u64> {
+        match target {
+            TxnNodeRef::Id(id) => Some(*id),
+            TxnNodeRef::Local(local) => self.local_node_ids.get(local).copied(),
+            TxnNodeRef::Key { .. } => None,
+        }
+    }
+
+    pub fn edge_id(&self, target: &TxnEdgeRef) -> Option<u64> {
+        match target {
+            TxnEdgeRef::Id(id) => Some(*id),
+            TxnEdgeRef::Local(local) => self.local_edge_ids.get(local).copied(),
+            TxnEdgeRef::Triple { .. } => None,
         }
     }
 }
@@ -1254,10 +1367,10 @@ pub enum WalSyncMode {
 
     /// Background fsync on a timer. Lowest latency, small data-loss window.
     GroupCommit {
-        /// How often the background thread fsyncs (default: 10ms).
+        /// How often the background thread fsyncs (default: 50ms).
         interval_ms: u64,
 
-        /// Soft trigger: fsync early when buffered bytes exceed this (default: 4MB).
+        /// Soft trigger: fsync early when buffered bytes exceed this (default: 2MB).
         soft_trigger_bytes: usize,
 
         /// Hard cap: block incoming writers when buffered bytes exceed this

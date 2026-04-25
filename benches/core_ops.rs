@@ -1,10 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use overgraph::{
     AllShortestPathsOptions, DatabaseEngine, DbOptions, DegreeOptions, Direction, EdgeInput,
-    ExportOptions, IsConnectedOptions, NeighborOptions, NodeInput, PageRequest, PprAlgorithm,
-    PprOptions, PropValue, PropertyRangeBound, PrunePolicy, SecondaryIndexKind,
+    ExportOptions, GraphPatch, IsConnectedOptions, NeighborOptions, NodeInput, PageRequest,
+    PprAlgorithm, PprOptions, PropValue, PropertyRangeBound, PrunePolicy, SecondaryIndexKind,
     SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPathOptions, TopKOptions,
-    TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
+    TraverseOptions, TxnIntent, TxnLocalRef, TxnNodeRef, UpsertEdgeOptions, UpsertNodeOptions,
+    WalSyncMode,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,7 +23,7 @@ fn temp_db() -> (tempfile::TempDir, DatabaseEngine) {
 
 fn bench_upsert_node(c: &mut Criterion) {
     c.bench_function("upsert_node", |b| {
-        let (_dir, mut engine) = temp_db();
+        let (_dir, engine) = temp_db();
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("node_{}", i);
@@ -36,7 +37,7 @@ fn bench_upsert_node(c: &mut Criterion) {
 
 fn bench_upsert_node_with_props(c: &mut Criterion) {
     c.bench_function("upsert_node_with_props", |b| {
-        let (_dir, mut engine) = temp_db();
+        let (_dir, engine) = temp_db();
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("node_{}", i);
@@ -60,7 +61,7 @@ fn bench_upsert_node_with_props(c: &mut Criterion) {
 
 fn bench_upsert_edge(c: &mut Criterion) {
     c.bench_function("upsert_edge", |b| {
-        let (_dir, mut engine) = temp_db();
+        let (_dir, engine) = temp_db();
         // Pre-create nodes
         let inputs: Vec<NodeInput> = (0..1000)
             .map(|i| NodeInput {
@@ -87,7 +88,7 @@ fn bench_upsert_edge(c: &mut Criterion) {
 
 fn bench_get_node(c: &mut Criterion) {
     c.bench_function("get_node", |b| {
-        let (_dir, mut engine) = temp_db();
+        let (_dir, engine) = temp_db();
         let inputs: Vec<NodeInput> = (0..1000)
             .map(|i| NodeInput {
                 type_id: 1,
@@ -108,7 +109,7 @@ fn bench_get_node(c: &mut Criterion) {
     });
 
     c.bench_function("get_node_segment", |b| {
-        let (_dir, mut engine) = temp_db();
+        let (_dir, engine) = temp_db();
         let inputs: Vec<NodeInput> = (0..1000)
             .map(|i| NodeInput {
                 type_id: 1,
@@ -468,7 +469,7 @@ fn bench_flush(c: &mut Criterion) {
     group.bench_function("flush_100_nodes_20_edges", |b| {
         b.iter_batched(
             || {
-                let (dir, mut engine) = temp_db();
+                let (dir, engine) = temp_db();
                 let node_inputs: Vec<NodeInput> = (0..100)
                     .map(|i| NodeInput {
                         type_id: 1,
@@ -494,7 +495,7 @@ fn bench_flush(c: &mut Criterion) {
                 engine.batch_upsert_edges(&edge_inputs).unwrap();
                 (dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 engine.flush().unwrap();
             },
             BatchSize::PerIteration,
@@ -505,7 +506,7 @@ fn bench_flush(c: &mut Criterion) {
 
 fn bench_batch_upsert_nodes(c: &mut Criterion) {
     c.bench_function("batch_upsert_100_nodes", |b| {
-        let (_dir, mut engine) = temp_db();
+        let (_dir, engine) = temp_db();
         let mut batch_num = 0u64;
         b.iter(|| {
             let inputs: Vec<NodeInput> = (0..100)
@@ -565,6 +566,7 @@ fn wait_for_property_index_state(
     loop {
         if engine
             .list_node_property_indexes()
+            .unwrap()
             .into_iter()
             .any(|info| info.index_id == index_id && info.state == expected_state)
         {
@@ -575,7 +577,7 @@ fn wait_for_property_index_state(
             "timed out waiting for property index {} to reach {:?}; current indexes: {:?}",
             index_id,
             expected_state,
-            engine.list_node_property_indexes()
+            engine.list_node_property_indexes().unwrap()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -801,7 +803,7 @@ fn bench_property_indexes(c: &mut Criterion) {
     flush_group.bench_function("zero_declarations", |b| {
         b.iter_batched(
             || build_property_flush_engine(false),
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 engine.flush().unwrap();
             },
             BatchSize::PerIteration,
@@ -811,7 +813,7 @@ fn bench_property_indexes(c: &mut Criterion) {
     flush_group.bench_function("equality_and_range_declarations", |b| {
         b.iter_batched(
             || build_property_flush_engine(true),
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 engine.flush().unwrap();
             },
             BatchSize::PerIteration,
@@ -826,7 +828,7 @@ fn bench_property_indexes(c: &mut Criterion) {
     compact_group.bench_function("zero_declarations", |b| {
         b.iter_batched(
             || build_property_compaction_engine(false),
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 black_box(engine.compact().unwrap());
             },
             BatchSize::PerIteration,
@@ -836,7 +838,7 @@ fn bench_property_indexes(c: &mut Criterion) {
     compact_group.bench_function("equality_and_range_declarations", |b| {
         b.iter_batched(
             || build_property_compaction_engine(true),
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 black_box(engine.compact().unwrap());
             },
             BatchSize::PerIteration,
@@ -862,7 +864,7 @@ fn bench_compact(c: &mut Criterion) {
                     compact_after_n_flushes: 0,
                     ..DbOptions::default()
                 };
-                let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+                let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
                 for seg in 0..5u64 {
                     let node_inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
@@ -891,7 +893,7 @@ fn bench_compact(c: &mut Criterion) {
                 }
                 (dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 engine.compact().unwrap();
             },
             BatchSize::PerIteration,
@@ -910,7 +912,7 @@ fn bench_compact(c: &mut Criterion) {
                     compact_after_n_flushes: 0,
                     ..DbOptions::default()
                 };
-                let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+                let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
                 for seg in 0..5u64 {
                     let node_inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
@@ -949,7 +951,7 @@ fn bench_compact(c: &mut Criterion) {
                     .unwrap();
                 (dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 engine.compact().unwrap();
             },
             BatchSize::PerIteration,
@@ -968,7 +970,7 @@ fn bench_compact(c: &mut Criterion) {
                     compact_after_n_flushes: 0,
                     ..DbOptions::default()
                 };
-                let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+                let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
                 for seg in 0..5u64 {
                     let node_inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
@@ -997,7 +999,7 @@ fn bench_compact(c: &mut Criterion) {
                 }
                 (dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 engine.compact().unwrap();
             },
             BatchSize::PerIteration,
@@ -1015,7 +1017,7 @@ fn bench_compact(c: &mut Criterion) {
                     compact_after_n_flushes: 0,
                     ..DbOptions::default()
                 };
-                let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+                let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
                 for seg in 0..5u64 {
                     let node_inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
@@ -1049,7 +1051,7 @@ fn bench_compact(c: &mut Criterion) {
                 engine.flush().unwrap();
                 (dir, engine)
             },
-            |(_dir, mut engine)| {
+            |(_dir, engine)| {
                 engine.compact().unwrap();
             },
             BatchSize::PerIteration,
@@ -1073,7 +1075,7 @@ fn bench_group_commit(c: &mut Criterion) {
             wal_sync_mode: WalSyncMode::Immediate,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
         let mut i = 0u64;
         b.iter(|| {
             engine
@@ -1084,21 +1086,17 @@ fn bench_group_commit(c: &mut Criterion) {
         engine.close().unwrap();
     });
 
-    // Single upsert: GroupCommit mode (should be ~40-100μs/write)
+    // Single upsert: default GroupCommit mode
     group.bench_function("upsert_node_group_commit", |b| {
         let dir = tempfile::tempdir().unwrap();
         let opts = DbOptions {
             create_if_missing: true,
             edge_uniqueness: true,
             compact_after_n_flushes: 0,
-            wal_sync_mode: WalSyncMode::GroupCommit {
-                interval_ms: 10,
-                soft_trigger_bytes: 4 * 1024 * 1024,
-                hard_cap_bytes: 16 * 1024 * 1024,
-            },
+            wal_sync_mode: WalSyncMode::default(),
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
         let mut i = 0u64;
         b.iter(|| {
             engine
@@ -1118,7 +1116,7 @@ fn bench_group_commit(c: &mut Criterion) {
             wal_sync_mode: WalSyncMode::Immediate,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
         let mut batch_num = 0u64;
         b.iter(|| {
             let inputs: Vec<NodeInput> = (0..100)
@@ -1137,20 +1135,16 @@ fn bench_group_commit(c: &mut Criterion) {
         engine.close().unwrap();
     });
 
-    // Batch 100 nodes: GroupCommit mode
+    // Batch 100 nodes: default GroupCommit mode
     group.bench_function("batch_100_nodes_group_commit", |b| {
         let dir = tempfile::tempdir().unwrap();
         let opts = DbOptions {
             create_if_missing: true,
             compact_after_n_flushes: 0,
-            wal_sync_mode: WalSyncMode::GroupCommit {
-                interval_ms: 10,
-                soft_trigger_bytes: 4 * 1024 * 1024,
-                hard_cap_bytes: 16 * 1024 * 1024,
-            },
+            wal_sync_mode: WalSyncMode::default(),
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
         let mut batch_num = 0u64;
         b.iter(|| {
             let inputs: Vec<NodeInput> = (0..100)
@@ -1223,6 +1217,22 @@ fn bench_degree(c: &mut Criterion) {
         engine.flush().unwrap();
         b.iter(|| {
             engine.degree(hub, &DegreeOptions::default()).unwrap();
+        });
+    });
+
+    c.bench_function("degree_fanout_100_type_filtered", |b| {
+        let (_dir, mut engine) = temp_db();
+        let hub = build_hub_graph(&mut engine, 100);
+        b.iter(|| {
+            engine
+                .degree(
+                    hub,
+                    &DegreeOptions {
+                        type_filter: Some(vec![1]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
         });
     });
 
@@ -2182,7 +2192,7 @@ fn bench_recovery(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let dir = tempfile::tempdir().unwrap();
-                let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+                let engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
                 for batch in 0..10u64 {
                     let inputs: Vec<NodeInput> = (0..500u64)
                         .map(|i| NodeInput {
@@ -2211,7 +2221,7 @@ fn bench_recovery(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let dir = tempfile::tempdir().unwrap();
-                let mut engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+                let engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
                 for seg in 0..3u64 {
                     let inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
@@ -2250,7 +2260,7 @@ fn build_ring_graph(n: usize) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let inputs: Vec<NodeInput> = (0..n)
         .map(|i| NodeInput {
@@ -2296,7 +2306,7 @@ fn build_ring_graph(n: usize) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
 }
 
 fn build_ring_graph_flushed(n: usize) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
-    let (dir, mut engine, node_ids) = build_ring_graph(n);
+    let (dir, engine, node_ids) = build_ring_graph(n);
     engine.flush().unwrap();
     (dir, engine, node_ids)
 }
@@ -2499,7 +2509,7 @@ fn bench_shortest_path(c: &mut Criterion) {
             compact_after_n_flushes: 0,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
         let inputs: Vec<NodeInput> = (0..100)
             .map(|i| NodeInput {
@@ -2572,7 +2582,7 @@ fn bench_shortest_path(c: &mut Criterion) {
             compact_after_n_flushes: 0,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
         let inputs: Vec<NodeInput> = (0..100)
             .map(|i| NodeInput {
@@ -2646,7 +2656,7 @@ fn bench_shortest_path(c: &mut Criterion) {
             compact_after_n_flushes: 0,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
         let inputs: Vec<NodeInput> = (0..100)
             .map(|i| NodeInput {
@@ -2720,7 +2730,7 @@ fn bench_shortest_path(c: &mut Criterion) {
             compact_after_n_flushes: 0,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
         let inputs: Vec<NodeInput> = (0..100)
             .map(|i| NodeInput {
@@ -2802,7 +2812,7 @@ fn bench_batch_get_by_keys(c: &mut Criterion) {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
     let keys: Vec<(u32, String)> = (0..1000).map(|i| (1u32, format!("key_{:04}", i))).collect();
     for (tid, k) in &keys {
         engine
@@ -2837,6 +2847,257 @@ fn bench_batch_get_by_keys(c: &mut Criterion) {
     engine.close().unwrap();
 }
 
+fn txn_intents(batch_num: u64, node_count: usize, edge_count: usize) -> Vec<TxnIntent> {
+    let mut intents = Vec::with_capacity(node_count + edge_count);
+    for i in 0..node_count {
+        intents.push(TxnIntent::UpsertNode {
+            alias: None,
+            type_id: 1,
+            key: format!("txn_{}_n_{}", batch_num, i),
+            options: UpsertNodeOptions::default(),
+        });
+    }
+    for i in 0..edge_count {
+        intents.push(TxnIntent::UpsertEdge {
+            alias: None,
+            from: TxnNodeRef::Local(TxnLocalRef::Slot((i % node_count) as u32)),
+            to: TxnNodeRef::Local(TxnLocalRef::Slot(((i + 1) % node_count) as u32)),
+            type_id: 7,
+            options: UpsertEdgeOptions::default(),
+        });
+    }
+    intents
+}
+
+fn bench_write_txn(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write_txn");
+    group.sample_size(20);
+
+    for (name, node_count, edge_count) in [
+        ("explicit_4_intents", 2usize, 2usize),
+        ("explicit_16_intents", 8usize, 8usize),
+        ("explicit_64_intents", 32usize, 32usize),
+    ] {
+        group.bench_function(name, |b| {
+            let (_dir, engine) = temp_db();
+            let mut batch_num = 0u64;
+            b.iter(|| {
+                let mut txn = engine.begin_write_txn().unwrap();
+                txn.stage_intents(txn_intents(batch_num, node_count, edge_count))
+                    .unwrap();
+                black_box(txn.commit().unwrap());
+                batch_num += 1;
+            });
+        });
+    }
+
+    group.bench_function("explicit_existing_mixed_16_intents", |b| {
+        let (_dir, engine) = temp_db();
+        let existing_nodes: Vec<NodeInput> = (0..8)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("txn_existing_{}", i),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect();
+        let existing_ids = engine.batch_upsert_nodes(&existing_nodes).unwrap();
+        let mut batch_num = 0u64;
+        b.iter(|| {
+            let mut intents = Vec::with_capacity(16);
+            for i in 0..8 {
+                intents.push(TxnIntent::UpsertNode {
+                    alias: None,
+                    type_id: 1,
+                    key: format!("txn_existing_{}", i),
+                    options: UpsertNodeOptions {
+                        weight: 1.0 + (batch_num % 100) as f32,
+                        ..Default::default()
+                    },
+                });
+            }
+            for i in 0..8 {
+                intents.push(TxnIntent::UpsertEdge {
+                    alias: None,
+                    from: TxnNodeRef::Id(existing_ids[i]),
+                    to: TxnNodeRef::Id(existing_ids[(i + 1) % 8]),
+                    type_id: 7,
+                    options: UpsertEdgeOptions {
+                        weight: 1.0 + (batch_num % 100) as f32,
+                        ..Default::default()
+                    },
+                });
+            }
+            let mut txn = engine.begin_write_txn().unwrap();
+            txn.stage_intents(intents).unwrap();
+            black_box(txn.commit().unwrap());
+            batch_num += 1;
+        });
+    });
+
+    group.bench_function("implicit_graph_patch_equivalent_16_intents", |b| {
+        let (_dir, engine) = temp_db();
+        let existing_nodes: Vec<NodeInput> = (0..8)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("patch_existing_{}", i),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect();
+        let existing_ids = engine.batch_upsert_nodes(&existing_nodes).unwrap();
+        let mut batch_num = 0u64;
+        b.iter(|| {
+            let nodes: Vec<NodeInput> = (0..8)
+                .map(|i| NodeInput {
+                    type_id: 1,
+                    key: format!("patch_existing_{}", i),
+                    props: BTreeMap::new(),
+                    weight: 1.0 + (batch_num % 100) as f32,
+                    dense_vector: None,
+                    sparse_vector: None,
+                })
+                .collect();
+            let edges: Vec<EdgeInput> = (0..8)
+                .map(|i| EdgeInput {
+                    from: existing_ids[i % existing_ids.len()],
+                    to: existing_ids[(i + 1) % existing_ids.len()],
+                    type_id: 7,
+                    props: BTreeMap::new(),
+                    weight: 1.0 + (batch_num % 100) as f32,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect();
+            black_box(
+                engine
+                    .graph_patch(&GraphPatch {
+                        upsert_nodes: nodes,
+                        upsert_edges: edges,
+                        invalidate_edges: Vec::new(),
+                        delete_node_ids: Vec::new(),
+                        delete_edge_ids: Vec::new(),
+                    })
+                    .unwrap(),
+            );
+            batch_num += 1;
+        });
+    });
+
+    group.bench_function("explicit_existing_edges_16_intents", |b| {
+        let (_dir, engine) = temp_db();
+        let nodes: Vec<NodeInput> = (0..17)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("edge_existing_{}", i),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect();
+        let ids = engine.batch_upsert_nodes(&nodes).unwrap();
+        let mut batch_num = 0u64;
+        b.iter(|| {
+            let intents: Vec<TxnIntent> = (0..16)
+                .map(|i| TxnIntent::UpsertEdge {
+                    alias: None,
+                    from: TxnNodeRef::Id(ids[i]),
+                    to: TxnNodeRef::Id(ids[i + 1]),
+                    type_id: 11,
+                    options: UpsertEdgeOptions {
+                        weight: 1.0 + (batch_num % 100) as f32,
+                        ..Default::default()
+                    },
+                })
+                .collect();
+            let mut txn = engine.begin_write_txn().unwrap();
+            txn.stage_intents(intents).unwrap();
+            black_box(txn.commit().unwrap());
+            batch_num += 1;
+        });
+    });
+
+    group.bench_function("implicit_graph_patch_edges_16_intents", |b| {
+        let (_dir, engine) = temp_db();
+        let nodes: Vec<NodeInput> = (0..17)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("patch_edge_existing_{}", i),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect();
+        let ids = engine.batch_upsert_nodes(&nodes).unwrap();
+        let mut batch_num = 0u64;
+        b.iter(|| {
+            let edges: Vec<EdgeInput> = (0..16)
+                .map(|i| EdgeInput {
+                    from: ids[i],
+                    to: ids[i + 1],
+                    type_id: 11,
+                    props: BTreeMap::new(),
+                    weight: 1.0 + (batch_num % 100) as f32,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect();
+            black_box(
+                engine
+                    .graph_patch(&GraphPatch {
+                        upsert_nodes: Vec::new(),
+                        upsert_edges: edges,
+                        invalidate_edges: Vec::new(),
+                        delete_node_ids: Vec::new(),
+                        delete_edge_ids: Vec::new(),
+                    })
+                    .unwrap(),
+            );
+            batch_num += 1;
+        });
+    });
+
+    group.bench_function("conflict_update_same_key", |b| {
+        let (_dir, engine) = temp_db();
+        engine
+            .upsert_node(1, "conflict", UpsertNodeOptions::default())
+            .unwrap();
+        let mut i = 0u64;
+        b.iter(|| {
+            let mut txn = engine.begin_write_txn().unwrap();
+            txn.upsert_node(
+                1,
+                "conflict",
+                UpsertNodeOptions {
+                    weight: 2.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            engine
+                .upsert_node(
+                    1,
+                    "conflict",
+                    UpsertNodeOptions {
+                        weight: 3.0 + i as f32,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert!(txn.commit().is_err());
+            i += 1;
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_upsert_node,
@@ -2857,5 +3118,6 @@ criterion_group!(
     bench_recovery,
     bench_shortest_path,
     bench_batch_get_by_keys,
+    bench_write_txn,
 );
 criterion_main!(benches);

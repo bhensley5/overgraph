@@ -36,6 +36,8 @@ pub mod types;
 // Internal modules: accessible within the workspace (connectors, CLI binaries)
 // but hidden from public documentation since they are implementation details.
 #[doc(hidden)]
+pub(crate) mod degree_cache;
+#[doc(hidden)]
 pub mod dense_hnsw;
 #[doc(hidden)]
 pub mod encoding;
@@ -58,6 +60,6 @@ pub mod wal;
 #[doc(hidden)]
 pub mod wal_sync;
 
-pub use engine::DatabaseEngine;
+pub use engine::{DatabaseEngine, WriteTxn};
 pub use error::EngineError;
 pub use types::*;

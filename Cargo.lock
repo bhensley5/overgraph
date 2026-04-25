@@ -30,6 +30,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -609,8 +618,9 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "overgraph"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
+ "arc-swap",
  "crc32fast",
  "criterion",
  "memmap2",
@@ -623,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "overgraph-node"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -634,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "overgraph-python"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "overgraph",
  "pyo3",

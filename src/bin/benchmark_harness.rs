@@ -267,7 +267,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-CRUD-001";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("crud-upsert-node"))?;
+        let engine = open_db(&tmp_root.db_path("crud-upsert-node"))?;
         let stats = run_bench_growth(iter_cfg, |i| {
             engine
                 .upsert_node(
@@ -298,7 +298,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-CRUD-002";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("crud-upsert-edge"))?;
+        let engine = open_db(&tmp_root.db_path("crud-upsert-edge"))?;
         let node_inputs: Vec<NodeInput> = (0..(iter_cfg.warmup + iter_cfg.iters + 1))
             .map(|i| NodeInput {
                 type_id: 1,
@@ -341,7 +341,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-BATCH-001";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("batch-nodes-json"))?;
+        let engine = open_db(&tmp_root.db_path("batch-nodes-json"))?;
         let stats = run_bench(iter_cfg, |i| {
             let inputs: Vec<NodeInput> = (0..cfg.batch_nodes)
                 .map(|j| NodeInput {
@@ -373,7 +373,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-CRUD-003";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("crud-get-node"))?;
+        let engine = open_db(&tmp_root.db_path("crud-get-node"))?;
         let node_inputs: Vec<NodeInput> = (0..cfg.get_node_nodes)
             .map(|i| NodeInput {
                 type_id: 1,
@@ -410,7 +410,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-CRUD-004";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("crud-upsert-node-fixed"))?;
+        let engine = open_db(&tmp_root.db_path("crud-upsert-node-fixed"))?;
         engine
             .upsert_node(
                 1,
@@ -453,7 +453,7 @@ fn main() -> Result<(), String> {
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let mut opts = benchmark_db_options();
         opts.edge_uniqueness = true;
-        let mut engine = DatabaseEngine::open(&tmp_root.db_path("crud-upsert-edge-fixed"), &opts)
+        let engine = DatabaseEngine::open(&tmp_root.db_path("crud-upsert-edge-fixed"), &opts)
             .map_err(|e| e.to_string())?;
         let node_a = engine
             .upsert_node(1, "fixed-a", UpsertNodeOptions::default())
@@ -484,7 +484,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-TRAV-001";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("trav-neighbors"))?;
+        let engine = open_db(&tmp_root.db_path("trav-neighbors"))?;
         let mut node_inputs = vec![NodeInput {
             type_id: 1,
             key: "hub".to_string(),
@@ -726,7 +726,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-TRAV-003";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("trav-degree"))?;
+        let engine = open_db(&tmp_root.db_path("trav-degree"))?;
         let mut node_inputs = vec![NodeInput {
             type_id: 1,
             key: "hub".to_string(),
@@ -783,7 +783,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-TRAV-004";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("trav-degrees"))?;
+        let engine = open_db(&tmp_root.db_path("trav-degrees"))?;
         let mut node_inputs: Vec<NodeInput> =
             Vec::with_capacity(cfg.batch_nodes * (1 + cfg.fanout));
         for h in 0..cfg.batch_nodes {
@@ -853,7 +853,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-TRAV-005";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("trav-shortest-path"))?;
+        let engine = open_db(&tmp_root.db_path("trav-shortest-path"))?;
 
         let node_inputs: Vec<NodeInput> = (0..cfg.shortest_path_nodes)
             .map(|i| NodeInput {
@@ -938,7 +938,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-TRAV-006";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("trav-is-connected"))?;
+        let engine = open_db(&tmp_root.db_path("trav-is-connected"))?;
 
         let node_inputs: Vec<NodeInput> = (0..cfg.shortest_path_nodes)
             .map(|i| NodeInput {
@@ -1022,7 +1022,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-ADV-001";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("adv-top-k"))?;
+        let engine = open_db(&tmp_root.db_path("adv-top-k"))?;
         let mut node_inputs = vec![NodeInput {
             type_id: 1,
             key: "hub".to_string(),
@@ -1091,7 +1091,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-ADV-003";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("adv-time-range"))?;
+        let engine = open_db(&tmp_root.db_path("adv-time-range"))?;
         let node_inputs: Vec<NodeInput> = (0..cfg.time_range_nodes)
             .map(|i| NodeInput {
                 type_id: 1,
@@ -1135,7 +1135,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-ADV-004";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("adv-ppr"))?;
+        let engine = open_db(&tmp_root.db_path("adv-ppr"))?;
 
         let node_inputs: Vec<NodeInput> = (0..cfg.ppr_nodes)
             .map(|i| NodeInput {
@@ -1229,7 +1229,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-ADV-005";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("adv-export"))?;
+        let engine = open_db(&tmp_root.db_path("adv-export"))?;
 
         let node_inputs: Vec<NodeInput> = (0..cfg.export_nodes)
             .map(|i| NodeInput {
@@ -1297,7 +1297,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-MAIN-001";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_db(&tmp_root.db_path("maint-flush"))?;
+        let engine = open_db(&tmp_root.db_path("maint-flush"))?;
         let stats = run_bench(iter_cfg, |i| {
             let nodes: Vec<NodeInput> = (0..cfg.flush_nodes_per_iter)
                 .map(|j| NodeInput {
@@ -1350,7 +1350,7 @@ fn main() -> Result<(), String> {
     {
         let scenario_id = "S-VEC-001";
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
-        let mut engine = open_vector_db(&tmp_root.db_path("vec-hybrid"), cfg.vector_dim)?;
+        let engine = open_vector_db(&tmp_root.db_path("vec-hybrid"), cfg.vector_dim)?;
 
         let inputs: Vec<NodeInput> = (0..cfg.vector_nodes)
             .map(|i| {
@@ -1497,7 +1497,7 @@ fn parse_args() -> Result<CliArgs, String> {
 }
 
 fn help_text() -> String {
-    "Usage: cargo run --release --bin benchmark_harness -- --profile <small|medium|large|xlarge> --warmup <n> --iters <n>".to_string()
+    "Usage: cargo run --release --features cli --bin benchmark-harness -- --profile <small|medium|large|xlarge> --warmup <n> --iters <n>".to_string()
 }
 
 fn effective_config(

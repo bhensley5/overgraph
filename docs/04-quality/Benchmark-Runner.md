@@ -33,6 +33,7 @@ Files:
 - Rust: `core-benchmark-v1-parity` (runs `src/bin/benchmark_harness.rs` with shared scenario contract)
 - Node.js: `connector-benchmark-v3-parity` (shared-profile + shared scenario-contract harness)
 - Python: `connector-benchmark-v2-parity` (shared-profile + shared scenario-contract harness)
+- Phase 20b adds Criterion `write_txn/*` microbenches for explicit 4/16/64-intent commits, a 16-intent implicit batch comparator, and a same-key conflict-heavy workload. Connector benchmark harnesses should mirror this with ordered `stage(operations)` arrays for Node.js and Python.
 
 Shared parity contract:
 - `docs/04-quality/workloads/scenario-contract.json`

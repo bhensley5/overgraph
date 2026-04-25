@@ -29,7 +29,7 @@ fn props(pairs: &[(&str, &str)]) -> BTreeMap<String, PropValue> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db = DatabaseEngine::open(Path::new("./example-graph"), &DbOptions::default())?;
+    let db = DatabaseEngine::open(Path::new("./example-graph"), &DbOptions::default())?;
 
     // --- Build a knowledge graph ---
 
@@ -228,7 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 4. Database stats
-    let stats = db.stats();
+    let stats = db.stats()?;
     println!("\nDatabase stats:");
     println!("  Segments: {}", stats.segment_count);
     println!("  WAL sync mode: {}", stats.wal_sync_mode);

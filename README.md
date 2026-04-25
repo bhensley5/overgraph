@@ -20,7 +20,7 @@
 
 OverGraph is a graph database that runs inside your process. No server, no network calls, no Docker containers. You open a directory, and you have a full graph database with temporal edges, weighted relationships, sub-microsecond lookups, and built-in vector search.
 
-I built it because I wanted a graph database that was genuinely fast. Not "fast for a database," but fast enough that you forget it's there. Node lookups in 26 nanoseconds. Neighbor traversals in 2 microseconds. Batch writes at 600K+ nodes per second. And I wanted graph structure and vector similarity to live together in one engine. No separate vector database, no external index, no synchronization headaches.
+I built it because I wanted a graph database that was genuinely fast. Not "fast for a database," but fast enough that you forget it's there. Node lookups in 34 nanoseconds. Neighbor traversals in 2 microseconds. Batch writes at 1.29M+ nodes per second. And I wanted graph structure and vector similarity to live together in one engine. No separate vector database, no external index, no synchronization headaches.
 
 It's written entirely in Rust and it ships native connectors for Node.js (napi-rs) and Python (PyO3) so you can use it from whatever you're building in.
 
@@ -39,7 +39,8 @@ It's written entirely in Rust and it ships native connectors for Node.js (napi-r
 - **Truly embedded.** No separate process. No socket. Your database is a folder on disk. Copy it, move it, back it up with `cp -r`.
 - **Graph + vectors in one engine.** Dense HNSW and sparse inverted indexes live alongside graph adjacency indexes in the same storage engine. Vector search can be scoped to graph neighborhoods ("find similar nodes within 2 hops of X") without a second database or a synchronization layer.
 - **Rich graph primitives.** Weighted nodes and edges, temporal validity windows, exponential decay scoring, automatic retention policies. Model relationships that evolve over time, and let the graph clean up what's no longer relevant.
-- **Fast where it matters.** Node lookups in ~26ns. Neighbor traversal in ~2μs. Batch writes at 600K+ nodes/sec. The storage engine is a log-structured merge tree with mmap'd immutable segments, so reads never block writes.
+- **Fast where it matters.** Node lookups in ~34ns. Neighbor traversal in ~2μs. Batch writes at 1.29M+ nodes/sec. The storage engine is a log-structured merge tree with mmap'd immutable segments, so reads never block writes.
+- **Explicit write transactions.** Stage ordered node and edge mutations locally, read your own staged writes, then commit atomically with optimistic conflict detection. Available in Rust, Node.js, and Python.
 - **Three languages, one engine.** Rust core with native bindings for Node.js (napi-rs) and Python (PyO3). Not a wrapper around a REST API. Actual FFI into the same Rust engine with minimal overhead.
 - **No query language.** Just functions. `upsert_node`, `neighbors`, `vector_search`. If you can call a function, you can use OverGraph.
 
@@ -49,10 +50,10 @@ All numbers from a real benchmark suite running on the Rust core (group-commit d
 
 | Operation | Latency | Throughput |
 |---|---|---|
-| `get_node` | 26 ns | 39M ops/s |
+| `get_node` | 34 ns | 29M ops/s |
 | `upsert_node` | 2.2 μs | 807K ops/s |
 | `neighbors` (1-hop) | 2.1 μs | 541K ops/s |
-| `batch_upsert_nodes` (100) | 236 μs | 625K nodes/s |
+| `batch_upsert_nodes` (100) | 77.261 µs | 1.29M nodes/s |
 | `top_k_neighbors` | 17.5 μs | 81K ops/s |
 | `personalized_pagerank` | 254 μs | 4.3K ops/s |
 
@@ -242,6 +243,7 @@ Both Python and Node.js connectors include full async variants of every API. Pyt
 - **Upsert semantics.** Nodes are keyed by `(type_id, key)`. Upsert the same key twice and you get an update, not a duplicate. Edges can optionally enforce uniqueness on `(from, to, type_id)`.
 - **Batch operations.** `batch_upsert_nodes` and `batch_upsert_edges` amortize WAL and memtable overhead. `get_nodes` and `get_nodes_by_keys` do batched reads with sorted merge-walks instead of per-item lookups. There's also a packed binary format for maximum write throughput.
 - **Atomic graph patch.** `graph_patch` lets you upsert nodes, upsert edges, delete nodes, delete edges, and invalidate edges in a single atomic operation.
+- **Explicit transactions.** `begin_write_txn()` / `beginWriteTxn()` gives you ordered staging, rollback, read-own-writes point lookups, local aliases, atomic commit, and clean conflict errors for retry loops.
 
 ### Temporal edges
 - **Validity windows.** Edges have optional `valid_from` and `valid_to` timestamps. Query at any point in time with the `at_epoch` parameter and only see edges that were valid at that moment.
@@ -280,7 +282,7 @@ ID-keyed collection APIs use keyset pagination with `limit` and `after`. `traver
 
 OverGraph uses a log-structured storage engine purpose-built from scratch in pure Rust. Unlike generic LSM key-value stores, every segment is a fully indexed graph structure. Adjacency lists, label indexes, temporal indexes, declared property indexes, and vector indexes are all materialized at flush time when applicable, not just at compaction. Reads are near-optimal the moment data hits disk, while writes stay append-only and fast.
 
-**Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue unblocked against a fresh memtable. Each segment ships with pre-built adjacency indexes (inbound and outbound), optional declared property-index sidecars, and, when the segment contains vectors, HNSW and sparse posting-list indexes.
+**Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue unblocked against a fresh memtable. Each segment ships with pre-built adjacency indexes (inbound and outbound), optional declared property-index sidecars, optional signed degree-delta sidecars for degree/weight fast paths, and, when the segment contains vectors, HNSW and sparse posting-list indexes.
 
 **Read path:** Queries check the memtable first (freshest data), then merge results across immutable segments using the per-segment indexes. Because every segment carries its own adjacency index, a neighbor query is a handful of index lookups, not a scan across sorted keys. Vector search follows the same model: memtable candidates are found by exact brute-force scan, segment candidates via HNSW or posting-list indexes, then the engine merges and deduplicates across all sources. Property equality and numeric range queries stay index-transparent too: if a matching optional property-index declaration is `Ready`, the engine uses the declaration-backed path, otherwise it falls back to a type-scoped scan through the same public API. Pagination uses early termination to avoid unnecessary work.
 
@@ -301,6 +303,7 @@ my-graph/
       type_index.dat      # type_id -> [id...]
       tombstones.dat      # deleted IDs
       secondary_indexes/  # optional declared property-index sidecars
+      degree_delta.dat    # optional signed degree deltas for fast degree/weight reads
       node_dense_vectors.dat    # dense vector blob (when present)
       node_sparse_vectors.dat   # sparse vector blob (when present)
       dense_hnsw_graph.dat      # HNSW graph index (when present)

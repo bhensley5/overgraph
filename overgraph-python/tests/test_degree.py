@@ -1,4 +1,5 @@
 import time
+import os
 import pytest
 from overgraph import OverGraph
 
@@ -160,6 +161,58 @@ class TestDegreesBatch:
         assert result[a] == 1
         result2 = db.degrees([a], at_epoch=250)
         assert result2.get(a, 0) == 0
+
+
+class TestDegreeSidecars:
+    def test_flush_compact_reopen_preserves_degree_family_results(self, db_path):
+        db = OverGraph.open(db_path)
+        a = db.upsert_node(1, "a")
+        b = db.upsert_node(1, "b")
+        c = db.upsert_node(1, "c")
+        db.upsert_edge(a, b, 10, weight=2.0)
+        db.flush()
+        db.upsert_edge(a, c, 10, weight=4.0)
+        db.flush()
+        db.compact()
+
+        assert db.degree(a) == 2
+        assert abs(db.sum_edge_weights(a) - 6.0) < 1e-6
+        assert abs(db.avg_edge_weight(a) - 3.0) < 1e-6
+        assert db.degrees([a, b, c])[a] == 2
+        db.close()
+
+        reopened = OverGraph.open(db_path)
+        assert reopened.degree(a) == 2
+        assert abs(reopened.sum_edge_weights(a) - 6.0) < 1e-6
+        assert abs(reopened.avg_edge_weight(a) - 3.0) < 1e-6
+        assert reopened.degrees([a, b, c])[a] == 2
+        reopened.close()
+
+    def test_corrupt_degree_sidecar_falls_back(self, db_path):
+        db = OverGraph.open(db_path)
+        a = db.upsert_node(1, "a")
+        b = db.upsert_node(1, "b")
+        db.upsert_edge(a, b, 10, weight=5.0)
+        db.flush()
+        db.close()
+
+        segments_dir = os.path.join(db_path, "segments")
+        sidecars = [
+            os.path.join(segments_dir, name, "degree_delta.dat")
+            for name in os.listdir(segments_dir)
+            if name.startswith("seg_")
+        ]
+        assert len(sidecars) == 1
+        with open(sidecars[0], "wb") as f:
+            f.write(b"not a degree sidecar")
+
+        reopened = OverGraph.open(db_path)
+        assert reopened.degree(a) == 1
+        assert abs(reopened.sum_edge_weights(a) - 5.0) < 1e-6
+        assert abs(reopened.avg_edge_weight(a) - 5.0) < 1e-6
+        assert reopened.degrees([a, b])[a] == 1
+        assert len(reopened.neighbors(a)) == 1
+        reopened.close()
 
 
 class TestDegreeTemporal:

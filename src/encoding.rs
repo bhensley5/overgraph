@@ -147,7 +147,7 @@ fn read_str(cursor: &mut Cursor<&[u8]>) -> Result<String, EngineError> {
 // --- Public API ---
 
 /// Encode a WalOp into the provided buffer (clears first, reuses allocation).
-pub fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), EngineError> {
+pub(crate) fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), EngineError> {
     buf.clear();
 
     match op {
@@ -215,14 +215,24 @@ pub fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), EngineErr
 }
 
 /// Encode a WalOp into a new buffer. Convenience wrapper around `encode_wal_op_into`.
-pub fn encode_wal_op(op: &WalOp) -> Result<Vec<u8>, EngineError> {
+#[cfg(test)]
+pub(crate) fn encode_wal_op(op: &WalOp) -> Result<Vec<u8>, EngineError> {
     let mut buf = Vec::new();
     encode_wal_op_into(op, &mut buf)?;
     Ok(buf)
 }
 
+fn reject_trailing_bytes(cursor: &Cursor<&[u8]>, context: &str) -> Result<(), EngineError> {
+    if remaining_bytes(cursor) != 0 {
+        return Err(EngineError::CorruptRecord(format!(
+            "unexpected trailing bytes in {context}"
+        )));
+    }
+    Ok(())
+}
+
 /// Decode a binary payload into a WalOp.
-pub fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
+pub(crate) fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
     let mut cursor = Cursor::new(data);
 
     let op_tag = read_u8(&mut cursor)?;
@@ -273,11 +283,7 @@ pub fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
                     None
                 };
 
-                if remaining_bytes(&cursor) != 0 {
-                    return Err(EngineError::CorruptRecord(
-                        "unexpected trailing bytes in node WAL op".into(),
-                    ));
-                }
+                reject_trailing_bytes(&cursor, "node WAL op")?;
 
                 (dense_vector, sparse_vector)
             };
@@ -309,6 +315,7 @@ pub fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
 
             let valid_from = read_i64(&mut cursor)?;
             let valid_to = read_i64(&mut cursor)?;
+            reject_trailing_bytes(&cursor, "edge WAL op")?;
 
             Ok(WalOp::UpsertEdge(EdgeRecord {
                 id,
@@ -327,11 +334,13 @@ pub fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
         Some(OpTag::DeleteNode) => {
             let id = read_u64(&mut cursor)?;
             let deleted_at = read_i64(&mut cursor)?;
+            reject_trailing_bytes(&cursor, "delete-node WAL op")?;
             Ok(WalOp::DeleteNode { id, deleted_at })
         }
         Some(OpTag::DeleteEdge) => {
             let id = read_u64(&mut cursor)?;
             let deleted_at = read_i64(&mut cursor)?;
+            reject_trailing_bytes(&cursor, "delete-edge WAL op")?;
             Ok(WalOp::DeleteEdge { id, deleted_at })
         }
         None => Err(EngineError::CorruptRecord(format!(

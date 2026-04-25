@@ -15,7 +15,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let mut all_node_ids = Vec::new();
 
@@ -57,7 +57,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
 
     // Flush to segment 1
     engine.flush().unwrap();
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     // ---- Step 2: Add more nodes, flush to segment 2 ----
     let batch2: Vec<NodeInput> = (500..1000)
@@ -89,7 +89,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
 
     // Flush to segment 2
     engine.flush().unwrap();
-    assert_eq!(engine.segment_count(), 2);
+    assert_eq!(engine.segment_count().unwrap(), 2);
 
     // ---- Step 3: Verify indexes across two segments ----
 
@@ -146,13 +146,13 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
 
     // Flush deletes to a new segment
     engine.flush().unwrap();
-    assert_eq!(engine.segment_count(), 3);
+    assert_eq!(engine.segment_count().unwrap(), 3);
 
     // Compact all 3 segments into 1
     let stats = engine.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 3);
     assert_eq!(stats.nodes_kept, 900); // 1000 - 100 deleted
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     // ---- Step 5: Verify indexes correct after compaction ----
 

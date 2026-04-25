@@ -11,7 +11,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // --- Step 1: Insert 5k nodes ---
     let mut node_ids = Vec::with_capacity(5_000);
@@ -65,7 +65,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
 
     // --- Flush to segment 1 ---
     engine.flush().unwrap();
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     // Measure disk size after first flush
     let size_before = dir_size(&db_path);
@@ -83,7 +83,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
 
     // --- Flush to segment 2 (tombstones go to segment) ---
     engine.flush().unwrap();
-    assert_eq!(engine.segment_count(), 2);
+    assert_eq!(engine.segment_count().unwrap(), 2);
 
     // Disk should be BIGGER now (two segments plus tombstone data)
     let size_after_delete_flush = dir_size(&db_path);
@@ -100,7 +100,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
         .unwrap()
         .expect("should compact 2 segments");
     assert_eq!(stats.segments_merged, 2);
-    assert_eq!(engine.segment_count(), 1); // merged into one
+    assert_eq!(engine.segment_count().unwrap(), 1); // merged into one
 
     // Tombstoned records should be removed
     assert!(
@@ -210,7 +210,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
 
     // --- Step 5: Reopen and verify persistence ---
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     // Spot-check a few surviving nodes
     let spot = node_ids[delete_count + 100];
@@ -233,7 +233,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // --- Build a graph across 3 segments + memtable ---
 
@@ -350,7 +350,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         .unwrap();
     engine.flush().unwrap();
 
-    assert_eq!(engine.segment_count(), 3);
+    assert_eq!(engine.segment_count().unwrap(), 3);
 
     // --- Snapshot: record expected state before compaction ---
     let pre_a = engine.get_node(a).unwrap();
@@ -410,7 +410,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         .unwrap()
         .expect("should compact 3 segments");
     assert_eq!(stats.segments_merged, 3);
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     // --- Post-compaction: all reads should match pre-compaction ---
 
@@ -497,7 +497,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
     // --- Reopen and verify persistence ---
     engine.close().unwrap();
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     // Spot checks after reopen
     assert_eq!(engine.get_node(a).unwrap().unwrap().key, "alpha");

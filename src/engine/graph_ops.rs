@@ -62,10 +62,10 @@ struct LayerBestEntry {
 /// search grows large, the view promotes itself to a fully materialized union
 /// of tombstones for O(1) membership checks thereafter.
 struct TraversalTombstoneView<'a> {
-    memtable_deleted_nodes: &'a NodeIdMap<TombstoneEntry>,
-    memtable_deleted_edges: &'a NodeIdMap<TombstoneEntry>,
+    memtable: &'a Memtable,
+    snapshot_seq: u64,
     immutable_memtables: &'a [ImmutableEpoch],
-    segments: &'a [SegmentReader],
+    segments: &'a [Arc<SegmentReader>],
     deleted_nodes: Option<IdSet>,
     deleted_edges: Option<IdSet>,
     node_cache: IdMap<bool>,
@@ -79,11 +79,12 @@ impl<'a> TraversalTombstoneView<'a> {
     fn new(
         memtable: &'a Memtable,
         immutable_memtables: &'a [ImmutableEpoch],
-        segments: &'a [SegmentReader],
+        segments: &'a [Arc<SegmentReader>],
+        snapshot_seq: u64,
     ) -> Self {
         Self {
-            memtable_deleted_nodes: memtable.deleted_nodes(),
-            memtable_deleted_edges: memtable.deleted_edges(),
+            memtable,
+            snapshot_seq,
             immutable_memtables,
             segments,
             deleted_nodes: None,
@@ -102,11 +103,11 @@ impl<'a> TraversalTombstoneView<'a> {
             return deleted;
         }
 
-        let deleted = self.memtable_deleted_nodes.contains_key(&id)
+        let deleted = self.memtable.is_node_deleted_at(id, self.snapshot_seq)
             || self
                 .immutable_memtables
                 .iter()
-                .any(|epoch| epoch.memtable.deleted_nodes().contains_key(&id))
+                .any(|epoch| epoch.memtable.is_node_deleted_at(id, self.snapshot_seq))
             || self.segments.iter().any(|seg| seg.is_node_deleted(id));
         self.node_cache.insert(id, deleted);
         self.membership_checks += 1;
@@ -122,11 +123,11 @@ impl<'a> TraversalTombstoneView<'a> {
             return deleted;
         }
 
-        let deleted = self.memtable_deleted_edges.contains_key(&id)
+        let deleted = self.memtable.is_edge_deleted_at(id, self.snapshot_seq)
             || self
                 .immutable_memtables
                 .iter()
-                .any(|epoch| epoch.memtable.deleted_edges().contains_key(&id))
+                .any(|epoch| epoch.memtable.is_edge_deleted_at(id, self.snapshot_seq))
             || self.segments.iter().any(|seg| seg.is_edge_deleted(id));
         self.edge_cache.insert(id, deleted);
         self.membership_checks += 1;
@@ -142,11 +143,11 @@ impl<'a> TraversalTombstoneView<'a> {
             return;
         }
 
-        let mut deleted_nodes: IdSet = self.memtable_deleted_nodes.keys().copied().collect();
-        let mut deleted_edges: IdSet = self.memtable_deleted_edges.keys().copied().collect();
+        let mut deleted_nodes = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
+        let mut deleted_edges = self.memtable.collect_deleted_edges_at(self.snapshot_seq);
         for epoch in self.immutable_memtables {
-            deleted_nodes.extend(epoch.memtable.deleted_nodes().keys().copied());
-            deleted_edges.extend(epoch.memtable.deleted_edges().keys().copied());
+            deleted_nodes.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
+            deleted_edges.extend(epoch.memtable.collect_deleted_edges_at(self.snapshot_seq));
         }
         for seg in self.segments {
             deleted_nodes.extend(seg.deleted_node_ids().iter().copied());
@@ -223,260 +224,92 @@ impl UnionFind {
     }
 }
 
-impl DatabaseEngine {
-    // --- Degree cache (Phase 18a2) ---
-
-    /// Rebuild the degree cache from scratch using the walk-based degree logic.
-    /// Enumerates adjacency-bearing node IDs (nodes that appear in memtable
-    /// adjacency maps or segment adjacency indexes), then computes degree
-    /// stats for each using the proven-correct walk path.
-    ///
-    /// Uses `now_millis()` as reference time, matching the default behavior of
-    /// `degree(at_epoch=None)`. The cache accelerates only the `at_epoch=None`
-    /// path, so rebuild semantics must match.
-    ///
-    /// Called at the end of `open()` (after WAL replay + segment loading)
-    /// and after compaction completes.
+impl EngineCore {
+    // Compatibility shim for older internal tests. Phase 20c degree state is
+    // published through active/frozen overlays and segment sidecars, so there
+    // is no live aggregate cache to rebuild.
+    #[allow(dead_code)]
     pub(crate) fn rebuild_degree_cache(&mut self) -> Result<(), EngineError> {
-        let now = now_millis();
-
-        // Collect adjacency-bearing node IDs from active + immutable memtables
-        let mut node_ids: IdSet = IdSet::default();
-        node_ids.extend(self.memtable.adj_out().keys());
-        node_ids.extend(self.memtable.adj_in().keys());
-        for epoch in &self.immutable_epochs {
-            node_ids.extend(epoch.memtable.adj_out().keys());
-            node_ids.extend(epoch.memtable.adj_in().keys());
-        }
-
-        // Collect adjacency-bearing node IDs from segments
-        for seg in &self.segments {
-            node_ids.extend(seg.adj_node_ids()?);
-        }
-
-        // Collect tombstones once (shared across all nodes)
-        let mut deleted_nodes: IdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
-        let mut deleted_edges: IdSet =
-            self.memtable.deleted_edges().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted_nodes.extend(epoch.memtable.deleted_nodes().keys().copied());
-            deleted_edges.extend(epoch.memtable.deleted_edges().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted_nodes.extend(seg.deleted_node_ids());
-            deleted_edges.extend(seg.deleted_edge_ids());
-        }
-
-        // Skip deleted nodes. Their incident edges are tombstoned (cascade),
-        // so walk returns (0, 0.0) and they'd be excluded anyway.
-        node_ids.retain(|id| !deleted_nodes.contains(id));
-
-        let mut cache = NodeIdMap::with_capacity_and_hasher(node_ids.len(), Default::default());
-        let mut seen_edges: IdSet = IdSet::default();
-        for &nid in &node_ids {
-            let (out_deg, out_wsum) = self.degree_stats_raw_walk_inner(
-                nid,
-                Direction::Outgoing,
-                None,
-                now,
-                &deleted_nodes,
-                &deleted_edges,
-                &mut seen_edges,
-            )?;
-            let (in_deg, in_wsum) = self.degree_stats_raw_walk_inner(
-                nid,
-                Direction::Incoming,
-                None,
-                now,
-                &deleted_nodes,
-                &deleted_edges,
-                &mut seen_edges,
-            )?;
-
-            // Walk outgoing edges to count self-loops and temporal edges.
-            // Piggybacks on the same memtable-first / segments-newest-first /
-            // seen_edges dedup pattern as degree_stats_raw_walk.
-            let mut sl_count: u32 = 0;
-            let mut sl_wsum: f64 = 0.0;
-            let mut out_temporal: u32 = 0;
-            let mut sl_temporal: u32 = 0;
-            seen_edges.clear();
-
-            let _ = self.memtable.for_each_adj_entry(
-                nid,
-                Direction::Outgoing,
-                None,
-                &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
-                    seen_edges.insert(edge_id);
-                    if valid_to != i64::MAX || valid_from > now {
-                        out_temporal += 1;
-                        if neighbor_id == nid {
-                            sl_temporal += 1;
-                        }
-                    }
-                    if !is_edge_valid_at(valid_from, valid_to, now) {
-                        return ControlFlow::Continue(());
-                    }
-                    if neighbor_id == nid {
-                        sl_count += 1;
-                        sl_wsum += weight as f64;
-                    }
-                    ControlFlow::Continue(())
-                },
-            );
-            for epoch in &self.immutable_epochs {
-                let _ = epoch.memtable.for_each_adj_entry(
-                    nid,
-                    Direction::Outgoing,
-                    None,
-                    &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
-                        if !seen_edges.insert(edge_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if deleted_edges.contains(&edge_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if deleted_nodes.contains(&neighbor_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if valid_to != i64::MAX || valid_from > now {
-                            out_temporal += 1;
-                            if neighbor_id == nid {
-                                sl_temporal += 1;
-                            }
-                        }
-                        if !is_edge_valid_at(valid_from, valid_to, now) {
-                            return ControlFlow::Continue(());
-                        }
-                        if neighbor_id == nid {
-                            sl_count += 1;
-                            sl_wsum += weight as f64;
-                        }
-                        ControlFlow::Continue(())
-                    },
-                );
-            }
-            for seg in &self.segments {
-                let _ = seg.for_each_adj_posting(
-                    nid,
-                    Direction::Outgoing,
-                    None,
-                    &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
-                        if !seen_edges.insert(edge_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if deleted_edges.contains(&edge_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if deleted_nodes.contains(&neighbor_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if valid_to != i64::MAX || valid_from > now {
-                            out_temporal += 1;
-                            if neighbor_id == nid {
-                                sl_temporal += 1;
-                            }
-                        }
-                        if !is_edge_valid_at(valid_from, valid_to, now) {
-                            return ControlFlow::Continue(());
-                        }
-                        if neighbor_id == nid {
-                            sl_count += 1;
-                            sl_wsum += weight as f64;
-                        }
-                        ControlFlow::Continue(())
-                    },
-                )?;
-            }
-
-            // Walk incoming edges to count temporal incoming edges.
-            let mut in_temporal: u32 = 0;
-            seen_edges.clear();
-            let _ = self.memtable.for_each_adj_entry(
-                nid,
-                Direction::Incoming,
-                None,
-                &mut |edge_id, _neighbor_id, _weight, valid_from, valid_to| {
-                    seen_edges.insert(edge_id);
-                    if valid_to != i64::MAX || valid_from > now {
-                        in_temporal += 1;
-                    }
-                    ControlFlow::Continue(())
-                },
-            );
-            for epoch in &self.immutable_epochs {
-                let _ = epoch.memtable.for_each_adj_entry(
-                    nid,
-                    Direction::Incoming,
-                    None,
-                    &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
-                        if !seen_edges.insert(edge_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if deleted_edges.contains(&edge_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if deleted_nodes.contains(&neighbor_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if valid_to != i64::MAX || valid_from > now {
-                            in_temporal += 1;
-                        }
-                        ControlFlow::Continue(())
-                    },
-                );
-            }
-            for seg in &self.segments {
-                let _ = seg.for_each_adj_posting(
-                    nid,
-                    Direction::Incoming,
-                    None,
-                    &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
-                        if !seen_edges.insert(edge_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if deleted_edges.contains(&edge_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if deleted_nodes.contains(&neighbor_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if valid_to != i64::MAX || valid_from > now {
-                            in_temporal += 1;
-                        }
-                        ControlFlow::Continue(())
-                    },
-                )?;
-            }
-
-            // temporal_edge_count = out_temporal + in_temporal - sl_temporal
-            // (self-loop temporal edges are counted in both directions but
-            // should only count once, matching the self_loop_count pattern)
-            let temporal_edge_count =
-                out_temporal + in_temporal - sl_temporal;
-
-            if out_deg > 0 || in_deg > 0 || temporal_edge_count > 0 {
-                cache.insert(
-                    nid,
-                    DegreeEntry {
-                        out_degree: out_deg as u32,
-                        in_degree: in_deg as u32,
-                        out_weight_sum: out_wsum,
-                        in_weight_sum: in_wsum,
-                        self_loop_count: sl_count,
-                        self_loop_weight_sum: sl_wsum,
-                        temporal_edge_count,
-                    },
-                );
-            }
-        }
-
-        self.degree_cache = cache;
         Ok(())
     }
+}
 
+impl ReadView {
     // --- Degree counts + aggregations (Phase 18a) ---
+
+    pub(crate) fn degree_delta_sum(&self, node_id: u64) -> Option<DegreeDelta> {
+        let mut sum = self.active_degree_overlay.get(node_id);
+        for epoch in &self.immutable_epochs {
+            sum.add_assign_delta(epoch.degree_overlay.get(node_id));
+        }
+        for segment in &self.segments {
+            sum.add_assign_delta(segment.degree_delta(node_id)?);
+        }
+        Some(sum)
+    }
+
+    fn degree_fast_path_globally_eligible(&self, options: &DegreeOptions) -> bool {
+        options.type_filter.is_none()
+            && options.at_epoch.is_none()
+            && self.manifest.prune_policies.is_empty()
+    }
+
+    fn degree_sidecars_available(&self) -> bool {
+        self.segments
+            .iter()
+            .all(|segment| segment.degree_delta_available())
+    }
+
+    fn degree_entry_fast_path(&self, node_id: u64) -> Option<DegreeEntry> {
+        let entry = DegreeEntry::apply_delta(self.degree_delta_sum(node_id)?);
+        if entry.temporal_edge_count == 0 {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    fn degree_entry_stats(entry: DegreeEntry, direction: Direction) -> (u64, f64) {
+        match direction {
+            Direction::Outgoing => {
+                let count = entry.out_degree as u64;
+                let weight = if count == 0 { 0.0 } else { entry.out_weight_sum };
+                (count, weight)
+            }
+            Direction::Incoming => {
+                let count = entry.in_degree as u64;
+                let weight = if count == 0 { 0.0 } else { entry.in_weight_sum };
+                (count, weight)
+            }
+            Direction::Both => {
+                let count = (entry.out_degree as u64)
+                    .saturating_add(entry.in_degree as u64)
+                    .saturating_sub(entry.self_loop_count as u64);
+                let weight = if count == 0 {
+                    0.0
+                } else {
+                    entry.out_weight_sum + entry.in_weight_sum - entry.self_loop_weight_sum
+                };
+                (count, weight)
+            }
+        }
+    }
+
+    fn degree_fast_path_result(
+        &self,
+        node_id: u64,
+        direction: Direction,
+    ) -> Option<(u64, f64)> {
+        self.degree_entry_fast_path(node_id)
+            .map(|entry| Self::degree_entry_stats(entry, direction))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn degree_entry_for_test(&self, node_id: u64) -> DegreeEntry {
+        self.degree_delta_sum(node_id)
+            .map(DegreeEntry::apply_delta)
+            .unwrap_or(DegreeEntry::ZERO)
+    }
 
     /// Walk-based degree stats: merge adjacency postings across memtable +
     /// segments. Deduplicates by edge_id, skips tombstoned edges/nodes,
@@ -526,10 +359,11 @@ impl DatabaseEngine {
 
         // Memtable (local tombstone filtering handled inside).
         // Shadow first: always record edge_id so segment versions can't leak.
-        let _ = self.memtable.for_each_adj_entry(
+        let _ = self.memtable.for_each_adj_entry_at(
             node_id,
             direction,
             type_filter,
+            self.snapshot_seq,
             &mut |edge_id, _neighbor_id, weight, valid_from, valid_to| {
                 seen_edges.insert(edge_id);
                 if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -543,10 +377,11 @@ impl DatabaseEngine {
 
         // Immutable memtables (newest-first).
         for epoch in &self.immutable_epochs {
-            let _ = epoch.memtable.for_each_adj_entry(
+            let _ = epoch.memtable.for_each_adj_entry_at(
                 node_id,
                 direction,
                 type_filter,
+                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     if !seen_edges.insert(edge_id) {
                         return ControlFlow::Continue(());
@@ -639,10 +474,11 @@ impl DatabaseEngine {
 
         let mut seen_edges: IdSet = IdSet::with_capacity_and_hasher(32, Default::default());
 
-        let _ = self.memtable.for_each_adj_entry(
+        let _ = self.memtable.for_each_adj_entry_at(
             node_id,
             direction,
             type_filter,
+            self.snapshot_seq,
             &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                 seen_edges.insert(edge_id);
                 if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -661,10 +497,11 @@ impl DatabaseEngine {
 
         // Immutable memtables (newest-first).
         for epoch in &self.immutable_epochs {
-            let _ = epoch.memtable.for_each_adj_entry(
+            let _ = epoch.memtable.for_each_adj_entry_at(
                 node_id,
                 direction,
                 type_filter,
+                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     if !seen_edges.insert(edge_id) {
                         return ControlFlow::Continue(());
@@ -737,219 +574,150 @@ impl DatabaseEngine {
         Ok((total_count, total_weight))
     }
 
-    /// Count the number of edges incident to a node (its degree).
-    ///
-    /// Counts adjacency postings across memtable + segments without
-    /// materializing the neighbor list. Deduplicates by edge_id and
-    /// skips tombstoned edges/nodes. Applies temporal filtering (edges
-    /// must be valid at `at_epoch`, defaulting to now). Respects prune policies.
-    ///
-    /// - `direction`: `Outgoing`, `Incoming`, or `Both`.
-    /// - `type_filter`: if `Some`, only count edges whose type_id is in the list.
-    /// - `at_epoch`: reference time in epoch millis. `None` → now.
-    ///
-    /// Returns 0 for nonexistent nodes (not an error).
-    pub fn degree(
+    pub(super) fn degree_outcome(
         &self,
         node_id: u64,
         options: &DegreeOptions,
-    ) -> Result<u64, EngineError> {
+    ) -> Result<DegreeQueryOutcome<u64>, EngineError> {
         let direction = options.direction;
-        let type_filter = options.type_filter.as_deref();
-        let at_epoch = options.at_epoch;
-        // O(1) cache path: unfiltered, non-temporal, no prune policies,
-        // and no temporal edges incident to this node (which could expire
-        // and change degree without a mutation).
-        if at_epoch.is_none()
-            && type_filter.is_none()
-            && self.manifest.prune_policies.is_empty()
-        {
-            let entry = self
-                .degree_cache
-                .get(&node_id)
-                .copied()
-                .unwrap_or(DegreeEntry::ZERO);
-            if entry.temporal_edge_count == 0 {
-                return Ok(match direction {
-                    Direction::Outgoing => entry.out_degree as u64,
-                    Direction::Incoming => entry.in_degree as u64,
-                    Direction::Both => {
-                        (entry.out_degree + entry.in_degree - entry.self_loop_count) as u64
-                    }
+        if self.degree_fast_path_globally_eligible(options) {
+            if let Some((count, _)) = self.degree_fast_path_result(node_id, direction) {
+                return Ok(DegreeQueryOutcome {
+                    value: count,
+                    routes: DegreeQueryRouteTally::fast_path(),
                 });
             }
         }
-        let reference_time = at_epoch.unwrap_or_else(now_millis);
+
+        let type_filter = options.type_filter.as_deref();
+        let reference_time = options.at_epoch.unwrap_or_else(now_millis);
         let (count, _) = self.degree_stats(node_id, direction, type_filter, reference_time)?;
-        Ok(count)
+        Ok(DegreeQueryOutcome {
+            value: count,
+            routes: DegreeQueryRouteTally::walk_path(),
+        })
     }
 
-    /// Sum of edge weights incident to a node.
-    ///
-    /// Walks adjacency postings (where weight is embedded as f32) and
-    /// accumulates into f64 for precision. No edge record hydration.
-    /// Applies temporal filtering (edges must be valid at `at_epoch`,
-    /// defaulting to now). Respects prune policies.
-    ///
-    /// - `at_epoch`: reference time in epoch millis. `None` → now.
-    ///
-    /// Returns 0.0 for nonexistent or zero-degree nodes.
-    pub fn sum_edge_weights(
+    pub(super) fn sum_edge_weights_outcome(
         &self,
         node_id: u64,
         options: &DegreeOptions,
-    ) -> Result<f64, EngineError> {
+    ) -> Result<DegreeQueryOutcome<f64>, EngineError> {
         let direction = options.direction;
-        let type_filter = options.type_filter.as_deref();
-        let at_epoch = options.at_epoch;
-        // O(1) cache path
-        if at_epoch.is_none()
-            && type_filter.is_none()
-            && self.manifest.prune_policies.is_empty()
-        {
-            let entry = self
-                .degree_cache
-                .get(&node_id)
-                .copied()
-                .unwrap_or(DegreeEntry::ZERO);
-            if entry.temporal_edge_count == 0 {
-                return Ok(match direction {
-                    Direction::Outgoing => entry.out_weight_sum,
-                    Direction::Incoming => entry.in_weight_sum,
-                    Direction::Both => {
-                        entry.out_weight_sum + entry.in_weight_sum - entry.self_loop_weight_sum
-                    }
+        if self.degree_fast_path_globally_eligible(options) {
+            if let Some((_, weight_sum)) = self.degree_fast_path_result(node_id, direction) {
+                return Ok(DegreeQueryOutcome {
+                    value: weight_sum,
+                    routes: DegreeQueryRouteTally::fast_path(),
                 });
             }
         }
-        let reference_time = at_epoch.unwrap_or_else(now_millis);
+
+        let type_filter = options.type_filter.as_deref();
+        let reference_time = options.at_epoch.unwrap_or_else(now_millis);
         let (_, weight_sum) = self.degree_stats(node_id, direction, type_filter, reference_time)?;
-        Ok(weight_sum)
+        Ok(DegreeQueryOutcome {
+            value: weight_sum,
+            routes: DegreeQueryRouteTally::walk_path(),
+        })
     }
 
-    /// Average edge weight incident to a node.
-    ///
-    /// Returns `None` if the node has zero edges (avoids division by zero).
-    /// Uses f64 accumulator for precision. Applies temporal filtering
-    /// (edges must be valid at `at_epoch`, defaulting to now). Respects
-    /// prune policies.
-    ///
-    /// - `at_epoch`: reference time in epoch millis. `None` → now.
-    pub fn avg_edge_weight(
+    pub(super) fn avg_edge_weight_outcome(
         &self,
         node_id: u64,
         options: &DegreeOptions,
-    ) -> Result<Option<f64>, EngineError> {
+    ) -> Result<DegreeQueryOutcome<Option<f64>>, EngineError> {
         let direction = options.direction;
-        let type_filter = options.type_filter.as_deref();
-        let at_epoch = options.at_epoch;
-        // O(1) cache path
-        if at_epoch.is_none()
-            && type_filter.is_none()
-            && self.manifest.prune_policies.is_empty()
-        {
-            let entry = self
-                .degree_cache
-                .get(&node_id)
-                .copied()
-                .unwrap_or(DegreeEntry::ZERO);
-            if entry.temporal_edge_count == 0 {
-                let (count, weight_sum) = match direction {
-                    Direction::Outgoing => (entry.out_degree as u64, entry.out_weight_sum),
-                    Direction::Incoming => (entry.in_degree as u64, entry.in_weight_sum),
-                    Direction::Both => (
-                        (entry.out_degree + entry.in_degree - entry.self_loop_count) as u64,
-                        entry.out_weight_sum + entry.in_weight_sum - entry.self_loop_weight_sum,
-                    ),
-                };
-                return if count == 0 {
-                    Ok(None)
-                } else {
-                    Ok(Some(weight_sum / count as f64))
-                };
+        if self.degree_fast_path_globally_eligible(options) {
+            if let Some((count, weight_sum)) = self.degree_fast_path_result(node_id, direction) {
+                return Ok(DegreeQueryOutcome {
+                    value: if count == 0 {
+                        None
+                    } else {
+                        Some(weight_sum / count as f64)
+                    },
+                    routes: DegreeQueryRouteTally::fast_path(),
+                });
             }
         }
-        let reference_time = at_epoch.unwrap_or_else(now_millis);
+
+        let type_filter = options.type_filter.as_deref();
+        let reference_time = options.at_epoch.unwrap_or_else(now_millis);
         let (count, weight_sum) =
             self.degree_stats(node_id, direction, type_filter, reference_time)?;
-        if count == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(weight_sum / count as f64))
-        }
+        Ok(DegreeQueryOutcome {
+            value: if count == 0 {
+                None
+            } else {
+                Some(weight_sum / count as f64)
+            },
+            routes: DegreeQueryRouteTally::walk_path(),
+        })
     }
 
-    /// Batch degree counts for multiple nodes. Collects tombstones once, then
-    /// uses a single adaptive cursor walk per segment for all node IDs.
-    ///
-    /// Returns a [`NodeIdMap<u64>`] mapping each queried node_id to its degree.
-    /// `NodeIdMap` is a `HashMap` with identity hashing optimized for
-    /// engine-generated numeric IDs. Nodes with degree 0 are omitted
-    /// (consistent with `neighbors_batch`). Applies temporal filtering
-    /// (edges must be valid at `at_epoch`, defaulting to now). Respects
-    /// prune policies.
-    ///
-    /// - `at_epoch`: reference time in epoch millis. `None` → now.
-    ///
-    /// `node_ids` need not be sorted (sorted internally).
-    pub fn degrees(
+    pub(super) fn degrees_outcome(
         &self,
         node_ids: &[u64],
         options: &DegreeOptions,
-    ) -> Result<NodeIdMap<u64>, EngineError> {
+    ) -> Result<DegreeQueryOutcome<NodeIdMap<u64>>, EngineError> {
         let direction = options.direction;
         let type_filter = options.type_filter.as_deref();
-        let at_epoch = options.at_epoch;
-        // O(1) cache path: N cache lookups instead of batch merge-walk.
-        // Per-node: use cache if temporal_edge_count == 0, else fall through
-        // to walk for that individual node.
-        if at_epoch.is_none()
-            && type_filter.is_none()
-            && self.manifest.prune_policies.is_empty()
-        {
-            let mut counts: NodeIdMap<u64> =
-                NodeIdMap::with_capacity_and_hasher(node_ids.len(), IdBuildHasher::default());
-            let mut walk_needed: Vec<u64> = Vec::new();
-            for &nid in node_ids {
-                let entry = self
-                    .degree_cache
-                    .get(&nid)
-                    .copied()
-                    .unwrap_or(DegreeEntry::ZERO);
-                if entry.temporal_edge_count == 0 {
-                    let deg = match direction {
-                        Direction::Outgoing => entry.out_degree as u64,
-                        Direction::Incoming => entry.in_degree as u64,
-                        Direction::Both => {
-                            (entry.out_degree + entry.in_degree - entry.self_loop_count) as u64
-                        }
-                    };
-                    if deg > 0 {
-                        counts.insert(nid, deg);
-                    }
-                } else {
-                    walk_needed.push(nid);
-                }
-            }
-            if !walk_needed.is_empty() {
-                let now = now_millis();
-                // Batch-walk temporal nodes via degrees_raw (single tombstone
-                // collection + batched segment cursor walks). Safe because
-                // we're already inside the prune_policies.is_empty() guard.
-                let walked = self.degrees_raw(
-                    &walk_needed, direction, type_filter, now,
-                )?;
-                counts.extend(walked);
-            }
-            return Ok(counts);
+        if node_ids.is_empty() {
+            return Ok(DegreeQueryOutcome {
+                value: NodeIdMap::default(),
+                routes: DegreeQueryRouteTally::default(),
+            });
         }
 
-        let reference_time = at_epoch.unwrap_or_else(now_millis);
-        if self.manifest.prune_policies.is_empty() {
-            return self.degrees_raw(node_ids, direction, type_filter, reference_time);
+        if self.degree_fast_path_globally_eligible(options) && self.degree_sidecars_available() {
+            let sorted_ids: Vec<u64> = {
+                let mut ids = node_ids.to_vec();
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            };
+            let mut counts: NodeIdMap<u64> =
+                NodeIdMap::with_capacity_and_hasher(sorted_ids.len(), IdBuildHasher::default());
+            let mut fallback_ids = Vec::new();
+            let mut routes = DegreeQueryRouteTally::default();
+
+            for node_id in sorted_ids {
+                if let Some(entry) = self.degree_entry_fast_path(node_id) {
+                    let (count, _) = Self::degree_entry_stats(entry, direction);
+                    if count > 0 {
+                        counts.insert(node_id, count);
+                    }
+                    routes.add_fast_path();
+                } else {
+                    fallback_ids.push(node_id);
+                    routes.add_walk_path();
+                }
+            }
+
+            if !fallback_ids.is_empty() {
+                let reference_time = now_millis();
+                let fallback =
+                    self.degrees_raw(&fallback_ids, direction, None, reference_time)?;
+                counts.extend(fallback);
+            }
+
+            return Ok(DegreeQueryOutcome {
+                value: counts,
+                routes,
+            });
         }
-        if node_ids.is_empty() {
-            return Ok(NodeIdMap::default());
+
+        let reference_time = options.at_epoch.unwrap_or_else(now_millis);
+        if self.manifest.prune_policies.is_empty() {
+            let value = self.degrees_raw(node_ids, direction, type_filter, reference_time)?;
+            let mut routes = DegreeQueryRouteTally::default();
+            routes.add_walk_paths({
+                let mut ids = node_ids.to_vec();
+                ids.sort_unstable();
+                ids.dedup();
+                ids.len()
+            });
+            return Ok(DegreeQueryOutcome { value, routes });
         }
 
         // Policy path: single walk tracking both total counts AND per-neighbor
@@ -968,28 +736,18 @@ impl DatabaseEngine {
             IdMap::with_capacity_and_hasher(sorted_ids.len(), IdBuildHasher::default());
         let mut all_neighbor_ids: IdSet = IdSet::default();
 
-        let mut deleted_nodes: IdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
-        let mut deleted_edges: IdSet =
-            self.memtable.deleted_edges().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted_nodes.extend(epoch.memtable.deleted_nodes().keys().copied());
-            deleted_edges.extend(epoch.memtable.deleted_edges().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted_nodes.extend(seg.deleted_node_ids());
-            deleted_edges.extend(seg.deleted_edge_ids());
-        }
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
 
         let mut seen_edges: HashSet<(u64, u64)> = HashSet::new();
 
         for &nid in &sorted_ids {
             let mut count: u64 = 0;
             let mut nbr_map: IdMap<u64> = IdMap::default();
-            let _ = self.memtable.for_each_adj_entry(
+            let _ = self.memtable.for_each_adj_entry_at(
                 nid,
                 direction,
                 type_filter,
+                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                     seen_edges.insert((nid, edge_id));
                     if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -1011,10 +769,11 @@ impl DatabaseEngine {
         for epoch in &self.immutable_epochs {
             for &nid in &sorted_ids {
                 let mut count: u64 = 0;
-                let _ = epoch.memtable.for_each_adj_entry(
+                let _ = epoch.memtable.for_each_adj_entry_at(
                     nid,
                     direction,
                     type_filter,
+                    self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((nid, edge_id)) {
                             return ControlFlow::Continue(());
@@ -1096,7 +855,12 @@ impl DatabaseEngine {
         }
 
         counts.retain(|_, &mut v| v > 0);
-        Ok(counts)
+        let mut routes = DegreeQueryRouteTally::default();
+        routes.add_walk_paths(sorted_ids.len());
+        Ok(DegreeQueryOutcome {
+            value: counts,
+            routes,
+        })
     }
 
     /// Raw batch degree counts with no prune policy filtering. Collects
@@ -1124,18 +888,7 @@ impl DatabaseEngine {
             NodeIdMap::with_capacity_and_hasher(sorted_ids.len(), IdBuildHasher::default());
 
         // Collect global tombstones once
-        let mut deleted_nodes: IdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
-        let mut deleted_edges: IdSet =
-            self.memtable.deleted_edges().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted_nodes.extend(epoch.memtable.deleted_nodes().keys().copied());
-            deleted_edges.extend(epoch.memtable.deleted_edges().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted_nodes.extend(seg.deleted_node_ids());
-            deleted_edges.extend(seg.deleted_edge_ids());
-        }
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
 
         // Flat (node_id, edge_id) set for cross-source dedup. Single allocation
         // instead of one HashSet per node
@@ -1144,10 +897,11 @@ impl DatabaseEngine {
         // Memtable pass: shadow first, then temporal filter
         for &nid in &sorted_ids {
             let mut count: u64 = 0;
-            let _ = self.memtable.for_each_adj_entry(
+            let _ = self.memtable.for_each_adj_entry_at(
                 nid,
                 direction,
                 type_filter,
+                self.snapshot_seq,
                 &mut |edge_id, _neighbor_id, _weight, valid_from, valid_to| {
                     seen_edges.insert((nid, edge_id));
                     if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -1166,10 +920,11 @@ impl DatabaseEngine {
         for epoch in &self.immutable_epochs {
             for &nid in &sorted_ids {
                 let mut count: u64 = 0;
-                let _ = epoch.memtable.for_each_adj_entry(
+                let _ = epoch.memtable.for_each_adj_entry_at(
                     nid,
                     direction,
                     type_filter,
+                    self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((nid, edge_id)) {
                             return ControlFlow::Continue(());
@@ -1403,7 +1158,12 @@ impl DatabaseEngine {
             }
         }
 
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
         let mut blocked_hidden: IdSet = IdSet::default();
         let mut visited: IdSet = IdSet::default();
         visited.insert(start);
@@ -1507,19 +1267,10 @@ impl DatabaseEngine {
 
     /// Collect global tombstones once for use across BFS/Dijkstra iterations.
     fn collect_tombstones(&self) -> (IdSet, IdSet) {
-        let mut deleted_nodes: IdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
-        let mut deleted_edges: IdSet =
-            self.memtable.deleted_edges().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted_nodes.extend(epoch.memtable.deleted_nodes().keys().copied());
-            deleted_edges.extend(epoch.memtable.deleted_edges().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted_nodes.extend(seg.deleted_node_ids());
-            deleted_edges.extend(seg.deleted_edge_ids());
-        }
-        (deleted_nodes, deleted_edges)
+        (
+            self.sources().collect_deleted_nodes(),
+            self.sources().collect_deleted_edges(),
+        )
     }
 
     fn traversal_after_cursor(cursor: Option<&TraversalCursor>, depth: u32, node_id: u64) -> bool {
@@ -1607,10 +1358,11 @@ impl DatabaseEngine {
         for &nid in &sorted_ids {
             if self
                 .memtable
-                .for_each_adj_entry(
+                .for_each_adj_entry_at(
                     nid,
                     direction,
                     edge_type_filter,
+                    self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         seen_edges.insert((nid, edge_id));
                         if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -1630,10 +1382,11 @@ impl DatabaseEngine {
             for &nid in &sorted_ids {
                 if epoch
                     .memtable
-                    .for_each_adj_entry(
+                    .for_each_adj_entry_at(
                         nid,
                         direction,
                         edge_type_filter,
+                        self.snapshot_seq,
                         &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                             if !seen_edges.insert((nid, edge_id)) {
                                 return ControlFlow::Continue(());
@@ -2053,7 +1806,12 @@ impl DatabaseEngine {
             return Ok(successors);
         }
 
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
         let mut blocked_hidden: IdSet = IdSet::default();
         let mut frontier = vec![from];
         let mut discovered: IdSet = IdSet::default();
@@ -2217,7 +1975,12 @@ impl DatabaseEngine {
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<IdMap<Vec<(u64, u64)>>, EngineError> {
         let mut successors: IdMap<Vec<(u64, u64)>> = IdMap::default();
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
         let mut scratch = SearchNeighborScratch::default();
         let mut weight_cache: IdMap<f64> = IdMap::default();
 
@@ -2274,7 +2037,12 @@ impl DatabaseEngine {
         let layer_count = max_depth as usize + 1;
         let mut successors: Vec<IdMap<Vec<(u64, u64)>>> =
             (0..layer_count).map(|_| IdMap::default()).collect();
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
         let mut scratch = SearchNeighborScratch::default();
         let mut weight_cache: IdMap<f64> = IdMap::default();
 
@@ -2488,7 +2256,12 @@ impl DatabaseEngine {
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<Option<ShortestPath>, EngineError> {
         let bwd_direction = Self::reverse_direction(direction);
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
 
         // Forward state
         let mut fwd_frontier: Vec<u64> = vec![from];
@@ -2656,7 +2429,12 @@ impl DatabaseEngine {
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<bool, EngineError> {
         let bwd_direction = Self::reverse_direction(direction);
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
 
         let mut fwd_frontier: Vec<u64> = vec![from];
         let mut fwd_visited: IdSet = IdSet::default();
@@ -2873,10 +2651,11 @@ impl DatabaseEngine {
 
         if self
             .memtable
-            .for_each_adj_entry(
+            .for_each_adj_entry_at(
                 node_id,
                 direction,
                 edge_type_filter,
+                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     scratch.seen_edges.insert(edge_id);
                     if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -2913,10 +2692,11 @@ impl DatabaseEngine {
             callback_error = None;
             if epoch
                 .memtable
-                .for_each_adj_entry(
+                .for_each_adj_entry_at(
                     node_id,
                     direction,
                     edge_type_filter,
+                    self.snapshot_seq,
                     &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                         if !scratch.seen_edges.insert(edge_id) {
                             return ControlFlow::Continue(());
@@ -3056,7 +2836,12 @@ impl DatabaseEngine {
 
         let mut mu = f64::INFINITY;
         let mut meeting_node: Option<u64> = None;
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
         let mut scratch = SearchNeighborScratch::default();
         let mut weight_cache: IdMap<f64> = IdMap::default();
 
@@ -3273,7 +3058,12 @@ impl DatabaseEngine {
 
         let mut mu = f64::INFINITY;
         let mut best_meeting: Option<(u64, u32, u32)> = None;
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
         let mut scratch = SearchNeighborScratch::default();
         let mut weight_cache: IdMap<f64> = IdMap::default();
 
@@ -3579,7 +3369,12 @@ impl DatabaseEngine {
         } else {
             max_paths
         };
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
         let mut blocked_hidden: IdSet = IdSet::default();
         let mut fwd_frontier: Vec<u64> = vec![from];
         let mut bwd_frontier: Vec<u64> = vec![to];
@@ -3839,7 +3634,12 @@ impl DatabaseEngine {
         bwd_dist.insert(to, 0.0);
 
         let mut mu = f64::INFINITY;
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
         let mut scratch = SearchNeighborScratch::default();
         let mut weight_cache: IdMap<f64> = IdMap::default();
 
@@ -4132,7 +3932,12 @@ impl DatabaseEngine {
 
         let mut mu = f64::INFINITY;
         let mut best_meeting: Option<(u64, u32, u32)> = None;
-        let mut tombstones = TraversalTombstoneView::new(&self.memtable, &self.immutable_epochs, &self.segments);
+        let mut tombstones = TraversalTombstoneView::new(
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+            self.snapshot_seq,
+        );
         let mut scratch = SearchNeighborScratch::default();
         let mut weight_cache: IdMap<f64> = IdMap::default();
 
@@ -4878,12 +4683,16 @@ impl DatabaseEngine {
         let reference_time = at_epoch.unwrap_or(now);
 
         // Start with memtable results (fetch without limit to allow for temporal filtering)
-        let mut results = self.memtable.neighbors(node_id, direction, type_filter, 0);
+        let mut results =
+            self.memtable
+                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
         let mut seen_edges: IdSet = results.iter().map(|e| e.edge_id).collect();
 
         // Immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
-            let mt_results = epoch.memtable.neighbors(node_id, direction, type_filter, 0);
+            let mt_results = epoch
+                .memtable
+                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
             for entry in mt_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -5109,18 +4918,7 @@ impl DatabaseEngine {
         };
 
         // Collect all tombstoned node and edge IDs ONCE
-        let mut deleted_nodes: IdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
-        let mut deleted_edges: IdSet =
-            self.memtable.deleted_edges().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted_nodes.extend(epoch.memtable.deleted_nodes().keys().copied());
-            deleted_edges.extend(epoch.memtable.deleted_edges().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted_nodes.extend(seg.deleted_node_ids());
-            deleted_edges.extend(seg.deleted_edge_ids());
-        }
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
 
         let now = now_millis();
         let reference_time = at_epoch.unwrap_or(now);
@@ -5128,7 +4926,7 @@ impl DatabaseEngine {
         // Start with memtable results.
         let mut results = self
             .memtable
-            .neighbors_batch(&sorted_ids, direction, type_filter);
+            .neighbors_batch_at(&sorted_ids, direction, type_filter, self.snapshot_seq);
 
         // Track seen edge IDs per node for dedup (memtable/newer segment wins)
         let mut seen_edges: NodeIdMap<NodeIdSet> = NodeIdMap::default();
@@ -5141,7 +4939,12 @@ impl DatabaseEngine {
 
         // Immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
-            let mt_results = epoch.memtable.neighbors_batch(&sorted_ids, direction, type_filter);
+            let mt_results = epoch.memtable.neighbors_batch_at(
+                &sorted_ids,
+                direction,
+                type_filter,
+                self.snapshot_seq,
+            );
             for (nid, mt_entries) in mt_results {
                 let seen = seen_edges.entry(nid).or_default();
                 let node_entries = results.entry(nid).or_default();
@@ -5247,18 +5050,7 @@ impl DatabaseEngine {
         }
 
         // Collect all tombstoned node and edge IDs across memtable + immutable memtables + segments
-        let mut deleted_nodes: IdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
-        let mut deleted_edges: IdSet =
-            self.memtable.deleted_edges().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted_nodes.extend(epoch.memtable.deleted_nodes().keys().copied());
-            deleted_edges.extend(epoch.memtable.deleted_edges().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted_nodes.extend(seg.deleted_node_ids());
-            deleted_edges.extend(seg.deleted_edge_ids());
-        }
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
 
         let now = now_millis();
         let reference_time = at_epoch.unwrap_or(now);
@@ -5267,11 +5059,17 @@ impl DatabaseEngine {
         let has_policies = !self.manifest.prune_policies.is_empty();
 
         // Collect sources: memtable (unsorted) + immutable memtables + segments (sorted by edge_id)
-        let memtable_entries = self.memtable.neighbors(node_id, direction, type_filter, 0);
+        let memtable_entries =
+            self.memtable
+                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
         let mut segment_entries: Vec<Vec<NeighborEntry>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
         for epoch in &self.immutable_epochs {
-            segment_entries.push(epoch.memtable.neighbors(node_id, direction, type_filter, 0));
+            segment_entries.push(
+                epoch
+                    .memtable
+                    .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq),
+            );
         }
         for seg in &self.segments {
             segment_entries.push(seg.neighbors(node_id, direction, type_filter, 0)?);
@@ -5484,24 +5282,15 @@ impl DatabaseEngine {
         }
 
         // Collect all tombstoned node and edge IDs
-        let mut deleted_nodes: IdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
-        let mut deleted_edges: IdSet =
-            self.memtable.deleted_edges().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted_nodes.extend(epoch.memtable.deleted_nodes().keys().copied());
-            deleted_edges.extend(epoch.memtable.deleted_edges().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted_nodes.extend(seg.deleted_node_ids());
-            deleted_edges.extend(seg.deleted_edge_ids());
-        }
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
 
         let now = now_millis();
         let reference_time = at_epoch.unwrap_or(now);
 
         // Gather all neighbors from memtable + immutable memtables + segments with dedup + deletion filter
-        let mut all_entries = self.memtable.neighbors(node_id, direction, type_filter, 0);
+        let mut all_entries =
+            self.memtable
+                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
         // Filter memtable results against deleted sets (M2 fix)
         all_entries
             .retain(|e| !deleted_edges.contains(&e.edge_id) && !deleted_nodes.contains(&e.node_id));
@@ -5509,7 +5298,9 @@ impl DatabaseEngine {
 
         // Immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
-            let mt_results = epoch.memtable.neighbors(node_id, direction, type_filter, 0);
+            let mt_results = epoch
+                .memtable
+                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
             for entry in mt_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -5758,9 +5549,9 @@ impl DatabaseEngine {
         // 1. Collect all visible node IDs (policy-filtered, type-filtered).
         let node_types: Vec<u32> = {
             let mut types: HashSet<u32> =
-                self.memtable.type_node_index().keys().copied().collect();
+                self.memtable.visible_types(self.snapshot_seq).into_iter().collect();
             for epoch in &self.immutable_epochs {
-                types.extend(epoch.memtable.type_node_index().keys().copied());
+                types.extend(epoch.memtable.visible_types(self.snapshot_seq));
             }
             for seg in &self.segments {
                 for tid in seg.node_type_ids()? {
@@ -5812,27 +5603,17 @@ impl DatabaseEngine {
         //    unions endpoints inline during the cursor walk.
         let reference_time = at_epoch.unwrap_or_else(now_millis);
 
-        let mut deleted_nodes: IdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
-        let mut deleted_edges: IdSet =
-            self.memtable.deleted_edges().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted_nodes.extend(epoch.memtable.deleted_nodes().keys().copied());
-            deleted_edges.extend(epoch.memtable.deleted_edges().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted_nodes.extend(seg.deleted_node_ids());
-            deleted_edges.extend(seg.deleted_edge_ids());
-        }
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
 
         let mut seen_edges: HashSet<(u64, u64)> = HashSet::new();
 
         // Memtable pass (per-node callback).
         for &nid in &node_ids {
-            let _ = self.memtable.for_each_adj_entry(
+            let _ = self.memtable.for_each_adj_entry_at(
                 nid,
                 Direction::Outgoing,
                 edge_type_filter,
+                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                     seen_edges.insert((nid, edge_id));
                     if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -5849,10 +5630,11 @@ impl DatabaseEngine {
         // Immutable memtable passes (newest-first).
         for epoch in &self.immutable_epochs {
             for &nid in &node_ids {
-                let _ = epoch.memtable.for_each_adj_entry(
+                let _ = epoch.memtable.for_each_adj_entry_at(
                     nid,
                     Direction::Outgoing,
                     edge_type_filter,
+                    self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((nid, edge_id)) {
                             return ControlFlow::Continue(());

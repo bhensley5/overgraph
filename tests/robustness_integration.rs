@@ -32,7 +32,7 @@ fn test_crash_recovery_wal_replay() {
 
     // Phase 1: write data, flush some to segment, leave some in WAL only
     {
-        let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
         node_a = db
             .upsert_node(
                 1,
@@ -141,7 +141,7 @@ fn test_crash_recovery_with_deletes() {
     let node_b;
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
         node_a = db
             .upsert_node(1, "a", UpsertNodeOptions::default())
             .unwrap();
@@ -197,7 +197,7 @@ fn test_large_scale_100k_nodes() {
         ..DbOptions::default()
     };
 
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Batch insert 100k nodes in chunks
     let chunk_size = 10_000;
@@ -305,7 +305,7 @@ fn test_engine_manifest_corruption_recovery() {
 
     // Write data and flush to create a manifest
     {
-        let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
         db.upsert_node(1, "a", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
@@ -352,7 +352,7 @@ fn test_engine_wal_truncated_record_recovery() {
 
     // Write valid data
     {
-        let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
         node_a = db
             .upsert_node(
                 1,
@@ -408,7 +408,7 @@ fn test_temporal_edges_cross_source() {
         ..DbOptions::default()
     };
 
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
         .unwrap();

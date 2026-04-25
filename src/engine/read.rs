@@ -306,7 +306,7 @@ fn collect_top_k_from_scores(scores: NodeIdMap<f32>, k: usize) -> Vec<VectorHit>
     hits
 }
 
-impl DatabaseEngine {
+impl ReadView {
     // --- Read-time policy filtering ---
 
     /// Check if a single node is excluded by any registered prune policy.
@@ -316,7 +316,7 @@ impl DatabaseEngine {
             return false;
         }
         let now = now_millis();
-        let cutoffs = PrecomputedPruneCutoffs::from_manifest(&self.manifest, now);
+        let cutoffs = PrecomputedPruneCutoffs::from_policies(&self.manifest.prune_policies, now);
         cutoffs.excludes(node)
     }
 
@@ -327,7 +327,8 @@ impl DatabaseEngine {
         if self.manifest.prune_policies.is_empty() || node_ids.is_empty() {
             return Ok(NodeIdSet::default());
         }
-        let cutoffs = PrecomputedPruneCutoffs::from_manifest(&self.manifest, now_millis());
+        let cutoffs =
+            PrecomputedPruneCutoffs::from_policies(&self.manifest.prune_policies, now_millis());
         let records = self.get_nodes_raw(node_ids)?;
         let mut excluded = NodeIdSet::default();
         for (i, slot) in records.iter().enumerate() {
@@ -346,8 +347,8 @@ impl DatabaseEngine {
         if self.manifest.prune_policies.is_empty() {
             None
         } else {
-            Some(PrecomputedPruneCutoffs::from_manifest(
-                &self.manifest,
+            Some(PrecomputedPruneCutoffs::from_policies(
+                &self.manifest.prune_policies,
                 now_millis(),
             ))
         }
@@ -408,94 +409,37 @@ impl DatabaseEngine {
         Ok(visible.contains(&from) && visible.contains(&to))
     }
 
-    fn record_equality_scan_fallback_route(&self) {
-        #[cfg(test)]
-        self.property_query_routes
-            .equality_scan_fallback
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_equality_index_lookup_route(&self) {
-        #[cfg(test)]
-        self.property_query_routes
-            .equality_index_lookup
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_range_scan_fallback_route(&self) {
-        #[cfg(test)]
-        self.property_query_routes
-            .range_scan_fallback
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_range_index_lookup_route(&self) {
-        #[cfg(test)]
-        self.property_query_routes
-            .range_index_lookup
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn degrade_ready_equality_index_after_sidecar_failure(
+    fn equality_sidecar_failure_followup(
         &self,
         index_id: u64,
-        error: Option<&EngineError>,
-    ) {
-        let next_state = if error.is_some_and(|error| !is_not_found_io_error(error)) {
+        error: Option<EngineError>,
+    ) -> Option<SecondaryIndexReadFollowup> {
+        let next_state = if error
+            .as_ref()
+            .is_some_and(|error| !is_not_found_io_error(error))
+        {
             SecondaryIndexState::Failed
         } else {
             SecondaryIndexState::Building
         };
         let next_last_error = if next_state == SecondaryIndexState::Failed {
-            error.map(ToString::to_string)
+            error.as_ref().map(ToString::to_string)
         } else {
             None
         };
 
-        let Some(current_entry) = self
-            .secondary_index_entries_snapshot()
-            .into_iter()
-            .find(|entry| entry.index_id == index_id)
-        else {
-            return;
-        };
+        let current_entry = self
+            .secondary_index_entries
+            .iter()
+            .find(|entry| entry.index_id == index_id)?;
         if !matches!(current_entry.kind, SecondaryIndexKind::Equality) {
-            return;
+            return None;
         }
-        let should_queue_build = next_state == SecondaryIndexState::Building
-            && current_entry.state != SecondaryIndexState::Building;
         if current_entry.state == next_state && current_entry.last_error == next_last_error {
-            return;
+            return None;
         }
 
-        let _ = update_secondary_index_manifest_runtime(
-            &self.db_dir,
-            &self.manifest_write_lock,
-            &self.secondary_index_catalog,
-            &self.secondary_index_entries,
-            &self.next_node_id_seen,
-            &self.next_edge_id_seen,
-            &self.engine_seq_seen,
-            |manifest| {
-                if let Some(entry) = manifest
-                    .secondary_indexes
-                    .iter_mut()
-                    .find(|entry| entry.index_id == index_id)
-                {
-                    if matches!(entry.kind, SecondaryIndexKind::Equality) {
-                        entry.state = next_state;
-                        entry.last_error = next_last_error.clone();
-                    }
-                }
-                Ok(())
-            },
-        );
-
-        if should_queue_build {
-            if let Some(bg) = &self.secondary_index_bg {
-                let _ = bg.job_tx.send(SecondaryIndexJob::Build { index_id });
-            }
-        }
+        Some(SecondaryIndexReadFollowup::EqualitySidecarFailure { index_id, error })
     }
 
     fn ready_equality_verified_node_ids(
@@ -539,13 +483,18 @@ impl DatabaseEngine {
         index_id: u64,
         prop_key: &str,
         prop_value: &PropValue,
-    ) -> Result<Option<ReadyEqualitySourceIds>, EngineError> {
+    ) -> Result<
+        (
+            Option<ReadyEqualitySourceIds>,
+            Option<SecondaryIndexReadFollowup>,
+        ),
+        EngineError,
+    > {
         let memtable_ids = self
             .memtable
-            .find_secondary_eq_nodes(index_id, prop_key, prop_value);
+            .find_secondary_eq_nodes_at(index_id, prop_key, prop_value, self.snapshot_seq);
         let mut memtable_verified: NodeIdSet = memtable_ids.iter().copied().collect();
-        let mut deleted_above: NodeIdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
+        let mut deleted_above = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
         let value_hash = hash_prop_value(prop_value);
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
@@ -553,13 +502,13 @@ impl DatabaseEngine {
         for epoch in &self.immutable_epochs {
             let ids: Vec<u64> = epoch
                 .memtable
-                .find_secondary_eq_nodes(index_id, prop_key, prop_value)
+                .find_secondary_eq_nodes_at(index_id, prop_key, prop_value, self.snapshot_seq)
                 .into_iter()
                 .filter(|id| !deleted_above.contains(id))
                 .collect();
             memtable_verified.extend(ids.iter().copied());
             segment_ids.push(ids);
-            deleted_above.extend(epoch.memtable.deleted_nodes().keys().copied());
+            deleted_above.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
         }
 
         for seg in &self.segments {
@@ -567,12 +516,13 @@ impl DatabaseEngine {
             {
                 Ok(Some(ids)) => ids,
                 Ok(None) => {
-                    self.degrade_ready_equality_index_after_sidecar_failure(index_id, None);
-                    return Ok(None);
+                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
                 }
                 Err(error) => {
-                    self.degrade_ready_equality_index_after_sidecar_failure(index_id, Some(&error));
-                    return Ok(None);
+                    return Ok((
+                        None,
+                        self.equality_sidecar_failure_followup(index_id, Some(error)),
+                    ));
                 }
             };
             let ids: Vec<u64> = ids
@@ -583,69 +533,40 @@ impl DatabaseEngine {
             deleted_above.extend(seg.deleted_node_ids());
         }
 
-        Ok(Some((memtable_ids, segment_ids, memtable_verified)))
+        Ok((Some((memtable_ids, segment_ids, memtable_verified)), None))
     }
 
-    fn degrade_ready_range_index_after_sidecar_failure(
+    fn range_sidecar_failure_followup(
         &self,
         index_id: u64,
-        error: Option<&EngineError>,
-    ) {
-        let next_state = if error.is_some_and(|error| !is_not_found_io_error(error)) {
+        error: Option<EngineError>,
+    ) -> Option<SecondaryIndexReadFollowup> {
+        let next_state = if error
+            .as_ref()
+            .is_some_and(|error| !is_not_found_io_error(error))
+        {
             SecondaryIndexState::Failed
         } else {
             SecondaryIndexState::Building
         };
         let next_last_error = if next_state == SecondaryIndexState::Failed {
-            error.map(ToString::to_string)
+            error.as_ref().map(ToString::to_string)
         } else {
             None
         };
 
-        let Some(current_entry) = self
-            .secondary_index_entries_snapshot()
-            .into_iter()
-            .find(|entry| entry.index_id == index_id)
-        else {
-            return;
-        };
+        let current_entry = self
+            .secondary_index_entries
+            .iter()
+            .find(|entry| entry.index_id == index_id)?;
         if !matches!(current_entry.kind, SecondaryIndexKind::Range { .. }) {
-            return;
+            return None;
         }
-        let should_queue_build = next_state == SecondaryIndexState::Building
-            && current_entry.state != SecondaryIndexState::Building;
         if current_entry.state == next_state && current_entry.last_error == next_last_error {
-            return;
+            return None;
         }
 
-        let _ = update_secondary_index_manifest_runtime(
-            &self.db_dir,
-            &self.manifest_write_lock,
-            &self.secondary_index_catalog,
-            &self.secondary_index_entries,
-            &self.next_node_id_seen,
-            &self.next_edge_id_seen,
-            &self.engine_seq_seen,
-            |manifest| {
-                if let Some(entry) = manifest
-                    .secondary_indexes
-                    .iter_mut()
-                    .find(|entry| entry.index_id == index_id)
-                {
-                    if matches!(entry.kind, SecondaryIndexKind::Range { .. }) {
-                        entry.state = next_state;
-                        entry.last_error = next_last_error.clone();
-                    }
-                }
-                Ok(())
-            },
-        );
-
-        if should_queue_build {
-            if let Some(bg) = &self.secondary_index_bg {
-                let _ = bg.job_tx.send(SecondaryIndexJob::Build { index_id });
-            }
-        }
+        Some(SecondaryIndexReadFollowup::RangeSidecarFailure { index_id, error })
     }
 
     fn nodes_by_type_paged_unfiltered(
@@ -653,12 +574,12 @@ impl DatabaseEngine {
         type_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        let (deleted, _) = self.collect_tombstones();
-        let memtable_ids = self.memtable.nodes_by_type(type_id);
+        let deleted = self.sources().collect_deleted_nodes();
+        let memtable_ids = self.memtable.visible_nodes_by_type(type_id, self.snapshot_seq);
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
         for epoch in &self.immutable_epochs {
-            segment_ids.push(epoch.memtable.nodes_by_type(type_id));
+            segment_ids.push(epoch.memtable.visible_nodes_by_type(type_id, self.snapshot_seq));
         }
         for seg in &self.segments {
             segment_ids.push(seg.nodes_by_type(type_id)?);
@@ -898,16 +819,15 @@ impl DatabaseEngine {
         index_id: u64,
         prop_key: &str,
         prop_value: &PropValue,
-    ) -> Result<Option<Vec<u64>>, EngineError> {
-        Ok(self
-            .find_nodes_paged_ready_equality_index(
-                type_id,
-                index_id,
-                prop_key,
-                prop_value,
-                &PageRequest::default(),
-            )?
-            .map(|page| page.items))
+    ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        let (page, followup) = self.find_nodes_paged_ready_equality_index(
+            type_id,
+            index_id,
+            prop_key,
+            prop_value,
+            &PageRequest::default(),
+        )?;
+        Ok((page.map(|page| page.items), followup))
     }
 
     fn find_nodes_paged_ready_equality_index(
@@ -917,11 +837,16 @@ impl DatabaseEngine {
         prop_key: &str,
         prop_value: &PropValue,
         page: &PageRequest,
-    ) -> Result<Option<PageResult<u64>>, EngineError> {
-        let Some((memtable_ids, segment_ids, memtable_verified)) =
-            self.ready_equality_source_ids(index_id, prop_key, prop_value)?
-        else {
-            return Ok(None);
+    ) -> Result<
+        (
+            Option<PageResult<u64>>,
+            Option<SecondaryIndexReadFollowup>,
+        ),
+        EngineError,
+    > {
+        let (sources, followup) = self.ready_equality_source_ids(index_id, prop_key, prop_value)?;
+        let Some((memtable_ids, segment_ids, memtable_verified)) = sources else {
+            return Ok((None, followup));
         };
 
         let deleted = NodeIdSet::default();
@@ -945,10 +870,13 @@ impl DatabaseEngine {
                 .into_iter()
                 .filter(|id| visible.contains(id) && !excluded.contains(id))
                 .collect();
-            Ok(Some(PageResult {
-                items,
-                next_cursor: None,
-            }))
+            Ok((
+                Some(PageResult {
+                    items,
+                    next_cursor: None,
+                }),
+                followup,
+            ))
         } else {
             let chunk_limit = limit.saturating_mul(4).max(limit);
             let mut collected = Vec::with_capacity(limit);
@@ -966,10 +894,13 @@ impl DatabaseEngine {
                     &chunk_page,
                 );
                 if merged.items.is_empty() {
-                    return Ok(Some(PageResult {
-                        items: collected,
-                        next_cursor: None,
-                    }));
+                    return Ok((
+                        Some(PageResult {
+                            items: collected,
+                            next_cursor: None,
+                        }),
+                        followup,
+                    ));
                 }
 
                 let visible = self.ready_equality_verified_node_ids(
@@ -984,20 +915,26 @@ impl DatabaseEngine {
                     if visible.contains(&id) && !excluded.contains(&id) {
                         collected.push(id);
                         if collected.len() >= limit {
-                            return Ok(Some(PageResult {
-                                items: collected,
-                                next_cursor: Some(id),
-                            }));
+                            return Ok((
+                                Some(PageResult {
+                                    items: collected,
+                                    next_cursor: Some(id),
+                                }),
+                                followup,
+                            ));
                         }
                     }
                     cursor = Some(id);
                 }
 
                 if merged.next_cursor.is_none() {
-                    return Ok(Some(PageResult {
-                        items: collected,
-                        next_cursor: None,
-                    }));
+                    return Ok((
+                        Some(PageResult {
+                            items: collected,
+                            next_cursor: None,
+                        }),
+                        followup,
+                    ));
                 }
             }
         }
@@ -1055,29 +992,6 @@ impl DatabaseEngine {
         })
     }
 
-    fn range_seek_start(
-        lower: Option<(u64, bool)>,
-        after: Option<(u64, u64)>,
-    ) -> Option<((u64, u64), bool)> {
-        let mut start = lower.map(|(encoded_value, inclusive)| {
-            if inclusive {
-                ((encoded_value, 0), false)
-            } else {
-                ((encoded_value, u64::MAX), true)
-            }
-        });
-        if let Some(after) = after {
-            let after_start = (after, true);
-            start = Some(match start {
-                Some(existing) if existing.0 > after_start.0 => existing,
-                Some(existing) if existing.0 < after_start.0 => after_start,
-                Some(existing) => (existing.0, existing.1 || after_start.1),
-                None => after_start,
-            });
-        }
-        start
-    }
-
     fn ready_range_chunk_limit(limit: usize) -> usize {
         if limit == 0 {
             512
@@ -1090,13 +1004,15 @@ impl DatabaseEngine {
         owners: &mut NodeIdMap<usize>,
         source_idx: usize,
         memtable: &Memtable,
+        snapshot_seq: u64,
     ) {
-        for node_id in memtable.deleted_nodes().keys().copied() {
+        for node_id in memtable.collect_deleted_nodes_at(snapshot_seq) {
             owners.entry(node_id).or_insert(source_idx);
         }
-        for node_id in memtable.nodes().keys().copied() {
-            owners.entry(node_id).or_insert(source_idx);
-        }
+        let _ = memtable.for_each_visible_node_at(snapshot_seq, &mut |node| {
+            owners.entry(node.id).or_insert(source_idx);
+            ControlFlow::Continue(())
+        });
     }
 
     fn record_ready_range_segment_owners(
@@ -1119,37 +1035,11 @@ impl DatabaseEngine {
         lower: Option<(u64, bool)>,
         upper: Option<(u64, bool)>,
         after: Option<(u64, u64)>,
+        snapshot_seq: u64,
     ) -> ReadyRangeSource<'a> {
-        use std::ops::Bound;
-
-        let upper_bound = upper;
-        let iter: Box<dyn Iterator<Item = (u64, u64)> + 'a> =
-            if let Some(entries) = memtable.secondary_range_state().get(&index_id) {
-                let in_upper_bound = move |entry: &(u64, u64)| {
-                    upper_bound.is_none_or(|(upper_value, inclusive)| {
-                        entry.0 < upper_value || (inclusive && entry.0 == upper_value)
-                    })
-                };
-
-                match Self::range_seek_start(lower, after) {
-                    Some((target, strict)) => {
-                        let bound = if strict {
-                            Bound::Excluded(target)
-                        } else {
-                            Bound::Included(target)
-                        };
-                        Box::new(
-                            entries
-                                .range((bound, Bound::Unbounded))
-                                .copied()
-                                .take_while(in_upper_bound),
-                        )
-                    }
-                    None => Box::new(entries.iter().copied().take_while(in_upper_bound)),
-                }
-            } else {
-                Box::new(std::iter::empty())
-            };
+        let entries =
+            memtable.visible_secondary_range_entries(index_id, lower, upper, after, snapshot_seq);
+        let iter: Box<dyn Iterator<Item = (u64, u64)> + 'a> = Box::new(entries.into_iter());
 
         ReadyRangeSource {
             kind: ReadyRangeSourceKind::Iter(iter),
@@ -1188,6 +1078,7 @@ impl DatabaseEngine {
             .is_some_and(|owner_idx| *owner_idx < source_idx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn find_nodes_paged_ready_range_index(
         &self,
         type_id: u32,
@@ -1197,7 +1088,13 @@ impl DatabaseEngine {
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         page: &PropertyRangePageRequest,
-    ) -> Result<Option<PropertyRangePageResult<u64>>, EngineError> {
+    ) -> Result<
+        (
+            Option<PropertyRangePageResult<u64>>,
+            Option<SecondaryIndexReadFollowup>,
+        ),
+        EngineError,
+    > {
         let lower_encoded = Self::encode_property_range_bound(domain, lower);
         let upper_encoded = Self::encode_property_range_bound(domain, upper);
         let after_encoded = Self::encode_property_range_cursor(domain, page.after.as_ref());
@@ -1212,19 +1109,26 @@ impl DatabaseEngine {
 
         let mut owners = NodeIdMap::default();
         let mut sources = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
-        Self::record_ready_range_memtable_owners(&mut owners, sources.len(), &self.memtable);
+        Self::record_ready_range_memtable_owners(
+            &mut owners,
+            sources.len(),
+            &self.memtable,
+            self.snapshot_seq,
+        );
         sources.push(Self::ready_range_memtable_source(
             &self.memtable,
             index_id,
             lower_encoded,
             upper_encoded,
             after_encoded,
+            self.snapshot_seq,
         ));
         for epoch in &self.immutable_epochs {
             Self::record_ready_range_memtable_owners(
                 &mut owners,
                 sources.len(),
                 epoch.memtable.as_ref(),
+                self.snapshot_seq,
             );
             sources.push(Self::ready_range_memtable_source(
                 epoch.memtable.as_ref(),
@@ -1232,6 +1136,7 @@ impl DatabaseEngine {
                 lower_encoded,
                 upper_encoded,
                 after_encoded,
+                self.snapshot_seq,
             ));
         }
         for seg in &self.segments {
@@ -1255,12 +1160,13 @@ impl DatabaseEngine {
                 }
                 Ok(ReadyRangeSourceStep::Exhausted) => {}
                 Ok(ReadyRangeSourceStep::MissingSidecar) => {
-                    self.degrade_ready_range_index_after_sidecar_failure(index_id, None);
-                    return Ok(None);
+                    return Ok((None, self.range_sidecar_failure_followup(index_id, None)));
                 }
                 Err(error) => {
-                    self.degrade_ready_range_index_after_sidecar_failure(index_id, Some(&error));
-                    return Ok(None);
+                    return Ok((
+                        None,
+                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                    ));
                 }
             }
         }
@@ -1314,12 +1220,13 @@ impl DatabaseEngine {
                 }
                 Ok(ReadyRangeSourceStep::Exhausted) => {}
                 Ok(ReadyRangeSourceStep::MissingSidecar) => {
-                    self.degrade_ready_range_index_after_sidecar_failure(index_id, None);
-                    return Ok(None);
+                    return Ok((None, self.range_sidecar_failure_followup(index_id, None)));
                 }
                 Err(error) => {
-                    self.degrade_ready_range_index_after_sidecar_failure(index_id, Some(&error));
-                    return Ok(None);
+                    return Ok((
+                        None,
+                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                    ));
                 }
             }
 
@@ -1337,24 +1244,31 @@ impl DatabaseEngine {
         }
 
         if limit == 0 {
-            return Ok(Some(PropertyRangePageResult {
-                items: visible.into_iter().map(|(node_id, _)| node_id).collect(),
-                next_cursor: None,
-            }));
+            return Ok((
+                Some(PropertyRangePageResult {
+                    items: visible.into_iter().map(|(node_id, _)| node_id).collect(),
+                    next_cursor: None,
+                }),
+                None,
+            ));
         }
 
         let has_more = visible.len() > limit;
         let selected = &visible[..visible.len().min(limit)];
-        Ok(Some(PropertyRangePageResult {
-            items: selected.iter().map(|(node_id, _)| *node_id).collect(),
-            next_cursor: if has_more {
-                selected.last().map(|(_, cursor)| cursor.clone())
-            } else {
-                None
-            },
-        }))
+        Ok((
+            Some(PropertyRangePageResult {
+                items: selected.iter().map(|(node_id, _)| *node_id).collect(),
+                next_cursor: if has_more {
+                    selected.last().map(|(_, cursor)| cursor.clone())
+                } else {
+                    None
+                },
+            }),
+            None,
+        ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_property_range_scan_matches(
         &self,
         type_id: u32,
@@ -1416,74 +1330,6 @@ impl DatabaseEngine {
         Ok(matches)
     }
 
-    // --- Read APIs (multi-source: memtable → segments newest-first) ---
-
-    /// Get a node by ID (raw, unfiltered). Checks all sources in precedence
-    /// order: active memtable → immutable memtables → segments newest-first.
-    /// Returns None if not found or deleted (tombstoned).
-    /// Used internally by upsert dedup, cascade deletes, and prune.
-    fn get_node_raw(&self, id: u64) -> Result<Option<NodeRecord>, EngineError> {
-        self.sources().find_node(id)
-    }
-
-    /// Get a node by ID. Checks memtable first, then segments newest-to-oldest.
-    /// Returns None if not found, deleted, or excluded by a registered prune policy.
-    pub fn get_node(&self, id: u64) -> Result<Option<NodeRecord>, EngineError> {
-        let node = match self.get_node_raw(id)? {
-            Some(n) => n,
-            None => return Ok(None),
-        };
-        if self.is_node_excluded_by_policies(&node) {
-            return Ok(None);
-        }
-        Ok(Some(node))
-    }
-
-    /// Get an edge by ID. Checks all sources in precedence order.
-    /// Returns None if not found or deleted (tombstoned).
-    pub fn get_edge(&self, id: u64) -> Result<Option<EdgeRecord>, EngineError> {
-        self.sources().find_edge(id)
-    }
-
-    /// Get a node by (type_id, key) across all sources (raw, unfiltered).
-    /// Used internally by upsert dedup. Not subject to prune policy filtering.
-    fn get_node_by_key_raw(
-        &self,
-        type_id: u32,
-        key: &str,
-    ) -> Result<Option<NodeRecord>, EngineError> {
-        self.sources().find_node_by_key(type_id, key)
-    }
-
-    /// Get a node by (type_id, key) across memtable + segments.
-    /// Returns None if not found, deleted, or excluded by a registered prune policy.
-    pub fn get_node_by_key(
-        &self,
-        type_id: u32,
-        key: &str,
-    ) -> Result<Option<NodeRecord>, EngineError> {
-        let node = match self.get_node_by_key_raw(type_id, key)? {
-            Some(n) => n,
-            None => return Ok(None),
-        };
-        if self.is_node_excluded_by_policies(&node) {
-            return Ok(None);
-        }
-        Ok(Some(node))
-    }
-
-    /// Get an edge by (from, to, type_id) across all sources.
-    /// Returns the most recently written edge matching the triple.
-    /// Returns None if not found or deleted (tombstoned).
-    pub fn get_edge_by_triple(
-        &self,
-        from: u64,
-        to: u64,
-        type_id: u32,
-    ) -> Result<Option<EdgeRecord>, EngineError> {
-        self.sources().find_edge_by_triple(from, to, type_id)
-    }
-
     fn score_dense_candidate_ids(
         &self,
         candidate_ids: &NodeIdSet,
@@ -1501,20 +1347,19 @@ impl DatabaseEngine {
         let query_norm = crate::dense_hnsw::dense_query_norm(metric, query);
         let mut hits = Vec::with_capacity(ids.len());
         let mut remaining = Vec::with_capacity(ids.len());
-
-        for &node_id in &ids {
-            if self.memtable.deleted_nodes().contains_key(&node_id) {
-                continue;
-            }
-            if let Some(node) = self.memtable.get_node(node_id) {
+        self.memtable.visit_nodes_sorted_at(
+            &ids,
+            self.snapshot_seq,
+            &mut remaining,
+            &mut |node_id, node| {
                 if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
-                    continue;
+                    return;
                 }
                 if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                    continue;
+                    return;
                 }
                 let Some(dense_vector) = node.dense_vector.as_ref() else {
-                    continue;
+                    return;
                 };
                 hits.push(VectorHit {
                     node_id,
@@ -1525,10 +1370,8 @@ impl DatabaseEngine {
                         dense_vector,
                     ),
                 });
-            } else {
-                remaining.push(node_id);
-            }
-        }
+            },
+        );
 
         // Check immutable memtables (newest-first), reusing a single buffer.
         let mut next_remaining_imm = Vec::with_capacity(remaining.len());
@@ -1536,15 +1379,17 @@ impl DatabaseEngine {
             if remaining.is_empty() {
                 break;
             }
-            remaining.retain(|&node_id| !epoch.memtable.deleted_nodes().contains_key(&node_id));
             next_remaining_imm.clear();
-            for &node_id in &remaining {
-                if let Some(node) = epoch.memtable.get_node(node_id) {
+            epoch.memtable.visit_nodes_sorted_at(
+                &remaining,
+                self.snapshot_seq,
+                &mut next_remaining_imm,
+                &mut |node_id, node| {
                     if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
-                        continue;
+                        return;
                     }
                     if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                        continue;
+                        return;
                     }
                     if let Some(dense_vector) = node.dense_vector.as_ref() {
                         hits.push(VectorHit {
@@ -1557,10 +1402,8 @@ impl DatabaseEngine {
                             ),
                         });
                     }
-                } else {
-                    next_remaining_imm.push(node_id);
-                }
-            }
+                },
+            );
             std::mem::swap(&mut remaining, &mut next_remaining_imm);
         }
 
@@ -1891,26 +1734,36 @@ impl DatabaseEngine {
             .filter_map(|segment| {
                 segment
                     .dense_hnsw_header()
-                    .map(|header| (segment, header.point_count as usize))
+                    .map(|header| (segment.as_ref(), header.point_count as usize))
             })
             .collect();
 
         // --- Small-scope fast path: skip HNSW, exact-score scope IDs only ---
         if let Some(scope) = scope_ids {
+            let mut active_dense_points = 0usize;
+            let _ = self
+                .memtable
+                .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
+                    if node.dense_vector.is_some() {
+                        active_dense_points += 1;
+                    }
+                    ControlFlow::Continue(())
+                });
+            let mut immutable_dense_points = 0usize;
+            for epoch in &self.immutable_epochs {
+                let _ = epoch
+                    .memtable
+                    .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
+                        if node.dense_vector.is_some() {
+                            immutable_dense_points += 1;
+                        }
+                        ControlFlow::Continue(())
+                    });
+            }
             let total_dense_points: usize =
                 searchable_segments.iter().map(|(_, pc)| *pc).sum::<usize>()
-                    + self
-                        .memtable
-                        .nodes()
-                        .values()
-                        .filter(|n| n.dense_vector.is_some())
-                        .count()
-                    + self
-                        .immutable_epochs
-                        .iter()
-                        .flat_map(|epoch| epoch.memtable.nodes().values())
-                        .filter(|n| n.dense_vector.is_some())
-                        .count();
+                    + active_dense_points
+                    + immutable_dense_points;
             if scope.len() <= total_dense_points / 20 || scope.len() <= 2048 {
                 let mut hits = self.score_dense_candidate_ids(
                     scope,
@@ -1925,39 +1778,39 @@ impl DatabaseEngine {
         }
 
         // --- Standard path (no scope) or large-scope path (HNSW + ACORN) ---
-        let mut candidate_ids = NodeIdSet::with_capacity_and_hasher(
-            self.memtable.nodes().len(),
-            NodeIdBuildHasher::default(),
-        );
-        candidate_ids.extend(
-            self.memtable
-                .nodes()
-                .values()
-                .filter(|node| {
-                    node.dense_vector.is_some()
-                        && type_filter.is_none_or(|types| types.contains(&node.type_id))
-                        && scope_ids.is_none_or(|s| s.contains(&node.id))
-                })
-                .map(|node| node.id),
-        );
+        let active_deleted = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
+        let mut active_node_ids =
+            NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
+        let mut candidate_ids = NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
+        let _ = self
+            .memtable
+            .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
+                active_node_ids.insert(node.id);
+                if node.dense_vector.is_some()
+                    && type_filter.is_none_or(|types| types.contains(&node.type_id))
+                    && scope_ids.is_none_or(|scope| scope.contains(&node.id))
+                {
+                    candidate_ids.insert(node.id);
+                }
+                ControlFlow::Continue(())
+            });
         // Also collect dense vector candidates from immutable memtables.
         // Note: candidate_ids is a NodeIdSet, so duplicates across immutable memtables
         // are harmless; score_dense_candidate_ids does a proper newest-first lookup.
         for epoch in &self.immutable_epochs {
-            candidate_ids.extend(
-                epoch
-                    .memtable
-                    .nodes()
-                    .values()
-                    .filter(|node| {
-                        node.dense_vector.is_some()
-                            && !self.memtable.deleted_nodes().contains_key(&node.id)
-                            && !self.memtable.nodes().contains_key(&node.id)
-                            && type_filter.is_none_or(|types| types.contains(&node.type_id))
-                            && scope_ids.is_none_or(|s| s.contains(&node.id))
-                    })
-                    .map(|node| node.id),
-            );
+            let _ = epoch
+                .memtable
+                .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
+                    if node.dense_vector.is_some()
+                        && !active_deleted.contains(&node.id)
+                        && !active_node_ids.contains(&node.id)
+                        && type_filter.is_none_or(|types| types.contains(&node.type_id))
+                        && scope_ids.is_none_or(|scope| scope.contains(&node.id))
+                    {
+                        candidate_ids.insert(node.id);
+                    }
+                    ControlFlow::Continue(())
+                });
         }
 
         if candidate_ids.is_empty() && searchable_segments.is_empty() {
@@ -2151,77 +2004,65 @@ impl DatabaseEngine {
         }
 
         let mut top_hits = BinaryHeap::with_capacity(k);
-        let mut hidden_ids: NodeIdSet = NodeIdSet::with_capacity_and_hasher(
-            self.memtable.deleted_nodes().len(),
-            NodeIdBuildHasher::default(),
-        );
-        hidden_ids.extend(self.memtable.deleted_nodes().keys().copied());
-        // Include immutable memtable tombstones in hidden_ids
+        let mut hidden_ids: NodeIdSet =
+            NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
+        hidden_ids.extend(self.memtable.collect_deleted_nodes_at(self.snapshot_seq));
         for epoch in &self.immutable_epochs {
-            hidden_ids.extend(epoch.memtable.deleted_nodes().keys().copied());
+            hidden_ids.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
         }
-        hidden_ids.reserve(
-            self.memtable.nodes().len()
-                + self
-                    .immutable_epochs
-                    .iter()
-                    .map(|epoch| epoch.memtable.nodes().len())
-                    .sum::<usize>()
-                + self
-                    .segments
-                    .iter()
-                    .take(self.segments.len().saturating_sub(1))
-                    .map(|segment| segment.deleted_node_count())
-                    .sum::<usize>(),
-        );
-
-        for node in self.memtable.nodes().values() {
-            hidden_ids.insert(node.id);
-            if scope_ids.is_some_and(|s| !s.contains(&node.id)) {
-                continue;
-            }
-            if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
-                continue;
-            }
-            if policy_cutoffs
-                .as_ref()
-                .is_some_and(|cutoffs| cutoffs.excludes(node))
-            {
-                continue;
-            }
-            let Some(sparse_vector) = node.sparse_vector.as_ref() else {
-                continue;
-            };
-            let score = sparse_dot_score(&query, sparse_vector);
-            if score > 0.0 {
-                Self::push_sparse_top_k(&mut top_hits, k, node.id, score);
-            }
-        }
-
-        // Score nodes in immutable memtables (newest-first)
-        for epoch in &self.immutable_epochs {
-            for node in epoch.memtable.nodes().values() {
+        let _ = self
+            .memtable
+            .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
                 hidden_ids.insert(node.id);
-                if scope_ids.is_some_and(|s| !s.contains(&node.id)) {
-                    continue;
+                if scope_ids.is_some_and(|scope| !scope.contains(&node.id)) {
+                    return ControlFlow::Continue(());
                 }
                 if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
-                    continue;
+                    return ControlFlow::Continue(());
                 }
                 if policy_cutoffs
                     .as_ref()
                     .is_some_and(|cutoffs| cutoffs.excludes(node))
                 {
-                    continue;
+                    return ControlFlow::Continue(());
                 }
                 let Some(sparse_vector) = node.sparse_vector.as_ref() else {
-                    continue;
+                    return ControlFlow::Continue(());
                 };
                 let score = sparse_dot_score(&query, sparse_vector);
                 if score > 0.0 {
                     Self::push_sparse_top_k(&mut top_hits, k, node.id, score);
                 }
-            }
+                ControlFlow::Continue(())
+            });
+
+        // Score nodes in immutable memtables (newest-first)
+        for epoch in &self.immutable_epochs {
+            let _ = epoch
+                .memtable
+                .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
+                    hidden_ids.insert(node.id);
+                    if scope_ids.is_some_and(|scope| !scope.contains(&node.id)) {
+                        return ControlFlow::Continue(());
+                    }
+                    if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
+                        return ControlFlow::Continue(());
+                    }
+                    if policy_cutoffs
+                        .as_ref()
+                        .is_some_and(|cutoffs| cutoffs.excludes(node))
+                    {
+                        return ControlFlow::Continue(());
+                    }
+                    let Some(sparse_vector) = node.sparse_vector.as_ref() else {
+                        return ControlFlow::Continue(());
+                    };
+                    let score = sparse_dot_score(&query, sparse_vector);
+                    if score > 0.0 {
+                        Self::push_sparse_top_k(&mut top_hits, k, node.id, score);
+                    }
+                    ControlFlow::Continue(())
+                });
         }
 
         // Count segments with sparse posting data to decide parallel vs serial.
@@ -2330,16 +2171,16 @@ impl DatabaseEngine {
 
         // Track IDs we still need to find across segments (memtable first).
         let mut remaining = Vec::with_capacity(sorted_ids.len());
-        for &node_id in &sorted_ids {
-            if self.memtable.deleted_nodes().contains_key(&node_id) {
-                continue;
-            }
-            if let Some(node) = self.memtable.get_node(node_id) {
+        self.memtable.visit_nodes_sorted_at(
+            &sorted_ids,
+            self.snapshot_seq,
+            &mut remaining,
+            &mut |node_id, node| {
                 if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
-                    continue;
+                    return;
                 }
                 if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                    continue;
+                    return;
                 }
                 if let Some(sparse_vector) = node.sparse_vector.as_ref() {
                     let score = sparse_dot_score(query, sparse_vector);
@@ -2347,25 +2188,25 @@ impl DatabaseEngine {
                         Self::push_sparse_top_k(&mut top_hits, k, node_id, score);
                     }
                 }
-                continue;
-            }
-            remaining.push(node_id);
-        }
+            },
+        );
 
         // Check immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
             if remaining.is_empty() {
                 break;
             }
-            remaining.retain(|&id| !epoch.memtable.deleted_nodes().contains_key(&id));
             let mut next = Vec::with_capacity(remaining.len());
-            for &node_id in &remaining {
-                if let Some(node) = epoch.memtable.get_node(node_id) {
+            epoch.memtable.visit_nodes_sorted_at(
+                &remaining,
+                self.snapshot_seq,
+                &mut next,
+                &mut |node_id, node| {
                     if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
-                        continue;
+                        return;
                     }
                     if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                        continue;
+                        return;
                     }
                     if let Some(sparse_vector) = node.sparse_vector.as_ref() {
                         let score = sparse_dot_score(query, sparse_vector);
@@ -2373,10 +2214,8 @@ impl DatabaseEngine {
                             Self::push_sparse_top_k(&mut top_hits, k, node_id, score);
                         }
                     }
-                    continue;
-                }
-                next.push(node_id);
-            }
+                },
+            );
             remaining = next;
         }
 
@@ -2516,295 +2355,24 @@ impl DatabaseEngine {
         }
     }
 
-    /// Batch node lookup (raw, unfiltered). Core implementation shared by
-    /// `get_nodes` (public, filtered) and `policy_excluded_node_ids`.
-    fn get_nodes_raw(&self, ids: &[u64]) -> Result<Vec<Option<NodeRecord>>, EngineError> {
-        let n = ids.len();
-        let mut results: Vec<Option<NodeRecord>> = vec![None; n];
-        if n == 0 {
-            return Ok(results);
-        }
-
-        // Build (original_index, id) pairs for tracking
-        let mut remaining: Vec<(usize, u64)> = Vec::with_capacity(n);
-        for (i, &id) in ids.iter().enumerate() {
-            // Memtable tombstone, definitely deleted, skip
-            if self.memtable.deleted_nodes().contains_key(&id) {
-                continue;
-            }
-            // Memtable hit, freshest source
-            if let Some(node) = self.memtable.get_node(id) {
-                results[i] = Some(node.clone());
-                continue;
-            }
-            remaining.push((i, id));
-        }
-
-        // Check immutable memtables (newest-first)
-        for epoch in &self.immutable_epochs {
-            if remaining.is_empty() {
-                break;
-            }
-            remaining.retain(|&(i, id)| {
-                if epoch.memtable.deleted_nodes().contains_key(&id) {
-                    return false; // tombstoned, stop looking
-                }
-                if let Some(node) = epoch.memtable.get_node(id) {
-                    results[i] = Some(node.clone());
-                    return false; // found, stop looking
-                }
-                true // keep searching
-            });
-        }
-
-        // Sort once before segment scan. retain() preserves order so
-        // remaining stays sorted across iterations.
-        remaining.sort_unstable_by_key(|&(_, id)| id);
-
-        // Scan segments newest-first with sorted merge-walk
-        for seg in &self.segments {
-            if remaining.is_empty() {
-                break;
-            }
-
-            // Filter out IDs tombstoned in this segment before the batch scan
-            // (tombstone in a newer segment hides data in older segments)
-            remaining.retain(|&(_, id)| !seg.is_node_deleted(id));
-
-            seg.get_nodes_batch(&remaining, &mut results)?;
-
-            // Remove IDs that were found in this segment
-            remaining.retain(|&(i, _)| results[i].is_none());
-        }
-
-        Ok(results)
-    }
-
-    /// Get multiple nodes by ID in a single call.
-    /// Returns a `Vec<Option<NodeRecord>>`, one per input ID (order preserved).
-    /// Missing, deleted, or policy-excluded nodes are None.
-    ///
-    /// Uses a batched approach: resolves memtable hits first (O(1) each),
-    /// then does a single sorted merge-walk per segment instead of N binary searches.
-    pub fn get_nodes(&self, ids: &[u64]) -> Result<Vec<Option<NodeRecord>>, EngineError> {
-        let mut results = self.get_nodes_raw(ids)?;
-
-        // Policy filtering: exclude nodes matching any registered prune policy.
-        // Early-out when no policies are registered (zero overhead).
-        if !self.manifest.prune_policies.is_empty() {
-            let cutoffs = PrecomputedPruneCutoffs::from_manifest(&self.manifest, now_millis());
-            for slot in results.iter_mut() {
-                if let Some(ref node) = slot {
-                    if cutoffs.excludes(node) {
-                        *slot = None;
-                    }
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Batch-resolve `(type_id, key)` pairs to node records across all sources.
-    /// Returns `Vec<Option<NodeRecord>>` with the same length and order as input.
-    /// Duplicates get duplicate result slots.
-    ///
-    /// Walks memtable (O(1) per key) → immutable memtables → segments (batch
-    /// merge-walk or per-key seek, cost-model selected). A key resolved in a
-    /// newer source is authoritative even if tombstoned. It does NOT fall
-    /// through to older segments.
-    fn get_nodes_by_keys_raw(
-        &self,
-        keys: &[(u32, &str)],
-    ) -> Result<Vec<Option<NodeRecord>>, EngineError> {
-        let n = keys.len();
-        let mut results: Vec<Option<NodeRecord>> = vec![None; n];
-        if n == 0 {
-            return Ok(results);
-        }
-
-        // Phase 1: Active memtable, O(1) HashMap per key
-        let mut remaining: Vec<(usize, u32, &str)> = Vec::with_capacity(n);
-        for (i, &(type_id, key)) in keys.iter().enumerate() {
-            if let Some(node) = self.memtable.node_by_key(type_id, key) {
-                results[i] = Some(node.clone());
-            } else {
-                remaining.push((i, type_id, key));
-            }
-        }
-
-        // Phase 2: Immutable memtables (newest-first)
-        for (epoch_idx, epoch) in self.immutable_epochs.iter().enumerate() {
-            if remaining.is_empty() {
-                break;
-            }
-            remaining.retain(|&(i, type_id, key)| {
-                if let Some(node) = epoch.memtable.node_by_key(type_id, key) {
-                    // Check higher-precedence sources: active memtable +
-                    // newer immutable epochs (mirrors is_node_tombstoned_above_immutable)
-                    let tombstoned = self.memtable.deleted_nodes().contains_key(&node.id)
-                        || self.immutable_epochs[..epoch_idx]
-                            .iter()
-                            .any(|e| e.memtable.deleted_nodes().contains_key(&node.id));
-                    if tombstoned {
-                        return false; // tombstoned, stop searching this key
-                    }
-                    results[i] = Some(node.clone());
-                    return false;
-                }
-                true
-            });
-        }
-
-        // Phase 3: Sort remaining by (type_id, key) for segment batch ops
-        remaining.sort_unstable_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
-
-        // Pre-collect deleted node IDs from memtable + all immutable epochs
-        // so the per-found-node tombstone check inside the segment loop is O(1)
-        // instead of O(F × I).
-        let mut deleted_above: crate::types::NodeIdSet =
-            self.memtable.deleted_nodes().keys().copied().collect();
-        for e in &self.immutable_epochs {
-            deleted_above.extend(e.memtable.deleted_nodes().keys().copied());
-        }
-
-        // Phase 4: Segments (newest-first)
-        for (seg_idx, seg) in self.segments.iter().enumerate() {
-            if remaining.is_empty() {
-                break;
-            }
-
-            // Resolve keys → records; returns which orig_idxs were found in key index
-            let found = seg.resolve_keys_batch(&remaining, &mut results)?;
-
-            // Tombstone-filter found results: check higher-precedence sources
-            for &orig_idx in &found {
-                if let Some(ref node) = results[orig_idx] {
-                    let tombstoned = deleted_above.contains(&node.id)
-                        || self.segments[..seg_idx]
-                            .iter()
-                            .any(|s| s.is_node_deleted(node.id));
-                    if tombstoned {
-                        results[orig_idx] = None;
-                    }
-                }
-            }
-
-            // Remove ALL found keys from remaining (even if tombstoned,
-            // the newest source containing a key is authoritative).
-            if !found.is_empty() {
-                let mut found_mask = vec![false; n];
-                for &idx in &found {
-                    found_mask[idx] = true;
-                }
-                remaining.retain(|&(i, _, _)| !found_mask[i]);
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Get multiple nodes by `(type_id, key)` in a single call.
-    /// Returns `Vec<Option<NodeRecord>>`, one per input key (order preserved).
-    /// Missing, deleted, or policy-excluded nodes are None.
-    ///
-    /// Uses a batched approach: resolves memtable hits first (O(1) each),
-    /// then does a single sorted merge-walk per segment instead of N binary searches.
-    pub fn get_nodes_by_keys(
-        &self,
-        keys: &[(u32, &str)],
-    ) -> Result<Vec<Option<NodeRecord>>, EngineError> {
-        let mut results = self.get_nodes_by_keys_raw(keys)?;
-
-        if !self.manifest.prune_policies.is_empty() {
-            let cutoffs = PrecomputedPruneCutoffs::from_manifest(&self.manifest, now_millis());
-            for slot in results.iter_mut() {
-                if let Some(ref node) = slot {
-                    if cutoffs.excludes(node) {
-                        *slot = None;
-                    }
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Get multiple edges by ID in a single call.
-    /// Returns a `Vec<Option<EdgeRecord>>`, one per input ID (order preserved).
-    /// Missing or deleted edges are None.
-    ///
-    /// Uses a batched approach: resolves memtable hits first (O(1) each),
-    /// then does a single sorted merge-walk per segment instead of N binary searches.
-    pub fn get_edges(&self, ids: &[u64]) -> Result<Vec<Option<EdgeRecord>>, EngineError> {
-        let n = ids.len();
-        let mut results: Vec<Option<EdgeRecord>> = vec![None; n];
-        if n == 0 {
-            return Ok(results);
-        }
-
-        let mut remaining: Vec<(usize, u64)> = Vec::with_capacity(n);
-        for (i, &id) in ids.iter().enumerate() {
-            if self.memtable.deleted_edges().contains_key(&id) {
-                continue;
-            }
-            if let Some(edge) = self.memtable.get_edge(id) {
-                results[i] = Some(edge.clone());
-                continue;
-            }
-            remaining.push((i, id));
-        }
-
-        // Check immutable memtables (newest-first)
-        for epoch in &self.immutable_epochs {
-            if remaining.is_empty() {
-                break;
-            }
-            remaining.retain(|&(i, id)| {
-                if epoch.memtable.deleted_edges().contains_key(&id) {
-                    return false;
-                }
-                if let Some(edge) = epoch.memtable.get_edge(id) {
-                    results[i] = Some(edge.clone());
-                    return false;
-                }
-                true
-            });
-        }
-
-        // Sort once. retain() preserves order across iterations.
-        remaining.sort_unstable_by_key(|&(_, id)| id);
-
-        for seg in &self.segments {
-            if remaining.is_empty() {
-                break;
-            }
-            remaining.retain(|&(_, id)| !seg.is_edge_deleted(id));
-            seg.get_edges_batch(&remaining, &mut results)?;
-            remaining.retain(|&(i, _)| results[i].is_none());
-        }
-
-        Ok(results)
-    }
-
     // --- Secondary index queries ---
 
     /// Return all live node IDs with the given type_id (raw, unfiltered).
     /// Used internally by collect_prune_targets.
     fn nodes_by_type_raw(&self, type_id: u32) -> Result<Vec<u64>, EngineError> {
-        let (deleted, _) = self.collect_tombstones();
+        let deleted = self.sources().collect_deleted_nodes();
 
         let mut seen = NodeIdSet::default();
         let mut results = Vec::new();
 
-        for id in self.memtable.nodes_by_type(type_id) {
+        for id in self.memtable.visible_nodes_by_type(type_id, self.snapshot_seq) {
             if !deleted.contains(&id) && seen.insert(id) {
                 results.push(id);
             }
         }
 
         for epoch in &self.immutable_epochs {
-            for id in epoch.memtable.nodes_by_type(type_id) {
+            for id in epoch.memtable.visible_nodes_by_type(type_id, self.snapshot_seq) {
                 if !deleted.contains(&id) && seen.insert(id) {
                     results.push(id);
                 }
@@ -2839,19 +2407,19 @@ impl DatabaseEngine {
     /// Return all live edge IDs with the given type_id, merged across
     /// memtable and all segments. Excludes tombstoned edges.
     pub fn edges_by_type(&self, type_id: u32) -> Result<Vec<u64>, EngineError> {
-        let (_, deleted) = self.collect_tombstones();
+        let deleted = self.sources().collect_deleted_edges();
 
         let mut seen = NodeIdSet::default();
         let mut results = Vec::new();
 
-        for id in self.memtable.edges_by_type(type_id) {
+        for id in self.memtable.visible_edges_by_type(type_id, self.snapshot_seq) {
             if !deleted.contains(&id) && seen.insert(id) {
                 results.push(id);
             }
         }
 
         for epoch in &self.immutable_epochs {
-            for id in epoch.memtable.edges_by_type(type_id) {
+            for id in epoch.memtable.visible_edges_by_type(type_id, self.snapshot_seq) {
                 if !deleted.contains(&id) && seen.insert(id) {
                     results.push(id);
                 }
@@ -2986,21 +2554,14 @@ impl DatabaseEngine {
         type_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        // Build global deleted set (cross-source tombstones)
-        let mut deleted: NodeIdSet = self.memtable.deleted_edges().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted.extend(epoch.memtable.deleted_edges().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted.extend(seg.deleted_edge_ids());
-        }
+        let deleted = self.sources().collect_deleted_edges();
 
         // Collect sources
-        let memtable_ids = self.memtable.edges_by_type(type_id);
+        let memtable_ids = self.memtable.visible_edges_by_type(type_id, self.snapshot_seq);
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
         for epoch in &self.immutable_epochs {
-            segment_ids.push(epoch.memtable.edges_by_type(type_id));
+            segment_ids.push(epoch.memtable.visible_edges_by_type(type_id, self.snapshot_seq));
         }
         for seg in &self.segments {
             segment_ids.push(seg.edges_by_type(type_id)?);
@@ -3050,109 +2611,98 @@ impl DatabaseEngine {
         })
     }
 
-    /// Find node IDs matching (type_id, prop_key == prop_value).
-    /// Merges candidates from memtable + segments, deduplicates, and post-filters
-    /// to verify actual property equality (handles hash collisions).
-    /// Excludes nodes matching any registered prune policy.
-    pub fn find_nodes(
+    fn find_nodes_outcome(
         &self,
         type_id: u32,
         prop_key: &str,
         prop_value: &PropValue,
-    ) -> Result<Vec<u64>, EngineError> {
+    ) -> Result<PropertyQueryOutcome<Vec<u64>>, EngineError> {
         let ready_entry =
             self.node_property_index_entry(type_id, prop_key, &SecondaryIndexKind::Equality);
         if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
-            if let Some(results) =
-                self.find_nodes_ready_equality_index(type_id, entry.index_id, prop_key, prop_value)?
+            let (results, followup) =
+                self.find_nodes_ready_equality_index(type_id, entry.index_id, prop_key, prop_value)?;
+            if let Some(results) = results
             {
-                self.record_equality_index_lookup_route();
-                Ok(results)
+                Ok(PropertyQueryOutcome {
+                    value: results,
+                    route: PropertyQueryRouteKind::EqualityIndexLookup,
+                    followup,
+                })
             } else {
-                self.record_equality_scan_fallback_route();
-                self.find_nodes_scan_fallback(type_id, prop_key, prop_value)
+                Ok(PropertyQueryOutcome {
+                    value: self.find_nodes_scan_fallback(type_id, prop_key, prop_value)?,
+                    route: PropertyQueryRouteKind::EqualityScanFallback,
+                    followup,
+                })
             }
         } else {
-            self.record_equality_scan_fallback_route();
-            self.find_nodes_scan_fallback(type_id, prop_key, prop_value)
+            Ok(PropertyQueryOutcome {
+                value: self.find_nodes_scan_fallback(type_id, prop_key, prop_value)?,
+                route: PropertyQueryRouteKind::EqualityScanFallback,
+                followup: None,
+            })
         }
     }
 
-    /// Paginated version of `find_nodes`. Returns a page of node IDs matching
-    /// (type_id, prop_key == prop_value), sorted by ID with cursor-based
-    /// pagination.
-    ///
-    /// Uses K-way merge across sorted property hash buckets (segment IDs are
-    /// written sorted at flush/compaction time). Post-filters for hash
-    /// collisions, then applies cursor + limit on the verified results.
-    /// Policy filtering applied when policies are active.
-    pub fn find_nodes_paged(
+    fn find_nodes_paged_outcome(
         &self,
         type_id: u32,
         prop_key: &str,
         prop_value: &PropValue,
         page: &PageRequest,
-    ) -> Result<PageResult<u64>, EngineError> {
+    ) -> Result<PropertyQueryOutcome<PageResult<u64>>, EngineError> {
         let ready_entry =
             self.node_property_index_entry(type_id, prop_key, &SecondaryIndexKind::Equality);
         if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
-            if let Some(result) = self.find_nodes_paged_ready_equality_index(
+            let (result, followup) = self.find_nodes_paged_ready_equality_index(
                 type_id,
                 entry.index_id,
                 prop_key,
                 prop_value,
                 page,
-            )? {
-                self.record_equality_index_lookup_route();
-                Ok(result)
+            )?;
+            if let Some(result) = result {
+                Ok(PropertyQueryOutcome {
+                    value: result,
+                    route: PropertyQueryRouteKind::EqualityIndexLookup,
+                    followup,
+                })
             } else {
-                self.record_equality_scan_fallback_route();
-                self.find_nodes_paged_scan_fallback(type_id, prop_key, prop_value, page)
+                Ok(PropertyQueryOutcome {
+                    value: self.find_nodes_paged_scan_fallback(
+                        type_id, prop_key, prop_value, page,
+                    )?,
+                    route: PropertyQueryRouteKind::EqualityScanFallback,
+                    followup,
+                })
             }
         } else {
-            self.record_equality_scan_fallback_route();
-            self.find_nodes_paged_scan_fallback(type_id, prop_key, prop_value, page)
+            Ok(PropertyQueryOutcome {
+                value: self.find_nodes_paged_scan_fallback(type_id, prop_key, prop_value, page)?,
+                route: PropertyQueryRouteKind::EqualityScanFallback,
+                followup: None,
+            })
         }
     }
 
-    /// Find node IDs whose property value falls within the given numeric bounds.
-    ///
-    /// Results are ordered by `(property_value asc, node_id asc)`.
-    pub fn find_nodes_range(
-        &self,
-        type_id: u32,
-        prop_key: &str,
-        lower: Option<&PropertyRangeBound>,
-        upper: Option<&PropertyRangeBound>,
-    ) -> Result<Vec<u64>, EngineError> {
-        Ok(self
-            .find_nodes_range_paged(
-                type_id,
-                prop_key,
-                lower,
-                upper,
-                &PropertyRangePageRequest::default(),
-            )?
-            .items)
-    }
-
-    /// Paginated version of `find_nodes_range`.
-    pub fn find_nodes_range_paged(
+    fn find_nodes_range_paged_outcome(
         &self,
         type_id: u32,
         prop_key: &str,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         page: &PropertyRangePageRequest,
-    ) -> Result<PropertyRangePageResult<u64>, EngineError> {
+    ) -> Result<PropertyQueryOutcome<PropertyRangePageResult<u64>>, EngineError> {
         let domain = Self::validate_property_range_bounds(lower, upper, page.after.as_ref())?;
         let ready_entry = self.node_property_index_entry(
             type_id,
             prop_key,
             &SecondaryIndexKind::Range { domain },
         );
+        let mut followup = None;
         if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
-            if let Some(result) = self.find_nodes_paged_ready_range_index(
+            let (result, ready_followup) = self.find_nodes_paged_ready_range_index(
                 type_id,
                 entry.index_id,
                 prop_key,
@@ -3160,14 +2710,18 @@ impl DatabaseEngine {
                 lower,
                 upper,
                 page,
-            )? {
-                self.record_range_index_lookup_route();
-                return Ok(result);
+            )?;
+            if let Some(result) = result {
+                return Ok(PropertyQueryOutcome {
+                    value: result,
+                    route: PropertyQueryRouteKind::RangeIndexLookup,
+                    followup: ready_followup,
+                });
             }
+            followup = ready_followup;
         }
 
-        self.record_range_scan_fallback_route();
-        match page.limit {
+        let value = match page.limit {
             Some(limit) if limit > 0 => {
                 let matches = self.collect_property_range_scan_matches(
                     type_id,
@@ -3189,7 +2743,7 @@ impl DatabaseEngine {
                 } else {
                     None
                 };
-                Ok(PropertyRangePageResult { items, next_cursor })
+                PropertyRangePageResult { items, next_cursor }
             }
             _ => {
                 let matches = self.collect_property_range_scan_matches(
@@ -3201,12 +2755,18 @@ impl DatabaseEngine {
                     page.after.as_ref(),
                     None,
                 )?;
-                Ok(PropertyRangePageResult {
+                PropertyRangePageResult {
                     items: matches.into_iter().map(|entry| entry.node_id).collect(),
                     next_cursor: None,
-                })
+                }
             }
-        }
+        };
+
+        Ok(PropertyQueryOutcome {
+            value,
+            route: PropertyQueryRouteKind::RangeScanFallback,
+            followup,
+        })
     }
 
     // --- Timestamp range queries ---
@@ -3241,21 +2801,21 @@ impl DatabaseEngine {
         to_ms: i64,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        // Build global deleted set (cross-source tombstones)
-        let mut deleted: NodeIdSet = self.memtable.deleted_nodes().keys().copied().collect();
-        for epoch in &self.immutable_epochs {
-            deleted.extend(epoch.memtable.deleted_nodes().keys().copied());
-        }
-        for seg in &self.segments {
-            deleted.extend(seg.deleted_node_ids());
-        }
+        let deleted = self.sources().collect_deleted_nodes();
 
         // Collect sources: memtable + immutable memtables + segments
-        let memtable_ids = self.memtable.nodes_by_time_range(type_id, from_ms, to_ms);
+        let memtable_ids =
+            self.memtable
+                .visible_nodes_by_time_range(type_id, from_ms, to_ms, self.snapshot_seq);
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
         for epoch in &self.immutable_epochs {
-            segment_ids.push(epoch.memtable.nodes_by_time_range(type_id, from_ms, to_ms));
+            segment_ids.push(epoch.memtable.visible_nodes_by_time_range(
+                type_id,
+                from_ms,
+                to_ms,
+                self.snapshot_seq,
+            ));
         }
         for seg in &self.segments {
             segment_ids.push(seg.nodes_by_time_range(type_id, from_ms, to_ms)?);
@@ -3748,9 +3308,10 @@ impl DatabaseEngine {
     ) -> Result<AdjacencyExport, EngineError> {
         // Collect all node type IDs from memtable + immutable memtables + segments
         let node_types: Vec<u32> = {
-            let mut types: HashSet<u32> = self.memtable.type_node_index().keys().copied().collect();
+            let mut types: HashSet<u32> =
+                self.memtable.visible_types(self.snapshot_seq).into_iter().collect();
             for epoch in &self.immutable_epochs {
-                types.extend(epoch.memtable.type_node_index().keys().copied());
+                types.extend(epoch.memtable.visible_types(self.snapshot_seq));
             }
             for seg in &self.segments {
                 for tid in seg.node_type_ids()? {

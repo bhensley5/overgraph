@@ -520,6 +520,18 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn valid_sparse_posting_files() -> (Vec<u8>, Vec<u8>) {
+        let dir = TempDir::new().unwrap();
+        let mut groups = BTreeMap::new();
+        groups.insert(2, vec![(3, 1.5), (9, 0.25)]);
+        groups.insert(7, vec![(11, 0.75), (17, 2.0)]);
+        write_sparse_posting_files(dir.path(), &groups).unwrap();
+        (
+            std::fs::read(dir.path().join(SPARSE_POSTING_INDEX_FILENAME)).unwrap(),
+            std::fs::read(dir.path().join(SPARSE_POSTINGS_FILENAME)).unwrap(),
+        )
+    }
+
     #[test]
     fn test_sparse_dot_score_matches_overlap_only() {
         let score = sparse_dot_score(
@@ -586,5 +598,85 @@ mod tests {
         assert_eq!(scores.len(), 2);
         assert!((scores[&5] - 2.0).abs() < 1e-6);
         assert!((scores[&9] - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_validate_sparse_postings_rejects_malformed_index_length() {
+        let (mut index, data) = valid_sparse_posting_files();
+        index.truncate(index.len() - 1);
+
+        match validate_sparse_posting_files(&index, &data, 4, true) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("size"));
+            }
+            other => panic!("expected malformed index length error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_sparse_postings_rejects_non_monotonic_dimensions() {
+        let (mut index, data) = valid_sparse_posting_files();
+        let second_dim_off = 8 + SPARSE_POSTING_INDEX_ENTRY_SIZE;
+        index[second_dim_off..second_dim_off + 4].copy_from_slice(&2u32.to_le_bytes());
+
+        match validate_sparse_posting_files(&index, &data, 4, true) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("not strictly increasing"));
+            }
+            other => panic!("expected non-monotonic dimension error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_sparse_postings_rejects_offset_gap_or_overlap() {
+        let (mut index, data) = valid_sparse_posting_files();
+        let second_offset_off = 8 + SPARSE_POSTING_INDEX_ENTRY_SIZE + 4;
+        index[second_offset_off..second_offset_off + 8].copy_from_slice(&12u64.to_le_bytes());
+
+        match validate_sparse_posting_files(&index, &data, 4, true) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("offset"));
+            }
+            other => panic!("expected bad offset error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_sparse_postings_rejects_truncated_posting_payload() {
+        let (index, mut data) = valid_sparse_posting_files();
+        data.truncate(data.len() - 1);
+
+        match validate_sparse_posting_files(&index, &data, 4, true) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("exceeds data length"));
+            }
+            other => panic!("expected truncated posting payload error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_sparse_postings_rejects_unsorted_node_ids() {
+        let (index, mut data) = valid_sparse_posting_files();
+        data[12..20].copy_from_slice(&1u64.to_le_bytes());
+
+        match validate_sparse_posting_files(&index, &data, 4, true) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("node IDs are not strictly increasing"));
+            }
+            other => panic!("expected unsorted node id error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_sparse_postings_rejects_trailing_posting_bytes() {
+        let (index, mut data) = valid_sparse_posting_files();
+        data.push(0);
+
+        match validate_sparse_posting_files(&index, &data, 4, true) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("trailing or unreferenced bytes"));
+            }
+            other => panic!("expected trailing posting bytes error, got {:?}", other),
+        }
     }
 }

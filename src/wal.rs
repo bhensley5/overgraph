@@ -141,7 +141,7 @@ impl WalWriter {
     /// The seq is stored as an 8-byte LE prefix inside the CRC-protected payload.
     /// Frame: [len:u32][crc:u32][seq:u64][walop_bytes]
     /// Returns the byte size written.
-    pub fn append(&mut self, op: &WalOp, engine_seq: u64) -> Result<usize, EngineError> {
+    pub(crate) fn append(&mut self, op: &WalOp, engine_seq: u64) -> Result<usize, EngineError> {
         encode_wal_op_into(op, &mut self.encode_buf)?;
         let seq_bytes = engine_seq.to_le_bytes();
         let total_payload = 8 + self.encode_buf.len();
@@ -165,7 +165,7 @@ impl WalWriter {
     /// All ops are pre-encoded before any I/O, so encoding failures
     /// don't leave partial data in the write buffer.
     /// Returns total bytes written (framing + payload).
-    pub fn append_batch(&mut self, ops: &[(u64, WalOp)]) -> Result<usize, EngineError> {
+    pub(crate) fn append_batch(&mut self, ops: &[(u64, WalOp)]) -> Result<usize, EngineError> {
         // Pre-encode all ops into a single contiguous buffer
         let mut batch_buf = Vec::new();
         for (seq, op) in ops {
@@ -255,7 +255,8 @@ impl WalReader {
     /// Validates the WAL header (magic + version) before reading records.
     /// Returns `(engine_seq, WalOp)` pairs. Returns an error if the file is
     /// not a valid OverGraph WAL.
-    pub fn read_all(&self) -> Result<Vec<(u64, WalOp)>, EngineError> {
+    #[cfg(test)]
+    pub(crate) fn read_all(&self) -> Result<Vec<(u64, WalOp)>, EngineError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -351,7 +352,10 @@ impl WalReader {
 
     /// Read all valid records from a WAL generation file.
     /// Same as `read_all()` but reads from `wal_generation_path(db_dir, gen_id)`.
-    pub fn read_generation(db_dir: &Path, gen_id: u64) -> Result<Vec<(u64, WalOp)>, EngineError> {
+    pub(crate) fn read_generation(
+        db_dir: &Path,
+        gen_id: u64,
+    ) -> Result<Vec<(u64, WalOp)>, EngineError> {
         let path = wal_generation_path(db_dir, gen_id);
         if !path.exists() {
             return Ok(Vec::new());
@@ -962,6 +966,61 @@ mod tests {
             Ok(_) => panic!("expected malformed recognized WAL record to fail"),
             Err(other) => panic!("expected CorruptWal, got {}", other),
         }
+    }
+
+    fn assert_trailing_garbage_on_recognized_record_is_hard_error(op: WalOp) {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join(WAL_FILENAME);
+
+        let mut writer = WalWriter::open(dir.path()).unwrap();
+        writer.append(&make_test_node(1, "valid"), 1).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let walop_bytes = encode_wal_op(&op).unwrap();
+        let mut malformed_payload = Vec::new();
+        malformed_payload.extend_from_slice(&99u64.to_le_bytes());
+        malformed_payload.extend_from_slice(&walop_bytes);
+        malformed_payload.push(0xFF);
+        let crc = crc32fast::hash(&malformed_payload);
+        let len = malformed_payload.len() as u32;
+
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&len.to_le_bytes()).unwrap();
+        file.write_all(&crc.to_le_bytes()).unwrap();
+        file.write_all(&malformed_payload).unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let reader = WalReader::new(dir.path());
+        match reader.read_all() {
+            Err(EngineError::CorruptWal(message)) => {
+                assert!(message.contains("failed to decode WAL record"));
+            }
+            Ok(_) => panic!("expected malformed recognized WAL record to fail"),
+            Err(other) => panic!("expected CorruptWal, got {}", other),
+        }
+    }
+
+    #[test]
+    fn test_wal_malformed_upsert_edge_with_trailing_garbage_is_hard_error() {
+        assert_trailing_garbage_on_recognized_record_is_hard_error(make_test_edge(2, 1, 2));
+    }
+
+    #[test]
+    fn test_wal_malformed_delete_node_with_trailing_garbage_is_hard_error() {
+        assert_trailing_garbage_on_recognized_record_is_hard_error(WalOp::DeleteNode {
+            id: 2,
+            deleted_at: 2_000,
+        });
+    }
+
+    #[test]
+    fn test_wal_malformed_delete_edge_with_trailing_garbage_is_hard_error() {
+        assert_trailing_garbage_on_recognized_record_is_hard_error(WalOp::DeleteEdge {
+            id: 3,
+            deleted_at: 3_000,
+        });
     }
 
     // --- Regression test for M1: off-by-one in length sanity check ---

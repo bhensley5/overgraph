@@ -89,6 +89,68 @@ describe('async batch upserts', () => {
   });
 });
 
+describe('async write transactions', () => {
+  let tmpDir, db;
+  before(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-async-txn-'));
+    db = freshDb(tmpDir, 'txn');
+  });
+  after(async () => { await db.closeAsync(); rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('stages, reads, and commits asynchronously', async () => {
+    const txn = await db.beginWriteTxnAsync();
+    await txn.stageAsync([
+      { op: 'upsertNode', alias: 'alice', typeId: 1, key: 'alice', props: { name: 'Alice' } },
+      { op: 'upsertNode', alias: 'bob', typeId: 1, key: 'bob' },
+      { op: 'upsertEdge', alias: 'knows', from: { local: 'alice' }, to: { local: 'bob' }, typeId: 7 },
+    ]);
+
+    const staged = await txn.getNodeAsync({ local: 'alice' });
+    assert.ok(staged);
+    assert.equal(staged.id, undefined);
+    assert.equal(staged.props.name, 'Alice');
+
+    const result = await txn.commitAsync();
+    assert.equal(result.nodeAliases.alice, result.nodeIds[0]);
+    assert.equal(result.nodeAliases.bob, result.nodeIds[1]);
+    assert.equal(result.edgeAliases.knows, result.edgeIds[0]);
+    assert.ok(await db.getNodeAsync(result.nodeAliases.alice));
+  });
+
+  it('supports async builders and rollback', async () => {
+    const txn = db.beginWriteTxn();
+    const alice = await txn.upsertNodeAsAsync('async-alice', 1, 'async-alice', {
+      props: { mood: 'staged' },
+    });
+    const bob = await txn.upsertNodeAsAsync('async-bob', 1, 'async-bob');
+    await txn.upsertEdgeAsAsync('async-knows', alice, bob, 9);
+
+    const staged = await txn.getNodeByKeyAsync(1, 'async-alice');
+    assert.ok(staged);
+    assert.equal(staged.props.mood, 'staged');
+
+    await txn.rollbackAsync();
+    assert.equal(await db.getNodeByKeyAsync(1, 'async-alice'), null);
+  });
+
+  it('preserves async transaction call order when promises are started together', async () => {
+    const txn = await db.beginWriteTxnAsync();
+    const stage = txn.stageAsync([
+      { op: 'upsertNode', alias: 'queued', typeId: 1, key: 'queued' },
+    ]);
+    const read = txn.getNodeAsync({ local: 'queued' });
+    const commit = txn.commitAsync();
+
+    await stage;
+    const staged = await read;
+    const result = await commit;
+
+    assert.ok(staged);
+    assert.equal(staged.local, 'queued');
+    assert.equal(result.nodeAliases.queued, result.nodeIds[0]);
+  });
+});
+
 describe('async delete + neighbors + find', () => {
   let tmpDir, db;
   before(() => {

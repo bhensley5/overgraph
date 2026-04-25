@@ -38,7 +38,7 @@ fn wait_for_property_index_state(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if let Some(info) = engine
-            .list_node_property_indexes()
+            .list_node_property_indexes().unwrap()
             .into_iter()
             .find(|info| info.index_id == index_id)
         {
@@ -51,7 +51,39 @@ fn wait_for_property_index_state(
             "timed out waiting for property index {} to reach {:?}; current indexes: {:?}",
             index_id,
             expected_state,
-            engine.list_node_property_indexes()
+            engine.list_node_property_indexes().unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_pending_secondary_index_followup_count(
+    engine: &DatabaseEngine,
+    expected_count: usize,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let current_count = engine.pending_secondary_index_followup_count_for_test();
+        if current_count == expected_count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for pending secondary-index followup count {}; current count: {}",
+            expected_count,
+            current_count
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_path_absent(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {} to be removed",
+            path.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -130,8 +162,8 @@ fn test_open_creates_new_db() {
     let db_path = dir.path().join("testdb");
 
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-    assert_eq!(engine.node_count(), 0);
-    assert_eq!(engine.edge_count(), 0);
+    assert_eq!(engine.node_count().unwrap(), 0);
+    assert_eq!(engine.edge_count().unwrap(), 0);
     assert!(db_path.exists());
     assert!(db_path.join("manifest.current").exists());
     engine.close().unwrap();
@@ -166,19 +198,19 @@ fn test_open_persists_and_validates_dense_vector_manifest() {
 
     {
         let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
-        assert_eq!(engine.manifest().dense_vector.as_ref(), Some(&dense_config));
+        assert_eq!(engine.manifest().unwrap().dense_vector.as_ref(), Some(&dense_config));
         engine.close().unwrap();
     }
 
     {
         let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
-        assert_eq!(engine.manifest().dense_vector.as_ref(), Some(&dense_config));
+        assert_eq!(engine.manifest().unwrap().dense_vector.as_ref(), Some(&dense_config));
         engine.close().unwrap();
     }
 
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert_eq!(engine.manifest().dense_vector.as_ref(), Some(&dense_config));
+        assert_eq!(engine.manifest().unwrap().dense_vector.as_ref(), Some(&dense_config));
         engine.close().unwrap();
     }
 
@@ -256,7 +288,7 @@ fn test_open_rejects_compacted_dense_segment_missing_hnsw_graph() {
         }),
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     engine
         .upsert_node(
@@ -283,8 +315,9 @@ fn test_open_rejects_compacted_dense_segment_missing_hnsw_graph() {
         .unwrap();
     engine.flush().unwrap();
     engine.compact().unwrap().unwrap();
-    let seg_id = engine.segments[0].segment_id;
+    let seg_id = engine.segments_for_test()[0].segment_id;
     engine.close().unwrap();
+    drop(engine);
 
     let seg_dir = crate::segment_writer::segment_dir(dir.path(), seg_id);
     std::fs::remove_file(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap();
@@ -308,7 +341,7 @@ fn test_open_rejects_compacted_dense_segment_truncated_vector_blob() {
         }),
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     engine
         .upsert_node(
@@ -335,8 +368,9 @@ fn test_open_rejects_compacted_dense_segment_truncated_vector_blob() {
         .unwrap();
     engine.flush().unwrap();
     engine.compact().unwrap().unwrap();
-    let seg_id = engine.segments[0].segment_id;
+    let seg_id = engine.segments_for_test()[0].segment_id;
     engine.close().unwrap();
+    drop(engine);
 
     let seg_dir = crate::segment_writer::segment_dir(dir.path(), seg_id);
     let dense_blob_path = seg_dir.join(crate::segment_writer::NODE_DENSE_VECTOR_BLOB_FILENAME);
@@ -363,7 +397,7 @@ fn test_open_rejects_standard_compacted_dense_segment_missing_hnsw_graph() {
         }),
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let node_id = engine
         .upsert_node(
@@ -397,8 +431,9 @@ fn test_open_rejects_standard_compacted_dense_segment_missing_hnsw_graph() {
     assert_eq!(compaction_path_for(&engine), CompactionPath::UnifiedV3);
 
     engine.compact().unwrap().unwrap();
-    let seg_id = engine.segments[0].segment_id;
+    let seg_id = engine.segments_for_test()[0].segment_id;
     engine.close().unwrap();
+    drop(engine);
 
     let seg_dir = crate::segment_writer::segment_dir(dir.path(), seg_id);
     std::fs::remove_file(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap();
@@ -526,7 +561,7 @@ fn test_write_and_read_back() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     engine
         .write_op(&WalOp::UpsertNode(make_node(1, "alice")))
@@ -538,8 +573,8 @@ fn test_write_and_read_back() {
         .write_op(&WalOp::UpsertEdge(make_edge(1, 1, 2)))
         .unwrap();
 
-    assert_eq!(engine.node_count(), 2);
-    assert_eq!(engine.edge_count(), 1);
+    assert_eq!(engine.node_count().unwrap(), 2);
+    assert_eq!(engine.edge_count().unwrap(), 1);
 
     let alice = engine.get_node(1).unwrap().unwrap();
     assert_eq!(alice.key, "alice");
@@ -556,7 +591,7 @@ fn test_delete_operations() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     engine
         .write_op(&WalOp::UpsertNode(make_node(1, "alice")))
@@ -583,8 +618,8 @@ fn test_delete_operations() {
 
     assert!(engine.get_node(1).unwrap().is_none());
     assert!(engine.get_edge(1).unwrap().is_none());
-    assert_eq!(engine.node_count(), 0);
-    assert_eq!(engine.edge_count(), 0);
+    assert_eq!(engine.node_count().unwrap(), 0);
+    assert_eq!(engine.edge_count().unwrap(), 0);
 
     engine.close().unwrap();
 }
@@ -595,7 +630,7 @@ fn test_close_and_reopen_recovers_state() {
     let db_path = dir.path().join("testdb");
 
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         for i in 1..=10 {
             engine
                 .write_op(&WalOp::UpsertNode(make_node(i, &format!("node:{}", i))))
@@ -645,7 +680,7 @@ fn test_manifest_id_counters_survive_restart() {
     let db_path = dir.path().join("testdb");
 
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         engine
             .write_op(&WalOp::UpsertNode(make_node(42, "high_id")))
             .unwrap();
@@ -657,8 +692,8 @@ fn test_manifest_id_counters_survive_restart() {
 
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert!(engine.next_node_id() >= 43);
-        assert!(engine.next_edge_id() >= 100);
+        assert!(engine.next_node_id().unwrap() >= 43);
+        assert!(engine.next_edge_id().unwrap() >= 100);
         engine.close().unwrap();
     }
 }
@@ -669,7 +704,7 @@ fn test_wal_replay_with_deletes() {
     let db_path = dir.path().join("testdb");
 
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         engine
             .write_op(&WalOp::UpsertNode(make_node(1, "will_delete")))
             .unwrap();
@@ -700,14 +735,14 @@ fn test_write_op_batch() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let ops: Vec<WalOp> = (1..=50)
         .map(|i| WalOp::UpsertNode(make_node(i, &format!("batch:{}", i))))
         .collect();
     engine.write_op_batch(&ops).unwrap();
 
-    assert_eq!(engine.node_count(), 50);
+    assert_eq!(engine.node_count().unwrap(), 50);
     assert_eq!(engine.get_node(25).unwrap().unwrap().key, "batch:25");
 
     engine.close().unwrap();
@@ -724,7 +759,7 @@ fn test_write_op_batch_survives_restart() {
     let db_path = dir.path().join("testdb");
 
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let mut ops = Vec::new();
         for i in 1..=20 {
             ops.push(WalOp::UpsertNode(make_node(i, &format!("n:{}", i))));
@@ -762,7 +797,7 @@ fn test_write_op_batch_normalizes_node_vectors() {
     };
 
     {
-        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
         let ops = vec![WalOp::UpsertNode(NodeRecord {
             id: 1,
             type_id: 1,
@@ -796,7 +831,7 @@ fn test_upsert_overwrites_on_replay() {
     let db_path = dir.path().join("testdb");
 
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         engine
             .write_op(&WalOp::UpsertNode(make_node(1, "v1")))
             .unwrap();
@@ -824,7 +859,7 @@ fn test_flush_creates_segment() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     engine
         .upsert_node(
@@ -847,13 +882,13 @@ fn test_flush_creates_segment() {
         )
         .unwrap();
 
-    assert_eq!(engine.segment_count(), 0);
+    assert_eq!(engine.segment_count().unwrap(), 0);
     let info = engine.flush().unwrap();
     assert!(info.is_some());
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     // After flush, nodes are in the segment (not memtable)
-    assert_eq!(engine.node_count(), 2);
+    assert_eq!(engine.node_count().unwrap(), 2);
 
     engine.close().unwrap();
 }
@@ -863,11 +898,11 @@ fn test_flush_empty_memtable_is_noop() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let info = engine.flush().unwrap();
     assert!(info.is_none());
-    assert_eq!(engine.segment_count(), 0);
+    assert_eq!(engine.segment_count().unwrap(), 0);
 
     engine.close().unwrap();
 }
@@ -877,7 +912,7 @@ fn test_data_readable_after_flush() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = engine
         .upsert_node(
@@ -922,7 +957,7 @@ fn test_neighbors_after_flush() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = engine
         .upsert_node(
@@ -998,7 +1033,7 @@ fn test_traverse_depth_two_reproduces_basic_two_hop() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Build chain: a -> b -> c -> d
     let a = engine
@@ -1064,7 +1099,7 @@ fn test_traverse_depth_two_excludes_origin_and_hop1() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Build graph with back-edge: a -> b -> a (cycle)
     let a = engine
@@ -1120,7 +1155,7 @@ fn test_traverse_depth_two_respects_limit() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // a -> b, a -> c, b -> d, b -> e, c -> f
     let a = engine
@@ -1215,7 +1250,7 @@ fn test_traverse_depth_two_respects_edge_type_filter() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // a -[type1]-> b -[type1]-> c, b -[type2]-> d
     let a = engine
@@ -1281,7 +1316,7 @@ fn test_traverse_depth_two_incoming() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Chain: a -> b -> c -> d (incoming 2-hop from d should reach b)
     let a = engine
@@ -1347,7 +1382,7 @@ fn test_traverse_depth_two_nonexistent_or_hidden_start() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // No nodes at all. 2-hop on ID 999 should return empty
     let hop2 = traverse_depth_two(&engine, 999, Direction::Outgoing, None, None, 0, None);
@@ -1390,7 +1425,7 @@ fn test_cross_source_reads_memtable_plus_segment() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write batch 1, flush to segment
     let a = engine
@@ -1460,7 +1495,7 @@ fn test_upsert_dedup_across_flush_boundary() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Insert and flush
     let id1 = engine
@@ -1506,7 +1541,7 @@ fn test_tombstone_hides_segment_data() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = engine
         .upsert_node(
@@ -1552,7 +1587,7 @@ fn test_tombstone_survives_second_flush() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = engine
         .upsert_node(
@@ -1580,7 +1615,7 @@ fn test_multiple_flushes_accumulate_segments() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut ids = Vec::new();
     for i in 0..3 {
@@ -1598,7 +1633,7 @@ fn test_multiple_flushes_accumulate_segments() {
         engine.flush().unwrap();
     }
 
-    assert_eq!(engine.segment_count(), 3);
+    assert_eq!(engine.segment_count().unwrap(), 3);
 
     // All nodes readable across 3 segments
     for (i, &id) in ids.iter().enumerate() {
@@ -1614,7 +1649,7 @@ fn test_flush_updates_manifest() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     engine
         .upsert_node(
@@ -1628,7 +1663,7 @@ fn test_flush_updates_manifest() {
         .unwrap();
     engine.flush().unwrap();
 
-    let manifest = engine.manifest();
+    let manifest = engine.manifest().unwrap();
     assert_eq!(manifest.segments.len(), 1);
     assert_eq!(manifest.segments[0].id, 1);
 
@@ -1640,7 +1675,7 @@ fn test_id_counters_survive_flush() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     for i in 0..5 {
         engine
@@ -1654,7 +1689,7 @@ fn test_id_counters_survive_flush() {
             )
             .unwrap();
     }
-    let next_before = engine.next_node_id();
+    let next_before = engine.next_node_id().unwrap();
     engine.flush().unwrap();
 
     // New allocations should continue from where they left off
@@ -1682,7 +1717,7 @@ fn test_segment_data_survives_reopen() {
     let b;
     let eid;
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         a = engine
             .upsert_node(
                 1,
@@ -1712,7 +1747,7 @@ fn test_segment_data_survives_reopen() {
 
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert_eq!(engine.segment_count(), 1);
+        assert_eq!(engine.segment_count().unwrap(), 1);
         assert!(engine.get_node(a).unwrap().is_some());
         assert!(engine.get_node(b).unwrap().is_some());
         assert!(engine.get_edge(eid).unwrap().is_some());
@@ -1731,7 +1766,7 @@ fn test_deleted_edge_excluded_from_segment_neighbors() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = engine
         .upsert_node(
@@ -1788,7 +1823,7 @@ fn test_upsert_after_delete_across_flush_gets_new_id() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let id1 = engine
         .upsert_node(
@@ -1834,9 +1869,9 @@ fn test_auto_flush_triggers_on_threshold() {
         memtable_flush_threshold: 256, // 256 bytes, tiny
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    assert_eq!(engine.segment_count(), 0);
+    assert_eq!(engine.segment_count().unwrap(), 0);
 
     // Insert enough data to exceed the 256-byte threshold
     let mut ids = Vec::new();
@@ -1858,7 +1893,7 @@ fn test_auto_flush_triggers_on_threshold() {
     engine.flush().unwrap();
 
     // Auto-flush should have triggered at least once
-    assert!(engine.segment_count() >= 1);
+    assert!(engine.segment_count().unwrap() >= 1);
 
     // All data still readable across memtable + segments
     for (i, &id) in ids.iter().enumerate() {
@@ -1878,7 +1913,7 @@ fn test_auto_flush_disabled_when_zero() {
         memtable_flush_threshold: 0, // disabled
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     for i in 0..100 {
         engine
@@ -1894,8 +1929,8 @@ fn test_auto_flush_disabled_when_zero() {
     }
 
     // No auto-flush should have occurred
-    assert_eq!(engine.segment_count(), 0);
-    assert_eq!(engine.node_count(), 100);
+    assert_eq!(engine.segment_count().unwrap(), 0);
+    assert_eq!(engine.node_count().unwrap(), 100);
 
     engine.close().unwrap();
 }
@@ -1907,7 +1942,7 @@ fn test_compact_requires_two_segments() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // 0 segments → no-op
     assert!(engine.compact().unwrap().is_none());
@@ -1924,7 +1959,7 @@ fn test_compact_requires_two_segments() {
         )
         .unwrap();
     engine.flush().unwrap();
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
     assert!(engine.compact().unwrap().is_none());
 
     engine.close().unwrap();
@@ -1935,7 +1970,7 @@ fn test_compact_merges_two_segments() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = engine
         .upsert_node(
@@ -1961,13 +1996,13 @@ fn test_compact_merges_two_segments() {
         .unwrap();
     engine.flush().unwrap();
 
-    assert_eq!(engine.segment_count(), 2);
+    assert_eq!(engine.segment_count().unwrap(), 2);
 
     let stats = engine.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 2);
     assert_eq!(stats.nodes_kept, 2);
     assert_eq!(stats.nodes_removed, 0);
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     // Data still accessible
     assert_eq!(engine.get_node(a).unwrap().unwrap().key, "alice");
@@ -1981,7 +2016,7 @@ fn test_compact_applies_tombstones() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Segment 1: alice + bob + edge
     let a = engine
@@ -2014,7 +2049,7 @@ fn test_compact_applies_tombstones() {
     engine.delete_edge(eid).unwrap();
     engine.flush().unwrap();
 
-    assert_eq!(engine.segment_count(), 2);
+    assert_eq!(engine.segment_count().unwrap(), 2);
 
     let stats = engine.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 2);
@@ -2022,13 +2057,13 @@ fn test_compact_applies_tombstones() {
     assert_eq!(stats.nodes_removed, 1); // bob removed
     assert_eq!(stats.edges_kept, 0);
     assert_eq!(stats.edges_removed, 1);
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
     assert!(stats.output_segment_id > 0);
     assert!(stats.duration_ms < 30_000); // sanity upper bound
 
     // Compacted segment should have zero tombstones
-    assert_eq!(engine.segment_tombstone_node_count(), 0);
-    assert_eq!(engine.segment_tombstone_edge_count(), 0);
+    assert_eq!(engine.segment_tombstone_node_count().unwrap(), 0);
+    assert_eq!(engine.segment_tombstone_edge_count().unwrap(), 0);
 
     // alice survives, bob and edge are gone
     assert!(engine.get_node(a).unwrap().is_some());
@@ -2047,7 +2082,7 @@ fn test_compact_node_last_write_wins() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Segment 1: alice v1
     let mut props_v1 = BTreeMap::new();
@@ -2081,7 +2116,7 @@ fn test_compact_node_last_write_wins() {
         .unwrap();
     engine.flush().unwrap();
 
-    assert_eq!(engine.segment_count(), 2);
+    assert_eq!(engine.segment_count().unwrap(), 2);
 
     let stats = engine.compact().unwrap().unwrap();
     assert_eq!(stats.nodes_kept, 1);
@@ -2100,7 +2135,7 @@ fn test_compact_preserves_neighbors() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = engine
         .upsert_node(
@@ -2179,7 +2214,7 @@ fn test_compact_cleans_up_old_segment_dirs() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     engine
         .upsert_node(
@@ -2224,7 +2259,7 @@ fn test_compact_updates_manifest() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     engine
         .upsert_node(
@@ -2249,11 +2284,11 @@ fn test_compact_updates_manifest() {
         .unwrap();
     engine.flush().unwrap();
 
-    assert_eq!(engine.manifest().segments.len(), 2);
+    assert_eq!(engine.manifest().unwrap().segments.len(), 2);
 
     engine.compact().unwrap();
 
-    let manifest = engine.manifest();
+    let manifest = engine.manifest().unwrap();
     assert_eq!(manifest.segments.len(), 1);
     // New segment should have both nodes
     assert_eq!(manifest.segments[0].node_count, 2);
@@ -2269,7 +2304,7 @@ fn test_compact_data_survives_reopen() {
     let a;
     let b;
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         a = engine
             .upsert_node(
                 1,
@@ -2301,7 +2336,7 @@ fn test_compact_data_survives_reopen() {
 
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert_eq!(engine.segment_count(), 1);
+        assert_eq!(engine.segment_count().unwrap(), 1);
         assert_eq!(engine.get_node(a).unwrap().unwrap().key, "alice");
         assert_eq!(engine.get_node(b).unwrap().unwrap().key, "bob");
         let out = engine.neighbors(a, &NeighborOptions::default()).unwrap();
@@ -2319,7 +2354,7 @@ fn test_compact_three_segments() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let mut all_ids = Vec::new();
     for i in 0..3 {
@@ -2337,12 +2372,12 @@ fn test_compact_three_segments() {
         engine.flush().unwrap();
     }
 
-    assert_eq!(engine.segment_count(), 3);
+    assert_eq!(engine.segment_count().unwrap(), 3);
 
     let stats = engine.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 3);
     assert_eq!(stats.nodes_kept, 3);
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     for (i, &id) in all_ids.iter().enumerate() {
         assert_eq!(
@@ -2361,7 +2396,7 @@ fn test_compact_with_unflushed_tombstone() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Segment 1: alice + bob
     let a = engine
@@ -2401,7 +2436,7 @@ fn test_compact_with_unflushed_tombstone() {
 
     // Delete bob. Unflushed, lives in memtable only
     engine.delete_node(b).unwrap();
-    assert_eq!(engine.segment_count(), 2);
+    assert_eq!(engine.segment_count().unwrap(), 2);
 
     // Compact should flush the tombstone first, then merge all 3 segments
     let stats = engine.compact().unwrap().unwrap();
@@ -2412,7 +2447,7 @@ fn test_compact_with_unflushed_tombstone() {
     // bob is gone from the compacted segment
     assert!(engine.get_node(a).unwrap().is_some());
     assert!(engine.get_node(b).unwrap().is_none());
-    assert_eq!(engine.segment_count(), 1);
+    assert_eq!(engine.segment_count().unwrap(), 1);
 
     engine.close().unwrap();
 }
@@ -2424,7 +2459,7 @@ fn test_compact_with_unflushed_update() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Segment 1: alice v1
     let mut props_v1 = BTreeMap::new();
@@ -2487,7 +2522,7 @@ fn test_compact_removes_dangling_edges_after_node_delete() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Segment 1: A→B→C chain
     let a = engine
@@ -2574,7 +2609,7 @@ fn test_orphan_segment_does_not_reuse_id() {
 
     // Create DB, insert data, flush to create segment, close
     {
-        let mut engine = DatabaseEngine::open(
+        let engine = DatabaseEngine::open(
             &db_path,
             &DbOptions {
                 create_if_missing: true,
@@ -2599,7 +2634,7 @@ fn test_orphan_segment_does_not_reuse_id() {
 
     // Reopen. next_segment_id should skip past the orphan
     {
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         // Insert more data and flush. Should get segment ID > 99
         engine
             .upsert_node(1, "b", UpsertNodeOptions::default())
@@ -2608,7 +2643,7 @@ fn test_orphan_segment_does_not_reuse_id() {
 
         // The new segment should have ID >= 100 (since orphan was seg_0099)
         let max_manifest_seg = engine
-            .manifest()
+            .manifest().unwrap()
             .segments
             .iter()
             .map(|s| s.id)
@@ -2658,7 +2693,7 @@ fn test_map_props_roundtrip_memtable_and_segment() {
     props.insert("metadata".to_string(), PropValue::Map(nested));
     props.insert("name".to_string(), PropValue::String("test".into()));
 
-    let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let id = engine
         .upsert_node(
             1,
@@ -2691,9 +2726,9 @@ fn test_map_props_roundtrip_memtable_and_segment() {
 
 fn compaction_path_for(engine: &DatabaseEngine) -> CompactionPath {
     select_compaction_path(
-        &engine.segments,
-        engine.segments.iter().any(|s| s.has_tombstones()),
-        !engine.manifest.prune_policies.is_empty(),
+        &engine.segments_for_test(),
+        engine.segments_for_test().iter().any(|s| s.has_tombstones()),
+        !engine.manifest().unwrap().prune_policies.is_empty(),
     )
 }
 
@@ -2780,8 +2815,8 @@ fn assert_compacted_index_files_match(
     left_db_dir: &std::path::Path,
     right_db_dir: &std::path::Path,
 ) {
-    let left_dir = segment_dir(left_db_dir, left.segments[0].segment_id);
-    let right_dir = segment_dir(right_db_dir, right.segments[0].segment_id);
+    let left_dir = segment_dir(left_db_dir, left.segments_for_test()[0].segment_id);
+    let right_dir = segment_dir(right_db_dir, right.segments_for_test()[0].segment_id);
     assert_segment_common_artifacts_match(&left_dir, &right_dir);
 }
 
@@ -3083,7 +3118,7 @@ fn test_segments_non_overlapping_detection() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Unique keys per flush → non-overlapping IDs
     for seg in 0..3u64 {
@@ -3095,7 +3130,7 @@ fn test_segments_non_overlapping_detection() {
         engine.flush().unwrap();
     }
 
-    assert!(segments_are_non_overlapping(&engine.segments));
+    assert!(segments_are_non_overlapping(&engine.segments_for_test()));
     engine.close().unwrap();
 }
 
@@ -3106,7 +3141,7 @@ fn test_segments_overlapping_detection() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Same keys across flushes → same IDs → overlapping
     for _seg in 0..3 {
@@ -3118,7 +3153,7 @@ fn test_segments_overlapping_detection() {
         engine.flush().unwrap();
     }
 
-    assert!(!segments_are_non_overlapping(&engine.segments));
+    assert!(!segments_are_non_overlapping(&engine.segments_for_test()));
     engine.close().unwrap();
 }
 
@@ -3150,7 +3185,7 @@ fn test_fast_merge_eligibility_rules() {
     tombstone_engine.close().unwrap();
 
     let overlap_dir = TempDir::new().unwrap();
-    let mut overlap_engine = DatabaseEngine::open(overlap_dir.path(), &opts).unwrap();
+    let overlap_engine = DatabaseEngine::open(overlap_dir.path(), &opts).unwrap();
     for _seg in 0..3 {
         for i in 0..10 {
             overlap_engine
@@ -3174,7 +3209,7 @@ fn test_fast_merge_compaction_correctness() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Build 3 segments with unique non-overlapping data
     let mut all_node_ids = Vec::new();
@@ -3202,10 +3237,10 @@ fn test_fast_merge_compaction_correctness() {
         engine.flush().unwrap();
     }
 
-    assert_eq!(engine.segments.len(), 3);
+    assert_eq!(engine.segments_for_test().len(), 3);
     // Pre-condition: non-overlapping, no tombstones (simplest V3 case)
-    assert!(!engine.segments.iter().any(|s| s.has_tombstones()));
-    assert!(segments_are_non_overlapping(&engine.segments));
+    assert!(!engine.segments_for_test().iter().any(|s| s.has_tombstones()));
+    assert!(segments_are_non_overlapping(&engine.segments_for_test()));
     assert_eq!(compaction_path_for(&engine), CompactionPath::FastMerge);
 
     let stats = engine.compact().unwrap().unwrap();
@@ -3214,7 +3249,7 @@ fn test_fast_merge_compaction_correctness() {
     assert_eq!(stats.edges_kept, 15);
     assert_eq!(stats.nodes_removed, 0);
     assert_eq!(stats.edges_removed, 0);
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     // Verify all records are accessible (batch read)
     let node_results = engine.get_nodes(&all_node_ids).unwrap();
@@ -3259,7 +3294,7 @@ fn test_fast_merge_with_properties() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Segments with property data to verify raw byte copy preserves properties
     let mut ids = Vec::new();
@@ -3313,7 +3348,7 @@ fn test_fast_merge_survives_reopen() {
     let mut ids = Vec::new();
     let mut first_nodes = Vec::new();
     {
-        let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
         for seg in 0..3u64 {
             let mut seg_ids = Vec::new();
             for i in 0..10 {
@@ -3339,7 +3374,7 @@ fn test_fast_merge_survives_reopen() {
     for &id in &ids {
         assert!(engine.get_node(id).unwrap().is_some());
     }
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
     for &first in &first_nodes {
         assert_eq!(engine.degree(first, &DegreeOptions::default()).unwrap(), 1);
         let nbrs = engine
@@ -3364,7 +3399,7 @@ fn test_fast_merge_find_nodes_works() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for seg in 0..2u64 {
         for i in 0..20 {
@@ -3516,7 +3551,7 @@ fn test_fast_merge_background_matches_sync() {
         );
     }
     assert_compacted_index_files_match(&sync_engine, &bg_engine, sync_dir.path(), bg_dir.path());
-    assert_segment_metadata_semantics_match(&sync_engine.segments[0], &bg_engine.segments[0]);
+    assert_segment_metadata_semantics_match(&sync_engine.segments_for_test()[0], &bg_engine.segments_for_test()[0]);
 
     sync_engine.close().unwrap();
     bg_engine.close().unwrap();
@@ -3537,8 +3572,8 @@ fn test_fast_merge_matches_single_flush_artifacts_for_vector_segments() {
         ..DbOptions::default()
     };
 
-    let mut compact_engine = DatabaseEngine::open(compact_dir.path(), &opts).unwrap();
-    let mut flush_engine = DatabaseEngine::open(flush_dir.path(), &opts).unwrap();
+    let compact_engine = DatabaseEngine::open(compact_dir.path(), &opts).unwrap();
+    let flush_engine = DatabaseEngine::open(flush_dir.path(), &opts).unwrap();
     let mut compact_node_ids = Vec::new();
     let mut flush_node_ids = Vec::new();
     let mut compact_edge_ids = Vec::new();
@@ -3655,10 +3690,10 @@ fn test_fast_merge_matches_single_flush_artifacts_for_vector_segments() {
     let flush_edges = flush_engine.get_edges(&flush_edge_ids).unwrap();
     assert_edge_batches_match(&compact_edges, &flush_edges);
 
-    let compact_seg_dir = segment_dir(compact_dir.path(), compact_engine.segments[0].segment_id);
-    let flush_seg_dir = segment_dir(flush_dir.path(), flush_engine.segments[0].segment_id);
+    let compact_seg_dir = segment_dir(compact_dir.path(), compact_engine.segments_for_test()[0].segment_id);
+    let flush_seg_dir = segment_dir(flush_dir.path(), flush_engine.segments_for_test()[0].segment_id);
     assert_segment_common_artifacts_match(&compact_seg_dir, &flush_seg_dir);
-    assert_segment_metadata_semantics_match(&compact_engine.segments[0], &flush_engine.segments[0]);
+    assert_segment_metadata_semantics_match(&compact_engine.segments_for_test()[0], &flush_engine.segments_for_test()[0]);
 
     // Semantic HNSW parity: both engines should produce equivalent search results.
     let queries: Vec<Vec<f32>> = vec![
@@ -3718,7 +3753,7 @@ fn test_standard_path_used_for_overlapping_segments() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Same keys → overlapping IDs → standard path
     for _seg in 0..3 {
@@ -3736,7 +3771,7 @@ fn test_standard_path_used_for_overlapping_segments() {
     let stats = engine.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 3);
     assert_eq!(stats.nodes_kept, 10); // deduped to 10 unique nodes
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     for i in 0..10 {
         assert!(engine
@@ -3763,7 +3798,7 @@ fn test_auto_compact_triggers_after_n_flushes() {
         compact_after_n_flushes: 3,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Flush 1 and 2: no compaction yet
     for i in 0..10 {
@@ -3772,7 +3807,7 @@ fn test_auto_compact_triggers_after_n_flushes() {
             .unwrap();
     }
     engine.flush().unwrap();
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     for i in 0..10 {
         engine
@@ -3780,7 +3815,7 @@ fn test_auto_compact_triggers_after_n_flushes() {
             .unwrap();
     }
     engine.flush().unwrap();
-    assert_eq!(engine.segments.len(), 2);
+    assert_eq!(engine.segments_for_test().len(), 2);
 
     // Flush 3: should trigger auto-compact (3 segments → 1)
     for i in 0..10 {
@@ -3791,7 +3826,7 @@ fn test_auto_compact_triggers_after_n_flushes() {
     engine.flush().unwrap();
     // Auto-compact fires in background. Wait for it to complete.
     engine.wait_for_bg_compact();
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     // All 30 nodes should be accessible
     for prefix in ["a", "b", "c"] {
@@ -3815,7 +3850,7 @@ fn test_auto_compact_disabled_when_zero() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for flush in 0..10u64 {
         for i in 0..5 {
@@ -3831,7 +3866,7 @@ fn test_auto_compact_disabled_when_zero() {
     }
 
     // No auto-compact → all 10 segments should still exist
-    assert_eq!(engine.segments.len(), 10);
+    assert_eq!(engine.segments_for_test().len(), 10);
     engine.close().unwrap();
 }
 
@@ -3842,7 +3877,7 @@ fn test_auto_compact_counter_resets_on_manual_compact() {
         compact_after_n_flushes: 5,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // 2 flushes
     for seg in 0..2u64 {
@@ -3853,13 +3888,13 @@ fn test_auto_compact_counter_resets_on_manual_compact() {
         }
         engine.flush().unwrap();
     }
-    assert_eq!(engine.segments.len(), 2);
-    assert_eq!(engine.flush_count_since_last_compact, 2);
+    assert_eq!(engine.segments_for_test().len(), 2);
+    assert_eq!(engine.flush_count_since_last_compact_for_test(), 2);
 
     // Manual compact resets the counter
     engine.compact().unwrap();
-    assert_eq!(engine.flush_count_since_last_compact, 0);
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.flush_count_since_last_compact_for_test(), 0);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     // Now 4 more flushes (counter reset, so 5th from here triggers auto-compact)
     for seg in 2..6u64 {
@@ -3871,7 +3906,7 @@ fn test_auto_compact_counter_resets_on_manual_compact() {
         engine.flush().unwrap();
     }
     // 4 flushes since manual compact: segments = 1 (from manual) + 4 = 5
-    assert_eq!(engine.segments.len(), 5);
+    assert_eq!(engine.segments_for_test().len(), 5);
 
     // 5th flush triggers auto-compact
     for i in 0..5 {
@@ -3882,7 +3917,7 @@ fn test_auto_compact_counter_resets_on_manual_compact() {
     engine.flush().unwrap();
     // Auto-compact fires in background. Wait for it.
     engine.wait_for_bg_compact();
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     engine.close().unwrap();
 }
@@ -3894,7 +3929,7 @@ fn test_auto_compact_data_integrity() {
         compact_after_n_flushes: 2,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let mut all_ids = Vec::new();
     // This will trigger auto-compact after every 2 flushes
@@ -3928,7 +3963,7 @@ fn test_auto_compact_not_triggered_during_compact_flush() {
         compact_after_n_flushes: 1, // trigger after every single flush
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // First flush triggers auto-compact since threshold is 1.
     // But we only have 1 segment after flush, so compact() returns None (< 2 segments).
@@ -3939,7 +3974,7 @@ fn test_auto_compact_not_triggered_during_compact_flush() {
     }
     engine.flush().unwrap();
     // Only 1 segment, compact can't fire (needs >= 2)
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     // Second flush: now 2 segments, auto-compact should fire
     for i in 0..5 {
@@ -3952,7 +3987,7 @@ fn test_auto_compact_not_triggered_during_compact_flush() {
     engine.wait_for_bg_compact();
     // compact fires: 2 segments → 1. The flush inside compact()
     // (for unflushed memtable) should NOT trigger recursive auto-compact.
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     // All data accessible
     for i in 0..5 {
@@ -3980,7 +4015,7 @@ fn test_bg_compact_basic() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Two flushes to trigger background compaction
     for i in 0..10 {
@@ -3989,7 +4024,7 @@ fn test_bg_compact_basic() {
             .unwrap();
     }
     engine.flush().unwrap();
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     for i in 0..10 {
         engine
@@ -3998,11 +4033,11 @@ fn test_bg_compact_basic() {
     }
     engine.flush().unwrap();
     // Background compaction should have been started
-    assert!(engine.bg_compact.is_some() || engine.segments.len() == 1);
+    assert!(engine.bg_compact_active_for_test() || engine.segments_for_test().len() == 1);
 
     // Wait for background compaction to complete
     engine.wait_for_bg_compact();
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     // All 20 nodes accessible
     for prefix in ["a", "b"] {
@@ -4020,7 +4055,7 @@ fn test_bg_compact_basic() {
 }
 
 #[test]
-fn test_write_path_applies_finished_bg_compact() {
+fn test_lifecycle_pump_applies_finished_bg_compact_without_foreground_write() {
     let dir = TempDir::new().unwrap();
     let opts = DbOptions {
         compact_after_n_flushes: 2,
@@ -4029,7 +4064,7 @@ fn test_write_path_applies_finished_bg_compact() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..10 {
         engine
@@ -4044,34 +4079,54 @@ fn test_write_path_applies_finished_bg_compact() {
     }
     engine.flush().unwrap();
 
-    assert!(engine.bg_compact.is_some());
+    assert!(engine.bg_compact_active_for_test());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while engine
-        .bg_compact
-        .as_ref()
-        .is_some_and(|bg| !bg.handle.is_finished())
-    {
+    while engine.bg_compact_active_for_test() {
         assert!(
             std::time::Instant::now() < deadline,
-            "background compaction did not finish in time"
+            "lifecycle pump did not reap finished background compaction in time"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    assert!(engine.bg_compact.is_some());
-    assert_eq!(engine.segments.len(), 2);
-
-    engine
-        .upsert_node(1, "c0", UpsertNodeOptions::default())
-        .unwrap();
-
     assert!(
-        engine.bg_compact.is_none(),
-        "next write should reap finished background compaction"
+        !engine.bg_compact_incomplete_for_test(),
+        "finished background compaction should no longer be outstanding"
     );
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     engine.close().unwrap();
+}
+
+#[test]
+fn test_lifecycle_pump_applies_bg_flush_without_foreground_write() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        memtable_flush_threshold: 0,
+        compact_after_n_flushes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    db.upsert_node(1, "pump_flush", UpsertNodeOptions::default())
+        .unwrap();
+    db.freeze_memtable().unwrap();
+    db.enqueue_one_flush().unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while db.immutable_epoch_count() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lifecycle pump did not adopt completed bg flush in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(db.segment_count().unwrap(), 1);
+    assert!(db.get_node_by_key(1, "pump_flush").unwrap().is_some());
+
+    db.close().unwrap();
 }
 
 #[test]
@@ -4084,7 +4139,7 @@ fn test_bg_compact_writes_during() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Two flushes to trigger bg compact
     for i in 0..10 {
@@ -4141,7 +4196,7 @@ fn test_flushes_while_bg_compact_is_outstanding_count_toward_next_run() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..10 {
         engine
@@ -4156,8 +4211,8 @@ fn test_flushes_while_bg_compact_is_outstanding_count_toward_next_run() {
     }
     engine.flush().unwrap();
 
-    assert!(engine.bg_compact.is_some());
-    assert_eq!(engine.flush_count_since_last_compact, 0);
+    assert!(engine.bg_compact_active_for_test());
+    assert_eq!(engine.flush_count_since_last_compact_for_test(), 0);
 
     for i in 0..10 {
         engine
@@ -4167,12 +4222,12 @@ fn test_flushes_while_bg_compact_is_outstanding_count_toward_next_run() {
     engine.flush().unwrap();
 
     assert_eq!(
-        engine.flush_count_since_last_compact, 1,
+        engine.flush_count_since_last_compact_for_test(), 1,
         "flushes published while background compaction is outstanding should count toward the next auto-compaction"
     );
 
     engine.wait_for_bg_compact();
-    assert_eq!(engine.segments.len(), 2);
+    assert_eq!(engine.segments_for_test().len(), 2);
 
     for i in 0..10 {
         engine
@@ -4182,11 +4237,11 @@ fn test_flushes_while_bg_compact_is_outstanding_count_toward_next_run() {
     engine.flush().unwrap();
 
     assert!(
-        engine.bg_compact.is_some(),
+        engine.bg_compact_active_for_test(),
         "second auto-compaction should start once the post-compaction flush count reaches the threshold"
     );
     engine.wait_for_bg_compact();
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     engine.close().unwrap();
 }
@@ -4203,7 +4258,7 @@ fn test_bg_compact_flush_during() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Two flushes → triggers bg compact
     for i in 0..10 {
@@ -4231,7 +4286,7 @@ fn test_bg_compact_flush_during() {
     engine.wait_for_bg_compact();
 
     // Should have: 1 compacted segment (from a+b) + 1 new segment (from c)
-    assert_eq!(engine.segments.len(), 2);
+    assert_eq!(engine.segments_for_test().len(), 2);
 
     // All data accessible
     for prefix in ["a", "b", "c"] {
@@ -4259,7 +4314,7 @@ fn test_bg_compact_no_double() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // First flush: only 1 segment, bg compact needs >= 2, so no bg compact
     for i in 0..5 {
@@ -4268,7 +4323,7 @@ fn test_bg_compact_no_double() {
             .unwrap();
     }
     engine.flush().unwrap();
-    assert!(engine.bg_compact.is_none());
+    assert!(!engine.bg_compact_active_for_test());
 
     // Second flush: 2 segments, bg compact starts
     for i in 0..5 {
@@ -4278,7 +4333,7 @@ fn test_bg_compact_no_double() {
     }
     engine.flush().unwrap();
     // bg_compact should be Some (or already completed)
-    let had_bg = engine.bg_compact.is_some();
+    let had_bg = engine.bg_compact_active_for_test();
 
     // Third flush: bg compact is still running (or just completed),
     // should NOT start a second bg compact
@@ -4324,7 +4379,7 @@ fn test_bg_compact_manual_after_bg() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Two flushes → triggers bg compact
     for i in 0..10 {
@@ -4357,7 +4412,7 @@ fn test_bg_compact_manual_after_bg() {
     // Manual compact. With re-trigger scheduling, auto-compaction may have
     // already reduced segments — compact() returns None if < 2 remain.
     let _stats = engine.compact().unwrap();
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     // All data accessible
     for prefix in ["a", "b", "c", "d"] {
@@ -4383,7 +4438,7 @@ fn test_bg_compact_drop_waits() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..10 {
         engine
@@ -4427,7 +4482,7 @@ fn test_bg_compact_immediate_mode() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..10 {
         engine
@@ -4443,7 +4498,7 @@ fn test_bg_compact_immediate_mode() {
     engine.flush().unwrap();
 
     engine.wait_for_bg_compact();
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     engine.close().unwrap();
 
@@ -4475,7 +4530,7 @@ fn test_bg_compact_group_commit_mode() {
         },
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..10 {
         engine
@@ -4530,7 +4585,7 @@ fn test_bg_compact_cancel() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Two flushes → triggers bg compact
     for i in 0..10 {
@@ -4548,7 +4603,7 @@ fn test_bg_compact_cancel() {
 
     // Cancel the bg compact (may have already finished for small data, that's OK)
     engine.cancel_bg_compact();
-    assert!(engine.bg_compact.is_none());
+    assert!(!engine.bg_compact_active_for_test());
 
     // Segments should be >= 2 (cancel prevented the compaction from applying,
     // or if it finished before cancel, wait_for_bg_compact in cancel already
@@ -4578,7 +4633,7 @@ fn test_orphan_segment_cleanup_on_open() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Write + flush to create a real segment
     for i in 0..5 {
@@ -4587,7 +4642,7 @@ fn test_orphan_segment_cleanup_on_open() {
             .unwrap();
     }
     engine.flush().unwrap();
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
 
     engine.close().unwrap();
 
@@ -4609,7 +4664,7 @@ fn test_orphan_segment_cleanup_on_open() {
     assert!(!orphan2.exists(), "orphan2 should have been cleaned up");
 
     // Real segment should still be there
-    assert_eq!(engine.segments.len(), 1);
+    assert_eq!(engine.segments_for_test().len(), 1);
     for i in 0..5 {
         let key = format!("n{}", i);
         assert!(
@@ -4631,7 +4686,7 @@ fn test_orphan_cleanup_preserves_valid_segments() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Create 3 segments
     for seg in 0..3 {
@@ -4642,12 +4697,12 @@ fn test_orphan_cleanup_preserves_valid_segments() {
         }
         engine.flush().unwrap();
     }
-    assert_eq!(engine.segments.len(), 3);
+    assert_eq!(engine.segments_for_test().len(), 3);
     engine.close().unwrap();
 
     // Reopen. All 3 segments should survive (no orphan cleanup of valid segments)
     let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
-    assert_eq!(engine.segments.len(), 3);
+    assert_eq!(engine.segments_for_test().len(), 3);
 
     // All data accessible
     for seg in 0..3 {
@@ -4698,7 +4753,7 @@ fn temp_db_group_commit() -> (TempDir, DatabaseEngine) {
 
 #[test]
 fn test_immediate_mode_basic_operations() {
-    let (dir, mut engine) = temp_db_immediate();
+    let (dir, engine) = temp_db_immediate();
 
     // Write nodes and edges
     let n1 = engine
@@ -4735,7 +4790,7 @@ fn test_immediate_mode_basic_operations() {
 
 #[test]
 fn test_immediate_mode_batch_operations() {
-    let (_dir, mut engine) = temp_db_immediate();
+    let (_dir, engine) = temp_db_immediate();
 
     let inputs: Vec<NodeInput> = (0..50)
         .map(|i| NodeInput {
@@ -4760,7 +4815,7 @@ fn test_immediate_mode_batch_operations() {
 
 #[test]
 fn test_immediate_mode_flush_compact_cycle() {
-    let (_dir, mut engine) = temp_db_immediate();
+    let (_dir, engine) = temp_db_immediate();
 
     // Insert, flush, insert more, flush, compact
     for i in 0..100 {
@@ -4803,7 +4858,7 @@ fn test_immediate_mode_flush_compact_cycle() {
 
 #[test]
 fn test_group_commit_basic_write_close_reopen() {
-    let (dir, mut engine) = temp_db_group_commit();
+    let (dir, engine) = temp_db_group_commit();
 
     // Write 20 nodes
     let mut ids = Vec::new();
@@ -4846,7 +4901,7 @@ fn test_group_commit_basic_write_close_reopen() {
 
 #[test]
 fn test_group_commit_with_edges() {
-    let (dir, mut engine) = temp_db_group_commit();
+    let (dir, engine) = temp_db_group_commit();
 
     let n1 = engine
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -4892,7 +4947,7 @@ fn test_group_commit_with_edges() {
 
 #[test]
 fn test_group_commit_batch_operations() {
-    let (dir, mut engine) = temp_db_group_commit();
+    let (dir, engine) = temp_db_group_commit();
 
     let inputs: Vec<NodeInput> = (0..100)
         .map(|i| NodeInput {
@@ -4933,7 +4988,7 @@ fn test_group_commit_batch_operations() {
 
 #[test]
 fn test_sync_forces_immediate_flush() {
-    let (dir, mut engine) = temp_db_group_commit();
+    let (dir, engine) = temp_db_group_commit();
 
     // Write a node
     let id = engine
@@ -4965,7 +5020,7 @@ fn test_sync_forces_immediate_flush() {
 
 #[test]
 fn test_sync_noop_in_immediate_mode() {
-    let (_dir, mut engine) = temp_db_immediate();
+    let (_dir, engine) = temp_db_immediate();
 
     engine
         .upsert_node(1, "test", UpsertNodeOptions::default())
@@ -4977,7 +5032,7 @@ fn test_sync_noop_in_immediate_mode() {
 
 #[test]
 fn test_group_commit_flush_cycle() {
-    let (dir, mut engine) = temp_db_group_commit();
+    let (dir, engine) = temp_db_group_commit();
 
     // Write → flush → write → flush under GroupCommit
     for i in 0..50 {
@@ -5026,7 +5081,7 @@ fn test_group_commit_flush_cycle() {
 #[test]
 fn test_drop_joins_sync_thread() {
     // Verify Drop impl doesn't panic and joins the sync thread
-    let (_dir, mut engine) = temp_db_group_commit();
+    let (_dir, engine) = temp_db_group_commit();
 
     for i in 0..10 {
         engine
@@ -5066,7 +5121,7 @@ fn test_backpressure_blocks_writer_at_hard_cap() {
         },
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Write many nodes. Some will block on backpressure but the sync thread
     // will drain them. If backpressure is broken, buffered_bytes grows unbounded.
@@ -5093,7 +5148,7 @@ fn test_backpressure_blocks_writer_at_hard_cap() {
 
 #[test]
 fn test_clean_shutdown_drains_all_buffered_data() {
-    let (dir, mut engine) = temp_db_group_commit();
+    let (dir, engine) = temp_db_group_commit();
 
     // Write 100 nodes rapidly (most will be buffered, not yet synced)
     for i in 0..100 {
@@ -5134,7 +5189,7 @@ fn test_drop_drains_buffered_data() {
 
     // Write data and drop without close
     {
-        let mut engine = DatabaseEngine::open(
+        let engine = DatabaseEngine::open(
             dir.path(),
             &DbOptions {
                 create_if_missing: true,
@@ -5216,14 +5271,12 @@ fn test_sync_failure_poisons_engine() {
         },
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    // Replace the wal_state with our poisoned one (shut down the existing sync thread first)
-    if let Some(ref wal_state) = engine.wal_state {
-        crate::wal_sync::shutdown_sync_thread(wal_state, &mut engine.sync_thread).unwrap();
-    }
-    engine.wal_state = Some(arc);
-    engine.sync_thread = None; // no sync thread needed for this test
+    // Replace the WAL sync state with our poisoned one.
+    engine.replace_wal_state_for_test(arc).unwrap();
+    let before = engine.published_state();
+    engine.reset_publish_counters_for_test();
 
     // Attempt to write. Should get WalSyncFailed error
     let result = engine.upsert_node(1, "should_fail", UpsertNodeOptions::default());
@@ -5234,11 +5287,21 @@ fn test_sync_failure_poisons_engine() {
         "unexpected error: {}",
         err_msg
     );
+
+    let after = engine.published_state();
+    let counters = engine.publish_counter_snapshot_for_test();
+    assert!(std::sync::Arc::ptr_eq(&before.view.sources, &after.view.sources));
+    assert_eq!(before.engine_seq, after.engine_seq);
+    assert!(engine.get_node_by_key(1, "should_fail").unwrap().is_none());
+    assert!(counters.skipped >= 1);
+    assert_eq!(counters.snapshot_only, 0);
+    assert_eq!(counters.rebuild_sources, 0);
+    assert_eq!(counters.source_rebuilds, 0);
 }
 
 #[test]
 fn test_integration_1000_writes_group_commit() {
-    let (dir, mut engine) = temp_db_group_commit();
+    let (dir, engine) = temp_db_group_commit();
 
     // Write 1000 nodes with properties
     for i in 0..1000 {
@@ -5286,7 +5349,7 @@ fn test_integration_1000_writes_group_commit() {
 #[test]
 fn test_integration_write_flush_write_flush_group_commit() {
     // Exercises truncate_and_reset through multiple flush cycles
-    let (dir, mut engine) = temp_db_group_commit();
+    let (dir, engine) = temp_db_group_commit();
 
     // Cycle 1: write → flush
     for i in 0..100 {
@@ -5343,7 +5406,7 @@ fn test_integration_write_flush_write_flush_group_commit() {
 
 #[test]
 fn test_group_commit_delete_and_compact_cycle() {
-    let (dir, mut engine) = temp_db_group_commit();
+    let (dir, engine) = temp_db_group_commit();
 
     // Insert nodes
     let mut ids = Vec::new();
@@ -5486,9 +5549,9 @@ fn test_backpressure_flush_triggers_at_hard_cap_immediate() {
         compact_after_n_flushes: 0, // disable auto-compact
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    assert_eq!(engine.segment_count(), 0);
+    assert_eq!(engine.segment_count().unwrap(), 0);
 
     // Write enough data to exceed the 512-byte cap multiple times
     let mut ids = Vec::new();
@@ -5508,7 +5571,7 @@ fn test_backpressure_flush_triggers_at_hard_cap_immediate() {
 
     // Backpressure should have triggered at least one flush
     assert!(
-        engine.segment_count() >= 1,
+        engine.segment_count().unwrap() >= 1,
         "expected at least 1 segment from backpressure flush"
     );
 
@@ -5537,9 +5600,9 @@ fn test_backpressure_flush_triggers_at_hard_cap_group_commit() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    assert_eq!(engine.segment_count(), 0);
+    assert_eq!(engine.segment_count().unwrap(), 0);
 
     let mut ids = Vec::new();
     for i in 0..50 {
@@ -5558,7 +5621,7 @@ fn test_backpressure_flush_triggers_at_hard_cap_group_commit() {
 
     // Backpressure flushed at least once
     assert!(
-        engine.segment_count() >= 1,
+        engine.segment_count().unwrap() >= 1,
         "expected backpressure flush in group commit mode"
     );
 
@@ -5602,7 +5665,7 @@ fn test_backpressure_disabled_when_zero() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..100 {
         engine
@@ -5618,8 +5681,8 @@ fn test_backpressure_disabled_when_zero() {
     }
 
     // No flushes should have occurred
-    assert_eq!(engine.segment_count(), 0);
-    assert_eq!(engine.node_count(), 100);
+    assert_eq!(engine.segment_count().unwrap(), 0);
+    assert_eq!(engine.node_count().unwrap(), 100);
 
     engine.close().unwrap();
 }
@@ -5636,7 +5699,7 @@ fn test_backpressure_fires_before_soft_threshold() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..30 {
         engine
@@ -5653,7 +5716,7 @@ fn test_backpressure_fires_before_soft_threshold() {
 
     // Backpressure kicked in before the 1MB soft threshold
     assert!(
-        engine.segment_count() >= 1,
+        engine.segment_count().unwrap() >= 1,
         "backpressure should trigger before soft threshold"
     );
 
@@ -5671,7 +5734,7 @@ fn test_backpressure_with_edges_and_deletes() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Create nodes
     let mut node_ids = Vec::new();
@@ -5717,7 +5780,7 @@ fn test_backpressure_with_edges_and_deletes() {
     }
 
     // Segments created by backpressure
-    assert!(engine.segment_count() >= 1);
+    assert!(engine.segment_count().unwrap() >= 1);
 
     // Remaining data is accessible
     for nid in &node_ids[5..20] {
@@ -5738,7 +5801,7 @@ fn test_backpressure_with_batch_upserts() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // First batch: fills memtable
     let inputs1: Vec<NodeInput> = (0..20)
@@ -5767,7 +5830,7 @@ fn test_backpressure_with_batch_upserts() {
     let ids2 = engine.batch_upsert_nodes(&inputs2).unwrap();
 
     assert!(
-        engine.segment_count() >= 1,
+        engine.segment_count().unwrap() >= 1,
         "backpressure should flush during batch ops"
     );
 
@@ -5795,7 +5858,7 @@ fn test_backpressure_flush_then_write_cycle_group_commit() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // 200 writes. Each may trigger backpressure flush, each flush
     // acquires/releases WAL sync lock, then the write acquires it again.
@@ -5816,7 +5879,7 @@ fn test_backpressure_flush_then_write_cycle_group_commit() {
 
     // Many segments created
     assert!(
-        engine.segment_count() >= 5,
+        engine.segment_count().unwrap() >= 5,
         "expected many backpressure flushes"
     );
 
@@ -5864,7 +5927,7 @@ fn test_backpressure_interacts_with_auto_compact() {
         compact_after_n_flushes: 3, // compact after 3 flushes
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Write enough to trigger many backpressure flushes
     for i in 0..100 {
@@ -5908,7 +5971,7 @@ fn test_backpressure_invalidate_edge() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let mut engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let n1 = engine
         .upsert_node(1, "src", UpsertNodeOptions::default())
@@ -5940,7 +6003,7 @@ fn test_backpressure_invalidate_edge() {
     }
 
     assert!(
-        engine.segment_count() >= 1,
+        engine.segment_count().unwrap() >= 1,
         "backpressure should flush during invalidate_edge"
     );
 
@@ -5953,7 +6016,7 @@ fn test_backpressure_invalidate_edge() {
 fn test_compact_all_records_tombstoned() {
     // Compact when every record is deleted -- should produce a valid empty-ish segment.
     let dir = TempDir::new().unwrap();
-    let mut db = open_imm(&dir.path().join("db"));
+    let db = open_imm(&dir.path().join("db"));
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -5992,7 +6055,7 @@ fn test_compact_all_records_tombstoned() {
 #[test]
 fn test_engine_seq_monotonic_across_writes() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let id1 = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -6018,7 +6081,7 @@ fn test_engine_seq_monotonic_across_writes() {
 #[test]
 fn test_engine_seq_survives_flush() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     db.upsert_node(1, "a", UpsertNodeOptions::default())
         .unwrap();
@@ -6044,7 +6107,7 @@ fn test_engine_seq_survives_flush() {
 fn test_engine_seq_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         db.upsert_node(1, "a", UpsertNodeOptions::default())
             .unwrap();
         db.upsert_node(1, "b", UpsertNodeOptions::default())
@@ -6053,7 +6116,7 @@ fn test_engine_seq_survives_reopen() {
         db.close().unwrap();
     }
     {
-        let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         let id3 = db
             .upsert_node(1, "c", UpsertNodeOptions::default())
             .unwrap();
@@ -6069,7 +6132,7 @@ fn test_engine_seq_survives_reopen() {
 fn test_engine_seq_correct_after_replay() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         db.upsert_node(1, "a", UpsertNodeOptions::default())
             .unwrap();
         db.upsert_node(1, "b", UpsertNodeOptions::default())
@@ -6078,7 +6141,7 @@ fn test_engine_seq_correct_after_replay() {
         db.close().unwrap();
     }
     {
-        let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         // After replay, the memtable records should have seqs assigned
         let n1 = db.get_node(1).unwrap().unwrap();
         let n2 = db.get_node(2).unwrap().unwrap();
@@ -6106,7 +6169,7 @@ fn test_last_write_seq_exact_equality_across_reopen() {
 
     // Phase 1: write 3 nodes, capture exact seqs, close_fast (no flush)
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let id_a = db
             .upsert_node(1, "a", UpsertNodeOptions::default())
             .unwrap();
@@ -6125,7 +6188,7 @@ fn test_last_write_seq_exact_equality_across_reopen() {
 
     // Phase 2: reopen (WAL replay). Seqs must be exactly the same.
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         assert_eq!(
             db.get_node(1).unwrap().unwrap().last_write_seq,
             seq_a,
@@ -6171,7 +6234,7 @@ fn test_last_write_seq_exact_across_freeze_reopen() {
     let (seq_frozen, seq_active);
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let id_f = db
             .upsert_node(1, "frozen_node", UpsertNodeOptions::default())
             .unwrap();
@@ -6186,7 +6249,7 @@ fn test_last_write_seq_exact_across_freeze_reopen() {
     }
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         // Frozen node is in immutable_epochs, active node in memtable
         let f = db.get_node_by_key(1, "frozen_node").unwrap().unwrap();
         let a = db.get_node_by_key(1, "active_node").unwrap().unwrap();
@@ -6217,7 +6280,7 @@ fn test_last_write_seq_exact_across_freeze_reopen() {
 #[test]
 fn test_compaction_preserves_last_write_seq() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let id1 = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -6246,7 +6309,7 @@ fn test_compaction_preserves_last_write_seq() {
 #[test]
 fn test_batch_ops_get_distinct_seq() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let inputs: Vec<NodeInput> = (0..5)
         .map(|i| NodeInput {
@@ -6281,7 +6344,7 @@ fn test_batch_ops_get_distinct_seq() {
 #[test]
 fn test_compaction_preserves_edge_last_write_seq() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let nid1 = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -6315,7 +6378,7 @@ fn test_compaction_preserves_edge_last_write_seq() {
 fn test_get_edge_hydrates_last_write_seq_from_segment() {
     // Regression: M1. get_edge() must hydrate last_write_seq from edge_meta.dat.
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let nid1 = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -6349,7 +6412,7 @@ fn test_get_edge_hydrates_last_write_seq_from_segment() {
 fn test_get_nodes_batch_hydrates_last_write_seq_from_segment() {
     // Regression: M2. get_nodes_batch must hydrate last_write_seq from node_meta.dat.
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let id1 = db
         .upsert_node(1, "n1", UpsertNodeOptions::default())
@@ -6391,7 +6454,7 @@ fn test_get_nodes_batch_hydrates_last_write_seq_from_segment() {
 fn test_get_edges_batch_hydrates_last_write_seq_from_segment() {
     // Regression: M3. get_edges_batch must hydrate last_write_seq from edge_meta.dat.
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let nid1 = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -6444,20 +6507,20 @@ fn test_tombstone_last_write_seq_survives_flush_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let delete_seq;
     {
-        let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         let id = db
             .upsert_node(1, "doomed", UpsertNodeOptions::default())
             .unwrap();
         db.delete_node(id).unwrap();
         // The delete op gets its own engine_seq
-        delete_seq = db.engine_seq;
+        delete_seq = db.engine_seq_for_test();
         db.flush().unwrap();
         db.close().unwrap();
     }
     {
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         // Tombstone should be in the segment with a non-zero last_write_seq
-        let seg = &db.segments[0];
+        let seg = &db.segments_for_test()[0];
         let tombstones = seg.deleted_node_tombstones();
         assert_eq!(tombstones.len(), 1, "should have exactly 1 node tombstone");
         let entry = tombstones.values().next().unwrap();
@@ -6479,7 +6542,7 @@ fn test_tombstone_survives_flush_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let deleted_id;
     {
-        let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         deleted_id = db
             .upsert_node(1, "doomed", UpsertNodeOptions::default())
             .unwrap();
@@ -6490,7 +6553,7 @@ fn test_tombstone_survives_flush_reopen() {
     {
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         // After reopen, tombstone should be in the segment
-        assert_eq!(db.segment_tombstone_node_count(), 1);
+        assert_eq!(db.segment_tombstone_node_count().unwrap(), 1);
         // The deleted node should not be visible
         assert!(db.get_node(deleted_id).unwrap().is_none());
         db.close().unwrap();
@@ -6503,7 +6566,7 @@ fn test_tombstone_survives_flush_reopen() {
 fn test_source_list_find_node_across_segments() {
     // Verifies SourceList.find_node works when data is in segments
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     let id = db
         .upsert_node(1, "seg-node", UpsertNodeOptions::default())
         .unwrap();
@@ -6532,7 +6595,7 @@ fn test_source_list_find_node_across_segments() {
 #[test]
 fn test_source_list_find_node_tombstoned_in_memtable_segment_has_record() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     let id = db
         .upsert_node(1, "will-die", UpsertNodeOptions::default())
         .unwrap();
@@ -6549,7 +6612,7 @@ fn test_source_list_find_node_tombstoned_in_memtable_segment_has_record() {
 #[test]
 fn test_source_list_find_edge_by_triple_across_segment() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(
+    let db = DatabaseEngine::open(
         dir.path(),
         &DbOptions {
             edge_uniqueness: true,
@@ -6580,7 +6643,7 @@ fn test_source_list_find_edge_by_triple_across_segment() {
 #[test]
 fn test_source_list_find_node_by_key_across_segment() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     let id = db
         .upsert_node(1, "keyed", UpsertNodeOptions::default())
         .unwrap();
@@ -6603,7 +6666,7 @@ fn test_source_list_find_node_by_key_across_segment() {
 fn test_freeze_creates_immutable_memtable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("freeze_test");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write some data
     db.upsert_node(1, "alice", UpsertNodeOptions::default())
@@ -6630,7 +6693,7 @@ fn test_freeze_creates_immutable_memtable() {
 fn test_freeze_empty_memtable_is_noop() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("freeze_empty");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Freeze on empty memtable should be a no-op
     db.freeze_memtable().unwrap();
@@ -6644,7 +6707,7 @@ fn test_freeze_empty_memtable_is_noop() {
 fn test_write_after_freeze_goes_to_new_generation() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("freeze_write");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write before freeze
     let id_a = db
@@ -6690,7 +6753,7 @@ fn test_write_after_freeze_goes_to_new_generation() {
 fn test_flush_with_wal_generations() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("flush_gen");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write some data, freeze, then write more
     db.upsert_node(1, "alice", UpsertNodeOptions::default())
@@ -6727,7 +6790,7 @@ fn test_replay_multiple_wal_generations() {
 
     // Session 1: write data, freeze (creates gen 0 frozen + gen 1 active), close without flush
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "alice", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
@@ -6840,7 +6903,7 @@ fn test_freeze_and_read_from_immutable() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Write nodes
     let id_a = db
@@ -6895,7 +6958,7 @@ fn test_freeze_and_read_from_immutable() {
     release_tx.send(()).unwrap();
     db.wait_one_flush().unwrap();
     assert_eq!(db.immutable_epoch_count(), 0);
-    assert_eq!(db.segment_count(), 1);
+    assert_eq!(db.segment_count().unwrap(), 1);
 
     // Data still readable from segment
     assert!(db.get_node(id_a).unwrap().is_some());
@@ -6914,7 +6977,7 @@ fn test_multiple_freezes_before_flush() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Write and freeze three times
     db.upsert_node(1, "a", UpsertNodeOptions::default())
@@ -6962,7 +7025,7 @@ fn test_multiple_freezes_before_flush() {
     assert_eq!(db.immutable_epoch_count(), 0);
 
     // Data should now be in segments
-    assert_eq!(db.segment_count(), 3);
+    assert_eq!(db.segment_count().unwrap(), 3);
     let all = db.get_nodes_by_type(1).unwrap();
     assert_eq!(all.len(), 3);
 
@@ -6976,7 +7039,7 @@ fn test_wal_generation_survives_close_fast() {
 
     // Write data and close_fast (no flush)
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "node1", UpsertNodeOptions::default())
             .unwrap();
         db.upsert_node(1, "node2", UpsertNodeOptions::default())
@@ -6997,7 +7060,7 @@ fn test_wal_generation_survives_close_fast() {
 fn test_flush_retires_wal_generations() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("retire_gen");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write data
     db.upsert_node(1, "node1", UpsertNodeOptions::default())
@@ -7017,7 +7080,7 @@ fn test_flush_retires_wal_generations() {
     assert!(db.active_wal_generation() >= 1);
 
     // Manifest should have no pending flush epochs
-    assert!(db.manifest().pending_flush_epochs.is_empty());
+    assert!(db.manifest().unwrap().pending_flush_epochs.is_empty());
 
     db.close().unwrap();
 }
@@ -7036,7 +7099,7 @@ fn test_bg_flush_writes_continue_during_flush() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Write first batch and freeze
     for i in 0..50 {
@@ -7073,7 +7136,7 @@ fn test_bg_flush_writes_continue_during_flush() {
     // All 100 nodes still visible, now from segments
     let all = db.get_nodes_by_type(1).unwrap();
     assert_eq!(all.len(), 100, "all nodes should be visible after bg flush");
-    assert!(db.segment_count() >= 2, "should have at least 2 segments");
+    assert!(db.segment_count().unwrap() >= 2, "should have at least 2 segments");
     assert_eq!(db.immutable_epoch_count(), 0);
 
     db.close().unwrap();
@@ -7091,7 +7154,7 @@ fn test_bg_flush_multiple_immutables() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Freeze 4 separate batches
     for batch in 0..4 {
@@ -7127,7 +7190,7 @@ fn test_bg_flush_multiple_immutables() {
 
     assert_eq!(db.immutable_epoch_count(), 0);
     assert_eq!(
-        db.segment_count(),
+        db.segment_count().unwrap(),
         4,
         "should have 4 segments from 4 frozen epochs"
     );
@@ -7151,7 +7214,7 @@ fn test_bg_flush_close_drains_all() {
     // Verify that close() properly drains in-flight bg flush work.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("bg_flush_drain");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write data
     for i in 0..20 {
@@ -7184,7 +7247,7 @@ fn test_bg_flush_close_fast_preserves_recovery() {
     let db_path = dir.path().join("bg_flush_close_fast");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write data to memtable but don't flush
         for i in 0..15 {
@@ -7216,7 +7279,7 @@ fn test_bg_flush_close_fast_with_frozen_memtables() {
     let db_path = dir.path().join("bg_flush_close_fast_frozen");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write and freeze
         for i in 0..10 {
@@ -7248,6 +7311,40 @@ fn test_bg_flush_close_fast_with_frozen_memtables() {
     }
 }
 
+#[test]
+fn test_shutdown_bg_flush_resets_stale_in_flight_epochs() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("bg_flush_stale_in_flight");
+
+    {
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        db.upsert_node(1, "stale-in-flight", UpsertNodeOptions::default())
+            .unwrap();
+        db.freeze_memtable().unwrap();
+
+        db.with_core_mut(|core| {
+            assert_eq!(core.immutable_epochs.len(), 1);
+            core.immutable_epochs[0].in_flight = true;
+            assert_eq!(core.in_flight_count(), 1);
+
+            let events = core.shutdown_bg_flush();
+            assert!(events.is_empty());
+            assert_eq!(core.in_flight_count(), 0);
+            Ok(())
+        })
+        .unwrap();
+
+        db.close_fast().unwrap();
+    }
+
+    {
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let node = db.get_node_by_key(1, "stale-in-flight").unwrap();
+        assert!(node.is_some());
+        db.close().unwrap();
+    }
+}
+
 // --- CP3 regression test: M10 (stale FrozenPendingFlush after replay) ---
 
 #[test]
@@ -7260,7 +7357,7 @@ fn test_stale_frozen_epochs_cleaned_on_reopen_then_flush_works() {
 
     // Phase 1: write, freeze, close_fast (leaves FrozenPendingFlush)
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "before_crash", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
@@ -7271,11 +7368,11 @@ fn test_stale_frozen_epochs_cleaned_on_reopen_then_flush_works() {
 
     // Phase 2: reopen. Frozen epoch is rebuilt as immutable, not cleaned up.
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // FrozenPendingFlush epoch stays in manifest until flushed
         assert_eq!(
-            db.manifest().pending_flush_epochs.len(),
+            db.manifest().unwrap().pending_flush_epochs.len(),
             1,
             "frozen epoch retained in manifest on reopen"
         );
@@ -7302,7 +7399,7 @@ fn test_stale_frozen_epochs_cleaned_on_reopen_then_flush_works() {
 
         // All epochs drained after flush
         assert!(
-            db.manifest().pending_flush_epochs.is_empty(),
+            db.manifest().unwrap().pending_flush_epochs.is_empty(),
             "no stale epochs after post-recovery flush"
         );
 
@@ -7327,7 +7424,7 @@ fn test_repeated_crash_after_freeze_preserves_data() {
 
     // Phase 1: write, freeze, simulate crash
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "survivor", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
@@ -7345,7 +7442,7 @@ fn test_repeated_crash_after_freeze_preserves_data() {
 
     // Phase 3: reopen again. Data must survive the double crash.
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         assert!(
             db.get_node_by_key(1, "survivor").unwrap().is_some(),
             "data must survive two crashes without flush"
@@ -7355,7 +7452,7 @@ fn test_repeated_crash_after_freeze_preserves_data() {
         // Now flush to drain it
         db.flush().unwrap();
         assert_eq!(db.immutable_epoch_count(), 0);
-        assert!(db.manifest().pending_flush_epochs.is_empty());
+        assert!(db.manifest().unwrap().pending_flush_epochs.is_empty());
         db.close().unwrap();
     }
 
@@ -7382,7 +7479,7 @@ fn test_multi_freeze_flush_retires_each_wal_gen() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Freeze 3 separate batches → creates WAL gens 0, 1, 2 (active = 3)
     for batch in 0..3 {
@@ -7466,7 +7563,7 @@ fn test_multi_freeze_flush_retires_each_wal_gen() {
 
     // All data in segments
     assert_eq!(db.immutable_epoch_count(), 0);
-    assert_eq!(db.segment_count(), 3);
+    assert_eq!(db.segment_count().unwrap(), 3);
     for batch in 0..3 {
         assert!(
             db.get_node_by_key(1, &format!("batch{}", batch))
@@ -7493,7 +7590,7 @@ fn test_flush_wait_loop_handles_worker_failure() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Create one epoch and inject a failure
     db.upsert_node(1, "fail_node", UpsertNodeOptions::default())
@@ -7518,7 +7615,7 @@ fn test_flush_wait_loop_handles_worker_failure() {
     // Retry: flush() should re-enqueue and succeed this time
     db.flush().unwrap();
     assert_eq!(db.immutable_epoch_count(), 0);
-    assert_eq!(db.segment_count(), 1);
+    assert_eq!(db.segment_count().unwrap(), 1);
     assert!(
         db.get_node_by_key(1, "fail_node").unwrap().is_some(),
         "data should be in segment after retry"
@@ -7540,7 +7637,7 @@ fn test_write_after_reported_flush_failure_retries_in_background() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     db.upsert_node(1, "fail_node", UpsertNodeOptions::default())
         .unwrap();
@@ -7588,7 +7685,7 @@ fn test_write_after_reported_flush_failure_retries_in_background() {
 fn test_get_edges_batch_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("edges_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -7633,7 +7730,7 @@ fn test_get_edges_batch_sees_immutable() {
 fn test_neighbors_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("nbrs_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -7683,7 +7780,7 @@ fn test_neighbors_sees_immutable() {
 fn test_find_nodes_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("find_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert(
@@ -7732,7 +7829,7 @@ fn test_find_nodes_sees_immutable() {
 fn test_nodes_by_type_paged_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("type_paged_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     db.upsert_node(1, "a", UpsertNodeOptions::default())
         .unwrap();
@@ -7760,7 +7857,7 @@ fn test_nodes_by_type_paged_sees_immutable() {
 fn test_edges_by_type_paged_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("edge_type_paged_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -7795,7 +7892,7 @@ fn test_edges_by_type_paged_sees_immutable() {
 fn test_neighbors_batch_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("nbrs_batch_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -7846,7 +7943,7 @@ fn test_dense_search_sees_immutable() {
         dense_vector: Some(dense_config),
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Insert a node with dense vector
     db.upsert_node(
@@ -7901,7 +7998,7 @@ fn test_dense_search_sees_immutable() {
 fn test_sparse_search_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("sparse_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Insert node with sparse vector
     db.upsert_node(
@@ -7956,7 +8053,7 @@ fn test_sparse_search_sees_immutable() {
 fn test_degree_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("degree_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -7998,7 +8095,7 @@ fn test_degree_sees_immutable() {
 fn test_top_k_neighbors_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("topk_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8057,7 +8154,7 @@ fn test_top_k_neighbors_sees_immutable() {
 fn test_find_nodes_by_time_range_sees_immutable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("time_range_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     db.upsert_node(1, "a", UpsertNodeOptions::default())
         .unwrap();
@@ -8084,7 +8181,7 @@ fn test_immutable_tombstones_respected() {
     // Verify that tombstones in immutable memtables are respected by read paths.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("imm_tombstone");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8128,7 +8225,7 @@ fn test_multiple_immutable_memtables_newest_wins() {
     // S2: Verify newest-first precedence across multiple immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("multi_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write node A with weight 1.0
     let id_a = db
@@ -8205,7 +8302,7 @@ fn test_multiple_immutable_tombstone_shadows_older() {
     // S2 extension: tombstone in newer immutable shadows record in older immutable.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("multi_imm_tomb");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let id = db
         .upsert_node(1, "doomed", UpsertNodeOptions::default())
@@ -8233,7 +8330,7 @@ fn test_export_adjacency_sees_immutable() {
     // S5: export_adjacency must include edges from immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("export_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8271,7 +8368,7 @@ fn test_connected_components_sees_immutable() {
     // S6: connected_components must find edges in immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("cc_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8312,7 +8409,7 @@ fn test_shortest_path_through_immutable() {
     // S7: shortest_path and is_connected must traverse edges in immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("sp_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8363,7 +8460,7 @@ fn test_find_nodes_paged_sees_immutable() {
     // S8: find_nodes_paged must find nodes with matching props in immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("find_paged_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("role".to_string(), PropValue::String("admin".to_string()));
@@ -8417,7 +8514,7 @@ fn test_upsert_node_dedup_across_immutable() {
     // The engine must find it there and reuse the same ID.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("upsert_dedup_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let id1 = db
         .upsert_node(1, "alice", UpsertNodeOptions::default())
@@ -8463,7 +8560,7 @@ fn test_edge_uniqueness_across_immutable() {
         edge_uniqueness: true,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8511,7 +8608,7 @@ fn test_batch_upsert_node_dedup_across_immutable() {
     // batch_upsert_nodes must also find existing nodes in immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("batch_dedup_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let id_alice = db
         .upsert_node(1, "alice", UpsertNodeOptions::default())
@@ -8559,7 +8656,7 @@ fn test_batch_upsert_edge_uniqueness_across_immutable() {
         edge_uniqueness: true,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8615,7 +8712,7 @@ fn test_delete_node_cascades_immutable_edges() {
     // The cascade must find and tombstone those edges.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("del_cascade_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8669,7 +8766,7 @@ fn test_invalidate_edge_in_immutable() {
     // Invalidate an edge that lives in an immutable memtable.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("inv_edge_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8706,7 +8803,7 @@ fn test_graph_patch_dedup_across_immutable() {
         edge_uniqueness: true,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let a_id = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8776,7 +8873,7 @@ fn test_graph_patch_delete_cascades_immutable_edges() {
     // graph_patch node deletion must cascade edges in immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("patch_del_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8820,7 +8917,7 @@ fn test_prune_finds_targets_in_immutable_memtable() {
     // in the else (no type_id) branch.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("prune_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Insert a low-weight node
     db.upsert_node(
@@ -8875,7 +8972,7 @@ fn test_prune_respects_tombstones_in_immutable_memtable() {
     // re-prune that node (it's already deleted).
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("prune_ts_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Create and flush a low-weight node to segment
     let id = db
@@ -8919,7 +9016,7 @@ fn test_id_allocation_stable_across_freeze() {
     // correctly across freeze operations and don't cause ID reuse.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("id_alloc_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -8977,7 +9074,7 @@ fn test_traversal_sees_immutable_edges() {
     // Traverse should discover edges in immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("traverse_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -9026,7 +9123,7 @@ fn test_graph_patch_invalidate_edge_in_immutable() {
     // graph_patch edge invalidation must find edges in immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("patch_inv_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -9068,7 +9165,7 @@ fn test_dedup_across_active_immutable_and_segments() {
         edge_uniqueness: true,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Tier 1: write and flush to segment
     let a = db
@@ -9162,7 +9259,7 @@ fn test_write_dedup_across_multiple_immutables() {
         edge_uniqueness: true,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Freeze 1: alice + edge a->b in oldest immutable
     let id_alice = db
@@ -9240,7 +9337,7 @@ fn test_degrees_batch_sees_immutable() {
     // degrees (batch) has its own immutable memtable walk, separate from degree (single).
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("deg_batch_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -9285,7 +9382,7 @@ fn test_sum_edge_weights_sees_immutable() {
     // sum_edge_weights uses degree_stats_raw_walk_inner with its own immutable walk.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("sum_wt_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -9359,7 +9456,7 @@ fn test_neighbors_paged_sees_immutable() {
     // neighbors_paged builds its own K-way merge from immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("nbrs_paged_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -9413,7 +9510,7 @@ fn test_dense_search_tombstone_in_immutable_hides_result() {
         dense_vector: Some(dense_config),
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Insert two nodes with dense vectors, flush to segments
     let id_a = db
@@ -9477,7 +9574,7 @@ fn test_sparse_search_tombstone_in_immutable_hides_result() {
     // sparse search must exclude it.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("sparse_tomb_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let id_a = db
         .upsert_node(
@@ -9549,7 +9646,7 @@ fn test_dense_scoped_search_sees_immutable() {
         dense_vector: Some(dense_config),
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Hub node (scope start)
     let hub = db
@@ -9632,7 +9729,7 @@ fn test_dijkstra_shortest_path_through_immutable() {
     // Dijkstra (weighted) shortest_path has its own for_each_search_neighbor immutable walk.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("dijkstra_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -9697,7 +9794,7 @@ fn test_all_shortest_paths_through_immutable() {
     // all_shortest_paths has 4 internal variants, each with its own TraversalTombstoneView.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("all_sp_imm");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -9758,7 +9855,7 @@ fn test_crash_after_freeze_before_flush() {
     let db_path = dir.path().join("crash_freeze");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write data to gen 0
         let id_a = db
@@ -9822,7 +9919,7 @@ fn test_crash_with_flushed_segment_and_unflushed_wal() {
     let db_path = dir.path().join("crash_seg_manifest");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write and flush -- segment is created and manifest is updated
         db.upsert_node(1, "flushed_1", UpsertNodeOptions::default())
@@ -9832,7 +9929,7 @@ fn test_crash_with_flushed_segment_and_unflushed_wal() {
         db.flush().unwrap();
 
         // Verify segment exists
-        assert!(db.segment_count() >= 1);
+        assert!(db.segment_count().unwrap() >= 1);
 
         // Write more data (unflushed)
         db.upsert_node(1, "unflushed_1", UpsertNodeOptions::default())
@@ -9876,7 +9973,7 @@ fn test_crash_after_segment_write_before_manifest_publish() {
     let db_path = dir.path().join("crash_boundary2");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "alice", UpsertNodeOptions::default())
             .unwrap();
         db.upsert_node(1, "bob", UpsertNodeOptions::default())
@@ -9941,7 +10038,7 @@ fn test_crash_with_multiple_frozen_generations() {
     let db_path = dir.path().join("crash_multi_frozen");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Gen 0: write and freeze
         db.upsert_node(1, "gen0_node", UpsertNodeOptions::default())
@@ -10014,7 +10111,7 @@ fn test_crash_after_publish_before_wal_retire() {
     let seg_id;
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write data and flush -- creates segment and retires WAL
         node_id = db
@@ -10023,7 +10120,7 @@ fn test_crash_after_publish_before_wal_retire() {
         db.flush().unwrap();
 
         // Record the segment ID
-        seg_id = db.manifest().segments[0].id;
+        seg_id = db.manifest().unwrap().segments[0].id;
 
         db.close().unwrap();
     }
@@ -10084,7 +10181,7 @@ fn test_crash_after_publish_before_wal_retire() {
 
         // The PublishedPendingRetire epoch should have been cleaned up
         assert!(
-            db.manifest().pending_flush_epochs.is_empty(),
+            db.manifest().unwrap().pending_flush_epochs.is_empty(),
             "pending flush epochs should be empty after cleanup"
         );
 
@@ -10110,12 +10207,12 @@ fn test_reopen_fails_if_published_pending_retire_segment_is_missing() {
     let seg_id;
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         node_id = db
             .upsert_node(1, "published_node", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        seg_id = db.manifest().segments[0].id;
+        seg_id = db.manifest().unwrap().segments[0].id;
         db.close().unwrap();
     }
 
@@ -10191,11 +10288,11 @@ fn test_crash_after_wal_delete_before_epoch_removal() {
 
     let seg_id;
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "survivor", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        seg_id = db.manifest().segments[0].id;
+        seg_id = db.manifest().unwrap().segments[0].id;
         db.close().unwrap();
     }
 
@@ -10228,7 +10325,7 @@ fn test_crash_after_wal_delete_before_epoch_removal() {
 
         // Stale epoch should be cleaned from manifest
         assert!(
-            db.manifest().pending_flush_epochs.is_empty(),
+            db.manifest().unwrap().pending_flush_epochs.is_empty(),
             "stale PublishedPendingRetire epoch should be cleaned up even without WAL file"
         );
 
@@ -10245,11 +10342,11 @@ fn test_orphan_segment_ignored_on_reopen_cp8() {
     let db_path = dir.path().join("orphan_seg_cp8");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "real_node", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        assert_eq!(db.segment_count(), 1);
+        assert_eq!(db.segment_count().unwrap(), 1);
         db.close().unwrap();
     }
 
@@ -10270,7 +10367,7 @@ fn test_orphan_segment_ignored_on_reopen_cp8() {
         );
 
         // Real segment data should be intact
-        assert_eq!(db.segment_count(), 1);
+        assert_eq!(db.segment_count().unwrap(), 1);
         let node = db.get_node_by_key(1, "real_node").unwrap();
         assert!(node.is_some(), "real node should still be readable");
 
@@ -10286,7 +10383,7 @@ fn test_orphan_wal_generation_ignored() {
     let db_path = dir.path().join("orphan_wal");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "real_node", UpsertNodeOptions::default())
             .unwrap();
         db.close_fast().unwrap();
@@ -10353,7 +10450,7 @@ fn test_reopen_replays_frozen_epochs_oldest_first() {
     let db_path = dir.path().join("replay_order");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Gen 0: create node with initial value
         db.upsert_node(
@@ -10422,7 +10519,7 @@ fn test_published_pending_retire_not_replayed() {
     let db_path = dir.path().join("no_double_replay");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write 5 nodes and an edge, flush to segment
         let ids: Vec<u64> = (0..5)
@@ -10435,7 +10532,7 @@ fn test_published_pending_retire_not_replayed() {
             .upsert_edge(ids[0], ids[1], 10, UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        assert!(db.segment_count() >= 1);
+        assert!(db.segment_count().unwrap() >= 1);
 
         // Write more data after flush (this goes to the new active WAL gen)
         db.upsert_node(1, "post_flush_node", UpsertNodeOptions::default())
@@ -10491,7 +10588,7 @@ fn test_published_pending_retire_not_replayed() {
 
         // Epoch should be cleaned up
         assert!(
-            db.manifest().pending_flush_epochs.is_empty(),
+            db.manifest().unwrap().pending_flush_epochs.is_empty(),
             "PublishedPendingRetire epoch should be cleaned up"
         );
 
@@ -10513,7 +10610,7 @@ fn test_reopen_after_flush_then_more_writes() {
     let db_path = dir.path().join("flush_then_write");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write and flush
         for i in 0..10 {
@@ -10580,7 +10677,7 @@ fn test_multiple_flush_reopen_cycles() {
     let db_path = dir.path().join("multi_flush_cycle");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Cycle 1: write + flush
         for i in 0..5 {
@@ -10641,7 +10738,7 @@ fn test_close_fast_then_close_normally() {
 
     // Phase 1: Write, freeze, close_fast (simulate crash)
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "surviving_node", UpsertNodeOptions::default())
             .unwrap();
         let a = db
@@ -10663,7 +10760,7 @@ fn test_close_fast_then_close_normally() {
 
     // Phase 2: Reopen, verify data, flush, close normally
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // All data should be present via WAL replay
         assert!(db.get_node_by_key(1, "surviving_node").unwrap().is_some());
@@ -10676,7 +10773,7 @@ fn test_close_fast_then_close_normally() {
         // Now flush and close normally
         db.flush().unwrap();
         assert_eq!(db.immutable_memtable_count(), 0);
-        assert!(db.segment_count() >= 1, "segments should exist after flush");
+        assert!(db.segment_count().unwrap() >= 1, "segments should exist after flush");
 
         db.close().unwrap();
     }
@@ -10694,7 +10791,7 @@ fn test_close_fast_then_close_normally() {
 
         // Manifest should be clean -- no pending flush epochs
         assert!(
-            db.manifest().pending_flush_epochs.is_empty(),
+            db.manifest().unwrap().pending_flush_epochs.is_empty(),
             "no pending epochs after clean flush + close"
         );
 
@@ -10715,7 +10812,7 @@ fn test_crash_recovery_preserves_edges() {
     let edge_bc;
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         node_a = db
             .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -10785,7 +10882,7 @@ fn test_crash_recovery_preserves_deletes() {
     let db_path = dir.path().join("crash_deletes");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let node_a = db
             .upsert_node(1, "a", UpsertNodeOptions::default())
@@ -10838,7 +10935,7 @@ fn test_reopen_engine_seq_continuity() {
     let db_path = dir.path().join("seq_continuity");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write several items
         db.upsert_node(1, "a", UpsertNodeOptions::default())
@@ -10858,7 +10955,7 @@ fn test_reopen_engine_seq_continuity() {
 
     // Reopen
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write a new node -- its seq should be > pre-crash values
         db.upsert_node(1, "post_crash", UpsertNodeOptions::default())
@@ -10885,7 +10982,7 @@ fn test_repeated_crash_reopen_cycles() {
 
     // Crash cycle 1
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         db.upsert_node(1, "cycle1_node", UpsertNodeOptions::default())
             .unwrap();
         db.close_fast().unwrap();
@@ -10893,7 +10990,7 @@ fn test_repeated_crash_reopen_cycles() {
 
     // Crash cycle 2
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         // Verify cycle 1 data
         assert!(db.get_node_by_key(1, "cycle1_node").unwrap().is_some());
         db.upsert_node(1, "cycle2_node", UpsertNodeOptions::default())
@@ -10906,7 +11003,7 @@ fn test_repeated_crash_reopen_cycles() {
 
     // Crash cycle 3
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         // Verify cycle 1 + 2 data
         assert!(db.get_node_by_key(1, "cycle1_node").unwrap().is_some());
         assert!(db.get_node_by_key(1, "cycle2_node").unwrap().is_some());
@@ -10959,14 +11056,14 @@ fn test_backpressure_triggers_on_total_bytes() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Write 1 node (under threshold) and freeze.
     db.upsert_node(1, "frozen", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_memtable_count(), 1);
-    assert_eq!(db.segment_count(), 0);
+    assert_eq!(db.segment_count().unwrap(), 0);
 
     // Now write 1 more node. Active ~190 + immutable ~190 = ~380, exceeding
     // the 350-byte threshold. auto-flush should fire (async).
@@ -10978,7 +11075,7 @@ fn test_backpressure_triggers_on_total_bytes() {
 
     // Auto-flush should have fired because total bytes exceeded threshold
     assert!(
-        db.segment_count() >= 1,
+        db.segment_count().unwrap() >= 1,
         "auto-flush should trigger when total memtable bytes exceed soft threshold"
     );
 
@@ -11003,7 +11100,7 @@ fn test_max_immutable_memtables_blocks() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Write and freeze twice to reach max_immutable_memtables=2
     for i in 0..5 {
@@ -11012,7 +11109,7 @@ fn test_max_immutable_memtables_blocks() {
     }
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_memtable_count(), 1);
-    assert_eq!(db.segment_count(), 0);
+    assert_eq!(db.segment_count().unwrap(), 0);
 
     for i in 0..5 {
         db.upsert_node(1, &format!("g2:{}", i), UpsertNodeOptions::default())
@@ -11020,7 +11117,7 @@ fn test_max_immutable_memtables_blocks() {
     }
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_memtable_count(), 2);
-    assert_eq!(db.segment_count(), 0);
+    assert_eq!(db.segment_count().unwrap(), 0);
 
     // Now write to the active memtable. The next write triggers
     // backpressure because immutable count == max_immutable_memtables.
@@ -11031,7 +11128,7 @@ fn test_max_immutable_memtables_blocks() {
 
     // Backpressure should have flushed at least one immutable
     assert!(
-        db.segment_count() >= 1,
+        db.segment_count().unwrap() >= 1,
         "backpressure should trigger flush when immutable count >= max"
     );
 
@@ -11055,7 +11152,7 @@ fn test_max_immutable_memtables_disabled_when_zero() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Freeze 5 times without any flush being triggered
     for batch in 0..5 {
@@ -11072,7 +11169,7 @@ fn test_max_immutable_memtables_disabled_when_zero() {
 
     // No flushes should have occurred
     assert_eq!(
-        db.segment_count(),
+        db.segment_count().unwrap(),
         0,
         "no flush should trigger with count backpressure disabled"
     );
@@ -11097,7 +11194,7 @@ fn test_close_drains_all_immutables() {
     };
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         // Write and freeze 3 times
         for batch in 0..3 {
@@ -11119,7 +11216,7 @@ fn test_close_drains_all_immutables() {
         }
 
         assert_eq!(db.immutable_memtable_count(), 3);
-        assert_eq!(db.segment_count(), 0);
+        assert_eq!(db.segment_count().unwrap(), 0);
 
         // close() should freeze active + flush all immutables
         db.close().unwrap();
@@ -11133,7 +11230,7 @@ fn test_close_drains_all_immutables() {
 
         // Data should be in segments, not memtable (WAL was retired)
         assert!(
-            db.segment_count() >= 1,
+            db.segment_count().unwrap() >= 1,
             "close() should have flushed to segments"
         );
 
@@ -11163,7 +11260,7 @@ fn test_close_fast_preserves_wal_for_recovery() {
     };
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         // Write and freeze multiple times
         for batch in 0..3 {
@@ -11185,7 +11282,7 @@ fn test_close_fast_preserves_wal_for_recovery() {
         }
 
         assert_eq!(db.immutable_memtable_count(), 3);
-        assert_eq!(db.segment_count(), 0);
+        assert_eq!(db.segment_count().unwrap(), 0);
 
         // close_fast should NOT flush, just sync WAL and persist manifest.
         db.close_fast().unwrap();
@@ -11203,7 +11300,7 @@ fn test_close_fast_preserves_wal_for_recovery() {
 
         // No segments should exist (close_fast didn't flush)
         assert_eq!(
-            db.segment_count(),
+            db.segment_count().unwrap(),
             0,
             "close_fast should not create segments"
         );
@@ -11227,7 +11324,7 @@ fn test_compaction_respects_flush_published_segments() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Create first segment
     for i in 0..10 {
@@ -11243,13 +11340,13 @@ fn test_compaction_respects_flush_published_segments() {
     }
     db.flush().unwrap();
 
-    assert_eq!(db.segment_count(), 2);
+    assert_eq!(db.segment_count().unwrap(), 2);
 
     // Compact the two segments
     db.compact().unwrap();
 
     // After compaction, should have exactly 1 segment (the compacted one)
-    assert_eq!(db.segment_count(), 1);
+    assert_eq!(db.segment_count().unwrap(), 1);
 
     // Create a third segment (published after compaction)
     for i in 0..10 {
@@ -11259,7 +11356,7 @@ fn test_compaction_respects_flush_published_segments() {
     db.flush().unwrap();
 
     // Should have 2 segments now: compacted + new
-    assert_eq!(db.segment_count(), 2);
+    assert_eq!(db.segment_count().unwrap(), 2);
 
     // All 30 nodes should be readable
     let all = db.get_nodes_by_type(1).unwrap();
@@ -11267,7 +11364,7 @@ fn test_compaction_respects_flush_published_segments() {
 
     // Compact again to verify new segments coexist properly
     db.compact().unwrap();
-    assert_eq!(db.segment_count(), 1);
+    assert_eq!(db.segment_count().unwrap(), 1);
     assert_eq!(db.get_nodes_by_type(1).unwrap().len(), 30);
 
     db.close().unwrap();
@@ -11291,7 +11388,7 @@ fn test_close_with_active_and_immutable_data() {
     let mut node_ids = Vec::new();
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         // Write to active, then freeze
         let id = db
@@ -11316,7 +11413,7 @@ fn test_close_with_active_and_immutable_data() {
             assert!(db.get_node(id).unwrap().is_some());
         }
         assert_eq!(db.get_nodes_by_type(1).unwrap().len(), 2);
-        assert!(db.segment_count() >= 1, "close() should have flushed");
+        assert!(db.segment_count().unwrap() >= 1, "close() should have flushed");
         db.close().unwrap();
     }
 }
@@ -11331,11 +11428,11 @@ fn test_close_empty_db_is_noop() {
         ..DbOptions::default()
     };
     let db = DatabaseEngine::open(&db_path, &opts).unwrap();
-    assert_eq!(db.segment_count(), 0);
+    assert_eq!(db.segment_count().unwrap(), 0);
     db.close().unwrap();
 
     let db2 = DatabaseEngine::open(&db_path, &opts).unwrap();
-    assert_eq!(db2.segment_count(), 0);
+    assert_eq!(db2.segment_count().unwrap(), 0);
     db2.close().unwrap();
 }
 
@@ -11353,7 +11450,7 @@ fn test_backpressure_bytes_and_count_combined() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Freeze once to reach max_immutable_memtables=1
     for i in 0..3 {
@@ -11369,7 +11466,7 @@ fn test_backpressure_bytes_and_count_combined() {
 
     // Flush should have happened
     assert!(
-        db.segment_count() >= 1,
+        db.segment_count().unwrap() >= 1,
         "count-based backpressure should trigger flush"
     );
 
@@ -11389,7 +11486,7 @@ fn test_data_visible_while_in_flight() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let id = db
         .upsert_node(1, "visible", UpsertNodeOptions::default())
@@ -11415,7 +11512,7 @@ fn test_data_visible_while_in_flight() {
     let seg = db.wait_one_flush().unwrap();
     assert!(seg.is_some());
     assert_eq!(db.immutable_epoch_count(), 0);
-    assert_eq!(db.segment_count(), 1);
+    assert_eq!(db.segment_count().unwrap(), 1);
 
     // Data still readable from segment
     assert!(db.get_node(id).unwrap().is_some());
@@ -11434,7 +11531,7 @@ fn test_multiple_epochs_all_visible_during_flush() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Gen 1: oldest frozen
     let id1 = db
@@ -11500,7 +11597,7 @@ fn test_multiple_epochs_all_visible_during_flush() {
 
     assert_eq!(db.immutable_epoch_count(), 0);
     // 3 segments: gen1, gen2, plus gen3 (active) which flush() also freezes+flushes
-    assert_eq!(db.segment_count(), 3);
+    assert_eq!(db.segment_count().unwrap(), 3);
 
     db.close().unwrap();
 }
@@ -11516,7 +11613,7 @@ fn test_auto_flush_is_async_not_blocking() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Set pause before writing; auto-flush will consume it.
     let (ready_rx, release_tx) = db.set_flush_pause();
@@ -11545,7 +11642,7 @@ fn test_auto_flush_is_async_not_blocking() {
     // Release, drain
     release_tx.send(()).unwrap();
     db.flush().unwrap();
-    assert!(db.segment_count() >= 1);
+    assert!(db.segment_count().unwrap() >= 1);
 
     db.close().unwrap();
 }
@@ -11561,7 +11658,7 @@ fn test_apply_removes_epoch_after_publish() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let id = db
         .upsert_node(1, "apply_test", UpsertNodeOptions::default())
@@ -11574,7 +11671,7 @@ fn test_apply_removes_epoch_after_publish() {
     assert!(seg.is_some());
 
     assert_eq!(db.immutable_epoch_count(), 0);
-    assert_eq!(db.segment_count(), 1);
+    assert_eq!(db.segment_count().unwrap(), 1);
     assert!(db.get_node(id).unwrap().is_some());
 
     db.close().unwrap();
@@ -11591,7 +11688,7 @@ fn test_worker_failure_keeps_epoch_visible() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let id = db
         .upsert_node(1, "fail_test", UpsertNodeOptions::default())
@@ -11629,7 +11726,7 @@ fn test_backpressure_counts_all_epochs_including_in_flight() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Freeze twice to reach max
     db.upsert_node(1, "bp1", UpsertNodeOptions::default())
@@ -11653,7 +11750,7 @@ fn test_backpressure_counts_all_epochs_including_in_flight() {
     release_tx.send(()).unwrap();
     db.flush().unwrap();
     assert_eq!(db.immutable_epoch_count(), 0);
-    assert!(db.segment_count() >= 2);
+    assert!(db.segment_count().unwrap() >= 2);
 
     db.close().unwrap();
 }
@@ -11668,7 +11765,7 @@ fn test_flush_sync_barrier_drains_all_epochs() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Create 3 frozen memtables
     for i in 0..3 {
@@ -11681,7 +11778,7 @@ fn test_flush_sync_barrier_drains_all_epochs() {
     // flush() should drain everything
     db.flush().unwrap();
     assert_eq!(db.immutable_epoch_count(), 0);
-    assert_eq!(db.segment_count(), 3);
+    assert_eq!(db.segment_count().unwrap(), 3);
 
     // All data readable from segments
     for i in 0..3 {
@@ -11734,7 +11831,7 @@ fn test_async_flush_latency_profile() {
             compact_after_n_flushes: 0,
             ..DbOptions::default()
         };
-        let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
         let mut latencies = Vec::with_capacity(WRITE_COUNT as usize);
 
         for i in 0..WRITE_COUNT {
@@ -11760,7 +11857,7 @@ fn test_async_flush_latency_profile() {
             compact_after_n_flushes: 0,
             ..DbOptions::default()
         };
-        let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+        let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
         let mut latencies = Vec::with_capacity(WRITE_COUNT as usize);
 
         for i in 0..WRITE_COUNT {
@@ -11833,7 +11930,7 @@ fn test_property_index_manifest_reopens_and_reseeds_active_memtable() {
     let index_id;
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         index_id = db
             .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
             .unwrap()
@@ -11842,8 +11939,8 @@ fn test_property_index_manifest_reopens_and_reseeds_active_memtable() {
     }
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let indexes = db.list_node_property_indexes();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let indexes = db.list_node_property_indexes().unwrap();
         assert_eq!(indexes.len(), 1);
         let info = wait_for_property_index_state(&db, index_id, SecondaryIndexState::Ready);
         assert_eq!(info.index_id, index_id);
@@ -11865,9 +11962,9 @@ fn test_property_index_manifest_reopens_and_reseeds_active_memtable() {
             )
             .unwrap();
         let status_hash = hash_prop_value(&PropValue::String("red".to_string()));
-        let eq_ids = db
-            .active_memtable()
-            .secondary_eq_state()
+        let active_memtable = db.active_memtable();
+        let eq_state = active_memtable.secondary_eq_state();
+        let eq_ids = eq_state
             .get(&index_id)
             .unwrap()
             .get(&status_hash)
@@ -11887,7 +11984,7 @@ fn test_ensure_property_index_while_flush_in_flight_preserves_manifest_and_seedi
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert(
@@ -11915,21 +12012,21 @@ fn test_ensure_property_index_while_flush_in_flight_preserves_manifest_and_seedi
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
     let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
-    let frozen_eq_ids = db
-        .immutable_memtable(0)
-        .secondary_eq_state()
+    let frozen_memtable = db.immutable_memtable(0);
+    let frozen_eq_state = frozen_memtable.secondary_eq_state();
+    let frozen_eq_ids = frozen_eq_state
         .get(&info.index_id)
         .unwrap()
         .get(&status_hash)
         .unwrap();
     assert!(frozen_eq_ids.contains(&node_id));
-    assert_eq!(db.manifest().secondary_indexes.len(), 1);
+    assert_eq!(db.manifest().unwrap().secondary_indexes.len(), 1);
 
     release_tx.send(()).unwrap();
     assert!(db.wait_one_flush().unwrap().is_some());
     let ready = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.index_id, info.index_id);
-    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    let seg_dir = segment_dir(dir.path(), db.segments_for_test()[0].segment_id);
     assert!(crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id).exists());
     db.reset_property_query_routes();
     assert_eq!(
@@ -11957,7 +12054,7 @@ fn test_ready_property_index_downgrades_when_flush_publish_missed_declaration_sn
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert(
@@ -11991,13 +12088,13 @@ fn test_ready_property_index_downgrades_when_flush_publish_missed_declaration_sn
     repair_ready_rx.recv().unwrap();
 
     let building = db
-        .list_node_property_indexes()
+        .list_node_property_indexes().unwrap()
         .into_iter()
         .find(|entry| entry.index_id == info.index_id)
         .unwrap();
     assert_eq!(building.state, SecondaryIndexState::Building);
 
-    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    let seg_dir = segment_dir(dir.path(), db.segments_for_test()[0].segment_id);
     let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
     assert!(!sidecar_path.exists());
 
@@ -12029,6 +12126,72 @@ fn test_ready_property_index_downgrades_when_flush_publish_missed_declaration_sn
 }
 
 #[test]
+fn test_published_property_query_route_stays_snapshot_stable_across_build_completion() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert(
+        "status".to_string(),
+        PropValue::String("active".to_string()),
+    );
+    let node_id = db
+        .upsert_node(
+            1,
+            "snapshot-stable",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let (build_ready_rx, build_release_tx) = db.set_secondary_index_build_pause();
+    let info = db
+        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .unwrap();
+    build_ready_rx.recv().unwrap();
+
+    let pinned = db.published_state();
+    let pinned_before = pinned
+        .view
+        .find_nodes_outcome(1, "status", &PropValue::String("active".to_string()))
+        .unwrap();
+    assert_eq!(pinned_before.value, vec![node_id]);
+    assert_eq!(
+        pinned_before.route,
+        PropertyQueryRouteKind::EqualityScanFallback
+    );
+    assert!(pinned_before.followup.is_none());
+
+    build_release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let pinned_after = pinned
+        .view
+        .find_nodes_outcome(1, "status", &PropValue::String("active".to_string()))
+        .unwrap();
+    assert_eq!(pinned_after.value, vec![node_id]);
+    assert_eq!(
+        pinned_after.route,
+        PropertyQueryRouteKind::EqualityScanFallback
+    );
+    assert!(pinned_after.followup.is_none());
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+            .unwrap(),
+        vec![node_id]
+    );
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
 fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_snapshot() {
     let dir = TempDir::new().unwrap();
     let opts = DbOptions {
@@ -12037,7 +12200,7 @@ fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_sn
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let active = PropValue::String("active".to_string());
     let (compact_ready_rx, compact_release_tx) = db.set_bg_compact_pause();
@@ -12069,7 +12232,7 @@ fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_sn
         .unwrap();
     db.flush().unwrap();
     compact_ready_rx.recv().unwrap();
-    assert_eq!(db.segment_count(), 2);
+    assert_eq!(db.segment_count().unwrap(), 2);
 
     let expected_ids = vec![node_a, node_b];
 
@@ -12084,14 +12247,14 @@ fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_sn
     repair_ready_rx.recv().unwrap();
 
     let building = db
-        .list_node_property_indexes()
+        .list_node_property_indexes().unwrap()
         .into_iter()
         .find(|entry| entry.index_id == info.index_id)
         .unwrap();
     assert_eq!(building.state, SecondaryIndexState::Building);
-    assert_eq!(db.segment_count(), 1);
+    assert_eq!(db.segment_count().unwrap(), 1);
 
-    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    let seg_dir = segment_dir(dir.path(), db.segments_for_test()[0].segment_id);
     let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
     assert!(!sidecar_path.exists());
 
@@ -12128,7 +12291,7 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
     let db_path = dir.path().join("testdb");
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let mut color_props = BTreeMap::new();
         color_props.insert("color".to_string(), PropValue::String("red".to_string()));
         let color_id = db
@@ -12202,7 +12365,7 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
 
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let indexes = db.list_node_property_indexes();
+        let indexes = db.list_node_property_indexes().unwrap();
         assert_eq!(indexes.len(), 2);
         assert!(
             indexes
@@ -12249,7 +12412,7 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
 fn test_zero_declaration_flush_and_compaction_skip_equality_artifacts() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     for key in ["a", "b"] {
         let mut props = BTreeMap::new();
@@ -12265,7 +12428,7 @@ fn test_zero_declaration_flush_and_compaction_skip_equality_artifacts() {
         .unwrap();
     }
     db.flush().unwrap();
-    let first_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let first_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     assert!(!first_seg_dir.join("prop_index.dat").exists());
     assert!(!first_seg_dir.join("node_prop_hashes.dat").exists());
     assert!(!first_seg_dir
@@ -12288,7 +12451,7 @@ fn test_zero_declaration_flush_and_compaction_skip_equality_artifacts() {
     db.flush().unwrap();
     let stats = db.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 2);
-    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     assert!(!compacted_seg_dir.join("prop_index.dat").exists());
     assert!(!compacted_seg_dir.join("node_prop_hashes.dat").exists());
     assert!(!compacted_seg_dir
@@ -12302,7 +12465,7 @@ fn test_zero_declaration_flush_and_compaction_skip_equality_artifacts() {
 fn test_equality_index_backfills_existing_segments_and_compaction_preserves_sidecars() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let red = PropValue::String("red".to_string());
     let mut props = BTreeMap::new();
@@ -12324,7 +12487,7 @@ fn test_equality_index_backfills_existing_segments_and_compaction_preserves_side
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
-    let first_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let first_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let first_sidecar =
         crate::segment_writer::node_prop_eq_sidecar_path(&first_seg_dir, info.index_id);
     assert!(first_sidecar.exists());
@@ -12340,7 +12503,7 @@ fn test_equality_index_backfills_existing_segments_and_compaction_preserves_side
         )
         .unwrap();
     db.flush().unwrap();
-    for segment in &db.segments {
+    for segment in &db.segments_for_test() {
         let seg_dir = segment_dir(&db_path, segment.segment_id);
         let sidecar_path =
             crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
@@ -12349,7 +12512,7 @@ fn test_equality_index_backfills_existing_segments_and_compaction_preserves_side
 
     let stats = db.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 2);
-    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let compacted_sidecar =
         crate::segment_writer::node_prop_eq_sidecar_path(&compacted_seg_dir, info.index_id);
     assert!(compacted_sidecar.exists());
@@ -12376,7 +12539,7 @@ fn test_missing_equality_sidecar_reopens_and_repairs_to_ready() {
     let seg_id;
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), red.clone());
         db.upsert_node(
@@ -12395,7 +12558,7 @@ fn test_missing_equality_sidecar_reopens_and_repairs_to_ready() {
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
-        seg_id = db.segments[0].segment_id;
+        seg_id = db.segments_for_test()[0].segment_id;
         db.close().unwrap();
     }
 
@@ -12426,7 +12589,7 @@ fn test_corrupt_equality_sidecar_reopens_failed_and_queries_fallback() {
     let red = PropValue::String("red".to_string());
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), red.clone());
         let node_id = db
@@ -12446,7 +12609,7 @@ fn test_corrupt_equality_sidecar_reopens_failed_and_queries_fallback() {
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
-        seg_id = db.segments[0].segment_id;
+        seg_id = db.segments_for_test()[0].segment_id;
         assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
         db.close().unwrap();
     }
@@ -12457,7 +12620,7 @@ fn test_corrupt_equality_sidecar_reopens_failed_and_queries_fallback() {
 
     let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = reopened
-        .list_node_property_indexes()
+        .list_node_property_indexes().unwrap()
         .into_iter()
         .find(|info| info.index_id == index_id)
         .unwrap();
@@ -12479,7 +12642,7 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
     let db_path = dir.path().join("testdb");
     let red = PropValue::String("red".to_string());
     let blue = PropValue::String("blue".to_string());
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), red.clone());
@@ -12500,7 +12663,7 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
-    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
     std::fs::remove_file(&sidecar_path).unwrap();
     assert!(!sidecar_path.exists());
@@ -12527,8 +12690,8 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
     )
     .unwrap();
     let expected_after_degrade = (
-        db.next_node_id(),
-        db.next_edge_id(),
+        db.next_node_id().unwrap(),
+        db.next_edge_id().unwrap(),
         db.engine_seq_for_test(),
     );
 
@@ -12578,8 +12741,8 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
     )
     .unwrap();
     let expected_after_repair = (
-        db.next_node_id(),
-        db.next_edge_id(),
+        db.next_node_id().unwrap(),
+        db.next_edge_id().unwrap(),
         db.engine_seq_for_test(),
     );
 
@@ -12605,7 +12768,7 @@ fn test_corrupt_equality_sidecar_while_open_queries_fallback_and_marks_failed() 
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let red = PropValue::String("red".to_string());
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), red.clone());
@@ -12626,7 +12789,7 @@ fn test_corrupt_equality_sidecar_while_open_queries_fallback_and_marks_failed() 
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
-    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
     std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
 
@@ -12636,11 +12799,7 @@ fn test_corrupt_equality_sidecar_while_open_queries_fallback_and_marks_failed() 
     assert_eq!(routes.equality_scan_fallback, 1);
     assert_eq!(routes.equality_index_lookup, 0);
 
-    let failed = db
-        .list_node_property_indexes()
-        .into_iter()
-        .find(|entry| entry.index_id == info.index_id)
-        .unwrap();
+    let failed = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Failed);
     assert_eq!(failed.state, SecondaryIndexState::Failed);
     assert!(failed.last_error.is_some());
 
@@ -12652,7 +12811,7 @@ fn test_compaction_with_corrupt_ready_sidecar_succeeds_and_marks_failed() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let red = PropValue::String("red".to_string());
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), red.clone());
@@ -12685,22 +12844,18 @@ fn test_compaction_with_corrupt_ready_sidecar_succeeds_and_marks_failed() {
         .unwrap();
     db.flush().unwrap();
 
-    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
     std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
 
     let stats = db.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 2);
 
-    let failed = db
-        .list_node_property_indexes()
-        .into_iter()
-        .find(|entry| entry.index_id == info.index_id)
-        .unwrap();
+    let failed = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Failed);
     assert_eq!(failed.state, SecondaryIndexState::Failed);
     assert!(failed.last_error.is_some());
 
-    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let compacted_sidecar =
         crate::segment_writer::node_prop_eq_sidecar_path(&compacted_seg_dir, info.index_id);
     assert!(compacted_sidecar.exists());
@@ -12717,11 +12872,172 @@ fn test_compaction_with_corrupt_ready_sidecar_succeeds_and_marks_failed() {
 }
 
 #[test]
+fn test_compaction_with_missing_ready_sidecar_rebuilds_equality_index_via_targeted_decode() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let first_id = db
+        .upsert_node(
+            1,
+            "first-missing-sidecar",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let second_id = db
+        .upsert_node(
+            1,
+            "second-missing-sidecar",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let older_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let missing_sidecar_path =
+        crate::segment_writer::node_prop_eq_sidecar_path(&older_seg_dir, info.index_id);
+    std::fs::remove_file(&missing_sidecar_path).unwrap();
+    assert!(!missing_sidecar_path.exists());
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+
+    let rebuilt = db
+        .list_node_property_indexes().unwrap()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(rebuilt.state, SecondaryIndexState::Ready);
+    assert!(rebuilt.last_error.is_none());
+
+    let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let compacted_sidecar =
+        crate::segment_writer::node_prop_eq_sidecar_path(&compacted_seg_dir, info.index_id);
+    assert!(compacted_sidecar.exists());
+
+    db.reset_property_query_routes();
+    let mut ids = db.find_nodes(1, "color", &red).unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![first_id, second_id]);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    db.close().unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened_info = reopened
+        .list_node_property_indexes().unwrap()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(reopened_info.state, SecondaryIndexState::Ready);
+    assert!(reopened_info.last_error.is_none());
+
+    reopened.reset_property_query_routes();
+    let mut reopened_ids = reopened.find_nodes(1, "color", &red).unwrap();
+    reopened_ids.sort_unstable();
+    assert_eq!(reopened_ids, vec![first_id, second_id]);
+    let reopened_routes = reopened.property_query_route_snapshot();
+    assert_eq!(reopened_routes.equality_scan_fallback, 0);
+    assert_eq!(reopened_routes.equality_index_lookup, 1);
+
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_drop_equality_index_routes_to_fallback_and_cleans_sidecar() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let node_id = db
+        .upsert_node(
+            1,
+            "drop-equality",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    db.reset_property_query_routes();
+    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    let indexed_routes = db.property_query_route_snapshot();
+    assert_eq!(indexed_routes.equality_scan_fallback, 0);
+    assert_eq!(indexed_routes.equality_index_lookup, 1);
+
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(sidecar_path.exists());
+
+    assert!(db
+        .drop_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap());
+    assert!(
+        db.list_node_property_indexes().unwrap()
+            .into_iter()
+            .all(|entry| entry.index_id != info.index_id)
+    );
+    assert!(
+        db.active_memtable()
+            .secondary_eq_state()
+            .get(&info.index_id)
+            .is_none()
+    );
+
+    db.reset_property_query_routes();
+    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    let fallback_routes = db.property_query_route_snapshot();
+    assert_eq!(fallback_routes.equality_scan_fallback, 1);
+    assert_eq!(fallback_routes.equality_index_lookup, 0);
+
+    wait_for_path_absent(&sidecar_path);
+
+    db.close().unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    assert!(reopened.list_node_property_indexes().unwrap().is_empty());
+    reopened.reset_property_query_routes();
+    assert_eq!(reopened.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    let reopened_routes = reopened.property_query_route_snapshot();
+    assert_eq!(reopened_routes.equality_scan_fallback, 1);
+    assert_eq!(reopened_routes.equality_index_lookup, 0);
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_legacy_property_hash_backfill_and_compaction_parity() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let red = PropValue::String("red".to_string());
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), red.clone());
@@ -12737,8 +13053,9 @@ fn test_legacy_property_hash_backfill_and_compaction_parity() {
         .unwrap();
     db.flush().unwrap();
 
-    let first_seg_id = db.segments[0].segment_id;
+    let first_seg_id = db.segments_for_test()[0].segment_id;
     db.close().unwrap();
+    drop(db);
 
     let first_seg_dir = segment_dir(&db_path, first_seg_id);
     install_legacy_property_hash_sidecars(
@@ -12748,7 +13065,7 @@ fn test_legacy_property_hash_backfill_and_compaction_parity() {
     assert!(first_seg_dir.join("prop_index.dat").exists());
     assert!(first_seg_dir.join("node_prop_hashes.dat").exists());
 
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = db
         .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
         .unwrap();
@@ -12771,7 +13088,7 @@ fn test_legacy_property_hash_backfill_and_compaction_parity() {
 
     let stats = db.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 2);
-    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let compacted_sidecar =
         crate::segment_writer::node_prop_eq_sidecar_path(&compacted_seg_dir, info.index_id);
     assert!(compacted_sidecar.exists());
@@ -12792,7 +13109,7 @@ fn test_equality_backfill_survives_compaction_during_build() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let red = PropValue::String("red".to_string());
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     for key in ["first", "second"] {
         let mut props = BTreeMap::new();
@@ -12833,6 +13150,144 @@ fn test_equality_backfill_survives_compaction_during_build() {
 }
 
 #[test]
+fn test_equality_index_close_while_build_paused_reopens_and_resumes() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let opts = DbOptions {
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let node_id = db
+        .upsert_node(
+            1,
+            "close-paused-eq",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let close_handle = std::thread::spawn(move || {
+        let result = db.close();
+        let _ = done_tx.send(());
+        result
+    });
+    let _ = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+    release_tx.send(()).unwrap();
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    close_handle.join().unwrap().unwrap();
+
+    let manifest_after_close = crate::manifest::load_manifest_readonly(&db_path)
+        .unwrap()
+        .unwrap();
+    let entry_after_close = manifest_after_close
+        .secondary_indexes
+        .iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(entry_after_close.state, SecondaryIndexState::Building);
+    assert!(entry_after_close.last_error.is_none());
+
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(!sidecar_path.exists());
+
+    let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
+    wait_for_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+
+    reopened.reset_property_query_routes();
+    assert_eq!(reopened.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    let routes = reopened.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_drop_equality_index_while_build_paused_stale_sidecar_does_not_resurrect() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let opts = DbOptions {
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let node_id = db
+        .upsert_node(
+            1,
+            "drop-paused-eq",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    assert!(db
+        .drop_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap());
+    assert!(db.list_node_property_indexes().unwrap().is_empty());
+    let manifest_after_drop = crate::manifest::load_manifest_readonly(&db_path)
+        .unwrap()
+        .unwrap();
+    assert!(manifest_after_drop.secondary_indexes.is_empty());
+
+    release_tx.send(()).unwrap();
+    db.close().unwrap();
+
+    let stale_sidecar_path =
+        crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    let mut stale_groups = BTreeMap::new();
+    stale_groups.insert(hash_prop_value(&red), vec![node_id]);
+    std::fs::create_dir_all(stale_sidecar_path.parent().unwrap()).unwrap();
+    crate::segment_writer::write_node_prop_eq_sidecar_to_path(&stale_sidecar_path, &stale_groups)
+        .unwrap();
+    assert!(stale_sidecar_path.exists());
+
+    let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
+    assert!(reopened.list_node_property_indexes().unwrap().is_empty());
+    reopened.reset_property_query_routes();
+    assert_eq!(reopened.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    let routes = reopened.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 1);
+    assert_eq!(routes.equality_index_lookup, 0);
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
     let dir = TempDir::new().unwrap();
     let opts = DbOptions {
@@ -12841,7 +13296,7 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("score".to_string(), PropValue::Int(10));
@@ -12871,9 +13326,9 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
         )
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
-    let frozen_range = db
-        .immutable_memtable(0)
-        .secondary_range_state()
+    let frozen_memtable = db.immutable_memtable(0);
+    let frozen_range_state = frozen_memtable.secondary_range_state();
+    let frozen_range = frozen_range_state
         .get(&info.index_id)
         .unwrap();
     assert!(frozen_range.contains(&(10u64 ^ (1u64 << 63), node_id)));
@@ -12882,7 +13337,7 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
     assert!(db.wait_one_flush().unwrap().is_some());
     let ready = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.index_id, info.index_id);
-    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    let seg_dir = segment_dir(dir.path(), db.segments_for_test()[0].segment_id);
     assert!(crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id).exists());
     db.reset_property_query_routes();
     assert_eq!(
@@ -12915,7 +13370,7 @@ fn test_ready_property_range_index_downgrades_when_flush_publish_missed_declarat
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let mut db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("score".to_string(), PropValue::Int(10));
@@ -12952,13 +13407,13 @@ fn test_ready_property_range_index_downgrades_when_flush_publish_missed_declarat
     repair_ready_rx.recv().unwrap();
 
     let building = db
-        .list_node_property_indexes()
+        .list_node_property_indexes().unwrap()
         .into_iter()
         .find(|entry| entry.index_id == info.index_id)
         .unwrap();
     assert_eq!(building.state, SecondaryIndexState::Building);
 
-    let seg_dir = segment_dir(dir.path(), db.segments[0].segment_id);
+    let seg_dir = segment_dir(dir.path(), db.segments_for_test()[0].segment_id);
     let sidecar_path =
         crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
     assert!(!sidecar_path.exists());
@@ -13008,7 +13463,7 @@ fn test_missing_range_sidecar_reopens_and_repairs_to_ready() {
     let seg_id;
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let mut props = BTreeMap::new();
         props.insert("score".to_string(), PropValue::Int(10));
         db.upsert_node(
@@ -13033,7 +13488,7 @@ fn test_missing_range_sidecar_reopens_and_repairs_to_ready() {
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
-        seg_id = db.segments[0].segment_id;
+        seg_id = db.segments_for_test()[0].segment_id;
         db.close().unwrap();
     }
 
@@ -13068,7 +13523,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
     let seg_id;
 
     {
-        let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let mut props = BTreeMap::new();
         props.insert("score".to_string(), PropValue::Int(10));
         let node_id = db
@@ -13094,7 +13549,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
-        seg_id = db.segments[0].segment_id;
+        seg_id = db.segments_for_test()[0].segment_id;
         assert_eq!(
             db.find_nodes_range(
                 1,
@@ -13114,7 +13569,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
 
     let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = reopened
-        .list_node_property_indexes()
+        .list_node_property_indexes().unwrap()
         .into_iter()
         .find(|info| info.index_id == index_id)
         .unwrap();
@@ -13145,7 +13600,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
 fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("score".to_string(), PropValue::Int(10));
@@ -13172,7 +13627,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
-    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
     std::fs::remove_file(&sidecar_path).unwrap();
     assert!(!sidecar_path.exists());
@@ -13196,8 +13651,8 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     )
     .unwrap();
     let expected_after_degrade = (
-        db.next_node_id(),
-        db.next_edge_id(),
+        db.next_node_id().unwrap(),
+        db.next_edge_id().unwrap(),
         db.engine_seq_for_test(),
     );
 
@@ -13244,8 +13699,8 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     )
     .unwrap();
     let expected_after_repair = (
-        db.next_node_id(),
-        db.next_edge_id(),
+        db.next_node_id().unwrap(),
+        db.next_edge_id().unwrap(),
         db.engine_seq_for_test(),
     );
 
@@ -13267,7 +13722,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
 fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("score".to_string(), PropValue::Int(10));
@@ -13294,7 +13749,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
-    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
     std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
 
@@ -13317,8 +13772,8 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
     )
     .unwrap();
     let expected_after_degrade = (
-        db.next_node_id(),
-        db.next_edge_id(),
+        db.next_node_id().unwrap(),
+        db.next_edge_id().unwrap(),
         db.engine_seq_for_test(),
     );
 
@@ -13337,11 +13792,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
     assert_eq!(routes.range_scan_fallback, 1);
     assert_eq!(routes.range_index_lookup, 0);
 
-    let failed = db
-        .list_node_property_indexes()
-        .into_iter()
-        .find(|entry| entry.index_id == info.index_id)
-        .unwrap();
+    let failed = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Failed);
     assert_eq!(failed.state, SecondaryIndexState::Failed);
     assert!(failed.last_error.is_some());
 
@@ -13359,7 +13810,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
 fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("score".to_string(), PropValue::Int(10));
@@ -13398,7 +13849,7 @@ fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() 
         .unwrap();
     db.flush().unwrap();
 
-    let seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
     std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
 
@@ -13406,14 +13857,14 @@ fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() 
     assert_eq!(stats.segments_merged, 2);
 
     let failed = db
-        .list_node_property_indexes()
+        .list_node_property_indexes().unwrap()
         .into_iter()
         .find(|entry| entry.index_id == info.index_id)
         .unwrap();
     assert_eq!(failed.state, SecondaryIndexState::Failed);
     assert!(failed.last_error.is_some());
 
-    let compacted_seg_dir = segment_dir(&db_path, db.segments[0].segment_id);
+    let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let compacted_sidecar =
         crate::segment_writer::node_prop_range_sidecar_path(&compacted_seg_dir, info.index_id);
     assert!(compacted_sidecar.exists());
@@ -13437,10 +13888,268 @@ fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() 
 }
 
 #[test]
+fn test_compaction_with_missing_ready_range_sidecar_rebuilds_index_via_targeted_decode() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("score".to_string(), PropValue::Int(10));
+    let first_id = db
+        .upsert_node(
+            1,
+            "first-missing-range-sidecar",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let second_id = db
+        .upsert_node(
+            1,
+            "second-missing-range-sidecar",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let older_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let missing_sidecar_path =
+        crate::segment_writer::node_prop_range_sidecar_path(&older_seg_dir, info.index_id);
+    std::fs::remove_file(&missing_sidecar_path).unwrap();
+    assert!(!missing_sidecar_path.exists());
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+
+    let rebuilt = db
+        .list_node_property_indexes().unwrap()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(rebuilt.state, SecondaryIndexState::Ready);
+    assert!(rebuilt.last_error.is_none());
+
+    let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let compacted_sidecar =
+        crate::segment_writer::node_prop_range_sidecar_path(&compacted_seg_dir, info.index_id);
+    assert!(compacted_sidecar.exists());
+
+    db.reset_property_query_routes();
+    let mut ids = db
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![first_id, second_id]);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 1);
+
+    db.close().unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened_info = reopened
+        .list_node_property_indexes().unwrap()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(reopened_info.state, SecondaryIndexState::Ready);
+    assert!(reopened_info.last_error.is_none());
+
+    reopened.reset_property_query_routes();
+    let mut reopened_ids = reopened
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap();
+    reopened_ids.sort_unstable();
+    assert_eq!(reopened_ids, vec![first_id, second_id]);
+    let reopened_routes = reopened.property_query_route_snapshot();
+    assert_eq!(reopened_routes.range_scan_fallback, 0);
+    assert_eq!(reopened_routes.range_index_lookup, 1);
+
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("score".to_string(), PropValue::Int(10));
+    let first_id = db
+        .upsert_node(
+            1,
+            "drop-range-first",
+            UpsertNodeOptions {
+                props: props.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap(),
+        vec![first_id]
+    );
+    let indexed_routes = db.property_query_route_snapshot();
+    assert_eq!(indexed_routes.range_scan_fallback, 0);
+    assert_eq!(indexed_routes.range_index_lookup, 1);
+
+    let first_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let first_sidecar_path =
+        crate::segment_writer::node_prop_range_sidecar_path(&first_seg_dir, info.index_id);
+    assert!(first_sidecar_path.exists());
+
+    assert!(db
+        .drop_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap());
+    assert!(
+        db.list_node_property_indexes().unwrap()
+            .into_iter()
+            .all(|entry| entry.index_id != info.index_id)
+    );
+    assert!(
+        db.active_memtable()
+            .secondary_range_state()
+            .get(&info.index_id)
+            .is_none()
+    );
+
+    db.reset_property_query_routes();
+    assert_eq!(
+        db.find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap(),
+        vec![first_id]
+    );
+    let fallback_routes = db.property_query_route_snapshot();
+    assert_eq!(fallback_routes.range_scan_fallback, 1);
+    assert_eq!(fallback_routes.range_index_lookup, 0);
+
+    wait_for_path_absent(&first_sidecar_path);
+
+    let second_id = db
+        .upsert_node(
+            1,
+            "drop-range-second",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+    let second_seg_dir = segment_dir(&db_path, db.segments_for_test()[1].segment_id);
+    let second_sidecar_path =
+        crate::segment_writer::node_prop_range_sidecar_path(&second_seg_dir, info.index_id);
+    assert!(!second_sidecar_path.exists());
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+    let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let compacted_sidecar =
+        crate::segment_writer::node_prop_range_sidecar_path(&compacted_seg_dir, info.index_id);
+    assert!(!compacted_sidecar.exists());
+    assert!(db.list_node_property_indexes().unwrap().is_empty());
+
+    db.reset_property_query_routes();
+    let mut ids = db
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![first_id, second_id]);
+    let post_compact_routes = db.property_query_route_snapshot();
+    assert_eq!(post_compact_routes.range_scan_fallback, 1);
+    assert_eq!(post_compact_routes.range_index_lookup, 0);
+
+    db.close().unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    assert!(reopened.list_node_property_indexes().unwrap().is_empty());
+    reopened.reset_property_query_routes();
+    let mut reopened_ids = reopened
+        .find_nodes_range(
+            1,
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+        )
+        .unwrap();
+    reopened_ids.sort_unstable();
+    assert_eq!(reopened_ids, vec![first_id, second_id]);
+    let reopened_routes = reopened.property_query_route_snapshot();
+    assert_eq!(reopened_routes.range_scan_fallback, 1);
+    assert_eq!(reopened_routes.range_index_lookup, 0);
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_range_backfill_survives_compaction_during_build() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let mut db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     for key in ["first-range", "second-range"] {
         let mut props = BTreeMap::new();
@@ -13497,6 +14206,95 @@ fn test_range_backfill_survives_compaction_during_build() {
 }
 
 #[test]
+fn test_range_index_close_fast_while_build_paused_reopens_and_resumes() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let opts = DbOptions {
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let mut props = BTreeMap::new();
+    props.insert("score".to_string(), PropValue::Int(10));
+    let node_id = db
+        .upsert_node(
+            1,
+            "close-fast-paused-range",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
+    let info = db
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let close_handle = std::thread::spawn(move || {
+        let result = db.close_fast();
+        let _ = done_tx.send(());
+        result
+    });
+    let _ = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+    release_tx.send(()).unwrap();
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    close_handle.join().unwrap().unwrap();
+
+    let manifest_after_close = crate::manifest::load_manifest_readonly(&db_path)
+        .unwrap()
+        .unwrap();
+    let entry_after_close = manifest_after_close
+        .secondary_indexes
+        .iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(entry_after_close.state, SecondaryIndexState::Building);
+    assert!(entry_after_close.last_error.is_none());
+
+    let sidecar_path =
+        crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
+    assert!(!sidecar_path.exists());
+
+    let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
+    wait_for_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+
+    reopened.reset_property_query_routes();
+    assert_eq!(
+        reopened
+            .find_nodes_range(
+                1,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            )
+            .unwrap(),
+        vec![node_id]
+    );
+    let routes = reopened.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 1);
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_open_rejects_conflicting_range_declarations_for_same_property() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
@@ -13537,4 +14335,1004 @@ fn test_open_rejects_conflicting_range_declarations_for_same_property() {
         Err(other) => panic!("expected ManifestError, got {}", other),
         Ok(_) => panic!("expected conflicting range declarations to fail on open"),
     }
+}
+
+#[test]
+fn test_open_rejects_duplicate_secondary_index_ids_in_manifest() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    let mut manifest = crate::manifest::default_manifest();
+    manifest.secondary_indexes = vec![
+        SecondaryIndexManifestEntry {
+            index_id: 1,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        },
+        SecondaryIndexManifestEntry {
+            index_id: 1,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        },
+    ];
+    manifest.next_secondary_index_id = 2;
+    crate::manifest::write_manifest(&db_path, &manifest).unwrap();
+
+    match DatabaseEngine::open(&db_path, &DbOptions::default()) {
+        Err(EngineError::ManifestError(message)) => {
+            assert!(message.contains("duplicate secondary index id"));
+        }
+        Err(other) => panic!("expected ManifestError, got {}", other),
+        Ok(_) => panic!("expected duplicate secondary index ids to fail on open"),
+    }
+}
+
+#[test]
+fn test_open_rejects_duplicate_equality_declarations_for_same_property() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    let mut manifest = crate::manifest::default_manifest();
+    manifest.secondary_indexes = vec![
+        SecondaryIndexManifestEntry {
+            index_id: 1,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        },
+        SecondaryIndexManifestEntry {
+            index_id: 2,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        },
+    ];
+    manifest.next_secondary_index_id = 3;
+    crate::manifest::write_manifest(&db_path, &manifest).unwrap();
+
+    match DatabaseEngine::open(&db_path, &DbOptions::default()) {
+        Err(EngineError::ManifestError(message)) => {
+            assert!(message.contains("duplicate secondary index declaration"));
+        }
+        Err(other) => panic!("expected ManifestError, got {}", other),
+        Ok(_) => panic!("expected duplicate equality declarations to fail on open"),
+    }
+}
+
+#[test]
+fn test_shared_handle_clone_observes_state_and_close_is_family_wide() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let clone = db.clone();
+
+    let id = db
+        .upsert_node(1, "shared", UpsertNodeOptions::default())
+        .unwrap();
+    assert_eq!(clone.get_node(id).unwrap().unwrap().key, "shared");
+
+    clone.close().unwrap();
+
+    assert!(matches!(db.get_node(id), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(
+        db.upsert_node(1, "after-close", UpsertNodeOptions::default()),
+        Err(EngineError::DatabaseClosed)
+    ));
+    assert!(matches!(db.list_prune_policies(), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(
+        db.list_node_property_indexes(),
+        Err(EngineError::DatabaseClosed)
+    ));
+    assert!(matches!(db.stats(), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(db.manifest(), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(db.node_count(), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(db.edge_count(), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(db.next_node_id(), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(db.next_edge_id(), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(db.segment_count(), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(
+        db.segment_tombstone_node_count(),
+        Err(EngineError::DatabaseClosed)
+    ));
+    assert!(matches!(
+        db.segment_tombstone_edge_count(),
+        Err(EngineError::DatabaseClosed)
+    ));
+    assert!(matches!(db.ingest_mode(), Err(EngineError::DatabaseClosed)));
+    assert!(matches!(db.close(), Err(EngineError::DatabaseClosed)));
+
+    let reopened = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    assert_eq!(reopened.get_node(id).unwrap().unwrap().key, "shared");
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_shared_handle_reads_hold_old_published_snapshot_until_republish() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let reader = db.clone();
+    let writer = db.clone();
+
+    let (ready_rx, release_tx) = writer.set_runtime_publish_pause();
+    let (write_done_tx, write_done_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let result = writer.upsert_node(1, "during-publish", UpsertNodeOptions::default());
+        let _ = write_done_tx.send(result);
+    });
+
+    ready_rx.recv().unwrap();
+
+    assert!(reader.get_node(1).unwrap().is_none());
+    assert!(reader.get_node_by_key(1, "during-publish").unwrap().is_none());
+    assert!(reader.find_existing_node(1, "during-publish").unwrap().is_none());
+    let batch_nodes = reader.get_nodes(&[1]).unwrap();
+    assert!(batch_nodes[0].is_none());
+    let batch_keys = reader.get_nodes_by_keys(&[(1, "during-publish")]).unwrap();
+    assert!(batch_keys[0].is_none());
+
+    release_tx.send(()).unwrap();
+
+    let id = write_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(reader.get_node(id).unwrap().unwrap().key, "during-publish");
+    assert_eq!(
+        reader.get_node_by_key(1, "during-publish").unwrap().unwrap().id,
+        id
+    );
+    assert_eq!(
+        reader
+            .find_existing_node(1, "during-publish")
+            .unwrap()
+            .map(|(node_id, _)| node_id),
+        Some(id)
+    );
+
+    let batch_nodes = reader.get_nodes(&[id]).unwrap();
+    assert_eq!(batch_nodes[0].as_ref().unwrap().key, "during-publish");
+    let batch_keys = reader.get_nodes_by_keys(&[(1, "during-publish")]).unwrap();
+    assert_eq!(batch_keys[0].as_ref().unwrap().id, id);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_shared_handle_snapshot_queries_keep_visible_type_enumeration_until_republish() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let reader = db.clone();
+    let writer = db.clone();
+
+    let id = db
+        .upsert_node(1, "snapshot-type", UpsertNodeOptions::default())
+        .unwrap();
+
+    let initial_export = reader.export_adjacency(&ExportOptions::default()).unwrap();
+    assert_eq!(initial_export.node_ids, vec![id]);
+    let initial_components = reader
+        .connected_components(&ComponentOptions::default())
+        .unwrap();
+    assert_eq!(initial_components.get(&id), Some(&id));
+
+    let (ready_rx, release_tx) = writer.set_runtime_publish_pause();
+    let (write_done_tx, write_done_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let result = writer.delete_node(id);
+        let _ = write_done_tx.send(result);
+    });
+
+    ready_rx.recv().unwrap();
+
+    let pinned_export = reader.export_adjacency(&ExportOptions::default()).unwrap();
+    assert_eq!(
+        pinned_export.node_ids,
+        vec![id],
+        "old published snapshot must keep the pre-delete node type visible"
+    );
+    let pinned_components = reader
+        .connected_components(&ComponentOptions::default())
+        .unwrap();
+    assert_eq!(
+        pinned_components.get(&id),
+        Some(&id),
+        "connected_components must enumerate node types from snapshot-visible membership"
+    );
+
+    release_tx.send(()).unwrap();
+    write_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+
+    let after_export = reader.export_adjacency(&ExportOptions::default()).unwrap();
+    assert!(after_export.node_ids.is_empty());
+    let after_components = reader
+        .connected_components(&ComponentOptions::default())
+        .unwrap();
+    assert!(!after_components.contains_key(&id));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_shared_handle_close_waits_for_admitted_read_and_rejects_later_reads() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let id = db
+        .upsert_node(1, "close-read", UpsertNodeOptions::default())
+        .unwrap();
+
+    let reader = db.clone();
+    let closer = db.clone();
+    let (read_ready_rx, read_release_tx) = reader.set_runtime_read_pause();
+    let (read_done_tx, read_done_rx) = std::sync::mpsc::sync_channel(1);
+    let (close_done_tx, close_done_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let _ = read_done_tx.send(reader.get_node(id));
+    });
+
+    read_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    std::thread::spawn(move || {
+        let _ = close_done_tx.send(closer.close());
+    });
+
+    assert!(
+        close_done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "close should wait for an already-admitted read"
+    );
+    assert!(matches!(db.get_node(id), Err(EngineError::DatabaseClosed)));
+
+    read_release_tx.send(()).unwrap();
+    let node = read_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.id, id);
+
+    close_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+
+    let reopened = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    assert_eq!(reopened.get_node(id).unwrap().unwrap().key, "close-read");
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_shared_handle_close_waits_for_admitted_write_to_finish() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let writer = db.clone();
+    let closer = db.clone();
+
+    let (ready_rx, release_tx) = writer.set_runtime_publish_pause();
+    let (write_done_tx, write_done_rx) = std::sync::mpsc::sync_channel(1);
+    let (close_done_tx, close_done_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let result = writer.upsert_node(1, "close-barrier", UpsertNodeOptions::default());
+        let _ = write_done_tx.send(result);
+    });
+
+    ready_rx.recv().unwrap();
+
+    std::thread::spawn(move || {
+        let _ = close_done_tx.send(closer.close());
+    });
+
+    assert!(
+        close_done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "close should wait for already-admitted work"
+    );
+
+    release_tx.send(()).unwrap();
+
+    let write_id = write_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(write_id, 1);
+
+    close_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(db.get_node(write_id), Err(EngineError::DatabaseClosed)));
+
+    let reopened = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    assert_eq!(reopened.get_node(write_id).unwrap().unwrap().key, "close-barrier");
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_shared_handle_single_object_allows_point_read_during_paused_write() {
+    let dir = TempDir::new().unwrap();
+    let db = std::sync::Arc::new(DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap());
+    let writer = std::sync::Arc::clone(&db);
+    let reader = std::sync::Arc::clone(&db);
+
+    let (ready_rx, release_tx) = writer.set_runtime_publish_pause();
+    let (write_done_tx, write_done_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let result = writer.upsert_node(1, "single-object", UpsertNodeOptions::default());
+        let _ = write_done_tx.send(result);
+    });
+
+    ready_rx.recv().unwrap();
+
+    assert!(reader.get_node(1).unwrap().is_none());
+    assert!(reader.get_node_by_key(1, "single-object").unwrap().is_none());
+    assert!(reader.find_existing_node(1, "single-object").unwrap().is_none());
+    let batch_nodes = reader.get_nodes(&[1]).unwrap();
+    assert!(batch_nodes[0].is_none());
+    let batch_keys = reader.get_nodes_by_keys(&[(1, "single-object")]).unwrap();
+    assert!(batch_keys[0].is_none());
+
+    release_tx.send(()).unwrap();
+
+    let id = write_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(reader.get_node(id).unwrap().unwrap().key, "single-object");
+    assert_eq!(
+        reader.get_node_by_key(1, "single-object").unwrap().unwrap().id,
+        id
+    );
+    assert_eq!(
+        reader
+            .find_existing_node(1, "single-object")
+            .unwrap()
+            .map(|(node_id, _)| node_id),
+        Some(id)
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_coordinator_sequences_same_key_upserts_to_one_id() {
+    let dir = TempDir::new().unwrap();
+    let db = std::sync::Arc::new(DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+    let writer_a = std::sync::Arc::clone(&db);
+    let barrier_a = std::sync::Arc::clone(&barrier);
+    let handle_a = std::thread::spawn(move || {
+        barrier_a.wait();
+        writer_a.upsert_node(1, "same-key", UpsertNodeOptions::default())
+    });
+
+    let writer_b = std::sync::Arc::clone(&db);
+    let barrier_b = std::sync::Arc::clone(&barrier);
+    let handle_b = std::thread::spawn(move || {
+        barrier_b.wait();
+        writer_b.upsert_node(1, "same-key", UpsertNodeOptions::default())
+    });
+
+    barrier.wait();
+
+    let id_a = handle_a.join().unwrap().unwrap();
+    let id_b = handle_b.join().unwrap().unwrap();
+    assert_eq!(id_a, 1);
+    assert_eq!(id_b, 1);
+    assert_eq!(db.get_node_by_key(1, "same-key").unwrap().unwrap().id, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_coordinator_sequences_unique_edge_upserts_to_one_id() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        edge_uniqueness: true,
+        ..DbOptions::default()
+    };
+    let db = std::sync::Arc::new(DatabaseEngine::open(dir.path(), &opts).unwrap());
+    let a = db
+        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = db
+        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+    let writer_a = std::sync::Arc::clone(&db);
+    let barrier_a = std::sync::Arc::clone(&barrier);
+    let handle_a = std::thread::spawn(move || {
+        barrier_a.wait();
+        writer_a.upsert_edge(a, b, 9, UpsertEdgeOptions::default())
+    });
+
+    let writer_b = std::sync::Arc::clone(&db);
+    let barrier_b = std::sync::Arc::clone(&barrier);
+    let handle_b = std::thread::spawn(move || {
+        barrier_b.wait();
+        writer_b.upsert_edge(a, b, 9, UpsertEdgeOptions::default())
+    });
+
+    barrier.wait();
+
+    let id_a = handle_a.join().unwrap().unwrap();
+    let id_b = handle_b.join().unwrap().unwrap();
+    assert_eq!(id_a, 1);
+    assert_eq!(id_b, 1);
+    assert_eq!(db.get_edge_by_triple(a, b, 9).unwrap().unwrap().id, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_core_write_queue_capacity_blocks_pre_admission_until_slot_frees() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    db.set_core_write_queue_capacity_for_test(1);
+
+    let writer_a = db.clone();
+    let writer_b = db.clone();
+    let (ready_rx, release_tx) = writer_a.set_runtime_publish_pause();
+    let (done_a_tx, done_a_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_b_tx, done_b_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let _ = done_a_tx.send(writer_a.upsert_node(1, "queued-a", UpsertNodeOptions::default()));
+    });
+    ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+
+    std::thread::spawn(move || {
+        let _ = done_b_tx.send(writer_b.upsert_node(1, "queued-b", UpsertNodeOptions::default()));
+    });
+
+    assert!(
+        done_b_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "second writer should still be blocked waiting for queue capacity"
+    );
+
+    release_tx.send(()).unwrap();
+
+    assert_eq!(
+        done_a_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        done_b_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        2
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_core_write_queue_close_rejects_pre_admission_submitter() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    db.set_core_write_queue_capacity_for_test(1);
+
+    let writer_a = db.clone();
+    let writer_b = db.clone();
+    let closer = db.clone();
+    let (ready_rx, release_tx) = writer_a.set_runtime_publish_pause();
+    let (done_a_tx, done_a_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_b_tx, done_b_rx) = std::sync::mpsc::sync_channel(1);
+    let (close_done_tx, close_done_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let _ = done_a_tx.send(writer_a.upsert_node(1, "close-head", UpsertNodeOptions::default()));
+    });
+    ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+
+    std::thread::spawn(move || {
+        let _ = done_b_tx.send(writer_b.upsert_node(1, "close-blocked", UpsertNodeOptions::default()));
+    });
+    assert!(
+        done_b_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "blocked writer should still be waiting for queue capacity"
+    );
+
+    std::thread::spawn(move || {
+        let _ = close_done_tx.send(closer.close());
+    });
+    assert!(
+        close_done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "close should wait for the already-admitted head write"
+    );
+
+    release_tx.send(()).unwrap();
+
+    assert_eq!(
+        done_a_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        done_b_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap(),
+        Err(EngineError::DatabaseClosed)
+    ));
+    close_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+
+    let reopened = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    assert_eq!(reopened.get_node(1).unwrap().unwrap().key, "close-head");
+    assert!(reopened.get_node_by_key(1, "close-blocked").unwrap().is_none());
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_coordinator_head_of_line_backpressure_retry_preserves_order() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        memtable_flush_threshold: 0,
+        memtable_hard_cap_bytes: 0,
+        max_immutable_memtables: 1,
+        compact_after_n_flushes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    assert_eq!(
+        db.upsert_node(1, "seed", UpsertNodeOptions::default()).unwrap(),
+        1
+    );
+    db.freeze_memtable().unwrap();
+
+    let writer_a = db.clone();
+    let writer_b = db.clone();
+    let (ready_rx, release_tx) = db.set_flush_pause();
+    let (done_a_tx, done_a_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_b_tx, done_b_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let _ = done_a_tx.send(writer_a.upsert_node(1, "head-a", UpsertNodeOptions::default()));
+    });
+    ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+
+    std::thread::spawn(move || {
+        let _ = done_b_tx.send(writer_b.upsert_node(1, "queued-b", UpsertNodeOptions::default()));
+    });
+
+    assert!(
+        done_b_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "later queued write must not overtake the head command while it waits on lifecycle progress"
+    );
+
+    release_tx.send(()).unwrap();
+
+    assert_eq!(
+        done_a_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        done_b_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        3
+    );
+    assert_eq!(db.get_node_by_key(1, "head-a").unwrap().unwrap().id, 2);
+    assert_eq!(db.get_node_by_key(1, "queued-b").unwrap().unwrap().id, 3);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_coordinator_flush_barrier_stays_head_of_line() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+
+    db.upsert_node(1, "flush-head", UpsertNodeOptions::default())
+        .unwrap();
+    db.freeze_memtable().unwrap();
+
+    let flusher = db.clone();
+    let writer = db.clone();
+    let (ready_rx, release_tx) = db.set_flush_pause();
+    let (flush_done_tx, flush_done_rx) = std::sync::mpsc::sync_channel(1);
+    let (write_done_tx, write_done_rx) = std::sync::mpsc::sync_channel(1);
+
+    std::thread::spawn(move || {
+        let _ = flush_done_tx.send(flusher.flush());
+    });
+    ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+
+    std::thread::spawn(move || {
+        let _ = write_done_tx.send(writer.upsert_node(1, "queued-after-flush", UpsertNodeOptions::default()));
+    });
+
+    assert!(
+        write_done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "later queued write must not overtake the head flush barrier"
+    );
+
+    release_tx.send(()).unwrap();
+
+    assert!(flush_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        write_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        2
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_compact_with_progress_waits_for_admitted_work_and_blocks_later_mutations() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        compact_after_n_flushes: u32::MAX,
+        ..DbOptions::default()
+    };
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    let seg_a = db
+        .upsert_node(1, "seg-a", UpsertNodeOptions::default())
+        .unwrap();
+    db.flush().unwrap();
+    let seg_b = db
+        .upsert_node(1, "seg-b", UpsertNodeOptions::default())
+        .unwrap();
+    db.flush().unwrap();
+
+    let writer_a = db.clone();
+    let writer_b = db.clone();
+    let compactor = db.clone();
+    let (publish_ready_rx, publish_release_tx) = writer_a.set_runtime_publish_pause();
+    let (write_a_done_tx, write_a_done_rx) = std::sync::mpsc::sync_channel(1);
+    let (write_b_done_tx, write_b_done_rx) = std::sync::mpsc::sync_channel(1);
+    let (compact_started_tx, compact_started_rx) = std::sync::mpsc::sync_channel(1);
+    let (compact_release_tx, compact_release_rx) = std::sync::mpsc::sync_channel(1);
+    let (compact_done_tx, compact_done_rx) = std::sync::mpsc::sync_channel(1);
+    let compact_gate_used = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    std::thread::spawn(move || {
+        let _ = write_a_done_tx.send(writer_a.upsert_node(
+            1,
+            "ahead-of-compact",
+            UpsertNodeOptions::default(),
+        ));
+    });
+    publish_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    std::thread::spawn(move || {
+        let compact_gate_used = std::sync::Arc::clone(&compact_gate_used);
+        let _ = compact_done_tx.send(compactor.compact_with_progress(|_| {
+            if !compact_gate_used.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = compact_started_tx.send(());
+                compact_release_rx.recv().unwrap();
+            }
+            true
+        }));
+    });
+
+    assert!(
+        compact_started_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "compact_with_progress must wait for already-admitted queued work ahead of it"
+    );
+
+    publish_release_tx.send(()).unwrap();
+    assert_eq!(
+        write_a_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        3
+    );
+    compact_started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(db.get_node(seg_a).unwrap().unwrap().key, "seg-a");
+    assert_eq!(db.get_node(seg_b).unwrap().unwrap().key, "seg-b");
+
+    std::thread::spawn(move || {
+        let _ = write_b_done_tx.send(writer_b.upsert_node(
+            1,
+            "behind-compact",
+            UpsertNodeOptions::default(),
+        ));
+    });
+
+    assert!(
+        write_b_done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "mutating work must stay blocked while compact_with_progress holds the barrier"
+    );
+
+    compact_release_tx.send(()).unwrap();
+    compact_done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        write_b_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        4
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_publish_counters_use_snapshot_only_for_normal_write() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+
+    let before = db.published_state();
+    db.reset_publish_counters_for_test();
+    let node_id = db
+        .upsert_node(1, "snapshot-only", UpsertNodeOptions::default())
+        .unwrap();
+
+    let after = db.published_state();
+    let counters = db.publish_counter_snapshot_for_test();
+    assert_eq!(node_id, 1);
+    assert!(counters.skipped >= 1);
+    assert_eq!(counters.snapshot_only, 1);
+    assert_eq!(counters.rebuild_sources, 0);
+    assert_eq!(counters.source_rebuilds, 0);
+    assert!(std::sync::Arc::ptr_eq(&before.view.sources, &after.view.sources));
+    assert_ne!(before.engine_seq, after.engine_seq);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_publish_counters_rebuild_sources_for_flush() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    db.upsert_node(1, "flush-me", UpsertNodeOptions::default())
+        .unwrap();
+    db.reset_publish_counters_for_test();
+
+    assert!(db.flush().unwrap().is_some());
+
+    let counters = db.publish_counter_snapshot_for_test();
+    assert_eq!(counters.snapshot_only, 0);
+    assert!(counters.rebuild_sources >= 1);
+    assert_eq!(counters.source_rebuilds, counters.rebuild_sources);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_publish_counters_rebuild_sources_for_prune_policy_change_and_skip_noop() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let policy = PrunePolicy {
+        max_age_ms: Some(60_000),
+        max_weight: Some(0.5),
+        type_id: Some(1),
+    };
+
+    db.reset_publish_counters_for_test();
+    db.set_prune_policy("low-weight", policy.clone()).unwrap();
+
+    let counters = db.publish_counter_snapshot_for_test();
+    assert!(counters.skipped >= 1);
+    assert_eq!(counters.snapshot_only, 0);
+    assert_eq!(counters.rebuild_sources, 1);
+    assert_eq!(counters.source_rebuilds, 1);
+
+    db.reset_publish_counters_for_test();
+    db.set_prune_policy("low-weight", policy).unwrap();
+
+    let counters = db.publish_counter_snapshot_for_test();
+    assert!(counters.skipped >= 1);
+    assert_eq!(counters.snapshot_only, 0);
+    assert_eq!(counters.rebuild_sources, 0);
+    assert_eq!(counters.source_rebuilds, 0);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_publish_counters_rebuild_sources_for_property_index_change_and_skip_existing() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert(
+        "status".to_string(),
+        PropValue::String("active".to_string()),
+    );
+    db.upsert_node(
+        1,
+        "indexed",
+        UpsertNodeOptions {
+            props,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
+    db.reset_publish_counters_for_test();
+    let info = db
+        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .unwrap();
+
+    let counters = db.publish_counter_snapshot_for_test();
+    assert!(counters.skipped >= 1);
+    assert_eq!(counters.snapshot_only, 0);
+    assert_eq!(counters.rebuild_sources, 1);
+    assert_eq!(counters.source_rebuilds, 1);
+
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    db.reset_publish_counters_for_test();
+    let existing = db
+        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .unwrap();
+    assert_eq!(existing.index_id, info.index_id);
+
+    let counters = db.publish_counter_snapshot_for_test();
+    assert!(counters.skipped >= 1);
+    assert_eq!(counters.snapshot_only, 0);
+    assert_eq!(counters.rebuild_sources, 0);
+    assert_eq!(counters.source_rebuilds, 0);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_publish_counters_skip_ingest_mode_bookkeeping() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+
+    db.reset_publish_counters_for_test();
+    db.ingest_mode().unwrap();
+
+    let counters = db.publish_counter_snapshot_for_test();
+    assert!(counters.skipped >= 1);
+    assert_eq!(counters.snapshot_only, 0);
+    assert_eq!(counters.rebuild_sources, 0);
+    assert_eq!(counters.source_rebuilds, 0);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_property_index_followups_coalesce_while_first_followup_is_in_flight() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let node_id = db
+        .upsert_node(
+            1,
+            "coalesce",
+            UpsertNodeOptions {
+                props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    assert!(!sidecar_path.exists());
+
+    let (repair_ready_rx, repair_release_tx) = db.set_secondary_index_build_pause();
+    let (followup_ready_rx, followup_release_tx) = db.set_runtime_publish_pause();
+
+    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    followup_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(db.pending_secondary_index_followup_count_for_test(), 1);
+
+    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.pending_secondary_index_followup_count_for_test(), 1);
+
+    followup_release_tx.send(()).unwrap();
+    repair_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    wait_for_pending_secondary_index_followup_count(&db, 0);
+
+    let building = db
+        .list_node_property_indexes().unwrap()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(building.state, SecondaryIndexState::Building);
+
+    repair_release_tx.send(()).unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert!(sidecar_path.exists());
+
+    db.close().unwrap();
 }

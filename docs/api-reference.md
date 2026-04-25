@@ -46,6 +46,7 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
   - [get_edges](#get_edges)
 - [Atomic Operations](#atomic-operations)
   - [graph_patch](#graph_patch)
+  - [write transactions](#write-transactions)
 - [Type-Based Queries](#type-based-queries)
   - [nodes_by_type](#nodes_by_type)
   - [edges_by_type](#edges_by_type)
@@ -354,7 +355,7 @@ Options passed to [`open()`](#open). All fields are optional with sensible defau
 | memtable_hard_cap_bytes | `usize` | `memtableHardCapBytes` | `memtable_hard_cap_bytes` | `536870912` (512 MB) | Writes block when the active memtable exceeds this size and the flush queue is full. Prevents unbounded memory growth under heavy write load. Set to `0` to disable. |
 | max_immutable_memtables | `usize` | `maxImmutableMemtables` | `max_immutable_memtables` | `4` | Maximum number of sealed memtables allowed before the flush thread must drain one. Controls memory usage under write bursts. |
 | edge_uniqueness | `bool` | `edgeUniqueness` | `edge_uniqueness` | `false` | When `true`, `upsert_edge` enforces at most one edge per `(from, to, type_id)` triple. An upsert with the same triple updates the existing edge. When `false`, every `upsert_edge` call creates a new edge. |
-| compact_after_n_flushes | `u32` | `compactAfterNFlushes` | `compact_after_n_flushes` | `3` | Trigger background compaction after this many flushes. Set to `0` to disable auto-compaction. |
+| compact_after_n_flushes | `u32` | `compactAfterNFlushes` | `compact_after_n_flushes` | `4` | Trigger background compaction after this many flushes. Set to `0` to disable auto-compaction. |
 | dense_vector | `Option<DenseVectorConfig>` | `denseVector` | See below | `None` | Enable dense vector search. See [DenseVectorConfig](#densevectorconfig). In Python, use separate kwargs: `dense_vector_dimension` and `dense_vector_metric`. |
 
 ### WalSyncMode
@@ -1135,6 +1136,136 @@ Operations within a patch are applied in a deterministic order:
 |-------|------|---------|--------|-------------|
 | node_ids | `Vec<u64>` | `Float64Array` | `list[int]` | IDs of all upserted nodes, in input order. |
 | edge_ids | `Vec<u64>` | `Float64Array` | `list[int]` | IDs of all upserted edges, in input order. |
+
+---
+
+### write transactions
+
+Explicit write transactions stage ordered graph mutations locally, support bounded read-own-writes point lookups, and commit as one atomic WAL batch. Conflict detection is optimistic and write-target based: if a staged target changed after the transaction began, `commit` fails with a transaction conflict and no partial state is published.
+
+Use transactions when later operations need local aliases from earlier staged upserts, or when a caller needs rollback before durability. Use `graph_patch` for simpler grouped atomic batches that do not need ordered local references.
+
+Transaction reads are intentionally bounded. A transaction can read committed state from its begin snapshot plus its own staged writes for point/dedup lookups only: `get_node`, `get_edge`, `get_node_by_key`, and `get_edge_by_triple`. Traversal, vector search, property queries, pagination, export, analytics, prune-policy mutation, and maintenance APIs are not exposed on `WriteTxn`.
+
+**Rust**
+```rust
+let mut txn = db.begin_write_txn()?;
+let alice = txn.upsert_node_as("alice", USER, "alice", UpsertNodeOptions::default())?;
+let bob = txn.upsert_node_as("bob", USER, "bob", UpsertNodeOptions::default())?;
+txn.upsert_edge_as("knows", alice, bob, KNOWS, UpsertEdgeOptions::default())?;
+let staged = txn.get_node_by_key(USER, "alice")?;
+let result = txn.commit()?;
+```
+
+**Node.js**
+```javascript
+const txn = db.beginWriteTxn();
+txn.stage([
+  { op: 'upsertNode', alias: 'alice', typeId: USER, key: 'alice' },
+  { op: 'upsertNode', alias: 'bob', typeId: USER, key: 'bob' },
+  { op: 'upsertEdge', alias: 'knows', from: { local: 'alice' }, to: { local: 'bob' }, typeId: KNOWS },
+]);
+const staged = txn.getNode({ local: 'alice' });
+const result = txn.commit();
+```
+
+**Python**
+```python
+txn = db.begin_write_txn()
+txn.stage([
+    {"op": "upsert_node", "alias": "alice", "type_id": USER, "key": "alice"},
+    {"op": "upsert_node", "alias": "bob", "type_id": USER, "key": "bob"},
+    {"op": "upsert_edge", "alias": "knows", "from": {"local": "alice"}, "to": {"local": "bob"}, "type_id": KNOWS},
+])
+staged = txn.get_node({"local": "alice"})
+result = txn.commit()
+```
+
+#### Transaction Surface
+
+| Operation | Rust | Node.js | Python |
+|-----------|------|---------|--------|
+| Begin | `begin_write_txn()` | `beginWriteTxn()` | `begin_write_txn()` |
+| Stage node | `upsert_node`, `upsert_node_as` | `upsertNode`, `upsertNodeAs` | `upsert_node`, `upsert_node_as` |
+| Stage edge | `upsert_edge`, `upsert_edge_as` | `upsertEdge`, `upsertEdgeAs` | `upsert_edge`, `upsert_edge_as` |
+| Bulk ordered stage | `stage_intents(Vec<TxnIntent>)` | `stage(operations)` | `stage(operations)` |
+| Reads | `get_node`, `get_edge`, `get_node_by_key`, `get_edge_by_triple` | same camelCase names | same snake_case names |
+| Finish | `commit`, `rollback` | `commit`, `rollback` | `commit`, `rollback` |
+
+#### Builder Methods
+
+| Method | Required inputs | Optional inputs | Returns |
+|--------|-----------------|-----------------|---------|
+| `upsert_node` / `upsertNode` | `type_id` / `typeId`, `key` | node upsert options: `props`, `weight`, `dense_vector` / `denseVector`, `sparse_vector` / `sparseVector` | node ref addressable by key |
+| `upsert_node_as` / `upsertNodeAs` | `alias`, `type_id` / `typeId`, `key` | node upsert options | local node ref `{ local: alias }` |
+| `upsert_edge` / `upsertEdge` | `from`, `to`, `type_id` / `typeId` | edge upsert options: `props`, `weight`, `valid_from` / `validFrom`, `valid_to` / `validTo` | edge ref addressable by triple |
+| `upsert_edge_as` / `upsertEdgeAs` | `alias`, `from`, `to`, `type_id` / `typeId` | edge upsert options | local edge ref `{ local: alias }` |
+| `delete_node` / `deleteNode` | node ref | — | `void` / `None` |
+| `delete_edge` / `deleteEdge` | edge ref | — | `void` / `None` |
+| `invalidate_edge` / `invalidateEdge` | edge ref, `valid_to` / `validTo` | — | `void` / `None` |
+| `stage` / `stage_intents` | ordered operation payloads | — | `void` / `None` |
+
+#### Ordered Operation Payloads
+
+Node.js uses camelCase fields and op names: `upsertNode`, `upsertEdge`, `deleteNode`, `deleteEdge`, `invalidateEdge`.
+
+Python uses snake_case fields and op names: `upsert_node`, `upsert_edge`, `delete_node`, `delete_edge`, `invalidate_edge`.
+
+References are one of:
+
+| Ref kind | Node.js | Python |
+|----------|---------|--------|
+| Node by ID | `{ id }` | `{"id": id}` |
+| Node by key | `{ typeId, key }` | `{"type_id": type_id, "key": key}` |
+| Node local alias | `{ local }` | `{"local": local}` |
+| Edge by ID | `{ id }` | `{"id": id}` |
+| Edge by triple | `{ from, to, typeId }` | `{"from": from, "to": to, "type_id": type_id}` |
+| Edge local alias | `{ local }` | `{"local": local}` |
+
+Aliases are optional, process-local, and never persisted. When present, aliases must be unique within the transaction across node aliases and unique across edge aliases.
+
+#### Transaction Read Views
+
+`get_node` and `get_node_by_key` on a transaction return a transaction node view:
+
+| Field | Node.js | Python | Description |
+|-------|---------|--------|-------------|
+| id | `id?: number` | `"id": int \| None` | Committed node ID when already known; `None`/omitted for staged creates that allocate an ID at commit. |
+| local | `local?: string` | `"local": str \| None` | Local alias for aliased staged records. Internal unaliased slots are not exposed as strings. |
+| type_id | `typeId` | `"type_id"` | Node type. |
+| key | `key` | `"key"` | Node key. |
+| props | `props` | `"props"` | Node properties visible inside the transaction. |
+| created_at / updated_at | `createdAt?` / `updatedAt?` | `"created_at"` / `"updated_at"` | Present for committed records; absent/`None` for staged creates before commit. |
+| weight | `weight` | `"weight"` | Node weight. |
+| dense_vector / sparse_vector | `denseVector?` / `sparseVector?` | `"dense_vector"` / `"sparse_vector"` | Staged or committed vectors when present. |
+
+`get_edge` and `get_edge_by_triple` return a transaction edge view:
+
+| Field | Node.js | Python | Description |
+|-------|---------|--------|-------------|
+| id | `id?: number` | `"id": int \| None` | Committed edge ID when already known; `None`/omitted for staged creates that allocate an ID at commit. |
+| local | `local?: string` | `"local": str \| None` | Local alias for aliased staged records. |
+| from / to | `from` / `to` | `"from"` / `"to"` | Endpoint refs visible inside the transaction. |
+| type_id | `typeId` | `"type_id"` | Edge type. |
+| props | `props` | `"props"` | Edge properties visible inside the transaction. |
+| created_at / updated_at | `createdAt?` / `updatedAt?` | `"created_at"` / `"updated_at"` | Present for committed records; absent/`None` for staged creates before commit. |
+| weight | `weight` | `"weight"` | Edge weight. |
+| valid_from / valid_to | `validFrom?` / `validTo?` | `"valid_from"` / `"valid_to"` | Temporal validity bounds when present. |
+
+#### Commit Result
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| node IDs | `node_ids: Vec<u64>` | `nodeIds: Float64Array` | `node_ids: list[int]` | IDs returned by node upsert intents in input order. |
+| edge IDs | `edge_ids: Vec<u64>` | `edgeIds: Float64Array` | `edge_ids: list[int]` | IDs returned by edge upsert intents in input order. |
+| node aliases | `local_node_ids` | `nodeAliases` | `node_aliases` | Alias-to-node-ID map for aliased staged node upserts. |
+| edge aliases | `local_edge_ids` | `edgeAliases` | `edge_aliases` | Alias-to-edge-ID map for aliased staged edge upserts. |
+
+After `commit()` or `rollback()`, the transaction handle is closed. Further use fails with `TxnClosed` / `transaction is closed`.
+
+#### Conflict Handling
+
+`TxnConflict` means the transaction definitely did not commit: no WAL entry was appended and no partial state was published. The caller can retry by starting a new transaction, restaging the desired operations, re-reading any needed point records, and committing again. OverGraph does not automatically retry because conflict-safe retry policy depends on caller intent.
 
 ---
 
@@ -2065,7 +2196,7 @@ The edge count.
 
 #### Performance
 
-O(1) for unfiltered, non-temporal queries (cached degree counts). O(edges) when filtering by type or temporal epoch.
+Metadata-only fast path for unfiltered, non-temporal queries when all visible segments have valid degree sidecars. O(edges) walk fallback when filtering by type, using a temporal epoch, running with active prune policies, reading a node with temporal incident edges, or reading through a segment whose degree sidecar is missing/corrupt.
 
 ---
 
@@ -2678,8 +2809,8 @@ hits = db.vector_search("hybrid", k=10,
 
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
-| dense_weight | `Option<f32>` | `number` | `float` | No | `0.5` | Weight for dense scores in fusion (0.0–1.0). |
-| sparse_weight | `Option<f32>` | `number` | `float` | No | `0.5` | Weight for sparse scores in fusion (0.0–1.0). |
+| dense_weight | `Option<f32>` | `number` | `float` | No | `1.0` | Weight for dense scores in fusion. |
+| sparse_weight | `Option<f32>` | `number` | `float` | No | `1.0` | Weight for sparse scores in fusion. |
 | fusion_mode | `Option<FusionMode>` | `string` | `str` | No | `WeightedRankFusion` | How to combine dense and sparse results. See fusion modes below. |
 
 **Fusion modes:**
@@ -3178,6 +3309,8 @@ All methods can fail. Errors are returned differently across languages:
 | `ManifestError(String)` | Manifest file is corrupt or incompatible. |
 | `DatabaseNotFound(String)` | Directory doesn't exist and `create_if_missing` is false. |
 | `InvalidOperation(String)` | Invalid API usage (e.g., writing to a closed database). |
+| `TxnConflict(String)` | Explicit write transaction conflict. No WAL entry was appended and the transaction did not commit. |
+| `TxnClosed` | Explicit write transaction was already committed or rolled back. |
 | `CompactionCancelled` | Compaction was cancelled via the progress callback. |
 | `WalSyncFailed(String)` | WAL fsync failed. |
 
@@ -3231,11 +3364,13 @@ const node = await db.getNodeAsync(42);
 
 Async methods run on the libuv thread pool. Write operations acquire an exclusive lock; read operations acquire a shared lock (allowing concurrent reads).
 
-**Available async methods:** `closeAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `ensureNodePropertyIndexAsync`, `dropNodePropertyIndexAsync`, `listNodePropertyIndexesAsync`, `findNodesRangeAsync`, `findNodesRangePagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByTypeAsync`, `edgesByTypeAsync`, `getNodesByTypeAsync`, `getEdgesByTypeAsync`, `countNodesByTypeAsync`, `countEdgesByTypeAsync`, `nodesByTypePagedAsync`, `edgesByTypePagedAsync`, `getNodesByTypePagedAsync`, `getEdgesByTypePagedAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
+**Available async methods:** `closeAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `beginWriteTxnAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `ensureNodePropertyIndexAsync`, `dropNodePropertyIndexAsync`, `listNodePropertyIndexesAsync`, `findNodesRangeAsync`, `findNodesRangePagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByTypeAsync`, `edgesByTypeAsync`, `getNodesByTypeAsync`, `getEdgesByTypeAsync`, `countNodesByTypeAsync`, `countEdgesByTypeAsync`, `nodesByTypePagedAsync`, `edgesByTypePagedAsync`, `getNodesByTypePagedAsync`, `getEdgesByTypePagedAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
+
+`WriteTxn` handles expose async counterparts for the full transaction surface: `upsertNodeAsync`, `upsertNodeAsAsync`, `upsertEdgeAsync`, `upsertEdgeAsAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `stageAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `commitAsync`, and `rollbackAsync`. Async transaction operations on one handle execute in call order.
 
 ### Python
 
-The `AsyncOverGraph` class wraps every `OverGraph` method with `asyncio.to_thread()`:
+The `AsyncOverGraph` class wraps every `OverGraph` method with `asyncio.to_thread()`. `begin_write_txn()` returns an `AsyncWriteTxn` whose methods mirror `PyWriteTxn`:
 
 ```python
 from overgraph import AsyncOverGraph
@@ -3250,6 +3385,7 @@ asyncio.run(main())
 ```
 
 **All methods have identical signatures and semantics** to the sync `OverGraph` class but return coroutines.
+`AsyncWriteTxn` also serializes operations on each transaction handle so staged writes, reads, `commit()`, and `rollback()` run in await/call order.
 
 **GIL behavior**: The sync `OverGraph` releases the Python GIL during all Rust operations, enabling true parallelism in multi-threaded Python. The `AsyncOverGraph` uses `asyncio.to_thread()` to run sync operations in the default thread pool executor.
 
@@ -3279,6 +3415,7 @@ asyncio.run(main())
 | | `batch_upsert_edges` | Batch create/update edges |
 | | `get_edges` | Batch get edges by ID |
 | **Atomic** | `graph_patch` | Multi-op atomic batch |
+| | `begin_write_txn` / `beginWriteTxn` | Explicit ordered write transaction |
 | **Query** | `nodes_by_type` | All node IDs of a type |
 | | `edges_by_type` | All edge IDs of a type |
 | | `get_nodes_by_type` | All node records of a type |

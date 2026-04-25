@@ -5,7 +5,7 @@
     #[test]
     fn test_degree_basic() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -29,7 +29,7 @@
     #[test]
     fn test_degree_direction() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -52,7 +52,7 @@
     #[test]
     fn test_degree_type_filter() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -89,7 +89,7 @@
     #[test]
     fn test_degree_self_loop() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
@@ -107,7 +107,7 @@
     fn test_degree_self_loop_with_normal_edges() {
         // Self-loop + outgoing + incoming. Tests Both dedup more thoroughly
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -140,7 +140,7 @@
     #[test]
     fn test_degree_deleted_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -158,7 +158,7 @@
     #[test]
     fn test_degree_deleted_neighbor_node() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -175,7 +175,7 @@
     #[test]
     fn test_degree_after_flush() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -205,7 +205,7 @@
             edge_uniqueness: true,
             ..Default::default()
         };
-        let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -233,7 +233,7 @@
         let db_path = dir.path().join("db");
 
         {
-            let mut db = open_imm(&db_path);
+            let db = open_imm(&db_path);
             let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() })
@@ -251,7 +251,7 @@
     #[test]
     fn test_sum_edge_weights_basic() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -279,7 +279,7 @@
     #[test]
     fn test_sum_edge_weights_after_flush() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -302,7 +302,7 @@
     #[test]
     fn test_avg_edge_weight_basic() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -337,7 +337,7 @@
     fn test_degree_matches_neighbors_len() {
         // Degree must always equal neighbors().len() for the same query
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -377,7 +377,7 @@
     fn test_sum_weight_matches_neighbors() {
         // sum_edge_weights must match summing weights from neighbors()
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -403,7 +403,7 @@
     #[test]
     fn test_degree_respects_prune_policies() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "keep", UpsertNodeOptions::default()).unwrap();
@@ -453,7 +453,7 @@
     #[test]
     fn test_degree_after_compaction() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -478,7 +478,7 @@
     #[test]
     fn test_degree_self_loop_after_flush() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
@@ -497,7 +497,7 @@
     #[test]
     fn test_degrees_batch_basic() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -523,7 +523,7 @@
     fn test_degrees_batch_matches_individual() {
         // Batch degrees must match individual degree() calls
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -562,7 +562,7 @@
     #[test]
     fn test_degrees_batch_cross_segment() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -598,7 +598,7 @@
             edge_uniqueness: true,
             ..Default::default()
         };
-        let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -617,7 +617,7 @@
     #[test]
     fn test_degrees_batch_tombstones() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -639,7 +639,7 @@
     #[test]
     fn test_degrees_batch_self_loop() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -668,7 +668,7 @@
     fn test_degrees_batch_unsorted_input() {
         // Input need not be sorted. Sorted internally.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -692,7 +692,7 @@
     #[test]
     fn test_degrees_batch_after_compaction() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -718,7 +718,7 @@
     #[test]
     fn test_degrees_batch_respects_prune_policies() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "keep", UpsertNodeOptions::default()).unwrap();
@@ -759,7 +759,7 @@
     fn test_degrees_batch_matches_neighbors_batch() {
         // Batch degrees must match neighbors_batch().len() for each node
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -800,7 +800,7 @@
     #[test]
     fn test_degree_ignores_expired_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -826,7 +826,7 @@
     #[test]
     fn test_degree_ignores_future_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -853,7 +853,7 @@
     #[test]
     fn test_degree_ignores_invalidated_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -885,7 +885,7 @@
     #[test]
     fn test_degrees_batch_ignores_expired_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -905,7 +905,7 @@
     #[test]
     fn test_degrees_batch_ignores_future_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -922,7 +922,7 @@
     #[test]
     fn test_degrees_batch_ignores_invalidated_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -941,7 +941,7 @@
     fn test_degree_temporal_after_flush() {
         // Temporal edges flushed to segment. Same filtering must apply.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -972,7 +972,7 @@
     fn test_degree_at_epoch_parity_with_neighbors() {
         // degree(at_epoch=T) must equal neighbors(at_epoch=T).len()
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -1050,7 +1050,7 @@
         // version. The memtable's invalid version must prevent the older valid
         // segment version from being counted.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -1131,7 +1131,7 @@
     #[test]
     fn test_shortest_path_direct_neighbors() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let e = db
@@ -1173,7 +1173,7 @@
     #[test]
     fn test_shortest_path_no_path_disconnected() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         // No edge between a and b
@@ -1189,7 +1189,7 @@
     #[test]
     fn test_shortest_path_same_node() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         let path = db
@@ -1227,7 +1227,7 @@
     #[test]
     fn test_shortest_path_directed_no_reverse() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
@@ -1274,7 +1274,7 @@
     #[test]
     fn test_shortest_path_edge_type_filter() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -1334,7 +1334,7 @@
     #[test]
     fn test_shortest_path_temporal_filtering() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -1391,7 +1391,7 @@
     #[test]
     fn test_is_connected_same_node() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         assert!(db
@@ -1404,7 +1404,7 @@
     #[test]
     fn test_is_connected_disconnected() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
@@ -1455,7 +1455,7 @@
     #[test]
     fn test_shortest_path_across_flush_boundary() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         // First segment: a -> b -> c
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
@@ -1491,7 +1491,7 @@
     #[test]
     fn test_shortest_path_after_compact() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -1518,7 +1518,7 @@
     #[test]
     fn test_shortest_path_with_deleted_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -1550,7 +1550,7 @@
     #[test]
     fn test_shortest_path_with_deleted_node() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -1586,7 +1586,7 @@
     #[test]
     fn test_path_apis_respect_deleted_edges_after_flush_and_compact() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -1647,16 +1647,16 @@
     #[test]
     fn test_ingest_mode_suppresses_auto_compact() {
         let dir = TempDir::new().unwrap();
-        let mut db = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+        let db = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
 
-        db.ingest_mode();
+        db.ingest_mode().unwrap();
         for i in 0..10 {
             db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             db.flush().unwrap();
         }
         // 10 segments, no auto-compaction
-        assert_eq!(db.segment_count(), 10);
+        assert_eq!(db.segment_count().unwrap(), 10);
 
         // All data survives
         for i in 0..10 {
@@ -1665,7 +1665,7 @@
 
         let stats = db.end_ingest().unwrap().unwrap();
         assert_eq!(stats.segments_merged, 10);
-        assert_eq!(db.segment_count(), 1);
+        assert_eq!(db.segment_count().unwrap(), 1);
 
         // All data still intact after compaction
         for i in 0..10 {
@@ -1682,16 +1682,16 @@
             compact_after_n_flushes: 5,
             ..DbOptions::default()
         };
-        let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        assert_eq!(db.compact_after_n_flushes, 5);
-        db.ingest_mode();
-        assert_eq!(db.compact_after_n_flushes, 0);
-        assert_eq!(db.ingest_saved_compact_after_n_flushes, Some(5));
+        assert_eq!(db.compact_after_n_flushes_for_test(), 5);
+        db.ingest_mode().unwrap();
+        assert_eq!(db.compact_after_n_flushes_for_test(), 0);
+        assert_eq!(db.ingest_saved_compact_after_n_flushes_for_test(), Some(5));
 
         let _ = db.end_ingest().unwrap();
-        assert_eq!(db.compact_after_n_flushes, 5);
-        assert_eq!(db.ingest_saved_compact_after_n_flushes, None);
+        assert_eq!(db.compact_after_n_flushes_for_test(), 5);
+        assert_eq!(db.ingest_saved_compact_after_n_flushes_for_test(), None);
 
         db.close().unwrap();
     }
@@ -1703,16 +1703,16 @@
             compact_after_n_flushes: 5,
             ..DbOptions::default()
         };
-        let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        db.ingest_mode();
-        db.ingest_mode();
-        assert_eq!(db.compact_after_n_flushes, 0);
-        assert_eq!(db.ingest_saved_compact_after_n_flushes, Some(5));
+        db.ingest_mode().unwrap();
+        db.ingest_mode().unwrap();
+        assert_eq!(db.compact_after_n_flushes_for_test(), 0);
+        assert_eq!(db.ingest_saved_compact_after_n_flushes_for_test(), Some(5));
 
         let _ = db.end_ingest().unwrap();
-        assert_eq!(db.compact_after_n_flushes, 5);
-        assert_eq!(db.ingest_saved_compact_after_n_flushes, None);
+        assert_eq!(db.compact_after_n_flushes_for_test(), 5);
+        assert_eq!(db.ingest_saved_compact_after_n_flushes_for_test(), None);
 
         db.close().unwrap();
     }
@@ -1721,7 +1721,7 @@
     fn test_shortest_path_large_fan_out() {
         // Bidirectional BFS should handle large fan-out efficiently
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let end = db.upsert_node(1, "end", UpsertNodeOptions::default()).unwrap();
@@ -1763,7 +1763,7 @@
     #[test]
     fn test_shortest_path_incoming_direction() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -1791,7 +1791,7 @@
     #[test]
     fn test_shortest_path_cycle_safe() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -1823,7 +1823,7 @@
     #[test]
     fn test_shortest_path_nonexistent_node() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         // Node 999999 was never created
@@ -1847,7 +1847,7 @@
     #[test]
     fn test_path_apis_respect_prune_policy_visibility() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
@@ -1907,7 +1907,7 @@
     #[test]
     fn test_weighted_path_apis_respect_prune_policy_visibility() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
@@ -1969,7 +1969,7 @@
         // A->B (weight 10), A->C (weight 2), C->B (weight 3)
         // BFS shortest: A->B (1 hop). Dijkstra shortest: A->C->B (cost 5)
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -1997,7 +1997,7 @@
     fn test_dijkstra_custom_weight_field() {
         // Use a custom property "cost" on edges
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2030,7 +2030,7 @@
         // Only path A->B with cost 5 should work, A->C->B costs 6
         // max_cost=4 should exclude both, returning None
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2060,7 +2060,7 @@
     #[test]
     fn test_dijkstra_negative_weight_error() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: -1.0, ..Default::default() })
@@ -2079,7 +2079,7 @@
         // NaN specifically bypasses `w < 0.0` (NaN < 0.0 is false).
         // The !w.is_finite() guard must catch it.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
@@ -2110,7 +2110,7 @@
         // With max_depth=2, each side individually can reach 2 hops,
         // but the total path is 3 hops. Must be rejected.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2143,7 +2143,7 @@
     fn test_dijkstra_zero_weight_edges() {
         // A->B (weight 0), B->C (weight 0)
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2165,7 +2165,7 @@
     #[test]
     fn test_dijkstra_same_node() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         let path = db
@@ -2192,7 +2192,7 @@
         // costs 10. Bidirectional should find cost 2 regardless of which
         // side meets first.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2223,7 +2223,7 @@
     #[test]
     fn test_dijkstra_no_path() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         // No edges
@@ -2239,7 +2239,7 @@
     #[test]
     fn test_dijkstra_after_flush() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2262,7 +2262,7 @@
     #[test]
     fn test_dijkstra_after_compact() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2289,7 +2289,7 @@
         // A->B->C (2 hops, cost 100+100=200)
         // A->D->E->C (3 hops, cost 1+1+1=3)
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2329,7 +2329,7 @@
     fn test_dijkstra_max_depth() {
         // A->B->C->D, all weight 1
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2399,7 +2399,7 @@
     #[test]
     fn test_all_shortest_paths_bfs_same_node() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
         let paths = db
@@ -2415,7 +2415,7 @@
     #[test]
     fn test_all_shortest_paths_bfs_no_path() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
@@ -2431,7 +2431,7 @@
     fn test_all_shortest_paths_dijkstra_diamond() {
         // Diamond with equal weights: A->B(w=3)->D and A->C(w=3)->D, both cost 6
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2461,7 +2461,7 @@
     #[test]
     fn test_all_shortest_paths_dijkstra_max_paths() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2486,7 +2486,7 @@
     #[test]
     fn test_all_shortest_paths_dijkstra_no_path() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
@@ -2501,7 +2501,7 @@
     #[test]
     fn test_all_shortest_paths_negative_weight_error() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: -5.0, ..Default::default() })
@@ -2531,7 +2531,7 @@
     #[test]
     fn test_all_shortest_paths_bfs_after_compact() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2563,7 +2563,7 @@
     fn test_dijkstra_custom_int_weight() {
         // Use PropValue::Int for the weight field
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
 
@@ -2602,7 +2602,7 @@
         // Without max_depth: any cost-5 path is valid.
         // With max_depth=2: must find the 2-hop path S→A→T, not return None.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -2646,7 +2646,7 @@
         // settled before `X` depending on heap tie ordering. The bounded search must
         // still recover the shorter-hop equal-cost route.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -2681,7 +2681,7 @@
         // Cheapest path is too deep; bounded search must return the more expensive
         // valid path instead of filtering the global optimum down to nothing.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -2714,7 +2714,7 @@
         // A → T (weight 1)
         // Must not stack-overflow; should return path(s) with cost 1
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
@@ -2745,7 +2745,7 @@
         // max_depth=2: only the 2-hop path
         // max_depth=3: both paths
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -2785,7 +2785,7 @@
     #[test]
     fn test_all_shortest_paths_dijkstra_max_depth_uses_best_constrained_cost() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -2815,7 +2815,7 @@
     #[test]
     fn test_all_shortest_paths_dijkstra_after_flush_weighted() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2847,7 +2847,7 @@
         let db_path = dir.path().join("db");
 
         let (a, d) = {
-            let mut db = open_imm(&db_path);
+            let db = open_imm(&db_path);
             let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2902,7 +2902,7 @@
     fn test_dijkstra_direction_both() {
         // A->B->C, query with Direction::Both from C to A should find path
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -2924,7 +2924,7 @@
     fn test_shortest_path_memtable_plus_segments() {
         // Path where some edges are in segments and the bridge edge is in memtable
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -2958,7 +2958,7 @@
     fn test_neighbors_paged_basic() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node(1, "center", UpsertNodeOptions::default())
@@ -3014,7 +3014,7 @@
     fn test_neighbors_paged_cross_source() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node(1, "center", UpsertNodeOptions::default())
@@ -3067,7 +3067,7 @@
     fn test_neighbors_paged_respects_tombstones() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node(1, "center", UpsertNodeOptions::default())
@@ -3102,7 +3102,7 @@
     fn test_neighbors_paged_with_temporal_filter() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node(1, "center", UpsertNodeOptions::default())
@@ -3144,7 +3144,7 @@
         // Paginated results should match unpaginated neighbors()
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node(1, "center", UpsertNodeOptions::default())
@@ -3191,7 +3191,7 @@
         // Edges with future valid_from or past valid_to must be excluded.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node(1, "center", UpsertNodeOptions::default())
@@ -3256,7 +3256,7 @@
         // Create a mix of valid and invalid edges, paginate with small limit.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node(1, "center", UpsertNodeOptions::default())
@@ -3318,7 +3318,7 @@
     fn test_neighbors_paged_policy_refills_past_sparse_filtered_window() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node(1, "center", UpsertNodeOptions::default())
@@ -3380,7 +3380,7 @@
         // Page 2 should not re-return page 1 items.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Create 10 nodes of type 1
         let mut all_ids = Vec::new();
@@ -3438,7 +3438,7 @@
         // Create many matching nodes, paginate, verify no duplicates and parity.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let mut matching_ids = Vec::new();
         for i in 0..12 {
@@ -3494,7 +3494,7 @@
         // Verify cursor works correctly across memtable + segments.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Create some matching nodes, flush, create more
         let mut all_matching = Vec::new();
@@ -3549,7 +3549,7 @@
         // a newer source (memtable or newer segment) has changed the property.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
@@ -3611,7 +3611,7 @@
         // Same bug across segments: older segment has color=red, newer has color=blue.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
@@ -3646,7 +3646,7 @@
     #[test]
     fn test_traverse_basic_depth_and_order() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let depth1_low = db.upsert_node(1, "depth1-low", UpsertNodeOptions::default()).unwrap();
@@ -3695,7 +3695,7 @@
     #[test]
     fn test_traverse_depth_window_and_limit() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -3743,7 +3743,7 @@
     #[test]
     fn test_traverse_last_page_cursor_is_none_for_isolated_start() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let page = db
@@ -3760,7 +3760,7 @@
     #[test]
     fn test_traverse_last_page_cursor_is_none_when_deeper_work_is_filtered_out() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let middle = db.upsert_node(2, "middle", UpsertNodeOptions::default()).unwrap();
@@ -3794,7 +3794,7 @@
     #[test]
     fn test_traverse_cycle_safe_and_unique() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -3826,7 +3826,7 @@
     #[test]
     fn test_traverse_cursor_resume_across_pages_without_dup_or_skip() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -3862,7 +3862,7 @@
     #[test]
     fn test_traverse_cursor_resume_within_same_depth_layer() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -3912,7 +3912,7 @@
     #[test]
     fn test_traverse_exact_page_size_cutoff_is_last_page() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -3941,7 +3941,7 @@
     #[test]
     fn test_traverse_cursor_past_end_returns_empty_page() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -3964,7 +3964,7 @@
     #[test]
     fn test_traverse_edge_filter_and_node_type_filter_is_emission_only() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let middle = db.upsert_node(2, "middle", UpsertNodeOptions::default()).unwrap();
@@ -3991,7 +3991,7 @@
     #[test]
     fn test_traverse_incoming_and_both_directions() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -4034,7 +4034,7 @@
     #[test]
     fn test_traverse_pagination_with_node_type_filter_uses_filtered_path() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let mid_a = db.upsert_node(2, "mid-a", UpsertNodeOptions::default()).unwrap();
@@ -4090,7 +4090,7 @@
     #[test]
     fn test_traverse_respects_deleted_temporal_and_prune_visibility() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
@@ -4137,7 +4137,7 @@
     #[test]
     fn test_traverse_pagination_with_prune_policy_uses_filtered_path() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let keep_a = db.upsert_node(1, "keep-a", UpsertNodeOptions::default()).unwrap();
@@ -4197,7 +4197,7 @@
     #[test]
     fn test_traverse_hidden_or_missing_start_returns_empty() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let hidden_start = db.upsert_node(1, "hidden-start", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
         let next = db.upsert_node(1, "next", UpsertNodeOptions::default()).unwrap();
@@ -4232,7 +4232,7 @@
     fn test_traverse_flush_compact_and_reopen_parity() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("db");
-        let mut db = open_imm(&db_path);
+        let db = open_imm(&db_path);
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -4275,7 +4275,7 @@
     fn test_traverse_via_edge_id_uses_deterministic_tie_break() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("db");
-        let mut db = open_imm(&db_path);
+        let db = open_imm(&db_path);
 
         let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
         let middle = db.upsert_node(1, "middle", UpsertNodeOptions::default()).unwrap();
@@ -4333,7 +4333,7 @@
     fn test_traverse_depth_two_paged_basic() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -4388,7 +4388,7 @@
     fn test_traverse_depth_two_paged_roundtrip() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         for i in 0..5 {
@@ -4443,7 +4443,7 @@
     fn test_traverse_depth_two_cursor_past_end_returns_empty() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -4473,7 +4473,7 @@
     fn test_traverse_depth_two_filtered_emission_matches_old_constrained_shape() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -4504,7 +4504,7 @@
     fn test_traverse_depth_two_cross_segment() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -4541,7 +4541,7 @@
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         // Create edge and flush to segment
         let e1 = engine
@@ -4573,7 +4573,7 @@
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let n1 = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let n2 = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4606,7 +4606,7 @@
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         // Create edge and flush (segment 1 has the edge)
         let e1 = engine
@@ -4639,7 +4639,7 @@
     fn test_top_k_by_weight() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4677,7 +4677,7 @@
     fn test_top_k_by_recency() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4710,7 +4710,7 @@
     fn test_top_k_by_decay() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4750,7 +4750,7 @@
     fn test_top_k_zero_returns_empty() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4770,7 +4770,7 @@
     fn test_top_k_k_greater_than_neighbors() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4797,7 +4797,7 @@
     fn test_top_k_with_type_filter() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4828,7 +4828,7 @@
     fn test_top_k_excludes_deleted_neighbors() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4856,7 +4856,7 @@
     fn test_top_k_across_segments() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4884,7 +4884,7 @@
     fn test_top_k_negative_lambda_returns_error() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
@@ -4903,7 +4903,7 @@
         // A→B→C→D, extract from A at depth 1 → only A and B
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -4936,7 +4936,7 @@
         // A→B→C→D, extract from A at depth 3 → all nodes and edges
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -4968,7 +4968,7 @@
         // Diamond: A→B, A→C, B→D, C→D. Node D should appear once.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5006,7 +5006,7 @@
         // Cycle: A→B→C→A. BFS should terminate, not loop.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5040,7 +5040,7 @@
         // A→A (self-loop), A→B. Should not infinite-loop.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5069,7 +5069,7 @@
         // Depth 0 returns just the start node, no edges
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5110,7 +5110,7 @@
         // A→B, C (isolated). Subgraph from A should not include C.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5134,7 +5134,7 @@
         // A→B→C. Extract from C with Incoming direction → C, B, A
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5162,7 +5162,7 @@
         // A→B←C. Extract from B with Both direction → A, B, C
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5191,7 +5191,7 @@
         // Filter by type 1 → A, B, D (not C).
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5229,7 +5229,7 @@
             compact_after_n_flushes: 0,
             ..DbOptions::default()
         };
-        let mut engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5259,7 +5259,7 @@
         // A→B→C, delete B → subgraph from A should only contain A (B is deleted)
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5289,7 +5289,7 @@
         // A→B (edge1), A→C (edge2). Delete edge1. Subgraph from A → A, C.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5319,7 +5319,7 @@
         // At epoch 150 → only B reachable. At epoch 350 → only C reachable.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5351,7 +5351,7 @@
         // Hub node A with 50 outgoing edges to B1..B50
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
         let mut expected = NodeIdSet::from_iter([a]);
@@ -5381,7 +5381,7 @@
         // Chain: A→B→C→D→E. Depth 2 → A, B, C only.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5417,7 +5417,7 @@
         // Verify extracted nodes carry their full properties
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let mut engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let mut props_a = BTreeMap::new();
         props_a.insert("name".to_string(), PropValue::String("Alice".to_string()));
@@ -5458,7 +5458,7 @@
     #[test]
     fn test_neighbors_batch_basic() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -5481,7 +5481,7 @@
     #[test]
     fn test_neighbors_batch_matches_individual() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let mut ids = Vec::new();
         for i in 0..5 {
             ids.push(
@@ -5523,7 +5523,7 @@
     #[test]
     fn test_neighbors_batch_with_type_filter() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -5543,7 +5543,7 @@
     #[test]
     fn test_neighbors_batch_cross_segment() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
@@ -5570,7 +5570,7 @@
     #[test]
     fn test_neighbors_batch_dedup_across_sources() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
@@ -5602,7 +5602,7 @@
     #[test]
     fn test_neighbors_batch_respects_tombstones() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -5627,7 +5627,7 @@
     #[test]
     fn test_neighbors_batch_direction_both() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -5647,7 +5647,7 @@
     #[test]
     fn test_neighbors_batch_self_loop_dedup() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         // Self-loop: A→A appears in both adj_out and adj_in
@@ -5687,7 +5687,7 @@
     #[test]
     fn test_neighbors_batch_unsorted_input() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -5708,7 +5708,7 @@
     #[test]
     fn test_neighbors_batch_large_graph_parity() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         // Build a graph with 50 nodes and ~100 edges across segment + memtable
         let mut node_ids = Vec::new();
@@ -5770,7 +5770,7 @@
     #[test]
     fn test_self_loop_neighbors_outgoing() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(a, a, 10, UpsertEdgeOptions::default())
             .unwrap();
@@ -5802,7 +5802,7 @@
     #[test]
     fn test_self_loop_survives_flush_and_compact() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let e = db
             .upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() })
@@ -5837,7 +5837,7 @@
     #[test]
     fn test_self_loop_in_top_k() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
@@ -5861,7 +5861,7 @@
     #[test]
     fn test_degree_cache_rebuild_memtable_only() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -5907,7 +5907,7 @@
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("db");
         {
-            let mut db = open_imm(&path);
+            let db = open_imm(&path);
             let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
@@ -5938,7 +5938,7 @@
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("db");
         {
-            let mut db = open_imm(&path);
+            let db = open_imm(&path);
             let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -5970,7 +5970,7 @@
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("db");
         {
-            let mut db = open_imm(&path);
+            let db = open_imm(&path);
             let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -6002,7 +6002,7 @@
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("db");
         {
-            let mut db = open_imm(&path);
+            let db = open_imm(&path);
             let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             // Self-loop on a
@@ -6040,7 +6040,7 @@
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("db");
         {
-            let mut db = open_imm(&path);
+            let db = open_imm(&path);
 
             let mut nodes = Vec::new();
             for i in 0..10 {
@@ -6103,7 +6103,7 @@
     #[test]
     fn test_degree_cache_mutation_new_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6133,7 +6133,7 @@
     fn test_degree_cache_mutation_update_same_endpoints_weight_change() {
         let dir = TempDir::new().unwrap();
         let opts = DbOptions { edge_uniqueness: true, ..Default::default() };
-        let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6161,7 +6161,7 @@
     #[test]
     fn test_degree_cache_mutation_delete_memtable_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6185,7 +6185,7 @@
     #[test]
     fn test_degree_cache_mutation_delete_segment_only_edge() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6215,7 +6215,7 @@
     #[test]
     fn test_degree_cache_mutation_node_delete_cascade() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6255,7 +6255,7 @@
     #[test]
     fn test_degree_cache_mutation_self_loop() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6299,7 +6299,7 @@
     fn test_degree_cache_mutation_idempotent_delete() {
         // Deleting an already-deleted edge should not change the cache
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6329,7 +6329,7 @@
         let path = dir.path().join("db");
 
         {
-            let mut db = open_imm(&path);
+            let db = open_imm(&path);
 
             let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6390,7 +6390,7 @@
         // (they should return different results from the cache-backed unfiltered path
         // when type filtering narrows the result set).
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6427,7 +6427,7 @@
         // which means degree(at_epoch=None) falls through to the walk path
         // (correct even as wall-clock time passes).
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6465,7 +6465,7 @@
     fn test_degree_cache_temporal_delete_clears_count() {
         // Deleting a temporal edge should decrement temporal_edge_count.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6489,7 +6489,7 @@
         // upsert replaces the first (same from/to/type_id).
         let dir = TempDir::new().unwrap();
         let opts = DbOptions { edge_uniqueness: true, ..Default::default() };
-        let mut db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6509,7 +6509,7 @@
     fn test_degree_cache_timeless_to_temporal_update() {
         // invalidate_edge sets valid_to, making a timeless edge temporal.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6530,7 +6530,7 @@
         // A temporal self-loop should increment temporal_edge_count once
         // (not twice) on the node.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
@@ -6551,7 +6551,7 @@
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("db");
         {
-            let mut db = open_imm(&path);
+            let db = open_imm(&path);
             let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -6582,7 +6582,7 @@
         // An edge with valid_to in the past is not counted in degree
         // but should still register as temporal (so cache is bypassed).
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6605,7 +6605,7 @@
         // bypasses this node, falling through to the walk path which correctly
         // excludes the not-yet-valid edge.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6642,7 +6642,7 @@
         let a;
         let b;
         {
-            let mut db = open_imm(&path);
+            let db = open_imm(&path);
             a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             let far_future = i64::MAX - 1_000_000;
@@ -6662,10 +6662,1374 @@
     }
 
     #[test]
+    fn test_degree_overlay_explicit_txn_publishes_only_on_commit() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let before = db.active_degree_overlay_for_test();
+
+        let mut txn = db.begin_write_txn().unwrap();
+        txn.upsert_edge(
+            TxnNodeRef::Id(a),
+            TxnNodeRef::Id(b),
+            10,
+            UpsertEdgeOptions {
+                weight: 2.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(std::sync::Arc::ptr_eq(
+            &before,
+            &db.active_degree_overlay_for_test()
+        ));
+        assert_eq!(db.degree_cache_entry(a).out_degree, 0);
+
+        txn.commit().unwrap();
+        let after = db.active_degree_overlay_for_test();
+        assert!(!std::sync::Arc::ptr_eq(&before, &after));
+        let entry_a = db.degree_cache_entry(a);
+        assert_eq!(entry_a.out_degree, 1);
+        assert!((entry_a.out_weight_sum - 2.5).abs() < 1e-10);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_overlay_txn_rollback_and_conflict_publish_no_state() {
+        let dir = TempDir::new().unwrap();
+        let opts = DbOptions {
+            edge_uniqueness: true,
+            ..Default::default()
+        };
+        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+
+        let before_rollback = db.active_degree_overlay_for_test();
+        let mut rollback_txn = db.begin_write_txn().unwrap();
+        rollback_txn
+            .upsert_edge(
+                TxnNodeRef::Id(a),
+                TxnNodeRef::Id(b),
+                10,
+                UpsertEdgeOptions::default(),
+            )
+            .unwrap();
+        rollback_txn.rollback().unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &before_rollback,
+            &db.active_degree_overlay_for_test()
+        ));
+        assert_eq!(db.degree_cache_entry(a).out_degree, 0);
+
+        let mut conflicted_txn = db.begin_write_txn().unwrap();
+        conflicted_txn
+            .upsert_edge(
+                TxnNodeRef::Id(a),
+                TxnNodeRef::Id(b),
+                10,
+                UpsertEdgeOptions {
+                    weight: 2.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        db.upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                weight: 3.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before_conflict = db.active_degree_overlay_for_test();
+        let err = match conflicted_txn.commit() {
+            Ok(_) => panic!("expected transaction conflict"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, EngineError::TxnConflict(_)));
+        assert!(std::sync::Arc::ptr_eq(
+            &before_conflict,
+            &db.active_degree_overlay_for_test()
+        ));
+        let entry_a = db.degree_cache_entry(a);
+        assert_eq!(entry_a.out_degree, 1);
+        assert!((entry_a.out_weight_sum - 3.0).abs() < 1e-10);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_overlay_stale_read_view_and_node_only_no_overlay_edit() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let overlay_before_node_only = db.active_degree_overlay_for_test();
+        db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &overlay_before_node_only,
+            &db.active_degree_overlay_for_test()
+        ));
+
+        let stale = db.published_read_view_for_test();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .unwrap();
+        assert_eq!(stale.degree_entry_for_test(a).out_degree, 0);
+        assert_eq!(db.degree_cache_entry(a).out_degree, 1);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_overlay_repeated_edge_ids_in_one_wal_batch() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let now = now_millis();
+        let first = EdgeRecord {
+            id: 42,
+            from: a,
+            to: b,
+            type_id: 10,
+            props: std::collections::BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+            weight: 2.0,
+            valid_from: 0,
+            valid_to: i64::MAX,
+            last_write_seq: 0,
+        };
+        let mut second = first.clone();
+        second.updated_at = now + 1;
+        second.weight = 5.0;
+
+        db.write_op_batch(&[WalOp::UpsertEdge(first), WalOp::UpsertEdge(second)])
+            .unwrap();
+
+        let entry_a = db.degree_cache_entry(a);
+        assert_eq!(entry_a.out_degree, 1);
+        assert!((entry_a.out_weight_sum - 5.0).abs() < 1e-10);
+        let entry_b = db.degree_cache_entry(b);
+        assert_eq!(entry_b.in_degree, 1);
+        assert!((entry_b.in_weight_sum - 5.0).abs() < 1e-10);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_overlay_flush_writes_segment_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+            .unwrap();
+
+        db.flush().unwrap();
+        let segments = db.segments_for_test();
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].degree_delta_available());
+        assert_eq!(segments[0].degree_delta(a).unwrap().out_degree, 1);
+        assert_eq!(segments[0].degree_delta(b).unwrap().in_degree, 1);
+
+        let entry_a = db.degree_cache_entry(a);
+        assert_eq!(entry_a.out_degree, 1);
+        assert!((entry_a.out_weight_sum - 2.0).abs() < 1e-10);
+
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(
+            a,
+            c,
+            10,
+            UpsertEdgeOptions {
+                weight: 3.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let entry_a = db.degree_cache_entry(a);
+        assert_eq!(entry_a.out_degree, 2);
+        assert!((entry_a.out_weight_sum - 5.0).abs() < 1e-10);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_sidecar_compaction_folds_valid_inputs() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.flush().unwrap();
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default()).unwrap();
+        db.flush().unwrap();
+
+        db.compact().unwrap();
+        let segments = db.segments_for_test();
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].degree_delta_available());
+        assert_eq!(segments[0].degree_delta(a).unwrap().out_degree, 2);
+        assert_eq!(segments[0].degree_delta(b).unwrap().in_degree, 1);
+        assert_eq!(segments[0].degree_delta(c).unwrap().in_degree, 1);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_sidecar_streaming_compaction_large_overlap_fast_path() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let hub = db
+            .upsert_node(1, "hub", UpsertNodeOptions::default())
+            .unwrap();
+        let mut leaves = Vec::new();
+        for idx in 0..320 {
+            leaves.push(
+                db.upsert_node(1, &format!("leaf-{idx}"), UpsertNodeOptions::default())
+                    .unwrap(),
+            );
+        }
+        db.flush().unwrap();
+
+        for chunk in leaves.chunks(80) {
+            for &leaf in chunk {
+                db.upsert_edge(
+                    hub,
+                    leaf,
+                    10,
+                    UpsertEdgeOptions {
+                        weight: 1.5,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        db.compact().unwrap();
+        let segments = db.segments_for_test();
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].degree_delta_available());
+        assert_eq!(segments[0].degree_delta(hub).unwrap().out_degree, 320);
+        assert_scalar_degree_family_routes(
+            &db,
+            hub,
+            DegreeOptions::default(),
+            320,
+            480.0,
+            Some(1.5),
+            3,
+            0,
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_sidecar_compaction_folds_update_and_delete_deltas() {
+        let dir = TempDir::new().unwrap();
+        let opts = DbOptions {
+            edge_uniqueness: true,
+            ..Default::default()
+        };
+        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ac = db
+            .upsert_edge(
+                a,
+                c,
+                10,
+                UpsertEdgeOptions {
+                    weight: 4.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        db.flush().unwrap();
+
+        db.upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                weight: 5.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.delete_edge(ac).unwrap();
+        db.flush().unwrap();
+
+        db.compact().unwrap();
+        let segments = db.segments_for_test();
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].degree_delta_available());
+        let a_delta = segments[0].degree_delta(a).unwrap();
+        assert_eq!(a_delta.out_degree, 1);
+        assert!((a_delta.out_weight_sum - 5.0).abs() < 1e-10);
+        let b_delta = segments[0].degree_delta(b).unwrap();
+        assert_eq!(b_delta.in_degree, 1);
+        assert!((b_delta.in_weight_sum - 5.0).abs() < 1e-10);
+        assert_eq!(
+            segments[0].degree_delta(c).unwrap(),
+            crate::degree_cache::DegreeDelta::ZERO
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_sidecar_compaction_omits_when_input_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let a;
+        let b;
+        let c;
+        {
+            let db = open_imm(&path);
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+            db.flush().unwrap();
+            db.upsert_edge(a, c, 10, UpsertEdgeOptions::default()).unwrap();
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+
+        std::fs::remove_file(segment_dir(&path, 1).join(crate::degree_cache::DEGREE_DELTA_FILENAME))
+            .unwrap();
+
+        let db = open_imm(&path);
+        assert!(db
+            .segments_for_test()
+            .iter()
+            .any(|segment| !segment.degree_delta_available()));
+        db.compact().unwrap();
+
+        let segments = db.segments_for_test();
+        assert_eq!(segments.len(), 1);
+        assert!(!segments[0].degree_delta_available());
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_sidecar_compaction_omits_when_prune_policy_active() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.flush().unwrap();
+        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default()).unwrap();
+        db.flush().unwrap();
+
+        db.set_prune_policy(
+            "active_but_no_match",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.0),
+                type_id: None,
+            },
+        )
+        .unwrap();
+        db.compact().unwrap();
+
+        let segments = db.segments_for_test();
+        assert_eq!(segments.len(), 1);
+        assert!(!segments[0].degree_delta_available());
+        assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
+
+        db.close().unwrap();
+    }
+
+    fn assert_scalar_degree_family_routes(
+        db: &DatabaseEngine,
+        node_id: u64,
+        options: DegreeOptions,
+        expected_degree: u64,
+        expected_sum: f64,
+        expected_avg: Option<f64>,
+        expected_fast: usize,
+        expected_walk: usize,
+    ) {
+        db.reset_degree_query_routes();
+        assert_eq!(db.degree(node_id, &options).unwrap(), expected_degree);
+        assert!((db.sum_edge_weights(node_id, &options).unwrap() - expected_sum).abs() < 1e-10);
+        match (db.avg_edge_weight(node_id, &options).unwrap(), expected_avg) {
+            (Some(actual), Some(expected)) => assert!((actual - expected).abs() < 1e-10),
+            (None, None) => {}
+            (actual, expected) => panic!("avg mismatch: actual={actual:?}, expected={expected:?}"),
+        }
+        let routes = db.degree_query_route_snapshot();
+        assert_eq!(routes.fast_path, expected_fast);
+        assert_eq!(routes.walk_path, expected_walk);
+    }
+
+    fn assert_degrees_batch_routes(
+        db: &DatabaseEngine,
+        node_ids: &[u64],
+        options: DegreeOptions,
+        expected: &[(u64, u64)],
+        expected_fast: usize,
+        expected_walk: usize,
+    ) {
+        db.reset_degree_query_routes();
+        let degrees = db.degrees(node_ids, &options).unwrap();
+        assert_eq!(degrees.len(), expected.len());
+        for &(node_id, degree) in expected {
+            assert_eq!(degrees.get(&node_id), Some(&degree));
+        }
+        let routes = db.degree_query_route_snapshot();
+        assert_eq!(routes.fast_path, expected_fast);
+        assert_eq!(routes.walk_path, expected_walk);
+    }
+
+    fn assert_degree_family_fast_matches_forced_walk(
+        db: &DatabaseEngine,
+        node_id: u64,
+        direction: Direction,
+    ) {
+        db.reset_degree_query_routes();
+        let fast_options = DegreeOptions {
+            direction,
+            ..Default::default()
+        };
+        let fast_degree = db.degree(node_id, &fast_options).unwrap();
+        let fast_sum = db.sum_edge_weights(node_id, &fast_options).unwrap();
+        let fast_avg = db.avg_edge_weight(node_id, &fast_options).unwrap();
+        let routes = db.degree_query_route_snapshot();
+        assert_eq!(routes.fast_path, 3);
+        assert_eq!(routes.walk_path, 0);
+
+        db.reset_degree_query_routes();
+        let walk_options = DegreeOptions {
+            direction,
+            at_epoch: Some(now_millis()),
+            ..Default::default()
+        };
+        let walk_degree = db.degree(node_id, &walk_options).unwrap();
+        let walk_sum = db.sum_edge_weights(node_id, &walk_options).unwrap();
+        let walk_avg = db.avg_edge_weight(node_id, &walk_options).unwrap();
+        let routes = db.degree_query_route_snapshot();
+        assert_eq!(routes.fast_path, 0);
+        assert_eq!(routes.walk_path, 3);
+
+        assert_eq!(fast_degree, walk_degree);
+        assert!((fast_sum - walk_sum).abs() < 1e-10);
+        match (fast_avg, walk_avg) {
+            (Some(fast), Some(walk)) => assert!((fast - walk).abs() < 1e-10),
+            (None, None) => {}
+            (fast, walk) => panic!("avg mismatch: fast={fast:?}, walk={walk:?}"),
+        }
+    }
+
+    fn unique_node_count(node_ids: &[u64]) -> usize {
+        let mut unique = node_ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        unique.len()
+    }
+
+    fn assert_degrees_batch_fast_matches_forced_walk(
+        db: &DatabaseEngine,
+        node_ids: &[u64],
+        direction: Direction,
+    ) {
+        let unique_count = unique_node_count(node_ids);
+        let fast_options = DegreeOptions {
+            direction,
+            ..Default::default()
+        };
+        db.reset_degree_query_routes();
+        let fast = db.degrees(node_ids, &fast_options).unwrap();
+        let routes = db.degree_query_route_snapshot();
+        assert_eq!(routes.fast_path, unique_count);
+        assert_eq!(routes.walk_path, 0);
+
+        let walk_options = DegreeOptions {
+            direction,
+            at_epoch: Some(now_millis()),
+            ..Default::default()
+        };
+        db.reset_degree_query_routes();
+        let walk = db.degrees(node_ids, &walk_options).unwrap();
+        let routes = db.degree_query_route_snapshot();
+        assert_eq!(routes.fast_path, 0);
+        assert_eq!(routes.walk_path, unique_count);
+
+        assert_eq!(fast, walk);
+    }
+
+    fn assert_degree_family_all_directions_fast_match_walk(
+        db: &DatabaseEngine,
+        node_id: u64,
+        batch_node_ids: &[u64],
+    ) {
+        for direction in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
+            assert_degree_family_fast_matches_forced_walk(db, node_id, direction);
+            assert_degrees_batch_fast_matches_forced_walk(db, batch_node_ids, direction);
+        }
+    }
+
+    fn historical_temporal_edge(id: u64, from: u64, to: u64, weight: f32) -> EdgeRecord {
+        EdgeRecord {
+            id,
+            from,
+            to,
+            type_id: 10,
+            props: std::collections::BTreeMap::new(),
+            created_at: 1_000,
+            updated_at: 1_500,
+            weight,
+            valid_from: 1_000,
+            valid_to: 2_000,
+            last_write_seq: 0,
+        }
+    }
+
+    fn current_timeless_edge(id: u64, from: u64, to: u64, weight: f32) -> EdgeRecord {
+        let now = now_millis();
+        EdgeRecord {
+            id,
+            from,
+            to,
+            type_id: 10,
+            props: std::collections::BTreeMap::new(),
+            created_at: 1_000,
+            updated_at: now,
+            weight,
+            valid_from: 1_000,
+            valid_to: i64::MAX,
+            last_write_seq: 0,
+        }
+    }
+
+    #[test]
+    fn test_degree_fast_path_scalar_route_matrix() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.upsert_edge(
+            a,
+            c,
+            20,
+            UpsertEdgeOptions {
+                weight: 3.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions::default(),
+            2,
+            5.0,
+            Some(2.5),
+            3,
+            0,
+        );
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions {
+                type_filter: Some(vec![10]),
+                ..Default::default()
+            },
+            1,
+            2.0,
+            Some(2.0),
+            0,
+            3,
+        );
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions {
+                at_epoch: Some(now_millis()),
+                ..Default::default()
+            },
+            2,
+            5.0,
+            Some(2.5),
+            0,
+            3,
+        );
+
+        db.set_prune_policy(
+            "active_but_no_match",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.0),
+                type_id: None,
+            },
+        )
+        .unwrap();
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions::default(),
+            2,
+            5.0,
+            Some(2.5),
+            0,
+            3,
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_fast_path_reads_frozen_overlay_while_flush_in_flight() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(
+            a,
+            b,
+            10,
+            UpsertEdgeOptions {
+                weight: 2.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        db.freeze_memtable().unwrap();
+        assert_eq!(db.immutable_epoch_count(), 1);
+
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions::default(),
+            1,
+            2.0,
+            Some(2.0),
+            3,
+            0,
+        );
+
+        let (ready_rx, release_tx) = db.set_flush_pause();
+        db.enqueue_one_flush().unwrap();
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(db.in_flight_count(), 1);
+
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions::default(),
+            1,
+            2.0,
+            Some(2.0),
+            3,
+            0,
+        );
+
+        release_tx.send(()).unwrap();
+        db.wait_one_flush().unwrap();
+        assert_eq!(db.immutable_epoch_count(), 0);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_fast_path_walks_when_sidecar_unavailable_or_temporal() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let a;
+        {
+            let db = open_imm(&path);
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(
+                a,
+                b,
+                10,
+                UpsertEdgeOptions {
+                    weight: 2.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+        std::fs::remove_file(segment_dir(&path, 1).join(crate::degree_cache::DEGREE_DELTA_FILENAME))
+            .unwrap();
+        let db = open_imm(&path);
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions::default(),
+            1,
+            2.0,
+            Some(2.0),
+            0,
+            3,
+        );
+        db.close().unwrap();
+
+        let temporal_dir = TempDir::new().unwrap();
+        let temporal = open_imm(&temporal_dir.path().join("db"));
+        let x = temporal
+            .upsert_node(1, "x", UpsertNodeOptions::default())
+            .unwrap();
+        let y = temporal
+            .upsert_node(1, "y", UpsertNodeOptions::default())
+            .unwrap();
+        temporal
+            .upsert_edge(
+                x,
+                y,
+                10,
+                UpsertEdgeOptions {
+                    weight: 4.0,
+                    valid_to: Some(now_millis() + 10_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_scalar_degree_family_routes(
+            &temporal,
+            x,
+            DegreeOptions::default(),
+            1,
+            4.0,
+            Some(4.0),
+            0,
+            3,
+        );
+        temporal.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_fast_path_deleting_expired_temporal_edge_reverses_original_delta() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let a;
+        {
+            let db = open_imm(&path);
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            db.write_op(&WalOp::UpsertEdge(historical_temporal_edge(42, a, b, 2.0)))
+                .unwrap();
+
+            assert_scalar_degree_family_routes(
+                &db,
+                a,
+                DegreeOptions::default(),
+                0,
+                0.0,
+                None,
+                0,
+                3,
+            );
+
+            db.flush().unwrap();
+            db.write_op(&WalOp::DeleteEdge {
+                id: 42,
+                deleted_at: now_millis(),
+            })
+            .unwrap();
+
+            assert_scalar_degree_family_routes(
+                &db,
+                a,
+                DegreeOptions::default(),
+                0,
+                0.0,
+                None,
+                3,
+                0,
+            );
+
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+
+        let reopened = open_imm(&path);
+        assert_scalar_degree_family_routes(
+            &reopened,
+            a,
+            DegreeOptions::default(),
+            0,
+            0.0,
+            None,
+            3,
+            0,
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_fast_path_updating_expired_temporal_edge_reverses_original_delta() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let a;
+        {
+            let db = open_imm(&path);
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            db.write_op(&WalOp::UpsertEdge(historical_temporal_edge(42, a, b, 2.0)))
+                .unwrap();
+            db.flush().unwrap();
+
+            db.write_op(&WalOp::UpsertEdge(current_timeless_edge(42, a, b, 5.0)))
+                .unwrap();
+
+            assert_scalar_degree_family_routes(
+                &db,
+                a,
+                DegreeOptions::default(),
+                1,
+                5.0,
+                Some(5.0),
+                3,
+                0,
+            );
+
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+
+        let reopened = open_imm(&path);
+        assert_scalar_degree_family_routes(
+            &reopened,
+            a,
+            DegreeOptions::default(),
+            1,
+            5.0,
+            Some(5.0),
+            3,
+            0,
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn test_degrees_fast_path_batch_routes_all_fast_all_walk_and_mixed() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .unwrap();
+        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default())
+            .unwrap();
+
+        db.reset_degree_query_routes();
+        let degrees = db
+            .degrees(&[c, a, b, a], &DegreeOptions::default())
+            .unwrap();
+        assert_eq!(degrees.get(&a), Some(&2));
+        assert!(!degrees.contains_key(&b));
+        assert!(!degrees.contains_key(&c));
+        let routes = db.degree_query_route_snapshot();
+        assert_eq!(routes.fast_path, 3);
+        assert_eq!(routes.walk_path, 0);
+
+        db.reset_degree_query_routes();
+        let degrees = db
+            .degrees(
+                &[a, b, c],
+                &DegreeOptions {
+                    type_filter: Some(vec![10]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(degrees.get(&a), Some(&1));
+        let routes = db.degree_query_route_snapshot();
+        assert_eq!(routes.fast_path, 0);
+        assert_eq!(routes.walk_path, 3);
+
+        db.upsert_edge(
+            b,
+            c,
+            10,
+            UpsertEdgeOptions {
+                valid_to: Some(now_millis() + 10_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.reset_degree_query_routes();
+        let degrees = db.degrees(&[a, b, c], &DegreeOptions::default()).unwrap();
+        assert_eq!(degrees.get(&a), Some(&2));
+        assert_eq!(degrees.get(&b), Some(&1));
+        assert!(!degrees.contains_key(&c));
+        let routes = db.degree_query_route_snapshot();
+        assert_eq!(routes.fast_path, 1);
+        assert_eq!(routes.walk_path, 2);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_fast_path_matches_forced_walk_across_source_states_and_directions() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let a;
+        let b;
+        let c;
+        let d;
+        {
+            let db = open_imm(&path);
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(
+                a,
+                b,
+                10,
+                UpsertEdgeOptions {
+                    weight: 2.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.upsert_edge(
+                c,
+                a,
+                10,
+                UpsertEdgeOptions {
+                    weight: 6.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.upsert_edge(
+                a,
+                a,
+                10,
+                UpsertEdgeOptions {
+                    weight: 4.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let initial_batch = [a, b, c, a];
+            assert_degree_family_all_directions_fast_match_walk(&db, a, &initial_batch);
+
+            db.freeze_memtable().unwrap();
+            assert_eq!(db.immutable_epoch_count(), 1);
+            assert_degree_family_all_directions_fast_match_walk(&db, a, &initial_batch);
+
+            db.flush().unwrap();
+            assert_eq!(db.segments_for_test().len(), 1);
+            assert_degree_family_all_directions_fast_match_walk(&db, a, &initial_batch);
+
+            d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(
+                a,
+                d,
+                10,
+                UpsertEdgeOptions {
+                    weight: 8.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let full_batch = [a, b, c, d, a];
+            assert_degree_family_all_directions_fast_match_walk(&db, a, &full_batch);
+
+            db.flush().unwrap();
+            assert_eq!(db.segments_for_test().len(), 2);
+            assert_degree_family_all_directions_fast_match_walk(&db, a, &full_batch);
+
+            db.compact().unwrap();
+            assert_eq!(db.segments_for_test().len(), 1);
+            assert_degree_family_all_directions_fast_match_walk(&db, a, &full_batch);
+
+            db.close().unwrap();
+        }
+
+        let reopened = open_imm(&path);
+        let full_batch = [a, b, c, d, a];
+        assert_degree_family_all_directions_fast_match_walk(&reopened, a, &full_batch);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_fast_path_parity_across_sources_flush_compact_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let a;
+        {
+            let db = open_imm(&path);
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+
+            db.upsert_edge(
+                a,
+                b,
+                10,
+                UpsertEdgeOptions {
+                    weight: 2.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_scalar_degree_family_routes(
+                &db,
+                a,
+                DegreeOptions::default(),
+                1,
+                2.0,
+                Some(2.0),
+                3,
+                0,
+            );
+
+            db.flush().unwrap();
+            db.upsert_edge(
+                a,
+                c,
+                10,
+                UpsertEdgeOptions {
+                    weight: 3.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_scalar_degree_family_routes(
+                &db,
+                a,
+                DegreeOptions::default(),
+                2,
+                5.0,
+                Some(2.5),
+                3,
+                0,
+            );
+
+            db.flush().unwrap();
+            db.upsert_edge(
+                a,
+                d,
+                10,
+                UpsertEdgeOptions {
+                    weight: 4.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.flush().unwrap();
+            assert_eq!(db.segments_for_test().len(), 3);
+            assert_scalar_degree_family_routes(
+                &db,
+                a,
+                DegreeOptions::default(),
+                3,
+                9.0,
+                Some(3.0),
+                3,
+                0,
+            );
+
+            db.compact().unwrap();
+            assert_eq!(db.segments_for_test().len(), 1);
+            assert_scalar_degree_family_routes(
+                &db,
+                a,
+                DegreeOptions::default(),
+                3,
+                9.0,
+                Some(3.0),
+                3,
+                0,
+            );
+
+            db.close().unwrap();
+        }
+
+        let reopened = open_imm(&path);
+        assert_scalar_degree_family_routes(
+            &reopened,
+            a,
+            DegreeOptions::default(),
+            3,
+            9.0,
+            Some(3.0),
+            3,
+            0,
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_sidecar_missing_fallback_is_degree_only_and_no_backfill() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let a;
+        let b;
+        let c;
+        let edge_ab;
+        {
+            let db = open_imm(&path);
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            edge_ab = db
+                .upsert_edge(
+                    a,
+                    b,
+                    10,
+                    UpsertEdgeOptions {
+                        weight: 2.0,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            db.upsert_edge(
+                a,
+                c,
+                10,
+                UpsertEdgeOptions {
+                    weight: 3.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+
+        let sidecar_path =
+            segment_dir(&path, 1).join(crate::degree_cache::DEGREE_DELTA_FILENAME);
+        assert!(sidecar_path.exists());
+        std::fs::remove_file(&sidecar_path).unwrap();
+
+        let db = open_imm(&path);
+        assert!(!sidecar_path.exists());
+        let segments = db.segments_for_test();
+        assert_eq!(segments.len(), 1);
+        assert!(!segments[0].degree_delta_available());
+
+        assert!(db.get_node(a).unwrap().is_some());
+        assert!(db.get_edge(edge_ab).unwrap().is_some());
+        assert_eq!(
+            db.neighbors(
+                a,
+                &NeighborOptions {
+                    direction: Direction::Outgoing,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions::default(),
+            2,
+            5.0,
+            Some(2.5),
+            0,
+            3,
+        );
+        assert_degrees_batch_routes(
+            &db,
+            &[c, a, b, a],
+            DegreeOptions::default(),
+            &[(a, 2)],
+            0,
+            3,
+        );
+        assert!(!sidecar_path.exists(), "open/query must not backfill a missing degree sidecar");
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_sidecar_corrupt_fallback_is_degree_only_and_no_repair() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let a;
+        let b;
+        {
+            let db = open_imm(&path);
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(
+                a,
+                b,
+                10,
+                UpsertEdgeOptions {
+                    weight: 4.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+
+        let sidecar_path =
+            segment_dir(&path, 1).join(crate::degree_cache::DEGREE_DELTA_FILENAME);
+        std::fs::write(&sidecar_path, b"not a degree sidecar").unwrap();
+
+        let db = open_imm(&path);
+        assert!(sidecar_path.exists());
+        let segments = db.segments_for_test();
+        assert_eq!(segments.len(), 1);
+        assert!(!segments[0].degree_delta_available());
+
+        assert!(db.get_node(b).unwrap().is_some());
+        assert_eq!(
+            db.neighbors(
+                a,
+                &NeighborOptions {
+                    direction: Direction::Outgoing,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions::default(),
+            1,
+            4.0,
+            Some(4.0),
+            0,
+            3,
+        );
+        assert_degrees_batch_routes(
+            &db,
+            &[a, b, a],
+            DegreeOptions::default(),
+            &[(a, 1)],
+            0,
+            2,
+        );
+        assert_eq!(
+            std::fs::read(&sidecar_path).unwrap(),
+            b"not a degree sidecar",
+            "open/query must not repair a corrupt degree sidecar"
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_degree_sidecar_compaction_omits_when_input_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let a;
+        {
+            let db = open_imm(&path);
+            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+                .unwrap();
+            db.flush().unwrap();
+            db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+                .unwrap();
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+
+        std::fs::write(
+            segment_dir(&path, 1).join(crate::degree_cache::DEGREE_DELTA_FILENAME),
+            b"not a degree sidecar",
+        )
+        .unwrap();
+
+        let db = open_imm(&path);
+        assert!(db
+            .segments_for_test()
+            .iter()
+            .any(|segment| !segment.degree_delta_available()));
+        db.compact().unwrap();
+
+        let segments = db.segments_for_test();
+        assert_eq!(segments.len(), 1);
+        assert!(!segments[0].degree_delta_available());
+        assert_scalar_degree_family_routes(
+            &db,
+            a,
+            DegreeOptions::default(),
+            2,
+            2.0,
+            Some(1.0),
+            0,
+            3,
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
     fn test_degree_cache_batch_matches_individual() {
         // Verify batch degrees() from cache matches individual degree() calls
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let mut nodes = Vec::new();
         for i in 0..5 {
@@ -6696,7 +8060,7 @@
     #[test]
     fn test_wcc_single_component() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         // A - B - C (all connected via directed edges, WCC ignores direction)
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
@@ -6719,7 +8083,7 @@
     #[test]
     fn test_wcc_multiple_components() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         // Component 1: A - B
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
@@ -6751,7 +8115,7 @@
     #[test]
     fn test_wcc_isolated_nodes() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6773,7 +8137,7 @@
     #[test]
     fn test_wcc_self_loops() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6791,7 +8155,7 @@
     #[test]
     fn test_wcc_parallel_edges() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6813,7 +8177,7 @@
     #[test]
     fn test_wcc_deleted_nodes_and_edges() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         // A - B - C
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
@@ -6845,7 +8209,7 @@
     #[test]
     fn test_wcc_edge_type_filter() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6872,7 +8236,7 @@
     #[test]
     fn test_wcc_node_type_filter() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         // Type 1: A, B.  Type 2: C
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
@@ -6899,7 +8263,7 @@
     #[test]
     fn test_wcc_after_flush() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6923,7 +8287,7 @@
     #[test]
     fn test_wcc_after_compaction() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -6949,7 +8313,7 @@
         let db_path = dir.path().join("db");
 
         {
-            let mut db = open_imm(&db_path);
+            let db = open_imm(&db_path);
             let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -6980,7 +8344,7 @@
     fn test_wcc_direction_ignored() {
         // Directed edge A→B should put A and B in the same WCC component.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7002,7 +8366,7 @@
     fn test_wcc_deterministic_component_ids() {
         // Component IDs must be deterministic (min node_id).
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7025,7 +8389,7 @@
     #[test]
     fn test_wcc_prune_policy_hides_nodes() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // low weight
@@ -7057,7 +8421,7 @@
     fn test_wcc_memtable_only() {
         // WCC should work with memtable-only data (no flush).
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7081,7 +8445,7 @@
     #[test]
     fn test_component_of_basic() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7108,7 +8472,7 @@
     #[test]
     fn test_component_of_missing_node() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
 
@@ -7121,7 +8485,7 @@
     #[test]
     fn test_component_of_deleted_node() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7141,7 +8505,7 @@
     #[test]
     fn test_component_of_node_type_filter() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(2, "b", UpsertNodeOptions::default()).unwrap(); // type 2
@@ -7163,7 +8527,7 @@
     #[test]
     fn test_component_of_edge_type_filter() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7181,7 +8545,7 @@
     #[test]
     fn test_component_of_after_flush() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7200,7 +8564,7 @@
     #[test]
     fn test_component_of_after_compaction() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7228,7 +8592,7 @@
         let c;
 
         {
-            let mut db = open_imm(&db_path);
+            let db = open_imm(&db_path);
             a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
             b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
             c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
@@ -7246,7 +8610,7 @@
     #[test]
     fn test_component_of_prune_policy() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // low weight
@@ -7281,7 +8645,7 @@
     fn test_wcc_agrees_with_component_of() {
         // WCC and component_of must produce consistent results.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7316,7 +8680,7 @@
     fn test_wcc_agrees_with_component_of_filtered() {
         // Cross-consistency under both node_type_filter and edge_type_filter.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(2, "b", UpsertNodeOptions::default()).unwrap();
@@ -7350,7 +8714,7 @@
     #[test]
     fn test_component_of_self_loop() {
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(a, a, 10, UpsertEdgeOptions::default()).unwrap();
@@ -7366,7 +8730,7 @@
         // If A→B exists (directed), component_of(B) should find A
         // because WCC treats edges as undirected.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7383,7 +8747,7 @@
     fn test_wcc_at_epoch_temporal_filtering() {
         // Expired and not-yet-valid edges should be invisible to WCC.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7420,7 +8784,7 @@
 
         // Rebuild with explicit temporal windows for deterministic testing.
         let dir2 = TempDir::new().unwrap();
-        let mut db2 = open_imm(&dir2.path().join("db"));
+        let db2 = open_imm(&dir2.path().join("db"));
 
         let a2 = db2.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b2 = db2.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
@@ -7449,7 +8813,7 @@
     fn test_component_of_at_epoch_temporal_filtering() {
         // component_of should respect at_epoch for edge visibility.
         let dir = TempDir::new().unwrap();
-        let mut db = open_imm(&dir.path().join("db"));
+        let db = open_imm(&dir.path().join("db"));
 
         let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
