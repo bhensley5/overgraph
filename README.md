@@ -318,7 +318,8 @@ For a deeper dive, see the [architecture overview](docs/architecture-overview.md
 ## Documentation
 
 - **[overgraph.io/docs](https://overgraph.io/docs)** - full documentation, getting started guide, and API reference.
-- **[API Reference](https://overgraph.io/docs/api-reference)** - every method, parameter, type, and return value across Python, Node.js, and Rust.
+- **[API Reference](docs/api-reference.md)** - every method, parameter, type, and return value across Python, Node.js, and Rust.
+- **[Roadmap](docs/roadmap.md)** - where OverGraph is headed and what's already shipped.
 
 ## Running the benchmarks
 
