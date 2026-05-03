@@ -381,6 +381,217 @@ pub struct PageResult<T> {
     pub next_cursor: Option<u64>,
 }
 
+/// Request for planner-backed node queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeQuery {
+    pub type_id: Option<u32>,
+    pub ids: Vec<u64>,
+    pub keys: Vec<String>,
+    pub filter: Option<NodeFilterExpr>,
+    pub page: PageRequest,
+    pub order: NodeQueryOrder,
+    pub allow_full_scan: bool,
+}
+
+impl Default for NodeQuery {
+    fn default() -> Self {
+        Self {
+            type_id: None,
+            ids: Vec::new(),
+            keys: Vec::new(),
+            filter: None,
+            page: PageRequest::default(),
+            order: NodeQueryOrder::NodeIdAsc,
+            allow_full_scan: false,
+        }
+    }
+}
+
+/// Recursive boolean filter supported by planner-backed node queries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeFilterExpr {
+    PropertyEquals {
+        key: String,
+        value: PropValue,
+    },
+    PropertyIn {
+        key: String,
+        values: Vec<PropValue>,
+    },
+    PropertyRange {
+        key: String,
+        lower: Option<PropertyRangeBound>,
+        upper: Option<PropertyRangeBound>,
+    },
+    PropertyExists {
+        key: String,
+    },
+    PropertyMissing {
+        key: String,
+    },
+    UpdatedAtRange {
+        lower_ms: Option<i64>,
+        upper_ms: Option<i64>,
+    },
+    And(Vec<NodeFilterExpr>),
+    Or(Vec<NodeFilterExpr>),
+    Not(Box<NodeFilterExpr>),
+}
+
+/// Result ordering for planner-backed node queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeQueryOrder {
+    NodeIdAsc,
+}
+
+/// ID-only result for planner-backed node queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryNodeIdsResult {
+    pub items: Vec<u64>,
+    pub next_cursor: Option<u64>,
+}
+
+/// Hydrated result for planner-backed node queries.
+#[derive(Debug, Clone)]
+pub struct QueryNodesResult {
+    pub items: Vec<NodeRecord>,
+    pub next_cursor: Option<u64>,
+}
+
+/// Request for planner-backed graph pattern queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphPatternQuery {
+    pub nodes: Vec<NodePattern>,
+    pub edges: Vec<EdgePattern>,
+    pub at_epoch: Option<i64>,
+    pub limit: usize,
+    pub order: PatternOrder,
+}
+
+/// Node variable inside a graph pattern query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodePattern {
+    pub alias: String,
+    pub type_id: Option<u32>,
+    pub ids: Vec<u64>,
+    pub keys: Vec<String>,
+    pub filter: Option<NodeFilterExpr>,
+}
+
+/// Edge variable or edge constraint inside a graph pattern query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgePattern {
+    pub alias: Option<String>,
+    pub from_alias: String,
+    pub to_alias: String,
+    pub direction: Direction,
+    pub type_filter: Option<Vec<u32>>,
+    pub property_predicates: Vec<EdgePostFilterPredicate>,
+}
+
+/// Predicate supported as a bounded post-filter on expanded edges.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EdgePostFilterPredicate {
+    PropertyEquals {
+        key: String,
+        value: PropValue,
+    },
+    PropertyRange {
+        key: String,
+        lower: Option<PropertyRangeBound>,
+        upper: Option<PropertyRangeBound>,
+    },
+}
+
+/// Result ordering for planner-backed graph pattern queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternOrder {
+    AnchorThenAliasesAsc,
+}
+
+/// ID-binding result for planner-backed graph pattern queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryPatternResult {
+    pub matches: Vec<QueryMatch>,
+    pub truncated: bool,
+}
+
+/// One graph pattern match. Unnamed edge patterns are constraints only.
+///
+/// Distinct node aliases bind distinct node IDs. Distinct edge aliases may bind
+/// the same edge ID when multiple pattern edge variables are satisfied by the
+/// same visible edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryMatch {
+    pub nodes: BTreeMap<String, u64>,
+    pub edges: BTreeMap<String, u64>,
+}
+
+/// Kind of planner-backed query represented by a plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryPlanKind {
+    NodeQuery,
+    PatternQuery,
+}
+
+/// Explain output for planner-backed queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryPlan {
+    pub kind: QueryPlanKind,
+    pub root: QueryPlanNode,
+    pub estimated_candidates: Option<u64>,
+    pub warnings: Vec<QueryPlanWarning>,
+}
+
+/// Explain tree node for planner-backed queries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryPlanNode {
+    ExplicitIds,
+    KeyLookup,
+    NodeTypeIndex,
+    PropertyEqualityIndex,
+    PropertyRangeIndex,
+    TimestampIndex,
+    AdjacencyExpansion,
+    Intersect {
+        inputs: Vec<QueryPlanNode>,
+    },
+    Union {
+        inputs: Vec<QueryPlanNode>,
+    },
+    VerifyNodeFilter {
+        input: Box<QueryPlanNode>,
+    },
+    VerifyEdgePredicates {
+        input: Box<QueryPlanNode>,
+    },
+    PatternExpand {
+        anchor_alias: String,
+        input: Box<QueryPlanNode>,
+    },
+    FallbackTypeScan,
+    FallbackFullNodeScan,
+    EmptyResult,
+}
+
+/// Warning emitted by planner explain output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryPlanWarning {
+    MissingReadyIndex,
+    UsingFallbackScan,
+    FullScanRequiresOptIn,
+    FullScanExplicitlyAllowed,
+    UnboundedPatternRejected,
+    EdgePropertyPostFilter,
+    IndexSkippedAsBroad,
+    CandidateCapExceeded,
+    RangeCandidateCapExceeded,
+    TimestampCandidateCapExceeded,
+    VerifyOnlyFilter,
+    BooleanBranchFallback,
+    PlanningProbeBudgetExceeded,
+}
+
 /// Range domain for an optional secondary index declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SecondaryIndexRangeDomain {

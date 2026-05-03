@@ -5851,12 +5851,7 @@
         db.close().unwrap();
     }
 
-    // --- Phase 18a2: Degree cache rebuild tests ---
-    //
-    // CP1 tests validate rebuild_degree_cache() correctness. Since mutation
-    // hooks are not wired yet (CP2), tests that insert data after open()
-    // call rebuild_degree_cache() explicitly. Tests that close/reopen verify
-    // the rebuild happens automatically during open().
+    // --- Phase 18a2: Degree cache tests ---
 
     #[test]
     fn test_degree_cache_rebuild_memtable_only() {
@@ -5872,9 +5867,6 @@
         db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
         db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
         db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 1.5, ..Default::default() }).unwrap();
-
-        // Rebuild to pick up new edges (no mutation hooks in CP1)
-        db.rebuild_degree_cache().unwrap();
 
         let ea = db.degree_cache_entry(a);
         assert_eq!(ea.out_degree, 2);
@@ -7077,6 +7069,7 @@
         db.close().unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assert_scalar_degree_family_routes(
         db: &DatabaseEngine,
         node_id: u64,

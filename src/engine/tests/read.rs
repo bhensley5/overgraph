@@ -2109,6 +2109,83 @@ fn test_find_nodes_ready_declaration_uses_index_lookup_across_sources() {
 }
 
 #[test]
+fn test_find_nodes_ready_equality_index_matches_signed_zero_verifier_semantics() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut neg_zero_props = BTreeMap::new();
+    neg_zero_props.insert("temp".to_string(), PropValue::Float(-0.0));
+    let neg_zero = engine
+        .upsert_node(
+            1,
+            "temp-neg-zero",
+            UpsertNodeOptions {
+                props: neg_zero_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut pos_zero_props = BTreeMap::new();
+    pos_zero_props.insert("temp".to_string(), PropValue::Float(0.0));
+    let pos_zero = engine
+        .upsert_node(
+            1,
+            "temp-pos-zero",
+            UpsertNodeOptions {
+                props: pos_zero_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut non_zero_props = BTreeMap::new();
+    non_zero_props.insert("temp".to_string(), PropValue::Float(1.0));
+    engine
+        .upsert_node(
+            1,
+            "temp-one",
+            UpsertNodeOptions {
+                props: non_zero_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let info = engine
+        .ensure_node_property_index(1, "temp", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    wait_for_published_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    engine.reset_property_query_routes();
+    assert_eq!(
+        engine
+            .find_nodes(1, "temp", &PropValue::Float(-0.0))
+            .unwrap(),
+        vec![neg_zero, pos_zero]
+    );
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    engine.reset_property_query_routes();
+    assert_eq!(
+        engine
+            .find_nodes(1, "temp", &PropValue::Float(0.0))
+            .unwrap(),
+        vec![neg_zero, pos_zero]
+    );
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    engine.close().unwrap();
+}
+
+#[test]
 fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
@@ -2151,7 +2228,11 @@ fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates()
     let ready = wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.index_id, info.index_id);
 
-    let seg_dir = crate::segment_writer::segment_dir(&db_path, engine.segments_for_test()[0].segment_id);
+    let seg_dir =
+        crate::segment_writer::segment_dir(&db_path, engine.segments_for_test()[0].segment_id);
+    engine.close().unwrap();
+    drop(engine);
+
     let mut tampered_groups = std::collections::BTreeMap::new();
     tampered_groups.insert(hash_prop_value(&red), vec![node_id, blue_id]);
     crate::segment_writer::write_node_prop_eq_sidecar_to_path(
@@ -2159,6 +2240,7 @@ fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates()
         &tampered_groups,
     )
     .unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let mut updated_props = BTreeMap::new();
     updated_props.insert("color".to_string(), blue.clone());
@@ -3631,6 +3713,9 @@ fn test_find_nodes_range_ready_declaration_routes_and_orders_across_sources() {
         .unwrap();
     let ready = wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.index_id, info.index_id);
+    let published_ready =
+        wait_for_published_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    assert_eq!(published_ready.index_id, info.index_id);
 
     let expected = vec![imm_a, imm_b, active_20, active_25, seg_id];
 

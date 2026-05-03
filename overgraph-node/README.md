@@ -42,7 +42,7 @@ It's written entirely in Rust and it ships native connectors for Node.js (napi-r
 - **Fast where it matters.** Node lookups in ~34ns. Neighbor traversal in ~2μs. Batch writes at 1.29M+ nodes/sec. The storage engine is a log-structured merge tree with mmap'd immutable segments, so reads never block writes.
 - **Explicit write transactions.** Stage ordered node and edge mutations locally, read your own staged writes, then commit atomically with optimistic conflict detection. Available in Rust, Node.js, and Python.
 - **Three languages, one engine.** Rust core with native bindings for Node.js (napi-rs) and Python (PyO3). Not a wrapper around a REST API. Actual FFI into the same Rust engine with minimal overhead.
-- **No query language.** Just functions. `upsert_node`, `neighbors`, `vector_search`. If you can call a function, you can use OverGraph.
+- **Full queries as functions.** Use regular APIs for everything: `findNodes` for direct property lookups, `queryNodeIds` / `queryNodes` for full boolean node queries, and `queryPattern` for bounded graph pattern matching. No query strings to parse, escape, or generate.
 
 ## Performance
 
@@ -259,8 +259,9 @@ Both Python and Node.js connectors include full async variants of every API. Pyt
 - **Shortest path.** BFS (unweighted) or bidirectional Dijkstra (weighted). `is_connected` for fast reachability checks. `all_shortest_paths` when there are ties.
 - **Connected components.** `connected_components()` returns a global WCC labelling (union-find, near-linear). `component_of(node)` returns the members of a single node's component via BFS. Both support edge-type, node-type, and temporal filters.
 - **Degree counts.** Count edges, sum weights, and compute averages without materializing neighbor lists. Batch `degrees` for bulk analysis.
-- **Property queries.** `findNodes` and `findNodesPaged` do equality queries. `findNodesRange` and `findNodesRangePaged` do numeric range queries with exact bound and cursor semantics.
+- **Direct property queries.** `findNodes` and `findNodesPaged` do focused equality lookups. `findNodesRange` and `findNodesRangePaged` do numeric range scans with exact bound and cursor semantics.
 - **Optional property indexes.** Declare equality or numeric range indexes only where they pay off. Use `ensureNodePropertyIndex`, `listNodePropertyIndexes`, and `dropNodePropertyIndex` to manage them. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
+- **Full query APIs.** `queryNodeIds`, `queryNodes`, `queryPattern`, and explain APIs combine IDs, keys, types, property equality/IN/range/exists/missing filters, updated-at ranges, and bounded graph patterns without a query string. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
 - **Time-range queries.** Find nodes created or updated within a time window. Sorted timestamp index for efficient range scans.
 
 ### Pagination
@@ -282,7 +283,7 @@ ID-keyed collection APIs use keyset pagination with `limit` and `after`. `traver
 
 OverGraph uses a log-structured storage engine purpose-built from scratch in pure Rust. Unlike generic LSM key-value stores, every segment is a fully indexed graph structure. Adjacency lists, label indexes, temporal indexes, and vector indexes are all materialized at flush time, not just at compaction. Reads are near-optimal the moment data hits disk, while writes stay append-only and fast.
 
-**Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue unblocked against a fresh memtable. Each segment ships with pre-built adjacency indexes (inbound and outbound), optional declared property-index sidecars, optional signed degree-delta sidecars for degree/weight fast paths, and, when the segment contains vectors, HNSW and sparse posting-list indexes.
+**Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue unblocked against a fresh memtable. Each segment ships with pre-built adjacency indexes (inbound and outbound), optional declared property-index sidecars, optional advisory planner statistics, optional signed degree-delta sidecars for degree/weight fast paths, and, when the segment contains vectors, HNSW and sparse posting-list indexes.
 
 **Read path:** Queries check the memtable first (freshest data), then merge results across immutable segments using the per-segment indexes. Because every segment carries its own adjacency index, a neighbor query is a handful of index lookups, not a scan across sorted keys. Vector search follows the same model: memtable candidates are found by exact brute-force scan, segment candidates via HNSW or posting-list indexes, then the engine merges and deduplicates across all sources. Property equality and numeric range queries stay index-transparent too: if a matching optional property-index declaration is `Ready`, the engine uses the declaration-backed path, otherwise it falls back to a type-scoped scan through the same public API. Pagination uses early termination to avoid unnecessary work.
 
@@ -303,6 +304,7 @@ my-graph/
       type_index.dat      # type_id -> [id...]
       tombstones.dat      # deleted IDs
       secondary_indexes/  # optional declared property-index sidecars
+      planner_stats.dat   # optional advisory planner statistics
       degree_delta.dat    # optional signed degree deltas for fast degree/weight reads
       node_dense_vectors.dat    # dense vector blob (when present)
       node_sparse_vectors.dat   # sparse vector blob (when present)

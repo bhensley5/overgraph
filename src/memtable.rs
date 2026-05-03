@@ -1582,6 +1582,41 @@ impl Memtable {
         ids
     }
 
+    pub(crate) fn visible_node_ids_at(&self, snapshot_seq: u64) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let mut ids = Vec::new();
+        for (&node_id, slot) in &state.nodes {
+            if matches!(record_at(slot, snapshot_seq), Some(RecordState::Live(_))) {
+                ids.push(node_id);
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn visible_node_count_at(&self, snapshot_seq: u64) -> usize {
+        let state = self.state.read().unwrap();
+        state
+            .nodes
+            .values()
+            .filter(|slot| matches!(record_at(slot, snapshot_seq), Some(RecordState::Live(_))))
+            .count()
+    }
+
+    pub(crate) fn visible_nodes_by_type_count(&self, type_id: u32, snapshot_seq: u64) -> usize {
+        let state = self.state.read().unwrap();
+        state
+            .type_node_index
+            .get(&type_id)
+            .map(|members| {
+                members
+                    .values()
+                    .filter(|slot| slot_option_visible(slot, snapshot_seq))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     pub(crate) fn visible_edges_by_type(&self, type_id: u32, snapshot_seq: u64) -> Vec<u64> {
         let state = self.state.read().unwrap();
         let mut ids = Vec::new();
@@ -1620,6 +1655,38 @@ impl Memtable {
             .collect::<Vec<_>>();
         ids.sort_unstable();
         ids
+    }
+
+    pub(crate) fn for_each_visible_node_by_time_range_at<F>(
+        &self,
+        type_id: u32,
+        from_ms: i64,
+        to_ms: i64,
+        snapshot_seq: u64,
+        callback: &mut F,
+    ) -> ControlFlow<()>
+    where
+        F: FnMut(u64) -> ControlFlow<()>,
+    {
+        if from_ms > to_ms {
+            return ControlFlow::Continue(());
+        }
+        let state = self.state.read().unwrap();
+        use std::ops::Bound;
+        let start = (type_id, from_ms, 0u64);
+        let end = (type_id, to_ms, u64::MAX);
+        for (&(entry_type, _, node_id), slot) in state
+            .time_node_index
+            .range((Bound::Included(start), Bound::Included(end)))
+        {
+            if entry_type != type_id || !slot_option_visible(slot, snapshot_seq) {
+                continue;
+            }
+            if callback(node_id).is_break() {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     pub(crate) fn neighbors_at(
@@ -1837,6 +1904,17 @@ impl Memtable {
         prop_value: &PropValue,
         snapshot_seq: u64,
     ) -> Vec<u64> {
+        self.find_secondary_eq_nodes_at_limited(index_id, prop_key, prop_value, snapshot_seq, None)
+    }
+
+    pub(crate) fn find_secondary_eq_nodes_at_limited(
+        &self,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+        snapshot_seq: u64,
+        max_ids: Option<usize>,
+    ) -> Vec<u64> {
         let state = self.state.read().unwrap();
         let value_hash = hash_prop_value(prop_value);
         let mut ids = Vec::new();
@@ -1855,12 +1933,79 @@ impl Memtable {
                         .is_some_and(|value| value == prop_value)
                     {
                         ids.push(node_id);
+                        if max_ids.is_some_and(|max_ids| ids.len() >= max_ids) {
+                            break;
+                        }
                     }
                 }
             }
         }
         ids.sort_unstable();
         ids
+    }
+
+    pub(crate) fn find_secondary_eq_nodes_by_hash_at_limited(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+        snapshot_seq: u64,
+        max_ids: Option<usize>,
+    ) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let Some(groups) = state.secondary_eq_state.get(&index_id) else {
+            return Vec::new();
+        };
+        let Some(group) = groups.get(&value_hash) else {
+            return Vec::new();
+        };
+
+        let mut ids = Vec::new();
+        for (&node_id, slot) in group {
+            if !slot_option_visible(slot, snapshot_seq) {
+                continue;
+            }
+            ids.push(node_id);
+            if max_ids.is_some_and(|max_ids| ids.len() >= max_ids) {
+                break;
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn secondary_eq_node_count_at(
+        &self,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+        snapshot_seq: u64,
+    ) -> usize {
+        let state = self.state.read().unwrap();
+        let value_hash = hash_prop_value(prop_value);
+        let Some(groups) = state.secondary_eq_state.get(&index_id) else {
+            return 0;
+        };
+        let Some(group) = groups.get(&value_hash) else {
+            return 0;
+        };
+
+        let mut count = 0;
+        for (&node_id, slot) in group {
+            if !slot_option_visible(slot, snapshot_seq) {
+                continue;
+            }
+            let Some(node) = state.node_at(node_id, snapshot_seq) else {
+                continue;
+            };
+            if node
+                .props
+                .get(prop_key)
+                .is_some_and(|value| value == prop_value)
+            {
+                count += 1;
+            }
+        }
+        count
     }
 
     pub(crate) fn visible_secondary_range_entries(
@@ -1917,6 +2062,70 @@ impl Memtable {
                 slot_option_visible(slot, snapshot_seq).then_some((encoded, node_id))
             })
             .collect()
+    }
+
+    pub(crate) fn for_each_visible_secondary_range_entry_at<F>(
+        &self,
+        index_id: u64,
+        lower: Option<(u64, bool)>,
+        upper: Option<(u64, bool)>,
+        after: Option<(u64, u64)>,
+        snapshot_seq: u64,
+        callback: &mut F,
+    ) -> ControlFlow<()>
+    where
+        F: FnMut((u64, u64)) -> ControlFlow<()>,
+    {
+        use std::ops::Bound;
+
+        let state = self.state.read().unwrap();
+        let Some(entries) = state.secondary_range_state.get(&index_id) else {
+            return ControlFlow::Continue(());
+        };
+
+        let mut start = lower.map(|(value, inclusive)| {
+            if inclusive {
+                ((value, 0), false)
+            } else {
+                ((value, u64::MAX), true)
+            }
+        });
+        if let Some(cursor) = after {
+            let cursor_start = (cursor, true);
+            start = Some(match start {
+                Some(existing) if existing.0 > cursor_start.0 => existing,
+                Some(existing) if existing.0 < cursor_start.0 => cursor_start,
+                Some(existing) => (existing.0, existing.1 || cursor_start.1),
+                None => cursor_start,
+            });
+        }
+
+        let start = match start {
+            Some((target, strict)) => {
+                if strict {
+                    Bound::Excluded(target)
+                } else {
+                    Bound::Included(target)
+                }
+            }
+            None => Bound::Unbounded,
+        };
+
+        for (&(encoded, node_id), slot) in entries.range((start, Bound::Unbounded)) {
+            if upper.is_some_and(|(upper_value, inclusive)| {
+                encoded > upper_value || (!inclusive && encoded == upper_value)
+            }) {
+                break;
+            }
+            if !slot_option_visible(slot, snapshot_seq) {
+                continue;
+            }
+            if callback((encoded, node_id)).is_break() {
+                return ControlFlow::Break(());
+            }
+        }
+
+        ControlFlow::Continue(())
     }
 
     pub(crate) fn collect_deleted_nodes_at(&self, snapshot_seq: u64) -> NodeIdSet {

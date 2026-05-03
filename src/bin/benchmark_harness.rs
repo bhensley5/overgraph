@@ -1,8 +1,10 @@
 use overgraph::{
     DatabaseEngine, DbOptions, DegreeOptions, DenseMetric, DenseVectorConfig, EdgeInput,
-    ExportOptions, HnswConfig, IsConnectedOptions, NeighborOptions, NodeInput, PprOptions,
-    PropValue, ShortestPathOptions, TopKOptions, TraverseOptions, UpsertEdgeOptions,
-    UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, WalSyncMode,
+    ExportOptions, HnswConfig, IsConnectedOptions, NeighborOptions, NodeFilterExpr, NodeInput,
+    NodeQuery, PageRequest, PprOptions, PropValue, PropertyRangeBound, SecondaryIndexKind,
+    SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPathOptions, TopKOptions,
+    TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest,
+    WalSyncMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,6 +14,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+macro_rules! filter_and {
+    [] => {
+        None
+    };
+    [$single:expr $(,)?] => {
+        Some($single)
+    };
+    [$($filter:expr),+ $(,)?] => {
+        Some(NodeFilterExpr::And(vec![$($filter),+]))
+    };
+}
+
 const PROFILE_PATH: &str = "docs/04-quality/workloads/profiles.json";
 const SCENARIO_CONTRACT_PATH: &str = "docs/04-quality/workloads/scenario-contract.json";
 
@@ -20,6 +34,23 @@ struct CliArgs {
     profile: String,
     warmup: usize,
     iters: usize,
+    scenario_set: ScenarioSet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScenarioSet {
+    All,
+    Query,
+}
+
+impl ScenarioSet {
+    fn includes_query(self) -> bool {
+        matches!(self, ScenarioSet::All | ScenarioSet::Query)
+    }
+
+    fn includes_legacy(self) -> bool {
+        matches!(self, ScenarioSet::All)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -262,6 +293,21 @@ fn main() -> Result<(), String> {
     let cfg = effective_config(&profile, &scenario_contract.effective_config);
     let tmp_root = TempBenchDir::new(&args.profile)?;
     let mut scenarios: Vec<ScenarioOutput> = Vec::new();
+
+    if args.scenario_set.includes_query() {
+        push_query_scenarios(&args, &scenario_contract, &cfg, &tmp_root, &mut scenarios)?;
+    }
+
+    if !args.scenario_set.includes_legacy() {
+        return emit_output(
+            args,
+            profiles_payload,
+            profile,
+            scenario_contract,
+            cfg,
+            scenarios,
+        );
+    }
 
     // S-CRUD-001: upsert_node (growth)
     {
@@ -1417,37 +1463,21 @@ fn main() -> Result<(), String> {
         ));
     }
 
-    let output = HarnessOutput {
-        schema_version: 1,
-        language: "rust",
-        harness_stage: "core-benchmark-v1-parity",
-        profile_name: args.profile,
-        generated_at_utc: now_iso_utc_string(),
-        profile_source: PROFILE_PATH.to_string(),
-        scenario_contract_source: SCENARIO_CONTRACT_PATH.to_string(),
-        percentile_method: scenario_contract.percentile_method,
-        profile_contract: ProfileContractOutput {
-            determinism: profiles_payload.determinism,
-            profile,
-            effective_config: cfg,
-            scenario_contract_schema_version: scenario_contract.schema_version,
-        },
+    emit_output(
+        args,
+        profiles_payload,
+        profile,
+        scenario_contract,
+        cfg,
         scenarios,
-    };
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output)
-            .map_err(|e| format!("serialize benchmark output failed: {e}"))?
-    );
-
-    Ok(())
+    )
 }
 
 fn parse_args() -> Result<CliArgs, String> {
     let mut profile = String::from("small");
     let mut warmup: usize = 20;
     let mut iters: usize = 80;
+    let mut scenario_set = ScenarioSet::All;
 
     let mut args = env::args().skip(1);
     while let Some(token) = args.next() {
@@ -1473,6 +1503,21 @@ fn parse_args() -> Result<CliArgs, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --iters: {e}"))?;
             }
+            "--scenario-set" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--scenario-set requires a value".to_string())?;
+                scenario_set = match raw.as_str() {
+                    "all" => ScenarioSet::All,
+                    "query" => ScenarioSet::Query,
+                    _ => {
+                        return Err(format!(
+                            "unsupported --scenario-set '{raw}'\n{}",
+                            help_text()
+                        ))
+                    }
+                };
+            }
             "--help" | "-h" => {
                 return Err(help_text());
             }
@@ -1493,11 +1538,12 @@ fn parse_args() -> Result<CliArgs, String> {
         profile,
         warmup,
         iters,
+        scenario_set,
     })
 }
 
 fn help_text() -> String {
-    "Usage: cargo run --release --features cli --bin benchmark-harness -- --profile <small|medium|large|xlarge> --warmup <n> --iters <n>".to_string()
+    "Usage: cargo run --release --features cli --bin benchmark-harness -- --profile <small|medium|large|xlarge> --warmup <n> --iters <n> [--scenario-set <all|query>]".to_string()
 }
 
 fn effective_config(
@@ -1814,6 +1860,248 @@ fn open_vector_db(path: &Path, dim: u32) -> Result<DatabaseEngine, String> {
     DatabaseEngine::open(path, &opts).map_err(|e| e.to_string())
 }
 
+fn query_bench_props(i: usize) -> BTreeMap<String, PropValue> {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "status".to_string(),
+        PropValue::String(if i % 10 == 0 { "active" } else { "inactive" }.to_string()),
+    );
+    props.insert(
+        "tier".to_string(),
+        PropValue::String(if i % 20 == 0 { "gold" } else { "standard" }.to_string()),
+    );
+    props.insert("score".to_string(), PropValue::Int((i % 100) as i64));
+    props
+}
+
+fn wait_for_property_index_state(
+    engine: &DatabaseEngine,
+    index_id: u64,
+    expected_state: SecondaryIndexState,
+) -> Result<(), String> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if engine
+            .list_node_property_indexes()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .any(|info| info.index_id == index_id && info.state == expected_state)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for property index {index_id} to reach {expected_state:?}"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct QueryBenchmarkLayout {
+    segments: usize,
+    segment_nodes: usize,
+    memtable_tail_nodes: usize,
+}
+
+fn query_benchmark_layout(preload_nodes: usize) -> QueryBenchmarkLayout {
+    let segments = if preload_nodes >= 2 { 1 } else { 0 };
+    let segment_nodes = if segments == 0 {
+        0
+    } else {
+        (preload_nodes / (segments + 1)).max(1)
+    };
+    let flushed_nodes = segments * segment_nodes;
+
+    QueryBenchmarkLayout {
+        segments,
+        segment_nodes,
+        memtable_tail_nodes: preload_nodes.saturating_sub(flushed_nodes),
+    }
+}
+
+fn build_query_benchmark_engine(
+    path: &Path,
+    preload_nodes: usize,
+) -> Result<(DatabaseEngine, QueryBenchmarkLayout), String> {
+    let engine = open_db(path)?;
+    let status = engine
+        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .map_err(|e| e.to_string())?;
+    wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready)?;
+
+    let tier = engine
+        .ensure_node_property_index(1, "tier", SecondaryIndexKind::Equality)
+        .map_err(|e| e.to_string())?;
+    wait_for_property_index_state(&engine, tier.index_id, SecondaryIndexState::Ready)?;
+
+    let score = engine
+        .ensure_node_property_index(
+            1,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready)?;
+
+    let layout = query_benchmark_layout(preload_nodes);
+    for segment in 0..layout.segments {
+        let start = segment * layout.segment_nodes;
+        let inputs: Vec<NodeInput> = (start..start + layout.segment_nodes)
+            .map(|i| NodeInput {
+                type_id: 1,
+                key: format!("q-{i}"),
+                props: query_bench_props(i),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect();
+        engine
+            .batch_upsert_nodes(&inputs)
+            .map_err(|e| e.to_string())?;
+        engine.flush().map_err(|e| e.to_string())?;
+    }
+
+    let tail_start = layout.segments * layout.segment_nodes;
+    let tail_inputs: Vec<NodeInput> = (tail_start..tail_start + layout.memtable_tail_nodes)
+        .map(|i| NodeInput {
+            type_id: 1,
+            key: format!("q-{i}"),
+            props: query_bench_props(i),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect();
+    engine
+        .batch_upsert_nodes(&tail_inputs)
+        .map_err(|e| e.to_string())?;
+
+    Ok((engine, layout))
+}
+
+fn query_ids_intersected_request(limit: usize) -> NodeQuery {
+    NodeQuery {
+        type_id: Some(1),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("active".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "tier".to_string(),
+                value: PropValue::String("gold".to_string()),
+            },
+        ],
+        page: PageRequest {
+            limit: Some(limit),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn query_nodes_hydrated_request(limit: usize) -> NodeQuery {
+    NodeQuery {
+        type_id: Some(1),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("active".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(50))),
+                upper: None,
+            },
+        ],
+        page: PageRequest {
+            limit: Some(limit),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn push_query_scenarios(
+    args: &CliArgs,
+    scenario_contract: &ScenarioContract,
+    cfg: &EffectiveConfigResolved,
+    tmp_root: &TempBenchDir,
+    scenarios: &mut Vec<ScenarioOutput>,
+) -> Result<(), String> {
+    let preload_nodes = cfg.time_range_nodes;
+    let limit = 100usize;
+
+    {
+        let scenario_id = "S-QUERY-001";
+        let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+        let (engine, layout) = build_query_benchmark_engine(
+            &tmp_root.db_path("query-node-ids-intersected"),
+            preload_nodes,
+        )?;
+        let request = query_ids_intersected_request(limit);
+        let stats = run_bench(iter_cfg, |_i| engine.query_node_ids(&request).map(|_| ()))?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "query_node_ids_intersected_predicates",
+            "query",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "type_id": 1,
+                "preload_nodes": preload_nodes,
+                "segments": layout.segments,
+                "segment_nodes": layout.segment_nodes,
+                "memtable_tail_nodes": layout.memtable_tail_nodes,
+                "predicates": ["status_eq_active", "tier_eq_gold"],
+                "limit": limit
+            }),
+            scenario_comparability(scenario_contract, scenario_id),
+        ));
+    }
+
+    {
+        let scenario_id = "S-QUERY-002";
+        let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+        let (engine, layout) = build_query_benchmark_engine(
+            &tmp_root.db_path("query-nodes-hydrated-intersected"),
+            preload_nodes,
+        )?;
+        let request = query_nodes_hydrated_request(limit);
+        let stats = run_bench(iter_cfg, |_i| engine.query_nodes(&request).map(|_| ()))?;
+        engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "query_nodes_intersected_predicates_hydrated",
+            "query",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "type_id": 1,
+                "preload_nodes": preload_nodes,
+                "segments": layout.segments,
+                "segment_nodes": layout.segment_nodes,
+                "memtable_tail_nodes": layout.memtable_tail_nodes,
+                "predicates": ["status_eq_active", "score_gte_50"],
+                "limit": limit
+            }),
+            scenario_comparability(scenario_contract, scenario_id),
+        ));
+    }
+
+    Ok(())
+}
+
 fn bench_splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = x;
@@ -1966,6 +2254,41 @@ fn make_scenario(
         comparability,
         notes: None,
     }
+}
+
+fn emit_output(
+    args: CliArgs,
+    profiles_payload: ProfilesPayload,
+    profile: ProfileConfig,
+    scenario_contract: ScenarioContract,
+    cfg: EffectiveConfigResolved,
+    scenarios: Vec<ScenarioOutput>,
+) -> Result<(), String> {
+    let output = HarnessOutput {
+        schema_version: 1,
+        language: "rust",
+        harness_stage: "core-benchmark-v1-parity",
+        profile_name: args.profile,
+        generated_at_utc: now_iso_utc_string(),
+        profile_source: PROFILE_PATH.to_string(),
+        scenario_contract_source: SCENARIO_CONTRACT_PATH.to_string(),
+        percentile_method: scenario_contract.percentile_method,
+        profile_contract: ProfileContractOutput {
+            determinism: profiles_payload.determinism,
+            profile,
+            effective_config: cfg,
+            scenario_contract_schema_version: scenario_contract.schema_version,
+        },
+        scenarios,
+    };
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| format!("serialize benchmark output failed: {e}"))?
+    );
+
+    Ok(())
 }
 
 fn idx_props(idx: usize) -> BTreeMap<String, PropValue> {

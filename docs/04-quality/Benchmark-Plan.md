@@ -80,6 +80,8 @@ Graph shapes for each profile:
 | `S-CRUD-003` | `get_node` | required | required | required |
 | `S-CRUD-004` | `upsert_node_fixed_key` | required | required | required |
 | `S-CRUD-005` | `upsert_edge_fixed_triple` | required | required | required |
+| `S-QUERY-001` | `query_node_ids_intersected_predicates` | required | required | required |
+| `S-QUERY-002` | `query_nodes_intersected_predicates_hydrated` | required | required | required |
 | `S-TXN-001` | explicit write transaction commit, 4/16/64 staged intents | required | required | required |
 | `S-TXN-002` | explicit transaction conflict-heavy same-target writes | required | required | required |
 | `S-TXN-003` | connector ordered `stage(operations)` payload parsing | not used | required | required |
@@ -205,6 +207,11 @@ Node.js:
 
 Python:
 - `scripts/bench/run-python.sh --profile small --warmup 20 --iters 80`
+
+Phase 23 query-only cross-language matrix:
+- `scripts/bench/run-rust.sh --scenario-set query --profile small --warmup 20 --iters 80`
+- `scripts/bench/run-node.sh --scenario-set query --profile small --warmup 20 --iters 80`
+- `scripts/bench/run-python.sh --scenario-set query --profile small --warmup 20 --iters 80`
 
 Baseline compare:
 - `python3 tools/bench/compare_baseline.py --baseline <path> --candidate <path> --allowlist docs/04-quality/regression-allowlist.json --warn-threshold-pct 10 --fail-threshold-pct 20`

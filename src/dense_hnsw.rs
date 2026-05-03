@@ -1282,43 +1282,6 @@ pub(crate) fn exact_dense_search_above_cutoff(
     Ok(hits)
 }
 
-/// ACORN-1 scoped dense HNSW search. Only returns hits whose node_id is in
-/// `scope_ids`. Out-of-scope nodes are still traversed for graph connectivity
-/// and eagerly two-hop-expanded so that filtered-out regions do not disconnect
-/// the search frontier.
-///
-/// Called indirectly via `SegmentReader::search_dense_hnsw_scoped` which
-/// pre-loads the dense blob and delegates here.
-#[allow(dead_code)] // Used via SegmentReader wrapper; clippy can't trace through the indirection
-pub(crate) fn search_dense_hnsw_scoped(
-    meta: &[u8],
-    graph: &[u8],
-    dense_blob: &[u8],
-    query: &[f32],
-    ef_search: usize,
-    limit: usize,
-    scope_ids: &NodeIdSet,
-) -> Result<Vec<(u64, f32)>, EngineError> {
-    let header = read_header(meta)?;
-    if query.len() != header.dimension as usize {
-        return Err(EngineError::InvalidOperation(format!(
-            "dense query dimension {} does not match index dimension {}",
-            query.len(),
-            header.dimension
-        )));
-    }
-
-    let point_count = header.point_count as usize;
-    if point_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    let points = load_dense_hnsw_query_points(meta, header)?;
-    search_dense_hnsw_scoped_with_points(
-        header, &points, graph, dense_blob, query, ef_search, limit, scope_ids,
-    )
-}
-
 #[allow(clippy::too_many_arguments)] // HNSW scoped search needs all index components inline
 pub(crate) fn search_dense_hnsw_scoped_with_points(
     header: DenseHnswHeader,

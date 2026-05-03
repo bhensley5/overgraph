@@ -224,16 +224,6 @@ impl UnionFind {
     }
 }
 
-impl EngineCore {
-    // Compatibility shim for older internal tests. Phase 20c degree state is
-    // published through active/frozen overlays and segment sidecars, so there
-    // is no live aggregate cache to rebuild.
-    #[allow(dead_code)]
-    pub(crate) fn rebuild_degree_cache(&mut self) -> Result<(), EngineError> {
-        Ok(())
-    }
-}
-
 impl ReadView {
     // --- Degree counts + aggregations (Phase 18a) ---
 
@@ -316,8 +306,7 @@ impl ReadView {
     /// applies temporal filtering. No prune policy filtering.
     ///
     /// Used as the fallback for type-filtered, temporal, or policy-filtered
-    /// queries. Also used by `rebuild_degree_cache()` to populate the cache
-    /// from the known-correct walk path.
+    /// queries.
     fn degree_stats_raw_walk(
         &self,
         node_id: u64,
@@ -339,8 +328,7 @@ impl ReadView {
     }
 
     /// Inner walk-based degree stats with pre-collected tombstones.
-    /// Avoids redundant tombstone collection when called in a loop
-    /// (e.g., during `rebuild_degree_cache`).
+    /// Avoids redundant tombstone collection when called in a loop.
     #[allow(clippy::too_many_arguments)]
     fn degree_stats_raw_walk_inner(
         &self,

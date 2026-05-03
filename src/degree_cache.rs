@@ -275,18 +275,6 @@ impl DegreeOverlayEdit {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn delta_or_default(&self, node_id: u64) -> DegreeDelta {
-        let shard_index = degree_overlay_shard_index(node_id);
-        let group_index = shard_index / DEGREE_OVERLAY_GROUP_SIZE;
-        let local_index = shard_index % DEGREE_OVERLAY_GROUP_SIZE;
-        self.groups[group_index].shards[local_index]
-            .entries
-            .get(&node_id)
-            .copied()
-            .unwrap_or(DegreeDelta::ZERO)
-    }
-
     pub(crate) fn add_delta(&mut self, node_id: u64, delta: DegreeDelta) {
         if delta.is_zero() {
             return;
@@ -440,7 +428,7 @@ impl DegreeSidecar {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn write_degree_delta_sidecar(
     path: &Path,
     entries: &[(u64, DegreeDelta)],

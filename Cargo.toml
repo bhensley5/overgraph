@@ -3,7 +3,7 @@ members = [".", "overgraph-node", "overgraph-python"]
 
 [package]
 name = "overgraph"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "An absurdly fast embedded graph database. Pure Rust, sub-microsecond reads."
 license = "MIT OR Apache-2.0"
@@ -49,6 +49,10 @@ path = "examples/rust/knowledge_graph.rs"
 
 [[bench]]
 name = "core_ops"
+harness = false
+
+[[bench]]
+name = "query_ops"
 harness = false
 
 [[bench]]

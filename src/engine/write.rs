@@ -879,22 +879,6 @@ impl EngineCore {
         Ok((true, PublishImpact::RebuildSources))
     }
 
-    pub fn list_node_property_indexes(&self) -> Vec<NodePropertyIndexInfo> {
-        let mut indexes: Vec<NodePropertyIndexInfo> = self
-            .secondary_index_entries_snapshot()
-            .iter()
-            .map(Self::node_property_index_info)
-            .collect();
-        indexes.sort_unstable_by(|left, right| {
-            left.type_id
-                .cmp(&right.type_id)
-                .then_with(|| left.prop_key.cmp(&right.prop_key))
-                .then_with(|| format!("{:?}", left.kind).cmp(&format!("{:?}", right.kind)))
-                .then_with(|| left.index_id.cmp(&right.index_id))
-        });
-        indexes
-    }
-
     // --- Segment-aware dedup lookups (for upsert) ---
 
     /// Look up a node by (type_id, key) across memtable + segments.

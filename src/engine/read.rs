@@ -24,6 +24,76 @@ impl PartialOrd for SparseTopKEntry {
     }
 }
 
+enum TypeScanNodeSource<'a> {
+    Owned(Vec<u64>),
+    Segment {
+        segment: &'a SegmentReader,
+        posting: SegmentTypePosting,
+    },
+}
+
+impl TypeScanNodeSource<'_> {
+    fn get_id(&self, index: usize) -> Result<Option<u64>, EngineError> {
+        match self {
+            TypeScanNodeSource::Owned(ids) => Ok(ids.get(index).copied()),
+            TypeScanNodeSource::Segment { segment, posting } => {
+                segment.node_type_id_at_posting(*posting, index)
+            }
+        }
+    }
+
+    fn seek_after(&self, after: Option<u64>) -> Result<usize, EngineError> {
+        let Some(after) = after else {
+            return Ok(0);
+        };
+        match self {
+            TypeScanNodeSource::Owned(ids) => match ids.binary_search(&after) {
+                Ok(index) => Ok(index + 1),
+                Err(index) => Ok(index),
+            },
+            TypeScanNodeSource::Segment { segment, posting } => {
+                segment.node_type_id_lower_bound_posting(*posting, after)
+            }
+        }
+    }
+}
+
+struct EqualityRawPostingBudget {
+    cap: usize,
+    consumed: usize,
+}
+
+enum EqualitySegmentPostingScan {
+    #[cfg(test)]
+    AcceptedCapReached,
+    RawCapExceeded,
+    Exhausted,
+}
+
+impl EqualityRawPostingBudget {
+    fn new(cap: usize) -> Self {
+        Self { cap, consumed: 0 }
+    }
+
+    fn next_chunk_limit(&self) -> Option<usize> {
+        if self.consumed > self.cap {
+            None
+        } else {
+            Some(
+                self.cap
+                    .saturating_add(1)
+                    .saturating_sub(self.consumed)
+                    .min(QUERY_VERIFY_CHUNK),
+            )
+        }
+    }
+
+    fn consume(&mut self, count: usize) -> bool {
+        self.consumed = self.consumed.saturating_add(count);
+        self.consumed > self.cap
+    }
+}
+
 fn normalized_range_float(value: f64) -> Option<f64> {
     if !value.is_finite() {
         return None;
@@ -100,6 +170,129 @@ fn encode_range_sort_key(domain: SecondaryIndexRangeDomain, value: &PropValue) -
     crate::memtable::encode_range_prop_value(domain, value)
 }
 
+fn signed_zero_equality_probe_values(value: &PropValue) -> Option<[PropValue; 2]> {
+    match value {
+        PropValue::Float(value) if *value == 0.0 => {
+            Some([PropValue::Float(0.0), PropValue::Float(-0.0)])
+        }
+        _ => None,
+    }
+}
+
+fn memtable_secondary_eq_nodes_for_filter(
+    memtable: &Memtable,
+    index_id: u64,
+    prop_key: &str,
+    prop_value: &PropValue,
+    snapshot_seq: u64,
+) -> Vec<u64> {
+    let Some(probe_values) = signed_zero_equality_probe_values(prop_value) else {
+        return memtable.find_secondary_eq_nodes_at(index_id, prop_key, prop_value, snapshot_seq);
+    };
+
+    let mut ids = Vec::new();
+    for probe_value in &probe_values {
+        ids.extend(memtable.find_secondary_eq_nodes_at(
+            index_id,
+            prop_key,
+            probe_value,
+            snapshot_seq,
+        ));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn memtable_secondary_eq_raw_nodes_for_filter(
+    memtable: &Memtable,
+    index_id: u64,
+    prop_value: &PropValue,
+    snapshot_seq: u64,
+    max_ids: Option<usize>,
+) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for value_hash in equality_probe_value_hashes(prop_value) {
+        let remaining = max_ids.map(|max_ids| max_ids.saturating_sub(ids.len()));
+        if remaining == Some(0) {
+            break;
+        }
+        ids.extend(memtable.find_secondary_eq_nodes_by_hash_at_limited(
+            index_id,
+            value_hash,
+            snapshot_seq,
+            remaining,
+        ));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn memtable_secondary_eq_count_for_filter(
+    memtable: &Memtable,
+    index_id: u64,
+    prop_key: &str,
+    prop_value: &PropValue,
+    snapshot_seq: u64,
+) -> usize {
+    let Some(probe_values) = signed_zero_equality_probe_values(prop_value) else {
+        return memtable.secondary_eq_node_count_at(index_id, prop_key, prop_value, snapshot_seq);
+    };
+
+    probe_values
+        .iter()
+        .map(|probe_value| {
+            memtable.secondary_eq_node_count_at(index_id, prop_key, probe_value, snapshot_seq)
+        })
+        .sum()
+}
+
+fn segment_secondary_eq_ids_for_filter(
+    segment: &SegmentReader,
+    index_id: u64,
+    prop_value: &PropValue,
+) -> Result<Option<Vec<u64>>, EngineError> {
+    let Some(probe_values) = signed_zero_equality_probe_values(prop_value) else {
+        return segment
+            .find_nodes_by_secondary_eq_index_if_present(index_id, hash_prop_value(prop_value));
+    };
+
+    let mut ids = Vec::new();
+    for probe_value in &probe_values {
+        let Some(mut probe_ids) = segment
+            .find_nodes_by_secondary_eq_index_if_present(index_id, hash_prop_value(probe_value))?
+        else {
+            return Ok(None);
+        };
+        ids.append(&mut probe_ids);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(Some(ids))
+}
+
+fn segment_secondary_eq_posting_count_for_filter(
+    segment: &SegmentReader,
+    index_id: u64,
+    prop_value: &PropValue,
+) -> Result<Option<usize>, EngineError> {
+    let Some(probe_values) = signed_zero_equality_probe_values(prop_value) else {
+        return segment.secondary_eq_posting_count_if_present(index_id, hash_prop_value(prop_value));
+    };
+
+    let mut count = 0usize;
+    for probe_value in &probe_values {
+        let Some(probe_count) =
+            segment.secondary_eq_posting_count_if_present(index_id, hash_prop_value(probe_value))?
+        else {
+            return Ok(None);
+        };
+        count = count.saturating_add(probe_count);
+    }
+    Ok(Some(count))
+}
+
 #[derive(Clone, Debug)]
 struct RangeScanMatch {
     encoded_value: u64,
@@ -154,6 +347,24 @@ struct ReadyRangeSource<'a> {
 }
 
 type ReadyEqualitySourceIds = (Vec<u64>, Vec<Vec<u64>>, NodeIdSet);
+
+fn push_unique_candidate_id_limited(
+    ids: &mut Vec<u64>,
+    seen: &mut NodeIdSet,
+    node_id: u64,
+    max_ids: usize,
+) -> ControlFlow<()> {
+    if max_ids == 0 {
+        return ControlFlow::Break(());
+    }
+    if seen.insert(node_id) {
+        ids.push(node_id);
+        if ids.len() >= max_ids {
+            return ControlFlow::Break(());
+        }
+    }
+    ControlFlow::Continue(())
+}
 
 impl ReadyRangeSource<'_> {
     fn next_entry(&mut self) -> Result<ReadyRangeSourceStep, EngineError> {
@@ -490,19 +701,26 @@ impl ReadView {
         ),
         EngineError,
     > {
-        let memtable_ids = self
-            .memtable
-            .find_secondary_eq_nodes_at(index_id, prop_key, prop_value, self.snapshot_seq);
+        let memtable_ids = memtable_secondary_eq_nodes_for_filter(
+            &self.memtable,
+            index_id,
+            prop_key,
+            prop_value,
+            self.snapshot_seq,
+        );
         let mut memtable_verified: NodeIdSet = memtable_ids.iter().copied().collect();
         let mut deleted_above = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
-        let value_hash = hash_prop_value(prop_value);
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
 
         for epoch in &self.immutable_epochs {
-            let ids: Vec<u64> = epoch
-                .memtable
-                .find_secondary_eq_nodes_at(index_id, prop_key, prop_value, self.snapshot_seq)
+            let ids: Vec<u64> = memtable_secondary_eq_nodes_for_filter(
+                &epoch.memtable,
+                index_id,
+                prop_key,
+                prop_value,
+                self.snapshot_seq,
+            )
                 .into_iter()
                 .filter(|id| !deleted_above.contains(id))
                 .collect();
@@ -512,8 +730,7 @@ impl ReadView {
         }
 
         for seg in &self.segments {
-            let ids = match seg.find_nodes_by_secondary_eq_index_if_present(index_id, value_hash)
-            {
+            let ids = match segment_secondary_eq_ids_for_filter(seg, index_id, prop_value) {
                 Ok(Some(ids)) => ids,
                 Ok(None) => {
                     return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
@@ -534,6 +751,450 @@ impl ReadView {
         }
 
         Ok((Some((memtable_ids, segment_ids, memtable_verified)), None))
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn extend_verified_equality_candidates_from_segment_postings(
+        &self,
+        segment: &SegmentReader,
+        index_id: u64,
+        value_hash: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+        max_ids: usize,
+        mut raw_posting_budget: Option<&mut EqualityRawPostingBudget>,
+        accepted: &mut NodeIdSet,
+    ) -> Result<Option<EqualitySegmentPostingScan>, EngineError> {
+        let mut posting_offset = 0usize;
+        loop {
+            let raw_limit = if let Some(budget) = raw_posting_budget.as_ref() {
+                match budget.next_chunk_limit() {
+                    Some(limit) if limit > 0 => limit,
+                    _ => return Ok(Some(EqualitySegmentPostingScan::RawCapExceeded)),
+                }
+            } else {
+                QUERY_VERIFY_CHUNK
+            };
+            let chunk_start = posting_offset;
+            let Some(chunk) = segment.secondary_eq_posting_chunk_if_present(
+                index_id,
+                value_hash,
+                posting_offset,
+                raw_limit,
+            )?
+            else {
+                return Ok(None);
+            };
+            posting_offset = chunk.next_offset;
+            if let Some(budget) = raw_posting_budget.as_mut() {
+                if budget.consume(posting_offset.saturating_sub(chunk_start)) {
+                    return Ok(Some(EqualitySegmentPostingScan::RawCapExceeded));
+                }
+            }
+            if self.extend_verified_equality_candidates(
+                chunk.ids, prop_key, prop_value, max_ids, accepted,
+            )? {
+                return Ok(Some(EqualitySegmentPostingScan::AcceptedCapReached));
+            }
+            if chunk.exhausted {
+                return Ok(Some(EqualitySegmentPostingScan::Exhausted));
+            }
+        }
+    }
+
+    fn extend_raw_equality_candidates_from_segment_postings(
+        &self,
+        segment: &SegmentReader,
+        index_id: u64,
+        value_hash: u64,
+        raw_posting_budget: &mut EqualityRawPostingBudget,
+        deleted_above: &NodeIdSet,
+        accepted: &mut NodeIdSet,
+    ) -> Result<Option<EqualitySegmentPostingScan>, EngineError> {
+        let mut posting_offset = 0usize;
+        loop {
+            let raw_limit = match raw_posting_budget.next_chunk_limit() {
+                Some(limit) if limit > 0 => limit,
+                _ => return Ok(Some(EqualitySegmentPostingScan::RawCapExceeded)),
+            };
+            let chunk_start = posting_offset;
+            let Some(chunk) = segment.secondary_eq_posting_chunk_if_present(
+                index_id,
+                value_hash,
+                posting_offset,
+                raw_limit,
+            )?
+            else {
+                return Ok(None);
+            };
+            posting_offset = chunk.next_offset;
+            if raw_posting_budget.consume(posting_offset.saturating_sub(chunk_start)) {
+                return Ok(Some(EqualitySegmentPostingScan::RawCapExceeded));
+            }
+            accepted.extend(chunk.ids.into_iter().filter(|id| !deleted_above.contains(id)));
+            if chunk.exhausted {
+                return Ok(Some(EqualitySegmentPostingScan::Exhausted));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn ready_equality_candidate_ids_limited(
+        &self,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+        max_ids: Option<usize>,
+    ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        self.ready_equality_candidate_ids_limited_internal(
+            index_id, prop_key, prop_value, max_ids, None,
+        )
+    }
+
+    #[cfg(test)]
+    fn ready_equality_candidate_ids_limited_by_raw_postings(
+        &self,
+        index_id: u64,
+        prop_value: &PropValue,
+        raw_posting_cap: usize,
+    ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        self.ready_equality_candidate_ids_raw_limited(
+            index_id,
+            prop_value,
+            raw_posting_cap,
+        )
+    }
+
+    fn ready_equality_candidate_ids_raw_limited(
+        &self,
+        index_id: u64,
+        prop_value: &PropValue,
+        raw_posting_cap: usize,
+    ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        let mut raw_posting_budget = EqualityRawPostingBudget::new(raw_posting_cap);
+        let mut accepted = NodeIdSet::default();
+
+        let raw_limit = match raw_posting_budget.next_chunk_limit() {
+            Some(limit) if limit > 0 => limit,
+            _ => return Ok((None, None)),
+        };
+        let ids = memtable_secondary_eq_raw_nodes_for_filter(
+            &self.memtable,
+            index_id,
+            prop_value,
+            self.snapshot_seq,
+            Some(raw_limit),
+        );
+        if raw_posting_budget.consume(ids.len()) {
+            return Ok((None, None));
+        }
+        accepted.extend(ids);
+
+        let mut deleted_above = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
+        for epoch in &self.immutable_epochs {
+            let raw_limit = match raw_posting_budget.next_chunk_limit() {
+                Some(limit) if limit > 0 => limit,
+                _ => return Ok((None, None)),
+            };
+            let ids = memtable_secondary_eq_raw_nodes_for_filter(
+                &epoch.memtable,
+                index_id,
+                prop_value,
+                self.snapshot_seq,
+                Some(raw_limit),
+            );
+            if raw_posting_budget.consume(ids.len()) {
+                return Ok((None, None));
+            }
+            accepted.extend(ids.into_iter().filter(|id| !deleted_above.contains(id)));
+            deleted_above.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
+        }
+
+        for segment in &self.segments {
+            for value_hash in equality_probe_value_hashes(prop_value) {
+                match self.extend_raw_equality_candidates_from_segment_postings(
+                    segment,
+                    index_id,
+                    value_hash,
+                    &mut raw_posting_budget,
+                    &deleted_above,
+                    &mut accepted,
+                ) {
+                    Ok(Some(EqualitySegmentPostingScan::RawCapExceeded)) => {
+                        return Ok((None, None));
+                    }
+                    Ok(Some(EqualitySegmentPostingScan::Exhausted)) => {}
+                    #[cfg(test)]
+                    Ok(Some(EqualitySegmentPostingScan::AcceptedCapReached)) => {}
+                    Ok(None) => {
+                        return Ok((
+                            None,
+                            self.equality_sidecar_failure_followup(index_id, None),
+                        ));
+                    }
+                    Err(error) => {
+                        return Ok((
+                            None,
+                            self.equality_sidecar_failure_followup(index_id, Some(error)),
+                        ));
+                    }
+                }
+            }
+            deleted_above.extend(segment.deleted_node_ids());
+        }
+
+        let mut ids: Vec<u64> = accepted.into_iter().collect();
+        ids.sort_unstable();
+        Ok((Some(ids), None))
+    }
+
+    #[cfg(test)]
+    fn ready_equality_candidate_ids_limited_internal(
+        &self,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+        max_ids: Option<usize>,
+        raw_posting_cap: Option<usize>,
+    ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        let Some(max_ids) = max_ids else {
+            let (sources, followup) =
+                self.ready_equality_source_ids(index_id, prop_key, prop_value)?;
+            let Some((memtable_ids, segment_ids, _memtable_verified)) = sources else {
+                return Ok((None, followup));
+            };
+
+            let deleted = NodeIdSet::default();
+            let page = PageRequest::default();
+            let merged = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &page);
+            return Ok((Some(merged.items), followup));
+        };
+
+        let mut raw_posting_budget = raw_posting_cap.map(EqualityRawPostingBudget::new);
+        if let Some(probe_values) = signed_zero_equality_probe_values(prop_value) {
+            let mut accepted = NodeIdSet::default();
+            for node_id in memtable_secondary_eq_nodes_for_filter(
+                &self.memtable,
+                index_id,
+                prop_key,
+                prop_value,
+                self.snapshot_seq,
+            ) {
+                accepted.insert(node_id);
+                if accepted.len() >= max_ids {
+                    let mut ids: Vec<u64> = accepted.into_iter().collect();
+                    ids.sort_unstable();
+                    return Ok((Some(ids), None));
+                }
+            }
+
+            for epoch in &self.immutable_epochs {
+                let ids = memtable_secondary_eq_nodes_for_filter(
+                    &epoch.memtable,
+                    index_id,
+                    prop_key,
+                    prop_value,
+                    self.snapshot_seq,
+                );
+                if self.extend_verified_equality_candidates(
+                    ids,
+                    prop_key,
+                    prop_value,
+                    max_ids,
+                    &mut accepted,
+                )? {
+                    let mut ids: Vec<u64> = accepted.into_iter().collect();
+                    ids.sort_unstable();
+                    return Ok((Some(ids), None));
+                }
+            }
+
+            for segment in &self.segments {
+                for probe_value in &probe_values {
+                    match self.extend_verified_equality_candidates_from_segment_postings(
+                        segment,
+                        index_id,
+                        hash_prop_value(probe_value),
+                        prop_key,
+                        prop_value,
+                        max_ids,
+                        raw_posting_budget.as_mut(),
+                        &mut accepted,
+                    ) {
+                        Ok(Some(EqualitySegmentPostingScan::AcceptedCapReached)) => {
+                            let mut ids: Vec<u64> = accepted.into_iter().collect();
+                            ids.sort_unstable();
+                            return Ok((Some(ids), None));
+                        }
+                        Ok(Some(EqualitySegmentPostingScan::RawCapExceeded)) => {
+                            return Ok((None, None));
+                        }
+                        Ok(Some(EqualitySegmentPostingScan::Exhausted)) => {}
+                        Ok(None) => {
+                            return Ok((
+                                None,
+                                self.equality_sidecar_failure_followup(index_id, None),
+                            ));
+                        }
+                        Err(error) => {
+                            return Ok((
+                                None,
+                                self.equality_sidecar_failure_followup(index_id, Some(error)),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let mut ids: Vec<u64> = accepted.into_iter().collect();
+            ids.sort_unstable();
+            return Ok((Some(ids), None));
+        }
+
+        let mut accepted = NodeIdSet::default();
+        let memtable_ids = self.memtable.find_secondary_eq_nodes_at_limited(
+            index_id,
+            prop_key,
+            prop_value,
+            self.snapshot_seq,
+            Some(max_ids),
+        );
+        for node_id in memtable_ids {
+            accepted.insert(node_id);
+            if accepted.len() >= max_ids {
+                break;
+            }
+        }
+        if accepted.len() >= max_ids {
+            let mut ids: Vec<u64> = accepted.into_iter().collect();
+            ids.sort_unstable();
+            return Ok((Some(ids), None));
+        }
+
+        for epoch in &self.immutable_epochs {
+            let ids = memtable_secondary_eq_nodes_for_filter(
+                &epoch.memtable,
+                index_id,
+                prop_key,
+                prop_value,
+                self.snapshot_seq,
+            );
+            if self.extend_verified_equality_candidates(
+                ids,
+                prop_key,
+                prop_value,
+                max_ids,
+                &mut accepted,
+            )? {
+                let mut ids: Vec<u64> = accepted.into_iter().collect();
+                ids.sort_unstable();
+                return Ok((Some(ids), None));
+            }
+        }
+
+        for seg in &self.segments {
+            match self.extend_verified_equality_candidates_from_segment_postings(
+                seg,
+                index_id,
+                hash_prop_value(prop_value),
+                prop_key,
+                prop_value,
+                max_ids,
+                raw_posting_budget.as_mut(),
+                &mut accepted,
+            ) {
+                Ok(Some(EqualitySegmentPostingScan::AcceptedCapReached)) => {
+                    let mut ids: Vec<u64> = accepted.into_iter().collect();
+                    ids.sort_unstable();
+                    return Ok((Some(ids), None));
+                }
+                Ok(Some(EqualitySegmentPostingScan::RawCapExceeded)) => {
+                    return Ok((None, None));
+                }
+                Ok(Some(EqualitySegmentPostingScan::Exhausted)) => {}
+                Ok(None) => {
+                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                }
+                Err(error) => {
+                    return Ok((
+                        None,
+                        self.equality_sidecar_failure_followup(index_id, Some(error)),
+                    ));
+                }
+            }
+        }
+
+        let mut ids: Vec<u64> = accepted.into_iter().collect();
+        ids.sort_unstable();
+        Ok((Some(ids), None))
+    }
+
+    fn ready_equality_candidate_ids_from_postings(
+        &self,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+        limit: usize,
+    ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        let (sources, followup) =
+            self.ready_equality_source_ids(index_id, prop_key, prop_value)?;
+        let Some((memtable_ids, segment_ids, _memtable_verified)) = sources else {
+            return Ok((None, followup));
+        };
+
+        let deleted = NodeIdSet::default();
+        let page = PageRequest {
+            limit: Some(limit),
+            after: None,
+        };
+        let merged = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &page);
+        Ok((Some(merged.items), followup))
+    }
+
+    #[cfg(test)]
+    fn extend_verified_equality_candidates(
+        &self,
+        candidate_ids: Vec<u64>,
+        prop_key: &str,
+        prop_value: &PropValue,
+        max_ids: usize,
+        accepted: &mut NodeIdSet,
+    ) -> Result<bool, EngineError> {
+        if candidate_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let mut ids: Vec<u64> = candidate_ids
+            .into_iter()
+            .filter(|id| !accepted.contains(id))
+            .collect();
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+
+        #[cfg(test)]
+        self.note_equality_materialization_record_reads(ids.len());
+        let nodes = self.get_nodes_raw(&ids)?;
+        for (&node_id, node) in ids.iter().zip(nodes.iter()) {
+            let Some(node) = node.as_ref() else {
+                continue;
+            };
+            if node
+                .props
+                .get(prop_key)
+                .is_some_and(|candidate| candidate == prop_value)
+            {
+                accepted.insert(node_id);
+                if accepted.len() >= max_ids {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     fn range_sidecar_failure_followup(
@@ -592,6 +1253,74 @@ impl ReadView {
         ))
     }
 
+    fn scan_type_ids_unfiltered<F>(
+        &self,
+        type_id: u32,
+        start_after: Option<u64>,
+        mut visitor: F,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(u64) -> ControlFlow<()>,
+    {
+        let deleted = self.sources().collect_deleted_nodes();
+        let sources = self.type_scan_node_sources(type_id)?;
+        let mut heap = BinaryHeap::new();
+        for (source_index, source) in sources.iter().enumerate() {
+            let start = source.seek_after(start_after)?;
+            if let Some(node_id) = source.get_id(start)? {
+                heap.push(Reverse((node_id, source_index, start)));
+            }
+        }
+
+        let mut last_seen = None;
+        while let Some(Reverse((node_id, source_index, offset))) = heap.pop() {
+            let next_offset = offset + 1;
+            if let Some(next_id) = sources[source_index].get_id(next_offset)? {
+                heap.push(Reverse((next_id, source_index, next_offset)));
+            }
+
+            if last_seen == Some(node_id) {
+                continue;
+            }
+            last_seen = Some(node_id);
+            if deleted.contains(&node_id) {
+                continue;
+            }
+            if visitor(node_id).is_break() {
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn type_scan_node_sources(
+        &self,
+        type_id: u32,
+    ) -> Result<Vec<TypeScanNodeSource<'_>>, EngineError> {
+        let mut sources = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
+        sources.push(TypeScanNodeSource::Owned(
+            self.memtable
+                .visible_nodes_by_type(type_id, self.snapshot_seq),
+        ));
+        for epoch in &self.immutable_epochs {
+            sources.push(TypeScanNodeSource::Owned(
+                epoch
+                    .memtable
+                    .visible_nodes_by_type(type_id, self.snapshot_seq),
+            ));
+        }
+        for segment in &self.segments {
+            if let Some(posting) = segment.node_type_posting(type_id)? {
+                sources.push(TypeScanNodeSource::Segment {
+                    segment: segment.as_ref(),
+                    posting,
+                });
+            }
+        }
+        Ok(sources)
+    }
+
     fn scan_nodes_by_type_filtered<F>(
         &self,
         type_id: u32,
@@ -603,42 +1332,72 @@ impl ReadView {
     where
         F: FnMut(u64, &NodeRecord) -> Result<ControlFlow<()>, EngineError>,
     {
-        let mut cursor = start_after;
         let chunk_limit = chunk_limit.max(1);
+        let sources = self.type_scan_node_sources(type_id)?;
+        let mut heap = BinaryHeap::new();
+        for (source_index, source) in sources.iter().enumerate() {
+            let start = source.seek_after(start_after)?;
+            if let Some(node_id) = source.get_id(start)? {
+                heap.push(Reverse((node_id, source_index, start)));
+            }
+        }
 
-        loop {
-            let chunk = self.nodes_by_type_paged_unfiltered(
-                type_id,
-                &PageRequest {
-                    limit: Some(chunk_limit),
-                    after: cursor,
-                },
-            )?;
-            if chunk.items.is_empty() {
-                return Ok(());
+        let mut chunk = Vec::with_capacity(chunk_limit);
+        let mut last_seen = None;
+        while let Some(Reverse((node_id, source_index, offset))) = heap.pop() {
+            let next_offset = offset + 1;
+            if let Some(next_id) = sources[source_index].get_id(next_offset)? {
+                heap.push(Reverse((next_id, source_index, next_offset)));
             }
 
-            let nodes = self.get_nodes_raw(&chunk.items)?;
-            for (&node_id, node) in chunk.items.iter().zip(nodes.iter()) {
-                let Some(node) = node.as_ref() else {
-                    continue;
-                };
-                if node.type_id != type_id {
-                    continue;
-                }
-                if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                    continue;
-                }
-                if visitor(node_id, node)?.is_break() {
+            if last_seen == Some(node_id) {
+                continue;
+            }
+            last_seen = Some(node_id);
+            chunk.push(node_id);
+            if chunk.len() >= chunk_limit {
+                if self
+                    .visit_type_scan_chunk(type_id, &chunk, policy_cutoffs, &mut visitor)?
+                    .is_break()
+                {
                     return Ok(());
                 }
+                chunk.clear();
             }
-
-            let Some(next_cursor) = chunk.next_cursor else {
-                return Ok(());
-            };
-            cursor = Some(next_cursor);
         }
+
+        if !chunk.is_empty() {
+            let _ = self.visit_type_scan_chunk(type_id, &chunk, policy_cutoffs, &mut visitor)?;
+        }
+        Ok(())
+    }
+
+    fn visit_type_scan_chunk<F>(
+        &self,
+        type_id: u32,
+        chunk: &[u64],
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        visitor: &mut F,
+    ) -> Result<ControlFlow<()>, EngineError>
+    where
+        F: FnMut(u64, &NodeRecord) -> Result<ControlFlow<()>, EngineError>,
+    {
+        let nodes = self.get_nodes_raw(chunk)?;
+        for (&node_id, node) in chunk.iter().zip(nodes.iter()) {
+            let Some(node) = node.as_ref() else {
+                continue;
+            };
+            if node.type_id != type_id {
+                continue;
+            }
+            if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
+                continue;
+            }
+            if visitor(node_id, node)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
     }
 
     fn validate_property_range_bounds(
@@ -1076,6 +1835,115 @@ impl ReadView {
         owners
             .get(&node_id)
             .is_some_and(|owner_idx| *owner_idx < source_idx)
+    }
+
+    fn ready_range_candidate_ids(
+        &self,
+        index_id: u64,
+        domain: SecondaryIndexRangeDomain,
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+        max_ids: usize,
+    ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        let lower_encoded = Self::encode_property_range_bound(domain, lower);
+        let upper_encoded = Self::encode_property_range_bound(domain, upper);
+        let mut ids = Vec::with_capacity(max_ids.min(4096));
+        let mut seen = NodeIdSet::default();
+
+        for seg in &self.segments {
+            match seg.find_nodes_by_secondary_range_index_if_present_limited(
+                index_id,
+                lower_encoded,
+                upper_encoded,
+                None,
+                Some(1),
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Ok((None, self.range_sidecar_failure_followup(index_id, None)));
+                }
+                Err(error) => {
+                    return Ok((
+                        None,
+                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                    ));
+                }
+            }
+        }
+
+        let flow = self.memtable.for_each_visible_secondary_range_entry_at(
+            index_id,
+            lower_encoded,
+            upper_encoded,
+            None,
+            self.snapshot_seq,
+            &mut |(_, node_id)| {
+                push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
+            },
+        );
+        if flow.is_break() {
+            ids.sort_unstable();
+            return Ok((Some(ids), None));
+        }
+
+        for epoch in &self.immutable_epochs {
+            let flow = epoch.memtable.for_each_visible_secondary_range_entry_at(
+                index_id,
+                lower_encoded,
+                upper_encoded,
+                None,
+                self.snapshot_seq,
+                &mut |(_, node_id)| {
+                    push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
+                },
+            );
+            if flow.is_break() {
+                ids.sort_unstable();
+                return Ok((Some(ids), None));
+            }
+        }
+
+        let chunk_size = max_ids.clamp(1, 512);
+        for seg in &self.segments {
+            let mut source = Self::ready_range_segment_source(
+                seg,
+                index_id,
+                lower_encoded,
+                upper_encoded,
+                None,
+                chunk_size,
+            );
+            loop {
+                match source.next_entry() {
+                    Ok(ReadyRangeSourceStep::Entry((_, node_id))) => {
+                        if push_unique_candidate_id_limited(
+                            &mut ids,
+                            &mut seen,
+                            node_id,
+                            max_ids,
+                        )
+                        .is_break()
+                        {
+                            ids.sort_unstable();
+                            return Ok((Some(ids), None));
+                        }
+                    }
+                    Ok(ReadyRangeSourceStep::Exhausted) => break,
+                    Ok(ReadyRangeSourceStep::MissingSidecar) => {
+                        return Ok((None, self.range_sidecar_failure_followup(index_id, None)));
+                    }
+                    Err(error) => {
+                        return Ok((
+                            None,
+                            self.range_sidecar_failure_followup(index_id, Some(error)),
+                        ));
+                    }
+                }
+            }
+        }
+
+        ids.sort_unstable();
+        Ok((Some(ids), None))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2609,6 +3477,63 @@ impl ReadView {
             items,
             next_cursor: id_page.next_cursor,
         })
+    }
+
+    fn timestamp_candidate_ids(
+        &self,
+        type_id: u32,
+        from_ms: i64,
+        to_ms: i64,
+        max_ids: usize,
+    ) -> Result<Vec<u64>, EngineError> {
+        if from_ms > to_ms || max_ids == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut ids = Vec::with_capacity(max_ids.min(4096));
+        let mut seen = NodeIdSet::default();
+        let flow = self.memtable.for_each_visible_node_by_time_range_at(
+            type_id,
+            from_ms,
+            to_ms,
+            self.snapshot_seq,
+            &mut |node_id| {
+                push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
+            },
+        );
+        if flow.is_break() {
+            ids.sort_unstable();
+            return Ok(ids);
+        }
+
+        for epoch in &self.immutable_epochs {
+            let flow = epoch.memtable.for_each_visible_node_by_time_range_at(
+                type_id,
+                from_ms,
+                to_ms,
+                self.snapshot_seq,
+                &mut |node_id| {
+                    push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
+                },
+            );
+            if flow.is_break() {
+                ids.sort_unstable();
+                return Ok(ids);
+            }
+        }
+
+        for seg in &self.segments {
+            let flow = seg.for_each_node_by_time_range(type_id, from_ms, to_ms, |node_id| {
+                push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
+            })?;
+            if flow.is_break() {
+                ids.sort_unstable();
+                return Ok(ids);
+            }
+        }
+
+        ids.sort_unstable();
+        Ok(ids)
     }
 
     fn find_nodes_outcome(

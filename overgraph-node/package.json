@@ -1,6 +1,6 @@
 {
   "name": "overgraph",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "An absurdly fast embedded graph database for Node.js. Sub-microsecond reads, pure Rust core.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -35,6 +35,7 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "query-types.d.ts",
     "*.node",
     "README.md"
   ]

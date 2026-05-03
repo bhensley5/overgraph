@@ -6,16 +6,19 @@ use napi_derive::napi;
 use overgraph::{
     AdjacencyExport, AllShortestPathsOptions, CompactionPhase, CompactionStats, ComponentOptions,
     DatabaseEngine, DbOptions, DbStats, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
-    EdgeInput, EdgeRecord, EngineError, ExportOptions, FusionMode, GraphPatch, HnswConfig,
-    IsConnectedOptions, NeighborEntry, NeighborOptions, NodeIdMap, NodeInput,
-    NodePropertyIndexInfo, NodeRecord, PageRequest, PageResult, PprAlgorithm, PprOptions,
-    PprResult, PropValue, PropertyRangeBound, PropertyRangeCursor, PropertyRangePageRequest,
-    PropertyRangePageResult, PrunePolicy, PruneResult, ScoringMode, SecondaryIndexKind,
-    SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPath, ShortestPathOptions, Subgraph,
-    SubgraphOptions, TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult,
-    TraverseOptions, TxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef,
-    TxnNodeView, UpsertEdgeOptions, UpsertNodeOptions, VectorHit, VectorSearchMode,
-    VectorSearchRequest, VectorSearchScope, WalSyncMode, WriteTxn,
+    EdgeInput, EdgePattern, EdgePostFilterPredicate, EdgeRecord, EngineError, ExportOptions,
+    FusionMode, GraphPatch, GraphPatternQuery, HnswConfig, IsConnectedOptions, NeighborEntry,
+    NeighborOptions, NodeFilterExpr, NodeIdMap, NodeInput, NodePattern, NodePropertyIndexInfo,
+    NodeQuery, NodeQueryOrder, NodeRecord, PageRequest, PageResult, PatternOrder, PprAlgorithm,
+    PprOptions, PprResult, PropValue, PropertyRangeBound, PropertyRangeCursor,
+    PropertyRangePageRequest, PropertyRangePageResult, PrunePolicy, PruneResult, QueryMatch,
+    QueryNodeIdsResult, QueryNodesResult, QueryPatternResult, QueryPlan, QueryPlanKind,
+    QueryPlanNode, QueryPlanWarning, ScoringMode, SecondaryIndexKind, SecondaryIndexRangeDomain,
+    SecondaryIndexState, ShortestPath, ShortestPathOptions, Subgraph, SubgraphOptions, TopKOptions,
+    TraversalCursor, TraversalHit, TraversalPageResult, TraverseOptions, TxnCommitResult,
+    TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef, TxnNodeView, UpsertEdgeOptions,
+    UpsertNodeOptions, VectorHit, VectorSearchMode, VectorSearchRequest, VectorSearchScope,
+    WalSyncMode, WriteTxn,
 };
 
 /// ThreadsafeFunction with `CalleeHandled = false` so the JS callback
@@ -27,6 +30,24 @@ type ProgressTsfn = napi::threadsafe_function::ThreadsafeFunction<
     Status,
     false,
 >;
+
+pub struct JsJsonValue(serde_json::Value);
+
+impl TypeName for JsJsonValue {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for JsJsonValue {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        unsafe { serde_json::Value::to_napi_value(env, val.0) }
+    }
+}
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
@@ -778,6 +799,56 @@ impl OverGraph {
         let pv = json_to_prop_value(&prop_value);
         let ids = with_engine_ref(self, |eng| eng.find_nodes(type_id, &prop_key, &pv))?;
         ids_to_float64_array(&ids)
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryNodeRequest",
+        ts_return_type = "JsIdPageResult"
+    )]
+    pub fn query_node_ids(&self, request: serde_json::Value) -> Result<JsIdPageResult> {
+        let query = parse_js_node_query(&request)?;
+        let result = with_engine_ref(self, |eng| eng.query_node_ids(&query))?;
+        query_node_ids_to_js(result)
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryNodeRequest",
+        ts_return_type = "JsNodePageResult"
+    )]
+    pub fn query_nodes(&self, request: serde_json::Value) -> Result<JsNodePageResult> {
+        let query = parse_js_node_query(&request)?;
+        let result = with_engine_ref(self, |eng| eng.query_nodes(&query))?;
+        query_nodes_to_js(result)
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').GraphPatternRequest",
+        ts_return_type = "import('./query-types').QueryPatternResult"
+    )]
+    pub fn query_pattern(&self, request: serde_json::Value) -> Result<JsJsonValue> {
+        let query = parse_js_graph_pattern_query(&request)?;
+        let result = with_engine_ref(self, |eng| eng.query_pattern(&query))?;
+        query_pattern_result_to_js(result)
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryNodeRequest",
+        ts_return_type = "import('./query-types').QueryPlan"
+    )]
+    pub fn explain_node_query(&self, request: serde_json::Value) -> Result<JsJsonValue> {
+        let query = parse_js_node_query(&request)?;
+        let plan = with_engine_ref(self, |eng| eng.explain_node_query(&query))?;
+        query_plan_to_js(plan)
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').GraphPatternRequest",
+        ts_return_type = "import('./query-types').QueryPlan"
+    )]
+    pub fn explain_pattern_query(&self, request: serde_json::Value) -> Result<JsJsonValue> {
+        let query = parse_js_graph_pattern_query(&request)?;
+        let plan = with_engine_ref(self, |eng| eng.explain_pattern_query(&query))?;
+        query_plan_to_js(plan)
     }
 
     #[napi]
@@ -1758,6 +1829,86 @@ impl OverGraph {
             move |eng| eng.find_nodes(type_id, &prop_key, &pv),
             |ids| ids_to_float64_array(&ids),
         ))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryNodeRequest",
+        ts_return_type = "Promise<JsIdPageResult>"
+    )]
+    pub fn query_node_ids_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<QueryNodeIdsResult, JsIdPageResult>>> {
+        let query = parse_js_node_query(&request)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.query_node_ids(&query),
+            query_node_ids_to_js,
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryNodeRequest",
+        ts_return_type = "Promise<JsNodePageResult>"
+    )]
+    pub fn query_nodes_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<QueryNodesResult, JsNodePageResult>>> {
+        let query = parse_js_node_query(&request)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.query_nodes(&query),
+            query_nodes_to_js,
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').GraphPatternRequest",
+        ts_return_type = "Promise<import('./query-types').QueryPatternResult>"
+    )]
+    pub fn query_pattern_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<QueryPatternResult, JsJsonValue>>> {
+        let query = parse_js_graph_pattern_query(&request)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.query_pattern(&query),
+            query_pattern_result_to_js,
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryNodeRequest",
+        ts_return_type = "Promise<import('./query-types').QueryPlan>"
+    )]
+    pub fn explain_node_query_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<QueryPlan, JsJsonValue>>> {
+        let query = parse_js_node_query(&request)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.explain_node_query(&query),
+            query_plan_to_js,
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').GraphPatternRequest",
+        ts_return_type = "Promise<import('./query-types').QueryPlan>"
+    )]
+    pub fn explain_pattern_query_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<QueryPlan, JsJsonValue>>> {
+        let query = parse_js_graph_pattern_query(&request)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.explain_pattern_query(&query),
+            query_plan_to_js,
+        )))
     }
 
     #[napi(ts_return_type = "Promise<JsNodePropertyIndexInfo>")]
@@ -4048,6 +4199,959 @@ fn make_page_request(limit: Option<u32>, after: Option<f64>) -> napi::Result<Pag
         limit: limit.map(|l| l as usize),
         after: after_val,
     })
+}
+
+fn query_node_ids_to_js(result: QueryNodeIdsResult) -> Result<JsIdPageResult> {
+    Ok(JsIdPageResult {
+        items: ids_to_float64_array(&result.items)?,
+        next_cursor: result.next_cursor.map(u64_to_f64).transpose()?,
+    })
+}
+
+fn query_nodes_to_js(result: QueryNodesResult) -> Result<JsNodePageResult> {
+    Ok(JsNodePageResult {
+        items_vec: result
+            .items
+            .into_iter()
+            .map(JsNodeRecord::try_from)
+            .collect::<Result<Vec<_>>>()?,
+        cursor: result.next_cursor,
+    })
+}
+
+fn query_pattern_result_to_js(result: QueryPatternResult) -> Result<JsJsonValue> {
+    Ok(JsJsonValue(serde_json::json!({
+        "matches": result
+            .matches
+            .into_iter()
+            .map(query_match_to_js)
+            .collect::<Result<Vec<_>>>()?,
+        "truncated": result.truncated,
+    })))
+}
+
+fn query_match_to_js(match_: QueryMatch) -> Result<serde_json::Value> {
+    let mut nodes = serde_json::Map::new();
+    for (alias, id) in match_.nodes {
+        nodes.insert(alias, serde_json::json!(u64_to_f64(id)?));
+    }
+    let mut edges = serde_json::Map::new();
+    for (alias, id) in match_.edges {
+        edges.insert(alias, serde_json::json!(u64_to_f64(id)?));
+    }
+    Ok(serde_json::json!({
+        "nodes": nodes,
+        "edges": edges,
+    }))
+}
+
+fn query_plan_to_js(plan: QueryPlan) -> Result<JsJsonValue> {
+    Ok(JsJsonValue(serde_json::json!({
+        "kind": query_plan_kind_to_js(&plan.kind),
+        "root": query_plan_node_to_js(plan.root),
+        "estimatedCandidates": plan.estimated_candidates.map(|count| count as f64),
+        "warnings": plan
+            .warnings
+            .iter()
+            .map(query_plan_warning_to_js)
+            .collect::<Vec<_>>(),
+    })))
+}
+
+fn query_plan_kind_to_js(kind: &QueryPlanKind) -> &'static str {
+    match kind {
+        QueryPlanKind::NodeQuery => "node_query",
+        QueryPlanKind::PatternQuery => "pattern_query",
+    }
+}
+
+fn query_plan_node_to_js(node: QueryPlanNode) -> serde_json::Value {
+    match node {
+        QueryPlanNode::ExplicitIds => serde_json::json!({ "kind": "explicit_ids" }),
+        QueryPlanNode::KeyLookup => serde_json::json!({ "kind": "key_lookup" }),
+        QueryPlanNode::NodeTypeIndex => serde_json::json!({ "kind": "node_type_index" }),
+        QueryPlanNode::PropertyEqualityIndex => {
+            serde_json::json!({ "kind": "property_equality_index" })
+        }
+        QueryPlanNode::PropertyRangeIndex => {
+            serde_json::json!({ "kind": "property_range_index" })
+        }
+        QueryPlanNode::TimestampIndex => serde_json::json!({ "kind": "timestamp_index" }),
+        QueryPlanNode::AdjacencyExpansion => serde_json::json!({ "kind": "adjacency_expansion" }),
+        QueryPlanNode::Intersect { inputs } => serde_json::json!({
+            "kind": "intersect",
+            "inputs": inputs.into_iter().map(query_plan_node_to_js).collect::<Vec<_>>(),
+        }),
+        QueryPlanNode::Union { inputs } => serde_json::json!({
+            "kind": "union",
+            "inputs": inputs.into_iter().map(query_plan_node_to_js).collect::<Vec<_>>(),
+        }),
+        QueryPlanNode::VerifyNodeFilter { input } => serde_json::json!({
+            "kind": "verify_node_filter",
+            "input": query_plan_node_to_js(*input),
+        }),
+        QueryPlanNode::VerifyEdgePredicates { input } => serde_json::json!({
+            "kind": "verify_edge_predicates",
+            "input": query_plan_node_to_js(*input),
+        }),
+        QueryPlanNode::PatternExpand {
+            anchor_alias,
+            input,
+        } => serde_json::json!({
+            "kind": "pattern_expand",
+            "anchorAlias": anchor_alias,
+            "input": query_plan_node_to_js(*input),
+        }),
+        QueryPlanNode::FallbackTypeScan => serde_json::json!({ "kind": "fallback_type_scan" }),
+        QueryPlanNode::FallbackFullNodeScan => {
+            serde_json::json!({ "kind": "fallback_full_node_scan" })
+        }
+        QueryPlanNode::EmptyResult => serde_json::json!({ "kind": "empty_result" }),
+    }
+}
+
+fn query_plan_warning_to_js(warning: &QueryPlanWarning) -> &'static str {
+    match warning {
+        QueryPlanWarning::MissingReadyIndex => "missing_ready_index",
+        QueryPlanWarning::UsingFallbackScan => "using_fallback_scan",
+        QueryPlanWarning::FullScanRequiresOptIn => "full_scan_requires_opt_in",
+        QueryPlanWarning::FullScanExplicitlyAllowed => "full_scan_explicitly_allowed",
+        QueryPlanWarning::UnboundedPatternRejected => "unbounded_pattern_rejected",
+        QueryPlanWarning::EdgePropertyPostFilter => "edge_property_post_filter",
+        QueryPlanWarning::IndexSkippedAsBroad => "index_skipped_as_broad",
+        QueryPlanWarning::CandidateCapExceeded => "candidate_cap_exceeded",
+        QueryPlanWarning::RangeCandidateCapExceeded => "range_candidate_cap_exceeded",
+        QueryPlanWarning::TimestampCandidateCapExceeded => "timestamp_candidate_cap_exceeded",
+        QueryPlanWarning::VerifyOnlyFilter => "verify_only_filter",
+        QueryPlanWarning::BooleanBranchFallback => "boolean_branch_fallback",
+        QueryPlanWarning::PlanningProbeBudgetExceeded => "planning_probe_budget_exceeded",
+    }
+}
+
+fn parse_js_node_query(value: &serde_json::Value) -> Result<NodeQuery> {
+    let object = js_object(value, "node query request")?;
+    let page = PageRequest {
+        limit: parse_js_limit(object, "node query limit")?,
+        after: parse_js_optional_u64_field(object, "after", "node query after")?,
+    };
+    let order = match js_non_null_field(object, "orderBy") {
+        None => NodeQueryOrder::NodeIdAsc,
+        Some(value) => match value.as_str() {
+            Some("nodeIdAsc") | Some("node_id_asc") => NodeQueryOrder::NodeIdAsc,
+            Some(other) => {
+                return Err(napi::Error::from_reason(format!(
+                    "Invalid orderBy '{}'. Must be 'nodeIdAsc'.",
+                    other
+                )));
+            }
+            None => {
+                return Err(napi::Error::from_reason(
+                    "node query orderBy must be a string".to_string(),
+                ));
+            }
+        },
+    };
+    Ok(NodeQuery {
+        type_id: parse_js_optional_u32_field(object, "typeId", "node query typeId")?,
+        ids: parse_js_optional_u64_array_field(object, "ids", "node query ids")?,
+        keys: parse_js_optional_string_array_field(object, "keys", "node query keys")?,
+        filter: parse_js_node_filter(object, "updatedAt", "node query")?,
+        page,
+        order,
+        allow_full_scan: parse_js_optional_bool_field(
+            object,
+            "allowFullScan",
+            "node query allowFullScan",
+        )?
+        .unwrap_or(false),
+    })
+}
+
+fn parse_js_graph_pattern_query(value: &serde_json::Value) -> Result<GraphPatternQuery> {
+    let object = js_object(value, "graph pattern request")?;
+    let nodes = match js_non_null_field(object, "nodes") {
+        Some(value) => js_array(value, "graph pattern nodes")?
+            .iter()
+            .map(parse_js_node_pattern)
+            .collect::<Result<Vec<_>>>()?,
+        None => {
+            return Err(napi::Error::from_reason(
+                "graph pattern request requires nodes".to_string(),
+            ));
+        }
+    };
+    let edges = match js_non_null_field(object, "edges") {
+        Some(value) => js_array(value, "graph pattern edges")?
+            .iter()
+            .map(parse_js_edge_pattern)
+            .collect::<Result<Vec<_>>>()?,
+        None => {
+            return Err(napi::Error::from_reason(
+                "graph pattern request requires edges".to_string(),
+            ));
+        }
+    };
+    let limit = match object.get("limit") {
+        Some(serde_json::Value::Null) | None => {
+            return Err(napi::Error::from_reason(
+                "graph pattern request requires positive limit".to_string(),
+            ));
+        }
+        Some(value) => {
+            let parsed = js_number_to_u64(value, "graph pattern limit")?;
+            if parsed == 0 {
+                return Err(napi::Error::from_reason(
+                    "graph pattern limit must be > 0".to_string(),
+                ));
+            }
+            usize::try_from(parsed).map_err(|_| {
+                napi::Error::from_reason("graph pattern limit is too large".to_string())
+            })?
+        }
+    };
+    Ok(GraphPatternQuery {
+        nodes,
+        edges,
+        at_epoch: parse_js_optional_i64_field(object, "atEpoch", "graph pattern atEpoch")?,
+        limit,
+        order: PatternOrder::AnchorThenAliasesAsc,
+    })
+}
+
+fn parse_js_node_pattern(value: &serde_json::Value) -> Result<NodePattern> {
+    let object = js_object(value, "node pattern")?;
+    Ok(NodePattern {
+        alias: parse_js_required_string_field(object, "alias", "node pattern alias")?,
+        type_id: parse_js_optional_u32_field(object, "typeId", "node pattern typeId")?,
+        ids: parse_js_optional_u64_array_field(object, "ids", "node pattern ids")?,
+        keys: parse_js_optional_string_array_field(object, "keys", "node pattern keys")?,
+        filter: parse_js_node_filter(object, "updatedAt", "node pattern")?,
+    })
+}
+
+fn parse_js_edge_pattern(value: &serde_json::Value) -> Result<EdgePattern> {
+    let object = js_object(value, "edge pattern")?;
+    if object.contains_key("filter") {
+        return Err(napi::Error::from_reason(
+            "edge pattern filter is not supported in Phase 24; use edge pattern where or predicates"
+                .to_string(),
+        ));
+    }
+    let direction = match js_non_null_field(object, "direction") {
+        None => Direction::Outgoing,
+        Some(value) => parse_direction(Some(value.as_str().ok_or_else(|| {
+            napi::Error::from_reason("edge pattern direction must be a string".to_string())
+        })?))?,
+    };
+    Ok(EdgePattern {
+        alias: parse_js_optional_string_field(object, "alias", "edge pattern alias")?,
+        from_alias: parse_js_required_string_field(object, "fromAlias", "edge pattern fromAlias")?,
+        to_alias: parse_js_required_string_field(object, "toAlias", "edge pattern toAlias")?,
+        direction,
+        type_filter: parse_js_optional_u32_array_field(
+            object,
+            "typeFilter",
+            "edge pattern typeFilter",
+        )?,
+        property_predicates: parse_js_edge_predicates(object, "edge pattern")?,
+    })
+}
+
+fn reject_js_legacy_node_predicate_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<()> {
+    if object.contains_key("where") {
+        return Err(napi::Error::from_reason(format!(
+            "{} where is no longer supported; use filter",
+            context
+        )));
+    }
+    if object.contains_key("predicates") {
+        return Err(napi::Error::from_reason(format!(
+            "{} predicates are no longer supported; use filter",
+            context
+        )));
+    }
+    Ok(())
+}
+
+fn parse_js_node_filter(
+    object: &serde_json::Map<String, serde_json::Value>,
+    updated_at_key: &str,
+    context: &str,
+) -> Result<Option<NodeFilterExpr>> {
+    reject_js_legacy_node_predicate_fields(object, context)?;
+    match object.get("filter") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            parse_js_node_filter_expr(value, updated_at_key, &format!("{} filter", context))
+                .map(Some)
+        }
+    }
+}
+
+fn parse_js_node_filter_expr(
+    value: &serde_json::Value,
+    updated_at_key: &str,
+    context: &str,
+) -> Result<NodeFilterExpr> {
+    let object = js_object(value, context)?;
+    if object.is_empty() {
+        return Err(napi::Error::from_reason(format!(
+            "{} must not be an empty object",
+            context
+        )));
+    }
+
+    let selectors = ["and", "or", "not", "property", updated_at_key]
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .count();
+    if selectors != 1 {
+        return Err(napi::Error::from_reason(format!(
+            "{} must contain exactly one boolean tag or leaf selector",
+            context
+        )));
+    }
+    reject_js_uppercase_filter_fields(object, context)?;
+
+    if let Some(value) = object.get("and") {
+        ensure_only_js_fields(object, &["and"], context)?;
+        let children = js_array(value, &format!("{} and", context))?;
+        if children.is_empty() {
+            return Err(napi::Error::from_reason(format!(
+                "{} and must contain at least one child",
+                context
+            )));
+        }
+        return children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                parse_js_node_filter_expr(
+                    child,
+                    updated_at_key,
+                    &format!("{} and[{}]", context, index),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(NodeFilterExpr::And);
+    }
+    if let Some(value) = object.get("or") {
+        ensure_only_js_fields(object, &["or"], context)?;
+        let children = js_array(value, &format!("{} or", context))?;
+        if children.is_empty() {
+            return Err(napi::Error::from_reason(format!(
+                "{} or must contain at least one child",
+                context
+            )));
+        }
+        return children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                parse_js_node_filter_expr(
+                    child,
+                    updated_at_key,
+                    &format!("{} or[{}]", context, index),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(NodeFilterExpr::Or);
+    }
+    if let Some(value) = object.get("not") {
+        ensure_only_js_fields(object, &["not"], context)?;
+        return parse_js_node_filter_expr(value, updated_at_key, &format!("{} not", context))
+            .map(Box::new)
+            .map(NodeFilterExpr::Not);
+    }
+    if object.contains_key("property") {
+        return parse_js_property_node_filter(object, context);
+    }
+    if let Some(value) = object.get(updated_at_key) {
+        ensure_only_js_fields(object, &[updated_at_key], context)?;
+        return parse_js_updated_at_filter(value, updated_at_key, context);
+    }
+
+    Err(napi::Error::from_reason(format!(
+        "{} must contain a valid filter selector",
+        context
+    )))
+}
+
+fn parse_js_edge_predicates(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<Vec<EdgePostFilterPredicate>> {
+    let mut predicates = Vec::new();
+    if let Some(where_value) = js_non_null_field(object, "where") {
+        let where_object = js_object(where_value, &format!("{} where", context))?;
+        for (key, value) in where_object {
+            predicates.push(parse_js_property_edge_predicate(
+                key.clone(),
+                value,
+                &format!("{} where.{}", context, key),
+            )?);
+        }
+    }
+    if let Some(predicates_value) = js_non_null_field(object, "predicates") {
+        for (index, value) in js_array(predicates_value, &format!("{} predicates", context))?
+            .iter()
+            .enumerate()
+        {
+            let predicate_object = js_object(value, &format!("{} predicates[{}]", context, index))?;
+            if predicate_object.len() != 1 {
+                return Err(napi::Error::from_reason(format!(
+                    "{} predicates[{}] must contain exactly one top-level predicate tag",
+                    context, index
+                )));
+            }
+            let (tag, payload) = predicate_object.iter().next().unwrap();
+            match tag.as_str() {
+                "property" => predicates.push(parse_js_explicit_property_edge_predicate(
+                    payload,
+                    &format!("{} predicates[{}].property", context, index),
+                )?),
+                other => {
+                    return Err(napi::Error::from_reason(format!(
+                        "Unknown edge predicate tag '{}'. Only 'property' is supported.",
+                        other
+                    )));
+                }
+            }
+        }
+    }
+    Ok(predicates)
+}
+
+fn parse_js_explicit_property_edge_predicate(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<EdgePostFilterPredicate> {
+    let object = js_object(value, context)?;
+    let key = parse_js_required_string_field(object, "key", &format!("{} key", context))?;
+    parse_js_property_edge_predicate(key, value, context)
+}
+
+fn parse_js_property_node_filter(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<NodeFilterExpr> {
+    let key = parse_js_required_string_field(object, "property", &format!("{} property", context))?;
+    if key.is_empty() {
+        return Err(napi::Error::from_reason(format!(
+            "{} property must be non-empty",
+            context
+        )));
+    }
+
+    let has_range = has_any_js_field(object, &["gt", "gte", "lt", "lte"]);
+    let families = [
+        object.contains_key("eq"),
+        object.contains_key("in"),
+        has_range,
+        object.contains_key("exists"),
+        object.contains_key("missing"),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if families != 1 {
+        return Err(napi::Error::from_reason(format!(
+            "{} property filter must specify exactly one operator family",
+            context
+        )));
+    }
+
+    if let Some(value) = object.get("eq") {
+        ensure_only_js_fields(object, &["property", "eq"], context)?;
+        return Ok(NodeFilterExpr::PropertyEquals {
+            key,
+            value: json_to_prop_value(value),
+        });
+    }
+    if let Some(value) = object.get("in") {
+        ensure_only_js_fields(object, &["property", "in"], context)?;
+        let values = js_array(value, &format!("{} in", context))?;
+        if values.is_empty() {
+            return Err(napi::Error::from_reason(format!(
+                "{} in must contain at least one value",
+                context
+            )));
+        }
+        return Ok(NodeFilterExpr::PropertyIn {
+            key,
+            values: values.iter().map(json_to_prop_value).collect(),
+        });
+    }
+    if has_range {
+        ensure_only_js_fields(object, &["property", "gt", "gte", "lt", "lte"], context)?;
+        let (lower, upper) = parse_js_property_range_bounds(object, context)?;
+        return Ok(NodeFilterExpr::PropertyRange { key, lower, upper });
+    }
+    if object.contains_key("exists") {
+        ensure_only_js_fields(object, &["property", "exists"], context)?;
+        require_js_true_field(object, "exists", context)?;
+        return Ok(NodeFilterExpr::PropertyExists { key });
+    }
+    if object.contains_key("missing") {
+        ensure_only_js_fields(object, &["property", "missing"], context)?;
+        require_js_true_field(object, "missing", context)?;
+        return Ok(NodeFilterExpr::PropertyMissing { key });
+    }
+
+    unreachable!("operator family count was checked above")
+}
+
+fn parse_js_property_edge_predicate(
+    key: String,
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<EdgePostFilterPredicate> {
+    let parsed = parse_js_property_predicate(value, context)?;
+    Ok(match parsed {
+        JsParsedPropertyPredicate::Equals(value) => {
+            EdgePostFilterPredicate::PropertyEquals { key, value }
+        }
+        JsParsedPropertyPredicate::Range { lower, upper } => {
+            EdgePostFilterPredicate::PropertyRange { key, lower, upper }
+        }
+    })
+}
+
+enum JsParsedPropertyPredicate {
+    Equals(PropValue),
+    Range {
+        lower: Option<PropertyRangeBound>,
+        upper: Option<PropertyRangeBound>,
+    },
+}
+
+fn parse_js_property_predicate(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<JsParsedPropertyPredicate> {
+    let object = js_object(value, context)?;
+    match js_non_null_field(object, "op") {
+        Some(op_value) => match op_value.as_str() {
+            Some("eq") => {
+                ensure_no_js_fields(object, &["gt", "gte", "lt", "lte", "eq"], context)?;
+                let value = object.get("value").ok_or_else(|| {
+                    napi::Error::from_reason(format!("{} eq predicate requires value", context))
+                })?;
+                Ok(JsParsedPropertyPredicate::Equals(json_to_prop_value(value)))
+            }
+            Some("range") => {
+                ensure_no_js_fields(object, &["value", "eq"], context)?;
+                let (lower, upper) = parse_js_property_range_bounds(object, context)?;
+                Ok(JsParsedPropertyPredicate::Range { lower, upper })
+            }
+            Some(other) => Err(napi::Error::from_reason(format!(
+                "Unknown predicate op '{}'. Valid ops are 'eq' and 'range'.",
+                other
+            ))),
+            None => Err(napi::Error::from_reason(format!(
+                "{} predicate op must be a string",
+                context
+            ))),
+        },
+        None if object.contains_key("eq") => {
+            ensure_no_js_fields(object, &["value", "gt", "gte", "lt", "lte"], context)?;
+            Ok(JsParsedPropertyPredicate::Equals(json_to_prop_value(
+                object.get("eq").unwrap(),
+            )))
+        }
+        None if has_any_js_field(object, &["gt", "gte", "lt", "lte"]) => {
+            ensure_no_js_fields(object, &["value", "eq"], context)?;
+            let (lower, upper) = parse_js_property_range_bounds(object, context)?;
+            Ok(JsParsedPropertyPredicate::Range { lower, upper })
+        }
+        None => Err(napi::Error::from_reason(format!(
+            "{} predicate requires op, eq, or range bounds",
+            context
+        ))),
+    }
+}
+
+fn parse_js_updated_at_filter(
+    value: &serde_json::Value,
+    tag: &str,
+    context: &str,
+) -> Result<NodeFilterExpr> {
+    let object = js_object(value, &format!("{} {}", context, tag))?;
+    ensure_only_js_fields(
+        object,
+        &["gt", "gte", "lt", "lte"],
+        &format!("{} {}", context, tag),
+    )?;
+    let (lower_ms, upper_ms) = parse_js_i64_range_bounds(object, &format!("{} {}", context, tag))?;
+    Ok(NodeFilterExpr::UpdatedAtRange { lower_ms, upper_ms })
+}
+
+fn parse_js_property_range_bounds(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<(Option<PropertyRangeBound>, Option<PropertyRangeBound>)> {
+    if object.contains_key("gt") && object.contains_key("gte") {
+        return Err(napi::Error::from_reason(format!(
+            "{} range predicate cannot specify both gt and gte",
+            context
+        )));
+    }
+    if object.contains_key("lt") && object.contains_key("lte") {
+        return Err(napi::Error::from_reason(format!(
+            "{} range predicate cannot specify both lt and lte",
+            context
+        )));
+    }
+    let lower = if let Some(value) = object.get("gt") {
+        Some(PropertyRangeBound::Excluded(json_to_prop_value(value)))
+    } else {
+        object
+            .get("gte")
+            .map(|value| PropertyRangeBound::Included(json_to_prop_value(value)))
+    };
+    let upper = if let Some(value) = object.get("lt") {
+        Some(PropertyRangeBound::Excluded(json_to_prop_value(value)))
+    } else {
+        object
+            .get("lte")
+            .map(|value| PropertyRangeBound::Included(json_to_prop_value(value)))
+    };
+    if lower.is_none() && upper.is_none() {
+        return Err(napi::Error::from_reason(format!(
+            "{} range predicate requires at least one of gt, gte, lt, or lte",
+            context
+        )));
+    }
+    Ok((lower, upper))
+}
+
+fn parse_js_i64_range_bounds(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<(Option<i64>, Option<i64>)> {
+    if object.contains_key("gt") && object.contains_key("gte") {
+        return Err(napi::Error::from_reason(format!(
+            "{} range predicate cannot specify both gt and gte",
+            context
+        )));
+    }
+    if object.contains_key("lt") && object.contains_key("lte") {
+        return Err(napi::Error::from_reason(format!(
+            "{} range predicate cannot specify both lt and lte",
+            context
+        )));
+    }
+    let mut impossible = false;
+    let lower = if let Some(value) = object.get("gt") {
+        let value = js_number_to_i64(value, &format!("{} gt", context))?;
+        match value.checked_add(1) {
+            Some(next) => Some(next),
+            None => {
+                impossible = true;
+                Some(i64::MAX)
+            }
+        }
+    } else {
+        object
+            .get("gte")
+            .map(|value| js_number_to_i64(value, &format!("{} gte", context)))
+            .transpose()?
+    };
+    let upper = if let Some(value) = object.get("lt") {
+        let value = js_number_to_i64(value, &format!("{} lt", context))?;
+        match value.checked_sub(1) {
+            Some(prev) => Some(prev),
+            None => {
+                impossible = true;
+                Some(i64::MIN)
+            }
+        }
+    } else {
+        object
+            .get("lte")
+            .map(|value| js_number_to_i64(value, &format!("{} lte", context)))
+            .transpose()?
+    };
+    if lower.is_none() && upper.is_none() {
+        return Err(napi::Error::from_reason(format!(
+            "{} range predicate requires at least one of gt, gte, lt, or lte",
+            context
+        )));
+    }
+    if impossible {
+        return Ok((Some(i64::MAX), Some(i64::MIN)));
+    }
+    Ok((lower, upper))
+}
+
+fn js_object<'a>(
+    value: &'a serde_json::Value,
+    context: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| napi::Error::from_reason(format!("{} must be an object", context)))
+}
+
+fn js_array<'a>(value: &'a serde_json::Value, context: &str) -> Result<&'a Vec<serde_json::Value>> {
+    value
+        .as_array()
+        .ok_or_else(|| napi::Error::from_reason(format!("{} must be an array", context)))
+}
+
+fn js_non_null_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    object.get(key).filter(|value| !value.is_null())
+}
+
+fn parse_js_limit(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<Option<usize>> {
+    match object.get("limit") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let limit = js_number_to_u64(value, context)?;
+            if limit == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(usize::try_from(limit).map_err(|_| {
+                    napi::Error::from_reason(format!("{} is too large", context))
+                })?))
+            }
+        }
+    }
+}
+
+fn parse_js_optional_u64_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u64>> {
+    js_non_null_field(object, key)
+        .map(|value| js_number_to_u64(value, context))
+        .transpose()
+}
+
+fn parse_js_optional_i64_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<i64>> {
+    js_non_null_field(object, key)
+        .map(|value| js_number_to_i64(value, context))
+        .transpose()
+}
+
+fn parse_js_optional_u32_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u32>> {
+    js_non_null_field(object, key)
+        .map(|value| {
+            let value = js_number_to_u64(value, context)?;
+            u32::try_from(value)
+                .map_err(|_| napi::Error::from_reason(format!("{} must fit in u32", context)))
+        })
+        .transpose()
+}
+
+fn parse_js_optional_bool_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<bool>> {
+    js_non_null_field(object, key)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| napi::Error::from_reason(format!("{} must be a boolean", context)))
+        })
+        .transpose()
+}
+
+fn parse_js_optional_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<String>> {
+    js_non_null_field(object, key)
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| napi::Error::from_reason(format!("{} must be a string", context)))
+        })
+        .transpose()
+}
+
+fn parse_js_required_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<String> {
+    js_non_null_field(object, key)
+        .ok_or_else(|| napi::Error::from_reason(format!("{} is required", context)))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| napi::Error::from_reason(format!("{} must be a string", context)))
+        })
+}
+
+fn parse_js_optional_u64_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<u64>> {
+    match js_non_null_field(object, key) {
+        None => Ok(Vec::new()),
+        Some(value) => js_array(value, context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| js_number_to_u64(value, &format!("{}[{}]", context, index)))
+            .collect(),
+    }
+}
+
+fn parse_js_optional_u32_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<Vec<u32>>> {
+    match js_non_null_field(object, key) {
+        None => Ok(None),
+        Some(value) => Ok(Some(
+            js_array(value, context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let value = js_number_to_u64(value, &format!("{}[{}]", context, index))?;
+                    u32::try_from(value).map_err(|_| {
+                        napi::Error::from_reason(format!("{}[{}] must fit in u32", context, index))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )),
+    }
+}
+
+fn parse_js_optional_string_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    match js_non_null_field(object, key) {
+        None => Ok(Vec::new()),
+        Some(value) => js_array(value, context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.as_str().map(ToString::to_string).ok_or_else(|| {
+                    napi::Error::from_reason(format!("{}[{}] must be a string", context, index))
+                })
+            })
+            .collect(),
+    }
+}
+
+fn js_number_to_u64(value: &serde_json::Value, context: &str) -> Result<u64> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| napi::Error::from_reason(format!("{} must be a number", context)))?;
+    f64_to_u64(number)
+}
+
+fn js_number_to_i64(value: &serde_json::Value, context: &str) -> Result<i64> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| napi::Error::from_reason(format!("{} must be a number", context)))?;
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || number < i64::MIN as f64
+        || number > i64::MAX as f64
+    {
+        return Err(napi::Error::from_reason(format!(
+            "{} must be a finite integer",
+            context
+        )));
+    }
+    Ok(number as i64)
+}
+
+fn has_any_js_field(object: &serde_json::Map<String, serde_json::Value>, fields: &[&str]) -> bool {
+    fields.iter().any(|field| object.contains_key(*field))
+}
+
+fn ensure_only_js_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<()> {
+    for field in object.keys() {
+        if !allowed.iter().any(|allowed| *allowed == field) {
+            return Err(napi::Error::from_reason(format!(
+                "{} does not accept field '{}'",
+                context, field
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_js_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+    context: &str,
+) -> Result<()> {
+    for field in fields {
+        if object.contains_key(*field) {
+            return Err(napi::Error::from_reason(format!(
+                "{} does not accept field '{}'",
+                context, field
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_js_true_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    match object.get(field).and_then(serde_json::Value::as_bool) {
+        Some(true) => Ok(()),
+        _ => Err(napi::Error::from_reason(format!(
+            "{} {} must be true",
+            context, field
+        ))),
+    }
+}
+
+fn reject_js_uppercase_filter_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<()> {
+    for field in object.keys() {
+        if matches!(
+            field.as_str(),
+            "AND" | "OR" | "NOT" | "Eq" | "In" | "Exists" | "Missing"
+        ) {
+            return Err(napi::Error::from_reason(format!(
+                "{} uses unsupported uppercase filter field '{}'",
+                context, field
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn make_property_range_page_request(
