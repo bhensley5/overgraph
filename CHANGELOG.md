@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-02
+
+### Added
+
+#### Native Query Planner
+- **Planner-backed node queries.** Added `query_node_ids`, `query_nodes`, and explain APIs across Rust, Node.js, and Python for ID, key, type, property, timestamp, and compound predicate queries.
+- **Bounded graph pattern queries.** Added `query_pattern` and `explain_pattern_query` for deterministic bounded pattern matching with node filters and edge-scoped post-filters.
+- **Boolean filter model.** Added canonical recursive node filters with `and`, `or`, `not`, `in`, `exists`, `missing`, equality, numeric range, and updated-at range predicates.
+- **Durable planner statistics.** Segments may now include optional `planner_stats.dat` sidecars that provide private cost estimates, adaptive candidate caps, and graph-pattern fanout evidence.
+
+### Changed
+
+- **Index-aware planning.** Query execution now chooses among explicit IDs, key lookups, type indexes, declared equality/range property indexes, timestamp indexes, sorted intersections, sorted unions, and bounded fallback scans.
+- **Advisory stats model.** Planner statistics improve costing and explain output but never decide correctness; visible-record verification remains the final authority for every result.
+- **Connector query parity.** Rust, Node.js, and Python now share the same query, pattern, explain, filter, pagination, and warning semantics, including async connector variants.
+
+### Fixed
+
+- **Planner correctness hardening.** Boolean predicates, graph-pattern node filters, pagination, stale index candidates, tombstones, prune policies, signed-zero float probes, and hash-collision edge cases are verified against latest visible records.
+- **Property-index readiness consistency.** Public index listing now reports `Ready` only when new public reads can use the same published ready catalog.
+- **Stats refresh robustness.** Targeted secondary-index stats refresh handles missing, corrupt, obsolete, or unavailable sidecars without blocking open or query execution.
+
 ## [0.6.0] - 2026-04-25
 
 ### Added
@@ -249,6 +271,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.7.0]: https://github.com/bhensley5/overgraph/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/bhensley5/overgraph/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Bhensley5/overgraph/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Bhensley5/overgraph/compare/v0.4.0...v0.4.1

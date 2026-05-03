@@ -176,7 +176,9 @@ def load_profiles(path: Path) -> dict[str, Any]:
     return payload
 
 
-def build_command(lang: str, profile: str, warmup: int, iters: int) -> tuple[list[str], str]:
+def build_command(
+    lang: str, profile: str, warmup: int, iters: int, scenario_set: str
+) -> tuple[list[str], str]:
     if lang == "rust":
         return (
             [
@@ -194,6 +196,8 @@ def build_command(lang: str, profile: str, warmup: int, iters: int) -> tuple[lis
                 str(warmup),
                 "--iters",
                 str(iters),
+                "--scenario-set",
+                scenario_set,
             ],
             "core-benchmark-v1-parity",
         )
@@ -208,6 +212,8 @@ def build_command(lang: str, profile: str, warmup: int, iters: int) -> tuple[lis
                 str(warmup),
                 "--iters",
                 str(iters),
+                "--scenario-set",
+                scenario_set,
             ],
             "connector-benchmark-v3-parity",
         )
@@ -222,6 +228,8 @@ def build_command(lang: str, profile: str, warmup: int, iters: int) -> tuple[lis
                 str(warmup),
                 "--iters",
                 str(iters),
+                "--scenario-set",
+                scenario_set,
             ],
             "connector-benchmark-v2-parity",
         )
@@ -383,6 +391,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout-seconds", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=80)
+    parser.add_argument("--scenario-set", default="all", choices=["all", "query"])
     parser.add_argument(
         "--allow-legacy-rust-criterion-parse",
         action="store_true",
@@ -405,7 +414,9 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = ensure_unique_run_dir(output_root, run_id)
 
     metadata = collect_metadata(args.profile, profile)
-    command, harness_stage = build_command(args.lang, args.profile, args.warmup, args.iters)
+    command, harness_stage = build_command(
+        args.lang, args.profile, args.warmup, args.iters, args.scenario_set
+    )
     command_display = " ".join(command)
 
     stdout_log = run_dir / f"{args.lang}.stdout.log"

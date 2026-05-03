@@ -80,6 +80,18 @@
     "S-CRUD-001": {},
     "S-CRUD-002": {},
     "S-CRUD-003": {},
+    "S-QUERY-001": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    },
+    "S-QUERY-002": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    },
     "S-TRAV-003": {
       "iters_multiplier": 2
     },
@@ -156,6 +168,12 @@
       "status": "comparable"
     },
     "S-CRUD-005": {
+      "status": "comparable"
+    },
+    "S-QUERY-001": {
+      "status": "comparable"
+    },
+    "S-QUERY-002": {
       "status": "comparable"
     },
     "S-ADV-005": {

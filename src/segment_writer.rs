@@ -6,6 +6,10 @@ use crate::dense_hnsw::{write_dense_hnsw_index_from_points, DensePointInput};
 use crate::error::EngineError;
 use crate::memtable::{encode_range_prop_value, AdjEntry, Memtable};
 use crate::parallel::engine_cpu_try_join;
+use crate::planner_stats::{
+    write_compaction_planner_stats_sidecar_best_effort,
+    write_flush_planner_stats_sidecar_best_effort,
+};
 use crate::segment_reader::SegmentReader;
 use crate::sparse_postings::write_sparse_posting_files;
 use crate::types::*;
@@ -99,46 +103,9 @@ pub(crate) fn node_prop_range_sidecar_path(seg_dir: &Path, index_id: u64) -> Pat
 ///
 /// IMPORTANT: Two index-writing paths exist and must stay in sync:
 ///   1. This function (flush path, builds indexes from Memtable)
-///   2. `write_indexes_from_metadata()` (compaction path, builds from sidecars)
+///   2. `write_indexes_from_metadata_with_secondary_indexes()` (compaction path, builds from sidecars)
 ///
 /// If you add a new index type, you MUST add it to BOTH paths.
-#[allow(dead_code)]
-pub(crate) fn write_segment(
-    seg_dir: &Path,
-    segment_id: u64,
-    memtable: &Memtable,
-    dense_config: Option<&DenseVectorConfig>,
-    degree_overlay: &DegreeOverlaySnapshot,
-) -> Result<SegmentInfo, EngineError> {
-    write_segment_with_secondary_indexes(
-        seg_dir,
-        segment_id,
-        memtable,
-        dense_config,
-        degree_overlay,
-        &[],
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn write_segment_with_secondary_indexes(
-    seg_dir: &Path,
-    segment_id: u64,
-    memtable: &Memtable,
-    dense_config: Option<&DenseVectorConfig>,
-    degree_overlay: &DegreeOverlaySnapshot,
-    secondary_indexes: &[SecondaryIndexManifestEntry],
-) -> Result<SegmentInfo, EngineError> {
-    write_segment_with_degree_overlay_and_secondary_indexes(
-        seg_dir,
-        segment_id,
-        memtable,
-        dense_config,
-        degree_overlay,
-        secondary_indexes,
-    )
-}
-
 pub(crate) fn write_segment_with_degree_overlay_and_secondary_indexes(
     seg_dir: &Path,
     segment_id: u64,
@@ -232,6 +199,13 @@ fn write_segment_inner(
         },
         || write_sparse_posting_index(seg_dir, &nodes),
     )?;
+    write_flush_planner_stats_sidecar_best_effort(
+        seg_dir,
+        segment_id,
+        &nodes,
+        &edges,
+        secondary_indexes,
+    );
     write_format_version(seg_dir)?;
 
     // fsync all files and the directory
@@ -1524,10 +1498,6 @@ pub(crate) struct CompactNodeMeta {
     pub updated_at: i64,
     pub weight: f32,
     pub key_len: u16,
-    #[allow(dead_code)]
-    pub prop_hash_offset: u64,
-    #[allow(dead_code)]
-    pub prop_hash_count: u32,
     pub dense_vector_offset: u64,
     pub dense_vector_len: u32,
     pub sparse_vector_offset: u64,
@@ -1562,27 +1532,9 @@ pub(crate) struct CompactEdgeMeta {
 /// If you add a new index type, you MUST add it to BOTH paths.
 ///
 /// `node_metas` and `edge_metas` must be sorted by ID.
-#[allow(dead_code)]
-pub(crate) fn write_indexes_from_metadata(
-    seg_dir: &Path,
-    segments: &[Arc<SegmentReader>],
-    node_metas: &[CompactNodeMeta],
-    edge_metas: &[CompactEdgeMeta],
-    dense_config: Option<&DenseVectorConfig>,
-) -> Result<(), EngineError> {
-    let _ = write_indexes_from_metadata_with_secondary_indexes(
-        seg_dir,
-        segments,
-        node_metas,
-        edge_metas,
-        dense_config,
-        true,
-        &[],
-    )?;
-    Ok(())
-}
-
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
+    segment_id: u64,
     seg_dir: &Path,
     segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
@@ -1644,6 +1596,14 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
         },
         || write_sparse_posting_index_from_meta(seg_dir, segments, node_metas),
     )?;
+    write_compaction_planner_stats_sidecar_best_effort(
+        seg_dir,
+        segment_id,
+        segments,
+        node_metas,
+        edge_metas,
+        secondary_indexes,
+    );
     write_format_version(seg_dir)?;
     fsync_dir(seg_dir)?;
     let final_report = report.lock().unwrap().clone();
@@ -2490,6 +2450,7 @@ fn sort_sparse_posting_groups(
 mod tests {
     use super::*;
     use crate::degree_cache::DegreeDelta;
+    use std::sync::Arc;
 
     fn write_segment(
         seg_dir: &Path,
@@ -2498,12 +2459,13 @@ mod tests {
         dense_config: Option<&DenseVectorConfig>,
     ) -> Result<SegmentInfo, EngineError> {
         let degree_overlay = DegreeOverlaySnapshot::empty();
-        super::write_segment(
+        super::write_segment_with_degree_overlay_and_secondary_indexes(
             seg_dir,
             segment_id,
             memtable,
             dense_config,
             degree_overlay.as_ref(),
+            &[],
         )
     }
 
@@ -2515,7 +2477,7 @@ mod tests {
         secondary_indexes: &[SecondaryIndexManifestEntry],
     ) -> Result<SegmentInfo, EngineError> {
         let degree_overlay = DegreeOverlaySnapshot::empty();
-        super::write_segment_with_secondary_indexes(
+        super::write_segment_with_degree_overlay_and_secondary_indexes(
             seg_dir,
             segment_id,
             memtable,
@@ -2572,6 +2534,118 @@ mod tests {
             valid_to: i64::MAX,
             last_write_seq: 0,
         }
+    }
+
+    fn make_node_with_custom_props(
+        id: u64,
+        type_id: u32,
+        key: &str,
+        props: BTreeMap<String, PropValue>,
+        updated_at: i64,
+    ) -> NodeRecord {
+        NodeRecord {
+            id,
+            type_id,
+            key: key.to_string(),
+            props,
+            created_at: 1000,
+            updated_at,
+            weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
+        }
+    }
+
+    fn compact_copy_segment_for_test(
+        source: Arc<SegmentReader>,
+        out_dir: &Path,
+        out_segment_id: u64,
+        secondary_indexes: &[SecondaryIndexManifestEntry],
+    ) -> SegmentReader {
+        std::fs::create_dir_all(out_dir).unwrap();
+        let segments = vec![source.clone()];
+        let node_copy_info = write_merged_nodes_dat(out_dir, &segments).unwrap();
+        let edge_copy_info = write_merged_edges_dat(out_dir, &segments).unwrap();
+        let node_copy = &node_copy_info[0];
+        let edge_copy = &edge_copy_info[0];
+
+        let mut node_metas = Vec::new();
+        for index in 0..source.node_meta_count() as usize {
+            let (
+                node_id,
+                data_offset,
+                data_len,
+                type_id,
+                updated_at,
+                weight,
+                key_len,
+                _prop_hash_offset,
+                _prop_hash_count,
+                last_write_seq,
+            ) = source.node_meta_at(index).unwrap();
+            let (dense_vector_offset, dense_vector_len, sparse_vector_offset, sparse_vector_len) =
+                source.node_vector_meta_at(index).unwrap();
+            node_metas.push(CompactNodeMeta {
+                node_id,
+                new_data_offset: data_offset - node_copy.orig_data_start + node_copy.new_data_base,
+                data_len,
+                type_id,
+                updated_at,
+                weight,
+                key_len,
+                dense_vector_offset,
+                dense_vector_len,
+                sparse_vector_offset,
+                sparse_vector_len,
+                src_seg_idx: 0,
+                src_data_offset: data_offset,
+                last_write_seq,
+            });
+        }
+
+        let mut edge_metas = Vec::new();
+        for index in 0..source.edge_meta_count() as usize {
+            let (
+                edge_id,
+                data_offset,
+                data_len,
+                from,
+                to,
+                type_id,
+                updated_at,
+                weight,
+                valid_from,
+                valid_to,
+                last_write_seq,
+            ) = source.edge_meta_at(index).unwrap();
+            edge_metas.push(CompactEdgeMeta {
+                edge_id,
+                new_data_offset: data_offset - edge_copy.orig_data_start + edge_copy.new_data_base,
+                data_len,
+                from,
+                to,
+                type_id,
+                updated_at,
+                weight,
+                valid_from,
+                valid_to,
+                last_write_seq,
+            });
+        }
+
+        write_indexes_from_metadata_with_secondary_indexes(
+            out_segment_id,
+            out_dir,
+            &segments,
+            &node_metas,
+            &edge_metas,
+            None,
+            true,
+            secondary_indexes,
+        )
+        .unwrap();
+        SegmentReader::open(out_dir, out_segment_id, None).unwrap()
     }
 
     // --- encode_node_record / encode_edge_record ---
@@ -3448,5 +3522,468 @@ mod tests {
                 .unwrap(),
             vec![3]
         );
+    }
+
+    #[test]
+    fn test_flush_planner_stats_cover_core_declared_indexes_and_adjacency() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+
+        let mt = Memtable::new();
+        let mut red_10 = BTreeMap::new();
+        red_10.insert("color".to_string(), PropValue::String("red".to_string()));
+        red_10.insert("score".to_string(), PropValue::Int(10));
+        red_10.insert("tag".to_string(), PropValue::String("hot".to_string()));
+        let mut red_20 = BTreeMap::new();
+        red_20.insert("color".to_string(), PropValue::String("red".to_string()));
+        red_20.insert("score".to_string(), PropValue::Int(20));
+        let mut blue_30 = BTreeMap::new();
+        blue_30.insert("color".to_string(), PropValue::String("blue".to_string()));
+        blue_30.insert("score".to_string(), PropValue::Int(30));
+
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(1, 7, "a", red_10, 1000)),
+            1,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(2, 7, "b", red_20, 2000)),
+            2,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(3, 8, "c", blue_30, 3000)),
+            3,
+        );
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 4);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(11, 1, 3, 5)), 5);
+
+        let eq_entry = SecondaryIndexManifestEntry {
+            index_id: 71,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 7,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let range_entry = SecondaryIndexManifestEntry {
+            index_id: 72,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 7,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&range_entry);
+        let indexes = vec![eq_entry, range_entry];
+
+        write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
+        assert!(seg_dir
+            .join(crate::planner_stats::PLANNER_STATS_FILENAME)
+            .exists());
+
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        let stats = reader.planner_stats().expect("planner stats should load");
+        assert_eq!(stats.node_count, 3);
+        assert_eq!(stats.edge_count, 2);
+        assert!(stats.general_property_stats_complete);
+        assert_eq!(stats.node_id_sample, vec![1, 2, 3]);
+        assert_eq!(
+            stats
+                .type_stats
+                .iter()
+                .map(|type_stats| (type_stats.type_id, type_stats.node_count))
+                .collect::<Vec<_>>(),
+            vec![(7, 2), (8, 1)]
+        );
+
+        let color_stats = stats
+            .property_stats
+            .iter()
+            .find(|prop| prop.type_id == 7 && prop.prop_key == "color")
+            .unwrap();
+        assert_eq!(
+            color_stats.tracked_reason,
+            crate::planner_stats::PropertyStatsTrackedReason::DeclaredEquality
+        );
+        assert_eq!(color_stats.present_count, 2);
+        assert_eq!(color_stats.exact_distinct_count, Some(1));
+
+        let equality = stats
+            .equality_index_stats
+            .iter()
+            .find(|stats| stats.index_id == 71)
+            .unwrap();
+        assert_eq!(equality.total_postings, 2);
+        assert_eq!(equality.value_group_count, 1);
+        assert!(equality.sidecar_present_at_build);
+
+        let range = stats
+            .range_index_stats
+            .iter()
+            .find(|stats| stats.index_id == 72)
+            .unwrap();
+        assert_eq!(range.total_entries, 2);
+        assert_eq!(range.buckets.len(), 2);
+        assert!(range.sidecar_present_at_build);
+
+        let outgoing = stats
+            .adjacency_stats
+            .iter()
+            .find(|stats| {
+                stats.direction == crate::planner_stats::PlannerStatsDirection::Outgoing
+                    && stats.edge_type_id == Some(5)
+            })
+            .unwrap();
+        assert_eq!(outgoing.source_node_count, 1);
+        assert_eq!(outgoing.total_edges, 2);
+        assert_eq!(outgoing.max_fanout, 2);
+    }
+
+    #[test]
+    fn test_planner_stats_sidecar_is_deterministic_for_same_segment_contents() {
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::UInt(10));
+
+        let mt = Memtable::new();
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(2, 1, "b", props.clone(), 2000)),
+            1,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "a", props, 1000)),
+            2,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        write_segment(&left, 42, &mt, None).unwrap();
+        write_segment(&right, 42, &mt, None).unwrap();
+
+        let left_stats =
+            std::fs::read(left.join(crate::planner_stats::PLANNER_STATS_FILENAME)).unwrap();
+        let right_stats =
+            std::fs::read(right.join(crate::planner_stats::PLANNER_STATS_FILENAME)).unwrap();
+        assert_eq!(left_stats, right_stats);
+    }
+
+    #[test]
+    fn test_flush_planner_stats_caps_general_properties_but_keeps_declared_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+
+        let mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        for idx in 0..300 {
+            props.insert(format!("prop_{:03}", idx), PropValue::UInt(idx));
+        }
+        props.insert(
+            "zz_declared".to_string(),
+            PropValue::String("yes".to_string()),
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "wide", props, 1000)),
+            1,
+        );
+        let declared = SecondaryIndexManifestEntry {
+            index_id: 91,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "zz_declared".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&declared);
+
+        write_segment_with_secondary_indexes(
+            &seg_dir,
+            1,
+            &mt,
+            None,
+            std::slice::from_ref(&declared),
+        )
+        .unwrap();
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        let stats = reader.planner_stats().unwrap();
+        let type_one_props: Vec<_> = stats
+            .property_stats
+            .iter()
+            .filter(|prop| prop.type_id == 1)
+            .collect();
+        let general_count = type_one_props
+            .iter()
+            .filter(|prop| {
+                prop.tracked_reason
+                    == crate::planner_stats::PropertyStatsTrackedReason::GeneralTopProperty
+            })
+            .count();
+        assert_eq!(
+            general_count,
+            crate::planner_stats::PLANNER_STATS_MAX_PROPERTY_KEYS_PER_TYPE
+        );
+        let declared_stats = type_one_props
+            .iter()
+            .find(|prop| prop.prop_key == "zz_declared")
+            .unwrap();
+        assert_eq!(
+            declared_stats.tracked_reason,
+            crate::planner_stats::PropertyStatsTrackedReason::DeclaredEquality
+        );
+        assert_eq!(declared_stats.present_count, 1);
+    }
+
+    #[test]
+    fn test_flush_planner_stats_keeps_late_frequent_general_property() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+
+        let mt = Memtable::new();
+        let mut first_props = BTreeMap::new();
+        for idx in 0..crate::planner_stats::PLANNER_STATS_MAX_PROPERTY_KEYS_PER_TYPE * 4 {
+            first_props.insert(format!("one_off_{:04}", idx), PropValue::UInt(idx as u64));
+        }
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "wide", first_props, 1000)),
+            1,
+        );
+        for node_id in 2..=33 {
+            let mut props = BTreeMap::new();
+            props.insert("zz_late_hot".to_string(), PropValue::UInt(node_id));
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node_with_custom_props(
+                    node_id,
+                    1,
+                    &format!("hot_{}", node_id),
+                    props,
+                    1000 + node_id as i64,
+                )),
+                node_id,
+            );
+        }
+
+        write_segment(&seg_dir, 1, &mt, None).unwrap();
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        let stats = reader.planner_stats().unwrap();
+        let late_hot = stats
+            .property_stats
+            .iter()
+            .find(|prop| prop.type_id == 1 && prop.prop_key == "zz_late_hot")
+            .expect("late frequent property should be tracked");
+        assert_eq!(
+            late_hot.tracked_reason,
+            crate::planner_stats::PropertyStatsTrackedReason::GeneralTopProperty
+        );
+        assert_eq!(late_hot.present_count, 32);
+        assert_eq!(late_hot.exact_distinct_count, Some(32));
+    }
+
+    #[test]
+    fn test_planner_stats_declared_index_for_absent_type_stays_available() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_seg = source_dir.path().join("seg_0001");
+        let compact_dir = tempfile::tempdir().unwrap();
+        let compact_seg = compact_dir.path().join("seg_0002");
+
+        let mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String("red".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "present", props, 1000)),
+            1,
+        );
+
+        let absent_declared = SecondaryIndexManifestEntry {
+            index_id: 101,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 99,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&absent_declared);
+
+        write_segment_with_secondary_indexes(
+            &source_seg,
+            1,
+            &mt,
+            None,
+            std::slice::from_ref(&absent_declared),
+        )
+        .unwrap();
+        let source_reader = Arc::new(SegmentReader::open(&source_seg, 1, None).unwrap());
+        let flush_stats = source_reader.planner_stats().unwrap();
+        assert!(flush_stats
+            .property_stats
+            .iter()
+            .all(|prop| prop.type_id != 99));
+        let equality = flush_stats
+            .equality_index_stats
+            .iter()
+            .find(|stats| stats.index_id == 101)
+            .unwrap();
+        assert_eq!(equality.total_postings, 0);
+
+        let compact_reader =
+            compact_copy_segment_for_test(source_reader, &compact_seg, 2, &[absent_declared]);
+        let compact_stats = compact_reader.planner_stats().unwrap();
+        assert!(compact_stats
+            .property_stats
+            .iter()
+            .all(|prop| prop.type_id != 99));
+        let equality = compact_stats
+            .equality_index_stats
+            .iter()
+            .find(|stats| stats.index_id == 101)
+            .unwrap();
+        assert_eq!(equality.total_postings, 0);
+    }
+
+    #[test]
+    fn test_compaction_planner_stats_match_flush_for_complete_evidence() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_seg = source_dir.path().join("seg_0001");
+        let compact_dir = tempfile::tempdir().unwrap();
+        let compact_seg = compact_dir.path().join("seg_0002");
+
+        let mt = Memtable::new();
+        for (id, color, score) in [(1, "red", 10), (2, "red", 20), (3, "blue", 30)] {
+            let mut props = BTreeMap::new();
+            props.insert("color".to_string(), PropValue::String(color.to_string()));
+            props.insert("score".to_string(), PropValue::Int(score));
+            props.insert("tag".to_string(), PropValue::String(format!("n{}", id)));
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node_with_custom_props(
+                    id,
+                    9,
+                    &format!("k{}", id),
+                    props,
+                    1000 + id as i64,
+                )),
+                id,
+            );
+        }
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 4)), 10);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(11, 2, 3, 4)), 11);
+
+        let eq_entry = SecondaryIndexManifestEntry {
+            index_id: 81,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 9,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let range_entry = SecondaryIndexManifestEntry {
+            index_id: 82,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 9,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&range_entry);
+        let indexes = vec![eq_entry, range_entry];
+
+        write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
+        let source_reader = Arc::new(SegmentReader::open(&source_seg, 1, None).unwrap());
+        let compact_reader =
+            compact_copy_segment_for_test(source_reader.clone(), &compact_seg, 2, &indexes);
+
+        let flush_stats = source_reader.planner_stats().unwrap();
+        let compact_stats = compact_reader.planner_stats().unwrap();
+        assert_eq!(
+            compact_stats.build_kind,
+            crate::planner_stats::PlannerStatsBuildKind::Compaction
+        );
+        assert!(compact_stats.general_property_stats_complete);
+        assert_eq!(compact_stats.general_property_sampled_node_count, 3);
+        assert_eq!(compact_stats.type_stats, flush_stats.type_stats);
+        assert_eq!(compact_stats.timestamp_stats, flush_stats.timestamp_stats);
+        assert_eq!(compact_stats.property_stats, flush_stats.property_stats);
+        assert_eq!(
+            compact_stats.equality_index_stats,
+            flush_stats.equality_index_stats
+        );
+        assert_eq!(
+            compact_stats.range_index_stats,
+            flush_stats.range_index_stats
+        );
+        assert_eq!(compact_stats.adjacency_stats, flush_stats.adjacency_stats);
+        assert_eq!(compact_stats.node_id_sample, flush_stats.node_id_sample);
+    }
+
+    #[test]
+    fn test_compaction_planner_stats_marks_general_property_decode_budget() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_seg = source_dir.path().join("seg_0001");
+        let compact_dir = tempfile::tempdir().unwrap();
+        let compact_seg = compact_dir.path().join("seg_0002");
+
+        let mt = Memtable::new();
+        for id in 1..=1025u64 {
+            let mut props = BTreeMap::new();
+            props.insert("sampled".to_string(), PropValue::UInt(id));
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node_with_custom_props(
+                    id,
+                    1,
+                    &format!("n{}", id),
+                    props,
+                    id as i64,
+                )),
+                id,
+            );
+        }
+        write_segment(&source_seg, 1, &mt, None).unwrap();
+        let source_reader = Arc::new(SegmentReader::open(&source_seg, 1, None).unwrap());
+        let compact_reader = compact_copy_segment_for_test(source_reader, &compact_seg, 2, &[]);
+        let stats = compact_reader.planner_stats().unwrap();
+
+        assert!(!stats.general_property_stats_complete);
+        assert_eq!(stats.general_property_sampled_node_count, 1024);
+        assert!(stats.general_property_budget_exhausted);
+        let sampled = stats
+            .property_stats
+            .iter()
+            .find(|prop| prop.type_id == 1 && prop.prop_key == "sampled")
+            .unwrap();
+        assert_eq!(sampled.present_count, 1024);
+    }
+
+    #[test]
+    fn test_planner_stats_write_failure_does_not_block_segment_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        std::fs::create_dir_all(seg_dir.join("planner_stats.tmp")).unwrap();
+
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
+        let info = write_segment(&seg_dir, 1, &mt, None).unwrap();
+        assert_eq!(info.node_count, 1);
+        assert!(seg_dir.join("nodes.dat").exists());
+        assert!(!seg_dir
+            .join(crate::planner_stats::PLANNER_STATS_FILENAME)
+            .exists());
+
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        assert!(reader.get_node(1).unwrap().is_some());
+        assert!(!reader.planner_stats_available());
     }
 }

@@ -42,5 +42,5 @@ jobs:
       - name: Run tests
         run: cargo test --features cli
 
-      - name: Run tests (no default features)
-        run: cargo test
+      - name: Check without default features
+        run: cargo check --all-targets --no-default-features

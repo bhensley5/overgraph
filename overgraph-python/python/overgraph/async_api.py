@@ -312,6 +312,21 @@ class AsyncOverGraph:
     async def find_nodes(self, type_id: int, prop_key: str, prop_value: Any) -> IdArray:
         return await asyncio.to_thread(self._db.find_nodes, type_id, prop_key, prop_value)
 
+    async def query_node_ids(self, request: Any) -> PyIdPageResult:
+        return await asyncio.to_thread(self._db.query_node_ids, request)
+
+    async def query_nodes(self, request: Any) -> PyNodePageResult:
+        return await asyncio.to_thread(self._db.query_nodes, request)
+
+    async def query_pattern(self, request: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.query_pattern, request)
+
+    async def explain_node_query(self, request: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.explain_node_query, request)
+
+    async def explain_pattern_query(self, request: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.explain_pattern_query, request)
+
     async def ensure_node_property_index(
         self,
         type_id: int,

@@ -48,6 +48,8 @@ pub mod memtable;
 #[doc(hidden)]
 pub(crate) mod parallel;
 #[doc(hidden)]
+pub(crate) mod planner_stats;
+#[doc(hidden)]
 pub mod segment_reader;
 #[doc(hidden)]
 pub mod segment_writer;

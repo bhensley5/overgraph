@@ -22,6 +22,7 @@ function parseArgs(argv) {
     profile: 'small',
     warmup: 20,
     iters: 80,
+    scenarioSet: 'all',
   };
   for (let i = 2; i < argv.length; i++) {
     const token = argv[i];
@@ -31,7 +32,12 @@ function parseArgs(argv) {
       args.warmup = Number(argv[++i]);
     } else if (token === '--iters' && argv[i + 1]) {
       args.iters = Number(argv[++i]);
+    } else if (token === '--scenario-set' && argv[i + 1]) {
+      args.scenarioSet = argv[++i];
     }
+  }
+  if (!['all', 'query'].includes(args.scenarioSet)) {
+    throw new Error(`Unknown scenario set '${args.scenarioSet}'`);
   }
   return args;
 }
@@ -306,6 +312,145 @@ function scenario(
   };
 }
 
+function queryBenchProps(i) {
+  return {
+    status: i % 10 === 0 ? 'active' : 'inactive',
+    tier: i % 20 === 0 ? 'gold' : 'standard',
+    score: i % 100,
+  };
+}
+
+function waitForPropertyIndexReady(db, indexId) {
+  const deadline = performance.now() + 10_000;
+  while (performance.now() < deadline) {
+    if (db.listNodePropertyIndexes().some(info => info.indexId === indexId && info.state === 'ready')) {
+      return;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  throw new Error(`Timed out waiting for property index ${indexId} to become ready`);
+}
+
+function queryBenchmarkLayout(preloadNodes) {
+  const segments = preloadNodes >= 2 ? 1 : 0;
+  const segmentNodes = segments === 0 ? 0 : Math.max(1, Math.floor(preloadNodes / (segments + 1)));
+  return {
+    segments,
+    segment_nodes: segmentNodes,
+    memtable_tail_nodes: Math.max(0, preloadNodes - segments * segmentNodes),
+  };
+}
+
+function queryBenchNodes(start, count) {
+  return Array.from({ length: count }, (_, offset) => {
+    const i = start + offset;
+    return {
+      typeId: 1,
+      key: `q-${i}`,
+      props: queryBenchProps(i),
+    };
+  });
+}
+
+function buildQueryBenchmarkDb(path, preloadNodes) {
+  const db = OverGraph.open(path);
+  const status = db.ensureNodePropertyIndex(1, 'status', { kind: 'equality' });
+  waitForPropertyIndexReady(db, status.indexId);
+  const tier = db.ensureNodePropertyIndex(1, 'tier', { kind: 'equality' });
+  waitForPropertyIndexReady(db, tier.indexId);
+  const score = db.ensureNodePropertyIndex(1, 'score', { kind: 'range', domain: 'int' });
+  waitForPropertyIndexReady(db, score.indexId);
+
+  const layout = queryBenchmarkLayout(preloadNodes);
+  for (let segment = 0; segment < layout.segments; segment += 1) {
+    db.batchUpsertNodes(queryBenchNodes(segment * layout.segment_nodes, layout.segment_nodes));
+    db.flush();
+  }
+  db.batchUpsertNodes(
+    queryBenchNodes(layout.segments * layout.segment_nodes, layout.memtable_tail_nodes)
+  );
+  return { db, layout };
+}
+
+function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
+  const preloadNodes = cfg.time_range_nodes;
+  const limit = 100;
+
+  {
+    const scenarioId = 'S-QUERY-001';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout } = buildQueryBenchmarkDb(join(tmpRoot, 'query-node-ids-intersected'), preloadNodes);
+    const request = {
+      typeId: 1,
+      filter: {
+        and: [
+          { property: 'status', eq: 'active' },
+          { property: 'tier', eq: 'gold' },
+        ],
+      },
+      limit,
+    };
+    const s = runBench(() => db.queryNodeIds(request), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'query_node_ids_intersected_predicates',
+        'query',
+        s,
+        iterCfg,
+        {
+          type_id: 1,
+          preload_nodes: preloadNodes,
+          segments: layout.segments,
+          segment_nodes: layout.segment_nodes,
+          memtable_tail_nodes: layout.memtable_tail_nodes,
+          predicates: ['status_eq_active', 'tier_eq_gold'],
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    const scenarioId = 'S-QUERY-002';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout } = buildQueryBenchmarkDb(join(tmpRoot, 'query-nodes-hydrated-intersected'), preloadNodes);
+    const request = {
+      typeId: 1,
+      filter: {
+        and: [
+          { property: 'status', eq: 'active' },
+          { property: 'score', gte: 50 },
+        ],
+      },
+      limit,
+    };
+    const s = runBench(() => db.queryNodes(request), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'query_nodes_intersected_predicates_hydrated',
+        'query',
+        s,
+        iterCfg,
+        {
+          type_id: 1,
+          preload_nodes: preloadNodes,
+          segments: layout.segments,
+          segment_nodes: layout.segment_nodes,
+          memtable_tail_nodes: layout.memtable_tail_nodes,
+          predicates: ['status_eq_active', 'score_gte_50'],
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+}
+
 const args = parseArgs(process.argv);
 const { profilePath, profilePayload, profile, scenarioContractPath, scenarioContract } =
   loadWorkloadContracts(args.profile);
@@ -315,6 +460,9 @@ const tmpRoot = mkdtempSync(join(tmpdir(), `overgraph-node-bench-v2-${args.profi
 const scenarios = [];
 
 try {
+  pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios);
+
+  if (args.scenarioSet === 'all') {
   // S-CRUD-001: single upsert node (growth)
   {
     const scenarioId = 'S-CRUD-001';
@@ -1142,6 +1290,7 @@ try {
       )
     );
     db.close();
+  }
   }
 
   const output = {

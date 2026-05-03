@@ -57,7 +57,7 @@ Reads check multiple sources and merge them:
 1. **Memtable** (freshest data, always checked first)
 2. **Immutable segments** (scanned newest to oldest)
 
-For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we stop at the first source that has the record. For collection queries (`neighbors`, `find_nodes`, `nodes_by_type`), we merge results from all sources using a K-way merge with a min-heap. For eligible aggregation queries (`degree`, `degrees`, `sum_edge_weights`, `avg_edge_weight` with no type filter, no explicit epoch, no active prune policy, and valid degree sidecars on all visible segments), reads sum published degree overlays plus per-segment `degree_delta.dat` sidecars without walking adjacency. Filtered, temporal, prune-policy, temporal-edge, or sidecar-unavailable cases fall back to the adjacency walk path.
+For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we stop at the first source that has the record. For collection queries (`neighbors`, `find_nodes`, `nodes_by_type`), we merge results from all sources using a K-way merge with a min-heap. Planner-backed queries can also use optional per-segment `planner_stats.dat` sidecars for private cost estimates, adaptive candidate caps, and graph-pattern fanout ordering; the stats are advisory only, and final visible-record verification still decides results. For eligible aggregation queries (`degree`, `degrees`, `sum_edge_weights`, `avg_edge_weight` with no type filter, no explicit epoch, no active prune policy, and valid degree sidecars on all visible segments), reads sum published degree overlays plus per-segment `degree_delta.dat` sidecars without walking adjacency. Filtered, temporal, prune-policy, temporal-edge, or sidecar-unavailable cases fall back to the adjacency walk path.
 
 Tombstones (from `delete_node` / `delete_edge`) are applied during the merge. Prune policies are also evaluated at read time, so a registered policy takes effect immediately without waiting for compaction.
 
@@ -84,6 +84,7 @@ Each segment is a directory containing:
 | `tombstones.dat` | Set of deleted IDs |
 | `metadata.dat` | Sidecar with per-record metadata for fast compaction |
 | `degree_delta.dat` | Optional signed degree delta sidecar for degree/weight fast paths |
+| `planner_stats.dat` | Optional advisory planner statistics for private query costing |
 | `node_dense_vectors.dat` | Dense vector blob (present only when segment has vectors) |
 | `node_sparse_vectors.dat` | Sparse vector blob (present only when segment has vectors) |
 | `dense_hnsw_graph.dat` | HNSW graph index for dense ANN search |

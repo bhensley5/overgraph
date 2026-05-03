@@ -46,3 +46,13 @@ All benchmark harnesses (Rust, Node.js, Python) must load these fields consisten
 - scenario-specific warmup/measurement iteration policy
 - per-scenario comparability (`comparable` vs `non_comparable` + reason)
 - percentile computation method declaration
+
+## Query Scenario Set
+Phase 23 adds a query-only scenario set for native planner parity:
+
+- `S-QUERY-001`: `query_node_ids_intersected_predicates`
+- `S-QUERY-002`: `query_nodes_intersected_predicates_hydrated`
+
+These scenarios benchmark planner intersection over existing single-source property indexes. They
+must not be described as compound-index benchmarks; maintained compound/composite indexes remain a
+separate follow-up.

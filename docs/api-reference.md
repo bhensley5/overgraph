@@ -66,6 +66,20 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
   - [find_nodes](#find_nodes)
   - [find_nodes_range](#find_nodes_range)
   - [find_nodes_by_time_range](#find_nodes_by_time_range)
+- [Queries](#queries)
+  - [Node Queries](#node-queries)
+    - [query_node_ids](#query_node_ids)
+    - [query_nodes](#query_nodes)
+    - [explain_node_query](#explain_node_query)
+  - [Graph Pattern Queries](#graph-pattern-queries)
+    - [query_pattern](#query_pattern)
+    - [explain_pattern_query](#explain_pattern_query)
+  - [Query Request Types and Plans](#query-request-types-and-plans)
+    - [NodeQuery](#nodequery)
+    - [NodeFilter / QueryNodeFilter](#nodefilter--querynodefilter)
+    - [GraphPatternQuery](#graphpatternquery)
+    - [QueryPlan](#queryplan)
+    - [Validation notes](#validation-notes)
 - [Pagination](#pagination)
   - [nodes_by_type_paged](#nodes_by_type_paged)
   - [edges_by_type_paged](#edges_by_type_paged)
@@ -74,23 +88,21 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
   - [find_nodes_paged](#find_nodes_paged)
   - [find_nodes_range_paged](#find_nodes_range_paged)
   - [find_nodes_by_time_range_paged](#find_nodes_by_time_range_paged)
-- [Neighbor Queries](#neighbor-queries)
+- [Traversal](#traversal)
   - [neighbors](#neighbors)
   - [neighbors_paged](#neighbors_paged)
   - [neighbors_batch](#neighbors_batch)
   - [top_k_neighbors](#top_k_neighbors)
+  - [traverse](#traverse)
+  - [extract_subgraph](#extract_subgraph)
+  - [shortest_path](#shortest_path)
+  - [all_shortest_paths](#all_shortest_paths)
+  - [is_connected](#is_connected)
 - [Degree & Weight Aggregation](#degree--weight-aggregation)
   - [degree](#degree)
   - [degrees](#degrees)
   - [sum_edge_weights](#sum_edge_weights)
   - [avg_edge_weight](#avg_edge_weight)
-- [Traversal](#traversal)
-  - [traverse](#traverse)
-  - [extract_subgraph](#extract_subgraph)
-- [Pathfinding](#pathfinding)
-  - [shortest_path](#shortest_path)
-  - [all_shortest_paths](#all_shortest_paths)
-  - [is_connected](#is_connected)
 - [Graph Analytics](#graph-analytics)
   - [connected_components](#connected_components)
   - [component_of](#component_of)
@@ -456,7 +468,7 @@ Properties are encoded with [MessagePack](https://msgpack.org) internally and co
 
 ### Direction
 
-Controls edge traversal direction. Used across neighbor queries, traversal, pathfinding, and analytics.
+Controls edge traversal direction. Used across traversal and graph analytics APIs.
 
 | Value | Rust | Node.js | Python | Meaning |
 |-------|------|---------|--------|---------|
@@ -1397,7 +1409,7 @@ Property indexes are optional declarations on node properties. Public query meth
 
 Lifecycle rules:
 - `ensure_node_property_index` registers an equality or numeric range declaration and starts background build work when needed.
-- `list_node_property_indexes` exposes declaration kind, range domain, lifecycle state, and any last error.
+- `list_node_property_indexes` exposes declaration kind, range domain, lifecycle state, and any last error from the published read snapshot, so `Ready` means new public reads can use the same ready catalog.
 - `find_nodes`, `find_nodes_paged`, `find_nodes_range`, and `find_nodes_range_paged` use declaration-backed execution only when a matching declaration is `Ready`.
 - If a declaration is absent, `Building`, `Failed`, or cannot be used for a specific lookup, OverGraph falls back to the same public query API for that call.
 
@@ -1777,6 +1789,661 @@ Node IDs matching the time range. Uses the timestamp index.
 
 ---
 
+## Queries
+
+Query APIs combine explicit IDs, keys, type constraints, property filters, timestamp filters, and
+bounded graph patterns through normal function-call and object APIs. OverGraph still has no query
+string parser.
+
+Node queries use a recursive `filter` tree.
+
+Top-level request fields such as `type_id` / `typeId`, `ids`, and `keys` are not part of the
+filter tree. They are top-level constraints and are ANDed with the filter. Within `ids` and
+`keys`, values are OR alternatives.
+
+Use `filter` for all node predicates in node queries and node patterns. The old node-level
+connector `where` and `predicates` fields are no longer supported for node filters. Edge patterns
+still support their existing edge-scoped `where` / `predicates` post-filters.
+
+Query APIs use the same published read snapshot and visibility rules as direct read APIs.
+Internally, OverGraph may use explicit IDs, key lookup, the node type index, ready property
+equality/range indexes, the timestamp index, sorted intersection, sorted union, fallback scans, or
+bounded adjacency expansion. Candidate indexes are verified after candidate planning; indexes are
+never trusted as final truth.
+
+OverGraph may also use private durable planner statistics when they are available. These stats can
+improve cost estimates, adaptive caps, OR/IN costing, and graph-pattern fanout ordering, but they do
+not change request shapes or result semantics. Missing, corrupt, or stale stats only degrade
+planning quality; every returned result is still verified against the visible record.
+
+### What Query APIs Are
+
+Node queries are the API-first query surface for combining top-level constraints with a recursive
+node `filter` tree. They are useful when a request needs more than one constraint, when an index may
+help but should remain optional, or when the same filter should be explained.
+
+Graph pattern queries use the same node filter model on pattern nodes, then expand bounded edge
+constraints. Edge property checks remain edge-scoped post-filters in Phase 24.
+
+### Choosing the Right Query API
+
+Use [`query_node_ids`](#query_node_ids) when you need matching IDs and want OverGraph to combine
+top-level constraints with a node filter tree.
+
+Use [`query_nodes`](#query_nodes) for the same query shape when you need hydrated node records. It
+shares the same plan and verifier as `query_node_ids`; only the final payload differs.
+
+Use [`explain_node_query`](#explain_node_query) to inspect the selected physical plan and warnings
+without executing the page.
+
+Use direct property and time queries such as [`find_nodes`](#find_nodes),
+[`find_nodes_range`](#find_nodes_range), and
+[`find_nodes_by_time_range`](#find_nodes_by_time_range) when you already know you need one direct
+indexed lookup or range lookup. Those APIs keep their existing shapes.
+
+Use [`query_pattern`](#query_pattern) when the result is a bounded graph pattern binding across
+nodes and edges.
+
+### Node Queries
+
+#### query_node_ids
+
+Runs a node query and returns matching node IDs.
+
+**Rust**
+```rust
+let page = db.query_node_ids(&NodeQuery {
+    type_id: Some(USER),
+    filter: Some(NodeFilterExpr::And(vec![
+        NodeFilterExpr::PropertyEquals {
+            key: "status".into(),
+            value: PropValue::String("active".into()),
+        },
+        NodeFilterExpr::PropertyRange {
+            key: "score".into(),
+            lower: Some(PropertyRangeBound::Included(PropValue::Int(50))),
+            upper: None,
+        },
+    ])),
+    page: PageRequest { limit: Some(100), after: None },
+    ..Default::default()
+})?;
+```
+
+**Node.js**
+```javascript
+const page = db.queryNodeIds({
+  typeId: USER,
+  filter: {
+    and: [
+      { property: 'status', eq: 'active' },
+      { property: 'score', gte: 50 },
+    ],
+  },
+  limit: 100,
+});
+```
+
+**Python**
+```python
+page = db.query_node_ids({
+    "type_id": USER,
+    "filter": {
+        "and": [
+            {"property": "status", "eq": "active"},
+            {"property": "score", "gte": 50},
+        ],
+    },
+    "limit": 100,
+})
+```
+
+##### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Description |
+|-----------|------|---------|--------|----------|-------------|
+| request | `&NodeQuery` | `QueryNodeRequest` | `dict \| NodeQueryRequest` | Yes | Node query request. See [NodeQuery](#nodequery). |
+
+##### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<QueryNodeIdsResult, EngineError>` | `JsIdPageResult` | `PyIdPageResult` |
+
+Result fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| items | `items: Vec<u64>` | `items: Float64Array` | `items: IdArray` | Matching node IDs in ascending node ID order. |
+| cursor | `next_cursor: Option<u64>` | `nextCursor?: number` | `next_cursor: int \| None` | Cursor for the next page. Pass it as `after`. |
+
+---
+
+#### query_nodes
+
+Runs the same node query as [`query_node_ids`](#query_node_ids), then hydrates the final page of
+matching nodes.
+
+**Rust**
+```rust
+let page = db.query_nodes(&NodeQuery {
+    type_id: Some(USER),
+    filter: Some(NodeFilterExpr::PropertyEquals {
+        key: "status".into(),
+        value: PropValue::String("active".into()),
+    }),
+    page: PageRequest { limit: Some(25), after: None },
+    ..Default::default()
+})?;
+```
+
+**Node.js**
+```javascript
+const page = db.queryNodes({
+  typeId: MEMORY,
+  filter: {
+    and: [
+      { property: 'status', in: ['active', 'trial'] },
+      { not: { property: 'archivedAt', exists: true } },
+      {
+        or: [
+          { property: 'priority', gte: 8 },
+          { property: 'source', eq: 'user' },
+        ],
+      },
+    ],
+  },
+  limit: 25,
+});
+```
+
+**Python**
+```python
+page = db.query_nodes({
+    "type_id": MEMORY,
+    "filter": {
+        "and": [
+            {"property": "status", "in": ["active", "trial"]},
+            {"not": {"property": "archived_at", "exists": True}},
+            {
+                "or": [
+                    {"property": "priority", "gte": 8},
+                    {"property": "source", "eq": "user"},
+                ],
+            },
+        ],
+    },
+    "limit": 25,
+})
+```
+
+##### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Description |
+|-----------|------|---------|--------|----------|-------------|
+| request | `&NodeQuery` | `QueryNodeRequest` | `dict \| NodeQueryRequest` | Yes | Node query request. See [NodeQuery](#nodequery). |
+
+##### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<QueryNodesResult, EngineError>` | `JsNodePageResult` | `PyNodePageResult` |
+
+Result fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| items | `items: Vec<NodeRecord>` | `items: JsNodeRecord[]` | `items: list[PyNodeRecord]` | Hydrated final page of matching nodes. |
+| cursor | `next_cursor: Option<u64>` | `nextCursor: number \| null` | `next_cursor: int \| None` | Cursor for the next page. Pass it as `after`. |
+
+Connector node records expose top-level fields eagerly. Property maps are converted only when the
+`.props` getter is accessed.
+
+---
+
+#### explain_node_query
+
+Returns the deterministic planner tree, estimates, and warnings for a node query. It applies the
+same validation rules as execution.
+
+**Rust**
+```rust
+let plan = db.explain_node_query(&query)?;
+```
+
+**Node.js**
+```javascript
+const plan = db.explainNodeQuery({
+  typeId: USER,
+  filter: { property: 'status', eq: 'active' },
+});
+```
+
+**Python**
+```python
+plan = db.explain_node_query({
+    "type_id": USER,
+    "filter": {"property": "status", "eq": "active"},
+})
+```
+
+##### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<QueryPlan, EngineError>` | `object` | `dict` |
+
+See [QueryPlan](#queryplan).
+
+---
+
+### Graph Pattern Queries
+
+#### query_pattern
+
+Runs a bounded, connected graph pattern query and returns ID bindings for node and named edge
+aliases. Pattern v1 returns IDs only. Hydrate bound IDs with [`get_nodes`](#get_nodes) and
+[`get_edges`](#get_edges) when needed.
+
+Node patterns use the same recursive `filter` tree as node queries. Edge pattern `where` /
+`predicates` remain Phase 24 edge-scoped post-filters after bounded expansion.
+
+**Rust**
+```rust
+let result = db.query_pattern(&GraphPatternQuery {
+    nodes: vec![
+        NodePattern {
+            alias: "person".into(),
+            type_id: Some(USER),
+            ids: vec![],
+            keys: vec![],
+            filter: Some(NodeFilterExpr::Or(vec![
+                NodeFilterExpr::PropertyEquals {
+                    key: "status".into(),
+                    value: PropValue::String("active".into()),
+                },
+                NodeFilterExpr::PropertyEquals {
+                    key: "status".into(),
+                    value: PropValue::String("trial".into()),
+                },
+            ])),
+        },
+        NodePattern {
+            alias: "company".into(),
+            type_id: Some(COMPANY),
+            ids: vec![],
+            keys: vec!["acme".into()],
+            filter: None,
+        },
+    ],
+    edges: vec![EdgePattern {
+        alias: Some("employment".into()),
+        from_alias: "person".into(),
+        to_alias: "company".into(),
+        direction: Direction::Outgoing,
+        type_filter: Some(vec![WORKS_AT]),
+        property_predicates: vec![EdgePostFilterPredicate::PropertyEquals {
+            key: "role".into(),
+            value: PropValue::String("engineer".into()),
+        }],
+    }],
+    at_epoch: None,
+    limit: 100,
+    order: PatternOrder::AnchorThenAliasesAsc,
+})?;
+```
+
+**Node.js**
+```javascript
+const result = db.queryPattern({
+  nodes: [
+    {
+      alias: 'person',
+      typeId: USER,
+      filter: {
+        or: [
+          { property: 'status', eq: 'active' },
+          { property: 'status', eq: 'trial' },
+        ],
+      },
+    },
+    {
+      alias: 'company',
+      typeId: COMPANY,
+      keys: ['acme'],
+    },
+  ],
+  edges: [
+    {
+      alias: 'employment',
+      fromAlias: 'person',
+      toAlias: 'company',
+      direction: 'outgoing',
+      typeFilter: [WORKS_AT],
+
+      // Edge post-filter remains Phase 23 edge-scoped shape.
+      where: { role: { eq: 'engineer' } },
+    },
+  ],
+  limit: 100,
+});
+```
+
+**Python**
+```python
+result = db.query_pattern({
+    "nodes": [
+        {
+            "alias": "person",
+            "type_id": USER,
+            "filter": {
+                "or": [
+                    {"property": "status", "eq": "active"},
+                    {"property": "status", "eq": "trial"},
+                ],
+            },
+        },
+        {
+            "alias": "company",
+            "type_id": COMPANY,
+            "keys": ["acme"],
+        },
+    ],
+    "edges": [
+        {
+            "alias": "employment",
+            "from_alias": "person",
+            "to_alias": "company",
+            "direction": "outgoing",
+            "type_filter": [WORKS_AT],
+
+            # Edge post-filter remains edge-scoped.
+            "where": {"role": {"eq": "engineer"}},
+        },
+    ],
+    "limit": 100,
+})
+```
+
+##### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Description |
+|-----------|------|---------|--------|----------|-------------|
+| request | `&GraphPatternQuery` | `GraphPatternRequest` | `dict \| GraphPatternRequest` | Yes | Pattern request. See [GraphPatternQuery](#graphpatternquery). |
+
+##### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<QueryPatternResult, EngineError>` | `object` | `dict` |
+
+Result fields:
+
+| Field | Description |
+|-------|-------------|
+| matches | List of bindings. Each binding has `nodes` and `edges` maps keyed by alias. |
+| truncated | `true` when more matches existed than the requested `limit`. |
+
+---
+
+#### explain_pattern_query
+
+Returns the plan for a graph pattern query without executing the match. Pattern explain reports
+the selected anchor alias and the actual node-query physical plan used for that anchor.
+
+**Rust**
+```rust
+let plan = db.explain_pattern_query(&pattern)?;
+```
+
+**Node.js**
+```javascript
+const plan = db.explainPatternQuery(pattern);
+```
+
+**Python**
+```python
+plan = db.explain_pattern_query(pattern)
+```
+
+##### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<QueryPlan, EngineError>` | `object` | `dict` |
+
+See [QueryPlan](#queryplan).
+
+Node.js and Python async APIs expose the same query and explain request shapes through
+`queryNodeIdsAsync`, `queryNodesAsync`, `queryPatternAsync`, `explainNodeQueryAsync`,
+`explainPatternQueryAsync`, and the Python `AsyncOverGraph` methods.
+
+---
+
+### Query Request Types and Plans
+
+#### NodeQuery
+
+Node query request fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| type_id | `Option<u32>` | `typeId?: number` | `type_id?: int` | Optional type constraint. Required when using `keys`. |
+| ids | `Vec<u64>` | `ids?: number[]` | `ids?: list[int]` | Explicit node ID candidates. OR within the list. |
+| keys | `Vec<String>` | `keys?: string[]` | `keys?: list[str]` | Type-scoped key candidates. OR within the list. |
+| filter | `Option<NodeFilterExpr>` | `filter?: QueryNodeFilter \| null` | `filter?: QueryNodeFilter \| None` | Recursive node filter tree. Omit or pass null/None for no filter. |
+| limit | `page.limit` | `limit?: number` | `limit?: int` | Page size. Omit for unlimited. Connector `0` means unlimited. |
+| after | `page.after` | `after?: number` | `after?: int` | Cursor from a previous page. Returns items with node IDs strictly greater than `after`. |
+| allow_full_scan | `bool` | `allowFullScan?: boolean` | `allow_full_scan?: bool` | Required for type-less full scan fallback. |
+
+Top-level `type_id` / `typeId`, `ids`, and `keys` are ANDed with `filter`. Type-less verify-only
+filters require `allow_full_scan` / `allowFullScan` unless `ids` or `keys` provide a legal bounded
+universe.
+
+---
+
+#### NodeFilter / QueryNodeFilter
+
+Rust uses `NodeFilterExpr`. Node.js and Python use the canonical recursive `QueryNodeFilter`
+object shape.
+
+| Filter shape | Node.js | Python | Meaning |
+|--------------|---------|--------|---------|
+| Equality | `{ property: "status", eq: "active" }` | `{"property": "status", "eq": "active"}` | Property exactly equals value |
+| IN | `{ property: "status", in: ["active", "trial"] }` | `{"property": "status", "in": ["active", "trial"]}` | Property equals any listed value |
+| Range | `{ property: "score", gte: 50 }` | `{"property": "score", "gte": 50}` | Numeric/range comparison |
+| Range with two bounds | `{ property: "score", gt: 50, lte: 100 }` | `{"property": "score", "gt": 50, "lte": 100}` | Bounded numeric/range comparison |
+| Exists | `{ property: "embedding", exists: true }` | `{"property": "embedding", "exists": True}` | Property key is present |
+| Missing | `{ property: "deletedAt", missing: true }` | `{"property": "deleted_at", "missing": True}` | Property key is absent |
+| AND | `{ and: [filter, ...] }` | `{"and": [filter, ...]}` | All children must match |
+| OR | `{ or: [filter, ...] }` | `{"or": [filter, ...]}` | Any child may match |
+| NOT | `{ not: filter }` | `{"not": filter}` | Child must not match |
+| Updated-at range | `{ updatedAt: { gte: ms } }` | `{"updated_at": {"gte": ms}}` | Built-in node `updated_at` timestamp range |
+
+Property values use OverGraph's normal `PropValue` conversion rules. There is no query-only
+coercion. For example, string `"1"` does not match integer `1`, and integer `1` does not
+automatically match float `1.0`.
+
+`in` is equivalent to equality OR for matching semantics. When a ready equality index exists, the
+query engine may evaluate it as an indexed union, but final visible-record verification still decides
+correctness.
+
+`exists` and `missing` are key-presence predicates, not null checks. `exists` matches when the
+property key is present even if its value is null. `missing` matches only when the key is absent.
+
+`not` is verifier-first. A negative filter does not anchor a broad query by itself.
+
+`or` can use an indexed union only when every branch is bounded. If any OR branch is verify-only or
+requires fallback, the whole OR subtree is verified over the nearest legal universe rather than
+planned as a partial union.
+
+Results from node queries are ordered by node ID ascending. The `after` cursor means strictly
+greater than that node ID.
+
+##### Built-in timestamp versus same-named user property
+
+The built-in timestamp filter is a structural field. User property names always live in the
+`property` value field, so they do not collide with built-ins.
+
+**Node.js**
+```javascript
+// Built-in node timestamp:
+db.queryNodeIds({
+  typeId: NOTE,
+  filter: { updatedAt: { gte: startMs, lt: endMs } },
+});
+
+// User property literally named "updatedAt":
+db.queryNodeIds({
+  typeId: NOTE,
+  filter: { property: 'updatedAt', eq: 'manual-value' },
+});
+```
+
+**Python**
+```python
+# Built-in node timestamp:
+db.query_node_ids({
+    "type_id": NOTE,
+    "filter": {"updated_at": {"gte": start_ms, "lt": end_ms}},
+})
+
+# User property literally named "updated_at":
+db.query_node_ids({
+    "type_id": NOTE,
+    "filter": {"property": "updated_at", "eq": "manual-value"},
+})
+```
+
+---
+
+#### GraphPatternQuery
+
+Pattern request fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| nodes | `Vec<NodePattern>` | `nodes` | `nodes` | Node aliases and constraints. At least one required. |
+| edges | `Vec<EdgePattern>` | `edges` | `edges` | Edge constraints between node aliases. At least one required for pattern v1. |
+| at_epoch | `Option<i64>` | `atEpoch?: number` | `at_epoch?: int` | Optional temporal edge visibility timestamp. |
+| limit | `usize` | `limit: number` | `limit: int` | Required positive match limit. |
+| order | `PatternOrder` | implicit | implicit | `AnchorThenAliasesAsc` in v1. |
+
+Node pattern fields:
+
+| Field | Description |
+|-------|-------------|
+| alias | Non-empty unique node alias. |
+| type_id / typeId | Optional node type constraint. |
+| ids | Explicit node IDs. |
+| keys | Type-scoped keys. Requires `type_id` / `typeId`. |
+| filter | Recursive node filter tree. Omit/null/None means no node filter. |
+
+Edge pattern fields:
+
+| Field | Description |
+|-------|-------------|
+| alias | Optional unique edge alias. Unnamed edges are constraints only. |
+| from_alias / fromAlias | Source alias in the pattern direction. |
+| to_alias / toAlias | Target alias in the pattern direction. |
+| direction | `outgoing`, `incoming`, or `both`, relative to `from_alias`. |
+| type_filter / typeFilter | Optional edge type list. |
+| predicates / where | Bounded edge property post-filters. |
+
+Pattern validation:
+
+- Aliases must be unique and non-empty.
+- Every edge endpoint must reference a declared node alias.
+- Pattern v1 must be one connected component with at least one edge.
+- Distinct node aliases bind distinct node IDs.
+- Reusing the same alias in multiple edges means the same node binding.
+- Unbounded initial nodes without a legal bounded universe are rejected. A type-less verify-only
+  target filter is legal only after bounded edge expansion has produced target IDs.
+- Edge property `where` / `predicates` are edge-scoped post-filters. Phase 24 does not support
+  `filter` on edge patterns.
+
+---
+
+#### QueryPlan
+
+Explain APIs return:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| kind | `kind` | `kind` | `kind` | `node_query` or `pattern_query` in connectors. |
+| root | `root` | `root` | `root` | Recursive plan node. |
+| estimated candidates | `estimated_candidates` | `estimatedCandidates` | `estimated_candidates` | Optional candidate count estimate. |
+| warnings | `warnings` | `warnings` | `warnings` | Stable lower_snake warning strings in connectors. |
+
+Plan node kinds include:
+
+| Plan node kind | Meaning |
+|----------------|---------|
+| `empty_result` | Impossible filter or empty candidate universe. |
+| `explicit_ids` | Explicit ID candidate universe. |
+| `key_lookup` | Type-scoped key lookup. |
+| `node_type_index` | Type index candidate source. |
+| `property_equality_index` | Ready equality property index candidate source. |
+| `property_range_index` | Ready range property index candidate source. |
+| `timestamp_index` | Built-in timestamp index candidate source. |
+| `intersect` | Sorted intersection of bounded candidate sources. |
+| `union` | Sorted union of bounded OR/IN candidate sources. |
+| `verify_node_filter` | Final visible-record verification of the full node filter. |
+| `adjacency_expansion` | Bounded graph-pattern edge expansion. |
+| `pattern_expand` | Pattern execution expansion step. |
+| `verify_edge_predicates` | Edge post-filter verification. |
+| `fallback_type_scan` | Type-scoped scan universe. |
+| `fallback_full_node_scan` | Explicit full node scan universe. |
+
+Warning strings include:
+
+| Warning | Meaning |
+|---------|---------|
+| `missing_ready_index` | Needed index is absent, not ready, or unavailable. |
+| `using_fallback_scan` | Query used a scan universe. |
+| `full_scan_requires_opt_in` | Query would need a full scan but the caller did not opt in. |
+| `full_scan_explicitly_allowed` | Full scan ran because caller opted in. |
+| `unbounded_pattern_rejected` | Pattern was not safely bounded. |
+| `edge_property_post_filter` | Edge properties were checked after bounded expansion. |
+| `index_skipped_as_broad` | Ready index existed but was skipped as too broad. |
+| `candidate_cap_exceeded` | Candidate cap prevented materializing a source. |
+| `range_candidate_cap_exceeded` | Range candidate cap prevented bounded range materialization. |
+| `timestamp_candidate_cap_exceeded` | Timestamp candidate cap prevented bounded timestamp materialization. |
+| `verify_only_filter` | Some filter subtree ran only through verification. |
+| `boolean_branch_fallback` | Boolean branch or OR was cheaper or safer as verifier fallback. |
+| `planning_probe_budget_exceeded` | Planning probe/union budget forced fallback. |
+
+---
+
+#### Validation notes
+
+Invalid filter shapes:
+
+| Invalid shape | Why |
+|---------------|-----|
+| `{}` | Empty filter object is not a valid filter. |
+| `{ and: [] }` | `and` must contain at least one child. |
+| `{ or: [] }` | `or` must contain at least one child. |
+| `{ not: null }` | `not` must contain exactly one filter object. |
+| `{ AND: [...] }` | Uppercase boolean aliases are not supported. |
+| `{ property: "", eq: "active" }` | Property key must be non-empty. |
+| `{ eq: "active" }` | Property leaves require `property`. |
+| `{ property: "status" }` | Property leaf must specify one operator family. |
+| `{ property: "status", eq: "active", in: ["active"] }` | Mixed operator families are invalid. |
+| `{ property: "status", in: [] }` | `in` list must be non-empty. |
+| `{ property: "x", exists: false }` | `exists` only accepts true; use `missing: true` for the opposite. |
+| `{ property: "x", missing: false }` | `missing` only accepts true; use `exists: true` for the opposite. |
+| `{ property: "score", gt: 1, gte: 1 }` | Cannot specify both exclusive and inclusive lower bounds. |
+| `{ updatedAt: { eq: 123 } }` | Updated-at filters support range bounds only. |
+
+`filter` omitted/null/undefined/None means no node filter. `filter: {}` is invalid.
+
+Boolean objects cannot contain sibling tags. For example, `{ and: [...], or: [...] }` and
+`{ and: [...], property: "x", eq: 1 }` are invalid. No uppercase boolean or operator aliases are
+accepted.
+
+---
+
 ## Pagination
 
 All paginated methods use **keyset (cursor-based) pagination**, not offset-based. This provides stable results even when data is inserted between pages.
@@ -1967,11 +2634,11 @@ page = db.find_nodes_by_time_range_paged(USER, start_ms, end_ms, limit=50)
 
 ---
 
-## Neighbor Queries
+## Traversal
 
 ### neighbors
 
-Retrieves the immediate neighbors of a node (one hop). The most common graph query operation.
+Retrieves the immediate neighbors of a node (one hop). The most common graph traversal operation.
 
 **Rust**
 ```rust
@@ -2159,110 +2826,6 @@ Array of `NeighborEntry` sorted by score descending. Length is `min(k, actual_ne
 
 ---
 
-## Degree & Weight Aggregation
-
-### degree
-
-Counts the number of edges connected to a node.
-
-```rust
-let d = db.degree(node_id, &DegreeOptions::default())?;
-```
-
-```javascript
-const d = db.degree(nodeId, { direction: 'both' });
-```
-
-```python
-d = db.degree(node_id, direction="both")
-```
-
-#### Parameters
-
-| Parameter | Rust | Node.js | Python | Required | Default | Description |
-|-----------|------|---------|--------|----------|---------|-------------|
-| node_id | `u64` | `number` | `int` | Yes | — | Node to count edges for. |
-| direction | `Direction` | `string` | `str` | No | `Outgoing` | Which edges to count. |
-| type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Only count edges of these types. |
-| at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter. |
-
-#### Returns
-
-| Rust | Node.js | Python |
-|------|---------|--------|
-| `Result<u32, EngineError>` | `number` | `int` |
-
-The edge count.
-
-#### Performance
-
-Metadata-only fast path for unfiltered, non-temporal queries when all visible segments have valid degree sidecars. O(edges) walk fallback when filtering by type, using a temporal epoch, running with active prune policies, reading a node with temporal incident edges, or reading through a segment whose degree sidecar is missing/corrupt.
-
----
-
-### degrees
-
-Batch degree query for multiple nodes.
-
-```rust
-let map = db.degrees(&[1, 2, 3], &DegreeOptions::default())?;
-// map: NodeIdMap<u32>
-```
-
-```javascript
-const entries = db.degrees([1, 2, 3], { direction: 'outgoing' });
-// entries: { nodeId: number, degree: number }[]
-```
-
-```python
-result = db.degrees([1, 2, 3], direction="outgoing")
-# result: dict[int, int]
-```
-
----
-
-### sum_edge_weights
-
-Sums the weights of all edges connected to a node.
-
-```rust
-let total = db.sum_edge_weights(node_id, &DegreeOptions::default())?;
-```
-
-```javascript
-const total = db.sumEdgeWeights(nodeId, { direction: 'outgoing' });
-```
-
-```python
-total = db.sum_edge_weights(node_id, direction="outgoing")
-```
-
-Same parameters as [`degree`](#degree). Returns `f64` / `number` / `float`.
-
----
-
-### avg_edge_weight
-
-Average weight of edges connected to a node.
-
-```rust
-let avg = db.avg_edge_weight(node_id, &DegreeOptions::default())?;
-```
-
-```javascript
-const avg = db.avgEdgeWeight(nodeId); // number | null
-```
-
-```python
-avg = db.avg_edge_weight(node_id)  # float | None
-```
-
-Same parameters as [`degree`](#degree). Returns `None`/`null` if the node has no edges.
-
----
-
-## Traversal
-
 ### traverse
 
 Breadth-first traversal from a starting node up to a maximum depth. Supports pagination, type filtering, temporal filtering, and decay scoring.
@@ -2388,10 +2951,6 @@ print(len(sg.nodes), "nodes,", len(sg.edges), "edges")
 |-------|------|---------|--------|-------------|
 | nodes | `NodeIdMap<NodeRecord>` | `NodeRecord[]` | `list[NodeRecord]` | All nodes in the subgraph (full records). |
 | edges | `Vec<EdgeRecord>` or tuples | `EdgeRecord[]` | `list[EdgeRecord]` | All edges in the subgraph (full records). |
-
----
-
-## Pathfinding
 
 ### shortest_path
 
@@ -2525,6 +3084,108 @@ connected = db.is_connected(from_id, to_id, direction="both", max_depth=5)
 #### Returns
 
 `bool`. Returns `true` if a path exists, `false` otherwise.
+
+---
+
+## Degree & Weight Aggregation
+
+### degree
+
+Counts the number of edges connected to a node.
+
+```rust
+let d = db.degree(node_id, &DegreeOptions::default())?;
+```
+
+```javascript
+const d = db.degree(nodeId, { direction: 'both' });
+```
+
+```python
+d = db.degree(node_id, direction="both")
+```
+
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Default | Description |
+|-----------|------|---------|--------|----------|---------|-------------|
+| node_id | `u64` | `number` | `int` | Yes | — | Node to count edges for. |
+| direction | `Direction` | `string` | `str` | No | `Outgoing` | Which edges to count. |
+| type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Only count edges of these types. |
+| at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter. |
+
+#### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<u32, EngineError>` | `number` | `int` |
+
+The edge count.
+
+#### Performance
+
+Metadata-only fast path for unfiltered, non-temporal queries when all visible segments have valid degree sidecars. O(edges) walk fallback when filtering by type, using a temporal epoch, running with active prune policies, reading a node with temporal incident edges, or reading through a segment whose degree sidecar is missing/corrupt.
+
+---
+
+### degrees
+
+Batch degree query for multiple nodes.
+
+```rust
+let map = db.degrees(&[1, 2, 3], &DegreeOptions::default())?;
+// map: NodeIdMap<u32>
+```
+
+```javascript
+const entries = db.degrees([1, 2, 3], { direction: 'outgoing' });
+// entries: { nodeId: number, degree: number }[]
+```
+
+```python
+result = db.degrees([1, 2, 3], direction="outgoing")
+# result: dict[int, int]
+```
+
+---
+
+### sum_edge_weights
+
+Sums the weights of all edges connected to a node.
+
+```rust
+let total = db.sum_edge_weights(node_id, &DegreeOptions::default())?;
+```
+
+```javascript
+const total = db.sumEdgeWeights(nodeId, { direction: 'outgoing' });
+```
+
+```python
+total = db.sum_edge_weights(node_id, direction="outgoing")
+```
+
+Same parameters as [`degree`](#degree). Returns `f64` / `number` / `float`.
+
+---
+
+### avg_edge_weight
+
+Average weight of edges connected to a node.
+
+```rust
+let avg = db.avg_edge_weight(node_id, &DegreeOptions::default())?;
+```
+
+```javascript
+const avg = db.avgEdgeWeight(nodeId); // number | null
+```
+
+```python
+avg = db.avg_edge_weight(node_id)  # float | None
+```
+
+Same parameters as [`degree`](#degree). Returns `None`/`null` if the node has no edges.
 
 ---
 
@@ -3416,7 +4077,7 @@ asyncio.run(main())
 | | `get_edges` | Batch get edges by ID |
 | **Atomic** | `graph_patch` | Multi-op atomic batch |
 | | `begin_write_txn` / `beginWriteTxn` | Explicit ordered write transaction |
-| **Query** | `nodes_by_type` | All node IDs of a type |
+| **Type-Based Queries** | `nodes_by_type` | All node IDs of a type |
 | | `edges_by_type` | All edge IDs of a type |
 | | `get_nodes_by_type` | All node records of a type |
 | | `get_edges_by_type` | All edge records of a type |
@@ -3425,23 +4086,28 @@ asyncio.run(main())
 | **Property Indexes** | `ensure_node_property_index` | Declare optional equality or range index |
 | | `drop_node_property_index` | Remove optional property index declaration |
 | | `list_node_property_indexes` | Inspect declaration state |
-| | `find_nodes` | Property search |
+| **Property & Time Queries** | `find_nodes` | Property search |
 | | `find_nodes_range` | Numeric property range search |
 | | `find_nodes_by_time_range` | Time range search |
+| **Queries** | `query_node_ids` | Node query returning IDs |
+| | `query_nodes` | Node query returning hydrated nodes |
+| | `explain_node_query` | Explain a node query plan |
+| | `query_pattern` | Bounded graph pattern query |
+| | `explain_pattern_query` | Explain a graph pattern plan |
 | **Pagination** | `*_paged` | Paginated variants |
-| **Neighbors** | `neighbors` | Immediate neighbors |
+| **Traversal** | `neighbors` | Immediate neighbors |
 | | `neighbors_paged` | Paginated neighbors |
 | | `neighbors_batch` | Multi-node neighbors |
 | | `top_k_neighbors` | Top K by score |
-| **Degree** | `degree` | Edge count |
+| | `traverse` | BFS traversal |
+| | `extract_subgraph` | Subgraph extraction |
+| | `shortest_path` | Shortest path |
+| | `all_shortest_paths` | All shortest paths |
+| | `is_connected` | Reachability check |
+| **Degree & Weight** | `degree` | Edge count |
 | | `degrees` | Batch edge counts |
 | | `sum_edge_weights` | Sum of edge weights |
 | | `avg_edge_weight` | Average edge weight |
-| **Traversal** | `traverse` | BFS traversal |
-| | `extract_subgraph` | Subgraph extraction |
-| **Pathfinding** | `shortest_path` | Shortest path |
-| | `all_shortest_paths` | All shortest paths |
-| | `is_connected` | Reachability check |
 | **Analytics** | `connected_components` | WCC decomposition |
 | | `component_of` | Component membership |
 | | `personalized_pagerank` | PPR scoring |

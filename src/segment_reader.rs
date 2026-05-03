@@ -5,6 +5,12 @@ use crate::dense_hnsw::{
     DENSE_HNSW_GRAPH_FILENAME, DENSE_HNSW_META_FILENAME,
 };
 use crate::error::EngineError;
+#[cfg(test)]
+use crate::planner_stats::SegmentPlannerStatsV1;
+use crate::planner_stats::{
+    read_planner_stats_sidecar, DeclaredIndexRuntimeCoverageState, PlannerStatsAvailability,
+    PlannerStatsDeclaredIndexKind,
+};
 use crate::segment_writer::{
     NODE_DENSE_VECTOR_BLOB_FILENAME, NODE_SPARSE_VECTOR_BLOB_FILENAME, NODE_VECTOR_META_ENTRY_SIZE,
     NODE_VECTOR_META_FILENAME, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC,
@@ -35,11 +41,13 @@ enum MappedData {
 struct SecondaryEqSidecarCacheEntry {
     data: MappedData,
     validated: bool,
+    index_validated: bool,
 }
 
 struct SecondaryRangeSidecarCacheEntry {
     data: MappedData,
     validated: bool,
+    header_validated: bool,
 }
 
 impl Deref for MappedData {
@@ -422,8 +430,6 @@ struct SparseScoringMeta {
 
 pub struct SegmentReader {
     pub segment_id: u64,
-    #[allow(dead_code)] // Kept for future version-dependent logic
-    format_version: u32,
     seg_dir: PathBuf,
     nodes_mmap: MappedData,
     edges_mmap: MappedData,
@@ -450,15 +456,30 @@ pub struct SegmentReader {
     sparse_posting_index_mmap: MappedData,
     sparse_postings_mmap: MappedData,
     degree_delta: Option<DegreeSidecar>,
+    planner_stats: PlannerStatsAvailability,
     // Timestamp range index
     timestamp_index_mmap: MappedData,
     deleted_nodes: NodeIdMap<TombstoneEntry>,
     deleted_edges: NodeIdMap<TombstoneEntry>,
     secondary_eq_sidecars: Mutex<HashMap<u64, SecondaryEqSidecarCacheEntry>>,
     secondary_range_sidecars: Mutex<HashMap<u64, SecondaryRangeSidecarCacheEntry>>,
+    declared_index_runtime_coverage:
+        Mutex<HashMap<(u64, PlannerStatsDeclaredIndexKind), DeclaredIndexRuntimeCoverageState>>,
     node_ids: OnceLock<Box<[u64]>>,
     node_count: u64,
     edge_count: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SegmentTypePosting {
+    offset: usize,
+    count: usize,
+}
+
+pub(crate) struct SecondaryEqPostingChunk {
+    pub(crate) ids: Vec<u64>,
+    pub(crate) next_offset: usize,
+    pub(crate) exhausted: bool,
 }
 
 impl SegmentReader {
@@ -515,6 +536,7 @@ impl SegmentReader {
         } else {
             0
         };
+        let planner_stats = read_planner_stats_sidecar(seg_dir, segment_id, node_count, edge_count);
         let node_meta_count = if node_meta_mmap.len() >= 8 {
             read_u64_at(&node_meta_mmap, 0)?
         } else {
@@ -590,7 +612,6 @@ impl SegmentReader {
 
         Ok(SegmentReader {
             segment_id,
-            format_version,
             seg_dir: seg_dir.to_path_buf(),
             nodes_mmap,
             edges_mmap,
@@ -616,11 +637,13 @@ impl SegmentReader {
             sparse_posting_index_mmap,
             sparse_postings_mmap,
             degree_delta,
+            planner_stats,
             timestamp_index_mmap,
             deleted_nodes,
             deleted_edges,
             secondary_eq_sidecars: Mutex::new(HashMap::new()),
             secondary_range_sidecars: Mutex::new(HashMap::new()),
+            declared_index_runtime_coverage: Mutex::new(HashMap::new()),
             node_ids: OnceLock::new(),
             node_count,
             edge_count,
@@ -1649,6 +1672,35 @@ impl SegmentReader {
         self.node_count
     }
 
+    pub(crate) fn node_id_index_len(&self) -> usize {
+        self.node_count as usize
+    }
+
+    pub(crate) fn node_id_at_index(&self, index: usize) -> Result<Option<u64>, EngineError> {
+        if index >= self.node_id_index_len() {
+            return Ok(None);
+        }
+        Ok(Some(read_u64_at(
+            &self.nodes_mmap,
+            8 + index * NODE_INDEX_ENTRY_SIZE,
+        )?))
+    }
+
+    pub(crate) fn node_id_lower_bound(&self, after: u64) -> Result<usize, EngineError> {
+        let mut lo = 0usize;
+        let mut hi = self.node_id_index_len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let node_id = read_u64_at(&self.nodes_mmap, 8 + mid * NODE_INDEX_ENTRY_SIZE)?;
+            if node_id <= after {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
     pub fn edge_count(&self) -> u64 {
         self.edge_count
     }
@@ -1713,6 +1765,25 @@ impl SegmentReader {
     /// Raw mmap bytes for edges.dat (used by V3 compaction for raw binary copy).
     pub(crate) fn raw_edges_mmap(&self) -> &[u8] {
         &self.edges_mmap[..]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn planner_stats(&self) -> Option<&SegmentPlannerStatsV1> {
+        self.planner_stats.stats()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn planner_stats_available(&self) -> bool {
+        self.planner_stats.is_available()
+    }
+
+    pub(crate) fn planner_stats_availability(&self) -> &PlannerStatsAvailability {
+        &self.planner_stats
+    }
+
+    #[cfg(test)]
+    pub(crate) fn planner_stats_debug_snapshot_for_test(&self) -> PlannerStatsAvailability {
+        self.planner_stats.clone()
     }
 
     // --- V5 metadata sidecar accessors (for V3 compaction) ---
@@ -1996,6 +2067,51 @@ impl SegmentReader {
         self.query_type_index(&self.node_type_index_mmap, type_id, &self.deleted_nodes)
     }
 
+    /// Return the posting count for a given node type without decoding the posting list.
+    pub(crate) fn node_type_posting_count(&self, type_id: u32) -> Result<usize, EngineError> {
+        self.type_index_posting_count(&self.node_type_index_mmap, type_id)
+    }
+
+    pub(crate) fn node_type_posting(
+        &self,
+        type_id: u32,
+    ) -> Result<Option<SegmentTypePosting>, EngineError> {
+        self.type_index_posting(&self.node_type_index_mmap, type_id)
+    }
+
+    pub(crate) fn node_type_id_at_posting(
+        &self,
+        posting: SegmentTypePosting,
+        index: usize,
+    ) -> Result<Option<u64>, EngineError> {
+        if index >= posting.count {
+            return Ok(None);
+        }
+        Ok(Some(read_u64_at(
+            &self.node_type_index_mmap,
+            posting.offset + index * 8,
+        )?))
+    }
+
+    pub(crate) fn node_type_id_lower_bound_posting(
+        &self,
+        posting: SegmentTypePosting,
+        after: u64,
+    ) -> Result<usize, EngineError> {
+        let mut lo = 0usize;
+        let mut hi = posting.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let node_id = read_u64_at(&self.node_type_index_mmap, posting.offset + mid * 8)?;
+            if node_id <= after {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
     /// Return edge IDs for a given type_id from this segment's type index.
     /// Excludes tombstoned edges.
     pub fn edges_by_type(&self, type_id: u32) -> Result<Vec<u64>, EngineError> {
@@ -2050,6 +2166,72 @@ impl SegmentReader {
         }
 
         Ok(Vec::new())
+    }
+
+    fn type_index_posting_count(
+        &self,
+        mmap: &MappedData,
+        target_type: u32,
+    ) -> Result<usize, EngineError> {
+        Ok(self
+            .type_index_posting(mmap, target_type)?
+            .map(|posting| posting.count)
+            .unwrap_or(0))
+    }
+
+    fn type_index_posting(
+        &self,
+        mmap: &MappedData,
+        target_type: u32,
+    ) -> Result<Option<SegmentTypePosting>, EngineError> {
+        let data = &mmap[..];
+        if data.len() < 8 {
+            return Ok(None);
+        }
+        let count = read_u64_at(data, 0)? as usize;
+        if count == 0 {
+            return Ok(None);
+        }
+
+        let idx_start = 8;
+        let entry_size = TYPE_INDEX_ENTRY_SIZE;
+        let mut lo = 0usize;
+        let mut hi = count;
+
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let entry_off = idx_start + mid * entry_size;
+            let entry_type = read_u32_at(data, entry_off)?;
+            match entry_type.cmp(&target_type) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let offset = read_u64_at(data, entry_off + 4)? as usize;
+                    let id_count = read_u32_at(data, entry_off + 12)? as usize;
+                    let end = offset
+                        .checked_add(id_count.checked_mul(8).ok_or_else(|| {
+                            EngineError::CorruptRecord("type index posting overflow".into())
+                        })?)
+                        .ok_or_else(|| {
+                            EngineError::CorruptRecord("type index posting end overflow".into())
+                        })?;
+                    if end > data.len() {
+                        return Err(EngineError::CorruptRecord(format!(
+                            "type index posting [{}, {}) exceeds file length {}",
+                            offset,
+                            end,
+                            data.len()
+                        )));
+                    }
+                    return Ok(Some(SegmentTypePosting {
+                        offset,
+                        count: id_count,
+                    }));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Return all distinct node type IDs present in this segment's type index.
@@ -2141,6 +2323,65 @@ impl SegmentReader {
         // Sort by node_id for K-way merge compatibility
         result.sort_unstable();
         Ok(result)
+    }
+
+    pub(crate) fn for_each_node_by_time_range<F>(
+        &self,
+        type_id: u32,
+        from_ms: i64,
+        to_ms: i64,
+        mut callback: F,
+    ) -> Result<ControlFlow<()>, EngineError>
+    where
+        F: FnMut(u64) -> ControlFlow<()>,
+    {
+        let data = &self.timestamp_index_mmap[..];
+        if data.len() < 8 {
+            return Err(EngineError::CorruptRecord(
+                "timestamp_index.dat missing or truncated (< 8 bytes)".into(),
+            ));
+        }
+        let count = read_u64_at(data, 0)? as usize;
+        if count == 0 || from_ms > to_ms {
+            return Ok(ControlFlow::Continue(()));
+        }
+
+        let entry_start = 8usize;
+        let entry_size = 20usize;
+
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let off = entry_start + mid * entry_size;
+            let e_type = read_u32_at(data, off)?;
+            let e_time = read_i64_at(data, off + 4)?;
+            if (e_type, e_time) < (type_id, from_ms) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        let mut pos = lo;
+        while pos < count {
+            let off = entry_start + pos * entry_size;
+            let e_type = read_u32_at(data, off)?;
+            if e_type != type_id {
+                break;
+            }
+            let e_time = read_i64_at(data, off + 4)?;
+            if e_time > to_ms {
+                break;
+            }
+            let node_id = read_u64_at(data, off + 12)?;
+            if !self.deleted_nodes.contains_key(&node_id) && callback(node_id).is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+            pos += 1;
+        }
+
+        Ok(ControlFlow::Continue(()))
     }
 
     // --- Edge triple index ---
@@ -2268,6 +2509,69 @@ impl SegmentReader {
             .join(format!("node_prop_range_{}.dat", index_id))
     }
 
+    fn set_declared_index_runtime_coverage_state(
+        &self,
+        index_id: u64,
+        kind: PlannerStatsDeclaredIndexKind,
+        state: DeclaredIndexRuntimeCoverageState,
+    ) {
+        self.declared_index_runtime_coverage
+            .lock()
+            .unwrap()
+            .insert((index_id, kind), state);
+    }
+
+    pub(crate) fn declared_index_runtime_coverage_state(
+        &self,
+        index_id: u64,
+        kind: PlannerStatsDeclaredIndexKind,
+    ) -> DeclaredIndexRuntimeCoverageState {
+        self.declared_index_runtime_coverage
+            .lock()
+            .unwrap()
+            .get(&(index_id, kind))
+            .copied()
+            .unwrap_or(DeclaredIndexRuntimeCoverageState::Unknown)
+    }
+
+    pub(crate) fn warm_declared_index_runtime_coverage(&self, entry: &SecondaryIndexManifestEntry) {
+        if entry.state != SecondaryIndexState::Ready {
+            return;
+        }
+        match entry.kind {
+            SecondaryIndexKind::Equality => self.warm_secondary_eq_runtime_coverage(entry.index_id),
+            SecondaryIndexKind::Range { .. } => {
+                self.warm_secondary_range_runtime_coverage(entry.index_id)
+            }
+        }
+    }
+
+    fn warm_secondary_eq_runtime_coverage(&self, index_id: u64) {
+        let state = match self.with_secondary_eq_sidecar_index_validated(index_id, |_| Ok(())) {
+            Ok(Some(())) => DeclaredIndexRuntimeCoverageState::Available,
+            Ok(None) => DeclaredIndexRuntimeCoverageState::Missing,
+            Err(_) => DeclaredIndexRuntimeCoverageState::Corrupt,
+        };
+        self.set_declared_index_runtime_coverage_state(
+            index_id,
+            PlannerStatsDeclaredIndexKind::Equality,
+            state,
+        );
+    }
+
+    fn warm_secondary_range_runtime_coverage(&self, index_id: u64) {
+        let state = match self.with_secondary_range_sidecar_header_validated(index_id, |_| Ok(())) {
+            Ok(Some(())) => DeclaredIndexRuntimeCoverageState::Available,
+            Ok(None) => DeclaredIndexRuntimeCoverageState::Missing,
+            Err(_) => DeclaredIndexRuntimeCoverageState::Corrupt,
+        };
+        self.set_declared_index_runtime_coverage_state(
+            index_id,
+            PlannerStatsDeclaredIndexKind::Range,
+            state,
+        );
+    }
+
     fn with_secondary_eq_sidecar<T>(
         &self,
         index_id: u64,
@@ -2276,6 +2580,11 @@ impl SegmentReader {
         let path = self.secondary_eq_sidecar_path(index_id);
         if !path.exists() {
             self.secondary_eq_sidecars.lock().unwrap().remove(&index_id);
+            self.set_declared_index_runtime_coverage_state(
+                index_id,
+                PlannerStatsDeclaredIndexKind::Equality,
+                DeclaredIndexRuntimeCoverageState::Missing,
+            );
             return Ok(None);
         }
 
@@ -2286,6 +2595,11 @@ impl SegmentReader {
                 Err(EngineError::IoError(error))
                     if error.kind() == std::io::ErrorKind::NotFound =>
                 {
+                    self.set_declared_index_runtime_coverage_state(
+                        index_id,
+                        PlannerStatsDeclaredIndexKind::Equality,
+                        DeclaredIndexRuntimeCoverageState::Missing,
+                    );
                     return Ok(None);
                 }
                 Err(error) => return Err(error),
@@ -2293,6 +2607,7 @@ impl SegmentReader {
             entry.insert(SecondaryEqSidecarCacheEntry {
                 data,
                 validated: false,
+                index_validated: false,
             });
         }
 
@@ -2306,6 +2621,7 @@ impl SegmentReader {
                 match validate_secondary_eq_sidecar_data(&entry.data) {
                     Ok(()) => {
                         entry.validated = true;
+                        entry.index_validated = true;
                         None
                     }
                     Err(error) => Some(error),
@@ -2314,8 +2630,97 @@ impl SegmentReader {
         };
         if let Some(error) = validation_error {
             cache.remove(&index_id);
+            drop(cache);
+            self.set_declared_index_runtime_coverage_state(
+                index_id,
+                PlannerStatsDeclaredIndexKind::Equality,
+                DeclaredIndexRuntimeCoverageState::Corrupt,
+            );
             return Err(error);
         }
+        self.set_declared_index_runtime_coverage_state(
+            index_id,
+            PlannerStatsDeclaredIndexKind::Equality,
+            DeclaredIndexRuntimeCoverageState::Available,
+        );
+
+        let data = &cache
+            .get(&index_id)
+            .expect("secondary equality sidecar cache entry must exist")
+            .data[..];
+        Ok(Some(callback(data)?))
+    }
+
+    fn with_secondary_eq_sidecar_index_validated<T>(
+        &self,
+        index_id: u64,
+        callback: impl FnOnce(&[u8]) -> Result<T, EngineError>,
+    ) -> Result<Option<T>, EngineError> {
+        let path = self.secondary_eq_sidecar_path(index_id);
+        if !path.exists() {
+            self.secondary_eq_sidecars.lock().unwrap().remove(&index_id);
+            self.set_declared_index_runtime_coverage_state(
+                index_id,
+                PlannerStatsDeclaredIndexKind::Equality,
+                DeclaredIndexRuntimeCoverageState::Missing,
+            );
+            return Ok(None);
+        }
+
+        let mut cache = self.secondary_eq_sidecars.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(index_id) {
+            let data = match mmap_file(&path) {
+                Ok(data) => data,
+                Err(EngineError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    self.set_declared_index_runtime_coverage_state(
+                        index_id,
+                        PlannerStatsDeclaredIndexKind::Equality,
+                        DeclaredIndexRuntimeCoverageState::Missing,
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            entry.insert(SecondaryEqSidecarCacheEntry {
+                data,
+                validated: false,
+                index_validated: false,
+            });
+        }
+
+        let validation_error = {
+            let entry = cache
+                .get_mut(&index_id)
+                .expect("secondary equality sidecar cache entry must exist");
+            if entry.validated || entry.index_validated {
+                None
+            } else {
+                match validate_secondary_eq_sidecar_index(&entry.data) {
+                    Ok(()) => {
+                        entry.index_validated = true;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            }
+        };
+        if let Some(error) = validation_error {
+            cache.remove(&index_id);
+            drop(cache);
+            self.set_declared_index_runtime_coverage_state(
+                index_id,
+                PlannerStatsDeclaredIndexKind::Equality,
+                DeclaredIndexRuntimeCoverageState::Corrupt,
+            );
+            return Err(error);
+        }
+        self.set_declared_index_runtime_coverage_state(
+            index_id,
+            PlannerStatsDeclaredIndexKind::Equality,
+            DeclaredIndexRuntimeCoverageState::Available,
+        );
 
         let data = &cache
             .get(&index_id)
@@ -2335,6 +2740,11 @@ impl SegmentReader {
                 .lock()
                 .unwrap()
                 .remove(&index_id);
+            self.set_declared_index_runtime_coverage_state(
+                index_id,
+                PlannerStatsDeclaredIndexKind::Range,
+                DeclaredIndexRuntimeCoverageState::Missing,
+            );
             return Ok(None);
         }
 
@@ -2345,6 +2755,11 @@ impl SegmentReader {
                 Err(EngineError::IoError(error))
                     if error.kind() == std::io::ErrorKind::NotFound =>
                 {
+                    self.set_declared_index_runtime_coverage_state(
+                        index_id,
+                        PlannerStatsDeclaredIndexKind::Range,
+                        DeclaredIndexRuntimeCoverageState::Missing,
+                    );
                     return Ok(None);
                 }
                 Err(error) => return Err(error),
@@ -2352,6 +2767,7 @@ impl SegmentReader {
             entry.insert(SecondaryRangeSidecarCacheEntry {
                 data,
                 validated: false,
+                header_validated: false,
             });
         }
 
@@ -2365,6 +2781,7 @@ impl SegmentReader {
                 match validate_secondary_range_sidecar_data(&entry.data) {
                     Ok(()) => {
                         entry.validated = true;
+                        entry.header_validated = true;
                         None
                     }
                     Err(error) => Some(error),
@@ -2373,8 +2790,100 @@ impl SegmentReader {
         };
         if let Some(error) = validation_error {
             cache.remove(&index_id);
+            drop(cache);
+            self.set_declared_index_runtime_coverage_state(
+                index_id,
+                PlannerStatsDeclaredIndexKind::Range,
+                DeclaredIndexRuntimeCoverageState::Corrupt,
+            );
             return Err(error);
         }
+        self.set_declared_index_runtime_coverage_state(
+            index_id,
+            PlannerStatsDeclaredIndexKind::Range,
+            DeclaredIndexRuntimeCoverageState::Available,
+        );
+
+        let data = &cache
+            .get(&index_id)
+            .expect("secondary range sidecar cache entry must exist")
+            .data[..];
+        Ok(Some(callback(data)?))
+    }
+
+    fn with_secondary_range_sidecar_header_validated<T>(
+        &self,
+        index_id: u64,
+        callback: impl FnOnce(&[u8]) -> Result<T, EngineError>,
+    ) -> Result<Option<T>, EngineError> {
+        let path = self.secondary_range_sidecar_path(index_id);
+        if !path.exists() {
+            self.secondary_range_sidecars
+                .lock()
+                .unwrap()
+                .remove(&index_id);
+            self.set_declared_index_runtime_coverage_state(
+                index_id,
+                PlannerStatsDeclaredIndexKind::Range,
+                DeclaredIndexRuntimeCoverageState::Missing,
+            );
+            return Ok(None);
+        }
+
+        let mut cache = self.secondary_range_sidecars.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(index_id) {
+            let data = match mmap_file(&path) {
+                Ok(data) => data,
+                Err(EngineError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    self.set_declared_index_runtime_coverage_state(
+                        index_id,
+                        PlannerStatsDeclaredIndexKind::Range,
+                        DeclaredIndexRuntimeCoverageState::Missing,
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            entry.insert(SecondaryRangeSidecarCacheEntry {
+                data,
+                validated: false,
+                header_validated: false,
+            });
+        }
+
+        let validation_error = {
+            let entry = cache
+                .get_mut(&index_id)
+                .expect("secondary range sidecar cache entry must exist");
+            if entry.validated || entry.header_validated {
+                None
+            } else {
+                match validate_secondary_range_sidecar_header(&entry.data) {
+                    Ok(()) => {
+                        entry.header_validated = true;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            }
+        };
+        if let Some(error) = validation_error {
+            cache.remove(&index_id);
+            drop(cache);
+            self.set_declared_index_runtime_coverage_state(
+                index_id,
+                PlannerStatsDeclaredIndexKind::Range,
+                DeclaredIndexRuntimeCoverageState::Corrupt,
+            );
+            return Err(error);
+        }
+        self.set_declared_index_runtime_coverage_state(
+            index_id,
+            PlannerStatsDeclaredIndexKind::Range,
+            DeclaredIndexRuntimeCoverageState::Available,
+        );
 
         let data = &cache
             .get(&index_id)
@@ -2409,6 +2918,28 @@ impl SegmentReader {
     ) -> Result<Option<Vec<u64>>, EngineError> {
         self.with_secondary_eq_sidecar(index_id, |data| {
             find_nodes_in_secondary_eq_sidecar(data, &self.deleted_nodes, value_hash)
+        })
+    }
+
+    pub(crate) fn secondary_eq_posting_chunk_if_present(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+        start: usize,
+        raw_limit: usize,
+    ) -> Result<Option<SecondaryEqPostingChunk>, EngineError> {
+        self.with_secondary_eq_sidecar_index_validated(index_id, |data| {
+            secondary_eq_posting_chunk(data, &self.deleted_nodes, value_hash, start, raw_limit)
+        })
+    }
+
+    pub(crate) fn secondary_eq_posting_count_if_present(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+    ) -> Result<Option<usize>, EngineError> {
+        self.with_secondary_eq_sidecar_index_validated(index_id, |data| {
+            secondary_eq_posting_count(data, value_hash)
         })
     }
 
@@ -3396,50 +3927,15 @@ fn mmap_file(path: &Path) -> Result<MappedData, EngineError> {
 }
 
 fn validate_secondary_eq_sidecar_data(data: &[u8]) -> Result<(), EngineError> {
-    if data.len() < 8 {
-        return Err(EngineError::CorruptRecord(
-            "secondary equality sidecar missing header".into(),
-        ));
-    }
-
-    let count = read_u64_at(data, 0)? as usize;
-    let idx_bytes = count
-        .checked_mul(SECONDARY_EQ_ENTRY_SIZE)
-        .and_then(|bytes| bytes.checked_add(8))
-        .ok_or_else(|| {
-            EngineError::CorruptRecord("secondary equality sidecar index overflow".into())
-        })?;
-    if idx_bytes > data.len() {
-        return Err(EngineError::CorruptRecord(format!(
-            "secondary equality sidecar index length {} exceeds file length {}",
-            idx_bytes,
-            data.len()
-        )));
-    }
+    let (count, idx_bytes) = secondary_eq_sidecar_index_bounds(data)?;
 
     let mut prev_value_hash = None;
     let mut prev_end = idx_bytes;
     for index in 0..count {
         let entry_off = 8 + index * SECONDARY_EQ_ENTRY_SIZE;
         let value_hash = read_u64_at(data, entry_off)?;
-        let offset = read_u64_at(data, entry_off + 8)? as usize;
-        let id_count = read_u32_at(data, entry_off + 16)? as usize;
-        let end = offset
-            .checked_add(id_count.checked_mul(8).ok_or_else(|| {
-                EngineError::CorruptRecord("secondary equality sidecar group overflow".into())
-            })?)
-            .ok_or_else(|| {
-                EngineError::CorruptRecord("secondary equality sidecar group end overflow".into())
-            })?;
-        if offset < idx_bytes || end > data.len() {
-            return Err(EngineError::CorruptRecord(format!(
-                "secondary equality sidecar group {} range [{}, {}) exceeds file length {}",
-                index,
-                offset,
-                end,
-                data.len()
-            )));
-        }
+        let (offset, id_count) = secondary_eq_group_range_from_entry(data, idx_bytes, entry_off)?;
+        let end = offset + id_count * 8;
         if let Some(previous) = prev_value_hash {
             if value_hash <= previous {
                 return Err(EngineError::CorruptRecord(format!(
@@ -3474,27 +3970,107 @@ fn validate_secondary_eq_sidecar_data(data: &[u8]) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn validate_secondary_range_sidecar_data(data: &[u8]) -> Result<(), EngineError> {
+fn secondary_eq_sidecar_index_bounds(data: &[u8]) -> Result<(usize, usize), EngineError> {
     if data.len() < 8 {
         return Err(EngineError::CorruptRecord(
-            "secondary range sidecar missing header".into(),
+            "secondary equality sidecar missing header".into(),
         ));
     }
 
     let count = read_u64_at(data, 0)? as usize;
-    let entries_bytes = count
-        .checked_mul(SECONDARY_RANGE_ENTRY_SIZE)
+    let idx_bytes = count
+        .checked_mul(SECONDARY_EQ_ENTRY_SIZE)
         .and_then(|bytes| bytes.checked_add(8))
         .ok_or_else(|| {
-            EngineError::CorruptRecord("secondary range sidecar index overflow".into())
+            EngineError::CorruptRecord("secondary equality sidecar index overflow".into())
         })?;
-    if entries_bytes != data.len() {
+    if idx_bytes > data.len() {
         return Err(EngineError::CorruptRecord(format!(
-            "secondary range sidecar length {} does not match expected fixed-width length {}",
-            data.len(),
-            entries_bytes
+            "secondary equality sidecar index length {} exceeds file length {}",
+            idx_bytes,
+            data.len()
         )));
     }
+
+    Ok((count, idx_bytes))
+}
+
+fn validate_secondary_eq_sidecar_index(data: &[u8]) -> Result<(), EngineError> {
+    let (count, _) = secondary_eq_sidecar_index_bounds(data)?;
+    let mut previous = None;
+    for index in 0..count {
+        let entry_off = 8 + index * SECONDARY_EQ_ENTRY_SIZE;
+        let value_hash = read_u64_at(data, entry_off)?;
+        if let Some(previous) = previous {
+            if value_hash <= previous {
+                return Err(EngineError::CorruptRecord(format!(
+                    "secondary equality sidecar value hashes are not strictly increasing at group {}",
+                    index
+                )));
+            }
+        }
+        previous = Some(value_hash);
+    }
+    Ok(())
+}
+
+fn secondary_eq_group_range_from_entry(
+    data: &[u8],
+    idx_bytes: usize,
+    entry_off: usize,
+) -> Result<(usize, usize), EngineError> {
+    let offset = read_u64_at(data, entry_off + 8)? as usize;
+    let id_count = read_u32_at(data, entry_off + 16)? as usize;
+    let end = offset
+        .checked_add(id_count.checked_mul(8).ok_or_else(|| {
+            EngineError::CorruptRecord("secondary equality sidecar group overflow".into())
+        })?)
+        .ok_or_else(|| {
+            EngineError::CorruptRecord("secondary equality sidecar group end overflow".into())
+        })?;
+    if offset < idx_bytes || end > data.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "secondary equality sidecar group range [{}, {}) exceeds file length {}",
+            offset,
+            end,
+            data.len()
+        )));
+    }
+    Ok((offset, id_count))
+}
+
+fn secondary_eq_group_range(
+    data: &[u8],
+    value_hash: u64,
+) -> Result<Option<(usize, usize)>, EngineError> {
+    let (count, idx_bytes) = secondary_eq_sidecar_index_bounds(data)?;
+    if count == 0 {
+        return Ok(None);
+    }
+
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let entry_off = 8 + mid * SECONDARY_EQ_ENTRY_SIZE;
+        let entry_value_hash = read_u64_at(data, entry_off)?;
+        match entry_value_hash.cmp(&value_hash) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => {
+                return Ok(Some(secondary_eq_group_range_from_entry(
+                    data, idx_bytes, entry_off,
+                )?));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn validate_secondary_range_sidecar_data(data: &[u8]) -> Result<(), EngineError> {
+    validate_secondary_range_sidecar_header(data)?;
+    let count = read_u64_at(data, 0)? as usize;
 
     let mut previous = None;
     for index in 0..count {
@@ -3517,41 +4093,91 @@ fn validate_secondary_range_sidecar_data(data: &[u8]) -> Result<(), EngineError>
     Ok(())
 }
 
+fn validate_secondary_range_sidecar_header(data: &[u8]) -> Result<(), EngineError> {
+    if data.len() < 8 {
+        return Err(EngineError::CorruptRecord(
+            "secondary range sidecar missing header".into(),
+        ));
+    }
+
+    let count = read_u64_at(data, 0)? as usize;
+    let entries_bytes = count
+        .checked_mul(SECONDARY_RANGE_ENTRY_SIZE)
+        .and_then(|bytes| bytes.checked_add(8))
+        .ok_or_else(|| {
+            EngineError::CorruptRecord("secondary range sidecar index overflow".into())
+        })?;
+    if entries_bytes != data.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "secondary range sidecar length {} does not match expected fixed-width length {}",
+            data.len(),
+            entries_bytes
+        )));
+    }
+    Ok(())
+}
+
 fn find_nodes_in_secondary_eq_sidecar(
     data: &[u8],
     deleted_nodes: &NodeIdMap<TombstoneEntry>,
     value_hash: u64,
 ) -> Result<Vec<u64>, EngineError> {
-    let count = read_u64_at(data, 0)? as usize;
-    if count == 0 {
+    let Some((offset, id_count)) = secondary_eq_group_range(data, value_hash)? else {
         return Ok(Vec::new());
+    };
+
+    let mut result = Vec::with_capacity(id_count);
+    for index in 0..id_count {
+        let node_id = read_u64_at(data, offset + index * 8)?;
+        if !deleted_nodes.contains_key(&node_id) {
+            result.push(node_id);
+        }
+    }
+    Ok(result)
+}
+
+fn secondary_eq_posting_chunk(
+    data: &[u8],
+    deleted_nodes: &NodeIdMap<TombstoneEntry>,
+    value_hash: u64,
+    start: usize,
+    raw_limit: usize,
+) -> Result<SecondaryEqPostingChunk, EngineError> {
+    let Some((offset, id_count)) = secondary_eq_group_range(data, value_hash)? else {
+        return Ok(SecondaryEqPostingChunk {
+            ids: Vec::new(),
+            next_offset: 0,
+            exhausted: true,
+        });
+    };
+    if start >= id_count {
+        return Ok(SecondaryEqPostingChunk {
+            ids: Vec::new(),
+            next_offset: id_count,
+            exhausted: true,
+        });
     }
 
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let entry_off = 8 + mid * SECONDARY_EQ_ENTRY_SIZE;
-        let entry_value_hash = read_u64_at(data, entry_off)?;
-        match entry_value_hash.cmp(&value_hash) {
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Greater => hi = mid,
-            std::cmp::Ordering::Equal => {
-                let offset = read_u64_at(data, entry_off + 8)? as usize;
-                let id_count = read_u32_at(data, entry_off + 16)? as usize;
-                let mut result = Vec::with_capacity(id_count);
-                for index in 0..id_count {
-                    let node_id = read_u64_at(data, offset + index * 8)?;
-                    if !deleted_nodes.contains_key(&node_id) {
-                        result.push(node_id);
-                    }
-                }
-                return Ok(result);
-            }
+    let end = start.saturating_add(raw_limit.max(1)).min(id_count);
+    let mut ids = Vec::with_capacity(end - start);
+    for index in start..end {
+        let node_id = read_u64_at(data, offset + index * 8)?;
+        if !deleted_nodes.contains_key(&node_id) {
+            ids.push(node_id);
         }
     }
 
-    Ok(Vec::new())
+    Ok(SecondaryEqPostingChunk {
+        ids,
+        next_offset: end,
+        exhausted: end >= id_count,
+    })
+}
+
+fn secondary_eq_posting_count(data: &[u8], value_hash: u64) -> Result<usize, EngineError> {
+    Ok(secondary_eq_group_range(data, value_hash)?
+        .map(|(_, count)| count)
+        .unwrap_or(0))
 }
 
 fn secondary_range_sidecar_lower_bound(
@@ -4337,6 +4963,53 @@ pub(crate) mod tests {
         (dir, reader)
     }
 
+    #[test]
+    fn test_planner_stats_valid_sidecar_is_available() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(1, 7, "alice")), 1);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 7, "bob")), 2);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 3)), 3);
+
+        let (_dir, reader) = write_and_open(&mt);
+        let stats = reader.planner_stats().expect("planner stats should load");
+        assert_eq!(stats.segment_id, 1);
+        assert_eq!(stats.node_count, 2);
+        assert_eq!(stats.edge_count, 1);
+        assert!(stats.general_property_stats_complete);
+        assert_eq!(stats.general_property_sampled_node_count, 2);
+        assert_eq!(stats.node_id_sample, vec![1, 2]);
+        assert!(reader.planner_stats_available());
+    }
+
+    #[test]
+    fn test_planner_stats_missing_or_corrupt_sidecar_does_not_fail_open() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        write_segment(&seg_dir, 1, &mt, None).unwrap();
+        std::fs::remove_file(seg_dir.join(crate::planner_stats::PLANNER_STATS_FILENAME)).unwrap();
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        assert!(matches!(
+            reader.planner_stats_debug_snapshot_for_test(),
+            PlannerStatsAvailability::Missing
+        ));
+        assert!(reader.get_node(1).unwrap().is_some());
+
+        std::fs::write(
+            seg_dir.join(crate::planner_stats::PLANNER_STATS_FILENAME),
+            b"not planner stats",
+        )
+        .unwrap();
+        let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
+        assert!(matches!(
+            reader.planner_stats_debug_snapshot_for_test(),
+            PlannerStatsAvailability::Unavailable { .. }
+        ));
+        assert!(reader.get_node(1).unwrap().is_some());
+    }
+
     fn write_legacy_prop_index(seg_dir: &Path, groups: &[(u32, u64, u64, Vec<u64>)]) {
         use std::fs::File;
         use std::io::{BufWriter, Write};
@@ -4428,6 +5101,149 @@ pub(crate) mod tests {
         .unwrap();
         let reader = SegmentReader::open(&seg_dir, 1, None).unwrap();
         (dir, reader)
+    }
+
+    #[test]
+    fn test_runtime_coverage_cache_tracks_equality_sidecar_states() {
+        let mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String("red".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "apple".to_string(),
+                props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 91,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let (dir, reader) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
+        assert_eq!(
+            reader.declared_index_runtime_coverage_state(
+                entry.index_id,
+                PlannerStatsDeclaredIndexKind::Equality
+            ),
+            DeclaredIndexRuntimeCoverageState::Unknown
+        );
+
+        reader.warm_declared_index_runtime_coverage(&entry);
+        assert_eq!(
+            reader.declared_index_runtime_coverage_state(
+                entry.index_id,
+                PlannerStatsDeclaredIndexKind::Equality
+            ),
+            DeclaredIndexRuntimeCoverageState::Available
+        );
+
+        let sidecar_path = dir
+            .path()
+            .join("seg_0001")
+            .join("secondary_indexes")
+            .join(format!("node_prop_eq_{}.dat", entry.index_id));
+        std::fs::remove_file(&sidecar_path).unwrap();
+        reader.warm_declared_index_runtime_coverage(&entry);
+        assert_eq!(
+            reader.declared_index_runtime_coverage_state(
+                entry.index_id,
+                PlannerStatsDeclaredIndexKind::Equality
+            ),
+            DeclaredIndexRuntimeCoverageState::Missing
+        );
+
+        std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
+        reader.warm_declared_index_runtime_coverage(&entry);
+        assert_eq!(
+            reader.declared_index_runtime_coverage_state(
+                entry.index_id,
+                PlannerStatsDeclaredIndexKind::Equality
+            ),
+            DeclaredIndexRuntimeCoverageState::Corrupt
+        );
+    }
+
+    #[test]
+    fn test_runtime_coverage_cache_tracks_range_sidecar_states() {
+        let mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), PropValue::Int(10));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                type_id: 1,
+                key: "apple".to_string(),
+                props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 92,
+            target: SecondaryIndexTarget::NodeProperty {
+                type_id: 1,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let (dir, reader) = write_and_open_with_secondary_range_sidecar(&mt, &entry);
+
+        reader.warm_declared_index_runtime_coverage(&entry);
+        assert_eq!(
+            reader.declared_index_runtime_coverage_state(
+                entry.index_id,
+                PlannerStatsDeclaredIndexKind::Range
+            ),
+            DeclaredIndexRuntimeCoverageState::Available
+        );
+
+        let sidecar_path = dir
+            .path()
+            .join("seg_0001")
+            .join("secondary_indexes")
+            .join(format!("node_prop_range_{}.dat", entry.index_id));
+        std::fs::remove_file(&sidecar_path).unwrap();
+        reader.warm_declared_index_runtime_coverage(&entry);
+        assert_eq!(
+            reader.declared_index_runtime_coverage_state(
+                entry.index_id,
+                PlannerStatsDeclaredIndexKind::Range
+            ),
+            DeclaredIndexRuntimeCoverageState::Missing
+        );
+
+        std::fs::write(&sidecar_path, [1u8, 2, 3]).unwrap();
+        reader.warm_declared_index_runtime_coverage(&entry);
+        assert_eq!(
+            reader.declared_index_runtime_coverage_state(
+                entry.index_id,
+                PlannerStatsDeclaredIndexKind::Range
+            ),
+            DeclaredIndexRuntimeCoverageState::Corrupt
+        );
     }
 
     fn write_sparse_segment(nodes: Vec<NodeRecord>) -> (tempfile::TempDir, std::path::PathBuf) {

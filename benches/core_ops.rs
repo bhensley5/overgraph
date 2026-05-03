@@ -523,6 +523,21 @@ fn bench_batch_upsert_nodes(c: &mut Criterion) {
             batch_num += 1;
         });
     });
+
+    c.bench_function("write_throughput_stats_enabled", |b| {
+        let (_dir, mut engine) = property_bench_db();
+        ensure_property_query_declarations(&mut engine);
+        let mut batch_num = 0u64;
+        b.iter(|| {
+            let inputs = make_property_query_nodes(
+                &format!("stats-write-{batch_num}"),
+                batch_num * 100,
+                100,
+            );
+            engine.batch_upsert_nodes(&inputs).unwrap();
+            batch_num += 1;
+        });
+    });
 }
 
 /// Build properties representative of typical graph nodes.
@@ -643,6 +658,29 @@ fn make_property_query_nodes(prefix: &str, start: u64, count: usize) -> Vec<Node
         .collect()
 }
 
+fn make_property_budget_nodes(prefix: &str, start: u64, count: usize) -> Vec<NodeInput> {
+    (0..count as u64)
+        .map(|offset| {
+            let i = start + offset;
+            let mut props = make_property_index_bench_props(i);
+            for property in 0..48u64 {
+                props.insert(
+                    format!("budget_prop_{property:02}"),
+                    PropValue::String(format!("bucket_{}", (i + property) % 128)),
+                );
+            }
+            NodeInput {
+                type_id: 1,
+                key: format!("{}_{}", prefix, i),
+                props,
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            }
+        })
+        .collect()
+}
+
 fn property_bench_db() -> (tempfile::TempDir, DatabaseEngine) {
     let dir = tempfile::tempdir().unwrap();
     let opts = DbOptions {
@@ -692,6 +730,35 @@ fn build_property_compaction_engine(
         engine.flush().unwrap();
     }
     (dir, engine)
+}
+
+fn build_property_compaction_general_budget_engine() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, mut engine) = property_bench_db();
+    ensure_property_query_declarations(&mut engine);
+    for segment in 0..PROPERTY_COMPACTION_SEGMENTS {
+        let start = segment * PROPERTY_COMPACTION_NODES_PER_SEGMENT;
+        let nodes = make_property_budget_nodes(
+            &format!("budget{}", segment),
+            start,
+            PROPERTY_COMPACTION_NODES_PER_SEGMENT as usize,
+        );
+        engine.batch_upsert_nodes(&nodes).unwrap();
+        engine.flush().unwrap();
+    }
+    (dir, engine)
+}
+
+fn build_many_stats_sidecars_db() -> tempfile::TempDir {
+    let (dir, mut engine) = property_bench_db();
+    ensure_property_query_declarations(&mut engine);
+    for segment in 0..8u64 {
+        let start = segment * 1_000;
+        let nodes = make_property_query_nodes(&format!("open{}", segment), start, 1_000);
+        engine.batch_upsert_nodes(&nodes).unwrap();
+        engine.flush().unwrap();
+    }
+    engine.close().unwrap();
+    dir
 }
 
 fn bench_property_indexes(c: &mut Criterion) {
@@ -820,6 +887,16 @@ fn bench_property_indexes(c: &mut Criterion) {
         );
     });
 
+    flush_group.bench_function("flush_with_planner_stats", |b| {
+        b.iter_batched(
+            || build_property_flush_engine(true),
+            |(_dir, engine)| {
+                engine.flush().unwrap();
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
     flush_group.finish();
 
     let mut compact_group = c.benchmark_group("property_index_compact");
@@ -845,7 +922,44 @@ fn bench_property_indexes(c: &mut Criterion) {
         );
     });
 
+    compact_group.bench_function("compact_with_planner_stats", |b| {
+        b.iter_batched(
+            || build_property_compaction_engine(true),
+            |(_dir, engine)| {
+                black_box(engine.compact().unwrap());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    compact_group.bench_function("compact_with_planner_stats_general_property_budget", |b| {
+        b.iter_batched(
+            build_property_compaction_general_budget_engine,
+            |(_dir, engine)| {
+                black_box(engine.compact().unwrap());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
     compact_group.finish();
+
+    let mut stats_group = c.benchmark_group("planner_stats_maintenance");
+    stats_group.sample_size(10);
+
+    stats_group.bench_function("open_with_many_stats_sidecars", |b| {
+        b.iter_batched(
+            build_many_stats_sidecars_db,
+            |dir| {
+                let engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+                black_box(engine.segment_count().unwrap());
+                engine.close().unwrap();
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    stats_group.finish();
 }
 
 fn bench_compact(c: &mut Criterion) {

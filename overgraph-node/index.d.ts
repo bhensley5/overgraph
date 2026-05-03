@@ -114,6 +114,11 @@ export declare class OverGraph {
   isConnected(from: number, to: number, options?: JsIsConnectedOptions | undefined | null): boolean
   allShortestPaths(from: number, to: number, options?: JsAllShortestPathsOptions | undefined | null): Array<JsShortestPath>
   findNodes(typeId: number, propKey: string, propValue: any): Float64Array
+  queryNodeIds(request: import('./query-types').QueryNodeRequest): JsIdPageResult
+  queryNodes(request: import('./query-types').QueryNodeRequest): JsNodePageResult
+  queryPattern(request: import('./query-types').GraphPatternRequest): import('./query-types').QueryPatternResult
+  explainNodeQuery(request: import('./query-types').QueryNodeRequest): import('./query-types').QueryPlan
+  explainPatternQuery(request: import('./query-types').GraphPatternRequest): import('./query-types').QueryPlan
   ensureNodePropertyIndex(typeId: number, propKey: string, kind: JsSecondaryIndexKind): JsNodePropertyIndexInfo
   dropNodePropertyIndex(typeId: number, propKey: string, kind: JsSecondaryIndexKind): boolean
   listNodePropertyIndexes(): Array<JsNodePropertyIndexInfo>
@@ -181,6 +186,11 @@ export declare class OverGraph {
   topKNeighborsAsync(nodeId: number, k: number, options?: JsTopKNeighborsOptions | undefined | null): Promise<Array<JsNeighborEntry>>
   extractSubgraphAsync(startNodeId: number, maxDepth: number, options?: JsExtractSubgraphOptions | undefined | null): Promise<JsSubgraphResult>
   findNodesAsync(typeId: number, propKey: string, propValue: any): Promise<Float64Array>
+  queryNodeIdsAsync(request: import('./query-types').QueryNodeRequest): Promise<JsIdPageResult>
+  queryNodesAsync(request: import('./query-types').QueryNodeRequest): Promise<JsNodePageResult>
+  queryPatternAsync(request: import('./query-types').GraphPatternRequest): Promise<import('./query-types').QueryPatternResult>
+  explainNodeQueryAsync(request: import('./query-types').QueryNodeRequest): Promise<import('./query-types').QueryPlan>
+  explainPatternQueryAsync(request: import('./query-types').GraphPatternRequest): Promise<import('./query-types').QueryPlan>
   ensureNodePropertyIndexAsync(typeId: number, propKey: string, kind: JsSecondaryIndexKind): Promise<JsNodePropertyIndexInfo>
   dropNodePropertyIndexAsync(typeId: number, propKey: string, kind: JsSecondaryIndexKind): Promise<boolean>
   listNodePropertyIndexesAsync(): Promise<Array<JsNodePropertyIndexInfo>>

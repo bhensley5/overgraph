@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", default="small", choices=["small", "medium", "large", "xlarge"])
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=80)
+    parser.add_argument("--scenario-set", default="all", choices=["all", "query"])
     return parser.parse_args()
 
 
@@ -307,6 +308,150 @@ def pack_node_batch(nodes: list[dict[str, Any]]) -> bytes:
     return bytes(buf)
 
 
+def query_bench_props(i: int) -> dict[str, Any]:
+    return {
+        "status": "active" if i % 10 == 0 else "inactive",
+        "tier": "gold" if i % 20 == 0 else "standard",
+        "score": i % 100,
+    }
+
+
+def wait_for_property_index_ready(db: OverGraph, index_id: int) -> None:
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if any(info.index_id == index_id and info.state == "ready" for info in db.list_node_property_indexes()):
+            return
+        time.sleep(0.01)
+    raise RuntimeError(f"timed out waiting for property index {index_id} to become ready")
+
+
+def query_benchmark_layout(preload_nodes: int) -> dict[str, int]:
+    segments = 1 if preload_nodes >= 2 else 0
+    segment_nodes = 0 if segments == 0 else max(1, preload_nodes // (segments + 1))
+    return {
+        "segments": segments,
+        "segment_nodes": segment_nodes,
+        "memtable_tail_nodes": max(0, preload_nodes - segments * segment_nodes),
+    }
+
+
+def query_bench_nodes(start: int, count: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "type_id": 1,
+            "key": f"q-{i}",
+            "props": query_bench_props(i),
+        }
+        for i in range(start, start + count)
+    ]
+
+
+def build_query_benchmark_db(path: Path, preload_nodes: int) -> tuple[OverGraph, dict[str, int]]:
+    db = OverGraph.open(str(path))
+    status = db.ensure_node_property_index(1, "status", "equality")
+    wait_for_property_index_ready(db, status.index_id)
+    tier = db.ensure_node_property_index(1, "tier", "equality")
+    wait_for_property_index_ready(db, tier.index_id)
+    score = db.ensure_node_property_index(1, "score", "range", domain="int")
+    wait_for_property_index_ready(db, score.index_id)
+
+    layout = query_benchmark_layout(preload_nodes)
+    for segment in range(layout["segments"]):
+        start = segment * layout["segment_nodes"]
+        db.batch_upsert_nodes(query_bench_nodes(start, layout["segment_nodes"]))
+        db.flush()
+    tail_start = layout["segments"] * layout["segment_nodes"]
+    db.batch_upsert_nodes(query_bench_nodes(tail_start, layout["memtable_tail_nodes"]))
+    return db, layout
+
+
+def push_query_scenarios(
+    args: argparse.Namespace,
+    scenario_contract: dict[str, Any],
+    cfg: dict[str, Any],
+    tmp_root: Path,
+    scenarios: list[dict[str, Any]],
+) -> None:
+    preload_nodes = cfg["time_range_nodes"]
+    limit = 100
+
+    scenario_id = "S-QUERY-001"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout = build_query_benchmark_db(tmp_root / "query-node-ids-intersected", preload_nodes)
+    s = run_bench(
+        lambda _i: db.query_node_ids(
+            {
+                "type_id": 1,
+                "where": {
+                    "status": {"eq": "active"},
+                    "tier": {"eq": "gold"},
+                },
+                "limit": limit,
+            }
+        ),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "query_node_ids_intersected_predicates",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "type_id": 1,
+                "preload_nodes": preload_nodes,
+                "segments": layout["segments"],
+                "segment_nodes": layout["segment_nodes"],
+                "memtable_tail_nodes": layout["memtable_tail_nodes"],
+                "predicates": ["status_eq_active", "tier_eq_gold"],
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-QUERY-002"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout = build_query_benchmark_db(tmp_root / "query-nodes-hydrated-intersected", preload_nodes)
+    s = run_bench(
+        lambda _i: db.query_nodes(
+            {
+                "type_id": 1,
+                "where": {
+                    "status": {"eq": "active"},
+                    "score": {"gte": 50},
+                },
+                "limit": limit,
+            }
+        ),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "query_nodes_intersected_predicates_hydrated",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "type_id": 1,
+                "preload_nodes": preload_nodes,
+                "segments": layout["segments"],
+                "segment_nodes": layout["segment_nodes"],
+                "memtable_tail_nodes": layout["memtable_tail_nodes"],
+                "predicates": ["status_eq_active", "score_gte_50"],
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+
 def main() -> int:
     args = parse_args()
     profile_payload, profile, scenario_contract = load_contracts(args.profile)
@@ -315,6 +460,29 @@ def main() -> int:
     scenarios: list[dict[str, Any]] = []
 
     try:
+        push_query_scenarios(args, scenario_contract, cfg, tmp_root, scenarios)
+
+        if args.scenario_set == "query":
+            output = {
+                "schema_version": 1,
+                "language": "python",
+                "harness_stage": "connector-benchmark-v2-parity",
+                "profile_name": args.profile,
+                "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "profile_source": str(PROFILE_PATH),
+                "scenario_contract_source": str(SCENARIO_CONTRACT_PATH),
+                "percentile_method": scenario_contract["percentile_method"],
+                "profile_contract": {
+                    "determinism": profile_payload["determinism"],
+                    "profile": profile,
+                    "effective_config": cfg,
+                    "scenario_contract_schema_version": scenario_contract["schema_version"],
+                },
+                "scenarios": scenarios,
+            }
+            print(json.dumps(output, indent=2))
+            return 0
+
         # S-CRUD-001 (growth)
         scenario_id = "S-CRUD-001"
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)

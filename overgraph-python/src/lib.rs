@@ -3,20 +3,23 @@
 use eg::{
     AdjacencyExport, AllShortestPathsOptions, CompactionPhase, CompactionProgress, CompactionStats,
     ComponentOptions, DatabaseEngine, DbOptions, DbStats, DegreeOptions, DenseMetric,
-    DenseVectorConfig, Direction, EdgeInput, EdgeRecord, EngineError, ExportOptions, FusionMode,
-    GraphPatch, HnswConfig, IsConnectedOptions, NeighborEntry, NeighborOptions, NodeIdMap,
-    NodeInput, NodePropertyIndexInfo, NodeRecord, PageRequest, PprAlgorithm, PprOptions, PprResult,
-    PropValue, PropertyRangeBound, PropertyRangeCursor, PropertyRangePageRequest,
-    PropertyRangePageResult, PrunePolicy, PruneResult, ScoringMode, SecondaryIndexKind,
-    SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPath, ShortestPathOptions, Subgraph,
-    SubgraphOptions, TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult,
-    TraverseOptions, TxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef,
-    TxnNodeView, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest,
-    VectorSearchScope, WalSyncMode, WriteTxn,
+    DenseVectorConfig, Direction, EdgeInput, EdgePattern, EdgePostFilterPredicate, EdgeRecord,
+    EngineError, ExportOptions, FusionMode, GraphPatch, GraphPatternQuery, HnswConfig,
+    IsConnectedOptions, NeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap, NodeInput,
+    NodePattern, NodePropertyIndexInfo, NodeQuery, NodeQueryOrder, NodeRecord, PageRequest,
+    PatternOrder, PprAlgorithm, PprOptions, PprResult, PropValue, PropertyRangeBound,
+    PropertyRangeCursor, PropertyRangePageRequest, PropertyRangePageResult, PrunePolicy,
+    PruneResult, QueryMatch, QueryPatternResult, QueryPlan, QueryPlanKind, QueryPlanNode,
+    QueryPlanWarning, ScoringMode, SecondaryIndexKind, SecondaryIndexRangeDomain,
+    SecondaryIndexState, ShortestPath, ShortestPathOptions, Subgraph, SubgraphOptions, TopKOptions,
+    TraversalCursor, TraversalHit, TraversalPageResult, TraverseOptions, TxnCommitResult,
+    TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef, TxnNodeView, UpsertEdgeOptions,
+    UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, VectorSearchScope, WalSyncMode,
+    WriteTxn,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyList};
+use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyList};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -317,6 +320,60 @@ impl OverGraph {
                 ids: Arc::new(eng.find_nodes(type_id, &prop_key, &pv)?),
             })
         })
+    }
+
+    fn query_node_ids(
+        &self,
+        py: Python<'_>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<PyIdPageResult> {
+        let query = parse_py_node_query(py, request)?;
+        with_engine_ref(self, py, move |eng| {
+            let result = eng.query_node_ids(&query)?;
+            Ok(PyIdPageResult {
+                items: IdArray {
+                    ids: Arc::new(result.items),
+                },
+                next_cursor: result.next_cursor,
+            })
+        })
+    }
+
+    fn query_nodes(
+        &self,
+        py: Python<'_>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<PyNodePageResult> {
+        let query = parse_py_node_query(py, request)?;
+        with_engine_ref(self, py, move |eng| {
+            let result = eng.query_nodes(&query)?;
+            Ok(PyNodePageResult {
+                items: result.items.into_iter().map(PyNodeRecord::from).collect(),
+                next_cursor: result.next_cursor,
+            })
+        })
+    }
+
+    fn query_pattern(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let query = parse_py_graph_pattern_query(py, request)?;
+        let result = with_engine_ref(self, py, move |eng| eng.query_pattern(&query))?;
+        query_pattern_result_to_py(py, result)
+    }
+
+    fn explain_node_query(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let query = parse_py_node_query(py, request)?;
+        let plan = with_engine_ref(self, py, move |eng| eng.explain_node_query(&query))?;
+        query_plan_to_py(py, plan)
+    }
+
+    fn explain_pattern_query(
+        &self,
+        py: Python<'_>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<PyObject> {
+        let query = parse_py_graph_pattern_query(py, request)?;
+        let plan = with_engine_ref(self, py, move |eng| eng.explain_pattern_query(&query))?;
+        query_plan_to_py(py, plan)
     }
 
     #[pyo3(signature = (type_id, prop_key, kind, *, domain=None))]
@@ -2741,6 +2798,901 @@ fn props_to_py(py: Python<'_>, props: &BTreeMap<String, PropValue>) -> PyResult<
         dict.set_item(k, prop_value_to_py_obj(py, v)?)?;
     }
     Ok(dict.into_any().unbind())
+}
+
+fn query_pattern_result_to_py(py: Python<'_>, result: QueryPatternResult) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    let matches: PyResult<Vec<PyObject>> = result
+        .matches
+        .into_iter()
+        .map(|match_| query_match_to_py(py, match_))
+        .collect();
+    dict.set_item("matches", matches?)?;
+    dict.set_item("truncated", result.truncated)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn query_match_to_py(py: Python<'_>, match_: QueryMatch) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    let nodes = PyDict::new(py);
+    for (alias, id) in match_.nodes {
+        nodes.set_item(alias, id)?;
+    }
+    let edges = PyDict::new(py);
+    for (alias, id) in match_.edges {
+        edges.set_item(alias, id)?;
+    }
+    dict.set_item("nodes", nodes)?;
+    dict.set_item("edges", edges)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn query_plan_to_py(py: Python<'_>, plan: QueryPlan) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("kind", query_plan_kind_to_py(&plan.kind))?;
+    dict.set_item("root", query_plan_node_to_py(py, plan.root)?)?;
+    dict.set_item("estimated_candidates", plan.estimated_candidates)?;
+    dict.set_item(
+        "warnings",
+        plan.warnings
+            .iter()
+            .map(query_plan_warning_to_py)
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(dict.into_any().unbind())
+}
+
+fn query_plan_kind_to_py(kind: &QueryPlanKind) -> &'static str {
+    match kind {
+        QueryPlanKind::NodeQuery => "node_query",
+        QueryPlanKind::PatternQuery => "pattern_query",
+    }
+}
+
+fn query_plan_node_to_py(py: Python<'_>, node: QueryPlanNode) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    match node {
+        QueryPlanNode::ExplicitIds => dict.set_item("kind", "explicit_ids")?,
+        QueryPlanNode::KeyLookup => dict.set_item("kind", "key_lookup")?,
+        QueryPlanNode::NodeTypeIndex => dict.set_item("kind", "node_type_index")?,
+        QueryPlanNode::PropertyEqualityIndex => dict.set_item("kind", "property_equality_index")?,
+        QueryPlanNode::PropertyRangeIndex => dict.set_item("kind", "property_range_index")?,
+        QueryPlanNode::TimestampIndex => dict.set_item("kind", "timestamp_index")?,
+        QueryPlanNode::AdjacencyExpansion => dict.set_item("kind", "adjacency_expansion")?,
+        QueryPlanNode::Intersect { inputs } => {
+            dict.set_item("kind", "intersect")?;
+            let inputs: PyResult<Vec<PyObject>> = inputs
+                .into_iter()
+                .map(|input| query_plan_node_to_py(py, input))
+                .collect();
+            dict.set_item("inputs", inputs?)?;
+        }
+        QueryPlanNode::Union { inputs } => {
+            dict.set_item("kind", "union")?;
+            let inputs: PyResult<Vec<PyObject>> = inputs
+                .into_iter()
+                .map(|input| query_plan_node_to_py(py, input))
+                .collect();
+            dict.set_item("inputs", inputs?)?;
+        }
+        QueryPlanNode::VerifyNodeFilter { input } => {
+            dict.set_item("kind", "verify_node_filter")?;
+            dict.set_item("input", query_plan_node_to_py(py, *input)?)?;
+        }
+        QueryPlanNode::VerifyEdgePredicates { input } => {
+            dict.set_item("kind", "verify_edge_predicates")?;
+            dict.set_item("input", query_plan_node_to_py(py, *input)?)?;
+        }
+        QueryPlanNode::PatternExpand {
+            anchor_alias,
+            input,
+        } => {
+            dict.set_item("kind", "pattern_expand")?;
+            dict.set_item("anchor_alias", anchor_alias)?;
+            dict.set_item("input", query_plan_node_to_py(py, *input)?)?;
+        }
+        QueryPlanNode::FallbackTypeScan => dict.set_item("kind", "fallback_type_scan")?,
+        QueryPlanNode::FallbackFullNodeScan => dict.set_item("kind", "fallback_full_node_scan")?,
+        QueryPlanNode::EmptyResult => dict.set_item("kind", "empty_result")?,
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn query_plan_warning_to_py(warning: &QueryPlanWarning) -> &'static str {
+    match warning {
+        QueryPlanWarning::MissingReadyIndex => "missing_ready_index",
+        QueryPlanWarning::UsingFallbackScan => "using_fallback_scan",
+        QueryPlanWarning::FullScanRequiresOptIn => "full_scan_requires_opt_in",
+        QueryPlanWarning::FullScanExplicitlyAllowed => "full_scan_explicitly_allowed",
+        QueryPlanWarning::UnboundedPatternRejected => "unbounded_pattern_rejected",
+        QueryPlanWarning::EdgePropertyPostFilter => "edge_property_post_filter",
+        QueryPlanWarning::IndexSkippedAsBroad => "index_skipped_as_broad",
+        QueryPlanWarning::CandidateCapExceeded => "candidate_cap_exceeded",
+        QueryPlanWarning::RangeCandidateCapExceeded => "range_candidate_cap_exceeded",
+        QueryPlanWarning::TimestampCandidateCapExceeded => "timestamp_candidate_cap_exceeded",
+        QueryPlanWarning::VerifyOnlyFilter => "verify_only_filter",
+        QueryPlanWarning::BooleanBranchFallback => "boolean_branch_fallback",
+        QueryPlanWarning::PlanningProbeBudgetExceeded => "planning_probe_budget_exceeded",
+    }
+}
+
+fn parse_py_node_query(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<NodeQuery> {
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        return parse_py_node_query_dict(py, dict);
+    }
+    if value.hasattr("to_dict")? {
+        let dict_value = value.call_method0("to_dict")?;
+        let dict = dict_value.downcast::<PyDict>()?;
+        return parse_py_node_query_dict(py, dict);
+    }
+    Err(PyTypeError::new_err(
+        "node query request must be a dict or expose to_dict()",
+    ))
+}
+
+fn parse_py_node_query_dict(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<NodeQuery> {
+    let page = PageRequest {
+        limit: parse_py_query_limit(dict, "node query limit")?,
+        after: py_optional_query_u64(dict, "after", "node query after")?,
+    };
+    let order = match py_non_none_item(dict, "order_by")? {
+        None => NodeQueryOrder::NodeIdAsc,
+        Some(value) => {
+            let order_by: String = value.extract()?;
+            match order_by.as_str() {
+                "node_id_asc" | "nodeIdAsc" => NodeQueryOrder::NodeIdAsc,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "Invalid order_by '{}'. Must be 'node_id_asc'.",
+                        other
+                    )));
+                }
+            }
+        }
+    };
+    Ok(NodeQuery {
+        type_id: py_optional_query_u32(dict, "type_id", "node query type_id")?,
+        ids: py_optional_query_u64_vec(dict, "ids", "node query ids")?,
+        keys: py_optional_extract::<Vec<String>>(dict, "keys")?.unwrap_or_default(),
+        filter: parse_py_node_filter(py, dict, "updated_at", "node query")?,
+        page,
+        order,
+        allow_full_scan: py_optional_extract::<bool>(dict, "allow_full_scan")?.unwrap_or(false),
+    })
+}
+
+fn parse_py_graph_pattern_query(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<GraphPatternQuery> {
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        return parse_py_graph_pattern_query_dict(py, dict);
+    }
+    if value.hasattr("to_dict")? {
+        let dict_value = value.call_method0("to_dict")?;
+        let dict = dict_value.downcast::<PyDict>()?;
+        return parse_py_graph_pattern_query_dict(py, dict);
+    }
+    Err(PyTypeError::new_err(
+        "graph pattern request must be a dict or expose to_dict()",
+    ))
+}
+
+fn parse_py_graph_pattern_query_dict(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+) -> PyResult<GraphPatternQuery> {
+    let nodes_value = py_non_none_item(dict, "nodes")?
+        .ok_or_else(|| PyValueError::new_err("graph pattern request requires nodes"))?;
+    let edges_value = py_non_none_item(dict, "edges")?
+        .ok_or_else(|| PyValueError::new_err("graph pattern request requires edges"))?;
+    let nodes_list = nodes_value.downcast::<PyList>()?;
+    let edges_list = edges_value.downcast::<PyList>()?;
+    let mut nodes = Vec::with_capacity(nodes_list.len());
+    for item in nodes_list.iter() {
+        nodes.push(parse_py_node_pattern(py, item.downcast::<PyDict>()?)?);
+    }
+    let mut edges = Vec::with_capacity(edges_list.len());
+    for item in edges_list.iter() {
+        edges.push(parse_py_edge_pattern(py, item.downcast::<PyDict>()?)?);
+    }
+    let limit_value = py_non_none_item(dict, "limit")?
+        .ok_or_else(|| PyValueError::new_err("graph pattern request requires positive limit"))?;
+    let limit = py_query_usize(&limit_value, "graph pattern limit")?;
+    if limit == 0 {
+        return Err(PyValueError::new_err("graph pattern limit must be > 0"));
+    }
+    Ok(GraphPatternQuery {
+        nodes,
+        edges,
+        at_epoch: py_optional_query_i64(dict, "at_epoch", "graph pattern at_epoch")?,
+        limit,
+        order: PatternOrder::AnchorThenAliasesAsc,
+    })
+}
+
+fn parse_py_node_pattern(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<NodePattern> {
+    Ok(NodePattern {
+        alias: py_required_extract(dict, "alias")?,
+        type_id: py_optional_query_u32(dict, "type_id", "node pattern type_id")?,
+        ids: py_optional_query_u64_vec(dict, "ids", "node pattern ids")?,
+        keys: py_optional_extract::<Vec<String>>(dict, "keys")?.unwrap_or_default(),
+        filter: parse_py_node_filter(py, dict, "updated_at", "node pattern")?,
+    })
+}
+
+fn parse_py_edge_pattern(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<EdgePattern> {
+    if py_has_field(dict, "filter")? {
+        return Err(PyValueError::new_err(
+            "edge pattern filter is not supported in Phase 24; use edge pattern where or predicates",
+        ));
+    }
+    let direction = match py_non_none_item(dict, "direction")? {
+        None => Direction::Outgoing,
+        Some(value) => parse_direction(&value.extract::<String>()?)?,
+    };
+    Ok(EdgePattern {
+        alias: py_optional_extract(dict, "alias")?,
+        from_alias: py_required_extract(dict, "from_alias")?,
+        to_alias: py_required_extract(dict, "to_alias")?,
+        direction,
+        type_filter: py_optional_query_u32_vec(dict, "type_filter", "edge pattern type_filter")?,
+        property_predicates: parse_py_edge_predicates(py, dict, "edge pattern")?,
+    })
+}
+
+fn reject_py_legacy_node_predicate_fields(dict: &Bound<'_, PyDict>, context: &str) -> PyResult<()> {
+    if py_has_field(dict, "where")? {
+        return Err(PyValueError::new_err(format!(
+            "{} where is no longer supported; use filter",
+            context
+        )));
+    }
+    if py_has_field(dict, "predicates")? {
+        return Err(PyValueError::new_err(format!(
+            "{} predicates are no longer supported; use filter",
+            context
+        )));
+    }
+    Ok(())
+}
+
+fn parse_py_node_filter(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    updated_at_key: &str,
+    context: &str,
+) -> PyResult<Option<NodeFilterExpr>> {
+    reject_py_legacy_node_predicate_fields(dict, context)?;
+    match py_non_none_item(dict, "filter")? {
+        None => Ok(None),
+        Some(value) => {
+            parse_py_node_filter_expr(py, &value, updated_at_key, &format!("{} filter", context))
+                .map(Some)
+        }
+    }
+}
+
+fn parse_py_node_filter_expr(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    updated_at_key: &str,
+    context: &str,
+) -> PyResult<NodeFilterExpr> {
+    let dict = value
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err(format!("{} must be a dict", context)))?;
+    if dict.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "{} must not be an empty object",
+            context
+        )));
+    }
+
+    let selectors = ["and", "or", "not", "property", updated_at_key]
+        .iter()
+        .map(|field| py_has_field(dict, field))
+        .collect::<PyResult<Vec<_>>>()?
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if selectors != 1 {
+        return Err(PyValueError::new_err(format!(
+            "{} must contain exactly one boolean tag or leaf selector",
+            context
+        )));
+    }
+    reject_py_uppercase_filter_fields(dict, context)?;
+
+    if let Some(value) = dict.get_item("and")? {
+        ensure_only_py_fields(dict, &["and"], context)?;
+        let children = value.downcast::<PyList>()?;
+        if children.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "{} and must contain at least one child",
+                context
+            )));
+        }
+        let mut parsed = Vec::with_capacity(children.len());
+        for (index, child) in children.iter().enumerate() {
+            parsed.push(parse_py_node_filter_expr(
+                py,
+                &child,
+                updated_at_key,
+                &format!("{} and[{}]", context, index),
+            )?);
+        }
+        return Ok(NodeFilterExpr::And(parsed));
+    }
+    if let Some(value) = dict.get_item("or")? {
+        ensure_only_py_fields(dict, &["or"], context)?;
+        let children = value.downcast::<PyList>()?;
+        if children.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "{} or must contain at least one child",
+                context
+            )));
+        }
+        let mut parsed = Vec::with_capacity(children.len());
+        for (index, child) in children.iter().enumerate() {
+            parsed.push(parse_py_node_filter_expr(
+                py,
+                &child,
+                updated_at_key,
+                &format!("{} or[{}]", context, index),
+            )?);
+        }
+        return Ok(NodeFilterExpr::Or(parsed));
+    }
+    if let Some(value) = dict.get_item("not")? {
+        ensure_only_py_fields(dict, &["not"], context)?;
+        return Ok(NodeFilterExpr::Not(Box::new(parse_py_node_filter_expr(
+            py,
+            &value,
+            updated_at_key,
+            &format!("{} not", context),
+        )?)));
+    }
+    if py_has_field(dict, "property")? {
+        return parse_py_property_node_filter(py, dict, context);
+    }
+    if let Some(value) = dict.get_item(updated_at_key)? {
+        ensure_only_py_fields(dict, &[updated_at_key], context)?;
+        return parse_py_updated_at_filter(&value, updated_at_key, context);
+    }
+
+    Err(PyValueError::new_err(format!(
+        "{} must contain a valid filter selector",
+        context
+    )))
+}
+
+fn parse_py_edge_predicates(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<Vec<EdgePostFilterPredicate>> {
+    let mut predicates = Vec::new();
+    if let Some(where_value) = py_non_none_item(dict, "where")? {
+        let where_dict = where_value.downcast::<PyDict>()?;
+        for (key, value) in where_dict.iter() {
+            let key: String = key.extract()?;
+            predicates.push(parse_py_property_edge_predicate(
+                py,
+                key.clone(),
+                &value,
+                &format!("{} where.{}", context, key),
+            )?);
+        }
+    }
+    if let Some(predicates_value) = py_non_none_item(dict, "predicates")? {
+        let predicates_list = predicates_value.downcast::<PyList>()?;
+        for (index, item) in predicates_list.iter().enumerate() {
+            let predicate_dict = item.downcast::<PyDict>()?;
+            if predicate_dict.len() != 1 {
+                return Err(PyValueError::new_err(format!(
+                    "{} predicates[{}] must contain exactly one top-level predicate tag",
+                    context, index
+                )));
+            }
+            let (tag, payload) = predicate_dict.iter().next().unwrap();
+            let tag: String = tag.extract()?;
+            match tag.as_str() {
+                "property" => predicates.push(parse_py_explicit_property_edge_predicate(
+                    py,
+                    &payload,
+                    &format!("{} predicates[{}].property", context, index),
+                )?),
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "Unknown edge predicate tag '{}'. Only 'property' is supported.",
+                        other
+                    )));
+                }
+            }
+        }
+    }
+    Ok(predicates)
+}
+
+fn parse_py_explicit_property_edge_predicate(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<EdgePostFilterPredicate> {
+    let dict = value.downcast::<PyDict>()?;
+    let key: String = py_required_extract(dict, "key")?;
+    parse_py_property_edge_predicate(py, key, value, context)
+}
+
+fn parse_py_property_node_filter(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<NodeFilterExpr> {
+    let key_value = py_non_none_item(dict, "property")?
+        .ok_or_else(|| PyValueError::new_err(format!("{} property is required", context)))?;
+    let key: String = key_value.extract()?;
+    if key.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "{} property must be non-empty",
+            context
+        )));
+    }
+
+    let has_range = py_has_any_field(dict, &["gt", "gte", "lt", "lte"])?;
+    let families = [
+        py_has_field(dict, "eq")?,
+        py_has_field(dict, "in")?,
+        has_range,
+        py_has_field(dict, "exists")?,
+        py_has_field(dict, "missing")?,
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if families != 1 {
+        return Err(PyValueError::new_err(format!(
+            "{} property filter must specify exactly one operator family",
+            context
+        )));
+    }
+
+    if let Some(value) = dict.get_item("eq")? {
+        ensure_only_py_fields(dict, &["property", "eq"], context)?;
+        return Ok(NodeFilterExpr::PropertyEquals {
+            key,
+            value: py_to_prop_value(py, &value)?,
+        });
+    }
+    if let Some(value) = dict.get_item("in")? {
+        ensure_only_py_fields(dict, &["property", "in"], context)?;
+        let values = value.downcast::<PyList>()?;
+        if values.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "{} in must contain at least one value",
+                context
+            )));
+        }
+        let parsed = values
+            .iter()
+            .map(|value| py_to_prop_value(py, &value))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(NodeFilterExpr::PropertyIn {
+            key,
+            values: parsed,
+        });
+    }
+    if has_range {
+        ensure_only_py_fields(dict, &["property", "gt", "gte", "lt", "lte"], context)?;
+        let (lower, upper) = parse_py_property_range_bounds(py, dict, context)?;
+        return Ok(NodeFilterExpr::PropertyRange { key, lower, upper });
+    }
+    if py_has_field(dict, "exists")? {
+        ensure_only_py_fields(dict, &["property", "exists"], context)?;
+        require_py_true_field(dict, "exists", context)?;
+        return Ok(NodeFilterExpr::PropertyExists { key });
+    }
+    if py_has_field(dict, "missing")? {
+        ensure_only_py_fields(dict, &["property", "missing"], context)?;
+        require_py_true_field(dict, "missing", context)?;
+        return Ok(NodeFilterExpr::PropertyMissing { key });
+    }
+
+    unreachable!("operator family count was checked above")
+}
+
+fn parse_py_property_edge_predicate(
+    py: Python<'_>,
+    key: String,
+    value: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<EdgePostFilterPredicate> {
+    let parsed = parse_py_property_predicate(py, value, context)?;
+    Ok(match parsed {
+        PyParsedPropertyPredicate::Equals(value) => {
+            EdgePostFilterPredicate::PropertyEquals { key, value }
+        }
+        PyParsedPropertyPredicate::Range { lower, upper } => {
+            EdgePostFilterPredicate::PropertyRange { key, lower, upper }
+        }
+    })
+}
+
+enum PyParsedPropertyPredicate {
+    Equals(PropValue),
+    Range {
+        lower: Option<PropertyRangeBound>,
+        upper: Option<PropertyRangeBound>,
+    },
+}
+
+fn parse_py_property_predicate(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<PyParsedPropertyPredicate> {
+    let dict = value.downcast::<PyDict>()?;
+    match py_non_none_item(dict, "op")? {
+        Some(op_value) => {
+            let op: String = op_value.extract()?;
+            match op.as_str() {
+                "eq" => {
+                    ensure_no_py_fields(dict, &["gt", "gte", "lt", "lte", "eq"], context)?;
+                    let value = dict.get_item("value")?.ok_or_else(|| {
+                        PyValueError::new_err(format!("{} eq predicate requires value", context))
+                    })?;
+                    Ok(PyParsedPropertyPredicate::Equals(py_to_prop_value(
+                        py, &value,
+                    )?))
+                }
+                "range" => {
+                    ensure_no_py_fields(dict, &["value", "eq"], context)?;
+                    let (lower, upper) = parse_py_property_range_bounds(py, dict, context)?;
+                    Ok(PyParsedPropertyPredicate::Range { lower, upper })
+                }
+                other => Err(PyValueError::new_err(format!(
+                    "Unknown predicate op '{}'. Valid ops are 'eq' and 'range'.",
+                    other
+                ))),
+            }
+        }
+        None if py_has_field(dict, "eq")? => {
+            ensure_no_py_fields(dict, &["value", "gt", "gte", "lt", "lte"], context)?;
+            let value = dict.get_item("eq")?.unwrap();
+            Ok(PyParsedPropertyPredicate::Equals(py_to_prop_value(
+                py, &value,
+            )?))
+        }
+        None if py_has_any_field(dict, &["gt", "gte", "lt", "lte"])? => {
+            ensure_no_py_fields(dict, &["value", "eq"], context)?;
+            let (lower, upper) = parse_py_property_range_bounds(py, dict, context)?;
+            Ok(PyParsedPropertyPredicate::Range { lower, upper })
+        }
+        None => Err(PyValueError::new_err(format!(
+            "{} predicate requires op, eq, or range bounds",
+            context
+        ))),
+    }
+}
+
+fn parse_py_updated_at_filter(
+    value: &Bound<'_, PyAny>,
+    tag: &str,
+    context: &str,
+) -> PyResult<NodeFilterExpr> {
+    let dict = value.downcast::<PyDict>()?;
+    ensure_only_py_fields(
+        dict,
+        &["gt", "gte", "lt", "lte"],
+        &format!("{} {}", context, tag),
+    )?;
+    let (lower_ms, upper_ms) = parse_py_i64_range_bounds(dict, &format!("{} {}", context, tag))?;
+    Ok(NodeFilterExpr::UpdatedAtRange { lower_ms, upper_ms })
+}
+
+fn parse_py_property_range_bounds(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<(Option<PropertyRangeBound>, Option<PropertyRangeBound>)> {
+    if py_has_field(dict, "gt")? && py_has_field(dict, "gte")? {
+        return Err(PyValueError::new_err(format!(
+            "{} range predicate cannot specify both gt and gte",
+            context
+        )));
+    }
+    if py_has_field(dict, "lt")? && py_has_field(dict, "lte")? {
+        return Err(PyValueError::new_err(format!(
+            "{} range predicate cannot specify both lt and lte",
+            context
+        )));
+    }
+    let lower = if let Some(value) = dict.get_item("gt")? {
+        Some(PropertyRangeBound::Excluded(py_to_prop_value(py, &value)?))
+    } else {
+        dict.get_item("gte")?
+            .map(|value| py_to_prop_value(py, &value).map(PropertyRangeBound::Included))
+            .transpose()?
+    };
+    let upper = if let Some(value) = dict.get_item("lt")? {
+        Some(PropertyRangeBound::Excluded(py_to_prop_value(py, &value)?))
+    } else {
+        dict.get_item("lte")?
+            .map(|value| py_to_prop_value(py, &value).map(PropertyRangeBound::Included))
+            .transpose()?
+    };
+    if lower.is_none() && upper.is_none() {
+        return Err(PyValueError::new_err(format!(
+            "{} range predicate requires at least one of gt, gte, lt, or lte",
+            context
+        )));
+    }
+    Ok((lower, upper))
+}
+
+fn parse_py_i64_range_bounds(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<(Option<i64>, Option<i64>)> {
+    if py_has_field(dict, "gt")? && py_has_field(dict, "gte")? {
+        return Err(PyValueError::new_err(format!(
+            "{} range predicate cannot specify both gt and gte",
+            context
+        )));
+    }
+    if py_has_field(dict, "lt")? && py_has_field(dict, "lte")? {
+        return Err(PyValueError::new_err(format!(
+            "{} range predicate cannot specify both lt and lte",
+            context
+        )));
+    }
+    let mut impossible = false;
+    let lower = if let Some(value) = dict.get_item("gt")? {
+        let value = py_query_i64(&value, &format!("{} gt", context))?;
+        match value.checked_add(1) {
+            Some(next) => Some(next),
+            None => {
+                impossible = true;
+                Some(i64::MAX)
+            }
+        }
+    } else {
+        dict.get_item("gte")?
+            .map(|value| py_query_i64(&value, &format!("{} gte", context)))
+            .transpose()?
+    };
+    let upper = if let Some(value) = dict.get_item("lt")? {
+        let value = py_query_i64(&value, &format!("{} lt", context))?;
+        match value.checked_sub(1) {
+            Some(prev) => Some(prev),
+            None => {
+                impossible = true;
+                Some(i64::MIN)
+            }
+        }
+    } else {
+        dict.get_item("lte")?
+            .map(|value| py_query_i64(&value, &format!("{} lte", context)))
+            .transpose()?
+    };
+    if lower.is_none() && upper.is_none() {
+        return Err(PyValueError::new_err(format!(
+            "{} range predicate requires at least one of gt, gte, lt, or lte",
+            context
+        )));
+    }
+    if impossible {
+        return Ok((Some(i64::MAX), Some(i64::MIN)));
+    }
+    Ok((lower, upper))
+}
+
+fn parse_py_query_limit(dict: &Bound<'_, PyDict>, _context: &str) -> PyResult<Option<usize>> {
+    match py_non_none_item(dict, "limit")? {
+        None => Ok(None),
+        Some(value) => {
+            let limit = py_query_usize(&value, "node query limit")?;
+            if limit == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(limit))
+            }
+        }
+    }
+}
+
+fn py_optional_query_u32(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    context: &str,
+) -> PyResult<Option<u32>> {
+    py_non_none_item(dict, key)?
+        .map(|value| py_query_u32(&value, context))
+        .transpose()
+}
+
+fn py_optional_query_u64(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    context: &str,
+) -> PyResult<Option<u64>> {
+    py_non_none_item(dict, key)?
+        .map(|value| py_query_u64(&value, context))
+        .transpose()
+}
+
+fn py_optional_query_i64(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    context: &str,
+) -> PyResult<Option<i64>> {
+    py_non_none_item(dict, key)?
+        .map(|value| py_query_i64(&value, context))
+        .transpose()
+}
+
+fn py_optional_query_u64_vec(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    context: &str,
+) -> PyResult<Vec<u64>> {
+    match py_non_none_item(dict, key)? {
+        None => Ok(Vec::new()),
+        Some(value) => {
+            let items = value.downcast::<PyList>()?;
+            let mut parsed = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                parsed.push(py_query_u64(&item, &format!("{}[{}]", context, index))?);
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+fn py_optional_query_u32_vec(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    context: &str,
+) -> PyResult<Option<Vec<u32>>> {
+    match py_non_none_item(dict, key)? {
+        None => Ok(None),
+        Some(value) => {
+            let items = value.downcast::<PyList>()?;
+            let mut parsed = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                parsed.push(py_query_u32(&item, &format!("{}[{}]", context, index))?);
+            }
+            Ok(Some(parsed))
+        }
+    }
+}
+
+fn py_query_u32(value: &Bound<'_, PyAny>, context: &str) -> PyResult<u32> {
+    let parsed = py_query_u64(value, context)?;
+    u32::try_from(parsed).map_err(|_| PyValueError::new_err(format!("{} must fit in u32", context)))
+}
+
+fn py_query_u64(value: &Bound<'_, PyAny>, context: &str) -> PyResult<u64> {
+    reject_py_bool(value, context)?;
+    value.extract::<u64>()
+}
+
+fn py_query_i64(value: &Bound<'_, PyAny>, context: &str) -> PyResult<i64> {
+    reject_py_bool(value, context)?;
+    value.extract::<i64>()
+}
+
+fn py_query_usize(value: &Bound<'_, PyAny>, context: &str) -> PyResult<usize> {
+    reject_py_bool(value, context)?;
+    value.extract::<usize>()
+}
+
+fn reject_py_bool(value: &Bound<'_, PyAny>, context: &str) -> PyResult<()> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(format!(
+            "{} must be an integer, not bool",
+            context
+        )));
+    }
+    Ok(())
+}
+
+fn py_non_none_item<'py>(
+    dict: &Bound<'py, PyDict>,
+    key: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    Ok(dict.get_item(key)?.filter(|value| !value.is_none()))
+}
+
+fn py_optional_extract<T>(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<T>>
+where
+    for<'a> T: FromPyObject<'a>,
+{
+    py_non_none_item(dict, key)?
+        .map(|value| value.extract::<T>())
+        .transpose()
+}
+
+fn py_required_extract<T>(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<T>
+where
+    for<'a> T: FromPyObject<'a>,
+{
+    py_non_none_item(dict, key)?
+        .ok_or_else(|| PyValueError::new_err(format!("{} is required", key)))?
+        .extract::<T>()
+}
+
+fn py_has_field(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<bool> {
+    Ok(dict.get_item(key)?.is_some())
+}
+
+fn py_has_any_field(dict: &Bound<'_, PyDict>, fields: &[&str]) -> PyResult<bool> {
+    for field in fields {
+        if py_has_field(dict, field)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_only_py_fields(
+    dict: &Bound<'_, PyDict>,
+    allowed: &[&str],
+    context: &str,
+) -> PyResult<()> {
+    for (key, _) in dict.iter() {
+        let key: String = key.extract()?;
+        if !allowed.iter().any(|allowed| *allowed == key) {
+            return Err(PyValueError::new_err(format!(
+                "{} does not accept field '{}'",
+                context, key
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_py_fields(dict: &Bound<'_, PyDict>, fields: &[&str], context: &str) -> PyResult<()> {
+    for field in fields {
+        if py_has_field(dict, field)? {
+            return Err(PyValueError::new_err(format!(
+                "{} does not accept field '{}'",
+                context, field
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_py_true_field(dict: &Bound<'_, PyDict>, field: &str, context: &str) -> PyResult<()> {
+    let value = dict
+        .get_item(field)?
+        .ok_or_else(|| PyValueError::new_err(format!("{} {} is required", context, field)))?;
+    if value.is_instance_of::<PyBool>() && value.extract::<bool>()? {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{} {} must be true",
+            context, field
+        )))
+    }
+}
+
+fn reject_py_uppercase_filter_fields(dict: &Bound<'_, PyDict>, context: &str) -> PyResult<()> {
+    for (key, _) in dict.iter() {
+        let key: String = key.extract()?;
+        if matches!(
+            key.as_str(),
+            "AND" | "OR" | "NOT" | "Eq" | "In" | "Exists" | "Missing"
+        ) {
+            return Err(PyValueError::new_err(format!(
+                "{} uses unsupported uppercase filter field '{}'",
+                context, key
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn prop_value_debug_repr(py: Python<'_>, value: &PropValue) -> PyResult<String> {

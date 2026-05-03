@@ -3,7 +3,13 @@ use crate::dense_hnsw::exact_dense_search_above_cutoff;
 use crate::error::EngineError;
 use crate::manifest::{default_manifest, load_manifest, load_manifest_readonly, write_manifest};
 use crate::memtable::{encode_range_prop_value, Memtable};
-use crate::segment_reader::SegmentReader;
+use crate::planner_stats::{
+    planner_stats_declaration_fingerprint_for_entry,
+    write_targeted_secondary_index_planner_stats_sidecar, DeclaredIndexRuntimeCoverage,
+    EstimateConfidence, PlannerEstimateKind, PlannerStatsDirection, PlannerStatsView,
+    PlannerStatsWriteOutcome, StalePostingRisk,
+};
+use crate::segment_reader::{SegmentReader, SegmentTypePosting};
 use crate::segment_writer::{
     node_prop_eq_sidecar_path, node_prop_range_sidecar_path, segment_dir, segment_tmp_dir,
     write_indexes_from_metadata_with_secondary_indexes, write_merged_edges_dat,
@@ -645,6 +651,7 @@ enum SecondaryEqCoverageStatus {
 }
 
 enum SecondaryEqFinalizeOutcome {
+    ReadyApplied(SecondaryIndexReadyApplied),
     Applied,
     Retry,
     Inactive,
@@ -667,9 +674,54 @@ enum SecondaryRangeCoverageStatus {
 }
 
 enum SecondaryRangeFinalizeOutcome {
+    ReadyApplied(SecondaryIndexReadyApplied),
     Applied,
     Retry,
     Inactive,
+}
+
+#[derive(Clone, Debug)]
+struct SecondaryIndexReadyApplied {
+    index_id: u64,
+    kind: SecondaryIndexKind,
+    type_id: u32,
+    prop_key: String,
+    declaration_fingerprint: u64,
+    snapshot_segment_ids: Vec<u64>,
+}
+
+impl SecondaryIndexReadyApplied {
+    fn from_ready_entry(
+        entry: &SecondaryIndexManifestEntry,
+        snapshot_segment_ids: Vec<u64>,
+    ) -> Option<Self> {
+        if entry.state != SecondaryIndexState::Ready {
+            return None;
+        }
+        let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
+        Some(Self {
+            index_id: entry.index_id,
+            kind: entry.kind.clone(),
+            type_id: *type_id,
+            prop_key: prop_key.clone(),
+            declaration_fingerprint: planner_stats_declaration_fingerprint_for_entry(entry),
+            snapshot_segment_ids,
+        })
+    }
+
+    fn matches_entry(&self, entry: &SecondaryIndexManifestEntry) -> bool {
+        if entry.state != SecondaryIndexState::Ready
+            || entry.index_id != self.index_id
+            || entry.kind != self.kind
+        {
+            return false;
+        }
+        let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
+        *type_id == self.type_id
+            && prop_key == &self.prop_key
+            && planner_stats_declaration_fingerprint_for_entry(entry)
+                == self.declaration_fingerprint
+    }
 }
 
 fn load_secondary_eq_build_snapshot(
@@ -860,6 +912,13 @@ fn finalize_secondary_eq_build_snapshot(
                 SecondaryEqCoverageStatus::Covered => {
                     entry.state = SecondaryIndexState::Ready;
                     entry.last_error = None;
+                    let mut snapshot_segment_ids = snapshot.segment_ids.clone();
+                    snapshot_segment_ids.sort_unstable();
+                    if let Some(ready) =
+                        SecondaryIndexReadyApplied::from_ready_entry(entry, snapshot_segment_ids)
+                    {
+                        outcome = SecondaryEqFinalizeOutcome::ReadyApplied(ready);
+                    }
                 }
                 SecondaryEqCoverageStatus::Incomplete => {
                     entry.state = SecondaryIndexState::Building;
@@ -1071,6 +1130,13 @@ fn finalize_secondary_range_build_snapshot(
                 SecondaryRangeCoverageStatus::Covered => {
                     entry.state = SecondaryIndexState::Ready;
                     entry.last_error = None;
+                    let mut snapshot_segment_ids = snapshot.segment_ids.clone();
+                    snapshot_segment_ids.sort_unstable();
+                    if let Some(ready) =
+                        SecondaryIndexReadyApplied::from_ready_entry(entry, snapshot_segment_ids)
+                    {
+                        outcome = SecondaryRangeFinalizeOutcome::ReadyApplied(ready);
+                    }
                 }
                 SecondaryRangeCoverageStatus::Incomplete => {
                     entry.state = SecondaryIndexState::Building;
@@ -1102,13 +1168,13 @@ fn process_secondary_index_build(
     #[cfg(test)] build_pause: &Arc<Mutex<Option<SecondaryIndexBuildPauseHook>>>,
     index_id: u64,
     cancel: &AtomicBool,
-) -> Result<(), EngineError> {
+) -> Result<Option<SecondaryIndexReadyApplied>, EngineError> {
     #[cfg(test)]
     let mut build_pause_applied = false;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(None);
         }
 
         #[cfg(test)]
@@ -1127,7 +1193,7 @@ fn process_secondary_index_build(
             let coverage =
                 validate_secondary_eq_snapshot_coverage(db_dir, index_id, &snapshot, cancel)?;
             if matches!(coverage, SecondaryEqCoverageStatus::Cancelled) {
-                return Ok(());
+                return Ok(None);
             }
 
             match finalize_secondary_eq_build_snapshot(
@@ -1142,8 +1208,9 @@ fn process_secondary_index_build(
                 &snapshot,
                 &coverage,
             )? {
+                SecondaryEqFinalizeOutcome::ReadyApplied(ready) => return Ok(Some(ready)),
                 SecondaryEqFinalizeOutcome::Applied | SecondaryEqFinalizeOutcome::Inactive => {
-                    return Ok(())
+                    return Ok(None)
                 }
                 SecondaryEqFinalizeOutcome::Retry => continue,
             }
@@ -1154,7 +1221,7 @@ fn process_secondary_index_build(
             let coverage =
                 validate_secondary_range_snapshot_coverage(db_dir, index_id, &snapshot, cancel)?;
             if matches!(coverage, SecondaryRangeCoverageStatus::Cancelled) {
-                return Ok(());
+                return Ok(None);
             }
 
             match finalize_secondary_range_build_snapshot(
@@ -1169,14 +1236,170 @@ fn process_secondary_index_build(
                 &snapshot,
                 &coverage,
             )? {
+                SecondaryRangeFinalizeOutcome::ReadyApplied(ready) => return Ok(Some(ready)),
                 SecondaryRangeFinalizeOutcome::Applied
-                | SecondaryRangeFinalizeOutcome::Inactive => return Ok(()),
+                | SecondaryRangeFinalizeOutcome::Inactive => return Ok(None),
                 SecondaryRangeFinalizeOutcome::Retry => continue,
             }
         } else {
-            return Ok(());
+            return Ok(None);
         }
     }
+}
+
+#[derive(Clone)]
+struct TargetedStatsRefreshSnapshot {
+    dense_config: Option<DenseVectorConfig>,
+    target_entry: SecondaryIndexManifestEntry,
+    ready_indexes: Vec<SecondaryIndexManifestEntry>,
+    segment_ids: Vec<u64>,
+}
+
+fn load_targeted_stats_refresh_snapshot(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    ready: &SecondaryIndexReadyApplied,
+) -> Result<Option<TargetedStatsRefreshSnapshot>, EngineError> {
+    let _guard = manifest_write_lock.lock().unwrap();
+    let manifest = load_manifest_readonly(db_dir)?
+        .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
+    let Some(target_entry) = manifest
+        .secondary_indexes
+        .iter()
+        .find(|entry| entry.index_id == ready.index_id)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    if !ready.matches_entry(&target_entry) {
+        return Ok(None);
+    }
+
+    let snapshot_segment_ids: HashSet<u64> = ready.snapshot_segment_ids.iter().copied().collect();
+    let mut segment_ids: Vec<u64> = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.id)
+        .filter(|segment_id| snapshot_segment_ids.contains(segment_id))
+        .collect();
+    segment_ids.sort_unstable();
+    if segment_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut ready_indexes: Vec<_> = manifest
+        .secondary_indexes
+        .iter()
+        .filter(|entry| entry.state == SecondaryIndexState::Ready)
+        .cloned()
+        .collect();
+    ready_indexes.sort_by_key(|entry| entry.index_id);
+    Ok(Some(TargetedStatsRefreshSnapshot {
+        dense_config: manifest.dense_vector,
+        target_entry,
+        ready_indexes,
+        segment_ids,
+    }))
+}
+
+fn targeted_refresh_snapshot_contains_segment(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    ready: &SecondaryIndexReadyApplied,
+    segment_id: u64,
+) -> Result<Option<TargetedStatsRefreshSnapshot>, EngineError> {
+    let Some(snapshot) = load_targeted_stats_refresh_snapshot(db_dir, manifest_write_lock, ready)?
+    else {
+        return Ok(None);
+    };
+    if snapshot.segment_ids.binary_search(&segment_id).is_ok() {
+        Ok(Some(snapshot))
+    } else {
+        Ok(None)
+    }
+}
+
+fn target_secondary_sidecar_is_valid(
+    segment: &SegmentReader,
+    ready: &SecondaryIndexReadyApplied,
+) -> Result<bool, EngineError> {
+    match ready.kind {
+        SecondaryIndexKind::Equality => segment.validate_secondary_eq_sidecar(ready.index_id),
+        SecondaryIndexKind::Range { .. } => {
+            segment.validate_secondary_range_sidecar(ready.index_id)
+        }
+    }
+}
+
+fn refresh_ready_secondary_index_planner_stats(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    ready: &SecondaryIndexReadyApplied,
+    cancel: &AtomicBool,
+) -> Vec<(u64, Arc<SegmentReader>)> {
+    let Some(initial_snapshot) =
+        load_targeted_stats_refresh_snapshot(db_dir, manifest_write_lock, ready)
+            .ok()
+            .flatten()
+    else {
+        return Vec::new();
+    };
+    let mut refreshed = Vec::new();
+
+    for segment_id in initial_snapshot.segment_ids {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let seg_dir = segment_dir(db_dir, segment_id);
+        let segment =
+            match SegmentReader::open(&seg_dir, segment_id, initial_snapshot.dense_config.as_ref())
+            {
+                Ok(segment) => segment,
+                Err(error) if is_not_found_io_error(&error) => continue,
+                Err(_) => continue,
+            };
+        match target_secondary_sidecar_is_valid(&segment, ready) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => continue,
+        }
+
+        let Some(snapshot) = targeted_refresh_snapshot_contains_segment(
+            db_dir,
+            manifest_write_lock,
+            ready,
+            segment_id,
+        )
+        .ok()
+        .flatten() else {
+            continue;
+        };
+        match write_targeted_secondary_index_planner_stats_sidecar(
+            &seg_dir,
+            &segment,
+            &snapshot.target_entry,
+            &snapshot.ready_indexes,
+        ) {
+            Ok(PlannerStatsWriteOutcome::Written) => {}
+            Ok(PlannerStatsWriteOutcome::SkippedOversize)
+            | Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable)
+            | Err(_) => continue,
+        }
+
+        let refreshed_reader =
+            match SegmentReader::open(&seg_dir, segment_id, snapshot.dense_config.as_ref()) {
+                Ok(reader) => reader,
+                Err(error) if is_not_found_io_error(&error) => continue,
+                Err(_) => continue,
+            };
+        for entry in &snapshot.ready_indexes {
+            refreshed_reader.warm_declared_index_runtime_coverage(entry);
+        }
+        if target_secondary_sidecar_is_valid(&refreshed_reader, ready).unwrap_or(false) {
+            refreshed.push((segment_id, Arc::new(refreshed_reader)));
+        }
+    }
+
+    refreshed
 }
 
 fn process_secondary_index_drop_cleanup(
@@ -1227,7 +1450,7 @@ fn bg_secondary_index_worker(
         }
         match job {
             SecondaryIndexJob::Build { index_id } => {
-                if let Err(error) = process_secondary_index_build(
+                let ready_applied = match process_secondary_index_build(
                     &db_dir,
                     &manifest_write_lock,
                     &catalog_lock,
@@ -1240,20 +1463,39 @@ fn bg_secondary_index_worker(
                     index_id,
                     &cancel,
                 ) {
-                    mark_secondary_index_failed(
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        mark_secondary_index_failed(
+                            &db_dir,
+                            &manifest_write_lock,
+                            &catalog_lock,
+                            &entries_lock,
+                            next_node_id_seen.as_ref(),
+                            next_edge_id_seen.as_ref(),
+                            engine_seq_seen.as_ref(),
+                            index_id,
+                            &error,
+                        );
+                        None
+                    }
+                };
+                let refreshed_readers = ready_applied.as_ref().map_or_else(Vec::new, |ready| {
+                    refresh_ready_secondary_index_planner_stats(
                         &db_dir,
                         &manifest_write_lock,
-                        &catalog_lock,
-                        &entries_lock,
-                        next_node_id_seen.as_ref(),
-                        next_edge_id_seen.as_ref(),
-                        engine_seq_seen.as_ref(),
-                        index_id,
-                        &error,
-                    );
-                }
+                        ready,
+                        &cancel,
+                    )
+                });
                 if let Some(runtime) = runtime.as_ref().and_then(std::sync::Weak::upgrade) {
-                    runtime.republish_secondary_index_state_if_open();
+                    if let Some(ready) = ready_applied {
+                        runtime.republish_secondary_index_state_and_refreshed_stats_if_open(
+                            &ready,
+                            refreshed_readers,
+                        );
+                    } else {
+                        runtime.republish_secondary_index_state_if_open();
+                    }
                 }
             }
             SecondaryIndexJob::DropCleanup { index_id } => {
@@ -1459,6 +1701,40 @@ pub(crate) struct PublishedReadSources {
     segments: Vec<Arc<SegmentReader>>,
     secondary_index_catalog: SecondaryIndexCatalog,
     secondary_index_entries: SecondaryIndexEntries,
+    pub(crate) declared_index_runtime_coverage: Arc<DeclaredIndexRuntimeCoverage>,
+    planner_stats: Arc<PlannerStatsView>,
+    #[cfg(test)]
+    planning_probe_counters: QueryPlanningProbeCounters,
+    #[cfg(test)]
+    query_execution_counters: QueryExecutionCounters,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct QueryPlanningProbeCounters {
+    range: AtomicUsize,
+    timestamp: AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueryPlanningProbeSnapshot {
+    pub range: usize,
+    pub timestamp: usize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct QueryExecutionCounters {
+    equality_materialization_record_reads: AtomicUsize,
+    final_verifier_record_reads: AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueryExecutionCounterSnapshot {
+    pub equality_materialization_record_reads: usize,
+    pub final_verifier_record_reads: usize,
 }
 
 /// Published read-visible snapshot for CP1 point/dedup reads.
@@ -1944,6 +2220,8 @@ impl DbRuntime {
             if !lifecycle.mutating_barrier_active {
                 lifecycle.mutating_barrier_active = true;
                 lifecycle.active_non_read_ops += 1;
+                #[cfg(test)]
+                self.lifecycle_cv.notify_all();
                 while lifecycle.active_mutating_ops > 0 {
                     lifecycle = self.lifecycle_cv.wait(lifecycle).unwrap();
                     if lifecycle.closing || lifecycle.closed {
@@ -2224,7 +2502,54 @@ impl DbRuntime {
             return;
         };
         core.manifest.secondary_indexes = core.secondary_index_entries_snapshot();
-        self.publish_locked(core, PublishImpact::RebuildSources, false);
+        self.publish_locked(core, PublishImpact::RebuildSources, true);
+    }
+
+    fn republish_secondary_index_state_and_refreshed_stats_if_open(
+        &self,
+        ready: &SecondaryIndexReadyApplied,
+        refreshed_readers: Vec<(u64, Arc<SegmentReader>)>,
+    ) {
+        let mut core_guard = self.core.lock().unwrap();
+        let Some(core) = core_guard.as_mut() else {
+            return;
+        };
+        core.manifest.secondary_indexes = core.secondary_index_entries_snapshot();
+
+        let ready_still_current = core
+            .manifest
+            .secondary_indexes
+            .iter()
+            .any(|entry| ready.matches_entry(entry));
+        if ready_still_current {
+            for (segment_id, reader) in refreshed_readers {
+                if !core
+                    .manifest
+                    .segments
+                    .iter()
+                    .any(|segment| segment.id == segment_id)
+                {
+                    continue;
+                }
+                if !target_secondary_sidecar_is_valid(&reader, ready).unwrap_or(false) {
+                    continue;
+                }
+                let Some(position) = core
+                    .segments
+                    .iter()
+                    .position(|segment| segment.segment_id == segment_id)
+                else {
+                    continue;
+                };
+                if core.segments[position].node_count() == reader.node_count()
+                    && core.segments[position].edge_count() == reader.edge_count()
+                {
+                    core.segments[position] = reader;
+                }
+            }
+        }
+
+        self.publish_locked(core, PublishImpact::RebuildSources, true);
     }
 
     fn start_coordinator(self: &Arc<Self>) {
@@ -2866,6 +3191,13 @@ impl ReadView {
         snapshot_seq: u64,
         active_degree_overlay: Arc<DegreeOverlaySnapshot>,
     ) -> Self {
+        debug_assert!(
+            sources.declared_index_runtime_coverage.entry_count()
+                <= sources
+                    .segments
+                    .len()
+                    .saturating_mul(sources.secondary_index_entries.len())
+        );
         Self {
             sources,
             snapshot_seq,
@@ -2880,6 +3212,34 @@ impl ReadView {
             segments: &self.segments,
             snapshot_seq: self.snapshot_seq,
         }
+    }
+
+    #[cfg(test)]
+    fn note_range_planning_probe(&self) {
+        self.planning_probe_counters
+            .range
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_timestamp_planning_probe(&self) {
+        self.planning_probe_counters
+            .timestamp
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_equality_materialization_record_reads(&self, count: usize) {
+        self.query_execution_counters
+            .equality_materialization_record_reads
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_final_verifier_record_reads(&self, count: usize) {
+        self.query_execution_counters
+            .final_verifier_record_reads
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     fn node_property_index_entry(
@@ -3413,7 +3773,21 @@ impl DatabaseEngine {
     }
 
     pub fn list_node_property_indexes(&self) -> Result<Vec<NodePropertyIndexInfo>, EngineError> {
-        self.with_core_ref(|core| Ok(core.list_node_property_indexes()))
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        let mut indexes: Vec<NodePropertyIndexInfo> = published
+            .view
+            .secondary_index_entries
+            .iter()
+            .map(EngineCore::node_property_index_info)
+            .collect();
+        indexes.sort_unstable_by(|left, right| {
+            left.type_id
+                .cmp(&right.type_id)
+                .then_with(|| left.prop_key.cmp(&right.prop_key))
+                .then_with(|| format!("{:?}", left.kind).cmp(&format!("{:?}", right.kind)))
+                .then_with(|| left.index_id.cmp(&right.index_id))
+        });
+        Ok(indexes)
     }
 
     pub fn get_node(&self, id: u64) -> Result<Option<NodeRecord>, EngineError> {
@@ -4018,6 +4392,47 @@ impl DatabaseEngine {
         Arc::clone(&self.published_state().view)
     }
 
+    pub(crate) fn planner_stats_view_for_test(&self) -> Arc<PlannerStatsView> {
+        Arc::clone(&self.published_state().view.planner_stats)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn declared_index_runtime_coverage_len_for_test(&self) -> usize {
+        self.published_state()
+            .view
+            .declared_index_runtime_coverage
+            .entry_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reopen_segment_reader_and_rebuild_sources_for_test(
+        &self,
+        segment_id: u64,
+    ) -> Result<(), EngineError> {
+        let mut core_guard = self.runtime.core.lock().unwrap();
+        let core = core_guard
+            .as_mut()
+            .ok_or_else(|| EngineError::InvalidOperation("database is closed".into()))?;
+        let seg_path = segment_dir(&core.db_dir, segment_id);
+        let reader =
+            SegmentReader::open(&seg_path, segment_id, core.manifest.dense_vector.as_ref())?;
+        core.warm_declared_index_runtime_coverage_for_reader(&reader);
+        let Some(position) = core
+            .segments
+            .iter()
+            .position(|segment| segment.segment_id == segment_id)
+        else {
+            return Err(EngineError::InvalidOperation(format!(
+                "segment {} is not published",
+                segment_id
+            )));
+        };
+        core.segments[position] = Arc::new(reader);
+        self.runtime
+            .publish_locked(core, PublishImpact::RebuildSources, false);
+        Ok(())
+    }
+
     pub(crate) fn active_degree_overlay_for_test(&self) -> Arc<DegreeOverlaySnapshot> {
         self.with_core_ref(|core| Ok(Arc::clone(&core.active_degree_overlay)))
             .unwrap_or_else(|_| Arc::clone(&self.published_state().view.active_degree_overlay))
@@ -4075,6 +4490,77 @@ impl DatabaseEngine {
 
     pub(crate) fn reset_publish_counters_for_test(&self) {
         self.runtime.reset_publish_counters();
+    }
+
+    pub(crate) fn published_read_source_build_count_for_test(&self) -> usize {
+        self.with_core_ref(|core| Ok(core.published_read_source_builds.load(Ordering::Relaxed)))
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_planning_probe_snapshot_for_test(&self) -> QueryPlanningProbeSnapshot {
+        let published = self.published_state();
+        QueryPlanningProbeSnapshot {
+            range: published
+                .view
+                .planning_probe_counters
+                .range
+                .load(Ordering::Relaxed),
+            timestamp: published
+                .view
+                .planning_probe_counters
+                .timestamp
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_query_planning_probe_counters_for_test(&self) {
+        let published = self.published_state();
+        published
+            .view
+            .planning_probe_counters
+            .range
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .planning_probe_counters
+            .timestamp
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_execution_counter_snapshot_for_test(
+        &self,
+    ) -> QueryExecutionCounterSnapshot {
+        let published = self.published_state();
+        QueryExecutionCounterSnapshot {
+            equality_materialization_record_reads: published
+                .view
+                .query_execution_counters
+                .equality_materialization_record_reads
+                .load(Ordering::Relaxed),
+            final_verifier_record_reads: published
+                .view
+                .query_execution_counters
+                .final_verifier_record_reads
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_query_execution_counters_for_test(&self) {
+        let published = self.published_state();
+        published
+            .view
+            .query_execution_counters
+            .equality_materialization_record_reads
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .final_verifier_record_reads
+            .store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn set_flush_pause(
@@ -4158,6 +4644,32 @@ impl DatabaseEngine {
         let mut lifecycle = self.runtime.lifecycle.lock().unwrap();
         lifecycle.coordinator_queue_capacity = capacity.max(1);
         self.runtime.lifecycle_cv.notify_all();
+    }
+
+    pub(crate) fn wait_for_mutating_barrier_active_for_test(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut lifecycle = self.runtime.lifecycle.lock().unwrap();
+        while !lifecycle.mutating_barrier_active {
+            assert!(
+                !lifecycle.closing && !lifecycle.closed,
+                "database closed before mutating barrier became active"
+            );
+            let now = std::time::Instant::now();
+            assert!(
+                now < deadline,
+                "timed out waiting for mutating barrier; active_mutating_ops={}, active_non_read_ops={}",
+                lifecycle.active_mutating_ops,
+                lifecycle.active_non_read_ops
+            );
+            let remaining = deadline.saturating_duration_since(now);
+            let wait_for = remaining.min(std::time::Duration::from_millis(50));
+            let (next, _) = self
+                .runtime
+                .lifecycle_cv
+                .wait_timeout(lifecycle, wait_for)
+                .unwrap();
+            lifecycle = next;
+        }
     }
 
     pub(crate) fn pending_secondary_index_followup_count_for_test(&self) -> usize {
@@ -4254,10 +4766,6 @@ impl DatabaseEngine {
         ReadView::validate_property_range_bounds(lower, upper, after)
     }
 
-    pub(crate) fn rebuild_degree_cache(&self) -> Result<(), EngineError> {
-        self.with_core_mut(|core| core.rebuild_degree_cache())
-    }
-
     pub(crate) fn compact_after_n_flushes_for_test(&self) -> u32 {
         self.with_core_ref(|core| Ok(core.compact_after_n_flushes))
             .unwrap_or(0)
@@ -4344,6 +4852,11 @@ struct EngineCore {
     secondary_index_entries: Arc<RwLock<SecondaryIndexEntries>>,
     /// Cached published read-visible source bundle reused by ordinary writes.
     published_read_sources: Option<Arc<PublishedReadSources>>,
+    /// Monotonic generation for rebuilt read-source bundles and their stats rollup.
+    published_read_sources_generation: u64,
+    /// Counts read-source bundle rebuilds so tests can catch accidental helper-read rebuilds.
+    #[cfg(test)]
+    published_read_source_builds: AtomicUsize,
     /// Segment dirs whose cleanup is retried after published snapshots release
     /// mmap-backed readers. This matters on Windows, where mapped files cannot
     /// be removed while a reader handle is still alive.
@@ -4953,6 +5466,9 @@ impl EngineCore {
             secondary_index_catalog: Arc::new(RwLock::new(HashMap::new())),
             secondary_index_entries: Arc::new(RwLock::new(Vec::new())),
             published_read_sources: None,
+            published_read_sources_generation: 0,
+            #[cfg(test)]
+            published_read_source_builds: AtomicUsize::new(0),
             deferred_segment_dir_cleanup: Vec::new(),
             secondary_index_bg: None,
             runtime: None,
@@ -4973,6 +5489,7 @@ impl EngineCore {
         engine.recover_secondary_index_states_on_open()?;
         engine.rebuild_secondary_index_catalog()?;
         engine.seed_secondary_indexes_from_manifest()?;
+        engine.warm_declared_index_runtime_coverage_for_current_readers();
         engine.rebuild_published_read_sources();
 
         Ok(engine)
@@ -5056,10 +5573,40 @@ impl EngineCore {
         }
     }
 
+    fn warm_declared_index_runtime_coverage_for_reader(&self, reader: &SegmentReader) {
+        let entries = self.secondary_index_entries_snapshot();
+        for entry in &entries {
+            reader.warm_declared_index_runtime_coverage(entry);
+        }
+    }
+
+    fn warm_declared_index_runtime_coverage_for_current_readers(&self) {
+        let entries = self.secondary_index_entries_snapshot();
+        for segment in &self.segments {
+            for entry in &entries {
+                segment.warm_declared_index_runtime_coverage(entry);
+            }
+        }
+    }
+
     fn build_published_read_sources(&self) -> Arc<PublishedReadSources> {
+        #[cfg(test)]
+        self.published_read_source_builds
+            .fetch_add(1, Ordering::Relaxed);
+
         let secondary_index_entries = self.secondary_index_entries_snapshot();
         let secondary_index_catalog = build_secondary_index_catalog(&secondary_index_entries)
             .expect("secondary index runtime state must stay internally consistent");
+        let declared_index_runtime_coverage = Arc::new(DeclaredIndexRuntimeCoverage::from_readers(
+            &self.segments,
+            &secondary_index_entries,
+        ));
+        let planner_stats = Arc::new(PlannerStatsView::build_from_readers(
+            self.published_read_sources_generation,
+            &self.segments,
+            &secondary_index_entries,
+            declared_index_runtime_coverage.as_ref(),
+        ));
         Arc::new(PublishedReadSources {
             manifest: self.build_read_manifest_state(),
             memtable: Arc::clone(&self.memtable),
@@ -5067,10 +5614,18 @@ impl EngineCore {
             segments: self.segments.iter().map(Arc::clone).collect(),
             secondary_index_catalog,
             secondary_index_entries,
+            declared_index_runtime_coverage,
+            planner_stats,
+            #[cfg(test)]
+            planning_probe_counters: QueryPlanningProbeCounters::default(),
+            #[cfg(test)]
+            query_execution_counters: QueryExecutionCounters::default(),
         })
     }
 
     fn rebuild_published_read_sources(&mut self) {
+        self.published_read_sources_generation =
+            self.published_read_sources_generation.saturating_add(1);
         self.published_read_sources = Some(self.build_published_read_sources());
     }
 
@@ -5102,7 +5657,7 @@ impl EngineCore {
 
     fn read_view(&self) -> ReadView {
         ReadView::from_published_sources(
-            self.build_published_read_sources(),
+            self.current_published_read_sources(),
             self.engine_seq,
             Arc::clone(&self.active_degree_overlay),
         )
@@ -5691,7 +6246,11 @@ impl EngineCore {
 
         // 5. Swap memtable to immutable queue (newest-first = insert at front)
         self.active_wal_generation_id = new_wal_gen;
-        let frozen = std::mem::replace(&mut self.memtable, Arc::new(Memtable::new()));
+        let next_memtable = Arc::new(Memtable::new());
+        for entry in self.secondary_index_entries_snapshot() {
+            next_memtable.register_secondary_index(&entry);
+        }
+        let frozen = std::mem::replace(&mut self.memtable, next_memtable);
         let frozen_degree_overlay = std::mem::replace(
             &mut self.active_degree_overlay,
             DegreeOverlaySnapshot::empty(),
@@ -6128,6 +6687,7 @@ impl EngineCore {
                     !(epoch.epoch_id == adoption.epoch_id
                         && epoch.wal_generation_id == adoption.wal_gen_to_retire)
                 });
+                self.warm_declared_index_runtime_coverage_for_reader(&adoption.reader);
                 self.segments.insert(0, Arc::new(adoption.reader));
                 if let Some(idx) = self
                     .immutable_epochs
@@ -6442,6 +7002,7 @@ impl EngineCore {
         self.segments
             .retain(|s| !result.input_segment_ids.contains(&s.segment_id));
         // Compacted segment is oldest; push to end (segments are newest-first).
+        self.warm_declared_index_runtime_coverage_for_reader(&result.reader);
         self.segments.push(Arc::new(result.reader));
 
         // Defer old segment cleanup until after the new published snapshot is
@@ -6648,6 +7209,7 @@ impl EngineCore {
         self.manifest = new_manifest;
         self.rebuild_secondary_index_catalog()?;
         self.segments.clear();
+        self.warm_declared_index_runtime_coverage_for_reader(&new_reader);
         self.segments.push(Arc::new(new_reader));
 
         // Defer old segment cleanup until after the new published snapshot is
@@ -7666,6 +8228,12 @@ fn bg_flush_publish_worker(
         };
 
         let _ = remove_wal_generation(&db_dir, result.wal_gen_to_retire);
+        {
+            let entries = secondary_index_entries.read().unwrap().clone();
+            for entry in &entries {
+                reader.warm_declared_index_runtime_coverage(entry);
+            }
+        }
         send_bg_flush_event(
             &event_tx,
             &events_ready,
@@ -7789,6 +8357,9 @@ fn bg_compact_worker(
             seg_id
         )));
     }
+    for entry in &secondary_indexes {
+        reader.warm_declared_index_runtime_coverage(entry);
+    }
 
     let input_segment_ids: NodeIdSet = input_segments.iter().map(|(id, _)| *id).collect();
     let old_seg_dirs: Vec<PathBuf> = input_segments
@@ -7833,8 +8404,6 @@ struct NodeWinner {
     updated_at: i64,
     weight: f32,
     key_len: u16,
-    prop_hash_offset: u64,
-    prop_hash_count: u32,
     dense_vector_offset: u64,
     dense_vector_len: u32,
     sparse_vector_offset: u64,
@@ -7921,8 +8490,8 @@ fn v3_plan_winners(
                 updated_at,
                 weight,
                 key_len,
-                prop_hash_offset,
-                prop_hash_count,
+                _prop_hash_offset,
+                _prop_hash_count,
                 last_write_seq,
             ) = seg.node_meta_at(i)?;
             let (dense_vector_offset, dense_vector_len, sparse_vector_offset, sparse_vector_len) =
@@ -7954,8 +8523,6 @@ fn v3_plan_winners(
                     updated_at,
                     weight,
                     key_len,
-                    prop_hash_offset,
-                    prop_hash_count,
                     dense_vector_offset,
                     dense_vector_len,
                     sparse_vector_offset,
@@ -8103,8 +8670,6 @@ fn v3_build_output(
             updated_at: w.updated_at,
             weight: w.weight,
             key_len: w.key_len,
-            prop_hash_offset: w.prop_hash_offset,
-            prop_hash_count: w.prop_hash_count,
             dense_vector_offset: w.dense_vector_offset,
             dense_vector_len: w.dense_vector_len,
             sparse_vector_offset: w.sparse_vector_offset,
@@ -8142,6 +8707,7 @@ fn v3_build_output(
 
     // Build all secondary indexes and sidecars from metadata
     let secondary_index_report = write_indexes_from_metadata_with_secondary_indexes(
+        seg_id,
         tmp_dir,
         segments,
         &node_metas,
@@ -8180,8 +8746,8 @@ fn collect_fast_merge_node_metas(
                 updated_at,
                 weight,
                 key_len,
-                prop_hash_offset,
-                prop_hash_count,
+                _prop_hash_offset,
+                _prop_hash_count,
                 last_write_seq,
             ) = seg.node_meta_at(i)?;
             let (dense_vector_offset, dense_vector_len, sparse_vector_offset, sparse_vector_len) =
@@ -8210,8 +8776,6 @@ fn collect_fast_merge_node_metas(
                 updated_at,
                 weight,
                 key_len,
-                prop_hash_offset,
-                prop_hash_count,
                 dense_vector_offset,
                 dense_vector_len,
                 sparse_vector_offset,
@@ -8313,6 +8877,7 @@ fn build_fast_merge_output(
     let edge_metas = collect_fast_merge_edge_metas(segments, &edge_copy_info)?;
 
     let secondary_index_report = write_indexes_from_metadata_with_secondary_indexes(
+        seg_id,
         tmp_dir,
         segments,
         &node_metas,
@@ -8417,6 +8982,10 @@ include!("graph_ops.rs");
 include!("txn.rs");
 include!("write.rs");
 include!("read.rs");
+include!("query_ir.rs");
+include!("query_plan.rs");
+include!("query_exec.rs");
+include!("query.rs");
 
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
@@ -8462,4 +9031,5 @@ mod tests {
     include!("tests/write.rs");
     include!("tests/read.rs");
     include!("tests/graph_ops.rs");
+    include!("tests/query_planner.rs");
 }

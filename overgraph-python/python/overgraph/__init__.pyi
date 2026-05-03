@@ -1,6 +1,11 @@
 """Type stubs for the overgraph Python connector."""
 
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
+
+IntList = list[int] | tuple[int, ...]
+StrList = list[str] | tuple[str, ...]
+MappingList = list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...]
+QueryNodeFilter = Mapping[str, Any]
 
 # ============================================================
 # Data types
@@ -240,6 +245,80 @@ class PyAdjacencyExport:
     edges: list[PyExportEdge]
     def __repr__(self) -> str: ...
 
+class NodeQueryRequest:
+    type_id: int | None
+    ids: IntList | None
+    keys: StrList | None
+    filter: QueryNodeFilter | None
+    order_by: str | None
+    limit: int | None
+    after: int | None
+    allow_full_scan: bool
+    def __init__(
+        self,
+        type_id: int | None = None,
+        ids: IntList | None = None,
+        keys: StrList | None = None,
+        filter: QueryNodeFilter | None = None,
+        order_by: str | None = None,
+        limit: int | None = None,
+        after: int | None = None,
+        allow_full_scan: bool = False,
+    ) -> None: ...
+    def to_dict(self) -> dict[str, Any]: ...
+
+QueryNodeRequest = NodeQueryRequest
+
+class GraphNodePattern:
+    alias: str
+    type_id: int | None
+    ids: IntList | None
+    keys: StrList | None
+    filter: QueryNodeFilter | None
+    def __init__(
+        self,
+        alias: str,
+        type_id: int | None = None,
+        ids: IntList | None = None,
+        keys: StrList | None = None,
+        filter: QueryNodeFilter | None = None,
+    ) -> None: ...
+    def to_dict(self) -> dict[str, Any]: ...
+
+class GraphEdgePattern:
+    from_alias: str
+    to_alias: str
+    alias: str | None
+    direction: str | None
+    type_filter: IntList | None
+    where: Mapping[str, Any] | None
+    predicates: MappingList | None
+    def __init__(
+        self,
+        from_alias: str,
+        to_alias: str,
+        alias: str | None = None,
+        direction: str | None = None,
+        type_filter: IntList | None = None,
+        where: Mapping[str, Any] | None = None,
+        predicates: MappingList | None = None,
+    ) -> None: ...
+    def to_dict(self) -> dict[str, Any]: ...
+
+class GraphPatternRequest:
+    nodes: list[GraphNodePattern | Mapping[str, Any]] | tuple[GraphNodePattern | Mapping[str, Any], ...]
+    edges: list[GraphEdgePattern | Mapping[str, Any]] | tuple[GraphEdgePattern | Mapping[str, Any], ...]
+    limit: int
+    at_epoch: int | None
+    def __init__(
+        self,
+        nodes: list[GraphNodePattern | Mapping[str, Any]] | tuple[GraphNodePattern | Mapping[str, Any], ...],
+        edges: list[GraphEdgePattern | Mapping[str, Any]] | tuple[GraphEdgePattern | Mapping[str, Any], ...],
+        limit: int,
+        at_epoch: int | None = None,
+    ) -> None: ...
+    def to_dict(self) -> dict[str, Any]: ...
+
 # ============================================================
 # Exception
 # ============================================================
@@ -304,6 +383,11 @@ class OverGraph:
 
     # Queries
     def find_nodes(self, type_id: int, prop_key: str, prop_value: Any) -> IdArray: ...
+    def query_node_ids(self, request: dict[str, Any] | NodeQueryRequest) -> PyIdPageResult: ...
+    def query_nodes(self, request: dict[str, Any] | NodeQueryRequest) -> PyNodePageResult: ...
+    def query_pattern(self, request: dict[str, Any] | GraphPatternRequest) -> dict[str, Any]: ...
+    def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> dict[str, Any]: ...
+    def explain_pattern_query(self, request: dict[str, Any] | GraphPatternRequest) -> dict[str, Any]: ...
     def ensure_node_property_index(self, type_id: int, prop_key: str, kind: str, *, domain: str | None = None) -> PyNodePropertyIndexInfo: ...
     def drop_node_property_index(self, type_id: int, prop_key: str, kind: str, *, domain: str | None = None) -> bool: ...
     def list_node_property_indexes(self) -> list[PyNodePropertyIndexInfo]: ...
@@ -653,6 +737,11 @@ class AsyncOverGraph:
 
     # Queries
     async def find_nodes(self, type_id: int, prop_key: str, prop_value: Any) -> IdArray: ...
+    async def query_node_ids(self, request: dict[str, Any] | NodeQueryRequest) -> PyIdPageResult: ...
+    async def query_nodes(self, request: dict[str, Any] | NodeQueryRequest) -> PyNodePageResult: ...
+    async def query_pattern(self, request: dict[str, Any] | GraphPatternRequest) -> dict[str, Any]: ...
+    async def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> dict[str, Any]: ...
+    async def explain_pattern_query(self, request: dict[str, Any] | GraphPatternRequest) -> dict[str, Any]: ...
     async def ensure_node_property_index(self, type_id: int, prop_key: str, kind: str, *, domain: str | None = None) -> PyNodePropertyIndexInfo: ...
     async def drop_node_property_index(self, type_id: int, prop_key: str, kind: str, *, domain: str | None = None) -> bool: ...
     async def list_node_property_indexes(self) -> list[PyNodePropertyIndexInfo]: ...
