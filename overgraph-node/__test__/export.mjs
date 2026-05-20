@@ -18,7 +18,8 @@ describe('exportAdjacency (sync)', () => {
     assert.equal(r.nodeIds.length, 0);
     assert.equal(r.edgeFrom.length, 0);
     assert.equal(r.edgeTo.length, 0);
-    assert.equal(r.edgeTypeIds.length, 0);
+    assert.equal(r.edgeLabels.length, 0);
+    assert.equal(r.edgeLabelIndexes.length, 0);
     // Default include_weights=true, so weights typed array is present (but empty)
     assert.ok(r.edgeWeights != null);
     assert.equal(r.edgeWeights.length, 0);
@@ -30,12 +31,12 @@ describe('exportAdjacency, full graph', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-export-graph-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 1, { weight: 2.0 });
-    db.upsertEdge(b, c, 1, { weight: 3.0 });
-    db.upsertEdge(c, a, 2, { weight: 1.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'LINKS_TO', { weight: 2.0 });
+    db.upsertEdge(b, c, 'LINKS_TO', { weight: 3.0 });
+    db.upsertEdge(c, a, 'REFERENCES', { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -44,7 +45,8 @@ describe('exportAdjacency, full graph', () => {
     assert.equal(r.nodeIds.length, 3);
     assert.equal(r.edgeFrom.length, 3);
     assert.equal(r.edgeTo.length, 3);
-    assert.equal(r.edgeTypeIds.length, 3);
+    assert.equal(r.edgeLabels.length, 2);
+    assert.equal(r.edgeLabelIndexes.length, 3);
     assert.ok(r.edgeWeights !== null);
     assert.equal(r.edgeWeights.length, 3);
   });
@@ -62,7 +64,7 @@ describe('exportAdjacency, full graph', () => {
     let found = false;
     for (let i = 0; i < r.edgeFrom.length; i++) {
       if (r.edgeFrom[i] === a && r.edgeTo[i] === b) {
-        assert.equal(r.edgeTypeIds[i], 1);
+        assert.equal(r.edgeLabels[r.edgeLabelIndexes[i]], 'LINKS_TO');
         assert.ok(Math.abs(r.edgeWeights[i] - 2.0) < 1e-6);
         found = true;
       }
@@ -76,28 +78,31 @@ describe('exportAdjacency, filters', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-export-filter-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(2, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 1, { weight: 1.0 });
-    db.upsertEdge(a, c, 1, { weight: 1.0 });
-    db.upsertEdge(a, c, 2, { weight: 2.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Company', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'LINKS_TO', { weight: 1.0 });
+    db.upsertEdge(a, c, 'LINKS_TO', { weight: 1.0 });
+    db.upsertEdge(a, c, 'REFERENCES', { weight: 2.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('node type filter excludes nodes and their edges', () => {
-    const r = db.exportAdjacency({ nodeTypeFilter: [1], includeWeights: true });
+  it('node label filter excludes nodes and their edges', () => {
+    const r = db.exportAdjacency({
+      nodeLabelFilter: { labels: ['Person'], mode: 'all' },
+      includeWeights: true,
+    });
     assert.equal(r.nodeIds.length, 2); // a and c
-    // Edge a→b excluded (b is type 2)
+    // Edge a->b excluded because b is Company.
     for (let i = 0; i < r.edgeFrom.length; i++) {
       assert.notEqual(r.edgeTo[i], b);
     }
   });
 
-  it('edge type filter restricts edges', () => {
-    const r = db.exportAdjacency({ edgeTypeFilter: [2], includeWeights: true });
+  it('edge label filter restricts edges', () => {
+    const r = db.exportAdjacency({ edgeLabelFilter: ['REFERENCES'], includeWeights: true });
     assert.equal(r.edgeFrom.length, 1);
-    assert.equal(r.edgeTypeIds[0], 2);
+    assert.equal(r.edgeLabels[r.edgeLabelIndexes[0]], 'REFERENCES');
   });
 
   it('includeWeights false gives null weights', () => {
@@ -111,12 +116,12 @@ describe('exportAdjacency, across flush', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-export-flush-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    const a = db.upsertNode(1, 'a');
-    const b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 1, { weight: 1.0 });
+    const a = db.upsertNode('Person', 'a');
+    const b = db.upsertNode('Person', 'b');
+    db.upsertEdge(a, b, 'LINKS_TO', { weight: 1.0 });
     db.flush();
-    const c = db.upsertNode(1, 'c');
-    db.upsertEdge(b, c, 1, { weight: 2.0 });
+    const c = db.upsertNode('Person', 'c');
+    db.upsertEdge(b, c, 'LINKS_TO', { weight: 2.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -132,9 +137,9 @@ describe('exportAdjacencyAsync', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-export-async-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 1, { weight: 1.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    db.upsertEdge(a, b, 'LINKS_TO', { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -143,7 +148,8 @@ describe('exportAdjacencyAsync', () => {
     assert.equal(r.nodeIds.length, 2);
     assert.equal(r.edgeFrom.length, 1);
     assert.equal(r.edgeTo.length, 1);
-    assert.equal(r.edgeTypeIds.length, 1);
+    assert.equal(r.edgeLabels.length, 1);
+    assert.equal(r.edgeLabelIndexes.length, 1);
     assert.ok(r.edgeWeights !== null);
   });
 });

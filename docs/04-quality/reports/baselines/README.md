@@ -18,3 +18,7 @@ Notes:
 - CI workflow uses `docs/04-quality/reports/baselines/gha-ubuntu-22.04/<profile>/` by default.
 - CI now treats missing baseline files as an error (instead of silently skipping regression checks).
 - Small-profile baselines refreshed 2026-03-04 after BigInt→Number Node.js migration (commit 3789864).
+- Example baseline snapshots are historical benchmark artifacts. Pre-CP30.5 snapshots may
+  preserve old numeric-token scenario metadata and are excluded from current public API
+  vocabulary audits; freshly generated baselines should use label-ID metadata where numeric
+  labels are recorded.

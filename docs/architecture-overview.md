@@ -1,10 +1,10 @@
 # How OverGraph Works
 
-This is a technical overview of the OverGraph storage engine for contributors and curious engineers. It covers the core architecture without going into every implementation detail. If you want the full internal spec, see [Architecture.md](internal/architecture/Architecture.md).
+This is a technical overview of the OverGraph storage engine for contributors and curious engineers. It covers the core architecture without going into every implementation detail.
 
 ## The big picture
 
-OverGraph is a log-structured merge tree (LSM) graph database with built-in vector search. If you've worked with LevelDB, RocksDB, or Cassandra's storage engine, the core ideas will feel familiar. The key difference is that OverGraph is purpose-built for graph data: adjacency indexes, typed nodes and edges, temporal validity, decay scoring, and vector indexes (dense HNSW + sparse inverted posting lists) are first-class concepts in the storage format.
+OverGraph is a log-structured merge tree (LSM) graph database with built-in vector search. If you've worked with LevelDB, RocksDB, or Cassandra's storage engine, the core ideas will feel familiar. The key difference is that OverGraph is purpose-built for graph data: adjacency indexes, labeled nodes and labeled edges, temporal validity, decay scoring, and vector indexes (dense HNSW + sparse inverted posting lists) are first-class concepts in the storage format.
 
 ```
                     ┌─────────────────────┐
@@ -37,9 +37,9 @@ OverGraph is a log-structured merge tree (LSM) graph database with built-in vect
 
 Every mutation follows the same path:
 
-1. **WAL append.** The operation is serialized and appended to the write-ahead log (`data.wal`). This is the durability guarantee: if we crash after this point, we can replay the WAL on restart.
+1. **WAL append.** The operation is serialized and appended to the active write-ahead log generation (`wal_<generation>.wal`, starting with `wal_0.wal`). This is the durability guarantee: if we crash after this point, we can replay retained WAL generations on restart.
 
-2. **Memtable apply.** The operation is applied to the in-memory memtable. The memtable uses HashMaps for nodes, edges, adjacency lists, key lookups, and type indexes. Reads served from the memtable are always the freshest.
+2. **Memtable apply.** The operation is applied to the in-memory memtable. The memtable uses HashMaps for nodes, edges, adjacency lists, key lookups, and internal label-token indexes. Reads served from the memtable are always the freshest.
 
 3. **Ack.** The caller gets back the node or edge ID. The write is durable (depending on sync mode) and immediately visible to subsequent reads.
 
@@ -57,7 +57,7 @@ Reads check multiple sources and merge them:
 1. **Memtable** (freshest data, always checked first)
 2. **Immutable segments** (scanned newest to oldest)
 
-For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we stop at the first source that has the record. For collection queries (`neighbors`, `find_nodes`, `nodes_by_type`), we merge results from all sources using a K-way merge with a min-heap. Planner-backed queries can also use optional per-segment `planner_stats.dat` sidecars for private cost estimates, adaptive candidate caps, and graph-pattern fanout ordering; the stats are advisory only, and final visible-record verification still decides results. For eligible aggregation queries (`degree`, `degrees`, `sum_edge_weights`, `avg_edge_weight` with no type filter, no explicit epoch, no active prune policy, and valid degree sidecars on all visible segments), reads sum published degree overlays plus per-segment `degree_delta.dat` sidecars without walking adjacency. Filtered, temporal, prune-policy, temporal-edge, or sidecar-unavailable cases fall back to the adjacency walk path.
+For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we stop at the first source that has the record. For collection queries (`neighbors`, `find_nodes`, `nodes_by_labels`), we merge results from all sources using a K-way merge with a min-heap. Multi-label convenience scans use `All` semantics over label memberships; `Any` semantics are expressed through explicit node label filters. Planner-backed queries can also use optional per-segment `planner_stats.dat` sidecars for private cost estimates, adaptive candidate caps, and graph-pattern fanout ordering; the stats are advisory only, and final visible-record verification still decides results. For eligible aggregation queries (`degree`, `degrees`, `sum_edge_weights`, `avg_edge_weight` with no edge-label filter, no explicit epoch, no active prune policy, and valid degree sidecars on all visible segments), reads sum published degree overlays plus per-segment `degree_delta.dat` sidecars without walking adjacency. Filtered, temporal, prune-policy, temporal-edge, or sidecar-unavailable cases fall back to the adjacency walk path.
 
 Tombstones (from `delete_node` / `delete_edge`) are applied during the merge. Prune policies are also evaluated at read time, so a registered policy takes effect immediately without waiting for compaction.
 
@@ -69,44 +69,46 @@ All collection queries support keyset pagination via `limit` + `after`. The `aft
 
 When the memtable exceeds a size threshold (default 128MB), it gets frozen and flushed to disk as a new segment. A fresh memtable is allocated for incoming writes, so the flush never blocks the write path.
 
-Each segment is a directory containing:
+Each segment is a directory containing a small manifest plus a packed immutable core:
 
 | File | Purpose |
 |---|---|
-| `nodes.dat` | Node records (binary, packed) |
-| `edges.dat` | Edge records (binary, packed) |
-| `adj_out.idx` / `adj_out.dat` | Outgoing adjacency index + postings |
-| `adj_in.idx` / `adj_in.dat` | Incoming adjacency index + postings |
-| `key_index.dat` | `(type_id, key)` to node_id mapping |
-| `type_index.dat` | `type_id` to sorted list of IDs |
+| `segment_manifest.dat` | Component table of contents with identity/dependency records |
+| `segment.core` | Packed immutable core payloads and maintained indexes |
 | `secondary_indexes/` | Optional declared equality/range property-index sidecars |
-| `timestamp_index.dat` | Sorted `(updated_at, node_id)` pairs |
-| `tombstones.dat` | Set of deleted IDs |
-| `metadata.dat` | Sidecar with per-record metadata for fast compaction |
 | `degree_delta.dat` | Optional signed degree delta sidecar for degree/weight fast paths |
 | `planner_stats.dat` | Optional advisory planner statistics for private query costing |
-| `node_dense_vectors.dat` | Dense vector blob (present only when segment has vectors) |
-| `node_sparse_vectors.dat` | Sparse vector blob (present only when segment has vectors) |
-| `dense_hnsw_graph.dat` | HNSW graph index for dense ANN search |
-| `sparse_postings.dat` | Inverted posting lists for sparse dot-product search |
-| `node_vector_meta.dat` | Per-node vector presence, offsets, and lengths |
+| `dense_hnsw_meta.dat` / `dense_hnsw_graph.dat` | Optional dense-vector HNSW accelerator |
+| `sparse_posting_index.dat` / `sparse_postings.dat` | Optional sparse-vector inverted index accelerator |
 
-Vector files are optional per segment. Segments containing no vectors skip vector file generation entirely: no storage overhead, no index building, no mmap. The manifest tracks which segments have vector data so the engine can skip unnecessary I/O on open.
+`segment.core` holds the logical payloads that older documentation described as separate
+core files: node and edge records, tombstones, node/edge metadata, key/internal-node-label-token/internal-edge-label-token/timestamp/triple
+indexes, adjacency indexes/postings, vector source-truth blobs, and immutable edge metadata
+indexes. The segment manifest records each logical component as a range inside `segment.core`,
+so readers still expose payload-local byte slices to the same parsers while only mapping the
+core container once.
 
-All segment files are immutable after creation. Reads use memory-mapped I/O (`mmap`), so the OS page cache handles caching without any application-level buffer management. This means reads never block writes and there's no cache invalidation to worry about.
+Refreshable optional sidecars remain separate files. Declared property indexes, planner stats,
+degree deltas, dense HNSW, and sparse postings can be missing, rebuilt, or refreshed without
+rewriting `segment.core`; query correctness falls back to scans or exact vector search when an
+optional accelerator is unavailable.
+
+The packed core is immutable after creation. Reads use memory-mapped I/O (`mmap`), so the OS page cache handles caching without any application-level buffer management. This means reads never block writes and there's no cache invalidation to worry about.
 
 ### Adjacency index
 
-The adjacency index is the core structure that makes graph traversal fast. For each `(node_id, edge_type_id)` pair, it stores the offset and count of neighbor entries in a postings file.
+The adjacency index is the core structure that makes graph traversal fast. Public APIs pass edge-label names; the read boundary resolves those names to internal numeric edge-label tokens before the storage engine walks adjacency. For each `(node_id, edge_label_token)` pair, the index stores the offset and count of neighbor entries in a postings payload.
 
-**Index file** (sorted array, binary searchable):
+**Index payload** (count header plus sorted, binary-searchable entries):
 ```
-(node_id: u64, type_id: u32, offset: u64, count: u32)
+[count: u64]
+(node_id: u64, edge_label_token: u32, offset: u64, count: u32)
 ```
 
-**Postings file** (packed array at each offset):
+**Postings payload** (variable-length delta/varint encoded group at each offset):
 ```
-(edge_id: u64, neighbor_id: u64, weight: f32, valid_from: i64, valid_to: i64)
+first:      varint(edge_id) + varint(neighbor_id) + f32(weight) + varint(valid_from) + varint(valid_to)
+subsequent: varint(edge_id_delta) + varint(neighbor_id) + f32(weight) + varint(valid_from) + varint(valid_to)
 ```
 
 Looking up neighbors is a binary search in the index followed by a sequential scan of the postings. This is why neighbor lookups are ~2μs even with thousands of edges per node.
@@ -128,11 +130,11 @@ Filtered reads, explicit `at_epoch` reads, active prune policies, temporal-edge 
 
 ### Connected components
 
-`connected_components()` computes a global weakly-connected-component (WCC) labelling using union-find with path compression and union by rank for near-linear O(N·α(N)) time. The algorithm collects all visible nodes via `nodes_by_type()`, then performs a single outgoing `neighbors_batch()` scan to union endpoints. A final pass normalizes each component ID to the minimum node ID in the component for deterministic output.
+`connected_components()` computes a global weakly-connected-component (WCC) labelling using union-find with path compression and union by rank for near-linear O(N·α(N)) time. The algorithm collects visible nodes by resolved internal node-label token, then performs a single outgoing `neighbors_batch()` scan to union endpoints. A final pass normalizes each component ID to the minimum node ID in the component for deterministic output.
 
 `component_of(node_id, &ComponentOptions)` answers the targeted question "which nodes are in this node's component?" via BFS using `neighbors_batch()` with both-direction traversal per frontier layer. This avoids scanning the entire graph when only one component is needed.
 
-Both methods support edge-type, node-type, and temporal filtering, and respect active prune policies (pruned nodes are invisible to the algorithm).
+Both methods support edge-label, node-label, and temporal filtering, and respect active prune policies (pruned nodes are invisible to the algorithm).
 
 ### Batch adjacency
 
@@ -158,11 +160,11 @@ Over time, segments accumulate. Old segments may contain outdated versions of re
 
 OverGraph's compaction is designed to be fast:
 
-1. **Plan from metadata.** Each segment has a metadata sidecar with per-record summary info (ID, timestamps, weight, tombstone status). The compaction planner reads only sidecars to decide which records survive, without touching the actual record data.
+1. **Plan from metadata.** Each segment has packed metadata payloads with per-record summary info (ID, timestamps, weight, tombstone status). The compaction planner reads only metadata payloads to decide which records survive, without touching the actual record data.
 
-2. **Binary copy.** Winning records are copied as raw byte spans from input segments to the output segment. No deserialization, no re-serialization. Just memcpy.
+2. **Binary copy.** Winning records are copied as raw byte spans from input logical payloads to the output `segment.core`. No deserialization, no re-serialization. Just memcpy.
 
-3. **Metadata-driven index building.** All output indexes (adjacency, key, type, property, timestamp) are built from the metadata of winning records, not from the records themselves. This avoids a second pass over the data. Vector indexes (HNSW and sparse posting lists) are rebuilt from surviving vector blob payloads and metadata.
+3. **Metadata-driven index building.** Maintained core output indexes (adjacency, key, internal label-token, timestamp, triple, and edge metadata indexes) are built from the metadata of winning records, not from the records themselves. This avoids a second pass over the data. Optional declared property indexes, HNSW, and sparse posting lists remain external accelerators.
 
 4. **Cascade deletes.** If a node is tombstoned or pruned, all its incident edges are automatically dropped during the edge merge pass.
 

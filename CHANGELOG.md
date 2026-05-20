@@ -6,6 +6,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-20
+
+### Breaking Changes
+
+#### Pre-1.0 Storage Format Reset
+- **Existing database directories must be rebuilt for this release.** OverGraph now writes segment format v10 with a new component identity model and packed `segment.core` layout. Databases created by earlier releases are not expected to open on `0.8.0`.
+- **Upgrade guidance:** export or re-ingest your data into a fresh database directory when moving to `0.8.0`. This is an intentional pre-1.0 compatibility break so the storage layout, label model, and identity checks can settle before wider production use.
+- **Node identity changed from one type token to label sets.** Stored node records now carry node label IDs rather than a single `type_id`. Public node records expose `labels` instead of `type_id`.
+- **Edge identity vocabulary changed from type IDs to label IDs.** Edges still have exactly one edge label, but the durable and diagnostic vocabulary is now `label_id` / `labelId`, not `type_id` / `typeId`.
+- **No numeric type-ID compatibility aliases.** Public APIs now take node-label and edge-label names such as `"User"` and `"WORKS_AT"`. Ordinary graph APIs auto-create or resolve the internal label IDs for you. Numeric label IDs are exposed only through catalog diagnostics.
+
+### Added
+
+#### Public Label Model
+- **Named node and edge labels.** Rust, Node.js, and Python APIs now accept label names directly. You no longer pass `type_id` values into normal writes, reads, queries, traversals, vector scopes, prune policies, or exports.
+- **Automatic label catalog creation.** Mutating APIs durably create missing node-label and edge-label catalog entries as part of the same logical write plan. Read and query APIs resolve names without creating new catalog entries.
+- **Catalog diagnostics.** Added `ensure_node_label`, `ensure_edge_label`, `get_node_label_id`, `get_edge_label_id`, `get_node_label`, `get_edge_label`, `list_node_labels`, and `list_edge_labels` across Rust, Node.js, Python, and async connector surfaces.
+- **Multi-label nodes.** Nodes can now carry bounded label sets. Upserts accept one label or multiple labels; the engine maintains deterministic label-membership indexes and enforces conflict rules when the same key maps to different live nodes across supplied labels.
+- **Explicit Any/All label filters.** Added `NodeLabelFilter` / `LabelMatchMode` across query, traversal, vector search scope, graph algorithms, export, prune, and pattern APIs so callers can ask for any listed label or every listed label.
+
+#### Edge Queries And Edge Indexes
+- **Direct edge query APIs.** Added `query_edge_ids`, `query_edges`, and `explain_edge_query` across Rust, Node.js, Python, and async connectors.
+- **Edge query anchors.** Direct edge queries can combine explicit edge IDs, edge labels, `from` endpoint sets, `to` endpoint sets, either-endpoint sets, pagination, and explicit full-scan opt-in.
+- **Canonical edge filters.** Edge queries and graph-pattern edges now support recursive `and` / `or` / `not` filters over weight ranges, validity windows, built-in `updated_at`, property equality, `in`, property ranges, `exists`, and `missing`.
+- **Edge property index declarations.** Added `ensure_edge_property_index`, `drop_edge_property_index`, and `list_edge_property_indexes` for optional edge equality and numeric range indexes scoped by edge label.
+- **Edge-property-backed planning.** Ready edge property indexes can participate in direct edge query plans and graph-pattern edge-anchor plans while final results are still verified against visible edge records.
+- **Graph-pattern edge anchors.** Pattern planning can now start from selective edge labels, endpoint constraints, edge metadata, or indexed edge property predicates instead of always expanding from a node anchor first.
+
+#### Storage Identity And Scrub
+- **Segment component identity.** Added `segment_manifest.dat` component records, source-group dependency digests, build fingerprints, identity headers, required-vs-optional availability rules, and generation-aware optional refresh.
+- **Packed core segments.** Added the v10 `segment.core` container for immutable core source truth and required maintained indexes.
+- **Public scrub API.** Added database scrub diagnostics for segment identity, packed ranges, external sidecars, missing files, identity header mismatches, dependency mismatches, and semantic index divergence.
+
+### Changed
+
+#### API Model
+- **Type vocabulary is now label vocabulary.** Public docs, examples, TypeScript declarations, Python stubs, Rust APIs, benchmark metadata, and connector tests now use node labels and edge labels consistently.
+- **Node records expose `labels`.** Hydrated node records now return the complete public label set. Node label collection APIs are named `nodes_by_labels`, `get_nodes_by_labels`, `count_nodes_by_labels`, and paged variants.
+- **Edge label diagnostics expose label IDs.** Node.js catalog diagnostics now expose `labelId`; Python exposes `label_id`. These are diagnostic token IDs, not ordinary graph API inputs.
+- **Graph and vector APIs resolve names internally.** Neighbor, degree, shortest path, traversal, PPR, connected components, vector search, export, prune, query, transaction, graph patch, and batch APIs all accept public names and resolve compact numeric labels inside the engine.
+- **Atomic WAL replay batches.** First-use label-token writes and dependent records are grouped with reusable atomic WAL markers, so recovery replays the complete logical mutation or discards an incomplete tail without partial catalog, record, sequence, degree, or ID effects.
+
+#### Segment Layout
+- **Required core objects moved into `segment.core`.** Node records, edge records, tombstones, node metadata, edge metadata, key indexes, node-label indexes, edge-label indexes, timestamp indexes, edge triple indexes, adjacency indexes/postings, vector source-truth blobs, and immutable edge metadata indexes are now packed into one required core container.
+- **Optional accelerators stay external.** Declared node and edge property indexes, planner stats, degree deltas, dense HNSW accelerators, and sparse posting-list accelerators remain refreshable optional sidecars. If they are missing, stale, corrupt, or identity-incompatible, reads fall back to the correct non-accelerated path.
+- **Flush and compaction share the same index contract.** Required indexes and optional sidecars are built through both flush and compaction paths with matching label semantics, component identity records, and dependency checks.
+- **Segment open is identity-aware but still mmap-first.** Required components validate identity at open; hot read paths continue to use raw mmap payload slices without per-query digest checks.
+
+#### Planner And Execution
+- **Edge predicates are planned sources, not just post-filters.** Edge labels, endpoints, edge metadata, temporal windows, weight filters, and ready edge property indexes can all participate in costed plans.
+- **Endpoint plus property queries intersect candidate sources.** Queries such as "outgoing WORKS_AT edges from these nodes where role = lead" intersect endpoint/label sources with property-index candidates when that is cheaper than hydrating the endpoint universe.
+- **Pattern queries can choose edge-first plans.** High-fanout patterns with selective relationship predicates can anchor on the edge set, then bind endpoint aliases, while preserving deterministic logical result order.
+- **Planner stats understand the new model.** Advisory stats now account for node label memberships, edge labels, edge property declarations, sidecar runtime coverage, stale risk, and graph-pattern fanout under the v10 layout.
+
+### Fixed
+
+- **Multi-label visibility across every source.** Active memtables, frozen memtables, flushed segments, compaction output, reopened databases, transactions, prune policies, exports, connector hydration, and query plans all suppress stale label memberships and preserve latest-visible node semantics.
+- **Edge query correctness hardening.** Edge property filtering, endpoint visibility, tombstones, updated-at windows, valid-at windows, stale index candidates, signed-zero probes, hash collisions, pagination, and graph-pattern edge bindings are verified against visible records.
+- **Edge property sidecar lifecycle.** Edge property sidecars are maintained through active writes, frozen memtables, flush, compaction, background builds, drops, reopen, targeted stats refresh, and optional refresh without making bad sidecars authoritative.
+- **Packed-core and identity hardening.** Open, compaction, optional refresh, and scrub now reject or quarantine copied, stale, mismatched, missing, malformed, or wrong-container components according to whether the component is required or optional.
+- **Crash-recovery atomicity.** Torn first-use label creation, batch writes, graph patches, transaction commits, cascaded deletes, and prune operations no longer leave partial catalog or record state after WAL replay.
+- **Connector parity.** Node.js and Python sync/async APIs, TypeScript declarations, Python stubs, docs, examples, and tests now match the Rust core for label inputs, multi-label nodes, edge queries, edge property indexes, scrub, and catalog diagnostics.
+
 ## [0.7.0] - 2026-05-02
 
 ### Added
@@ -271,6 +334,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.8.0]: https://github.com/bhensley5/overgraph/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/bhensley5/overgraph/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/bhensley5/overgraph/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Bhensley5/overgraph/compare/v0.4.1...v0.5.0

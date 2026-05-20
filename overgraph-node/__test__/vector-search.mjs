@@ -14,19 +14,19 @@ function freshDb(dir, name) {
 function setupHybridDb(dir) {
   const db = freshDb(dir, 'hybrid');
   // Node 1: dense rank #1, sparse rank #4
-  const n1 = db.upsertNode(1, 'n1', { weight: 1.0,
+  const n1 = db.upsertNode('Person', 'n1', { weight: 1.0,
     denseVector: [0.95, 0.05, 0.05, 0.05], sparseVector: [{ dimension: 0, value: 0.2 }, { dimension: 1, value: 0.1 }] });
   // Node 2: dense rank #4, sparse rank #1
-  const n2 = db.upsertNode(1, 'n2', { weight: 1.0,
+  const n2 = db.upsertNode('Person', 'n2', { weight: 1.0,
     denseVector: [0.3, 0.5, 0.5, 0.5], sparseVector: [{ dimension: 0, value: 0.9 }, { dimension: 1, value: 0.8 }, { dimension: 2, value: 0.7 }] });
   // Node 3: dense rank #2, sparse rank #2 (balanced)
-  const n3 = db.upsertNode(1, 'n3', { weight: 1.0,
+  const n3 = db.upsertNode('Person', 'n3', { weight: 1.0,
     denseVector: [0.85, 0.1, 0.1, 0.1], sparseVector: [{ dimension: 0, value: 0.7 }, { dimension: 1, value: 0.6 }] });
   // Node 4: dense rank #3, sparse rank #3
-  const n4 = db.upsertNode(1, 'n4', { weight: 1.0,
+  const n4 = db.upsertNode('Person', 'n4', { weight: 1.0,
     denseVector: [0.6, 0.3, 0.3, 0.3], sparseVector: [{ dimension: 0, value: 0.5 }, { dimension: 2, value: 0.3 }] });
   // Node 5: dense rank #5, sparse rank #5
-  const n5 = db.upsertNode(1, 'n5', { weight: 1.0,
+  const n5 = db.upsertNode('Person', 'n5', { weight: 1.0,
     denseVector: [0.1, 0.4, 0.6, 0.6], sparseVector: [{ dimension: 1, value: 0.1 }] });
   db.flush();
   return { db, ids: [n1, n2, n3, n4, n5] };
@@ -169,11 +169,11 @@ describe('vectorSearch with scope (sync)', () => {
     db = freshDb(tmpDir, 'scope');
     ids = [];
     for (let i = 0; i < 4; i++) {
-      ids.push(db.upsertNode(1, `n${i}`, { weight: 1.0,
+      ids.push(db.upsertNode('Person', `n${i}`, { weight: 1.0,
         denseVector: [1, 0, 0, 0], sparseVector: [{ dimension: 0, value: (i + 1) * 0.3 }] }));
     }
-    db.upsertEdge(ids[0], ids[1], 1);
-    db.upsertEdge(ids[1], ids[2], 1);
+    db.upsertEdge(ids[0], ids[1], 'LINKS_TO');
+    db.upsertEdge(ids[1], ids[2], 'LINKS_TO');
     db.flush();
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true }); });

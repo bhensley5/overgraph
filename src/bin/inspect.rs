@@ -81,7 +81,7 @@ fn inspect_json(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         json!({
                             "max_age_ms": policy.max_age_ms,
                             "max_weight": policy.max_weight,
-                            "type_id": policy.type_id,
+                            "label": policy.label,
                         }),
                     )
                 })
@@ -187,8 +187,8 @@ fn inspect_text(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(w) = policy.max_weight {
                 criteria.push(format!("max_weight={}", w));
             }
-            if let Some(t) = policy.type_id {
-                criteria.push(format!("type_id={}", t));
+            if let Some(label) = policy.label.as_deref() {
+                criteria.push(format!("label={}", label));
             }
             println!("  {}: {}", name, criteria.join(", "));
         }

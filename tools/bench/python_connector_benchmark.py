@@ -209,37 +209,37 @@ def traverse_deep_branching(fanout: int) -> tuple[int, int, int]:
 
 
 def build_depth_two_traversal_graph(db: OverGraph, cfg: dict[str, Any]) -> int:
-    two_hop_nodes = [{"type_id": 1, "key": "root"}]
+    two_hop_nodes = [node_input("Person", "root")]
     for i in range(cfg["two_hop_mid"]):
-        two_hop_nodes.append({"type_id": 1, "key": f"m-{i}"})
+        two_hop_nodes.append(node_input("Person", f"m-{i}"))
         for j in range(cfg["two_hop_leaves_per_mid"]):
-            two_hop_nodes.append({"type_id": 1, "key": f"l-{i}-{j}"})
+            two_hop_nodes.append(node_input("Person", f"l-{i}-{j}"))
     two_hop_ids = db.batch_upsert_nodes(two_hop_nodes)
     root = two_hop_ids[0]
     mid_stride = 1 + cfg["two_hop_leaves_per_mid"]
     two_hop_edges = []
     for i in range(cfg["two_hop_mid"]):
         mid_id = two_hop_ids[1 + i * mid_stride]
-        two_hop_edges.append({"from_id": root, "to_id": mid_id, "type_id": 1, "weight": 1.0})
+        two_hop_edges.append({"from_id": root, "to_id": mid_id, "label": "LINKS_TO", "weight": 1.0})
         for j in range(cfg["two_hop_leaves_per_mid"]):
             leaf_id = two_hop_ids[1 + i * mid_stride + 1 + j]
-            two_hop_edges.append({"from_id": mid_id, "to_id": leaf_id, "type_id": 1, "weight": 1.0})
+            two_hop_edges.append({"from_id": mid_id, "to_id": leaf_id, "label": "LINKS_TO", "weight": 1.0})
     db.batch_upsert_edges(two_hop_edges)
     return root
 
 
 def build_deep_traversal_graph(db: OverGraph, fanout: int) -> tuple[int, tuple[int, int, int]]:
     level1, level2, level3 = traverse_deep_branching(fanout)
-    nodes = [{"type_id": 1, "key": "root"}]
+    nodes = [node_input("Person", "root")]
     for i in range(level1):
-        nodes.append({"type_id": 11, "key": f"lvl1-{i}"})
+        nodes.append(node_input("LevelOne", f"lvl1-{i}"))
     for i in range(level1):
         for j in range(level2):
-            nodes.append({"type_id": 2 if (i + j) % 2 == 0 else 3, "key": f"lvl2-{i}-{j}"})
+            nodes.append(node_input("Company" if (i + j) % 2 == 0 else "Document", f"lvl2-{i}-{j}"))
     for i in range(level1):
         for j in range(level2):
             for k in range(level3):
-                nodes.append({"type_id": 2 if (i + j + k) % 2 == 0 else 3, "key": f"lvl3-{i}-{j}-{k}"})
+                nodes.append(node_input("Company" if (i + j + k) % 2 == 0 else "Document", f"lvl3-{i}-{j}-{k}"))
     ids = db.batch_upsert_nodes(nodes)
     root = ids[0]
     level1_offset = 1
@@ -248,14 +248,14 @@ def build_deep_traversal_graph(db: OverGraph, fanout: int) -> tuple[int, tuple[i
     edges = []
     for i in range(level1):
         lvl1_id = ids[level1_offset + i]
-        edges.append({"from_id": root, "to_id": lvl1_id, "type_id": 1, "weight": 1.0})
+        edges.append({"from_id": root, "to_id": lvl1_id, "label": "LINKS_TO", "weight": 1.0})
         for j in range(level2):
             lvl2_idx = i * level2 + j
             lvl2_id = ids[level2_offset + lvl2_idx]
-            edges.append({"from_id": lvl1_id, "to_id": lvl2_id, "type_id": 1, "weight": 1.0})
+            edges.append({"from_id": lvl1_id, "to_id": lvl2_id, "label": "LINKS_TO", "weight": 1.0})
             for k in range(level3):
                 lvl3_idx = lvl2_idx * level3 + k
-                edges.append({"from_id": lvl2_id, "to_id": ids[level3_offset + lvl3_idx], "type_id": 1, "weight": 1.0})
+                edges.append({"from_id": lvl2_id, "to_id": ids[level3_offset + lvl3_idx], "label": "LINKS_TO", "weight": 1.0})
     db.batch_upsert_edges(edges)
     return root, (level1, level2, level3)
 
@@ -292,16 +292,29 @@ def bench_sparse_vector(dim_count: int, nnz: int, seed: int) -> list[tuple[int, 
     return [(d, 1.0 - i * 0.05) for i, d in enumerate(dims)]
 
 
+def node_input(label: str, key: str, **fields: Any) -> dict[str, Any]:
+    return {"labels": [label], "key": key, **fields}
+
+
+def node_label_filter(label: str) -> dict[str, Any]:
+    return {"labels": [label], "mode": "all"}
+
+
 def pack_node_batch(nodes: list[dict[str, Any]]) -> bytes:
     """Pack node dicts using the Python connector binary wire format."""
-    buf = bytearray(struct.pack("<I", len(nodes)))
+    buf = bytearray(b"OGNB" + struct.pack("<HI", 2, len(nodes)))
     for node in nodes:
-        type_id = int(node.get("type_id", 0))
+        labels = node.get("labels", [])
         weight = float(node.get("weight", 1.0))
         key = str(node.get("key", "")).encode("utf-8")
         props = node.get("props", {})
         props_json = json.dumps(props).encode("utf-8") if props else b""
-        buf.extend(struct.pack("<IfH", type_id, weight, len(key)))
+        buf.extend(struct.pack("<B", len(labels)))
+        for label in labels:
+            encoded = str(label).encode("utf-8")
+            buf.extend(struct.pack("<H", len(encoded)))
+            buf.extend(encoded)
+        buf.extend(struct.pack("<fH", weight, len(key)))
         buf.extend(key)
         buf.extend(struct.pack("<I", len(props_json)))
         buf.extend(props_json)
@@ -325,6 +338,15 @@ def wait_for_property_index_ready(db: OverGraph, index_id: int) -> None:
     raise RuntimeError(f"timed out waiting for property index {index_id} to become ready")
 
 
+def wait_for_edge_property_index_ready(db: OverGraph, index_id: int) -> None:
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if any(info.index_id == index_id and info.state == "ready" for info in db.list_edge_property_indexes()):
+            return
+        time.sleep(0.01)
+    raise RuntimeError(f"timed out waiting for edge property index {index_id} to become ready")
+
+
 def query_benchmark_layout(preload_nodes: int) -> dict[str, int]:
     segments = 1 if preload_nodes >= 2 else 0
     segment_nodes = 0 if segments == 0 else max(1, preload_nodes // (segments + 1))
@@ -337,22 +359,18 @@ def query_benchmark_layout(preload_nodes: int) -> dict[str, int]:
 
 def query_bench_nodes(start: int, count: int) -> list[dict[str, Any]]:
     return [
-        {
-            "type_id": 1,
-            "key": f"q-{i}",
-            "props": query_bench_props(i),
-        }
+        node_input("Person", f"q-{i}", props=query_bench_props(i))
         for i in range(start, start + count)
     ]
 
 
 def build_query_benchmark_db(path: Path, preload_nodes: int) -> tuple[OverGraph, dict[str, int]]:
     db = OverGraph.open(str(path))
-    status = db.ensure_node_property_index(1, "status", "equality")
+    status = db.ensure_node_property_index("Person", "status", "equality")
     wait_for_property_index_ready(db, status.index_id)
-    tier = db.ensure_node_property_index(1, "tier", "equality")
+    tier = db.ensure_node_property_index("Person", "tier", "equality")
     wait_for_property_index_ready(db, tier.index_id)
-    score = db.ensure_node_property_index(1, "score", "range", domain="int")
+    score = db.ensure_node_property_index("Person", "score", "range", domain="int")
     wait_for_property_index_ready(db, score.index_id)
 
     layout = query_benchmark_layout(preload_nodes)
@@ -363,6 +381,62 @@ def build_query_benchmark_db(path: Path, preload_nodes: int) -> tuple[OverGraph,
     tail_start = layout["segments"] * layout["segment_nodes"]
     db.batch_upsert_nodes(query_bench_nodes(tail_start, layout["memtable_tail_nodes"]))
     return db, layout
+
+
+def build_edge_query_benchmark_db(path: Path, preload_edges: int) -> tuple[OverGraph, dict[str, int], int]:
+    db = OverGraph.open(str(path))
+    source_count = 1
+    target_count = max(1, preload_edges)
+    nodes = [node_input("Person", f"edge-source-{i}") for i in range(source_count)]
+    nodes.extend(node_input("Company", f"edge-target-{i}") for i in range(target_count))
+    ids = db.batch_upsert_nodes(nodes)
+    source_ids = ids[:source_count]
+    target_ids = ids[source_count:]
+    source_id = source_ids[0]
+    segments = 1 if preload_edges >= 2 else 0
+    segment_edges = 0 if segments == 0 else max(1, preload_edges // 2)
+    memtable_tail_edges = max(0, preload_edges - segment_edges)
+
+    def make_edges(start: int, count: int) -> list[dict[str, Any]]:
+        edges = []
+        for i in range(start, start + count):
+            edges.append(
+                {
+                    "from_id": source_ids[i % source_count],
+                    "to_id": target_ids[i % len(target_ids)],
+                    "label": "WORKS_AT",
+                    "props": {"role": "lead" if i % 10 == 0 else "member", "score": i % 100},
+                    "weight": 2.0 if i % 2 == 0 else 0.5,
+                }
+            )
+        return edges
+
+    if segment_edges > 0:
+        db.batch_upsert_edges(make_edges(0, segment_edges))
+        db.flush()
+    if memtable_tail_edges > 0:
+        db.batch_upsert_edges(make_edges(segment_edges, memtable_tail_edges))
+    return (
+        db,
+        {
+            "segments": segments,
+            "segment_edges": segment_edges,
+            "memtable_tail_edges": memtable_tail_edges,
+        },
+        source_id,
+    )
+
+
+def build_indexed_edge_query_benchmark_db(
+    path: Path,
+    preload_edges: int,
+) -> tuple[OverGraph, dict[str, int], int]:
+    db, layout, source_id = build_edge_query_benchmark_db(path, preload_edges)
+    role = db.ensure_edge_property_index("WORKS_AT", "role", "equality")
+    wait_for_edge_property_index_ready(db, role.index_id)
+    score = db.ensure_edge_property_index("WORKS_AT", "score", "range", domain="int")
+    wait_for_edge_property_index_ready(db, score.index_id)
+    return db, layout, source_id
 
 
 def push_query_scenarios(
@@ -381,10 +455,12 @@ def push_query_scenarios(
     s = run_bench(
         lambda _i: db.query_node_ids(
             {
-                "type_id": 1,
-                "where": {
-                    "status": {"eq": "active"},
-                    "tier": {"eq": "gold"},
+                "label_filter": node_label_filter("Person"),
+                "filter": {
+                    "and": [
+                        {"property": "status", "eq": "active"},
+                        {"property": "tier", "eq": "gold"},
+                    ],
                 },
                 "limit": limit,
             }
@@ -400,12 +476,218 @@ def push_query_scenarios(
             s,
             iter_cfg,
             {
-                "type_id": 1,
+                "label": "Person",
                 "preload_nodes": preload_nodes,
                 "segments": layout["segments"],
                 "segment_nodes": layout["segment_nodes"],
                 "memtable_tail_nodes": layout["memtable_tail_nodes"],
                 "predicates": ["status_eq_active", "tier_eq_gold"],
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-QUERY-005"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout, source_id = build_indexed_edge_query_benchmark_db(
+        tmp_root / "query-edge-ids-property-indexed-equality", preload_nodes
+    )
+    s = run_bench(
+        lambda _i: db.query_edge_ids(
+            {
+                "label": "WORKS_AT",
+                "from_ids": [source_id],
+                "filter": {"property": "role", "eq": "lead"},
+                "limit": limit,
+            }
+        ),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "query_edge_ids_property_indexed_equality",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "WORKS_AT",
+                "preload_edges": preload_nodes,
+                "segments": layout["segments"],
+                "segment_edges": layout["segment_edges"],
+                "memtable_tail_edges": layout["memtable_tail_edges"],
+                "filter": "role_eq_lead",
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-QUERY-006"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout, source_id = build_indexed_edge_query_benchmark_db(
+        tmp_root / "query-edge-ids-property-indexed-range", preload_nodes
+    )
+    s = run_bench(
+        lambda _i: db.query_edge_ids(
+            {
+                "label": "WORKS_AT",
+                "from_ids": [source_id],
+                "filter": {"property": "score", "gte": 90},
+                "limit": limit,
+            }
+        ),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "query_edge_ids_property_indexed_range",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "WORKS_AT",
+                "preload_edges": preload_nodes,
+                "segments": layout["segments"],
+                "segment_edges": layout["segment_edges"],
+                "memtable_tail_edges": layout["memtable_tail_edges"],
+                "filter": "score_gte_90",
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-QUERY-007"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout, _source_id = build_indexed_edge_query_benchmark_db(
+        tmp_root / "query-pattern-edge-property-anchor-indexed", preload_nodes
+    )
+    s = run_bench(
+        lambda _i: db.query_pattern(
+            {
+                "nodes": [
+                    {"alias": "source", "label_filter": node_label_filter("Person")},
+                    {"alias": "target", "label_filter": node_label_filter("Company")},
+                ],
+                "edges": [
+                    {
+                        "alias": "edge",
+                        "from_alias": "source",
+                        "to_alias": "target",
+                        "direction": "outgoing",
+                        "label_filter": ["WORKS_AT"],
+                        "filter": {"property": "role", "eq": "lead"},
+                    }
+                ],
+                "limit": limit,
+            }
+        ),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "query_pattern_edge_property_anchor_indexed",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "WORKS_AT",
+                "preload_edges": preload_nodes,
+                "segments": layout["segments"],
+                "segment_edges": layout["segment_edges"],
+                "memtable_tail_edges": layout["memtable_tail_edges"],
+                "filter": "role_eq_lead",
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-QUERY-003"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout, source_id = build_edge_query_benchmark_db(
+        tmp_root / "query-edge-ids-endpoint-metadata", preload_nodes
+    )
+    s = run_bench(
+        lambda _i: db.query_edge_ids(
+            {
+                "label": "WORKS_AT",
+                "from_ids": [source_id],
+                "filter": {"weight": {"gte": 1.0}},
+                "limit": limit,
+            }
+        ),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "query_edge_ids_endpoint_metadata",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "WORKS_AT",
+                "preload_edges": preload_nodes,
+                "segments": layout["segments"],
+                "segment_edges": layout["segment_edges"],
+                "memtable_tail_edges": layout["memtable_tail_edges"],
+                "filter": "weight_gte_1",
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-QUERY-004"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout, source_id = build_edge_query_benchmark_db(
+        tmp_root / "query-edges-endpoint-property-hydrated", preload_nodes
+    )
+    s = run_bench(
+        lambda _i: db.query_edges(
+            {
+                "label": "WORKS_AT",
+                "from_ids": [source_id],
+                "filter": {
+                    "and": [
+                        {"weight": {"gte": 1.0}},
+                        {"property": "role", "eq": "lead"},
+                    ]
+                },
+                "limit": limit,
+            }
+        ),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "query_edges_endpoint_property_hydrated",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "WORKS_AT",
+                "preload_edges": preload_nodes,
+                "segments": layout["segments"],
+                "segment_edges": layout["segment_edges"],
+                "memtable_tail_edges": layout["memtable_tail_edges"],
+                "filter": "weight_gte_1_and_role_eq_lead",
                 "limit": limit,
             },
             scenario_comparability(scenario_contract, scenario_id),
@@ -419,10 +701,12 @@ def push_query_scenarios(
     s = run_bench(
         lambda _i: db.query_nodes(
             {
-                "type_id": 1,
-                "where": {
-                    "status": {"eq": "active"},
-                    "score": {"gte": 50},
+                "label_filter": node_label_filter("Person"),
+                "filter": {
+                    "and": [
+                        {"property": "status", "eq": "active"},
+                        {"property": "score", "gte": 50},
+                    ],
                 },
                 "limit": limit,
             }
@@ -438,7 +722,7 @@ def push_query_scenarios(
             s,
             iter_cfg,
             {
-                "type_id": 1,
+                "label": "Person",
                 "preload_nodes": preload_nodes,
                 "segments": layout["segments"],
                 "segment_nodes": layout["segment_nodes"],
@@ -488,7 +772,7 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "crud-upsert-node"))
         s = run_bench(
-            lambda i: db.upsert_node(1, f"node-{i}", props={"idx": i}, weight=1.0),
+            lambda i: db.upsert_node("Person", f"node-{i}", props={"idx": i}, weight=1.0),
             iter_cfg["warmup"],
             iter_cfg["iters"],
             growth=True,
@@ -500,7 +784,7 @@ def main() -> int:
                 "crud",
                 s,
                 iter_cfg,
-                {"type_id": 1, "with_props": True, "weight": 1.0},
+                {"label": "Person", "with_props": True, "weight": 1.0},
                 scenario_comparability(scenario_contract, scenario_id),
             )
         )
@@ -511,10 +795,10 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "crud-upsert-edge"))
         node_ids = db.batch_upsert_nodes(
-            [{"type_id": 1, "key": f"e-{i}"} for i in range(iter_cfg["warmup"] + iter_cfg["iters"] + 1)]
+            [node_input("Person", f"e-{i}") for i in range(iter_cfg["warmup"] + iter_cfg["iters"] + 1)]
         )
         s = run_bench(
-            lambda i: db.upsert_edge(node_ids[i], node_ids[i + 1], 1, weight=1.0),
+            lambda i: db.upsert_edge(node_ids[i], node_ids[i + 1], "LINKS_TO", weight=1.0),
             iter_cfg["warmup"],
             iter_cfg["iters"],
             growth=True,
@@ -526,7 +810,7 @@ def main() -> int:
                 "crud",
                 s,
                 iter_cfg,
-                {"edge_type_id": 1, "weight": 1.0},
+                {"label": "LINKS_TO", "weight": 1.0},
                 scenario_comparability(scenario_contract, scenario_id),
             )
         )
@@ -539,7 +823,7 @@ def main() -> int:
         s = run_bench(
             lambda i: db.batch_upsert_nodes(
                 [
-                    {"type_id": 1, "key": f"bn-{i}-{j}", "props": {"idx": j}, "weight": 1.0}
+                    node_input("Person", f"bn-{i}-{j}", props={"idx": j}, weight=1.0)
                     for j in range(cfg["batch_nodes"])
                 ]
             ),
@@ -553,7 +837,7 @@ def main() -> int:
                 "batch",
                 s,
                 iter_cfg,
-                {"batch_nodes": cfg["batch_nodes"], "type_id": 1, "with_props": True},
+                {"batch_nodes": cfg["batch_nodes"], "label": "Person", "with_props": True},
                 scenario_comparability(scenario_contract, scenario_id),
                 cfg["batch_nodes"],
             )
@@ -567,7 +851,7 @@ def main() -> int:
 
         def run_batch_binary(i: int) -> None:
             nodes = [
-                {"type_id": 1, "key": f"bb-{i}-{j}", "props": {"idx": j}, "weight": 1.0}
+                node_input("Person", f"bb-{i}-{j}", props={"idx": j}, weight=1.0)
                 for j in range(cfg["batch_nodes"])
             ]
             db.batch_upsert_nodes_binary(pack_node_batch(nodes))
@@ -592,7 +876,7 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "crud-get-node"))
         ids = db.batch_upsert_nodes(
-            [{"type_id": 1, "key": f"gn-{i}", "props": {"idx": i}} for i in range(cfg["get_node_nodes"])]
+            [node_input("Person", f"gn-{i}", props={"idx": i}) for i in range(cfg["get_node_nodes"])]
         )
         s = run_bench(lambda i: db.get_node(ids[i % len(ids)]), iter_cfg["warmup"], iter_cfg["iters"])
         scenarios.append(
@@ -612,9 +896,9 @@ def main() -> int:
         scenario_id = "S-CRUD-004"
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "crud-upsert-node-fixed"))
-        db.upsert_node(1, "fixed-node", props={"idx": 0}, weight=1.0)
+        db.upsert_node("Person", "fixed-node", props={"idx": 0}, weight=1.0)
         s = run_bench(
-            lambda i: db.upsert_node(1, "fixed-node", props={"idx": i}, weight=1.0),
+            lambda i: db.upsert_node("Person", "fixed-node", props={"idx": i}, weight=1.0),
             iter_cfg["warmup"],
             iter_cfg["iters"],
         )
@@ -625,7 +909,7 @@ def main() -> int:
                 "crud",
                 s,
                 iter_cfg,
-                {"type_id": 1, "with_props": True, "weight": 1.0, "fixed_key": True},
+                {"label": "Person", "with_props": True, "weight": 1.0, "fixed_key": True},
                 scenario_comparability(scenario_contract, scenario_id),
             )
         )
@@ -635,10 +919,10 @@ def main() -> int:
         scenario_id = "S-CRUD-005"
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "crud-upsert-edge-fixed"), edge_uniqueness=True)
-        node_a = db.upsert_node(1, "fixed-a")
-        node_b = db.upsert_node(1, "fixed-b")
+        node_a = db.upsert_node("Person", "fixed-a")
+        node_b = db.upsert_node("Person", "fixed-b")
         s = run_bench(
-            lambda _i: db.upsert_edge(node_a, node_b, 1, weight=1.0),
+            lambda _i: db.upsert_edge(node_a, node_b, "LINKS_TO", weight=1.0),
             iter_cfg["warmup"],
             iter_cfg["iters"],
         )
@@ -649,7 +933,7 @@ def main() -> int:
                 "crud",
                 s,
                 iter_cfg,
-                {"edge_type_id": 1, "weight": 1.0, "edge_uniqueness": True, "fixed_triple": True},
+                {"label": "LINKS_TO", "weight": 1.0, "edge_uniqueness": True, "fixed_triple": True},
                 scenario_comparability(scenario_contract, scenario_id),
             )
         )
@@ -660,12 +944,12 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "trav-neighbors"))
         nb_node_ids = db.batch_upsert_nodes(
-            [{"type_id": 1, "key": "hub"}]
-            + [{"type_id": 1, "key": f"n-{i}"} for i in range(cfg["fanout"])]
+            [node_input("Person", "hub")]
+            + [node_input("Person", f"n-{i}") for i in range(cfg["fanout"])]
         )
         hub = nb_node_ids[0]
         db.batch_upsert_edges([
-            {"from_id": hub, "to_id": nb_node_ids[1 + i], "type_id": 1, "weight": 1.0}
+            {"from_id": hub, "to_id": nb_node_ids[1 + i], "label": "LINKS_TO", "weight": 1.0}
             for i in range(cfg["fanout"])
         ])
         s = run_bench(lambda _i: db.neighbors(hub, direction="outgoing"), iter_cfg["warmup"], iter_cfg["iters"])
@@ -733,7 +1017,7 @@ def main() -> int:
                     "layout": "memtable",
                     "min_depth": 1,
                     "max_depth": 3,
-                    "node_type_filter": None,
+                    "node_label_filter": None,
                     "branching": list(branching),
                 },
                 scenario_comparability(scenario_contract, scenario_id),
@@ -764,7 +1048,7 @@ def main() -> int:
                     "layout": "segment",
                     "min_depth": 1,
                     "max_depth": 3,
-                    "node_type_filter": None,
+                    "node_label_filter": None,
                     "branching": list(branching),
                 },
                 scenario_comparability(scenario_contract, scenario_id),
@@ -783,7 +1067,7 @@ def main() -> int:
                 min_depth=1,
                 max_depth=3,
                 direction="outgoing",
-                node_type_filter=[2],
+                emit_node_label_filter=node_label_filter("Company"),
             ),
             iter_cfg["warmup"],
             iter_cfg["iters"],
@@ -800,7 +1084,7 @@ def main() -> int:
                     "layout": "memtable",
                     "min_depth": 1,
                     "max_depth": 3,
-                    "node_type_filter": [2],
+                    "node_label_filter": ["Company"],
                     "branching": list(branching),
                 },
                 scenario_comparability(scenario_contract, scenario_id),
@@ -820,7 +1104,7 @@ def main() -> int:
                 min_depth=1,
                 max_depth=3,
                 direction="outgoing",
-                node_type_filter=[2],
+                emit_node_label_filter=node_label_filter("Company"),
             ),
             iter_cfg["warmup"],
             iter_cfg["iters"],
@@ -837,7 +1121,7 @@ def main() -> int:
                     "layout": "segment",
                     "min_depth": 1,
                     "max_depth": 3,
-                    "node_type_filter": [2],
+                    "node_label_filter": ["Company"],
                     "branching": list(branching),
                 },
                 scenario_comparability(scenario_contract, scenario_id),
@@ -850,12 +1134,12 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "trav-degree"))
         deg_node_ids = db.batch_upsert_nodes(
-            [{"type_id": 1, "key": "hub"}]
-            + [{"type_id": 1, "key": f"d-{i}"} for i in range(cfg["fanout"])]
+            [node_input("Person", "hub")]
+            + [node_input("Person", f"d-{i}") for i in range(cfg["fanout"])]
         )
         hub = deg_node_ids[0]
         db.batch_upsert_edges([
-            {"from_id": hub, "to_id": deg_node_ids[1 + i], "type_id": 1, "weight": 1.0}
+            {"from_id": hub, "to_id": deg_node_ids[1 + i], "label": "LINKS_TO", "weight": 1.0}
             for i in range(cfg["fanout"])
         ])
         s = run_bench(lambda _i: db.degree(hub, direction="outgoing"), iter_cfg["warmup"], iter_cfg["iters"])
@@ -877,10 +1161,10 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "trav-degrees"))
         # Batch all nodes: hubs first, then fanout nodes for each hub
-        all_degree_nodes = [{"type_id": 1, "key": f"hub-{h}"} for h in range(cfg["batch_nodes"])]
+        all_degree_nodes = [node_input("Person", f"hub-{h}") for h in range(cfg["batch_nodes"])]
         for h in range(cfg["batch_nodes"]):
             for i in range(cfg["fanout"]):
-                all_degree_nodes.append({"type_id": 1, "key": f"dt-{h}-{i}"})
+                all_degree_nodes.append(node_input("Person", f"dt-{h}-{i}"))
         all_degree_ids = db.batch_upsert_nodes(all_degree_nodes)
         hub_ids = all_degree_ids[: cfg["batch_nodes"]]
         # Batch all edges: each hub connects to its fanout nodes
@@ -892,7 +1176,7 @@ def main() -> int:
                 degree_edges.append({
                     "from_id": hub_id,
                     "to_id": all_degree_ids[fanout_start + i],
-                    "type_id": 1,
+                    "label": "LINKS_TO",
                     "weight": 1.0,
                 })
         db.batch_upsert_edges(degree_edges)
@@ -918,7 +1202,7 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "trav-shortest-path"))
         sp_nodes = [
-            {"type_id": 1, "key": f"sp-{i}", "weight": 1.0} for i in range(cfg["shortest_path_nodes"])
+            node_input("Person", f"sp-{i}", weight=1.0) for i in range(cfg["shortest_path_nodes"])
         ]
         sp_ids = db.batch_upsert_nodes(sp_nodes)
         offsets = cfg["shortest_path_edge_offsets"]
@@ -927,8 +1211,8 @@ def main() -> int:
             from_id = sp_ids[i]
             to1 = sp_ids[(i + offsets[0]) % len(sp_ids)]
             to2 = sp_ids[(i + offsets[1]) % len(sp_ids)]
-            sp_edges.append({"from_id": from_id, "to_id": to1, "type_id": 1, "weight": 1.0})
-            sp_edges.append({"from_id": from_id, "to_id": to2, "type_id": 1, "weight": 1.0})
+            sp_edges.append({"from_id": from_id, "to_id": to1, "label": "LINKS_TO", "weight": 1.0})
+            sp_edges.append({"from_id": from_id, "to_id": to2, "label": "LINKS_TO", "weight": 1.0})
         db.batch_upsert_edges(sp_edges)
         sp_from = sp_ids[0]
         sp_to = sp_ids[len(sp_ids) // 2]
@@ -960,7 +1244,7 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "trav-is-connected"))
         ic_nodes = [
-            {"type_id": 1, "key": f"ic-{i}", "weight": 1.0} for i in range(cfg["shortest_path_nodes"])
+            node_input("Person", f"ic-{i}", weight=1.0) for i in range(cfg["shortest_path_nodes"])
         ]
         ic_ids = db.batch_upsert_nodes(ic_nodes)
         offsets = cfg["shortest_path_edge_offsets"]
@@ -969,8 +1253,8 @@ def main() -> int:
             from_id = ic_ids[i]
             to1 = ic_ids[(i + offsets[0]) % len(ic_ids)]
             to2 = ic_ids[(i + offsets[1]) % len(ic_ids)]
-            ic_edges.append({"from_id": from_id, "to_id": to1, "type_id": 1, "weight": 1.0})
-            ic_edges.append({"from_id": from_id, "to_id": to2, "type_id": 1, "weight": 1.0})
+            ic_edges.append({"from_id": from_id, "to_id": to1, "label": "LINKS_TO", "weight": 1.0})
+            ic_edges.append({"from_id": from_id, "to_id": to2, "label": "LINKS_TO", "weight": 1.0})
         db.batch_upsert_edges(ic_edges)
         ic_from = ic_ids[0]
         ic_to = ic_ids[len(ic_ids) // 2]
@@ -1001,13 +1285,13 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "adv-top-k"))
         tk_node_ids = db.batch_upsert_nodes(
-            [{"type_id": 1, "key": "hub"}]
-            + [{"type_id": 1, "key": f"tk-{i}"} for i in range(cfg["top_k_candidates"])]
+            [node_input("Person", "hub")]
+            + [node_input("Person", f"tk-{i}") for i in range(cfg["top_k_candidates"])]
         )
         hub = tk_node_ids[0]
         tk_candidate_ids = tk_node_ids[1:]
         db.batch_upsert_edges([
-            {"from_id": hub, "to_id": tk_candidate_ids[i], "type_id": 1, "weight": 1.0 + ((i % 100) / 10.0)}
+            {"from_id": hub, "to_id": tk_candidate_ids[i], "label": "LINKS_TO", "weight": 1.0 + ((i % 100) / 10.0)}
             for i in range(cfg["top_k_candidates"])
         ])
         s = run_bench(
@@ -1038,13 +1322,13 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "adv-time-range"))
         db.batch_upsert_nodes([
-            {"type_id": 1, "key": f"tr-{i}", "props": {"idx": i}, "weight": 1.0}
+            node_input("Person", f"tr-{i}", props={"idx": i}, weight=1.0)
             for i in range(cfg["time_range_nodes"])
         ])
         from_ms = cfg["time_range_from_ms"]
         to_ms = int(time.time() * 1000) + cfg["time_range_window_ms"]
         s = run_bench(
-            lambda _i: db.find_nodes_by_time_range(1, from_ms, to_ms),
+            lambda _i: db.find_nodes_by_time_range("Person", from_ms, to_ms),
             iter_cfg["warmup"],
             iter_cfg["iters"],
         )
@@ -1056,7 +1340,7 @@ def main() -> int:
                 s,
                 iter_cfg,
                 {
-                    "type_id": 1,
+                    "label": "Person",
                     "preload_nodes": cfg["time_range_nodes"],
                     "from_ms": cfg["time_range_from_ms"],
                     "to_ms_window": cfg["time_range_window_ms"],
@@ -1070,13 +1354,13 @@ def main() -> int:
         scenario_id = "S-ADV-004"
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "adv-ppr"))
-        ids = db.batch_upsert_nodes([{"type_id": 1, "key": f"ppr-{i}"} for i in range(cfg["ppr_nodes"])])
+        ids = db.batch_upsert_nodes([node_input("Person", f"ppr-{i}") for i in range(cfg["ppr_nodes"])])
         ppr_edges = []
         for i, from_id in enumerate(ids):
             to1 = ids[(i + cfg["ppr_edge_offsets"][0]) % len(ids)]
             to2 = ids[(i + cfg["ppr_edge_offsets"][1]) % len(ids)]
-            ppr_edges.append({"from_id": from_id, "to_id": to1, "type_id": 1, "weight": 1.0})
-            ppr_edges.append({"from_id": from_id, "to_id": to2, "type_id": 1, "weight": 0.7})
+            ppr_edges.append({"from_id": from_id, "to_id": to1, "label": "LINKS_TO", "weight": 1.0})
+            ppr_edges.append({"from_id": from_id, "to_id": to2, "label": "LINKS_TO", "weight": 0.7})
         db.batch_upsert_edges(ppr_edges)
         seed = ids[0]
         s = run_bench(
@@ -1113,14 +1397,14 @@ def main() -> int:
         iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
         db = OverGraph.open(str(tmp_root / "adv-export"))
         ids = db.batch_upsert_nodes(
-            [{"type_id": 1, "key": f"ex-{i}"} for i in range(cfg["export_nodes"])]
+            [node_input("Person", f"ex-{i}") for i in range(cfg["export_nodes"])]
         )
         export_edges = []
         for i in range(cfg["export_edges"]):
             from_id = ids[i % len(ids)]
             to_id = ids[(i * 13 + 7) % len(ids)]
             if from_id != to_id:
-                export_edges.append({"from_id": from_id, "to_id": to_id, "type_id": 1, "weight": 1.0})
+                export_edges.append({"from_id": from_id, "to_id": to_id, "label": "LINKS_TO", "weight": 1.0})
         db.batch_upsert_edges(export_edges)
         s = run_bench(
             lambda _i: db.export_adjacency(include_weights=cfg["include_weights_on_export"]),
@@ -1151,7 +1435,7 @@ def main() -> int:
 
         def run_flush(i: int) -> None:
             nodes = [
-                {"type_id": 1, "key": f"fl-{i}-{j}", "props": {"idx": j}, "weight": 1.0}
+                node_input("Person", f"fl-{i}-{j}", props={"idx": j}, weight=1.0)
                 for j in range(cfg["flush_nodes_per_iter"])
             ]
             node_ids = db.batch_upsert_nodes(nodes)
@@ -1161,7 +1445,7 @@ def main() -> int:
                     {
                         "from_id": node_ids[j],
                         "to_id": node_ids[j + 1],
-                        "type_id": 1,
+                        "label": "LINKS_TO",
                         "weight": 1.0,
                     }
                 )
@@ -1198,14 +1482,14 @@ def main() -> int:
         for i in range(cfg["vector_nodes"]):
             seed = 1729 * (i + 1)
             vec_nodes.append(
-                {
-                    "type_id": 1,
-                    "key": f"v-{i}",
-                    "dense_vector": bench_dense_vector(cfg["vector_dim"], seed),
-                    "sparse_vector": bench_sparse_vector(
+                node_input(
+                    "Person",
+                    f"v-{i}",
+                    dense_vector=bench_dense_vector(cfg["vector_dim"], seed),
+                    sparse_vector=bench_sparse_vector(
                         cfg["vector_sparse_dims"], cfg["vector_nnz"], seed + 0xCAFE
                     ),
-                }
+                )
             )
         db.batch_upsert_nodes(vec_nodes)
         db.flush()

@@ -50,16 +50,20 @@ fn test_inspect_with_data() {
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..10 {
-        db.upsert_node(1, &format!("node_{}", i), UpsertNodeOptions::default())
-            .unwrap();
+        db.upsert_node(
+            "Person",
+            &format!("node_{}", i),
+            UpsertNodeOptions::default(),
+        )
+        .unwrap();
     }
     let n1 = db
-        .upsert_node(2, "a", UpsertNodeOptions::default())
+        .upsert_node("Company", "a", UpsertNodeOptions::default())
         .unwrap();
     let n2 = db
-        .upsert_node(2, "b", UpsertNodeOptions::default())
+        .upsert_node("Company", "b", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(n1, n2, 1, UpsertEdgeOptions::default())
+    db.upsert_edge(n1, n2, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
 
     db.flush().unwrap();
@@ -98,14 +102,22 @@ fn test_inspect_multiple_segments() {
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..5 {
-        db.upsert_node(1, &format!("batch1_{}", i), UpsertNodeOptions::default())
-            .unwrap();
+        db.upsert_node(
+            "Person",
+            &format!("batch1_{}", i),
+            UpsertNodeOptions::default(),
+        )
+        .unwrap();
     }
     db.flush().unwrap();
 
     for i in 0..3 {
-        db.upsert_node(1, &format!("batch2_{}", i), UpsertNodeOptions::default())
-            .unwrap();
+        db.upsert_node(
+            "Person",
+            &format!("batch2_{}", i),
+            UpsertNodeOptions::default(),
+        )
+        .unwrap();
     }
     db.flush().unwrap();
 
@@ -141,7 +153,7 @@ fn test_inspect_with_prune_policies() {
         PrunePolicy {
             max_age_ms: Some(86_400_000),
             max_weight: Some(0.1),
-            type_id: Some(3),
+            label: Some("Article".to_string()),
         },
     )
     .unwrap();
@@ -159,7 +171,7 @@ fn test_inspect_with_prune_policies() {
     assert!(stdout.contains("old_memories"));
     assert!(stdout.contains("max_age=86400000ms"));
     assert!(stdout.contains("max_weight=0.1"));
-    assert!(stdout.contains("type_id=3"));
+    assert!(stdout.contains("label=Article"));
 }
 
 #[test]
@@ -175,8 +187,12 @@ fn test_inspect_json_with_data() {
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     for i in 0..5 {
-        db.upsert_node(1, &format!("node_{}", i), UpsertNodeOptions::default())
-            .unwrap();
+        db.upsert_node(
+            "Person",
+            &format!("node_{}", i),
+            UpsertNodeOptions::default(),
+        )
+        .unwrap();
     }
     db.flush().unwrap();
     db.close().unwrap();
@@ -205,6 +221,48 @@ fn test_inspect_json_with_data() {
     assert_eq!(parsed["segments"].as_array().unwrap().len(), 1);
     assert_eq!(parsed["segments"][0]["node_count"], 5);
     assert!(parsed["segments"][0]["size_bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn test_inspect_json_with_multi_label_data() {
+    let dir = TempDir::new().unwrap();
+
+    let opts = DbOptions {
+        create_if_missing: true,
+        wal_sync_mode: WalSyncMode::Immediate,
+        compact_after_n_flushes: 0,
+        ..DbOptions::default()
+    };
+    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    db.upsert_node("Person", "person-only", UpsertNodeOptions::default())
+        .unwrap();
+    db.upsert_node(
+        &["Person", "Employee"],
+        "person-employee",
+        UpsertNodeOptions::default(),
+    )
+    .unwrap();
+    db.flush().unwrap();
+    db.close().unwrap();
+
+    let output = Command::new(inspect_binary())
+        .args(["--json", dir.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run overgraph-inspect");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "inspect --json failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output should be valid JSON");
+    assert_eq!(parsed["segment_count"], 1);
+    assert_eq!(parsed["total_nodes"], 2);
+    assert_eq!(parsed["segments"][0]["node_count"], 2);
 }
 
 #[test]

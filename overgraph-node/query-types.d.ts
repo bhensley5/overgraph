@@ -9,6 +9,47 @@ export type QueryNodeFilter =
   | QueryNodePropertyFilter
   | QueryNodeUpdatedAtFilter
 
+export type QueryEdgeFilter =
+  | {
+      and: NonEmptyArray<QueryEdgeFilter>
+      or?: never
+      not?: never
+      property?: never
+      weight?: never
+      updatedAt?: never
+      validAt?: never
+      validFrom?: never
+      validTo?: never
+    }
+  | {
+      or: NonEmptyArray<QueryEdgeFilter>
+      and?: never
+      not?: never
+      property?: never
+      weight?: never
+      updatedAt?: never
+      validAt?: never
+      validFrom?: never
+      validTo?: never
+    }
+  | {
+      not: QueryEdgeFilter
+      and?: never
+      or?: never
+      property?: never
+      weight?: never
+      updatedAt?: never
+      validAt?: never
+      validFrom?: never
+      validTo?: never
+    }
+  | QueryEdgePropertyFilter
+  | QueryEdgeWeightFilter
+  | QueryEdgeUpdatedAtFilter
+  | QueryEdgeValidAtFilter
+  | QueryEdgeValidFromFilter
+  | QueryEdgeValidToFilter
+
 export type QueryNodePropertyFilter =
   | {
       property: string
@@ -64,6 +105,93 @@ export interface QueryNodeUpdatedAtFilter {
   property?: never
 }
 
+export type QueryEdgePropertyFilter =
+  | {
+      property: string
+      eq: any
+      in?: never
+      exists?: never
+      missing?: never
+      gt?: never
+      gte?: never
+      lt?: never
+      lte?: never
+    }
+  | {
+      property: string
+      in: NonEmptyArray<any>
+      eq?: never
+      exists?: never
+      missing?: never
+      gt?: never
+      gte?: never
+      lt?: never
+      lte?: never
+    }
+  | ({ property: string; eq?: never; in?: never; exists?: never; missing?: never } & QueryNodeRangePredicate)
+  | {
+      property: string
+      exists: true
+      eq?: never
+      in?: never
+      missing?: never
+      gt?: never
+      gte?: never
+      lt?: never
+      lte?: never
+    }
+  | {
+      property: string
+      missing: true
+      eq?: never
+      in?: never
+      exists?: never
+      gt?: never
+      gte?: never
+      lt?: never
+      lte?: never
+    }
+
+export interface QueryEdgeWeightFilter {
+  weight: QueryNodeRangePredicate
+  and?: never
+  or?: never
+  not?: never
+  property?: never
+}
+
+export interface QueryEdgeUpdatedAtFilter {
+  updatedAt: QueryNodeRangePredicate
+  and?: never
+  or?: never
+  not?: never
+  property?: never
+}
+
+export interface QueryEdgeValidAtFilter {
+  validAt: number
+  and?: never
+  or?: never
+  not?: never
+  property?: never
+}
+
+export interface QueryEdgeValidFromFilter {
+  validFrom: QueryNodeRangePredicate
+  and?: never
+  or?: never
+  not?: never
+  property?: never
+}
+
+export interface QueryEdgeValidToFilter {
+  validTo: QueryNodeRangePredicate
+  and?: never
+  or?: never
+  not?: never
+  property?: never
+}
+
 export type QueryLowerBound =
   | { gt: any; gte?: never }
   | { gte: any; gt?: never }
@@ -110,8 +238,15 @@ export interface QueryUpdatedAtPredicate {
 
 export type QueryPredicate = QueryPropertyPredicate | QueryUpdatedAtPredicate
 
+export type LabelMatchMode = 'any' | 'all'
+
+export interface NodeLabelFilter {
+  labels: Array<string>
+  mode: LabelMatchMode
+}
+
 export interface QueryNodeRequest {
-  typeId?: number
+  labelFilter?: NodeLabelFilter
   ids?: Array<number>
   keys?: Array<string>
   filter?: QueryNodeFilter | null
@@ -121,16 +256,24 @@ export interface QueryNodeRequest {
   allowFullScan?: boolean
 }
 
+export interface QueryEdgeRequest {
+  label?: string
+  ids?: Array<number>
+  fromIds?: Array<number>
+  toIds?: Array<number>
+  endpointIds?: Array<number>
+  filter?: QueryEdgeFilter | null
+  limit?: number | null
+  after?: number
+  allowFullScan?: boolean
+}
+
 export interface GraphNodePattern {
   alias: string
-  typeId?: number
+  labelFilter?: NodeLabelFilter
   ids?: Array<number>
   keys?: Array<string>
   filter?: QueryNodeFilter | null
-}
-
-export interface EdgePropertyPredicate {
-  property: QueryPropertyPredicatePayload
 }
 
 export interface GraphEdgePattern {
@@ -138,9 +281,8 @@ export interface GraphEdgePattern {
   fromAlias: string
   toAlias: string
   direction?: 'outgoing' | 'incoming' | 'both'
-  typeFilter?: Array<number>
-  where?: Record<string, QueryWherePredicate>
-  predicates?: Array<EdgePropertyPredicate>
+  labelFilter?: Array<string>
+  filter?: QueryEdgeFilter | null
 }
 
 export interface GraphPatternRequest {
@@ -160,7 +302,7 @@ export interface QueryPatternResult {
   truncated: boolean
 }
 
-export type QueryPlanKind = 'node_query' | 'pattern_query'
+export type QueryPlanKind = 'node_query' | 'edge_query' | 'pattern_query'
 
 export type QueryPlanWarning =
   | 'missing_ready_index'
@@ -176,22 +318,57 @@ export type QueryPlanWarning =
   | 'verify_only_filter'
   | 'boolean_branch_fallback'
   | 'planning_probe_budget_exceeded'
+  | 'unknown_node_label'
+  | 'unknown_edge_label'
+
+export type QueryPlanNote =
+  | 'node_label_any_dedupe_before_pagination'
+  | 'node_label_any_final_verification'
+  | 'node_label_all_superset_verification'
+  | 'stale_node_label_membership_verification'
+
+export interface QueryPlanPublicName {
+  alias?: string | null
+  name: string
+  known: boolean
+  mode?: LabelMatchMode | null
+}
+
+export interface QueryPlanPublicInputs {
+  nodeLabels: Array<QueryPlanPublicName>
+  edgeLabels: Array<QueryPlanPublicName>
+}
 
 export type QueryPlanNode =
   | { kind: 'explicit_ids' }
   | { kind: 'key_lookup' }
-  | { kind: 'node_type_index' }
+  | { kind: 'node_label_index' }
+  | { kind: 'node_label_any_index' }
   | { kind: 'property_equality_index' }
   | { kind: 'property_range_index' }
   | { kind: 'timestamp_index' }
   | { kind: 'adjacency_expansion' }
+  | { kind: 'explicit_edge_ids' }
+  | { kind: 'edge_label_index' }
+  | { kind: 'edge_triple_index' }
+  | { kind: 'edge_endpoint_adjacency' }
+  | { kind: 'edge_weight_index' }
+  | { kind: 'edge_updated_at_index' }
+  | { kind: 'edge_validity_index' }
+  | { kind: 'edge_metadata_scan' }
+  | { kind: 'edge_property_equality_index' }
+  | { kind: 'edge_property_range_index' }
   | { kind: 'intersect'; inputs: Array<QueryPlanNode> }
   | { kind: 'union'; inputs: Array<QueryPlanNode> }
   | { kind: 'verify_node_filter'; input: QueryPlanNode }
+  | { kind: 'verify_edge_filter'; input: QueryPlanNode }
   | { kind: 'verify_edge_predicates'; input: QueryPlanNode }
   | { kind: 'pattern_expand'; anchorAlias: string; input: QueryPlanNode }
-  | { kind: 'fallback_type_scan' }
+  | { kind: 'pattern_edge_anchor'; edgeAlias?: string | null; input: QueryPlanNode }
+  | { kind: 'fallback_node_label_scan' }
   | { kind: 'fallback_full_node_scan' }
+  | { kind: 'fallback_edge_label_scan' }
+  | { kind: 'fallback_full_edge_scan' }
   | { kind: 'empty_result' }
 
 export interface QueryPlan {
@@ -199,4 +376,6 @@ export interface QueryPlan {
   root: QueryPlanNode
   estimatedCandidates: number | null
   warnings: Array<QueryPlanWarning>
+  notes: Array<QueryPlanNote>
+  publicInputs: QueryPlanPublicInputs
 }

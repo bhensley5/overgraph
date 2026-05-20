@@ -2,8 +2,8 @@ use overgraph::{DatabaseEngine, DbOptions, NodeInput, PropValue, UpsertEdgeOptio
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
-/// Insert 1000 nodes across 5 types with varied properties across
-/// multiple segments, verify find_nodes, nodes_by_type, edges_by_type work
+/// Insert 1000 nodes across five labels with varied properties across
+/// multiple segments, verify find_nodes and nodes_by_labels work
 /// correctly through flush, compact, and reopen cycles.
 #[test]
 fn test_secondary_indexes_across_flush_compact_reopen() {
@@ -19,17 +19,22 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
 
     let mut all_node_ids = Vec::new();
 
-    // Create 500 nodes across 5 types with "category" property
-    let categories = ["alpha", "beta", "gamma", "delta", "epsilon"];
+    // Create 500 nodes across five labels with a paired "category" property.
+    let label_categories = [
+        ("Person", "alpha"),
+        ("Company", "beta"),
+        ("Article", "gamma"),
+        ("Topic", "delta"),
+        ("Project", "epsilon"),
+    ];
     let batch1: Vec<NodeInput> = (0..500)
         .map(|i| {
-            let type_id = (i % 5) as u32 + 1;
-            let cat = categories[i % 5];
+            let (label, cat) = label_categories[i % label_categories.len()];
             let mut props = BTreeMap::new();
             props.insert("category".to_string(), PropValue::String(cat.to_string()));
             props.insert("index".to_string(), PropValue::Int(i as i64));
             NodeInput {
-                type_id,
+                labels: vec![label.to_string()],
                 key: format!("node:{}", i),
                 props,
                 weight: 0.5,
@@ -38,17 +43,19 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
             }
         })
         .collect();
-    let ids1 = engine.batch_upsert_nodes(&batch1).unwrap();
+    let ids1 = engine.batch_upsert_nodes(batch1.clone()).unwrap();
     all_node_ids.extend_from_slice(&ids1);
 
-    // Add edges: chain within each type
+    // Add edges only when adjacent generated nodes happen to share a label.
     for i in 0..499 {
-        if batch1[i].type_id == batch1[i + 1].type_id {
+        let (label, _) = label_categories[i % label_categories.len()];
+        let (next_label, _) = label_categories[(i + 1) % label_categories.len()];
+        if label == next_label {
             engine
                 .upsert_edge(
                     ids1[i],
                     ids1[i + 1],
-                    batch1[i].type_id,
+                    "RELATED_TO",
                     UpsertEdgeOptions::default(),
                 )
                 .unwrap();
@@ -62,8 +69,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     // ---- Step 2: Add more nodes, flush to segment 2 ----
     let batch2: Vec<NodeInput> = (500..1000)
         .map(|i| {
-            let type_id = (i % 5) as u32 + 1;
-            let cat = categories[i % 5];
+            let (label, cat) = label_categories[i % label_categories.len()];
             let mut props = BTreeMap::new();
             props.insert("category".to_string(), PropValue::String(cat.to_string()));
             props.insert("index".to_string(), PropValue::Int(i as i64));
@@ -75,7 +81,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
                 );
             }
             NodeInput {
-                type_id,
+                labels: vec![label.to_string()],
                 key: format!("node:{}", i),
                 props,
                 weight: 0.6,
@@ -84,7 +90,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
             }
         })
         .collect();
-    let ids2 = engine.batch_upsert_nodes(&batch2).unwrap();
+    let ids2 = engine.batch_upsert_nodes(batch2.clone()).unwrap();
     all_node_ids.extend_from_slice(&ids2);
 
     // Flush to segment 2
@@ -93,46 +99,44 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
 
     // ---- Step 3: Verify indexes across two segments ----
 
-    // nodes_by_type: each type should have 200 nodes (1000/5)
-    for type_id in 1..=5 {
-        let by_type = engine.nodes_by_type(type_id).unwrap();
+    // nodes_by_labels: each label should have 200 nodes (1000/5)
+    for &(label, _) in &label_categories {
+        let by_label = engine.nodes_by_labels(label).unwrap();
         assert_eq!(
-            by_type.len(),
+            by_label.len(),
             200,
-            "type {} should have 200 nodes, got {}",
-            type_id,
-            by_type.len()
+            "label '{}' should have 200 nodes, got {}",
+            label,
+            by_label.len()
         );
     }
 
-    // find_nodes: each (type, category) combo has 200 nodes
-    // Type 1 has category="alpha", type 2 has "beta", etc.
-    for (idx, cat) in categories.iter().enumerate() {
-        let type_id = idx as u32 + 1;
+    // find_nodes: each paired (label, category) combo has 200 nodes.
+    for &(label, cat) in &label_categories {
         let found = engine
-            .find_nodes(type_id, "category", &PropValue::String(cat.to_string()))
+            .find_nodes(label, "category", &PropValue::String(cat.to_string()))
             .unwrap();
         assert_eq!(
             found.len(),
             200,
-            "type {} category '{}' should have 200 nodes, got {}",
-            type_id,
+            "label '{}' category '{}' should have 200 nodes, got {}",
+            label,
             cat,
             found.len()
         );
     }
 
     // find_nodes with status=active: 250 nodes (500..1000 step 2 = 250),
-    // distributed across 5 types = 50 per type
-    for type_id in 1..=5u32 {
+    // distributed across five labels = 50 per label.
+    for &(label, _) in &label_categories {
         let active = engine
-            .find_nodes(type_id, "status", &PropValue::String("active".to_string()))
+            .find_nodes(label, "status", &PropValue::String("active".to_string()))
             .unwrap();
         assert_eq!(
             active.len(),
             50,
-            "type {} active should have 50 nodes, got {}",
-            type_id,
+            "label '{}' active should have 50 nodes, got {}",
+            label,
             active.len()
         );
     }
@@ -156,29 +160,28 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
 
     // ---- Step 5: Verify indexes correct after compaction ----
 
-    // The deleted nodes were distributed across 5 types: 20 per type deleted
-    for type_id in 1..=5 {
-        let by_type = engine.nodes_by_type(type_id).unwrap();
+    // The deleted nodes were distributed across five labels: 20 per label deleted.
+    for &(label, _) in &label_categories {
+        let by_label = engine.nodes_by_labels(label).unwrap();
         assert_eq!(
-            by_type.len(),
+            by_label.len(),
             180,
-            "after compact, type {} should have 180 nodes, got {}",
-            type_id,
-            by_type.len()
+            "after compact, label '{}' should have 180 nodes, got {}",
+            label,
+            by_label.len()
         );
     }
 
     // find_nodes by category after compaction
-    for (idx, cat) in categories.iter().enumerate() {
-        let type_id = idx as u32 + 1;
+    for &(label, cat) in &label_categories {
         let found = engine
-            .find_nodes(type_id, "category", &PropValue::String(cat.to_string()))
+            .find_nodes(label, "category", &PropValue::String(cat.to_string()))
             .unwrap();
         assert_eq!(
             found.len(),
             180,
-            "after compact, type {} category '{}' should have 180, got {}",
-            type_id,
+            "after compact, label '{}' category '{}' should have 180, got {}",
+            label,
             cat,
             found.len()
         );
@@ -186,15 +189,15 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
 
     // Active status nodes: the first 100 deleted were all from batch1 (0..500),
     // which had no "status" property. So all 250 active nodes should survive.
-    for type_id in 1..=5u32 {
+    for &(label, _) in &label_categories {
         let active = engine
-            .find_nodes(type_id, "status", &PropValue::String("active".to_string()))
+            .find_nodes(label, "status", &PropValue::String("active".to_string()))
             .unwrap();
         assert_eq!(
             active.len(),
             50,
-            "after compact, type {} active should still have 50, got {}",
-            type_id,
+            "after compact, label '{}' active should still have 50, got {}",
+            label,
             active.len()
         );
     }
@@ -205,32 +208,31 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Same checks after reopen
-    for type_id in 1..=5 {
+    for &(label, _) in &label_categories {
         assert_eq!(
-            engine.nodes_by_type(type_id).unwrap().len(),
+            engine.nodes_by_labels(label).unwrap().len(),
             180,
-            "after reopen, type {} should have 180 nodes",
-            type_id
+            "after reopen, label '{}' should have 180 nodes",
+            label
         );
     }
 
-    for (idx, cat) in categories.iter().enumerate() {
-        let type_id = idx as u32 + 1;
+    for &(label, cat) in &label_categories {
         let found = engine
-            .find_nodes(type_id, "category", &PropValue::String(cat.to_string()))
+            .find_nodes(label, "category", &PropValue::String(cat.to_string()))
             .unwrap();
         assert_eq!(
             found.len(),
             180,
-            "after reopen, type {} category '{}' should have 180",
-            type_id,
+            "after reopen, label '{}' category '{}' should have 180",
+            label,
             cat
         );
     }
 
     // Verify a specific node from batch2 is still there with correct props
     let sample = engine.get_node(ids2[0]).unwrap().unwrap();
-    assert_eq!(sample.type_id, 1); // 500 % 5 + 1 = 1
+    assert_eq!(sample.labels.as_slice(), ["Person"]);
     assert_eq!(
         sample.props.get("category"),
         Some(&PropValue::String("alpha".to_string()))
@@ -240,13 +242,17 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     // Verify a deleted node is gone
     assert!(engine.get_node(all_node_ids[0]).unwrap().is_none());
 
-    // No false positives: wrong type+category combo returns empty
+    // No false positives: wrong label+category combo returns empty
     assert!(engine
-        .find_nodes(1, "category", &PropValue::String("beta".to_string()))
+        .find_nodes("Person", "category", &PropValue::String("beta".to_string()),)
         .unwrap()
         .is_empty());
     assert!(engine
-        .find_nodes(2, "category", &PropValue::String("alpha".to_string()))
+        .find_nodes(
+            "Company",
+            "category",
+            &PropValue::String("alpha".to_string()),
+        )
         .unwrap()
         .is_empty());
 

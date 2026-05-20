@@ -16,34 +16,34 @@ describe('getNodeByKey', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns node by type+key', () => {
-    const id = db.upsertNode(1, 'alice', { props: { name: 'Alice' }, weight: 1.0 });
-    const node = db.getNodeByKey(1, 'alice');
+    const id = db.upsertNode('Person', 'alice', { props: { name: 'Alice' }, weight: 1.0 });
+    const node = db.getNodeByKey('Person', 'alice');
     assert.ok(node);
     assert.equal(node.id, id);
-    assert.equal(node.typeId, 1);
+    assert.deepEqual(node.labels, ['Person']);
     assert.equal(node.key, 'alice');
     assert.equal(node.props.name, 'Alice');
   });
 
   it('returns null for missing key', () => {
-    assert.equal(db.getNodeByKey(1, 'nonexistent'), null);
+    assert.equal(db.getNodeByKey('Person', 'nonexistent'), null);
   });
 
-  it('returns null for wrong type_id', () => {
-    db.upsertNode(5, 'typed', { props: {} });
-    assert.equal(db.getNodeByKey(99, 'typed'), null);
+  it('returns null for wrong label', () => {
+    db.upsertNode('User', 'typed', { props: {} });
+    assert.equal(db.getNodeByKey('MissingLabel', 'typed'), null);
   });
 
   it('returns null for deleted node', () => {
-    const id = db.upsertNode(1, 'to-delete', { props: {} });
+    const id = db.upsertNode('Person', 'to-delete', { props: {} });
     db.deleteNode(id);
-    assert.equal(db.getNodeByKey(1, 'to-delete'), null);
+    assert.equal(db.getNodeByKey('Person', 'to-delete'), null);
   });
 
   it('works after flush (segment source)', () => {
-    const id = db.upsertNode(1, 'flushed', { props: { v: 1 } });
+    const id = db.upsertNode('Person', 'flushed', { props: { v: 1 } });
     db.flush();
-    const node = db.getNodeByKey(1, 'flushed');
+    const node = db.getNodeByKey('Person', 'flushed');
     assert.ok(node);
     assert.equal(node.id, id);
   });
@@ -58,46 +58,46 @@ describe('getEdgeByTriple', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns edge by from+to+type', () => {
-    const a = db.upsertNode(1, 'a', { props: {} });
-    const b = db.upsertNode(1, 'b', { props: {} });
-    const eid = db.upsertEdge(a, b, 10, { props: { rel: 'knows' }, weight: 0.5 });
-    const edge = db.getEdgeByTriple(a, b, 10);
+    const a = db.upsertNode('Person', 'a', { props: {} });
+    const b = db.upsertNode('Person', 'b', { props: {} });
+    const eid = db.upsertEdge(a, b, 'WORKS_AT', { props: { rel: 'knows' }, weight: 0.5 });
+    const edge = db.getEdgeByTriple(a, b, 'WORKS_AT');
     assert.ok(edge);
     assert.equal(edge.id, eid);
     assert.equal(edge.from, a);
     assert.equal(edge.to, b);
-    assert.equal(edge.typeId, 10);
+    assert.equal(edge.label, 'WORKS_AT');
     assert.equal(edge.props.rel, 'knows');
   });
 
-  it('returns null for wrong type_id', () => {
-    const a = db.upsertNode(1, 'c', { props: {} });
-    const b = db.upsertNode(1, 'd', { props: {} });
-    db.upsertEdge(a, b, 10, { props: {} });
-    assert.equal(db.getEdgeByTriple(a, b, 99), null);
+  it('returns null for wrong edge label', () => {
+    const a = db.upsertNode('Person', 'c', { props: {} });
+    const b = db.upsertNode('Person', 'd', { props: {} });
+    db.upsertEdge(a, b, 'WORKS_AT', { props: {} });
+    assert.equal(db.getEdgeByTriple(a, b, 'MISSING_EDGE_TYPE'), null);
   });
 
   it('returns null for reversed direction', () => {
-    const a = db.upsertNode(1, 'e', { props: {} });
-    const b = db.upsertNode(1, 'f', { props: {} });
-    db.upsertEdge(a, b, 10, { props: {} });
-    assert.equal(db.getEdgeByTriple(b, a, 10), null);
+    const a = db.upsertNode('Person', 'e', { props: {} });
+    const b = db.upsertNode('Person', 'f', { props: {} });
+    db.upsertEdge(a, b, 'WORKS_AT', { props: {} });
+    assert.equal(db.getEdgeByTriple(b, a, 'WORKS_AT'), null);
   });
 
   it('returns null after delete', () => {
-    const a = db.upsertNode(1, 'g', { props: {} });
-    const b = db.upsertNode(1, 'h', { props: {} });
-    const eid = db.upsertEdge(a, b, 10, { props: {} });
+    const a = db.upsertNode('Person', 'g', { props: {} });
+    const b = db.upsertNode('Person', 'h', { props: {} });
+    const eid = db.upsertEdge(a, b, 'WORKS_AT', { props: {} });
     db.deleteEdge(eid);
-    assert.equal(db.getEdgeByTriple(a, b, 10), null);
+    assert.equal(db.getEdgeByTriple(a, b, 'WORKS_AT'), null);
   });
 
   it('works after flush', () => {
-    const a = db.upsertNode(1, 'i', { props: {} });
-    const b = db.upsertNode(1, 'j', { props: {} });
-    const eid = db.upsertEdge(a, b, 20, { props: {} });
+    const a = db.upsertNode('Person', 'i', { props: {} });
+    const b = db.upsertNode('Person', 'j', { props: {} });
+    const eid = db.upsertEdge(a, b, 'MENTIONS', { props: {} });
     db.flush();
-    const edge = db.getEdgeByTriple(a, b, 20);
+    const edge = db.getEdgeByTriple(a, b, 'MENTIONS');
     assert.ok(edge);
     assert.equal(edge.id, eid);
   });
@@ -112,11 +112,11 @@ describe('extractSubgraph', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('extracts a simple chain', () => {
-    const a = db.upsertNode(1, 'sg-a', { props: { name: 'A' } });
-    const b = db.upsertNode(1, 'sg-b', { props: { name: 'B' } });
-    const c = db.upsertNode(1, 'sg-c', { props: { name: 'C' } });
-    db.upsertEdge(a, b, 1);
-    db.upsertEdge(b, c, 1);
+    const a = db.upsertNode('Person', 'sg-a', { props: { name: 'A' } });
+    const b = db.upsertNode('Person', 'sg-b', { props: { name: 'B' } });
+    const c = db.upsertNode('Person', 'sg-c', { props: { name: 'C' } });
+    db.upsertEdge(a, b, 'LINKS_TO');
+    db.upsertEdge(b, c, 'LINKS_TO');
 
     const sg = db.extractSubgraph(a, 2);
     assert.ok(sg);
@@ -125,7 +125,7 @@ describe('extractSubgraph', () => {
   });
 
   it('respects maxDepth', () => {
-    const sg = db.extractSubgraph(db.upsertNode(1, 'sg-a', { props: {} }), 0);
+    const sg = db.extractSubgraph(db.upsertNode('Person', 'sg-a', { props: {} }), 0);
     assert.equal(sg.nodes.length, 1);
     assert.equal(sg.edges.length, 0);
   });
@@ -140,9 +140,9 @@ describe('getNodes / getEdges (bulk)', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('getNodes returns array matching input order', () => {
-    const a = db.upsertNode(1, 'bulk-a', { props: { n: 'A' } });
-    const b = db.upsertNode(1, 'bulk-b', { props: { n: 'B' } });
-    const c = db.upsertNode(1, 'bulk-c', { props: { n: 'C' } });
+    const a = db.upsertNode('Person', 'bulk-a', { props: { n: 'A' } });
+    const b = db.upsertNode('Person', 'bulk-b', { props: { n: 'B' } });
+    const c = db.upsertNode('Person', 'bulk-c', { props: { n: 'C' } });
     const results = db.getNodes([a, b, c]);
     assert.equal(results.length, 3);
     assert.equal(results[0].key, 'bulk-a');
@@ -151,8 +151,8 @@ describe('getNodes / getEdges (bulk)', () => {
   });
 
   it('getNodes returns null for missing/deleted', () => {
-    const a = db.upsertNode(1, 'bulk-d', { props: {} });
-    const b = db.upsertNode(1, 'bulk-e', { props: {} });
+    const a = db.upsertNode('Person', 'bulk-d', { props: {} });
+    const b = db.upsertNode('Person', 'bulk-e', { props: {} });
     db.deleteNode(b);
     const results = db.getNodes([a, b, 99999]);
     assert.equal(results.length, 3);
@@ -167,11 +167,11 @@ describe('getNodes / getEdges (bulk)', () => {
   });
 
   it('getEdges returns array matching input order', () => {
-    const a = db.upsertNode(1, 'bulk-ea', { props: {} });
-    const b = db.upsertNode(1, 'bulk-eb', { props: {} });
-    const c = db.upsertNode(1, 'bulk-ec', { props: {} });
-    const e1 = db.upsertEdge(a, b, 1);
-    const e2 = db.upsertEdge(b, c, 1);
+    const a = db.upsertNode('Person', 'bulk-ea', { props: {} });
+    const b = db.upsertNode('Person', 'bulk-eb', { props: {} });
+    const c = db.upsertNode('Person', 'bulk-ec', { props: {} });
+    const e1 = db.upsertEdge(a, b, 'LINKS_TO');
+    const e2 = db.upsertEdge(b, c, 'LINKS_TO');
     const results = db.getEdges([e1, e2, 99999]);
     assert.equal(results.length, 3);
     assert.equal(results[0].from, a);
@@ -180,9 +180,9 @@ describe('getNodes / getEdges (bulk)', () => {
   });
 
   it('getNodes works cross-source (memtable + segment)', () => {
-    const a = db.upsertNode(1, 'bulk-xa', { props: {} });
+    const a = db.upsertNode('Person', 'bulk-xa', { props: {} });
     db.flush();
-    const b = db.upsertNode(1, 'bulk-xb', { props: {} });
+    const b = db.upsertNode('Person', 'bulk-xb', { props: {} });
     const results = db.getNodes([a, b]);
     assert.equal(results[0].key, 'bulk-xa');
     assert.equal(results[1].key, 'bulk-xb');
@@ -198,13 +198,13 @@ describe('getNodesByKeys (bulk key lookup)', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns matching nodes in input order', () => {
-    db.upsertNode(1, 'ka', { props: { n: 'A' } });
-    db.upsertNode(1, 'kb', { props: { n: 'B' } });
-    db.upsertNode(2, 'kc', { props: { n: 'C' } });
+    db.upsertNode('Person', 'ka', { props: { n: 'A' } });
+    db.upsertNode('Person', 'kb', { props: { n: 'B' } });
+    db.upsertNode('Company', 'kc', { props: { n: 'C' } });
     const results = db.getNodesByKeys([
-      { typeId: 1, key: 'ka' },
-      { typeId: 1, key: 'kb' },
-      { typeId: 2, key: 'kc' },
+      { label: 'Person', key: 'ka' },
+      { label: 'Person', key: 'kb' },
+      { label: 'Company', key: 'kc' },
     ]);
     assert.equal(results.length, 3);
     assert.equal(results[0].key, 'ka');
@@ -213,13 +213,13 @@ describe('getNodesByKeys (bulk key lookup)', () => {
   });
 
   it('returns null for missing and deleted keys', () => {
-    db.upsertNode(1, 'kd');
-    const bid = db.upsertNode(1, 'ke');
+    db.upsertNode('Person', 'kd');
+    const bid = db.upsertNode('Person', 'ke');
     db.deleteNode(bid);
     const results = db.getNodesByKeys([
-      { typeId: 1, key: 'kd' },
-      { typeId: 1, key: 'ke' },
-      { typeId: 1, key: 'nonexistent' },
+      { label: 'Person', key: 'kd' },
+      { label: 'Person', key: 'ke' },
+      { label: 'Person', key: 'nonexistent' },
     ]);
     assert.equal(results.length, 3);
     assert.ok(results[0]);
@@ -233,8 +233,8 @@ describe('getNodesByKeys (bulk key lookup)', () => {
   });
 
   it('async variant works', async () => {
-    db.upsertNode(1, 'kf');
-    const results = await db.getNodesByKeysAsync([{ typeId: 1, key: 'kf' }]);
+    db.upsertNode('Person', 'kf');
+    const results = await db.getNodesByKeysAsync([{ label: 'Person', key: 'kf' }]);
     assert.equal(results.length, 1);
     assert.equal(results[0].key, 'kf');
   });
@@ -249,42 +249,42 @@ describe('async variants of new APIs', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('getNodeByKeyAsync works', async () => {
-    const id = db.upsertNode(1, 'async-key', { props: { x: 1 } });
-    const node = await db.getNodeByKeyAsync(1, 'async-key');
+    const id = db.upsertNode('Person', 'async-key', { props: { x: 1 } });
+    const node = await db.getNodeByKeyAsync('Person', 'async-key');
     assert.ok(node);
     assert.equal(node.id, id);
   });
 
   it('getEdgeByTripleAsync works', async () => {
-    const a = db.upsertNode(1, 'at-a', { props: {} });
-    const b = db.upsertNode(1, 'at-b', { props: {} });
-    const eid = db.upsertEdge(a, b, 5);
-    const edge = await db.getEdgeByTripleAsync(a, b, 5);
+    const a = db.upsertNode('Person', 'at-a', { props: {} });
+    const b = db.upsertNode('Person', 'at-b', { props: {} });
+    const eid = db.upsertEdge(a, b, 'DEPENDS_ON');
+    const edge = await db.getEdgeByTripleAsync(a, b, 'DEPENDS_ON');
     assert.ok(edge);
     assert.equal(edge.id, eid);
   });
 
   it('getNodesAsync works', async () => {
-    const a = db.upsertNode(1, 'an-a', { props: {} });
-    const b = db.upsertNode(1, 'an-b', { props: {} });
+    const a = db.upsertNode('Person', 'an-a', { props: {} });
+    const b = db.upsertNode('Person', 'an-b', { props: {} });
     const results = await db.getNodesAsync([a, b]);
     assert.equal(results.length, 2);
     assert.equal(results[0].key, 'an-a');
   });
 
   it('getEdgesAsync works', async () => {
-    const a = db.upsertNode(1, 'ae-a', { props: {} });
-    const b = db.upsertNode(1, 'ae-b', { props: {} });
-    const e = db.upsertEdge(a, b, 1);
+    const a = db.upsertNode('Person', 'ae-a', { props: {} });
+    const b = db.upsertNode('Person', 'ae-b', { props: {} });
+    const e = db.upsertEdge(a, b, 'LINKS_TO');
     const results = await db.getEdgesAsync([e]);
     assert.equal(results.length, 1);
     assert.equal(results[0].from, a);
   });
 
   it('extractSubgraphAsync works', async () => {
-    const a = db.upsertNode(1, 'esg-a', { props: {} });
-    const b = db.upsertNode(1, 'esg-b', { props: {} });
-    db.upsertEdge(a, b, 1);
+    const a = db.upsertNode('Person', 'esg-a', { props: {} });
+    const b = db.upsertNode('Person', 'esg-b', { props: {} });
+    db.upsertEdge(a, b, 'LINKS_TO');
     const sg = await db.extractSubgraphAsync(a, 1);
     assert.ok(sg);
     assert.ok(sg.nodes.length >= 2);
@@ -303,13 +303,13 @@ describe('graphPatch', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('mixed ops in a single call', () => {
-    const a = db.upsertNode(1, 'pa', { props: {} });
-    const b = db.upsertNode(1, 'pb', { props: {} });
-    const e1 = db.upsertEdge(a, b, 1, { props: { v: 'old' } });
+    const a = db.upsertNode('Person', 'pa', { props: {} });
+    const b = db.upsertNode('Person', 'pb', { props: {} });
+    const e1 = db.upsertEdge(a, b, 'LINKS_TO', { props: { v: 'old' } });
 
     const result = db.graphPatch({
-      upsertNodes: [{ typeId: 1, key: 'pc', props: { role: 'new' } }],
-      upsertEdges: [{ from: a, to: b, typeId: 2 }],
+      upsertNodes: [{ labels: ['Person'], key: 'pc', props: { role: 'new' } }],
+      upsertEdges: [{ from: a, to: b, label: 'REFERENCES'}],
       invalidateEdges: [{ edgeId: e1, validTo: 1000 }],
       deleteEdgeIds: [],
       deleteNodeIds: [],
@@ -326,7 +326,7 @@ describe('graphPatch', () => {
     // New edge created
     const e2 = db.getEdge(result.edgeIds[0]);
     assert.ok(e2);
-    assert.equal(e2.typeId, 2);
+    assert.equal(e2.label, 'REFERENCES');
 
     // e1 invalidated
     const inv = db.getEdge(e1);
@@ -340,10 +340,26 @@ describe('graphPatch', () => {
     assert.equal(result.edgeIds.length, 0);
   });
 
+  it('uses NodeInput labels shape in patch node upserts', () => {
+    const result = db.graphPatch({
+      upsertNodes: [
+        { labels: 'Person', key: 'patch-string-label' },
+        { labels: ['Person', 'Admin'], key: 'patch-multi-label' },
+      ],
+    });
+
+    assert.deepEqual(db.getNode(result.nodeIds[0]).labels, ['Person']);
+    assert.deepEqual([...db.getNode(result.nodeIds[1]).labels].sort(), ['Admin', 'Person']);
+    assert.throws(
+      () => db.graphPatch({ upsertNodes: [{ labels: [], key: 'patch-empty-labels' }] }),
+      /node label set must contain at least one label/,
+    );
+  });
+
   it('delete cascades edges', () => {
-    const x = db.upsertNode(1, 'dx', { props: {} });
-    const y = db.upsertNode(1, 'dy', { props: {} });
-    const e = db.upsertEdge(x, y, 1);
+    const x = db.upsertNode('Person', 'dx', { props: {} });
+    const y = db.upsertNode('Person', 'dy', { props: {} });
+    const e = db.upsertEdge(x, y, 'LINKS_TO');
 
     db.graphPatch({ deleteNodeIds: [x] });
 
@@ -353,12 +369,12 @@ describe('graphPatch', () => {
   });
 
   it('deduplicates node upserts within patch', () => {
-    const existing = db.upsertNode(1, 'dup-node', { props: { v: '1' } });
+    const existing = db.upsertNode('Person', 'dup-node', { props: { v: '1' } });
 
     const result = db.graphPatch({
       upsertNodes: [
-        { typeId: 1, key: 'dup-node', props: { v: '2' } },
-        { typeId: 1, key: 'dup-node', props: { v: '3' } },
+        { labels: ['Person'], key: 'dup-node', props: { v: '2' } },
+        { labels: ['Person'], key: 'dup-node', props: { v: '3' } },
       ],
     });
 
@@ -372,10 +388,10 @@ describe('graphPatch', () => {
   });
 
   it('upsert then delete in same patch (delete wins)', () => {
-    const n = db.upsertNode(1, 'ud', { props: {} });
+    const n = db.upsertNode('Person', 'ud', { props: {} });
 
     db.graphPatch({
-      upsertNodes: [{ typeId: 1, key: 'ud', props: { v: 'updated' } }],
+      upsertNodes: [{ labels: ['Person'], key: 'ud', props: { v: 'updated' } }],
       deleteNodeIds: [n],
     });
 
@@ -389,12 +405,12 @@ describe('graphPatch', () => {
     const dbPath = join(tmpDir2, 'db');
     let db2 = OverGraph.open(dbPath, { walSyncMode: 'immediate' });
 
-    const a = db2.upsertNode(1, 'wa', { props: {} });
-    const b = db2.upsertNode(1, 'wb', { props: {} });
+    const a = db2.upsertNode('Person', 'wa', { props: {} });
+    const b = db2.upsertNode('Person', 'wb', { props: {} });
 
     const result = db2.graphPatch({
-      upsertNodes: [{ typeId: 1, key: 'wc', props: { role: 'new' } }],
-      upsertEdges: [{ from: a, to: b, typeId: 5 }],
+      upsertNodes: [{ labels: ['Person'], key: 'wc', props: { role: 'new' } }],
+      upsertEdges: [{ from: a, to: b, label: 'DEPENDS_ON'}],
     });
     const nodeId = result.nodeIds[0];
     const edgeId = result.edgeIds[0];
@@ -408,7 +424,7 @@ describe('graphPatch', () => {
 
     const edge = db2.getEdge(edgeId);
     assert.ok(edge);
-    assert.equal(edge.typeId, 5);
+    assert.equal(edge.label, 'DEPENDS_ON');
 
     db2.close();
     rmSync(tmpDir2, { recursive: true, force: true });
@@ -424,12 +440,12 @@ describe('graphPatchAsync', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('async patch works', async () => {
-    const a = db.upsertNode(1, 'ap-a', { props: {} });
-    const b = db.upsertNode(1, 'ap-b', { props: {} });
+    const a = db.upsertNode('Person', 'ap-a', { props: {} });
+    const b = db.upsertNode('Person', 'ap-b', { props: {} });
 
     const result = await db.graphPatchAsync({
-      upsertNodes: [{ typeId: 1, key: 'ap-c' }],
-      upsertEdges: [{ from: a, to: b, typeId: 3 }],
+      upsertNodes: [{ labels: ['Person'], key: 'ap-c' }],
+      upsertEdges: [{ from: a, to: b, label: 'PATCH_EDGE'}],
     });
 
     assert.equal(result.nodeIds.length, 1);
@@ -450,13 +466,13 @@ describe('prune', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('empty policy is rejected', () => {
-    db.upsertNode(1, 'safe', { props: {}, weight: 1.0 });
+    db.upsertNode('Person', 'safe', { props: {}, weight: 1.0 });
     assert.throws(() => db.prune({}), /at least max_age_ms or max_weight/);
   });
 
   it('prunes by weight', () => {
-    const low = db.upsertNode(1, 'pr-low', { props: {}, weight: 0.1 });
-    const high = db.upsertNode(1, 'pr-high', { props: {}, weight: 0.9 });
+    const low = db.upsertNode('Person', 'pr-low', { props: {}, weight: 0.1 });
+    const high = db.upsertNode('Person', 'pr-high', { props: {}, weight: 0.9 });
 
     const result = db.prune({ maxWeight: 0.5 });
     assert.ok(result.nodesPruned >= 1);
@@ -465,8 +481,8 @@ describe('prune', () => {
   });
 
   it('prunes by weight, boundary (<=)', () => {
-    const exact = db.upsertNode(1, 'pr-exact', { props: {}, weight: 0.5 });
-    const above = db.upsertNode(1, 'pr-above', { props: {}, weight: 0.500001 });
+    const exact = db.upsertNode('Person', 'pr-exact', { props: {}, weight: 0.5 });
+    const above = db.upsertNode('Person', 'pr-above', { props: {}, weight: 0.500001 });
 
     db.prune({ maxWeight: 0.5 });
     assert.equal(db.getNode(exact), null);
@@ -474,9 +490,9 @@ describe('prune', () => {
   });
 
   it('cascade deletes edges of pruned nodes', () => {
-    const a = db.upsertNode(1, 'pr-ca', { props: {}, weight: 0.1 });
-    const b = db.upsertNode(1, 'pr-cb', { props: {}, weight: 0.9 });
-    const e = db.upsertEdge(a, b, 1);
+    const a = db.upsertNode('Person', 'pr-ca', { props: {}, weight: 0.1 });
+    const b = db.upsertNode('Person', 'pr-cb', { props: {}, weight: 0.9 });
+    const e = db.upsertEdge(a, b, 'LINKS_TO');
 
     const result = db.prune({ maxWeight: 0.5 });
     assert.equal(db.getNode(a), null);
@@ -486,25 +502,25 @@ describe('prune', () => {
   });
 
   it('type-scoped prune', () => {
-    const t1 = db.upsertNode(10, 'pr-t1', { props: {}, weight: 0.1 });
-    const t2 = db.upsertNode(20, 'pr-t2', { props: {}, weight: 0.1 });
+    const t1 = db.upsertNode('PruneTarget', 'pr-t1', { props: {}, weight: 0.1 });
+    const t2 = db.upsertNode('PruneOther', 'pr-t2', { props: {}, weight: 0.1 });
 
-    db.prune({ maxWeight: 0.5, typeId: 10 });
+    db.prune({ maxWeight: 0.5, label: 'PruneTarget'});
     assert.equal(db.getNode(t1), null);
     assert.ok(db.getNode(t2)); // different type, survives
   });
 
   it('no matches returns zero counts', () => {
-    db.upsertNode(1, 'pr-nomatch', { props: {}, weight: 0.9 });
+    db.upsertNode('Person', 'pr-nomatch', { props: {}, weight: 0.9 });
     const result = db.prune({ maxWeight: 0.01 });
     assert.equal(result.nodesPruned, 0);
     assert.equal(result.edgesPruned, 0);
   });
 
   it('works after flush (segment source)', () => {
-    const a = db.upsertNode(1, 'pr-seg', { props: {}, weight: 0.1 });
-    const b = db.upsertNode(1, 'pr-seg-keep', { props: {}, weight: 0.9 });
-    const e = db.upsertEdge(a, b, 1);
+    const a = db.upsertNode('Person', 'pr-seg', { props: {}, weight: 0.1 });
+    const b = db.upsertNode('Person', 'pr-seg-keep', { props: {}, weight: 0.9 });
+    const e = db.upsertEdge(a, b, 'LINKS_TO');
     db.flush();
 
     const result = db.prune({ maxWeight: 0.5 });
@@ -519,9 +535,9 @@ describe('prune', () => {
     const dbPath = join(tmpDir2, 'db');
     let db2 = OverGraph.open(dbPath, { walSyncMode: 'immediate' });
 
-    const a = db2.upsertNode(1, 'pr-wal-a', { props: {}, weight: 0.1 });
-    const b = db2.upsertNode(1, 'pr-wal-b', { props: {}, weight: 0.9 });
-    const e = db2.upsertEdge(a, b, 1);
+    const a = db2.upsertNode('Person', 'pr-wal-a', { props: {}, weight: 0.1 });
+    const b = db2.upsertNode('Person', 'pr-wal-b', { props: {}, weight: 0.9 });
+    const e = db2.upsertEdge(a, b, 'LINKS_TO');
 
     db2.prune({ maxWeight: 0.5 });
     db2.close();
@@ -546,8 +562,8 @@ describe('pruneAsync', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('async prune works', async () => {
-    const a = db.upsertNode(1, 'ap-low', { props: {}, weight: 0.1 });
-    const b = db.upsertNode(1, 'ap-high', { props: {}, weight: 0.9 });
+    const a = db.upsertNode('Person', 'ap-low', { props: {}, weight: 0.1 });
+    const b = db.upsertNode('Person', 'ap-high', { props: {}, weight: 0.9 });
 
     const result = await db.pruneAsync({ maxWeight: 0.5 });
     assert.ok(result.nodesPruned >= 1);
@@ -605,7 +621,7 @@ describe('prune policy survives close/reopen', () => {
 
     let db = OverGraph.open(dbPath, { walSyncMode: 'immediate' });
     db.setPrunePolicy('age', { maxAgeMs: 30000 });
-    db.setPrunePolicy('weight', { maxWeight: 0.1, typeId: 5 });
+    db.setPrunePolicy('weight', { maxWeight: 0.1, label: 'User'});
     db.close();
 
     db = OverGraph.open(dbPath, { walSyncMode: 'immediate' });
@@ -616,7 +632,7 @@ describe('prune policy survives close/reopen', () => {
     assert.equal(list[0].policy.maxAgeMs, 30000);
     assert.equal(list[1].name, 'weight');
     assert.ok(Math.abs(list[1].policy.maxWeight - 0.1) < 1e-6);
-    assert.equal(list[1].policy.typeId, 5);
+    assert.equal(list[1].policy.label, 'User');
     db.close();
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -631,14 +647,14 @@ describe('compaction auto-prune', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('prunes matching nodes and cascade-drops edges during compaction', () => {
-    const a = db.upsertNode(1, 'a', { props: {}, weight: 0.1 });  // will be pruned
-    const b = db.upsertNode(1, 'b', { props: {}, weight: 0.9 });
-    const c = db.upsertNode(1, 'c', { props: {}, weight: 0.9 });
-    const e1 = db.upsertEdge(a, b, 1);
-    const e2 = db.upsertEdge(b, c, 1);
+    const a = db.upsertNode('Person', 'a', { props: {}, weight: 0.1 });  // will be pruned
+    const b = db.upsertNode('Person', 'b', { props: {}, weight: 0.9 });
+    const c = db.upsertNode('Person', 'c', { props: {}, weight: 0.9 });
+    const e1 = db.upsertEdge(a, b, 'LINKS_TO');
+    const e2 = db.upsertEdge(b, c, 'LINKS_TO');
     db.flush();
 
-    db.upsertNode(1, 'b', { props: {}, weight: 0.9 });  // overlap → forces standard compaction path
+    db.upsertNode('Person', 'b', { props: {}, weight: 0.9 });  // overlap → forces standard compaction path
     db.flush();
 
     db.setPrunePolicy('low', { maxWeight: 0.5 });
@@ -663,13 +679,13 @@ describe('compaction auto-prune type-scoped', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('only prunes the targeted type', () => {
-    const t1 = db.upsertNode(1, 't1-low', { props: {}, weight: 0.1 });
-    const t2 = db.upsertNode(2, 't2-low', { props: {}, weight: 0.1 });
+    const t1 = db.upsertNode('Person', 't1-low', { props: {}, weight: 0.1 });
+    const t2 = db.upsertNode('Company', 't2-low', { props: {}, weight: 0.1 });
     db.flush();
-    db.upsertNode(1, 't1-low', { props: {}, weight: 0.1 });  // overlap → forces standard compaction path
+    db.upsertNode('Person', 't1-low', { props: {}, weight: 0.1 });  // overlap → forces standard compaction path
     db.flush();
 
-    db.setPrunePolicy('type1', { maxWeight: 0.5, typeId: 1 });
+    db.setPrunePolicy('type1', { maxWeight: 0.5, label: 'Person'});
     const stats = db.compact();
 
     assert.equal(stats.nodesAutoPruned, 1);
@@ -711,8 +727,8 @@ describe('read-time policy filtering, getNode', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('policy-excluded node returns null from getNode', () => {
-    const lo = db.upsertNode(1, 'lo', { props: {}, weight: 0.2 });
-    const hi = db.upsertNode(1, 'hi', { props: {}, weight: 0.9 });
+    const lo = db.upsertNode('Person', 'lo', { props: {}, weight: 0.2 });
+    const hi = db.upsertNode('Person', 'hi', { props: {}, weight: 0.9 });
 
     // Before policy: both visible
     assert.ok(db.getNode(lo));
@@ -725,8 +741,8 @@ describe('read-time policy filtering, getNode', () => {
     assert.ok(db.getNode(hi));
 
     // getNodeByKey also filtered
-    assert.equal(db.getNodeByKey(1, 'lo'), null);
-    assert.ok(db.getNodeByKey(1, 'hi'));
+    assert.equal(db.getNodeByKey('Person', 'lo'), null);
+    assert.ok(db.getNodeByKey('Person', 'hi'));
 
     // Remove policy → visible again
     db.removePrunePolicy('hide-low');
@@ -743,12 +759,12 @@ describe('read-time policy filtering, neighbors', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('policy-excluded neighbor omitted from results', () => {
-    const a = db.upsertNode(1, 'a', { props: {}, weight: 0.9 });
-    const b = db.upsertNode(1, 'b', { props: {}, weight: 0.2 }); // will be excluded
-    const c = db.upsertNode(1, 'c', { props: {}, weight: 0.8 });
+    const a = db.upsertNode('Person', 'a', { props: {}, weight: 0.9 });
+    const b = db.upsertNode('Person', 'b', { props: {}, weight: 0.2 }); // will be excluded
+    const c = db.upsertNode('Person', 'c', { props: {}, weight: 0.8 });
 
-    db.upsertEdge(a, b, 1, { props: {}, weight: 1.0 });
-    db.upsertEdge(a, c, 1, { props: {}, weight: 1.0 });
+    db.upsertEdge(a, b, 'LINKS_TO', { props: {}, weight: 1.0 });
+    db.upsertEdge(a, c, 'LINKS_TO', { props: {}, weight: 1.0 });
 
     // Before policy: 2 neighbors
     let result = db.neighbors(a, { direction: 'outgoing' });
@@ -772,7 +788,7 @@ describe('read-time policy filtering, toggle visibility', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('add policy hides node, remove policy reveals it', () => {
-    const id = db.upsertNode(1, 'target', { props: {}, weight: 0.3 });
+    const id = db.upsertNode('Person', 'target', { props: {}, weight: 0.3 });
 
     assert.ok(db.getNode(id));
 
@@ -784,14 +800,14 @@ describe('read-time policy filtering, toggle visibility', () => {
   });
 
   it('upsert dedup works through policy (no duplicate IDs)', () => {
-    const id1 = db.upsertNode(1, 'dedup-test', { props: {}, weight: 0.2 });
+    const id1 = db.upsertNode('Person', 'dedup-test', { props: {}, weight: 0.2 });
     db.setPrunePolicy('p', { maxWeight: 0.5 });
 
     // Hidden from reads
     assert.equal(db.getNode(id1), null);
 
     // Upsert same key; must reuse ID
-    const id2 = db.upsertNode(1, 'dedup-test', { props: {}, weight: 0.8 });
+    const id2 = db.upsertNode('Person', 'dedup-test', { props: {}, weight: 0.8 });
     assert.equal(id1, id2);
 
     // Now weight 0.8 > 0.5, visible again
@@ -803,7 +819,7 @@ describe('read-time policy filtering, toggle visibility', () => {
 
 // Phase 12: API Completeness tests
 
-describe('getNodesByType', () => {
+describe('getNodesByLabels', () => {
   let tmpDir, db;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-nbt-'));
@@ -815,13 +831,13 @@ describe('getNodesByType', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns hydrated node records by type', () => {
-    db.upsertNode(1, 'alice', { props: { name: 'Alice' }, weight: 0.9 });
-    db.upsertNode(1, 'bob', { props: { name: 'Bob' }, weight: 0.8 });
-    db.upsertNode(2, 'charlie', { props: {}, weight: 0.7 });
+    db.upsertNode('Person', 'alice', { props: { name: 'Alice' }, weight: 0.9 });
+    db.upsertNode('Person', 'bob', { props: { name: 'Bob' }, weight: 0.8 });
+    db.upsertNode('Company', 'charlie', { props: {}, weight: 0.7 });
 
-    const type1 = db.getNodesByType(1);
+    const type1 = db.getNodesByLabels('Person');
     assert.equal(type1.length, 2);
-    assert.ok(type1.every(n => n.typeId === 1));
+    assert.ok(type1.every(n => n.labels.includes('Person')));
     const keys = type1.map(n => n.key);
     assert.ok(keys.includes('alice'));
     assert.ok(keys.includes('bob'));
@@ -834,30 +850,30 @@ describe('getNodesByType', () => {
   });
 
   it('returns empty array for non-existent type', () => {
-    assert.deepEqual(db.getNodesByType(99), []);
+    assert.deepEqual(db.getNodesByLabels('MissingLabel'), []);
   });
 
   it('excludes deleted nodes', () => {
-    const id = db.upsertNode(3, 'to-delete', { props: {} });
-    db.upsertNode(3, 'keeper', { props: {} });
+    const id = db.upsertNode('Document', 'to-delete', { props: {} });
+    db.upsertNode('Document', 'keeper', { props: {} });
     db.deleteNode(id);
 
-    const type3 = db.getNodesByType(3);
+    const type3 = db.getNodesByLabels('Document');
     assert.equal(type3.length, 1);
     assert.equal(type3[0].key, 'keeper');
   });
 
   it('works across memtable and segments', () => {
-    db.upsertNode(4, 'seg1', { props: {} });
+    db.upsertNode('Post', 'seg1', { props: {} });
     db.flush();
-    db.upsertNode(4, 'mem1', { props: {} });
+    db.upsertNode('Post', 'mem1', { props: {} });
 
-    const type4 = db.getNodesByType(4);
+    const type4 = db.getNodesByLabels('Post');
     assert.equal(type4.length, 2);
   });
 });
 
-describe('getEdgesByType', () => {
+describe('getEdgesByLabel', () => {
   let tmpDir, db;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-ebt-'));
@@ -869,38 +885,38 @@ describe('getEdgesByType', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns hydrated edge records by type', () => {
-    const a = db.upsertNode(1, 'a', { props: {} });
-    const b = db.upsertNode(1, 'b', { props: {} });
-    const c = db.upsertNode(1, 'c', { props: {} });
+    const a = db.upsertNode('Person', 'a', { props: {} });
+    const b = db.upsertNode('Person', 'b', { props: {} });
+    const c = db.upsertNode('Person', 'c', { props: {} });
 
-    db.upsertEdge(a, b, 10, { props: { rel: 'knows' }, weight: 0.9 });
-    db.upsertEdge(b, c, 10, { props: { rel: 'likes' }, weight: 0.8 });
-    db.upsertEdge(a, c, 20, { props: {}, weight: 0.5 });
+    db.upsertEdge(a, b, 'WORKS_AT', { props: { rel: 'knows' }, weight: 0.9 });
+    db.upsertEdge(b, c, 'WORKS_AT', { props: { rel: 'likes' }, weight: 0.8 });
+    db.upsertEdge(a, c, 'MENTIONS', { props: {}, weight: 0.5 });
 
-    const type10 = db.getEdgesByType(10);
+    const type10 = db.getEdgesByLabel('WORKS_AT');
     assert.equal(type10.length, 2);
-    assert.ok(type10.every(e => e.typeId === 10));
+    assert.ok(type10.every(e => e.label === 'WORKS_AT'));
     assert.ok(type10.every(e => e.weight > 0));
   });
 
   it('returns empty array for non-existent type', () => {
-    assert.deepEqual(db.getEdgesByType(99), []);
+    assert.deepEqual(db.getEdgesByLabel('MISSING_EDGE_TYPE'), []);
   });
 
   it('works across memtable and segments', () => {
-    const x = db.upsertNode(1, 'x', { props: {} });
-    const y = db.upsertNode(1, 'y', { props: {} });
-    db.upsertEdge(x, y, 30, { props: {}, weight: 1.0 });
+    const x = db.upsertNode('Person', 'x', { props: {} });
+    const y = db.upsertNode('Person', 'y', { props: {} });
+    db.upsertEdge(x, y, 'OWNS', { props: {}, weight: 1.0 });
     db.flush();
-    const z = db.upsertNode(1, 'z', { props: {} });
-    db.upsertEdge(y, z, 30, { props: {}, weight: 1.0 });
+    const z = db.upsertNode('Person', 'z', { props: {} });
+    db.upsertEdge(y, z, 'OWNS', { props: {}, weight: 1.0 });
 
-    const type30 = db.getEdgesByType(30);
+    const type30 = db.getEdgesByLabel('OWNS');
     assert.equal(type30.length, 2);
   });
 });
 
-describe('countNodesByType / countEdgesByType', () => {
+describe('countNodesByLabels / countEdgesByLabel', () => {
   let tmpDir, db;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-cnt-'));
@@ -912,41 +928,41 @@ describe('countNodesByType / countEdgesByType', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('counts nodes by type without hydrating records', () => {
-    db.upsertNode(1, 'n1', { props: {} });
-    db.upsertNode(1, 'n2', { props: {} });
-    db.upsertNode(2, 'n3', { props: {} });
+    db.upsertNode('Person', 'n1', { props: {} });
+    db.upsertNode('Person', 'n2', { props: {} });
+    db.upsertNode('Company', 'n3', { props: {} });
 
-    assert.equal(db.countNodesByType(1), 2);
-    assert.equal(db.countNodesByType(2), 1);
-    assert.equal(db.countNodesByType(99), 0);
+    assert.equal(db.countNodesByLabels('Person'), 2);
+    assert.equal(db.countNodesByLabels('Company'), 1);
+    assert.equal(db.countNodesByLabels('MissingLabel'), 0);
   });
 
   it('counts edges by type', () => {
-    const a = db.upsertNode(1, 'ca', { props: {} });
-    const b = db.upsertNode(1, 'cb', { props: {} });
-    const c = db.upsertNode(1, 'cc', { props: {} });
-    db.upsertEdge(a, b, 10, { props: {}, weight: 1.0 });
-    db.upsertEdge(b, c, 10, { props: {}, weight: 1.0 });
-    db.upsertEdge(a, c, 20, { props: {}, weight: 1.0 });
+    const a = db.upsertNode('Person', 'ca', { props: {} });
+    const b = db.upsertNode('Person', 'cb', { props: {} });
+    const c = db.upsertNode('Person', 'cc', { props: {} });
+    db.upsertEdge(a, b, 'WORKS_AT', { props: {}, weight: 1.0 });
+    db.upsertEdge(b, c, 'WORKS_AT', { props: {}, weight: 1.0 });
+    db.upsertEdge(a, c, 'MENTIONS', { props: {}, weight: 1.0 });
 
-    assert.equal(db.countEdgesByType(10), 2);
-    assert.equal(db.countEdgesByType(20), 1);
-    assert.equal(db.countEdgesByType(99), 0);
+    assert.equal(db.countEdgesByLabel('WORKS_AT'), 2);
+    assert.equal(db.countEdgesByLabel('MENTIONS'), 1);
+    assert.equal(db.countEdgesByLabel('MISSING_EDGE_TYPE'), 0);
   });
 
   it('counts respect tombstones', () => {
-    const id = db.upsertNode(5, 'temp', { props: {} });
-    assert.equal(db.countNodesByType(5), 1);
+    const id = db.upsertNode('User', 'temp', { props: {} });
+    assert.equal(db.countNodesByLabels('User'), 1);
     db.deleteNode(id);
-    assert.equal(db.countNodesByType(5), 0);
+    assert.equal(db.countNodesByLabels('User'), 0);
   });
 
   it('counts work across memtable and segments', () => {
-    db.upsertNode(6, 's1', { props: {} });
+    db.upsertNode('Location', 's1', { props: {} });
     db.flush();
-    db.upsertNode(6, 'm1', { props: {} });
+    db.upsertNode('Location', 'm1', { props: {} });
 
-    assert.equal(db.countNodesByType(6), 2);
+    assert.equal(db.countNodesByLabels('Location'), 2);
   });
 });
 
@@ -958,38 +974,38 @@ describe('async variants of type query APIs', () => {
       walSyncMode: 'immediate',
       compactAfterNFlushes: 0,
     });
-    db.upsertNode(1, 'a', { props: { v: 1 }, weight: 0.9 });
-    db.upsertNode(1, 'b', { props: { v: 2 }, weight: 0.8 });
-    db.upsertNode(2, 'c', { props: {}, weight: 0.7 });
-    const na = db.upsertNode(1, 'a', { props: { v: 1 }, weight: 0.9 }); // already exists, same id
-    const nb = db.upsertNode(1, 'b', { props: { v: 2 }, weight: 0.8 });
-    db.upsertEdge(na, nb, 10, { props: {}, weight: 1.0 });
+    db.upsertNode('Person', 'a', { props: { v: 1 }, weight: 0.9 });
+    db.upsertNode('Person', 'b', { props: { v: 2 }, weight: 0.8 });
+    db.upsertNode('Company', 'c', { props: {}, weight: 0.7 });
+    const na = db.upsertNode('Person', 'a', { props: { v: 1 }, weight: 0.9 }); // already exists, same id
+    const nb = db.upsertNode('Person', 'b', { props: { v: 2 }, weight: 0.8 });
+    db.upsertEdge(na, nb, 'WORKS_AT', { props: {}, weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('getNodesByTypeAsync returns hydrated records', async () => {
-    const records = await db.getNodesByTypeAsync(1);
+  it('getNodesByLabelsAsync returns hydrated records', async () => {
+    const records = await db.getNodesByLabelsAsync('Person');
     assert.equal(records.length, 2);
-    assert.ok(records.every(n => n.typeId === 1));
+    assert.ok(records.every(n => n.labels.includes('Person')));
   });
 
-  it('getEdgesByTypeAsync returns hydrated records', async () => {
-    const records = await db.getEdgesByTypeAsync(10);
+  it('getEdgesByLabelAsync returns hydrated records', async () => {
+    const records = await db.getEdgesByLabelAsync('WORKS_AT');
     assert.equal(records.length, 1);
-    assert.equal(records[0].typeId, 10);
+    assert.equal(records[0].label, 'WORKS_AT');
   });
 
-  it('countNodesByTypeAsync returns correct count', async () => {
-    const count = await db.countNodesByTypeAsync(1);
+  it('countNodesByLabelsAsync returns correct count', async () => {
+    const count = await db.countNodesByLabelsAsync('Person');
     assert.equal(count, 2);
-    const zero = await db.countNodesByTypeAsync(99);
+    const zero = await db.countNodesByLabelsAsync('MissingLabel');
     assert.equal(zero, 0);
   });
 
-  it('countEdgesByTypeAsync returns correct count', async () => {
-    const count = await db.countEdgesByTypeAsync(10);
+  it('countEdgesByLabelAsync returns correct count', async () => {
+    const count = await db.countEdgesByLabelAsync('WORKS_AT');
     assert.equal(count, 1);
-    const zero = await db.countEdgesByTypeAsync(99);
+    const zero = await db.countEdgesByLabelAsync('MISSING_EDGE_TYPE');
     assert.equal(zero, 0);
   });
 });

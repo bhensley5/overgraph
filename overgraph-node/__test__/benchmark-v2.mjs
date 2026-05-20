@@ -187,12 +187,20 @@ function traverseDeepBranching(fanout) {
   return [Math.max(8, Math.min(24, Math.floor(fanout / 4))), 4, 4];
 }
 
+function nodeInput(label, key, fields = {}) {
+  return { labels: [label], key, ...fields };
+}
+
+function nodeFilter(label, mode = 'all') {
+  return { labels: [label], mode };
+}
+
 function buildDepthTwoTraversalGraph(db, cfg) {
-  const hopNodes = [{ typeId: 1, key: 'root' }];
+  const hopNodes = [nodeInput('Person', 'root')];
   for (let i = 0; i < cfg.two_hop_mid; i++) {
-    hopNodes.push({ typeId: 1, key: `m-${i}` });
+    hopNodes.push(nodeInput('Person', `m-${i}`));
     for (let j = 0; j < cfg.two_hop_leaves_per_mid; j++) {
-      hopNodes.push({ typeId: 1, key: `l-${i}-${j}` });
+      hopNodes.push(nodeInput('Person', `l-${i}-${j}`));
     }
   }
   const hopIds = db.batchUpsertNodes(hopNodes);
@@ -201,10 +209,10 @@ function buildDepthTwoTraversalGraph(db, cfg) {
   const hopEdges = [];
   for (let i = 0; i < cfg.two_hop_mid; i++) {
     const midId = hopIds[1 + i * midStride];
-    hopEdges.push({ from: root, to: midId, typeId: 1, weight: 1.0 });
+    hopEdges.push({ from: root, to: midId, label: 'LINKS_TO', weight: 1.0 });
     for (let j = 0; j < cfg.two_hop_leaves_per_mid; j++) {
       const leafId = hopIds[1 + i * midStride + 1 + j];
-      hopEdges.push({ from: midId, to: leafId, typeId: 1, weight: 1.0 });
+      hopEdges.push({ from: midId, to: leafId, label: 'LINKS_TO', weight: 1.0 });
     }
   }
   db.batchUpsertEdges(hopEdges);
@@ -213,19 +221,19 @@ function buildDepthTwoTraversalGraph(db, cfg) {
 
 function buildDeepTraversalGraph(db, cfg) {
   const [level1, level2, level3] = traverseDeepBranching(cfg.fanout);
-  const nodes = [{ typeId: 1, key: 'root' }];
+  const nodes = [nodeInput('Person', 'root')];
   for (let i = 0; i < level1; i++) {
-    nodes.push({ typeId: 11, key: `lvl1-${i}` });
+    nodes.push(nodeInput('LevelOne', `lvl1-${i}`));
   }
   for (let i = 0; i < level1; i++) {
     for (let j = 0; j < level2; j++) {
-      nodes.push({ typeId: (i + j) % 2 === 0 ? 2 : 3, key: `lvl2-${i}-${j}` });
+      nodes.push(nodeInput((i + j) % 2 === 0 ? 'Company' : 'Document', `lvl2-${i}-${j}`));
     }
   }
   for (let i = 0; i < level1; i++) {
     for (let j = 0; j < level2; j++) {
       for (let k = 0; k < level3; k++) {
-        nodes.push({ typeId: (i + j + k) % 2 === 0 ? 2 : 3, key: `lvl3-${i}-${j}-${k}` });
+        nodes.push(nodeInput((i + j + k) % 2 === 0 ? 'Company' : 'Document', `lvl3-${i}-${j}-${k}`));
       }
     }
   }
@@ -237,14 +245,14 @@ function buildDeepTraversalGraph(db, cfg) {
   const edges = [];
   for (let i = 0; i < level1; i++) {
     const lvl1Id = ids[level1Offset + i];
-    edges.push({ from: root, to: lvl1Id, typeId: 1, weight: 1.0 });
+    edges.push({ from: root, to: lvl1Id, label: 'LINKS_TO', weight: 1.0 });
     for (let j = 0; j < level2; j++) {
       const lvl2Idx = i * level2 + j;
       const lvl2Id = ids[level2Offset + lvl2Idx];
-      edges.push({ from: lvl1Id, to: lvl2Id, typeId: 1, weight: 1.0 });
+      edges.push({ from: lvl1Id, to: lvl2Id, label: 'LINKS_TO', weight: 1.0 });
       for (let k = 0; k < level3; k++) {
         const lvl3Idx = lvl2Idx * level3 + k;
-        edges.push({ from: lvl2Id, to: ids[level3Offset + lvl3Idx], typeId: 1, weight: 1.0 });
+        edges.push({ from: lvl2Id, to: ids[level3Offset + lvl3Idx], label: 'LINKS_TO', weight: 1.0 });
       }
     }
   }
@@ -331,6 +339,17 @@ function waitForPropertyIndexReady(db, indexId) {
   throw new Error(`Timed out waiting for property index ${indexId} to become ready`);
 }
 
+function waitForEdgePropertyIndexReady(db, indexId) {
+  const deadline = performance.now() + 10_000;
+  while (performance.now() < deadline) {
+    if (db.listEdgePropertyIndexes().some(info => info.indexId === indexId && info.state === 'ready')) {
+      return;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  throw new Error(`Timed out waiting for edge property index ${indexId} to become ready`);
+}
+
 function queryBenchmarkLayout(preloadNodes) {
   const segments = preloadNodes >= 2 ? 1 : 0;
   const segmentNodes = segments === 0 ? 0 : Math.max(1, Math.floor(preloadNodes / (segments + 1)));
@@ -344,21 +363,19 @@ function queryBenchmarkLayout(preloadNodes) {
 function queryBenchNodes(start, count) {
   return Array.from({ length: count }, (_, offset) => {
     const i = start + offset;
-    return {
-      typeId: 1,
-      key: `q-${i}`,
+    return nodeInput('Person', `q-${i}`, {
       props: queryBenchProps(i),
-    };
+    });
   });
 }
 
 function buildQueryBenchmarkDb(path, preloadNodes) {
   const db = OverGraph.open(path);
-  const status = db.ensureNodePropertyIndex(1, 'status', { kind: 'equality' });
+  const status = db.ensureNodePropertyIndex('Person', 'status', { kind: 'equality' });
   waitForPropertyIndexReady(db, status.indexId);
-  const tier = db.ensureNodePropertyIndex(1, 'tier', { kind: 'equality' });
+  const tier = db.ensureNodePropertyIndex('Person', 'tier', { kind: 'equality' });
   waitForPropertyIndexReady(db, tier.indexId);
-  const score = db.ensureNodePropertyIndex(1, 'score', { kind: 'range', domain: 'int' });
+  const score = db.ensureNodePropertyIndex('Person', 'score', { kind: 'range', domain: 'int' });
   waitForPropertyIndexReady(db, score.indexId);
 
   const layout = queryBenchmarkLayout(preloadNodes);
@@ -372,6 +389,57 @@ function buildQueryBenchmarkDb(path, preloadNodes) {
   return { db, layout };
 }
 
+function buildEdgeQueryBenchmarkDb(path, preloadEdges) {
+  const db = OverGraph.open(path);
+  const sourceCount = 1;
+  const targetCount = Math.max(1, preloadEdges);
+  const nodes = [];
+  for (let i = 0; i < sourceCount; i += 1) {
+    nodes.push(nodeInput('Person', `edge-source-${i}`));
+  }
+  for (let i = 0; i < targetCount; i += 1) {
+    nodes.push(nodeInput('Company', `edge-target-${i}`));
+  }
+  const ids = db.batchUpsertNodes(nodes);
+  const sourceIds = ids.slice(0, sourceCount);
+  const targetIds = ids.slice(sourceCount);
+  const sourceId = sourceIds[0];
+  const segments = preloadEdges >= 2 ? 1 : 0;
+  const segmentEdges = segments === 0 ? 0 : Math.max(1, Math.floor(preloadEdges / 2));
+  const memtableTailEdges = Math.max(0, preloadEdges - segmentEdges);
+  const makeEdges = (start, count) => Array.from({ length: count }, (_, offset) => {
+    const i = start + offset;
+    return {
+      from: sourceIds[i % sourceCount],
+      to: targetIds[i % targetIds.length],
+      label: 'WORKS_AT',
+      props: { role: i % 10 === 0 ? 'lead' : 'member', score: i % 100 },
+      weight: i % 2 === 0 ? 2.0 : 0.5,
+    };
+  });
+  if (segmentEdges > 0) {
+    db.batchUpsertEdges(makeEdges(0, segmentEdges));
+    db.flush();
+  }
+  if (memtableTailEdges > 0) {
+    db.batchUpsertEdges(makeEdges(segmentEdges, memtableTailEdges));
+  }
+  return {
+    db,
+    sourceId,
+    layout: { segments, segment_edges: segmentEdges, memtable_tail_edges: memtableTailEdges },
+  };
+}
+
+function buildIndexedEdgeQueryBenchmarkDb(path, preloadEdges) {
+  const fixture = buildEdgeQueryBenchmarkDb(path, preloadEdges);
+  const role = fixture.db.ensureEdgePropertyIndex('WORKS_AT', 'role', { kind: 'equality' });
+  waitForEdgePropertyIndexReady(fixture.db, role.indexId);
+  const score = fixture.db.ensureEdgePropertyIndex('WORKS_AT', 'score', { kind: 'range', domain: 'int' });
+  waitForEdgePropertyIndexReady(fixture.db, score.indexId);
+  return fixture;
+}
+
 function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
   const preloadNodes = cfg.time_range_nodes;
   const limit = 100;
@@ -381,7 +449,7 @@ function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const { db, layout } = buildQueryBenchmarkDb(join(tmpRoot, 'query-node-ids-intersected'), preloadNodes);
     const request = {
-      typeId: 1,
+      labelFilter: nodeFilter('Person'),
       filter: {
         and: [
           { property: 'status', eq: 'active' },
@@ -399,7 +467,7 @@ function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
         s,
         iterCfg,
         {
-          type_id: 1,
+          label: 'Person',
           preload_nodes: preloadNodes,
           segments: layout.segments,
           segment_nodes: layout.segment_nodes,
@@ -418,7 +486,7 @@ function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const { db, layout } = buildQueryBenchmarkDb(join(tmpRoot, 'query-nodes-hydrated-intersected'), preloadNodes);
     const request = {
-      typeId: 1,
+      labelFilter: nodeFilter('Person'),
       filter: {
         and: [
           { property: 'status', eq: 'active' },
@@ -436,12 +504,208 @@ function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
         s,
         iterCfg,
         {
-          type_id: 1,
+          label: 'Person',
           preload_nodes: preloadNodes,
           segments: layout.segments,
           segment_nodes: layout.segment_nodes,
           memtable_tail_nodes: layout.memtable_tail_nodes,
           predicates: ['status_eq_active', 'score_gte_50'],
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    const scenarioId = 'S-QUERY-003';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout, sourceId } = buildEdgeQueryBenchmarkDb(
+      join(tmpRoot, 'query-edge-ids-endpoint-metadata'),
+      preloadNodes
+    );
+    const request = {
+      label: 'WORKS_AT',
+      fromIds: [sourceId],
+      filter: { weight: { gte: 1.0 } },
+      limit,
+    };
+    const s = runBench(() => db.queryEdgeIds(request), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'query_edge_ids_endpoint_metadata',
+        'query',
+        s,
+        iterCfg,
+        {
+          label: 'WORKS_AT',
+          preload_edges: preloadNodes,
+          segments: layout.segments,
+          segment_edges: layout.segment_edges,
+          memtable_tail_edges: layout.memtable_tail_edges,
+          filter: 'weight_gte_1',
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    const scenarioId = 'S-QUERY-004';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout, sourceId } = buildEdgeQueryBenchmarkDb(
+      join(tmpRoot, 'query-edges-endpoint-property-hydrated'),
+      preloadNodes
+    );
+    const request = {
+      label: 'WORKS_AT',
+      fromIds: [sourceId],
+      filter: {
+        and: [
+          { weight: { gte: 1.0 } },
+          { property: 'role', eq: 'lead' },
+        ],
+      },
+      limit,
+    };
+    const s = runBench(() => db.queryEdges(request), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'query_edges_endpoint_property_hydrated',
+        'query',
+        s,
+        iterCfg,
+        {
+          label: 'WORKS_AT',
+          preload_edges: preloadNodes,
+          segments: layout.segments,
+          segment_edges: layout.segment_edges,
+          memtable_tail_edges: layout.memtable_tail_edges,
+          filter: 'weight_gte_1_and_role_eq_lead',
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    const scenarioId = 'S-QUERY-005';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout, sourceId } = buildIndexedEdgeQueryBenchmarkDb(
+      join(tmpRoot, 'query-edge-ids-property-indexed-equality'),
+      preloadNodes
+    );
+    const request = {
+      label: 'WORKS_AT',
+      fromIds: [sourceId],
+      filter: { property: 'role', eq: 'lead' },
+      limit,
+    };
+    const s = runBench(() => db.queryEdgeIds(request), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'query_edge_ids_property_indexed_equality',
+        'query',
+        s,
+        iterCfg,
+        {
+          label: 'WORKS_AT',
+          preload_edges: preloadNodes,
+          segments: layout.segments,
+          segment_edges: layout.segment_edges,
+          memtable_tail_edges: layout.memtable_tail_edges,
+          filter: 'role_eq_lead',
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    const scenarioId = 'S-QUERY-006';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout, sourceId } = buildIndexedEdgeQueryBenchmarkDb(
+      join(tmpRoot, 'query-edge-ids-property-indexed-range'),
+      preloadNodes
+    );
+    const request = {
+      label: 'WORKS_AT',
+      fromIds: [sourceId],
+      filter: { property: 'score', gte: 90 },
+      limit,
+    };
+    const s = runBench(() => db.queryEdgeIds(request), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'query_edge_ids_property_indexed_range',
+        'query',
+        s,
+        iterCfg,
+        {
+          label: 'WORKS_AT',
+          preload_edges: preloadNodes,
+          segments: layout.segments,
+          segment_edges: layout.segment_edges,
+          memtable_tail_edges: layout.memtable_tail_edges,
+          filter: 'score_gte_90',
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    const scenarioId = 'S-QUERY-007';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout } = buildIndexedEdgeQueryBenchmarkDb(
+      join(tmpRoot, 'query-pattern-edge-property-anchor-indexed'),
+      preloadNodes
+    );
+    const request = {
+      nodes: [
+        { alias: 'source', labelFilter: nodeFilter('Person') },
+        { alias: 'target', labelFilter: nodeFilter('Company') },
+      ],
+      edges: [
+        {
+          alias: 'edge',
+          fromAlias: 'source',
+          toAlias: 'target',
+          direction: 'outgoing',
+          edgeLabelFilter: ['WORKS_AT'],
+          filter: { property: 'role', eq: 'lead' },
+        },
+      ],
+      limit,
+    };
+    const s = runBench(() => db.queryPattern(request), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'query_pattern_edge_property_anchor_indexed',
+        'query',
+        s,
+        iterCfg,
+        {
+          label: 'WORKS_AT',
+          preload_edges: preloadNodes,
+          segments: layout.segments,
+          segment_edges: layout.segment_edges,
+          memtable_tail_edges: layout.memtable_tail_edges,
+          filter: 'role_eq_lead',
           limit,
         },
         scenarioComparability(scenarioContract, scenarioId)
@@ -469,7 +733,7 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'crud-upsert-node'));
     const s = runBench(
-      (i) => db.upsertNode(1, `node-${i}`, { props: { idx: i }, weight: 1.0 }),
+      (i) => db.upsertNode('Person', `node-${i}`, { props: { idx: i }, weight: 1.0 }),
       iterCfg.warmup,
       iterCfg.iters,
       true
@@ -481,7 +745,7 @@ try {
         'crud',
         s,
         iterCfg,
-        { type_id: 1, with_props: true, weight: 1.0 },
+        { label: 'Person', with_props: true, weight: 1.0 },
         scenarioComparability(scenarioContract, scenarioId)
       )
     );
@@ -494,10 +758,10 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'crud-upsert-edge'));
     const nodeIds = db.batchUpsertNodes(
-      Array.from({ length: iterCfg.warmup + iterCfg.iters + 1 }, (_, i) => ({ typeId: 1, key: `e-${i}` }))
+      Array.from({ length: iterCfg.warmup + iterCfg.iters + 1 }, (_, i) => nodeInput('Person', `e-${i}`))
     );
     const s = runBench(
-      (i) => db.upsertEdge(nodeIds[i], nodeIds[i + 1], 1, { weight: 1.0 }),
+      (i) => db.upsertEdge(nodeIds[i], nodeIds[i + 1], 'LINKS_TO', { weight: 1.0 }),
       iterCfg.warmup,
       iterCfg.iters,
       true
@@ -509,7 +773,7 @@ try {
         'crud',
         s,
         iterCfg,
-        { edge_type_id: 1, weight: 1.0 },
+        { label: 'LINKS_TO', weight: 1.0 },
         scenarioComparability(scenarioContract, scenarioId)
       )
     );
@@ -524,10 +788,7 @@ try {
     const s = runBench(
       (i) => {
         const nodes = Array.from({ length: cfg.batch_nodes }, (_, j) => ({
-          typeId: 1,
-          key: `bn-${i}-${j}`,
-          props: { idx: j },
-          weight: 1.0,
+          ...nodeInput('Person', `bn-${i}-${j}`, { props: { idx: j }, weight: 1.0 }),
         }));
         db.batchUpsertNodes(nodes);
       },
@@ -541,7 +802,7 @@ try {
         'batch',
         s,
         iterCfg,
-        { batch_nodes: cfg.batch_nodes, type_id: 1, with_props: true },
+        { batch_nodes: cfg.batch_nodes, label: 'Person', with_props: true },
         scenarioComparability(scenarioContract, scenarioId),
         cfg.batch_nodes
       )
@@ -557,10 +818,7 @@ try {
     const s = runBench(
       (i) => {
         const nodes = Array.from({ length: cfg.batch_nodes }, (_, j) => ({
-          typeId: 1,
-          key: `bb-${i}-${j}`,
-          props: { idx: j },
-          weight: 1.0,
+          ...nodeInput('Person', `bb-${i}-${j}`, { props: { idx: j }, weight: 1.0 }),
         }));
         db.batchUpsertNodesBinary(packNodeBatch(nodes));
       },
@@ -589,9 +847,7 @@ try {
     const db = OverGraph.open(join(tmpRoot, 'crud-get-node'));
     const ids = db.batchUpsertNodes(
       Array.from({ length: cfg.get_node_nodes }, (_, i) => ({
-        typeId: 1,
-        key: `gn-${i}`,
-        props: { idx: i },
+        ...nodeInput('Person', `gn-${i}`, { props: { idx: i } }),
       }))
     );
     const s = runBench(
@@ -618,9 +874,9 @@ try {
     const scenarioId = 'S-CRUD-004';
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'crud-upsert-node-fixed'));
-    db.upsertNode(1, 'fixed-node', { props: { idx: 0 }, weight: 1.0 });
+    db.upsertNode('Person', 'fixed-node', { props: { idx: 0 }, weight: 1.0 });
     const s = runBench(
-      (i) => db.upsertNode(1, 'fixed-node', { props: { idx: i }, weight: 1.0 }),
+      (i) => db.upsertNode('Person', 'fixed-node', { props: { idx: i }, weight: 1.0 }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -631,7 +887,7 @@ try {
         'crud',
         s,
         iterCfg,
-        { type_id: 1, with_props: true, weight: 1.0, fixed_key: true },
+        { label: 'Person', with_props: true, weight: 1.0, fixed_key: true },
         scenarioComparability(scenarioContract, scenarioId)
       )
     );
@@ -645,10 +901,10 @@ try {
     const db = OverGraph.open(join(tmpRoot, 'crud-upsert-edge-fixed'), {
       edgeUniqueness: true,
     });
-    const nodeA = db.upsertNode(1, 'fixed-a');
-    const nodeB = db.upsertNode(1, 'fixed-b');
+    const nodeA = db.upsertNode('Person', 'fixed-a');
+    const nodeB = db.upsertNode('Person', 'fixed-b');
     const s = runBench(
-      () => db.upsertEdge(nodeA, nodeB, 1, { weight: 1.0 }),
+      () => db.upsertEdge(nodeA, nodeB, 'LINKS_TO', { weight: 1.0 }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -659,7 +915,7 @@ try {
         'crud',
         s,
         iterCfg,
-        { edge_type_id: 1, weight: 1.0, edge_uniqueness: true, fixed_triple: true },
+        { label: 'LINKS_TO', weight: 1.0, edge_uniqueness: true, fixed_triple: true },
         scenarioComparability(scenarioContract, scenarioId)
       )
     );
@@ -672,15 +928,15 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'trav-neighbors'));
     const neighNodeIds = db.batchUpsertNodes([
-      { typeId: 1, key: 'hub' },
-      ...Array.from({ length: cfg.fanout }, (_, i) => ({ typeId: 1, key: `n-${i}` })),
+      nodeInput('Person', 'hub'),
+      ...Array.from({ length: cfg.fanout }, (_, i) => nodeInput('Person', `n-${i}`)),
     ]);
     const hub = neighNodeIds[0];
     db.batchUpsertEdges(
       Array.from({ length: cfg.fanout }, (_, i) => ({
         from: hub,
         to: neighNodeIds[i + 1],
-        typeId: 1,
+        label: 'LINKS_TO',
         weight: 1.0,
       }))
     );
@@ -757,7 +1013,7 @@ try {
           layout: 'memtable',
           min_depth: 1,
           max_depth: 3,
-          node_type_filter: null,
+          node_label_filter: null,
           branching,
         },
         scenarioComparability(scenarioContract, scenarioId)
@@ -790,7 +1046,7 @@ try {
           layout: 'segment',
           min_depth: 1,
           max_depth: 3,
-          node_type_filter: null,
+          node_label_filter: null,
           branching,
         },
         scenarioComparability(scenarioContract, scenarioId)
@@ -806,7 +1062,7 @@ try {
     const db = OverGraph.open(join(tmpRoot, 'trav-depth13-filtered-memtable'));
     const { root, branching } = buildDeepTraversalGraph(db, cfg);
     const s = runBench(
-      () => db.traverse(root, 3, { direction: 'outgoing', nodeTypeFilter: [2] }),
+      () => db.traverse(root, 3, { direction: 'outgoing', emitNodeLabelFilter: nodeFilter('Company') }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -822,7 +1078,7 @@ try {
           layout: 'memtable',
           min_depth: 1,
           max_depth: 3,
-          node_type_filter: [2],
+          node_label_filter: ['Company'],
           branching,
         },
         scenarioComparability(scenarioContract, scenarioId)
@@ -839,7 +1095,7 @@ try {
     const { root, branching } = buildDeepTraversalGraph(db, cfg);
     db.flush();
     const s = runBench(
-      () => db.traverse(root, 3, { direction: 'outgoing', nodeTypeFilter: [2] }),
+      () => db.traverse(root, 3, { direction: 'outgoing', emitNodeLabelFilter: nodeFilter('Company') }),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -855,7 +1111,7 @@ try {
           layout: 'segment',
           min_depth: 1,
           max_depth: 3,
-          node_type_filter: [2],
+          node_label_filter: ['Company'],
           branching,
         },
         scenarioComparability(scenarioContract, scenarioId)
@@ -870,15 +1126,15 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'trav-degree'));
     const degNodeIds = db.batchUpsertNodes([
-      { typeId: 1, key: 'hub' },
-      ...Array.from({ length: cfg.fanout }, (_, i) => ({ typeId: 1, key: `d-${i}` })),
+      nodeInput('Person', 'hub'),
+      ...Array.from({ length: cfg.fanout }, (_, i) => nodeInput('Person', `d-${i}`)),
     ]);
     const hub = degNodeIds[0];
     db.batchUpsertEdges(
       Array.from({ length: cfg.fanout }, (_, i) => ({
         from: hub,
         to: degNodeIds[i + 1],
-        typeId: 1,
+        label: 'LINKS_TO',
         weight: 1.0,
       }))
     );
@@ -909,9 +1165,9 @@ try {
     // Batch all hub + spoke nodes: [hub-0, spoke-0-0, spoke-0-1, ..., hub-1, spoke-1-0, ...]
     const allNodes = [];
     for (let h = 0; h < cfg.batch_nodes; h++) {
-      allNodes.push({ typeId: 1, key: `hub-${h}` });
+      allNodes.push(nodeInput('Person', `hub-${h}`));
       for (let i = 0; i < cfg.fanout; i++) {
-        allNodes.push({ typeId: 1, key: `dt-${h}-${i}` });
+        allNodes.push(nodeInput('Person', `dt-${h}-${i}`));
       }
     }
     const allNodeIds = db.batchUpsertNodes(allNodes);
@@ -922,7 +1178,7 @@ try {
       const hubId = allNodeIds[h * stride];
       hubIds.push(hubId);
       for (let i = 0; i < cfg.fanout; i++) {
-        degEdges.push({ from: hubId, to: allNodeIds[h * stride + 1 + i], typeId: 1, weight: 1.0 });
+        degEdges.push({ from: hubId, to: allNodeIds[h * stride + 1 + i], label: 'LINKS_TO', weight: 1.0 });
       }
     }
     db.batchUpsertEdges(degEdges);
@@ -952,15 +1208,15 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'trav-shortest-path'));
     const ids = db.batchUpsertNodes(
-      Array.from({ length: cfg.shortest_path_nodes }, (_, i) => ({ typeId: 1, key: `sp-${i}` }))
+      Array.from({ length: cfg.shortest_path_nodes }, (_, i) => nodeInput('Person', `sp-${i}`))
     );
     const spEdges = [];
     for (let i = 0; i < ids.length; i++) {
       const from = ids[i];
       const to1 = ids[(i + cfg.shortest_path_edge_offsets[0]) % ids.length];
       const to2 = ids[(i + cfg.shortest_path_edge_offsets[1]) % ids.length];
-      spEdges.push({ from, to: to1, typeId: 1, weight: 1.0 });
-      spEdges.push({ from, to: to2, typeId: 1, weight: 1.0 });
+      spEdges.push({ from, to: to1, label: 'LINKS_TO', weight: 1.0 });
+      spEdges.push({ from, to: to2, label: 'LINKS_TO', weight: 1.0 });
     }
     db.batchUpsertEdges(spEdges);
     const spFrom = ids[0];
@@ -995,15 +1251,15 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'trav-is-connected'));
     const ids = db.batchUpsertNodes(
-      Array.from({ length: cfg.shortest_path_nodes }, (_, i) => ({ typeId: 1, key: `ic-${i}` }))
+      Array.from({ length: cfg.shortest_path_nodes }, (_, i) => nodeInput('Person', `ic-${i}`))
     );
     const icEdges = [];
     for (let i = 0; i < ids.length; i++) {
       const from = ids[i];
       const to1 = ids[(i + cfg.shortest_path_edge_offsets[0]) % ids.length];
       const to2 = ids[(i + cfg.shortest_path_edge_offsets[1]) % ids.length];
-      icEdges.push({ from, to: to1, typeId: 1, weight: 1.0 });
-      icEdges.push({ from, to: to2, typeId: 1, weight: 1.0 });
+      icEdges.push({ from, to: to1, label: 'LINKS_TO', weight: 1.0 });
+      icEdges.push({ from, to: to2, label: 'LINKS_TO', weight: 1.0 });
     }
     db.batchUpsertEdges(icEdges);
     const spFrom = ids[0];
@@ -1037,10 +1293,9 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'adv-top-k'));
     const topKNodeIds = db.batchUpsertNodes([
-      { typeId: 1, key: 'hub' },
+      nodeInput('Person', 'hub'),
       ...Array.from({ length: cfg.top_k_candidates }, (_, i) => ({
-        typeId: 1,
-        key: `tk-${i}`,
+        ...nodeInput('Person', `tk-${i}`),
       })),
     ]);
     const hub = topKNodeIds[0];
@@ -1048,7 +1303,7 @@ try {
       Array.from({ length: cfg.top_k_candidates }, (_, i) => ({
         from: hub,
         to: topKNodeIds[i + 1],
-        typeId: 1,
+        label: 'LINKS_TO',
         weight: 1.0 + ((i % 100) / 10.0),
       }))
     );
@@ -1083,16 +1338,13 @@ try {
     const db = OverGraph.open(join(tmpRoot, 'adv-time-range'));
     db.batchUpsertNodes(
       Array.from({ length: cfg.time_range_nodes }, (_, i) => ({
-        typeId: 1,
-        key: `tr-${i}`,
-        props: { idx: i },
-        weight: 1.0,
+        ...nodeInput('Person', `tr-${i}`, { props: { idx: i }, weight: 1.0 }),
       }))
     );
     const fromMs = cfg.time_range_from_ms;
     const toMs = Date.now() + cfg.time_range_window_ms;
     const s = runBench(
-      () => db.findNodesByTimeRange(1, fromMs, toMs),
+      () => db.findNodesByTimeRange('Person', fromMs, toMs),
       iterCfg.warmup,
       iterCfg.iters
     );
@@ -1104,7 +1356,7 @@ try {
         s,
         iterCfg,
         {
-          type_id: 1,
+          label: 'Person',
           preload_nodes: cfg.time_range_nodes,
           from_ms: cfg.time_range_from_ms,
           to_ms_window: cfg.time_range_window_ms,
@@ -1121,15 +1373,15 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'adv-ppr'));
     const ids = db.batchUpsertNodes(
-      Array.from({ length: cfg.ppr_nodes }, (_, i) => ({ typeId: 1, key: `ppr-${i}` }))
+      Array.from({ length: cfg.ppr_nodes }, (_, i) => nodeInput('Person', `ppr-${i}`))
     );
     const pprEdges = [];
     for (let i = 0; i < ids.length; i++) {
       const from = ids[i];
       const to1 = ids[(i + cfg.ppr_edge_offsets[0]) % ids.length];
       const to2 = ids[(i + cfg.ppr_edge_offsets[1]) % ids.length];
-      pprEdges.push({ from, to: to1, typeId: 1, weight: 1.0 });
-      pprEdges.push({ from, to: to2, typeId: 1, weight: 0.7 });
+      pprEdges.push({ from, to: to1, label: 'LINKS_TO', weight: 1.0 });
+      pprEdges.push({ from, to: to2, label: 'LINKS_TO', weight: 0.7 });
     }
     db.batchUpsertEdges(pprEdges);
     const s = runBench(
@@ -1168,13 +1420,13 @@ try {
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
     const db = OverGraph.open(join(tmpRoot, 'adv-export'));
     const ids = db.batchUpsertNodes(
-      Array.from({ length: cfg.export_nodes }, (_, i) => ({ typeId: 1, key: `ex-${i}` }))
+      Array.from({ length: cfg.export_nodes }, (_, i) => nodeInput('Person', `ex-${i}`))
     );
     const exportEdges = [];
     for (let i = 0; i < cfg.export_edges; i++) {
       const from = ids[i % ids.length];
       const to = ids[(i * 13 + 7) % ids.length];
-      if (from !== to) exportEdges.push({ from, to, typeId: 1, weight: 1.0 });
+      if (from !== to) exportEdges.push({ from, to, label: 'LINKS_TO', weight: 1.0 });
     }
     db.batchUpsertEdges(exportEdges);
     const s = runBench(
@@ -1208,15 +1460,12 @@ try {
     const s = runBench(
       (i) => {
         const nodes = Array.from({ length: cfg.flush_nodes_per_iter }, (_, j) => ({
-          typeId: 1,
-          key: `fl-${i}-${j}`,
-          props: { idx: j },
-          weight: 1.0,
+          ...nodeInput('Person', `fl-${i}-${j}`, { props: { idx: j }, weight: 1.0 }),
         }));
         const ids = db.batchUpsertNodes(nodes);
         const edges = [];
         for (let j = 0; j < Math.min(cfg.flush_edges_per_iter_cap, ids.length - 1); j++) {
-          edges.push({ from: ids[j], to: ids[j + 1], typeId: 1, weight: 1.0 });
+          edges.push({ from: ids[j], to: ids[j + 1], label: 'LINKS_TO', weight: 1.0 });
         }
         db.batchUpsertEdges(edges);
         db.flush();
@@ -1252,7 +1501,7 @@ try {
     const nodes = Array.from({ length: cfg.vector_nodes }, (_, i) => {
       const seed = 1729 * (i + 1);
       return {
-        typeId: 1,
+        labels: ['Person'],
         key: `v-${i}`,
         denseVector: benchDenseVector(cfg.vector_dim, seed),
         sparseVector: benchSparseVector(cfg.vector_sparse_dims, cfg.vector_nnz, seed + 0xCAFE),

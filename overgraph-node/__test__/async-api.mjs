@@ -9,6 +9,51 @@ function freshDb(tmpDir, name) {
   return OverGraph.open(join(tmpDir, name));
 }
 
+describe('async catalog diagnostics', () => {
+  let tmpDir, db;
+  before(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-async-catalog-'));
+    db = freshDb(tmpDir, 'catalog');
+  });
+  after(async () => { await db.closeAsync(); rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('ensures, gets, and lists node labels and edge labels', async () => {
+    assert.deepEqual(await db.listNodeLabelsAsync(), []);
+    assert.deepEqual(await db.listEdgeLabelsAsync(), []);
+
+    const personId = await db.ensureNodeLabelAsync('Person');
+    const companyId = await db.ensureNodeLabelAsync('Company');
+    const worksAtId = await db.ensureEdgeLabelAsync('WORKS_AT');
+    const knowsId = await db.ensureEdgeLabelAsync('KNOWS');
+
+    assert.equal(await db.ensureNodeLabelAsync('Person'), personId);
+    assert.equal(await db.ensureEdgeLabelAsync('WORKS_AT'), worksAtId);
+    assert.equal(await db.getNodeLabelIdAsync('Person'), personId);
+    assert.equal(await db.getNodeLabelIdAsync('MissingLabel'), null);
+    assert.equal(await db.getEdgeLabelIdAsync('WORKS_AT'), worksAtId);
+    assert.equal(await db.getEdgeLabelIdAsync('MISSING_EDGE'), null);
+    assert.equal(await db.getNodeLabelAsync(personId), 'Person');
+    assert.equal(await db.getNodeLabelAsync(999_999), null);
+    assert.equal(await db.getEdgeLabelAsync(worksAtId), 'WORKS_AT');
+    assert.equal(await db.getEdgeLabelAsync(999_999), null);
+
+    assert.deepEqual(
+      (await db.listNodeLabelsAsync()).sort((a, b) => a.labelId - b.labelId),
+      [
+        { label: 'Person', labelId: personId },
+        { label: 'Company', labelId: companyId },
+      ],
+    );
+    assert.deepEqual(
+      (await db.listEdgeLabelsAsync()).sort((a, b) => a.labelId - b.labelId),
+      [
+        { label: 'WORKS_AT', labelId: worksAtId },
+        { label: 'KNOWS', labelId: knowsId },
+      ],
+    );
+  });
+});
+
 describe('async upsert + get', () => {
   let tmpDir, db;
   before(() => {
@@ -18,25 +63,25 @@ describe('async upsert + get', () => {
   after(async () => { await db.closeAsync(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('upsertNodeAsync returns a number', async () => {
-    const id = await db.upsertNodeAsync(1, 'alice', { props: { age: 30 }, weight: 0.9 });
+    const id = await db.upsertNodeAsync('Person', 'alice', { props: { age: 30 }, weight: 0.9 });
     assert.equal(typeof id, 'number');
     assert.ok(id > 0);
   });
 
   it('upsertEdgeAsync returns a number', async () => {
-    const a = await db.upsertNodeAsync(1, 'src');
-    const b = await db.upsertNodeAsync(1, 'dst');
-    const eid = await db.upsertEdgeAsync(a, b, 5, { props: { rel: 'knows' }, weight: 1.5 });
+    const a = await db.upsertNodeAsync('Person', 'src');
+    const b = await db.upsertNodeAsync('Person', 'dst');
+    const eid = await db.upsertEdgeAsync(a, b, 'DEPENDS_ON', { props: { rel: 'knows' }, weight: 1.5 });
     assert.equal(typeof eid, 'number');
     assert.ok(eid > 0);
   });
 
   it('getNodeAsync returns full record', async () => {
-    const id = await db.upsertNodeAsync(2, 'bob', { props: { color: 'red' } });
+    const id = await db.upsertNodeAsync('Company', 'bob', { props: { color: 'red' } });
     const n = await db.getNodeAsync(id);
     assert.ok(n);
     assert.equal(n.id, id);
-    assert.equal(n.typeId, 2);
+    assert.deepEqual(n.labels, ['Company']);
     assert.equal(n.key, 'bob');
     assert.equal(n.props.color, 'red');
   });
@@ -47,14 +92,25 @@ describe('async upsert + get', () => {
   });
 
   it('getEdgeAsync returns full record', async () => {
-    const a = await db.upsertNodeAsync(1, 'ea');
-    const b = await db.upsertNodeAsync(1, 'eb');
-    const eid = await db.upsertEdgeAsync(a, b, 10, { props: { kind: 'test' } });
+    const a = await db.upsertNodeAsync('Person', 'ea');
+    const b = await db.upsertNodeAsync('Person', 'eb');
+    const eid = await db.upsertEdgeAsync(a, b, 'WORKS_AT', { props: { kind: 'test' } });
     const e = await db.getEdgeAsync(eid);
     assert.ok(e);
     assert.equal(e.id, eid);
-    assert.equal(e.typeId, 10);
+    assert.equal(e.label, 'WORKS_AT');
     assert.equal(e.props.kind, 'test');
+  });
+
+  it('addNodeLabelAsync and removeNodeLabelAsync return changed flags', async () => {
+    const id = await db.upsertNodeAsync(['Person'], 'label-mutation');
+    assert.equal(await db.addNodeLabelAsync(id, 'Admin'), true);
+    assert.equal(await db.addNodeLabelAsync(id, 'Admin'), false);
+    const withLabel = await db.getNodeAsync(id);
+    assert.deepEqual([...withLabel.labels].sort(), ['Admin', 'Person']);
+    assert.equal(await db.removeNodeLabelAsync(id, 'Admin'), true);
+    assert.equal(await db.removeNodeLabelAsync(id, 'Admin'), false);
+    assert.deepEqual((await db.getNodeAsync(id)).labels, ['Person']);
   });
 });
 
@@ -68,8 +124,8 @@ describe('async batch upserts', () => {
 
   it('batchUpsertNodesAsync returns Float64Array', async () => {
     const ids = await db.batchUpsertNodesAsync([
-      { typeId: 1, key: 'n1' },
-      { typeId: 1, key: 'n2', props: { x: 1 } },
+      { labels: ['Person'], key: 'n1' },
+      { labels: ['Person'], key: 'n2', props: { x: 1 } },
     ]);
     assert.ok(ids instanceof Float64Array);
     assert.equal(ids.length, 2);
@@ -78,11 +134,11 @@ describe('async batch upserts', () => {
 
   it('batchUpsertEdgesAsync returns Float64Array', async () => {
     const [a, b] = await db.batchUpsertNodesAsync([
-      { typeId: 1, key: 'ba' },
-      { typeId: 1, key: 'bb' },
+      { labels: ['Person'], key: 'ba' },
+      { labels: ['Person'], key: 'bb' },
     ]);
     const eids = await db.batchUpsertEdgesAsync([
-      { from: a, to: b, typeId: 5 },
+      { from: a, to: b, label: 'DEPENDS_ON'},
     ]);
     assert.ok(eids instanceof Float64Array);
     assert.equal(eids.length, 1);
@@ -100,14 +156,15 @@ describe('async write transactions', () => {
   it('stages, reads, and commits asynchronously', async () => {
     const txn = await db.beginWriteTxnAsync();
     await txn.stageAsync([
-      { op: 'upsertNode', alias: 'alice', typeId: 1, key: 'alice', props: { name: 'Alice' } },
-      { op: 'upsertNode', alias: 'bob', typeId: 1, key: 'bob' },
-      { op: 'upsertEdge', alias: 'knows', from: { local: 'alice' }, to: { local: 'bob' }, typeId: 7 },
+      { op: 'upsertNode', alias: 'alice', labels: ['Person'], key: 'alice', props: { name: 'Alice' } },
+      { op: 'upsertNode', alias: 'bob', labels: ['Person'], key: 'bob' },
+      { op: 'upsertEdge', alias: 'knows', from: { local: 'alice' }, to: { local: 'bob' }, label: 'KNOWS'},
     ]);
 
     const staged = await txn.getNodeAsync({ local: 'alice' });
     assert.ok(staged);
     assert.equal(staged.id, undefined);
+    assert.deepEqual(staged.labels, ['Person']);
     assert.equal(staged.props.name, 'Alice');
 
     const result = await txn.commitAsync();
@@ -119,24 +176,24 @@ describe('async write transactions', () => {
 
   it('supports async builders and rollback', async () => {
     const txn = db.beginWriteTxn();
-    const alice = await txn.upsertNodeAsAsync('async-alice', 1, 'async-alice', {
+    const alice = await txn.upsertNodeAsAsync('async-alice', 'Person', 'async-alice', {
       props: { mood: 'staged' },
     });
-    const bob = await txn.upsertNodeAsAsync('async-bob', 1, 'async-bob');
-    await txn.upsertEdgeAsAsync('async-knows', alice, bob, 9);
+    const bob = await txn.upsertNodeAsAsync('async-bob', 'Person', 'async-bob');
+    await txn.upsertEdgeAsAsync('async-knows', alice, bob, 'FOLLOWS');
 
-    const staged = await txn.getNodeByKeyAsync(1, 'async-alice');
+    const staged = await txn.getNodeByKeyAsync('Person', 'async-alice');
     assert.ok(staged);
     assert.equal(staged.props.mood, 'staged');
 
     await txn.rollbackAsync();
-    assert.equal(await db.getNodeByKeyAsync(1, 'async-alice'), null);
+    assert.equal(await db.getNodeByKeyAsync('Person', 'async-alice'), null);
   });
 
   it('preserves async transaction call order when promises are started together', async () => {
     const txn = await db.beginWriteTxnAsync();
     const stage = txn.stageAsync([
-      { op: 'upsertNode', alias: 'queued', typeId: 1, key: 'queued' },
+      { op: 'upsertNode', alias: 'queued', labels: ['Person'], key: 'queued' },
     ]);
     const read = txn.getNodeAsync({ local: 'queued' });
     const commit = txn.commitAsync();
@@ -160,27 +217,27 @@ describe('async delete + neighbors + find', () => {
   after(async () => { await db.closeAsync(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('deleteNodeAsync removes a node', async () => {
-    const id = await db.upsertNodeAsync(1, 'doomed');
+    const id = await db.upsertNodeAsync('Person', 'doomed');
     assert.ok(await db.getNodeAsync(id));
     await db.deleteNodeAsync(id);
     assert.equal(await db.getNodeAsync(id), null);
   });
 
   it('deleteEdgeAsync removes an edge', async () => {
-    const a = await db.upsertNodeAsync(1, 'da');
-    const b = await db.upsertNodeAsync(1, 'db');
-    const eid = await db.upsertEdgeAsync(a, b, 1);
+    const a = await db.upsertNodeAsync('Person', 'da');
+    const b = await db.upsertNodeAsync('Person', 'db');
+    const eid = await db.upsertEdgeAsync(a, b, 'LINKS_TO');
     assert.ok(await db.getEdgeAsync(eid));
     await db.deleteEdgeAsync(eid);
     assert.equal(await db.getEdgeAsync(eid), null);
   });
 
   it('neighborsAsync returns correct results', async () => {
-    const c = await db.upsertNodeAsync(1, 'center');
-    const n1 = await db.upsertNodeAsync(1, 'nbr1');
-    const n2 = await db.upsertNodeAsync(1, 'nbr2');
-    await db.upsertEdgeAsync(c, n1, 10, { weight: 1 });
-    await db.upsertEdgeAsync(c, n2, 10, { weight: 2 });
+    const c = await db.upsertNodeAsync('Person', 'center');
+    const n1 = await db.upsertNodeAsync('Person', 'nbr1');
+    const n2 = await db.upsertNodeAsync('Person', 'nbr2');
+    await db.upsertEdgeAsync(c, n1, 'WORKS_AT', { weight: 1 });
+    await db.upsertEdgeAsync(c, n2, 'WORKS_AT', { weight: 2 });
 
     const result = await db.neighborsAsync(c, { direction: 'outgoing' });
     assert.ok(Array.isArray(result));
@@ -189,11 +246,11 @@ describe('async delete + neighbors + find', () => {
   });
 
   it('topKNeighborsAsync returns plain neighbor entry arrays', async () => {
-    const c = await db.upsertNodeAsync(1, 'topk-center');
-    const n1 = await db.upsertNodeAsync(1, 'topk-nbr1');
-    const n2 = await db.upsertNodeAsync(1, 'topk-nbr2');
-    await db.upsertEdgeAsync(c, n1, 10, { weight: 1 });
-    await db.upsertEdgeAsync(c, n2, 10, { weight: 2 });
+    const c = await db.upsertNodeAsync('Person', 'topk-center');
+    const n1 = await db.upsertNodeAsync('Person', 'topk-nbr1');
+    const n2 = await db.upsertNodeAsync('Person', 'topk-nbr2');
+    await db.upsertEdgeAsync(c, n1, 'WORKS_AT', { weight: 1 });
+    await db.upsertEdgeAsync(c, n2, 'WORKS_AT', { weight: 2 });
 
     const result = await db.topKNeighborsAsync(c, 2, { direction: 'outgoing', scoring: 'weight' });
     assert.ok(Array.isArray(result));
@@ -205,11 +262,11 @@ describe('async delete + neighbors + find', () => {
   });
 
   it('traverseAsync returns 2nd-hop nodes', async () => {
-    const a = await db.upsertNodeAsync(1, 'hop-a');
-    const b = await db.upsertNodeAsync(1, 'hop-b');
-    const c = await db.upsertNodeAsync(1, 'hop-c');
-    await db.upsertEdgeAsync(a, b, 10);
-    await db.upsertEdgeAsync(b, c, 10);
+    const a = await db.upsertNodeAsync('Person', 'hop-a');
+    const b = await db.upsertNodeAsync('Person', 'hop-b');
+    const c = await db.upsertNodeAsync('Person', 'hop-c');
+    await db.upsertEdgeAsync(a, b, 'WORKS_AT');
+    await db.upsertEdgeAsync(b, c, 'WORKS_AT');
 
     const page = await db.traverseAsync(a, 2, { minDepth: 2, direction: 'outgoing' });
     const nodeSet = new Set(page.items.map(hit => hit.nodeId));
@@ -219,11 +276,11 @@ describe('async delete + neighbors + find', () => {
   });
 
   it('findNodesAsync returns matching ids', async () => {
-    await db.upsertNodeAsync(7, 'fa', { props: { city: 'NYC' } });
-    await db.upsertNodeAsync(7, 'fb', { props: { city: 'NYC' } });
-    await db.upsertNodeAsync(7, 'fc', { props: { city: 'LA' } });
+    await db.upsertNodeAsync('CityResident', 'fa', { props: { city: 'NYC' } });
+    await db.upsertNodeAsync('CityResident', 'fb', { props: { city: 'NYC' } });
+    await db.upsertNodeAsync('CityResident', 'fc', { props: { city: 'LA' } });
 
-    const ids = await db.findNodesAsync(7, 'city', 'NYC');
+    const ids = await db.findNodesAsync('CityResident', 'city', 'NYC');
     assert.ok(ids instanceof Float64Array);
     assert.equal(ids.length, 2);
   });
@@ -238,7 +295,7 @@ describe('async flush + compact', () => {
   after(async () => { await db.closeAsync(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('flushAsync resolves without error', async () => {
-    await db.upsertNodeAsync(1, 'flushed');
+    await db.upsertNodeAsync('Person', 'flushed');
     await db.flushAsync();
   });
 
@@ -256,11 +313,11 @@ describe('async flush + compact', () => {
 
     try {
       for (let i = 0; i < 50; i++) {
-        testDb.upsertNode(1, `cn-${i}`, { props: { idx: i } });
+        testDb.upsertNode('Person', `cn-${i}`, { props: { idx: i } });
       }
       await testDb.flushAsync();
       for (let i = 50; i < 100; i++) {
-        testDb.upsertNode(1, `cn-${i}`, { props: { idx: i } });
+        testDb.upsertNode('Person', `cn-${i}`, { props: { idx: i } });
       }
       await testDb.flushAsync();
 
@@ -292,11 +349,11 @@ describe('compactWithProgressAsync', () => {
 
   it('returns stats and calls progress callback', async () => {
     for (let i = 0; i < 50; i++) {
-      db.upsertNode(1, `cp-${i}`, { props: { idx: i } });
+      db.upsertNode('Person', `cp-${i}`, { props: { idx: i } });
     }
     await db.flushAsync();
     for (let i = 50; i < 100; i++) {
-      db.upsertNode(1, `cp-${i}`, { props: { idx: i } });
+      db.upsertNode('Person', `cp-${i}`, { props: { idx: i } });
     }
     await db.flushAsync();
 
@@ -316,11 +373,11 @@ describe('compactWithProgressAsync', () => {
 
   it('does not block event loop during compaction', async () => {
     for (let i = 0; i < 100; i++) {
-      db.upsertNode(2, `nb2-${i}`, { props: { data: 'y'.repeat(50) } });
+      db.upsertNode('Company', `nb2-${i}`, { props: { data: 'y'.repeat(50) } });
     }
     await db.flushAsync();
     for (let i = 100; i < 200; i++) {
-      db.upsertNode(2, `nb2-${i}`, { props: { data: 'y'.repeat(50) } });
+      db.upsertNode('Company', `nb2-${i}`, { props: { data: 'y'.repeat(50) } });
     }
     await db.flushAsync();
 
@@ -347,7 +404,7 @@ describe('async does not block event loop', () => {
   it('setTimeout fires during async flush', async () => {
     // Insert enough data to make flush take a moment
     for (let i = 0; i < 200; i++) {
-      db.upsertNode(1, `nb-${i}`, { props: { data: 'x'.repeat(100) } });
+      db.upsertNode('Person', `nb-${i}`, { props: { data: 'x'.repeat(100) } });
     }
 
     let timerFired = false;

@@ -1,7 +1,7 @@
 """Vector search tests for the Python connector (Phase 19f)."""
 
 import pytest
-from overgraph import OverGraph, PyVectorHit
+from overgraph import OverGraph, VectorHit
 
 
 @pytest.fixture
@@ -12,19 +12,19 @@ def hybrid_db(tmp_path):
         dense_vector_metric="cosine",
     )
     # Node 1: dense rank #1, sparse rank #4
-    n1 = db.upsert_node(1, "n1", dense_vector=[0.95, 0.05, 0.05, 0.05],
+    n1 = db.upsert_node("Person", "n1", dense_vector=[0.95, 0.05, 0.05, 0.05],
                          sparse_vector=[(0, 0.2), (1, 0.1)])
     # Node 2: dense rank #4, sparse rank #1
-    n2 = db.upsert_node(1, "n2", dense_vector=[0.3, 0.5, 0.5, 0.5],
+    n2 = db.upsert_node("Person", "n2", dense_vector=[0.3, 0.5, 0.5, 0.5],
                          sparse_vector=[(0, 0.9), (1, 0.8), (2, 0.7)])
     # Node 3: dense rank #2, sparse rank #2. Balanced.
-    n3 = db.upsert_node(1, "n3", dense_vector=[0.85, 0.1, 0.1, 0.1],
+    n3 = db.upsert_node("Person", "n3", dense_vector=[0.85, 0.1, 0.1, 0.1],
                          sparse_vector=[(0, 0.7), (1, 0.6)])
     # Node 4: dense rank #3, sparse rank #3
-    n4 = db.upsert_node(1, "n4", dense_vector=[0.6, 0.3, 0.3, 0.3],
+    n4 = db.upsert_node("Person", "n4", dense_vector=[0.6, 0.3, 0.3, 0.3],
                          sparse_vector=[(0, 0.5), (2, 0.3)])
     # Node 5: dense rank #5, sparse rank #5
-    n5 = db.upsert_node(1, "n5", dense_vector=[0.1, 0.4, 0.6, 0.6],
+    n5 = db.upsert_node("Person", "n5", dense_vector=[0.1, 0.4, 0.6, 0.6],
                          sparse_vector=[(1, 0.1)])
     db.flush()
     yield db, [n1, n2, n3, n4, n5]
@@ -32,6 +32,19 @@ def hybrid_db(tmp_path):
 
 
 class TestDenseSearch:
+    def test_hydrated_node_records_preserve_vectors(self, hybrid_db):
+        db, ids = hybrid_db
+        node = db.get_node(ids[0])
+        assert node.dense_vector == pytest.approx([0.95, 0.05, 0.05, 0.05])
+        assert [dim for dim, _ in node.sparse_vector] == [0, 1]
+        assert [weight for _, weight in node.sparse_vector] == pytest.approx([0.2, 0.1])
+
+        queried = db.query_nodes({"label_filter": {"labels": ["Person"], "mode": "all"}, "keys": ["n1"]})
+        assert len(queried.items) == 1
+        assert queried.items[0].dense_vector == pytest.approx([0.95, 0.05, 0.05, 0.05])
+        assert [dim for dim, _ in queried.items[0].sparse_vector] == [0, 1]
+        assert [weight for _, weight in queried.items[0].sparse_vector] == pytest.approx([0.2, 0.1])
+
     def test_returns_sorted_results(self, hybrid_db):
         db, ids = hybrid_db
         hits = db.vector_search("dense", 5, dense_query=[1, 0, 0, 0])
@@ -156,12 +169,12 @@ class TestVectorSearchScope:
         ids = []
         for i in range(4):
             ids.append(db.upsert_node(
-                1, f"n{i}",
+                "Person", f"n{i}",
                 dense_vector=[1, 0, 0, 0],
                 sparse_vector=[(0, (i + 1) * 0.3)],
             ))
-        db.upsert_edge(ids[0], ids[1], 1)
-        db.upsert_edge(ids[1], ids[2], 1)
+        db.upsert_edge(ids[0], ids[1], "RELATES_TO")
+        db.upsert_edge(ids[1], ids[2], "RELATES_TO")
         db.flush()
 
         hits = db.vector_search(

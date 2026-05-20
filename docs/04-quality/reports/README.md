@@ -24,6 +24,10 @@ Additional report assets:
 Historical naming note:
 - Pre-Phase 18c benchmark artifacts may label `S-TRAV-002` as `neighbors_2hop`.
 - That scenario now maps to `traverse_depth_2`, meaning `traverse(start, min_depth=2, max_depth=2, ...)`.
+- Pre-CP30.5 archived run payloads may include old numeric-token field names in
+  `scenario_params`. They are immutable historical benchmark artifacts and are excluded
+  from current public API vocabulary audits; new runs should use label-ID metadata where
+  numeric labels are recorded.
 
 Regression comparison outputs are typically stored alongside runs or under:
 

@@ -1,7 +1,25 @@
+use crate::edge_metadata::EdgeMetadataCandidate;
+#[cfg(test)]
+use crate::edge_metadata::{i64_matches_bounds, weight_matches_bounds, RangeBoundFlags};
 use crate::types::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::ControlFlow;
+use std::ops::{Bound, ControlFlow};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
+
+#[cfg(test)]
+static ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_endpoint_cursor_entries_visited_for_test() {
+    ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn endpoint_cursor_entries_visited_for_test() -> usize {
+    ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.load(Ordering::Relaxed)
+}
 
 fn encode_signed_range_key(value: i64) -> u64 {
     (value as u64) ^ (1u64 << 63)
@@ -40,7 +58,7 @@ pub(crate) fn encode_range_prop_value(
 #[derive(Debug, Clone)]
 pub struct AdjEntry {
     pub edge_id: u64,
-    pub type_id: u32,
+    pub label_id: u32,
     pub neighbor_id: u64,
     pub weight: f32,
     pub valid_from: i64,
@@ -107,6 +125,12 @@ type SecondaryEqMemberState = HashMap<u64, NodeIdMap<MembershipSlot<()>>>;
 type SecondaryEqState = HashMap<u64, SecondaryEqMemberState>;
 type SecondaryRangeState = HashMap<u64, BTreeMap<(u64, u64), MembershipSlot<()>>>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MemtableEndpointCountEstimate {
+    pub(crate) count: usize,
+    pub(crate) exact: bool,
+}
+
 fn apply_size_delta(total: &mut usize, before: usize, after: usize) {
     if after >= before {
         *total += after - before;
@@ -143,7 +167,8 @@ fn estimate_adj_slot(slot: &MembershipSlot<AdjEntry>) -> usize {
 
 fn estimate_secondary_decl_entry(entry: &SecondaryIndexManifestEntry) -> usize {
     let prop_key_len = match &entry.target {
-        SecondaryIndexTarget::NodeProperty { prop_key, .. } => prop_key.len(),
+        SecondaryIndexTarget::NodeProperty { prop_key, .. }
+        | SecondaryIndexTarget::EdgeProperty { prop_key, .. } => prop_key.len(),
     };
     96 + prop_key_len + entry.last_error.as_ref().map(|msg| msg.len()).unwrap_or(0)
 }
@@ -188,12 +213,19 @@ struct MemtableState {
     edge_triple_index: HashMap<(u64, u64, u32), LookupSlot<u64>>,
     adj_out: NodeIdMap<NodeIdMap<MembershipSlot<AdjEntry>>>,
     adj_in: NodeIdMap<NodeIdMap<MembershipSlot<AdjEntry>>>,
-    type_node_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
-    type_edge_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
+    ordered_edge_ids: BTreeMap<u64, MembershipSlot<()>>,
+    ordered_label_edge_index: BTreeMap<(u32, u64), MembershipSlot<()>>,
+    ordered_adj_out: NodeIdMap<BTreeMap<u64, MembershipSlot<AdjEntry>>>,
+    ordered_adj_in: NodeIdMap<BTreeMap<u64, MembershipSlot<AdjEntry>>>,
+    label_node_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
+    label_edge_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
     time_node_index: BTreeMap<(u32, i64, u64), MembershipSlot<()>>,
     secondary_index_declarations: HashMap<u64, SecondaryIndexManifestEntry>,
     secondary_eq_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
     secondary_range_by_prop: HashMap<u32, HashMap<String, Vec<(u64, SecondaryIndexRangeDomain)>>>,
+    secondary_edge_eq_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
+    secondary_edge_range_by_prop:
+        HashMap<u32, HashMap<String, Vec<(u64, SecondaryIndexRangeDomain)>>>,
     secondary_eq_state: SecondaryEqState,
     secondary_range_state: SecondaryRangeState,
 }
@@ -242,11 +274,11 @@ fn current_adj_map(
     result
 }
 
-fn current_type_index(
+fn current_label_membership_index(
     source: &HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
 ) -> HashMap<u32, NodeIdSet> {
     let mut result = HashMap::new();
-    for (&type_id, members) in source {
+    for (&target_label_id, members) in source {
         let mut visible = NodeIdSet::default();
         for (&member_id, slot) in members {
             if slot_option_current(slot).is_some() {
@@ -254,7 +286,7 @@ fn current_type_index(
             }
         }
         if !visible.is_empty() {
-            result.insert(type_id, visible);
+            result.insert(target_label_id, visible);
         }
     }
     result
@@ -342,8 +374,8 @@ impl MemtableState {
         }
     }
 
-    fn set_node_key(&mut self, type_id: u32, key: &str, value: Option<u64>, write_seq: u64) {
-        let by_key = self.node_key_index.entry(type_id).or_default();
+    fn set_node_key(&mut self, label_id: u32, key: &str, value: Option<u64>, write_seq: u64) {
+        let by_key = self.node_key_index.entry(label_id).or_default();
         if let Some(slot) = by_key.get_mut(key) {
             let before = estimate_lookup_slot(slot);
             slot.replace(write_seq, value);
@@ -360,11 +392,11 @@ impl MemtableState {
         &mut self,
         from: u64,
         to: u64,
-        type_id: u32,
+        label_id: u32,
         value: Option<u64>,
         write_seq: u64,
     ) {
-        if let Some(slot) = self.edge_triple_index.get_mut(&(from, to, type_id)) {
+        if let Some(slot) = self.edge_triple_index.get_mut(&(from, to, label_id)) {
             let before = estimate_lookup_slot(slot);
             slot.replace(write_seq, value);
             let after = estimate_lookup_slot(slot);
@@ -372,7 +404,7 @@ impl MemtableState {
         } else {
             let slot = VersionedSlot::new(write_seq, value);
             self.estimated_bytes += estimate_lookup_slot(&slot);
-            self.edge_triple_index.insert((from, to, type_id), slot);
+            self.edge_triple_index.insert((from, to, label_id), slot);
         }
     }
 
@@ -397,15 +429,36 @@ impl MemtableState {
         }
     }
 
-    fn set_type_slot(
+    fn set_ordered_adj_slot(
+        map: &mut NodeIdMap<BTreeMap<u64, MembershipSlot<AdjEntry>>>,
+        owner_id: u64,
+        member_id: u64,
+        value: Option<AdjEntry>,
+        write_seq: u64,
+    ) -> (usize, usize) {
+        let members = map.entry(owner_id).or_default();
+        if let Some(slot) = members.get_mut(&member_id) {
+            let before = estimate_adj_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_adj_slot(slot);
+            (before, after)
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            let after = estimate_adj_slot(&slot);
+            members.insert(member_id, slot);
+            (0, after)
+        }
+    }
+
+    fn set_label_membership_slot(
         map: &mut HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
-        type_id: u32,
+        target_label_id: u32,
         member_id: u64,
         present: bool,
         write_seq: u64,
     ) -> (usize, usize) {
         let value = present.then_some(());
-        let members = map.entry(type_id).or_default();
+        let members = map.entry(target_label_id).or_default();
         if let Some(slot) = members.get_mut(&member_id) {
             let before = estimate_membership_slot(slot);
             slot.replace(write_seq, value);
@@ -460,6 +513,41 @@ impl MemtableState {
         }
     }
 
+    fn set_ordered_edge_slot(&mut self, edge_id: u64, present: bool, write_seq: u64) {
+        let value = present.then_some(());
+        if let Some(slot) = self.ordered_edge_ids.get_mut(&edge_id) {
+            let before = estimate_membership_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_membership_slot(slot);
+            apply_size_delta(&mut self.estimated_bytes, before, after);
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            self.estimated_bytes += estimate_membership_slot(&slot);
+            self.ordered_edge_ids.insert(edge_id, slot);
+        }
+    }
+
+    fn set_ordered_edge_label_slot(
+        &mut self,
+        label_id: u32,
+        edge_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) {
+        let value = present.then_some(());
+        let key = (label_id, edge_id);
+        if let Some(slot) = self.ordered_label_edge_index.get_mut(&key) {
+            let before = estimate_membership_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_membership_slot(slot);
+            apply_size_delta(&mut self.estimated_bytes, before, after);
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            self.estimated_bytes += estimate_membership_slot(&slot);
+            self.ordered_label_edge_index.insert(key, slot);
+        }
+    }
+
     fn set_secondary_eq_slot_in(
         state: &mut SecondaryEqState,
         index_id: u64,
@@ -510,10 +598,16 @@ impl MemtableState {
         }
     }
 
-    fn set_node_type_slot(&mut self, type_id: u32, member_id: u64, present: bool, write_seq: u64) {
-        let (before, after) = Self::set_type_slot(
-            &mut self.type_node_index,
-            type_id,
+    fn set_node_label_slot(
+        &mut self,
+        label_id: u32,
+        member_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) {
+        let (before, after) = Self::set_label_membership_slot(
+            &mut self.label_node_index,
+            label_id,
             member_id,
             present,
             write_seq,
@@ -521,10 +615,16 @@ impl MemtableState {
         apply_size_delta(&mut self.estimated_bytes, before, after);
     }
 
-    fn set_edge_type_slot(&mut self, type_id: u32, member_id: u64, present: bool, write_seq: u64) {
-        let (before, after) = Self::set_type_slot(
-            &mut self.type_edge_index,
-            type_id,
+    fn set_edge_label_slot(
+        &mut self,
+        label_id: u32,
+        member_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) {
+        let (before, after) = Self::set_label_membership_slot(
+            &mut self.label_edge_index,
+            label_id,
             member_id,
             present,
             write_seq,
@@ -539,8 +639,21 @@ impl MemtableState {
         value: Option<AdjEntry>,
         write_seq: u64,
     ) {
-        let (before, after) =
-            Self::set_adj_slot(&mut self.adj_out, owner_id, member_id, value, write_seq);
+        let (before, after) = Self::set_adj_slot(
+            &mut self.adj_out,
+            owner_id,
+            member_id,
+            value.clone(),
+            write_seq,
+        );
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+        let (before, after) = Self::set_ordered_adj_slot(
+            &mut self.ordered_adj_out,
+            owner_id,
+            member_id,
+            value,
+            write_seq,
+        );
         apply_size_delta(&mut self.estimated_bytes, before, after);
     }
 
@@ -551,8 +664,21 @@ impl MemtableState {
         value: Option<AdjEntry>,
         write_seq: u64,
     ) {
-        let (before, after) =
-            Self::set_adj_slot(&mut self.adj_in, owner_id, member_id, value, write_seq);
+        let (before, after) = Self::set_adj_slot(
+            &mut self.adj_in,
+            owner_id,
+            member_id,
+            value.clone(),
+            write_seq,
+        );
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+        let (before, after) = Self::set_ordered_adj_slot(
+            &mut self.ordered_adj_in,
+            owner_id,
+            member_id,
+            value,
+            write_seq,
+        );
         apply_size_delta(&mut self.estimated_bytes, before, after);
     }
 
@@ -640,8 +766,28 @@ impl MemtableState {
             .values()
             .map(|entries| entries.values().map(estimate_adj_slot).sum::<usize>())
             .sum();
-        let type_idx_size: usize = self
-            .type_node_index
+        let ordered_edge_size: usize = self
+            .ordered_edge_ids
+            .values()
+            .map(estimate_membership_slot)
+            .sum::<usize>()
+            + self
+                .ordered_label_edge_index
+                .values()
+                .map(estimate_membership_slot)
+                .sum::<usize>();
+        let ordered_adj_size: usize = self
+            .ordered_adj_out
+            .values()
+            .map(|entries| entries.values().map(estimate_adj_slot).sum::<usize>())
+            .sum::<usize>()
+            + self
+                .ordered_adj_in
+                .values()
+                .map(|entries| entries.values().map(estimate_adj_slot).sum::<usize>())
+                .sum::<usize>();
+        let label_idx_size: usize = self
+            .label_node_index
             .values()
             .map(|members| {
                 members
@@ -651,7 +797,7 @@ impl MemtableState {
             })
             .sum::<usize>()
             + self
-                .type_edge_index
+                .label_edge_index
                 .values()
                 .map(|members| {
                     members
@@ -694,6 +840,30 @@ impl MemtableState {
                     .sum::<usize>()
             })
             .sum();
+        let secondary_edge_eq_lookup_size: usize = self
+            .secondary_edge_eq_by_prop
+            .values()
+            .map(|by_prop| {
+                by_prop
+                    .iter()
+                    .map(|(prop_key, index_ids)| {
+                        estimate_secondary_eq_lookup_entry(prop_key, index_ids)
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        let secondary_edge_range_lookup_size: usize = self
+            .secondary_edge_range_by_prop
+            .values()
+            .map(|by_prop| {
+                by_prop
+                    .iter()
+                    .map(|(prop_key, indexes)| {
+                        estimate_secondary_range_lookup_entry(prop_key, indexes)
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
         let secondary_eq_state_size: usize = self
             .secondary_eq_state
             .values()
@@ -726,11 +896,15 @@ impl MemtableState {
             + edge_triple_size
             + adj_out_size
             + adj_in_size
-            + type_idx_size
+            + ordered_edge_size
+            + ordered_adj_size
+            + label_idx_size
             + time_idx_size
             + secondary_decl_size
             + secondary_eq_lookup_size
             + secondary_range_lookup_size
+            + secondary_edge_eq_lookup_size
+            + secondary_edge_range_lookup_size
             + secondary_eq_state_size
             + secondary_range_state_size
     }
@@ -743,9 +917,9 @@ impl MemtableState {
         record_current(self.edges.get(&id)?)
     }
 
-    fn current_edge_triple_id(&self, from: u64, to: u64, type_id: u32) -> Option<u64> {
+    fn current_edge_triple_id(&self, from: u64, to: u64, label_id: u32) -> Option<u64> {
         self.edge_triple_index
-            .get(&(from, to, type_id))
+            .get(&(from, to, label_id))
             .and_then(slot_option_current)
             .copied()
     }
@@ -808,99 +982,49 @@ impl MemtableState {
             })
     }
 
-    fn add_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
-        let eq_by_prop = &self.secondary_eq_by_prop;
-        let range_by_prop = &self.secondary_range_by_prop;
-        let mut eq_actions = Vec::new();
-        let mut range_actions = Vec::new();
-        for (prop_key, prop_value) in &node.props {
-            if let Some(index_ids) = eq_by_prop
-                .get(&node.type_id)
-                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                let value_hash = hash_prop_value(prop_value);
-                for &index_id in index_ids {
-                    eq_actions.push((index_id, value_hash));
-                }
-            }
-
-            if let Some(indexes) = range_by_prop
-                .get(&node.type_id)
-                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                for &(index_id, domain) in indexes {
-                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
-                        range_actions.push((index_id, encoded));
-                    }
-                }
-            }
-        }
-        for (index_id, value_hash) in eq_actions {
-            self.set_secondary_eq_slot(index_id, value_hash, node.id, true, write_seq);
-        }
-        for (index_id, encoded) in range_actions {
-            self.set_secondary_range_slot(index_id, encoded, node.id, true, write_seq);
-        }
-    }
-
-    fn remove_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
-        let eq_by_prop = &self.secondary_eq_by_prop;
-        let range_by_prop = &self.secondary_range_by_prop;
-        let mut eq_actions = Vec::new();
-        let mut range_actions = Vec::new();
-        for (prop_key, prop_value) in &node.props {
-            if let Some(index_ids) = eq_by_prop
-                .get(&node.type_id)
-                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                let value_hash = hash_prop_value(prop_value);
-                for &index_id in index_ids {
-                    eq_actions.push((index_id, value_hash));
-                }
-            }
-
-            if let Some(indexes) = range_by_prop
-                .get(&node.type_id)
-                .and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                for &(index_id, domain) in indexes {
-                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
-                        range_actions.push((index_id, encoded));
-                    }
-                }
-            }
-        }
-        for (index_id, value_hash) in eq_actions {
-            self.set_secondary_eq_slot(index_id, value_hash, node.id, false, write_seq);
-        }
-        for (index_id, encoded) in range_actions {
-            self.set_secondary_range_slot(index_id, encoded, node.id, false, write_seq);
-        }
-    }
-
-    fn sync_secondary_index_entries_for_node_upsert(
-        &mut self,
-        old_node: Option<&NodeRecord>,
-        new_node: &NodeRecord,
-        write_seq: u64,
+    fn collect_secondary_index_entries_for_node_label(
+        &self,
+        label_id: u32,
+        node_id: u64,
+        props: &BTreeMap<String, PropValue>,
+        present: bool,
+        eq_actions: &mut Vec<(u64, u64, u64, bool)>,
+        range_actions: &mut Vec<(u64, u64, u64, bool)>,
     ) {
-        let Some(old_node) = old_node else {
-            self.add_secondary_index_entries_for_node(new_node, write_seq);
-            return;
-        };
-
-        if old_node.type_id != new_node.type_id {
-            self.remove_secondary_index_entries_for_node(old_node, write_seq);
-            self.add_secondary_index_entries_for_node(new_node, write_seq);
+        let eq_by_prop = self.secondary_eq_by_prop.get(&label_id);
+        let range_by_prop = self.secondary_range_by_prop.get(&label_id);
+        if eq_by_prop.is_none() && range_by_prop.is_none() {
             return;
         }
 
-        let eq_by_prop = &self.secondary_eq_by_prop;
-        let range_by_prop = &self.secondary_range_by_prop;
-        let mut eq_actions = Vec::new();
-        let mut range_actions = Vec::new();
+        for (prop_key, prop_value) in props {
+            if let Some(index_ids) = eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str())) {
+                let value_hash = hash_prop_value(prop_value);
+                for &index_id in index_ids {
+                    eq_actions.push((index_id, value_hash, node_id, present));
+                }
+            }
 
-        if let Some(by_prop) = eq_by_prop.get(&new_node.type_id) {
+            if let Some(indexes) = range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                for &(index_id, domain) in indexes {
+                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                        range_actions.push((index_id, encoded, node_id, present));
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_secondary_index_updates_for_node_label(
+        &self,
+        label_id: u32,
+        old_node: &NodeRecord,
+        new_node: &NodeRecord,
+        eq_actions: &mut Vec<(u64, u64, u64, bool)>,
+        range_actions: &mut Vec<(u64, u64, u64, bool)>,
+    ) {
+        if let Some(by_prop) = self.secondary_eq_by_prop.get(&label_id) {
             for (prop_key, index_ids) in by_prop {
                 let old_value = old_node.props.get(prop_key.as_str());
                 let new_value = new_node.props.get(prop_key.as_str());
@@ -922,7 +1046,7 @@ impl MemtableState {
             }
         }
 
-        if let Some(by_prop) = range_by_prop.get(&new_node.type_id) {
+        if let Some(by_prop) = self.secondary_range_by_prop.get(&label_id) {
             for (prop_key, indexes) in by_prop {
                 let old_value = old_node.props.get(prop_key.as_str());
                 let new_value = new_node.props.get(prop_key.as_str());
@@ -943,11 +1067,267 @@ impl MemtableState {
                 }
             }
         }
+    }
+
+    fn add_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
+        if self.secondary_eq_by_prop.is_empty() && self.secondary_range_by_prop.is_empty() {
+            return;
+        }
+        let mut eq_actions = Vec::new();
+        let mut range_actions = Vec::new();
+        for &label_id in node.label_ids.as_slice() {
+            self.collect_secondary_index_entries_for_node_label(
+                label_id,
+                node.id,
+                &node.props,
+                true,
+                &mut eq_actions,
+                &mut range_actions,
+            );
+        }
         for (index_id, value_hash, node_id, present) in eq_actions {
             self.set_secondary_eq_slot(index_id, value_hash, node_id, present, write_seq);
         }
         for (index_id, encoded, node_id, present) in range_actions {
             self.set_secondary_range_slot(index_id, encoded, node_id, present, write_seq);
+        }
+    }
+
+    fn remove_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
+        if self.secondary_eq_by_prop.is_empty() && self.secondary_range_by_prop.is_empty() {
+            return;
+        }
+        let mut eq_actions = Vec::new();
+        let mut range_actions = Vec::new();
+        for &label_id in node.label_ids.as_slice() {
+            self.collect_secondary_index_entries_for_node_label(
+                label_id,
+                node.id,
+                &node.props,
+                false,
+                &mut eq_actions,
+                &mut range_actions,
+            );
+        }
+        for (index_id, value_hash, node_id, present) in eq_actions {
+            self.set_secondary_eq_slot(index_id, value_hash, node_id, present, write_seq);
+        }
+        for (index_id, encoded, node_id, present) in range_actions {
+            self.set_secondary_range_slot(index_id, encoded, node_id, present, write_seq);
+        }
+    }
+
+    fn sync_secondary_index_entries_for_node_upsert(
+        &mut self,
+        old_node: Option<&NodeRecord>,
+        new_node: &NodeRecord,
+        write_seq: u64,
+    ) {
+        if self.secondary_eq_by_prop.is_empty() && self.secondary_range_by_prop.is_empty() {
+            return;
+        }
+
+        let Some(old_node) = old_node else {
+            self.add_secondary_index_entries_for_node(new_node, write_seq);
+            return;
+        };
+
+        let mut eq_actions = Vec::new();
+        let mut range_actions = Vec::new();
+
+        for &old_label_id in old_node.label_ids.as_slice() {
+            if !new_node.label_ids.contains(old_label_id) {
+                self.collect_secondary_index_entries_for_node_label(
+                    old_label_id,
+                    old_node.id,
+                    &old_node.props,
+                    false,
+                    &mut eq_actions,
+                    &mut range_actions,
+                );
+            }
+        }
+
+        for &new_label_id in new_node.label_ids.as_slice() {
+            if old_node.label_ids.contains(new_label_id) {
+                self.collect_secondary_index_updates_for_node_label(
+                    new_label_id,
+                    old_node,
+                    new_node,
+                    &mut eq_actions,
+                    &mut range_actions,
+                );
+            } else {
+                self.collect_secondary_index_entries_for_node_label(
+                    new_label_id,
+                    new_node.id,
+                    &new_node.props,
+                    true,
+                    &mut eq_actions,
+                    &mut range_actions,
+                );
+            }
+        }
+        for (index_id, value_hash, node_id, present) in eq_actions {
+            self.set_secondary_eq_slot(index_id, value_hash, node_id, present, write_seq);
+        }
+        for (index_id, encoded, node_id, present) in range_actions {
+            self.set_secondary_range_slot(index_id, encoded, node_id, present, write_seq);
+        }
+    }
+
+    fn add_secondary_index_entries_for_edge(&mut self, edge: &EdgeRecord, write_seq: u64) {
+        if self.secondary_edge_eq_by_prop.is_empty() && self.secondary_edge_range_by_prop.is_empty()
+        {
+            return;
+        }
+        let eq_by_prop = self.secondary_edge_eq_by_prop.get(&edge.label_id);
+        let range_by_prop = self.secondary_edge_range_by_prop.get(&edge.label_id);
+        if eq_by_prop.is_none() && range_by_prop.is_none() {
+            return;
+        }
+        let mut eq_actions = Vec::new();
+        let mut range_actions = Vec::new();
+        for (prop_key, prop_value) in &edge.props {
+            if let Some(index_ids) = eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str())) {
+                let value_hash = hash_prop_value(prop_value);
+                for &index_id in index_ids {
+                    eq_actions.push((index_id, value_hash));
+                }
+            }
+
+            if let Some(indexes) = range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                for &(index_id, domain) in indexes {
+                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                        range_actions.push((index_id, encoded));
+                    }
+                }
+            }
+        }
+        for (index_id, value_hash) in eq_actions {
+            self.set_secondary_eq_slot(index_id, value_hash, edge.id, true, write_seq);
+        }
+        for (index_id, encoded) in range_actions {
+            self.set_secondary_range_slot(index_id, encoded, edge.id, true, write_seq);
+        }
+    }
+
+    fn remove_secondary_index_entries_for_edge(&mut self, edge: &EdgeRecord, write_seq: u64) {
+        if self.secondary_edge_eq_by_prop.is_empty() && self.secondary_edge_range_by_prop.is_empty()
+        {
+            return;
+        }
+        let eq_by_prop = self.secondary_edge_eq_by_prop.get(&edge.label_id);
+        let range_by_prop = self.secondary_edge_range_by_prop.get(&edge.label_id);
+        if eq_by_prop.is_none() && range_by_prop.is_none() {
+            return;
+        }
+        let mut eq_actions = Vec::new();
+        let mut range_actions = Vec::new();
+        for (prop_key, prop_value) in &edge.props {
+            if let Some(index_ids) = eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str())) {
+                let value_hash = hash_prop_value(prop_value);
+                for &index_id in index_ids {
+                    eq_actions.push((index_id, value_hash));
+                }
+            }
+
+            if let Some(indexes) = range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
+            {
+                for &(index_id, domain) in indexes {
+                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                        range_actions.push((index_id, encoded));
+                    }
+                }
+            }
+        }
+        for (index_id, value_hash) in eq_actions {
+            self.set_secondary_eq_slot(index_id, value_hash, edge.id, false, write_seq);
+        }
+        for (index_id, encoded) in range_actions {
+            self.set_secondary_range_slot(index_id, encoded, edge.id, false, write_seq);
+        }
+    }
+
+    fn sync_secondary_index_entries_for_edge_upsert(
+        &mut self,
+        old_edge: Option<&EdgeRecord>,
+        new_edge: &EdgeRecord,
+        write_seq: u64,
+    ) {
+        if self.secondary_edge_eq_by_prop.is_empty() && self.secondary_edge_range_by_prop.is_empty()
+        {
+            return;
+        }
+
+        let Some(old_edge) = old_edge else {
+            self.add_secondary_index_entries_for_edge(new_edge, write_seq);
+            return;
+        };
+
+        if old_edge.label_id != new_edge.label_id {
+            self.remove_secondary_index_entries_for_edge(old_edge, write_seq);
+            self.add_secondary_index_entries_for_edge(new_edge, write_seq);
+            return;
+        }
+
+        let eq_by_prop = self.secondary_edge_eq_by_prop.get(&new_edge.label_id);
+        let range_by_prop = self.secondary_edge_range_by_prop.get(&new_edge.label_id);
+        if eq_by_prop.is_none() && range_by_prop.is_none() {
+            return;
+        }
+        let mut eq_actions = Vec::new();
+        let mut range_actions = Vec::new();
+
+        if let Some(by_prop) = eq_by_prop {
+            for (prop_key, index_ids) in by_prop {
+                let old_value = old_edge.props.get(prop_key.as_str());
+                let new_value = new_edge.props.get(prop_key.as_str());
+                if old_value == new_value {
+                    continue;
+                }
+                if let Some(old_value) = old_value {
+                    let value_hash = hash_prop_value(old_value);
+                    for &index_id in index_ids {
+                        eq_actions.push((index_id, value_hash, old_edge.id, false));
+                    }
+                }
+                if let Some(new_value) = new_value {
+                    let value_hash = hash_prop_value(new_value);
+                    for &index_id in index_ids {
+                        eq_actions.push((index_id, value_hash, new_edge.id, true));
+                    }
+                }
+            }
+        }
+
+        if let Some(by_prop) = range_by_prop {
+            for (prop_key, indexes) in by_prop {
+                let old_value = old_edge.props.get(prop_key.as_str());
+                let new_value = new_edge.props.get(prop_key.as_str());
+                if old_value == new_value {
+                    continue;
+                }
+                for &(index_id, domain) in indexes {
+                    if let Some(encoded) =
+                        old_value.and_then(|value| encode_range_prop_value(domain, value))
+                    {
+                        range_actions.push((index_id, encoded, old_edge.id, false));
+                    }
+                    if let Some(encoded) =
+                        new_value.and_then(|value| encode_range_prop_value(domain, value))
+                    {
+                        range_actions.push((index_id, encoded, new_edge.id, true));
+                    }
+                }
+            }
+        }
+        for (index_id, value_hash, edge_id, present) in eq_actions {
+            self.set_secondary_eq_slot(index_id, value_hash, edge_id, present, write_seq);
+        }
+        for (index_id, encoded, edge_id, present) in range_actions {
+            self.set_secondary_range_slot(index_id, encoded, edge_id, present, write_seq);
         }
     }
 }
@@ -987,30 +1367,35 @@ impl Memtable {
                 let old_node = state.current_node(node.id).cloned();
                 let was_deleted = state.node_deleted_at(node.id, u64::MAX);
                 if let Some(old) = old_node.as_ref() {
-                    if old.type_id != node.type_id || old.key != node.key {
-                        state.set_node_key(old.type_id, &old.key, None, last_write_seq);
-                    }
-                    if old.type_id != node.type_id {
-                        state.set_node_type_slot(old.type_id, old.id, false, last_write_seq);
-                    }
-                    if old.type_id != node.type_id || old.updated_at != node.updated_at {
-                        state.set_time_slot(
-                            (old.type_id, old.updated_at, old.id),
-                            false,
-                            last_write_seq,
-                        );
+                    for &old_label_id in old.label_ids.as_slice() {
+                        let label_removed = !node.label_ids.contains(old_label_id);
+                        if label_removed || old.key != node.key {
+                            state.set_node_key(old_label_id, &old.key, None, last_write_seq);
+                        }
+                        if label_removed {
+                            state.set_node_label_slot(old_label_id, old.id, false, last_write_seq);
+                        }
+                        if label_removed || old.updated_at != node.updated_at {
+                            state.set_time_slot(
+                                (old_label_id, old.updated_at, old.id),
+                                false,
+                                last_write_seq,
+                            );
+                        }
                     }
                 }
 
                 let mut stored = node.clone();
                 stored.last_write_seq = last_write_seq;
-                state.set_node_key(node.type_id, &node.key, Some(node.id), last_write_seq);
-                state.set_node_type_slot(node.type_id, node.id, true, last_write_seq);
-                state.set_time_slot(
-                    (node.type_id, node.updated_at, node.id),
-                    true,
-                    last_write_seq,
-                );
+                for &new_label_id in node.label_ids.as_slice() {
+                    state.set_node_key(new_label_id, &node.key, Some(node.id), last_write_seq);
+                    state.set_node_label_slot(new_label_id, node.id, true, last_write_seq);
+                    state.set_time_slot(
+                        (new_label_id, node.updated_at, node.id),
+                        true,
+                        last_write_seq,
+                    );
+                }
                 state.sync_secondary_index_entries_for_node_upsert(
                     old_node.as_ref(),
                     &stored,
@@ -1025,14 +1410,20 @@ impl Memtable {
                 let old_edge = state.current_edge(edge.id).cloned();
                 let was_deleted = state.edge_deleted_at(edge.id, u64::MAX);
                 if let Some(old) = old_edge.as_ref() {
-                    if (old.from != edge.from || old.to != edge.to || old.type_id != edge.type_id)
-                        && state.current_edge_triple_id(old.from, old.to, old.type_id)
+                    if (old.from != edge.from || old.to != edge.to || old.label_id != edge.label_id)
+                        && state.current_edge_triple_id(old.from, old.to, old.label_id)
                             == Some(old.id)
                     {
-                        state.set_edge_triple(old.from, old.to, old.type_id, None, last_write_seq);
+                        state.set_edge_triple(old.from, old.to, old.label_id, None, last_write_seq);
                     }
-                    if old.type_id != edge.type_id {
-                        state.set_edge_type_slot(old.type_id, old.id, false, last_write_seq);
+                    if old.label_id != edge.label_id {
+                        state.set_edge_label_slot(old.label_id, old.id, false, last_write_seq);
+                        state.set_ordered_edge_label_slot(
+                            old.label_id,
+                            old.id,
+                            false,
+                            last_write_seq,
+                        );
                     }
                     if old.from != edge.from || old.to != edge.to {
                         state.set_adj_out_slot(old.from, old.id, None, last_write_seq);
@@ -1042,7 +1433,7 @@ impl Memtable {
 
                 let adj_out_entry = AdjEntry {
                     edge_id: edge.id,
-                    type_id: edge.type_id,
+                    label_id: edge.label_id,
                     neighbor_id: edge.to,
                     weight: edge.weight,
                     valid_from: edge.valid_from,
@@ -1050,7 +1441,7 @@ impl Memtable {
                 };
                 let adj_in_entry = AdjEntry {
                     edge_id: edge.id,
-                    type_id: edge.type_id,
+                    label_id: edge.label_id,
                     neighbor_id: edge.from,
                     weight: edge.weight,
                     valid_from: edge.valid_from,
@@ -1058,12 +1449,12 @@ impl Memtable {
                 };
 
                 let current_triple_id =
-                    state.current_edge_triple_id(edge.from, edge.to, edge.type_id);
+                    state.current_edge_triple_id(edge.from, edge.to, edge.label_id);
                 let should_update_triple = match old_edge.as_ref() {
                     Some(old)
                         if old.from == edge.from
                             && old.to == edge.to
-                            && old.type_id == edge.type_id =>
+                            && old.label_id == edge.label_id =>
                     {
                         current_triple_id.is_none_or(|current_id| current_id == edge.id)
                     }
@@ -1073,17 +1464,24 @@ impl Memtable {
                     state.set_edge_triple(
                         edge.from,
                         edge.to,
-                        edge.type_id,
+                        edge.label_id,
                         Some(edge.id),
                         last_write_seq,
                     );
                 }
                 state.set_adj_out_slot(edge.from, edge.id, Some(adj_out_entry), last_write_seq);
                 state.set_adj_in_slot(edge.to, edge.id, Some(adj_in_entry), last_write_seq);
-                state.set_edge_type_slot(edge.type_id, edge.id, true, last_write_seq);
+                state.set_edge_label_slot(edge.label_id, edge.id, true, last_write_seq);
+                state.set_ordered_edge_label_slot(edge.label_id, edge.id, true, last_write_seq);
+                state.set_ordered_edge_slot(edge.id, true, last_write_seq);
 
                 let mut stored = edge.clone();
                 stored.last_write_seq = last_write_seq;
+                state.sync_secondary_index_entries_for_edge_upsert(
+                    old_edge.as_ref(),
+                    &stored,
+                    last_write_seq,
+                );
                 if was_deleted {
                     state.set_edge_tombstone_slot(edge.id, false, last_write_seq);
                 }
@@ -1091,13 +1489,15 @@ impl Memtable {
             }
             WalOp::DeleteNode { id, deleted_at } => {
                 if let Some(node) = state.current_node(*id).cloned() {
-                    state.set_node_key(node.type_id, &node.key, None, last_write_seq);
-                    state.set_node_type_slot(node.type_id, node.id, false, last_write_seq);
-                    state.set_time_slot(
-                        (node.type_id, node.updated_at, node.id),
-                        false,
-                        last_write_seq,
-                    );
+                    for &label_id in node.label_ids.as_slice() {
+                        state.set_node_key(label_id, &node.key, None, last_write_seq);
+                        state.set_node_label_slot(label_id, node.id, false, last_write_seq);
+                        state.set_time_slot(
+                            (label_id, node.updated_at, node.id),
+                            false,
+                            last_write_seq,
+                        );
+                    }
                     state.remove_secondary_index_entries_for_node(&node, last_write_seq);
                 }
                 state.set_node_state(
@@ -1112,18 +1512,27 @@ impl Memtable {
             }
             WalOp::DeleteEdge { id, deleted_at } => {
                 if let Some(edge) = state.current_edge(*id).cloned() {
-                    if state.current_edge_triple_id(edge.from, edge.to, edge.type_id) == Some(*id) {
+                    if state.current_edge_triple_id(edge.from, edge.to, edge.label_id) == Some(*id)
+                    {
                         state.set_edge_triple(
                             edge.from,
                             edge.to,
-                            edge.type_id,
+                            edge.label_id,
                             None,
                             last_write_seq,
                         );
                     }
-                    state.set_edge_type_slot(edge.type_id, edge.id, false, last_write_seq);
+                    state.set_edge_label_slot(edge.label_id, edge.id, false, last_write_seq);
+                    state.set_ordered_edge_label_slot(
+                        edge.label_id,
+                        edge.id,
+                        false,
+                        last_write_seq,
+                    );
                     state.set_adj_out_slot(edge.from, edge.id, None, last_write_seq);
                     state.set_adj_in_slot(edge.to, edge.id, None, last_write_seq);
+                    state.set_ordered_edge_slot(edge.id, false, last_write_seq);
+                    state.remove_secondary_index_entries_for_edge(&edge, last_write_seq);
                 }
                 state.set_edge_state(
                     *id,
@@ -1135,6 +1544,10 @@ impl Memtable {
                 );
                 state.set_edge_tombstone_slot(*id, true, last_write_seq);
             }
+            WalOp::EnsureNodeLabel { .. }
+            | WalOp::EnsureEdgeLabel { .. }
+            | WalOp::BeginAtomicBatch { .. }
+            | WalOp::CommitAtomicBatch { .. } => {}
         }
     }
 
@@ -1151,10 +1564,10 @@ impl Memtable {
             .insert(entry.index_id, entry.clone());
         state.estimated_bytes += estimate_secondary_decl_entry(entry);
         match &entry.target {
-            SecondaryIndexTarget::NodeProperty { type_id, prop_key } => match &entry.kind {
+            SecondaryIndexTarget::NodeProperty { label_id, prop_key } => match &entry.kind {
                 SecondaryIndexKind::Equality => {
                     let (lookup_before, lookup_after) = {
-                        let by_prop = state.secondary_eq_by_prop.entry(*type_id).or_default();
+                        let by_prop = state.secondary_eq_by_prop.entry(*label_id).or_default();
                         match by_prop.get_mut(prop_key) {
                             Some(index_ids) => {
                                 let before =
@@ -1179,7 +1592,7 @@ impl Memtable {
                         let Some(node) = record_current(slot) else {
                             continue;
                         };
-                        if node.type_id != *type_id {
+                        if !node.label_ids.contains(*label_id) {
                             continue;
                         }
                         let Some(prop_value) = node.props.get(prop_key) else {
@@ -1199,7 +1612,7 @@ impl Memtable {
                 }
                 SecondaryIndexKind::Range { domain } => {
                     let (lookup_before, lookup_after) = {
-                        let by_prop = state.secondary_range_by_prop.entry(*type_id).or_default();
+                        let by_prop = state.secondary_range_by_prop.entry(*label_id).or_default();
                         match by_prop.get_mut(prop_key) {
                             Some(indexes) => {
                                 let before =
@@ -1228,7 +1641,7 @@ impl Memtable {
                         let Some(node) = record_current(slot) else {
                             continue;
                         };
-                        if node.type_id != *type_id {
+                        if !node.label_ids.contains(*label_id) {
                             continue;
                         }
                         let Some(prop_value) = node.props.get(prop_key) else {
@@ -1250,6 +1663,111 @@ impl Memtable {
                     }
                 }
             },
+            SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => match &entry.kind {
+                SecondaryIndexKind::Equality => {
+                    let (lookup_before, lookup_after) = {
+                        let by_prop = state
+                            .secondary_edge_eq_by_prop
+                            .entry(*label_id)
+                            .or_default();
+                        match by_prop.get_mut(prop_key) {
+                            Some(index_ids) => {
+                                let before =
+                                    estimate_secondary_eq_lookup_entry(prop_key, index_ids);
+                                index_ids.push(entry.index_id);
+                                let after = estimate_secondary_eq_lookup_entry(prop_key, index_ids);
+                                (before, after)
+                            }
+                            None => {
+                                let index_ids = vec![entry.index_id];
+                                let after =
+                                    estimate_secondary_eq_lookup_entry(prop_key, &index_ids);
+                                by_prop.insert(prop_key.clone(), index_ids);
+                                (0, after)
+                            }
+                        }
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                    state.secondary_eq_state.entry(entry.index_id).or_default();
+                    let mut seeded = Vec::new();
+                    for slot in state.edges.values() {
+                        let Some(edge) = record_current(slot) else {
+                            continue;
+                        };
+                        if edge.label_id != *label_id {
+                            continue;
+                        }
+                        let Some(prop_value) = edge.props.get(prop_key) else {
+                            continue;
+                        };
+                        seeded.push((hash_prop_value(prop_value), edge.id, edge.last_write_seq));
+                    }
+                    for (value_hash, edge_id, write_seq) in seeded {
+                        state.set_secondary_eq_slot(
+                            entry.index_id,
+                            value_hash,
+                            edge_id,
+                            true,
+                            write_seq,
+                        );
+                    }
+                }
+                SecondaryIndexKind::Range { domain } => {
+                    let (lookup_before, lookup_after) = {
+                        let by_prop = state
+                            .secondary_edge_range_by_prop
+                            .entry(*label_id)
+                            .or_default();
+                        match by_prop.get_mut(prop_key) {
+                            Some(indexes) => {
+                                let before =
+                                    estimate_secondary_range_lookup_entry(prop_key, indexes);
+                                indexes.push((entry.index_id, *domain));
+                                let after =
+                                    estimate_secondary_range_lookup_entry(prop_key, indexes);
+                                (before, after)
+                            }
+                            None => {
+                                let indexes = vec![(entry.index_id, *domain)];
+                                let after =
+                                    estimate_secondary_range_lookup_entry(prop_key, &indexes);
+                                by_prop.insert(prop_key.clone(), indexes);
+                                (0, after)
+                            }
+                        }
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                    state
+                        .secondary_range_state
+                        .entry(entry.index_id)
+                        .or_default();
+                    let mut seeded = Vec::new();
+                    for slot in state.edges.values() {
+                        let Some(edge) = record_current(slot) else {
+                            continue;
+                        };
+                        if edge.label_id != *label_id {
+                            continue;
+                        }
+                        let Some(prop_value) = edge.props.get(prop_key) else {
+                            continue;
+                        };
+                        let Some(encoded) = encode_range_prop_value(*domain, prop_value) else {
+                            continue;
+                        };
+                        seeded.push((encoded, edge.id, edge.last_write_seq));
+                    }
+                    for (encoded, edge_id, write_seq) in seeded {
+                        state.set_secondary_range_slot(
+                            entry.index_id,
+                            encoded,
+                            edge_id,
+                            true,
+                            write_seq,
+                        );
+                    }
+                }
+            },
         }
     }
 
@@ -1262,12 +1780,12 @@ impl Memtable {
             .estimated_bytes
             .saturating_sub(estimate_secondary_decl_entry(&entry));
         match entry.target {
-            SecondaryIndexTarget::NodeProperty { type_id, prop_key } => match entry.kind {
+            SecondaryIndexTarget::NodeProperty { label_id, prop_key } => match entry.kind {
                 SecondaryIndexKind::Equality => {
-                    let (lookup_before, lookup_after, remove_type_entry) = {
+                    let (lookup_before, lookup_after, remove_label_entry) = {
                         let mut delta = (0, 0);
-                        let mut remove_type_entry = false;
-                        if let Some(by_prop) = state.secondary_eq_by_prop.get_mut(&type_id) {
+                        let mut remove_label_entry = false;
+                        if let Some(by_prop) = state.secondary_eq_by_prop.get_mut(&label_id) {
                             let mut remove_prop_entry = false;
                             if let Some(index_ids) = by_prop.get_mut(&prop_key) {
                                 delta.0 = estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
@@ -1282,13 +1800,13 @@ impl Memtable {
                             if remove_prop_entry {
                                 by_prop.remove(&prop_key);
                             }
-                            remove_type_entry = by_prop.is_empty();
+                            remove_label_entry = by_prop.is_empty();
                         }
-                        (delta.0, delta.1, remove_type_entry)
+                        (delta.0, delta.1, remove_label_entry)
                     };
                     apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
-                    if remove_type_entry {
-                        state.secondary_eq_by_prop.remove(&type_id);
+                    if remove_label_entry {
+                        state.secondary_eq_by_prop.remove(&label_id);
                     }
                     if let Some(groups) = state.secondary_eq_state.remove(&index_id) {
                         state.estimated_bytes = state
@@ -1297,10 +1815,10 @@ impl Memtable {
                     }
                 }
                 SecondaryIndexKind::Range { domain } => {
-                    let (lookup_before, lookup_after, remove_type_entry) = {
+                    let (lookup_before, lookup_after, remove_label_entry) = {
                         let mut delta = (0, 0);
-                        let mut remove_type_entry = false;
-                        if let Some(by_prop) = state.secondary_range_by_prop.get_mut(&type_id) {
+                        let mut remove_label_entry = false;
+                        if let Some(by_prop) = state.secondary_range_by_prop.get_mut(&label_id) {
                             let mut remove_prop_entry = false;
                             if let Some(indexes) = by_prop.get_mut(&prop_key) {
                                 delta.0 = estimate_secondary_range_lookup_entry(&prop_key, indexes);
@@ -1317,13 +1835,84 @@ impl Memtable {
                             if remove_prop_entry {
                                 by_prop.remove(&prop_key);
                             }
-                            remove_type_entry = by_prop.is_empty();
+                            remove_label_entry = by_prop.is_empty();
                         }
-                        (delta.0, delta.1, remove_type_entry)
+                        (delta.0, delta.1, remove_label_entry)
                     };
                     apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
-                    if remove_type_entry {
-                        state.secondary_range_by_prop.remove(&type_id);
+                    if remove_label_entry {
+                        state.secondary_range_by_prop.remove(&label_id);
+                    }
+                    if let Some(entries) = state.secondary_range_state.remove(&index_id) {
+                        state.estimated_bytes = state
+                            .estimated_bytes
+                            .saturating_sub(estimate_secondary_range_state_entries(&entries));
+                    }
+                }
+            },
+            SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => match entry.kind {
+                SecondaryIndexKind::Equality => {
+                    let (lookup_before, lookup_after, remove_label_entry) = {
+                        let mut delta = (0, 0);
+                        let mut remove_label_entry = false;
+                        if let Some(by_prop) = state.secondary_edge_eq_by_prop.get_mut(&label_id) {
+                            let mut remove_prop_entry = false;
+                            if let Some(index_ids) = by_prop.get_mut(&prop_key) {
+                                delta.0 = estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
+                                index_ids.retain(|&id| id != index_id);
+                                if index_ids.is_empty() {
+                                    remove_prop_entry = true;
+                                } else {
+                                    delta.1 =
+                                        estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
+                                }
+                            }
+                            if remove_prop_entry {
+                                by_prop.remove(&prop_key);
+                            }
+                            remove_label_entry = by_prop.is_empty();
+                        }
+                        (delta.0, delta.1, remove_label_entry)
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                    if remove_label_entry {
+                        state.secondary_edge_eq_by_prop.remove(&label_id);
+                    }
+                    if let Some(groups) = state.secondary_eq_state.remove(&index_id) {
+                        state.estimated_bytes = state
+                            .estimated_bytes
+                            .saturating_sub(estimate_secondary_eq_state_groups(&groups));
+                    }
+                }
+                SecondaryIndexKind::Range { domain } => {
+                    let (lookup_before, lookup_after, remove_label_entry) = {
+                        let mut delta = (0, 0);
+                        let mut remove_label_entry = false;
+                        if let Some(by_prop) = state.secondary_edge_range_by_prop.get_mut(&label_id)
+                        {
+                            let mut remove_prop_entry = false;
+                            if let Some(indexes) = by_prop.get_mut(&prop_key) {
+                                delta.0 = estimate_secondary_range_lookup_entry(&prop_key, indexes);
+                                indexes.retain(|&(id, existing_domain)| {
+                                    id != index_id || existing_domain != domain
+                                });
+                                if indexes.is_empty() {
+                                    remove_prop_entry = true;
+                                } else {
+                                    delta.1 =
+                                        estimate_secondary_range_lookup_entry(&prop_key, indexes);
+                                }
+                            }
+                            if remove_prop_entry {
+                                by_prop.remove(&prop_key);
+                            }
+                            remove_label_entry = by_prop.is_empty();
+                        }
+                        (delta.0, delta.1, remove_label_entry)
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                    if remove_label_entry {
+                        state.secondary_edge_range_by_prop.remove(&label_id);
                     }
                     if let Some(entries) = state.secondary_range_state.remove(&index_id) {
                         state.estimated_bytes = state
@@ -1368,6 +1957,23 @@ impl Memtable {
         state.edge_at(id, snapshot_seq).cloned()
     }
 
+    pub(crate) fn edge_properties_at(
+        &self,
+        id: u64,
+        prop_keys: &[String],
+        snapshot_seq: u64,
+    ) -> Option<BTreeMap<String, PropValue>> {
+        let state = self.state.read().unwrap();
+        let edge = state.edge_at(id, snapshot_seq)?;
+        let mut props = BTreeMap::new();
+        for key in prop_keys {
+            if let Some(value) = edge.props.get(key) {
+                props.insert(key.clone(), value.clone());
+            }
+        }
+        Some(props)
+    }
+
     pub(crate) fn get_edge_core_at(
         &self,
         id: u64,
@@ -1384,6 +1990,88 @@ impl Memtable {
             edge.valid_from,
             edge.valid_to,
         ))
+    }
+
+    pub(crate) fn get_edge_metadata_at(
+        &self,
+        id: u64,
+        snapshot_seq: u64,
+    ) -> Option<EdgeMetadataCandidate> {
+        let state = self.state.read().unwrap();
+        state
+            .edge_at(id, snapshot_seq)
+            .map(EdgeMetadataCandidate::from_edge)
+    }
+
+    pub(crate) fn batch_get_node_visibility_meta_at(
+        &self,
+        lookups: &[(usize, u64)],
+        snapshot_seq: u64,
+        results: &mut [NodeVisibilityState],
+    ) -> Vec<(usize, u64)> {
+        if lookups.is_empty() {
+            return Vec::new();
+        }
+
+        let state = self.state.read().unwrap();
+        let mut cache =
+            NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
+        let mut remaining = Vec::with_capacity(lookups.len());
+
+        for &(orig_idx, id) in lookups {
+            let visibility = match cache.get(&id).copied() {
+                Some(state) => state,
+                None => {
+                    let state = match state
+                        .nodes
+                        .get(&id)
+                        .and_then(|slot| record_at(slot, snapshot_seq))
+                    {
+                        Some(RecordState::Live(node)) => {
+                            NodeVisibilityState::Live(NodeVisibilityMeta {
+                                label_ids: node.label_ids,
+                                updated_at: node.updated_at,
+                                weight: node.weight,
+                            })
+                        }
+                        Some(RecordState::Tombstone(_)) => NodeVisibilityState::Deleted,
+                        None if state.node_deleted_at(id, snapshot_seq) => {
+                            NodeVisibilityState::Deleted
+                        }
+                        None => NodeVisibilityState::Missing,
+                    };
+                    cache.insert(id, state);
+                    state
+                }
+            };
+
+            match visibility {
+                NodeVisibilityState::Live(_) | NodeVisibilityState::Deleted => {
+                    results[orig_idx] = visibility;
+                }
+                NodeVisibilityState::Missing => remaining.push((orig_idx, id)),
+            }
+        }
+
+        remaining
+    }
+
+    pub(crate) fn edge_visibility_state_at(
+        &self,
+        id: u64,
+        snapshot_seq: u64,
+    ) -> EdgeVisibilityState {
+        let state = self.state.read().unwrap();
+        match state
+            .edges
+            .get(&id)
+            .and_then(|slot| record_at(slot, snapshot_seq))
+        {
+            Some(RecordState::Live(_)) => EdgeVisibilityState::Live,
+            Some(RecordState::Tombstone(_)) => EdgeVisibilityState::Deleted,
+            None if state.edge_deleted_at(id, snapshot_seq) => EdgeVisibilityState::Deleted,
+            None => EdgeVisibilityState::Missing,
+        }
     }
 
     pub(crate) fn batch_get_nodes_at(
@@ -1524,12 +2212,13 @@ impl Memtable {
 
     pub(crate) fn node_by_key_at(
         &self,
-        type_id: u32,
+        label_id: u32,
         key: &str,
         snapshot_seq: u64,
     ) -> Option<NodeRecord> {
         let state = self.state.read().unwrap();
-        let node_id = *slot_option_at(state.node_key_index.get(&type_id)?.get(key)?, snapshot_seq)?;
+        let node_id =
+            *slot_option_at(state.node_key_index.get(&label_id)?.get(key)?, snapshot_seq)?;
         state.node_at(node_id, snapshot_seq).cloned()
     }
 
@@ -1537,15 +2226,66 @@ impl Memtable {
         &self,
         from: u64,
         to: u64,
-        type_id: u32,
+        label_id: u32,
         snapshot_seq: u64,
     ) -> Option<EdgeRecord> {
         let state = self.state.read().unwrap();
         let edge_id = *slot_option_at(
-            state.edge_triple_index.get(&(from, to, type_id))?,
+            state.edge_triple_index.get(&(from, to, label_id))?,
             snapshot_seq,
         )?;
         state.edge_at(edge_id, snapshot_seq).cloned()
+    }
+
+    pub(crate) fn batch_edges_by_triples_at(
+        &self,
+        lookups: &[(usize, u64, u64, u32)],
+        snapshot_seq: u64,
+        results: &mut [Option<EdgeRecord>],
+    ) -> Vec<(usize, u64, u64, u32)> {
+        #[derive(Clone, Copy)]
+        enum CachedLookup {
+            Live(usize),
+            Miss,
+        }
+
+        if lookups.is_empty() {
+            return Vec::new();
+        }
+
+        let state = self.state.read().unwrap();
+        let mut cache = HashMap::with_capacity(lookups.len());
+        let mut remaining = Vec::with_capacity(lookups.len());
+
+        for &(orig_idx, from, to, label_id) in lookups {
+            let triple = (from, to, label_id);
+            match cache.get(&triple).copied() {
+                Some(CachedLookup::Live(cached_idx)) => {
+                    results[orig_idx] = results[cached_idx].clone();
+                }
+                Some(CachedLookup::Miss) => remaining.push((orig_idx, from, to, label_id)),
+                None => {
+                    let outcome = match state
+                        .edge_triple_index
+                        .get(&triple)
+                        .and_then(|slot| slot_option_at(slot, snapshot_seq))
+                        .and_then(|edge_id| state.edge_at(*edge_id, snapshot_seq))
+                    {
+                        Some(edge) => {
+                            results[orig_idx] = Some(edge.clone());
+                            CachedLookup::Live(orig_idx)
+                        }
+                        None => {
+                            remaining.push((orig_idx, from, to, label_id));
+                            CachedLookup::Miss
+                        }
+                    };
+                    cache.insert(triple, outcome);
+                }
+            }
+        }
+
+        remaining
     }
 
     pub(crate) fn for_each_visible_node_at<F>(
@@ -1568,10 +2308,10 @@ impl Memtable {
         ControlFlow::Continue(())
     }
 
-    pub(crate) fn visible_nodes_by_type(&self, type_id: u32, snapshot_seq: u64) -> Vec<u64> {
+    pub(crate) fn visible_nodes_by_label_id(&self, label_id: u32, snapshot_seq: u64) -> Vec<u64> {
         let state = self.state.read().unwrap();
         let mut ids = Vec::new();
-        if let Some(members) = state.type_node_index.get(&type_id) {
+        if let Some(members) = state.label_node_index.get(&label_id) {
             for (&node_id, slot) in members {
                 if slot_option_visible(slot, snapshot_seq) {
                     ids.push(node_id);
@@ -1603,11 +2343,15 @@ impl Memtable {
             .count()
     }
 
-    pub(crate) fn visible_nodes_by_type_count(&self, type_id: u32, snapshot_seq: u64) -> usize {
+    pub(crate) fn visible_nodes_by_label_id_count(
+        &self,
+        label_id: u32,
+        snapshot_seq: u64,
+    ) -> usize {
         let state = self.state.read().unwrap();
         state
-            .type_node_index
-            .get(&type_id)
+            .label_node_index
+            .get(&label_id)
             .map(|members| {
                 members
                     .values()
@@ -1617,10 +2361,10 @@ impl Memtable {
             .unwrap_or(0)
     }
 
-    pub(crate) fn visible_edges_by_type(&self, type_id: u32, snapshot_seq: u64) -> Vec<u64> {
+    pub(crate) fn visible_edges_by_label_id(&self, label_id: u32, snapshot_seq: u64) -> Vec<u64> {
         let state = self.state.read().unwrap();
         let mut ids = Vec::new();
-        if let Some(members) = state.type_edge_index.get(&type_id) {
+        if let Some(members) = state.label_edge_index.get(&label_id) {
             for (&edge_id, slot) in members {
                 if slot_option_visible(slot, snapshot_seq) {
                     ids.push(edge_id);
@@ -1631,9 +2375,190 @@ impl Memtable {
         ids
     }
 
+    pub(crate) fn visible_edges_by_label_id_count(
+        &self,
+        label_id: u32,
+        snapshot_seq: u64,
+    ) -> usize {
+        let state = self.state.read().unwrap();
+        state
+            .ordered_label_edge_index
+            .range((label_id, 0)..=(label_id, u64::MAX))
+            .filter(|(_, slot)| slot_option_visible(slot, snapshot_seq))
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_edge_ids_at(&self, snapshot_seq: u64) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let mut ids = Vec::new();
+        for (&edge_id, slot) in &state.edges {
+            if matches!(record_at(slot, snapshot_seq), Some(RecordState::Live(_))) {
+                ids.push(edge_id);
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn next_visible_edge_id_after(
+        &self,
+        snapshot_seq: u64,
+        after: Option<u64>,
+    ) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        for (&edge_id, slot) in state.ordered_edge_ids.range((start, Bound::Unbounded)) {
+            if slot_option_visible(slot, snapshot_seq) {
+                return Some(edge_id);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn next_visible_edge_by_label_id_after(
+        &self,
+        label_id: u32,
+        snapshot_seq: u64,
+        after: Option<u64>,
+    ) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        let start_key = (label_id, after.unwrap_or(0));
+        let start = match after {
+            Some(_) => Bound::Excluded(start_key),
+            None => Bound::Included(start_key),
+        };
+        let end = Bound::Included((label_id, u64::MAX));
+        for (&(_, edge_id), slot) in state.ordered_label_edge_index.range((start, end)) {
+            if slot_option_visible(slot, snapshot_seq) {
+                return Some(edge_id);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn edge_ids_by_triple_at(
+        &self,
+        from: u64,
+        to: u64,
+        label_id: u32,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let mut ids = Vec::new();
+        if let Some(entries) = state.adj_out.get(&from) {
+            for (&edge_id, slot) in entries {
+                let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                    continue;
+                };
+                if entry.neighbor_id == to && entry.label_id == label_id {
+                    ids.push(edge_id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_metadata_scan_ids_at<F>(
+        &self,
+        snapshot_seq: u64,
+        mut predicate: F,
+    ) -> Vec<u64>
+    where
+        F: FnMut(EdgeMetadataCandidate) -> bool,
+    {
+        let state = self.state.read().unwrap();
+        let mut ids = Vec::new();
+        for (&edge_id, slot) in &state.edges {
+            let Some(RecordState::Live(edge)) = record_at(slot, snapshot_seq) else {
+                continue;
+            };
+            let meta = EdgeMetadataCandidate::from_edge(edge);
+            if predicate(meta) {
+                ids.push(edge_id);
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn for_each_edge_metadata_at<F>(
+        &self,
+        snapshot_seq: u64,
+        mut callback: F,
+    ) -> ControlFlow<()>
+    where
+        F: FnMut(EdgeMetadataCandidate) -> ControlFlow<()>,
+    {
+        let state = self.state.read().unwrap();
+        for slot in state.edges.values() {
+            let Some(RecordState::Live(edge)) = record_at(slot, snapshot_seq) else {
+                continue;
+            };
+            if callback(EdgeMetadataCandidate::from_edge(edge)).is_break() {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_ids_by_weight_range_at(
+        &self,
+        label_id: Option<u32>,
+        bounds: RangeBoundFlags<f32>,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        self.edge_metadata_scan_ids_at(snapshot_seq, |meta| {
+            label_id.is_none_or(|target| meta.label_id == target)
+                && weight_matches_bounds(meta.weight, bounds)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_ids_by_updated_at_range_at(
+        &self,
+        label_id: Option<u32>,
+        bounds: RangeBoundFlags<i64>,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        self.edge_metadata_scan_ids_at(snapshot_seq, |meta| {
+            label_id.is_none_or(|target| meta.label_id == target)
+                && i64_matches_bounds(meta.updated_at, bounds)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_ids_by_valid_from_range_at(
+        &self,
+        label_id: Option<u32>,
+        bounds: RangeBoundFlags<i64>,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        self.edge_metadata_scan_ids_at(snapshot_seq, |meta| {
+            label_id.is_none_or(|target| meta.label_id == target)
+                && i64_matches_bounds(meta.valid_from, bounds)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_ids_by_valid_to_range_at(
+        &self,
+        label_id: Option<u32>,
+        bounds: RangeBoundFlags<i64>,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        self.edge_metadata_scan_ids_at(snapshot_seq, |meta| {
+            label_id.is_none_or(|target| meta.label_id == target)
+                && i64_matches_bounds(meta.valid_to, bounds)
+        })
+    }
+
     pub(crate) fn visible_nodes_by_time_range(
         &self,
-        type_id: u32,
+        label_id: u32,
         from_ms: i64,
         to_ms: i64,
         snapshot_seq: u64,
@@ -1643,13 +2568,13 @@ impl Memtable {
         }
         let state = self.state.read().unwrap();
         use std::ops::Bound;
-        let start = (type_id, from_ms, 0u64);
-        let end = (type_id, to_ms, u64::MAX);
+        let start = (label_id, from_ms, 0u64);
+        let end = (label_id, to_ms, u64::MAX);
         let mut ids = state
             .time_node_index
             .range((Bound::Included(start), Bound::Included(end)))
-            .filter_map(|(&(entry_type, _, node_id), slot)| {
-                (entry_type == type_id && slot_option_visible(slot, snapshot_seq))
+            .filter_map(|(&(entry_label_id, _, node_id), slot)| {
+                (entry_label_id == label_id && slot_option_visible(slot, snapshot_seq))
                     .then_some(node_id)
             })
             .collect::<Vec<_>>();
@@ -1659,7 +2584,7 @@ impl Memtable {
 
     pub(crate) fn for_each_visible_node_by_time_range_at<F>(
         &self,
-        type_id: u32,
+        label_id: u32,
         from_ms: i64,
         to_ms: i64,
         snapshot_seq: u64,
@@ -1673,13 +2598,13 @@ impl Memtable {
         }
         let state = self.state.read().unwrap();
         use std::ops::Bound;
-        let start = (type_id, from_ms, 0u64);
-        let end = (type_id, to_ms, u64::MAX);
-        for (&(entry_type, _, node_id), slot) in state
+        let start = (label_id, from_ms, 0u64);
+        let end = (label_id, to_ms, u64::MAX);
+        for (&(entry_label_id, _, node_id), slot) in state
             .time_node_index
             .range((Bound::Included(start), Bound::Included(end)))
         {
-            if entry_type != type_id || !slot_option_visible(slot, snapshot_seq) {
+            if entry_label_id != label_id || !slot_option_visible(slot, snapshot_seq) {
                 continue;
             }
             if callback(node_id).is_break() {
@@ -1693,10 +2618,10 @@ impl Memtable {
         &self,
         node_id: u64,
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         limit: usize,
         snapshot_seq: u64,
-    ) -> Vec<NeighborEntry> {
+    ) -> Vec<NeighborRecord> {
         let state = self.state.read().unwrap();
         if state.node_deleted_at(node_id, snapshot_seq) {
             return Vec::new();
@@ -1706,7 +2631,7 @@ impl Memtable {
         let mut self_loop_edge_ids = NodeIdSet::default();
         let mut collect = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
                            dedupe_self_loops: bool,
-                           results: &mut Vec<NeighborEntry>| {
+                           results: &mut Vec<NeighborRecord>| {
             let Some(map) = map else {
                 return;
             };
@@ -1717,7 +2642,7 @@ impl Memtable {
                 let Some(entry) = slot_option_at(slot, snapshot_seq) else {
                     continue;
                 };
-                if type_filter.is_some_and(|types| !types.contains(&entry.type_id)) {
+                if label_filter_ids.is_some_and(|label_ids| !label_ids.contains(&entry.label_id)) {
                     continue;
                 }
                 if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
@@ -1730,10 +2655,10 @@ impl Memtable {
                 } else if entry.neighbor_id == node_id {
                     self_loop_edge_ids.insert(entry.edge_id);
                 }
-                results.push(NeighborEntry {
+                results.push(NeighborRecord {
                     node_id: entry.neighbor_id,
                     edge_id: entry.edge_id,
-                    edge_type_id: entry.type_id,
+                    edge_label_id: entry.label_id,
                     weight: entry.weight,
                     valid_from: entry.valid_from,
                     valid_to: entry.valid_to,
@@ -1761,9 +2686,9 @@ impl Memtable {
         &self,
         node_id: u64,
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
-    ) -> Vec<NeighborEntry> {
+    ) -> Vec<NeighborRecord> {
         let state = self.state.read().unwrap();
         if state.node_deleted_at(node_id, snapshot_seq) {
             return Vec::new();
@@ -1773,7 +2698,7 @@ impl Memtable {
         let mut self_loop_edge_ids = NodeIdSet::default();
         let mut collect = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
                            dedupe_self_loops: bool,
-                           results: &mut Vec<NeighborEntry>| {
+                           results: &mut Vec<NeighborRecord>| {
             let Some(map) = map else {
                 return;
             };
@@ -1781,7 +2706,7 @@ impl Memtable {
                 let Some(entry) = slot_option_at(slot, snapshot_seq) else {
                     continue;
                 };
-                if type_filter.is_some_and(|types| !types.contains(&entry.type_id)) {
+                if label_filter_ids.is_some_and(|label_ids| !label_ids.contains(&entry.label_id)) {
                     continue;
                 }
                 if dedupe_self_loops && entry.neighbor_id == node_id {
@@ -1791,10 +2716,10 @@ impl Memtable {
                 } else if entry.neighbor_id == node_id {
                     self_loop_edge_ids.insert(entry.edge_id);
                 }
-                results.push(NeighborEntry {
+                results.push(NeighborRecord {
                     node_id: entry.neighbor_id,
                     edge_id: entry.edge_id,
-                    edge_type_id: entry.type_id,
+                    edge_label_id: entry.label_id,
                     weight: entry.weight,
                     valid_from: entry.valid_from,
                     valid_to: entry.valid_to,
@@ -1822,7 +2747,7 @@ impl Memtable {
         &self,
         node_id: u64,
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
         callback: &mut F,
     ) -> ControlFlow<()>
@@ -1844,7 +2769,7 @@ impl Memtable {
                 let Some(entry) = slot_option_at(slot, snapshot_seq) else {
                     continue;
                 };
-                if type_filter.is_some_and(|types| !types.contains(&entry.type_id)) {
+                if label_filter_ids.is_some_and(|label_ids| !label_ids.contains(&entry.label_id)) {
                     continue;
                 }
                 if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
@@ -1882,19 +2807,148 @@ impl Memtable {
         }
     }
 
-    pub(crate) fn visible_types(&self, snapshot_seq: u64) -> Vec<u32> {
+    fn next_visible_adj_edge_after(
+        state: &MemtableState,
+        node_id: u64,
+        outgoing: bool,
+        label_filter_ids: Option<&[u32]>,
+        snapshot_seq: u64,
+        after: Option<u64>,
+    ) -> Option<u64> {
+        if state.node_deleted_at(node_id, snapshot_seq) {
+            return None;
+        }
+        let source = if outgoing {
+            &state.ordered_adj_out
+        } else {
+            &state.ordered_adj_in
+        };
+        let entries = source.get(&node_id)?;
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        for (&edge_id, slot) in entries.range((start, Bound::Unbounded)) {
+            #[cfg(test)]
+            ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.fetch_add(1, Ordering::Relaxed);
+            let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                continue;
+            };
+            if label_filter_ids.is_some_and(|label_ids| !label_ids.contains(&entry.label_id)) {
+                continue;
+            }
+            if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
+                continue;
+            }
+            return Some(edge_id);
+        }
+        None
+    }
+
+    fn visible_adj_edge_count_estimate(
+        state: &MemtableState,
+        node_id: u64,
+        outgoing: bool,
+        label_filter_ids: Option<&[u32]>,
+        snapshot_seq: u64,
+    ) -> MemtableEndpointCountEstimate {
+        if label_filter_ids.is_some_and(<[u32]>::is_empty)
+            || state.node_deleted_at(node_id, snapshot_seq)
+        {
+            return MemtableEndpointCountEstimate {
+                count: 0,
+                exact: true,
+            };
+        }
+        let source = if outgoing {
+            &state.ordered_adj_out
+        } else {
+            &state.ordered_adj_in
+        };
+        let Some(entries) = source.get(&node_id) else {
+            return MemtableEndpointCountEstimate {
+                count: 0,
+                exact: true,
+            };
+        };
+        MemtableEndpointCountEstimate {
+            count: entries.len(),
+            exact: entries.is_empty(),
+        }
+    }
+
+    pub(crate) fn next_visible_edge_from_endpoint_after(
+        &self,
+        node_id: u64,
+        label_filter_ids: Option<&[u32]>,
+        snapshot_seq: u64,
+        after: Option<u64>,
+    ) -> Option<u64> {
         let state = self.state.read().unwrap();
-        let mut types = Vec::new();
-        for (&type_id, members) in &state.type_node_index {
+        Self::next_visible_adj_edge_after(
+            &state,
+            node_id,
+            true,
+            label_filter_ids,
+            snapshot_seq,
+            after,
+        )
+    }
+
+    pub(crate) fn next_visible_edge_to_endpoint_after(
+        &self,
+        node_id: u64,
+        label_filter_ids: Option<&[u32]>,
+        snapshot_seq: u64,
+        after: Option<u64>,
+    ) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        Self::next_visible_adj_edge_after(
+            &state,
+            node_id,
+            false,
+            label_filter_ids,
+            snapshot_seq,
+            after,
+        )
+    }
+
+    pub(crate) fn visible_edges_from_endpoint_count_estimate(
+        &self,
+        node_id: u64,
+        label_filter_ids: Option<&[u32]>,
+        snapshot_seq: u64,
+    ) -> MemtableEndpointCountEstimate {
+        let state = self.state.read().unwrap();
+        Self::visible_adj_edge_count_estimate(&state, node_id, true, label_filter_ids, snapshot_seq)
+    }
+
+    pub(crate) fn visible_edges_to_endpoint_count_estimate(
+        &self,
+        node_id: u64,
+        label_filter_ids: Option<&[u32]>,
+        snapshot_seq: u64,
+    ) -> MemtableEndpointCountEstimate {
+        let state = self.state.read().unwrap();
+        Self::visible_adj_edge_count_estimate(
+            &state,
+            node_id,
+            false,
+            label_filter_ids,
+            snapshot_seq,
+        )
+    }
+
+    pub(crate) fn visible_node_label_ids(&self, snapshot_seq: u64) -> Vec<u32> {
+        let state = self.state.read().unwrap();
+        let mut label_ids = Vec::new();
+        for (&label_id, members) in &state.label_node_index {
             if members
                 .values()
                 .any(|slot| slot_option_visible(slot, snapshot_seq))
             {
-                types.push(type_id);
+                label_ids.push(label_id);
             }
         }
-        types.sort_unstable();
-        types
+        label_ids.sort_unstable();
+        label_ids
     }
 
     pub(crate) fn find_secondary_eq_nodes_at(
@@ -1998,6 +3052,70 @@ impl Memtable {
                 continue;
             };
             if node
+                .props
+                .get(prop_key)
+                .is_some_and(|value| value == prop_value)
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub(crate) fn find_secondary_eq_edges_by_hash_at_limited(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+        snapshot_seq: u64,
+        max_ids: Option<usize>,
+    ) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let Some(groups) = state.secondary_eq_state.get(&index_id) else {
+            return Vec::new();
+        };
+        let Some(group) = groups.get(&value_hash) else {
+            return Vec::new();
+        };
+
+        let mut ids = Vec::new();
+        for (&edge_id, slot) in group {
+            if !slot_option_visible(slot, snapshot_seq) {
+                continue;
+            }
+            ids.push(edge_id);
+            if max_ids.is_some_and(|max_ids| ids.len() >= max_ids) {
+                break;
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn secondary_eq_edge_count_at(
+        &self,
+        index_id: u64,
+        prop_key: &str,
+        prop_value: &PropValue,
+        snapshot_seq: u64,
+    ) -> usize {
+        let state = self.state.read().unwrap();
+        let value_hash = hash_prop_value(prop_value);
+        let Some(groups) = state.secondary_eq_state.get(&index_id) else {
+            return 0;
+        };
+        let Some(group) = groups.get(&value_hash) else {
+            return 0;
+        };
+
+        let mut count = 0;
+        for (&edge_id, slot) in group {
+            if !slot_option_visible(slot, snapshot_seq) {
+                continue;
+            }
+            let Some(edge) = state.edge_at(edge_id, snapshot_seq) else {
+                continue;
+            };
+            if edge
                 .props
                 .get(prop_key)
                 .is_some_and(|value| value == prop_value)
@@ -2150,43 +3268,27 @@ impl Memtable {
         deleted
     }
 
-    /// Current-head helpers below keep the existing memtable-facing API shape
-    /// for writer planning, flush, stats, and tests.
-    pub fn get_node(&self, id: u64) -> Option<NodeRecord> {
-        self.get_node_at(id, u64::MAX)
-    }
-
-    pub fn get_edge(&self, id: u64) -> Option<EdgeRecord> {
-        self.get_edge_at(id, u64::MAX)
-    }
-
-    pub fn node_by_key(&self, type_id: u32, key: &str) -> Option<NodeRecord> {
-        self.node_by_key_at(type_id, key, u64::MAX)
-    }
-
-    pub fn edge_by_triple(&self, from: u64, to: u64, type_id: u32) -> Option<EdgeRecord> {
-        self.edge_by_triple_at(from, to, type_id, u64::MAX)
-    }
-
-    pub fn neighbors(
+    #[allow(dead_code)]
+    pub(crate) fn neighbors(
         &self,
         node_id: u64,
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         limit: usize,
-    ) -> Vec<NeighborEntry> {
-        self.neighbors_at(node_id, direction, type_filter, limit, u64::MAX)
+    ) -> Vec<NeighborRecord> {
+        self.neighbors_at(node_id, direction, label_filter_ids, limit, u64::MAX)
     }
 
-    pub fn neighbors_batch(
+    #[allow(dead_code)]
+    pub(crate) fn neighbors_batch(
         &self,
         node_ids: &[u64],
         direction: Direction,
-        type_filter: Option<&[u32]>,
-    ) -> NodeIdMap<Vec<NeighborEntry>> {
+        label_filter_ids: Option<&[u32]>,
+    ) -> NodeIdMap<Vec<NeighborRecord>> {
         let mut results = NodeIdMap::default();
         for &nid in node_ids {
-            let entries = self.neighbors(nid, direction, type_filter, 0);
+            let entries = self.neighbors(nid, direction, label_filter_ids, 0);
             if !entries.is_empty() {
                 results.insert(nid, entries);
             }
@@ -2198,52 +3300,17 @@ impl Memtable {
         &self,
         node_ids: &[u64],
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
-    ) -> NodeIdMap<Vec<NeighborEntry>> {
+    ) -> NodeIdMap<Vec<NeighborRecord>> {
         let mut results = NodeIdMap::default();
         for &nid in node_ids {
-            let entries = self.neighbors_at(nid, direction, type_filter, 0, snapshot_seq);
+            let entries = self.neighbors_at(nid, direction, label_filter_ids, 0, snapshot_seq);
             if !entries.is_empty() {
                 results.insert(nid, entries);
             }
         }
         results
-    }
-
-    pub fn for_each_adj_entry<F>(
-        &self,
-        node_id: u64,
-        direction: Direction,
-        type_filter: Option<&[u32]>,
-        callback: &mut F,
-    ) -> ControlFlow<()>
-    where
-        F: FnMut(u64, u64, f32, i64, i64) -> ControlFlow<()>,
-    {
-        self.for_each_adj_entry_at(node_id, direction, type_filter, u64::MAX, callback)
-    }
-
-    pub fn incident_edge_ids(&self, node_id: u64) -> Vec<u64> {
-        let state = self.state.read().unwrap();
-        let mut ids = Vec::new();
-        if let Some(map) = state.adj_out.get(&node_id) {
-            for (&edge_id, slot) in map {
-                if slot_option_current(slot).is_some() {
-                    ids.push(edge_id);
-                }
-            }
-        }
-        if let Some(map) = state.adj_in.get(&node_id) {
-            for (&edge_id, slot) in map {
-                if slot_option_current(slot).is_some() {
-                    ids.push(edge_id);
-                }
-            }
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        ids
     }
 
     pub fn node_count(&self) -> usize {
@@ -2310,22 +3377,14 @@ impl Memtable {
         current_adj_map(&state.adj_in)
     }
 
-    pub fn nodes_by_type(&self, type_id: u32) -> Vec<u64> {
-        self.visible_nodes_by_type(type_id, u64::MAX)
-    }
-
-    pub fn edges_by_type(&self, type_id: u32) -> Vec<u64> {
-        self.visible_edges_by_type(type_id, u64::MAX)
-    }
-
-    pub fn type_node_index(&self) -> HashMap<u32, NodeIdSet> {
+    pub fn label_node_index(&self) -> HashMap<u32, NodeIdSet> {
         let state = self.state.read().unwrap();
-        current_type_index(&state.type_node_index)
+        current_label_membership_index(&state.label_node_index)
     }
 
-    pub fn type_edge_index(&self) -> HashMap<u32, NodeIdSet> {
+    pub fn label_edge_index(&self) -> HashMap<u32, NodeIdSet> {
         let state = self.state.read().unwrap();
-        current_type_index(&state.type_edge_index)
+        current_label_membership_index(&state.label_edge_index)
     }
 
     pub fn secondary_index_declarations(&self) -> HashMap<u64, SecondaryIndexManifestEntry> {
@@ -2346,30 +3405,6 @@ impl Memtable {
     pub fn time_node_index(&self) -> BTreeSet<(u32, i64, u64)> {
         let state = self.state.read().unwrap();
         current_time_index(&state.time_node_index)
-    }
-
-    pub fn nodes_by_time_range(&self, type_id: u32, from_ms: i64, to_ms: i64) -> Vec<u64> {
-        self.visible_nodes_by_time_range(type_id, from_ms, to_ms, u64::MAX)
-    }
-
-    pub fn find_nodes(&self, type_id: u32, prop_key: &str, prop_value: &PropValue) -> Vec<u64> {
-        self.visible_nodes_by_type(type_id, u64::MAX)
-            .into_iter()
-            .filter(|id| {
-                self.get_node(*id)
-                    .and_then(|node| node.props.get(prop_key).cloned())
-                    .is_some_and(|value| value == *prop_value)
-            })
-            .collect()
-    }
-
-    pub fn find_secondary_eq_nodes(
-        &self,
-        index_id: u64,
-        prop_key: &str,
-        prop_value: &PropValue,
-    ) -> Vec<u64> {
-        self.find_secondary_eq_nodes_at(index_id, prop_key, prop_value, u64::MAX)
     }
 
     fn estimate_node_record(node: &NodeRecord) -> usize {
@@ -2433,8 +3468,8 @@ impl Memtable {
 
 #[cfg(test)]
 impl Memtable {
-    fn type_node_index_key_count(&self) -> usize {
-        self.type_node_index().len()
+    fn label_node_index_key_count(&self) -> usize {
+        self.label_node_index().len()
     }
 
     fn node_key_index_key_count(&self) -> usize {
@@ -2460,10 +3495,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn make_node(id: u64, type_id: u32, key: &str) -> NodeRecord {
+    fn make_node(id: u64, label_id: u32, key: &str) -> NodeRecord {
         NodeRecord {
             id,
-            type_id,
+            label_ids: NodeLabelSet::single(label_id).unwrap(),
             key: key.to_string(),
             props: BTreeMap::new(),
             created_at: 1000,
@@ -2475,19 +3510,34 @@ mod tests {
         }
     }
 
-    fn make_node_at(id: u64, type_id: u32, key: &str, updated_at: i64) -> NodeRecord {
+    fn make_node_at(id: u64, label_id: u32, key: &str, updated_at: i64) -> NodeRecord {
         NodeRecord {
             updated_at,
-            ..make_node(id, type_id, key)
+            ..make_node(id, label_id, key)
         }
     }
 
-    fn make_edge(id: u64, from: u64, to: u64, type_id: u32) -> EdgeRecord {
+    fn make_node_with_labels(id: u64, label_ids: &[u32], key: &str, updated_at: i64) -> NodeRecord {
+        NodeRecord {
+            id,
+            label_ids: NodeLabelSet::from_canonical_ids(label_ids).unwrap(),
+            key: key.to_string(),
+            props: BTreeMap::new(),
+            created_at: 1000,
+            updated_at,
+            weight: 0.5,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
+        }
+    }
+
+    fn make_edge(id: u64, from: u64, to: u64, label_id: u32) -> EdgeRecord {
         EdgeRecord {
             id,
             from,
             to,
-            type_id,
+            label_id,
             props: BTreeMap::new(),
             created_at: 2000,
             updated_at: 2001,
@@ -2500,13 +3550,26 @@ mod tests {
 
     fn make_node_with_props(
         id: u64,
-        type_id: u32,
+        label_id: u32,
         key: &str,
         props: BTreeMap<String, PropValue>,
     ) -> NodeRecord {
         NodeRecord {
             props,
-            ..make_node(id, type_id, key)
+            ..make_node(id, label_id, key)
+        }
+    }
+
+    fn make_node_with_labels_and_props(
+        id: u64,
+        label_ids: &[u32],
+        key: &str,
+        props: BTreeMap<String, PropValue>,
+        updated_at: i64,
+    ) -> NodeRecord {
+        NodeRecord {
+            props,
+            ..make_node_with_labels(id, label_ids, key, updated_at)
         }
     }
 
@@ -2516,10 +3579,98 @@ mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
         mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 2);
 
-        assert_eq!(mt.get_node(1).unwrap().key, "alice");
-        assert_eq!(mt.get_edge(1).unwrap().from, 1);
-        assert_eq!(mt.node_by_key(1, "alice").unwrap().id, 1);
-        assert_eq!(mt.edge_by_triple(1, 2, 10).unwrap().id, 1);
+        assert_eq!(mt.get_node_at(1, u64::MAX).unwrap().key, "alice");
+        assert_eq!(mt.get_edge_at(1, u64::MAX).unwrap().from, 1);
+        assert_eq!(mt.node_by_key_at(1, "alice", u64::MAX).unwrap().id, 1);
+        assert_eq!(mt.edge_by_triple_at(1, 2, 10, u64::MAX).unwrap().id, 1);
+    }
+
+    #[test]
+    fn edge_metadata_source_helpers_return_visible_ids() {
+        let mt = Memtable::new();
+        let mut edge_a = make_edge(10, 1, 2, 5);
+        edge_a.weight = -0.0;
+        edge_a.updated_at = 100;
+        edge_a.valid_from = 10;
+        edge_a.valid_to = 100;
+        let mut edge_b = make_edge(11, 1, 3, 5);
+        edge_b.weight = 0.0;
+        edge_b.updated_at = 200;
+        edge_b.valid_from = 20;
+        edge_b.valid_to = 200;
+        let mut edge_c = make_edge(12, 4, 1, 6);
+        edge_c.weight = f32::NAN;
+        edge_c.updated_at = 300;
+
+        mt.apply_op(&WalOp::UpsertEdge(edge_a), 1);
+        mt.apply_op(&WalOp::UpsertEdge(edge_b), 2);
+        mt.apply_op(&WalOp::UpsertEdge(edge_c), 3);
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 12,
+                deleted_at: 400,
+            },
+            4,
+        );
+
+        assert_eq!(mt.visible_edge_ids_at(3), vec![10, 11, 12]);
+        assert_eq!(mt.visible_edge_ids_at(4), vec![10, 11]);
+        assert_eq!(mt.visible_edges_by_label_id(5, 4), vec![10, 11]);
+        let mut outgoing_ids = mt
+            .neighbors_batch_at(&[1], Direction::Outgoing, Some(&[5]), 4)
+            .into_values()
+            .flatten()
+            .map(|entry| entry.edge_id)
+            .collect::<Vec<_>>();
+        outgoing_ids.sort_unstable();
+        assert_eq!(outgoing_ids, vec![10, 11]);
+        let mut both_ids = mt
+            .neighbors_batch_at(&[1], Direction::Both, None, 4)
+            .into_values()
+            .flatten()
+            .map(|entry| entry.edge_id)
+            .collect::<Vec<_>>();
+        both_ids.sort_unstable();
+        both_ids.dedup();
+        assert_eq!(both_ids, vec![10, 11]);
+        assert_eq!(mt.edge_ids_by_triple_at(1, 2, 5, 4), vec![10]);
+        assert_eq!(
+            mt.edge_ids_by_weight_range_at(
+                Some(5),
+                RangeBoundFlags::inclusive(Some(0.0), Some(0.0)),
+                4,
+            ),
+            vec![10, 11]
+        );
+        assert_eq!(
+            mt.edge_ids_by_updated_at_range_at(
+                Some(5),
+                RangeBoundFlags::inclusive(Some(150), Some(250)),
+                4,
+            ),
+            vec![11]
+        );
+        assert_eq!(
+            mt.edge_ids_by_valid_from_range_at(
+                None,
+                RangeBoundFlags::inclusive(Some(0), Some(15)),
+                4,
+            ),
+            vec![10]
+        );
+        assert_eq!(
+            mt.edge_ids_by_valid_to_range_at(
+                None,
+                RangeBoundFlags {
+                    lower: Some(100),
+                    lower_inclusive: false,
+                    upper: None,
+                    upper_inclusive: true,
+                },
+                4,
+            ),
+            vec![11]
+        );
     }
 
     #[test]
@@ -2531,7 +3682,7 @@ mod tests {
         assert_eq!(mt.get_node_at(1, 10).unwrap().key, "alice");
         assert_eq!(mt.get_node_at(1, 19).unwrap().key, "alice");
         assert_eq!(mt.get_node_at(1, 20).unwrap().key, "alice_v2");
-        assert_eq!(mt.get_node(1).unwrap().key, "alice_v2");
+        assert_eq!(mt.get_node_at(1, u64::MAX).unwrap().key, "alice_v2");
     }
 
     #[test]
@@ -2546,7 +3697,7 @@ mod tests {
             6,
         );
 
-        assert!(mt.get_node(1).is_none());
+        assert!(mt.get_node_at(1, u64::MAX).is_none());
         assert_eq!(mt.get_node_at(1, 5).unwrap().key, "alice");
         assert!(mt.get_node_at(1, 6).is_none());
         assert!(mt.is_node_deleted_at(1, 6));
@@ -2613,11 +3764,11 @@ mod tests {
         assert_eq!(mt.node_by_key_at(1, "alice", 1).unwrap().id, 1);
         assert!(mt.node_by_key_at(1, "alice", 2).is_none());
         assert_eq!(mt.node_by_key_at(1, "alice", 3).unwrap().id, 2);
-        assert_eq!(mt.node_by_key(1, "alice").unwrap().id, 2);
+        assert_eq!(mt.node_by_key_at(1, "alice", u64::MAX).unwrap().id, 2);
     }
 
     #[test]
-    fn adjacency_and_type_memberships_are_snapshot_aware() {
+    fn adjacency_and_label_memberships_are_snapshot_aware() {
         let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 2);
@@ -2630,8 +3781,8 @@ mod tests {
             4,
         );
 
-        assert_eq!(mt.visible_edges_by_type(10, 3), vec![1]);
-        assert!(mt.visible_edges_by_type(10, 4).is_empty());
+        assert_eq!(mt.visible_edges_by_label_id(10, 3), vec![1]);
+        assert!(mt.visible_edges_by_label_id(10, 4).is_empty());
         let before_delete = mt.neighbors_at(1, Direction::Outgoing, None, 0, 3);
         assert_eq!(before_delete.len(), 1);
         assert_eq!(before_delete[0].node_id, 2);
@@ -2652,6 +3803,111 @@ mod tests {
     }
 
     #[test]
+    fn multi_label_node_memberships_are_maintained_by_label() {
+        let mt = Memtable::new();
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels(1, &[1, 2, 5], "alice", 100)),
+            1,
+        );
+
+        for label_id in [1, 2, 5] {
+            assert_eq!(
+                mt.node_by_key_at(label_id, "alice", 1).map(|node| node.id),
+                Some(1)
+            );
+            assert_eq!(mt.visible_nodes_by_label_id(label_id, 1), vec![1]);
+            assert_eq!(
+                mt.visible_nodes_by_time_range(label_id, 100, 100, 1),
+                vec![1]
+            );
+        }
+        assert!(mt.node_by_key_at(9, "alice", 1).is_none());
+        assert!(mt.visible_nodes_by_label_id(9, 1).is_empty());
+
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels(1, &[2, 5, 9], "alice", 200)),
+            2,
+        );
+
+        assert_eq!(
+            mt.node_by_key_at(1, "alice", 1).map(|node| node.id),
+            Some(1)
+        );
+        assert!(mt.node_by_key_at(1, "alice", 2).is_none());
+        assert!(mt.visible_nodes_by_label_id(1, 2).is_empty());
+        assert!(mt.visible_nodes_by_time_range(1, 100, 100, 2).is_empty());
+
+        for label_id in [2, 5, 9] {
+            assert_eq!(
+                mt.node_by_key_at(label_id, "alice", 2).map(|node| node.id),
+                Some(1)
+            );
+            assert_eq!(mt.visible_nodes_by_label_id(label_id, 2), vec![1]);
+            assert!(mt
+                .visible_nodes_by_time_range(label_id, 100, 100, 2)
+                .is_empty());
+            assert_eq!(
+                mt.visible_nodes_by_time_range(label_id, 200, 200, 2),
+                vec![1]
+            );
+        }
+
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 300,
+            },
+            3,
+        );
+        for label_id in [2, 5, 9] {
+            assert!(mt.node_by_key_at(label_id, "alice", 3).is_none());
+            assert!(mt.visible_nodes_by_label_id(label_id, 3).is_empty());
+            assert!(mt
+                .visible_nodes_by_time_range(label_id, 200, 200, 3)
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn multi_label_key_replacement_updates_all_label_memberships() {
+        let mt = Memtable::new();
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels(1, &[1, 2], "alice", 100)),
+            1,
+        );
+
+        for label_id in [1, 2] {
+            assert_eq!(
+                mt.node_by_key_at(label_id, "alice", 1).map(|node| node.id),
+                Some(1)
+            );
+        }
+
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels(1, &[2, 3], "alice2", 100)),
+            2,
+        );
+
+        for label_id in [1, 2] {
+            assert!(
+                mt.node_by_key_at(label_id, "alice", 2).is_none(),
+                "old key remained visible for label {label_id}"
+            );
+        }
+        assert!(
+            mt.node_by_key_at(1, "alice2", 2).is_none(),
+            "new key became visible for removed label"
+        );
+        for label_id in [2, 3] {
+            assert_eq!(
+                mt.node_by_key_at(label_id, "alice2", 2).map(|node| node.id),
+                Some(1),
+                "new key missing for label {label_id}"
+            );
+        }
+    }
+
+    #[test]
     fn secondary_eq_membership_history_is_snapshot_correct() {
         let mt = Memtable::new();
         let mut props = BTreeMap::new();
@@ -2659,7 +3915,7 @@ mod tests {
         let entry = SecondaryIndexManifestEntry {
             index_id: 10,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "name".into(),
             },
             kind: SecondaryIndexKind::Equality,
@@ -2693,6 +3949,149 @@ mod tests {
     }
 
     #[test]
+    fn multi_label_secondary_memberships_are_maintained_by_declared_label() {
+        let mt = Memtable::new();
+        let eq_label_1 = SecondaryIndexManifestEntry {
+            index_id: 10,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "color".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let eq_label_2 = SecondaryIndexManifestEntry {
+            index_id: 11,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 2,
+                prop_key: "color".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let range_label_2 = SecondaryIndexManifestEntry {
+            index_id: 12,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 2,
+                prop_key: "score".into(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let range_label_3 = SecondaryIndexManifestEntry {
+            index_id: 13,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 3,
+                prop_key: "score".into(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        for entry in [&eq_label_1, &eq_label_2, &range_label_2, &range_label_3] {
+            mt.register_secondary_index(entry);
+        }
+
+        let mut props = BTreeMap::new();
+        props.insert("color".into(), PropValue::String("red".into()));
+        props.insert("score".into(), PropValue::Int(42));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels_and_props(
+                1,
+                &[1, 2, 3],
+                "item",
+                props,
+                100,
+            )),
+            1,
+        );
+
+        assert_eq!(
+            mt.find_secondary_eq_nodes_at(10, "color", &PropValue::String("red".into()), 1),
+            vec![1]
+        );
+        assert_eq!(
+            mt.find_secondary_eq_nodes_at(11, "color", &PropValue::String("red".into()), 1),
+            vec![1]
+        );
+        let encoded_42 =
+            encode_range_prop_value(SecondaryIndexRangeDomain::Int, &PropValue::Int(42)).unwrap();
+        assert_eq!(
+            mt.visible_secondary_range_entries(
+                12,
+                Some((encoded_42, true)),
+                Some((encoded_42, true)),
+                None,
+                1
+            ),
+            vec![(encoded_42, 1)]
+        );
+        assert_eq!(
+            mt.visible_secondary_range_entries(
+                13,
+                Some((encoded_42, true)),
+                Some((encoded_42, true)),
+                None,
+                1
+            ),
+            vec![(encoded_42, 1)]
+        );
+
+        let mut updated_props = BTreeMap::new();
+        updated_props.insert("color".into(), PropValue::String("blue".into()));
+        updated_props.insert("score".into(), PropValue::Int(50));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels_and_props(
+                1,
+                &[2],
+                "item",
+                updated_props,
+                200,
+            )),
+            2,
+        );
+
+        assert!(mt
+            .find_secondary_eq_nodes_at(10, "color", &PropValue::String("red".into()), 2)
+            .is_empty());
+        assert!(mt
+            .find_secondary_eq_nodes_at(11, "color", &PropValue::String("red".into()), 2)
+            .is_empty());
+        assert_eq!(
+            mt.find_secondary_eq_nodes_at(11, "color", &PropValue::String("blue".into()), 2),
+            vec![1]
+        );
+        let encoded_50 =
+            encode_range_prop_value(SecondaryIndexRangeDomain::Int, &PropValue::Int(50)).unwrap();
+        assert!(mt
+            .visible_secondary_range_entries(
+                13,
+                Some((encoded_42, true)),
+                Some((encoded_42, true)),
+                None,
+                2
+            )
+            .is_empty());
+        assert_eq!(
+            mt.visible_secondary_range_entries(
+                12,
+                Some((encoded_50, true)),
+                Some((encoded_50, true)),
+                None,
+                2
+            ),
+            vec![(encoded_50, 1)]
+        );
+    }
+
+    #[test]
     fn same_write_seq_replace_overwrites_head_in_place() {
         let mut slot = VersionedSlot::new(1, 10u64);
         slot.replace(2, 20);
@@ -2710,7 +4109,7 @@ mod tests {
         let eq_entry = SecondaryIndexManifestEntry {
             index_id: 10,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "name".into(),
             },
             kind: SecondaryIndexKind::Equality,
@@ -2720,7 +4119,7 @@ mod tests {
         let range_entry = SecondaryIndexManifestEntry {
             index_id: 11,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "age".into(),
             },
             kind: SecondaryIndexKind::Range {
@@ -2832,7 +4231,7 @@ mod tests {
         let eq_entry = SecondaryIndexManifestEntry {
             index_id: 10,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "name".into(),
             },
             kind: SecondaryIndexKind::Equality,
@@ -2842,7 +4241,7 @@ mod tests {
         let range_entry = SecondaryIndexManifestEntry {
             index_id: 11,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "age".into(),
             },
             kind: SecondaryIndexKind::Range {
@@ -2875,9 +4274,9 @@ mod tests {
         );
 
         assert_eq!(mt.node_key_index_key_count(), 0);
-        assert_eq!(mt.type_node_index_key_count(), 0);
+        assert_eq!(mt.label_node_index_key_count(), 0);
         assert_eq!(mt.time_node_index_len(), 0);
-        assert!(mt.get_node(1).is_none());
+        assert!(mt.get_node_at(1, u64::MAX).is_none());
         assert_eq!(mt.max_node_id(), 1);
     }
 }

@@ -3,9 +3,7 @@ use crate::parallel::engine_cpu_install;
 use crate::types::{DenseMetric, DenseVectorConfig, NodeIdSet};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, RwLock};
 
@@ -214,15 +212,28 @@ impl PartialOrd for MaxCandidate {
     }
 }
 
-pub(crate) fn write_dense_hnsw_index_from_points(
-    seg_dir: &Path,
-    dense_config: Option<&DenseVectorConfig>,
+pub(crate) fn build_dense_hnsw_from_points(
     points: Vec<DensePointInput>,
+    config: &DenseVectorConfig,
+) -> Result<Option<BuiltHnsw>, EngineError> {
+    let points = dense_point_inputs_to_loaded_points(points);
+    if points.is_empty() {
+        return Ok(None);
+    }
+    build_hnsw(points, config).map(Some)
+}
+
+pub(crate) fn write_prebuilt_hnsw_to_writers(
+    meta_w: &mut impl Write,
+    graph_w: &mut impl Write,
+    config: &DenseVectorConfig,
+    built: &BuiltHnsw,
 ) -> Result<(), EngineError> {
-    let Some(config) = dense_config else {
-        return Ok(());
-    };
-    let points: Vec<DensePoint> = points
+    write_hnsw_payloads(meta_w, graph_w, config, built)
+}
+
+fn dense_point_inputs_to_loaded_points(points: Vec<DensePointInput>) -> Vec<DensePoint> {
+    points
         .into_iter()
         .map(|point| DensePoint {
             node_id: point.node_id,
@@ -230,23 +241,16 @@ pub(crate) fn write_dense_hnsw_index_from_points(
             norm: dense_vector_norm(&point.values),
             values: point.values,
         })
-        .collect();
-    write_dense_hnsw_index_from_loaded_points(seg_dir, config, points)
+        .collect()
 }
 
-fn write_dense_hnsw_index_from_loaded_points(
-    seg_dir: &Path,
-    config: &DenseVectorConfig,
-    points: Vec<DensePoint>,
-) -> Result<(), EngineError> {
-    if points.is_empty() {
-        return Ok(());
-    }
-
-    let built = build_hnsw(points, config)?;
-    write_hnsw_files(seg_dir, config, &built)
+fn hnsw_point_count_usize(header: DenseHnswHeader) -> Result<usize, EngineError> {
+    usize::try_from(header.point_count).map_err(|_| {
+        EngineError::CorruptRecord("dense HNSW point count exceeds addressable memory".into())
+    })
 }
 
+#[cfg(test)]
 pub(crate) fn validate_dense_hnsw_files(
     meta: &[u8],
     graph: &[u8],
@@ -275,7 +279,8 @@ pub(crate) fn validate_dense_hnsw_files(
             "dense HNSW metadata has zero points".into(),
         ));
     }
-    if header.point_count as usize != dense_vector_count {
+    let point_count = hnsw_point_count_usize(header)?;
+    if point_count != dense_vector_count {
         return Err(EngineError::CorruptRecord(format!(
             "dense HNSW point count {} does not match dense vector count {}",
             header.point_count, dense_vector_count
@@ -315,8 +320,11 @@ pub(crate) fn validate_dense_hnsw_files(
         }
     }
 
+    let point_meta_bytes = point_count
+        .checked_mul(DENSE_HNSW_POINT_META_SIZE)
+        .ok_or_else(|| EngineError::CorruptRecord("dense HNSW metadata size overflow".into()))?;
     let expected_meta_len = DENSE_HNSW_HEADER_SIZE
-        .checked_add(header.point_count as usize * DENSE_HNSW_POINT_META_SIZE)
+        .checked_add(point_meta_bytes)
         .ok_or_else(|| EngineError::CorruptRecord("dense HNSW metadata size overflow".into()))?;
     if meta.len() != expected_meta_len {
         return Err(EngineError::CorruptRecord(format!(
@@ -341,7 +349,7 @@ pub(crate) fn validate_dense_hnsw_files(
 
     let mut prev_node_id = None;
     let mut expected_level_offset = 0usize;
-    for index in 0..header.point_count as usize {
+    for index in 0..point_count {
         let point = read_point_meta(meta, index)?;
         if let Some(prev_node_id) = prev_node_id {
             if point.node_id <= prev_node_id {
@@ -353,7 +361,12 @@ pub(crate) fn validate_dense_hnsw_files(
         }
         prev_node_id = Some(point.node_id);
 
-        let dense_offset = point.dense_vector_offset as usize;
+        let dense_offset = usize::try_from(point.dense_vector_offset).map_err(|_| {
+            EngineError::CorruptRecord(format!(
+                "dense HNSW point {} vector offset exceeds addressable memory",
+                index
+            ))
+        })?;
         let dense_end = dense_offset
             .checked_add(dense_vector_bytes)
             .ok_or_else(|| EngineError::CorruptRecord("dense vector range overflow".into()))?;
@@ -422,6 +435,97 @@ pub(crate) fn validate_dense_hnsw_files(
     Ok(Some(header))
 }
 
+pub(crate) fn validate_dense_hnsw_files_for_open(
+    meta: &[u8],
+    graph: &[u8],
+    _dense_blob_len: usize,
+    dense_vector_count: usize,
+    dense_config: Option<&DenseVectorConfig>,
+) -> Result<Option<DenseHnswHeader>, EngineError> {
+    if meta.is_empty() && graph.is_empty() {
+        return Ok(None);
+    }
+    if meta.is_empty() || graph.is_empty() {
+        return Err(EngineError::CorruptRecord(
+            "dense HNSW files must appear together".into(),
+        ));
+    }
+    if dense_vector_count == 0 {
+        return Err(EngineError::CorruptRecord(
+            "segment has dense HNSW files but no dense vectors".into(),
+        ));
+    }
+
+    let header = read_header(meta)?;
+    if header.point_count == 0 {
+        return Err(EngineError::CorruptRecord(
+            "dense HNSW metadata has zero points".into(),
+        ));
+    }
+    let point_count = hnsw_point_count_usize(header)?;
+    if point_count != dense_vector_count {
+        return Err(EngineError::CorruptRecord(format!(
+            "dense HNSW point count {} does not match dense vector count {}",
+            header.point_count, dense_vector_count
+        )));
+    }
+    match dense_config {
+        Some(config) => {
+            if header.metric != config.metric {
+                return Err(EngineError::CorruptRecord(format!(
+                    "dense HNSW metric {:?} does not match configured metric {:?}",
+                    header.metric, config.metric
+                )));
+            }
+            if header.dimension != config.dimension {
+                return Err(EngineError::CorruptRecord(format!(
+                    "dense HNSW dimension {} does not match configured dimension {}",
+                    header.dimension, config.dimension
+                )));
+            }
+            if header.m != config.hnsw.m {
+                return Err(EngineError::CorruptRecord(format!(
+                    "dense HNSW m {} does not match configured m {}",
+                    header.m, config.hnsw.m
+                )));
+            }
+            if header.ef_construction != config.hnsw.ef_construction {
+                return Err(EngineError::CorruptRecord(format!(
+                    "dense HNSW ef_construction {} does not match configured ef_construction {}",
+                    header.ef_construction, config.hnsw.ef_construction
+                )));
+            }
+        }
+        None => {
+            return Err(EngineError::CorruptRecord(
+                "dense HNSW files require DbOptions::dense_vector to be configured".into(),
+            ));
+        }
+    }
+
+    let point_meta_bytes = point_count
+        .checked_mul(DENSE_HNSW_POINT_META_SIZE)
+        .ok_or_else(|| EngineError::CorruptRecord("dense HNSW metadata size overflow".into()))?;
+    let expected_meta_len = DENSE_HNSW_HEADER_SIZE
+        .checked_add(point_meta_bytes)
+        .ok_or_else(|| EngineError::CorruptRecord("dense HNSW metadata size overflow".into()))?;
+    if meta.len() != expected_meta_len {
+        return Err(EngineError::CorruptRecord(format!(
+            "dense HNSW metadata size {} does not match expected {}",
+            meta.len(),
+            expected_meta_len
+        )));
+    }
+    if header.entry_point as u64 >= header.point_count {
+        return Err(EngineError::CorruptRecord(format!(
+            "dense HNSW entry point {} out of range for {} points",
+            header.entry_point, header.point_count
+        )));
+    }
+
+    Ok(Some(header))
+}
+
 #[cfg(test)]
 pub(crate) fn search_dense_hnsw(
     meta: &[u8],
@@ -444,7 +548,7 @@ pub(crate) fn search_dense_hnsw(
         )));
     }
 
-    let point_count = header.point_count as usize;
+    let point_count = hnsw_point_count_usize(header)?;
     if point_count == 0 {
         return Ok(Vec::new());
     }
@@ -462,7 +566,7 @@ pub(crate) fn search_dense_hnsw_with_points(
     ef_search: usize,
     limit: usize,
 ) -> Result<Vec<(u64, f32)>, EngineError> {
-    let point_count = header.point_count as usize;
+    let point_count = hnsw_point_count_usize(header)?;
     if point_count == 0 {
         return Ok(Vec::new());
     }
@@ -508,6 +612,12 @@ pub(crate) fn search_dense_hnsw_with_points(
                 level_neighbor_span_from_point(points[entry_point], graph, level)?;
             for neighbor_idx in 0..neighbor_count {
                 let neighbor = read_u32_at(graph, neighbors_start + neighbor_idx * 4)? as usize;
+                if neighbor >= point_count {
+                    return Err(EngineError::CorruptRecord(format!(
+                        "dense HNSW neighbor {} out of range for {} points",
+                        neighbor, point_count
+                    )));
+                }
                 let neighbor_distance = point_distance(
                     points,
                     dense_blob,
@@ -555,6 +665,12 @@ pub(crate) fn search_dense_hnsw_with_points(
             level_neighbor_span_from_point(points[candidate.point], graph, 0)?;
         for neighbor_idx in 0..neighbor_count {
             let neighbor = read_u32_at(graph, neighbors_start + neighbor_idx * 4)? as usize;
+            if neighbor >= point_count {
+                return Err(EngineError::CorruptRecord(format!(
+                    "dense HNSW neighbor {} out of range for {} points",
+                    neighbor, point_count
+                )));
+            }
             if is_visited(&visited, neighbor) {
                 continue;
             }
@@ -620,7 +736,7 @@ fn mark_visited(visited: &mut [u64], point: usize) {
     visited[word] |= mask;
 }
 
-struct BuiltHnsw {
+pub(crate) struct BuiltHnsw {
     header: DenseHnswHeader,
     point_metas: Vec<PointMeta>,
     graph: Vec<Vec<Vec<usize>>>,
@@ -821,9 +937,15 @@ fn build_hnsw(
             max_level: level as u16,
         });
         for level_neighbors in &graph[point_metas.len() - 1] {
+            let neighbor_bytes = u64::try_from(level_neighbors.len())
+                .ok()
+                .and_then(|len| len.checked_mul(4))
+                .ok_or_else(|| {
+                    EngineError::CorruptRecord("dense HNSW graph offset overflow".into())
+                })?;
             level_offset = level_offset
                 .checked_add(4)
-                .and_then(|offset| offset.checked_add(level_neighbors.len() as u64 * 4))
+                .and_then(|offset| offset.checked_add(neighbor_bytes))
                 .ok_or_else(|| {
                     EngineError::CorruptRecord("dense HNSW graph offset overflow".into())
                 })?;
@@ -1293,7 +1415,7 @@ pub(crate) fn search_dense_hnsw_scoped_with_points(
     limit: usize,
     scope_ids: &NodeIdSet,
 ) -> Result<Vec<(u64, f32)>, EngineError> {
-    let point_count = header.point_count as usize;
+    let point_count = hnsw_point_count_usize(header)?;
     if point_count == 0 {
         return Ok(Vec::new());
     }
@@ -1533,8 +1655,9 @@ pub(crate) fn load_dense_hnsw_query_points(
     meta: &[u8],
     header: DenseHnswHeader,
 ) -> Result<Vec<DenseQueryPoint>, EngineError> {
-    let mut points = Vec::with_capacity(header.point_count as usize);
-    for point_idx in 0..header.point_count as usize {
+    let point_count = hnsw_point_count_usize(header)?;
+    let mut points = Vec::with_capacity(point_count);
+    for point_idx in 0..point_count {
         let point = read_point_meta(meta, point_idx)?;
         points.push(DenseQueryPoint {
             node_id: point.node_id,
@@ -1661,11 +1784,20 @@ fn level_neighbor_span_from_point(
         let neighbors_start = cursor.checked_add(4).ok_or_else(|| {
             EngineError::CorruptRecord("dense HNSW neighbor header overflow".into())
         })?;
-        let neighbors_end = neighbors_start
-            .checked_add(neighbor_count * 4)
-            .ok_or_else(|| {
-                EngineError::CorruptRecord("dense HNSW neighbor range overflow".into())
-            })?;
+        let neighbor_bytes = neighbor_count.checked_mul(4).ok_or_else(|| {
+            EngineError::CorruptRecord("dense HNSW neighbor bytes overflow".into())
+        })?;
+        let neighbors_end = neighbors_start.checked_add(neighbor_bytes).ok_or_else(|| {
+            EngineError::CorruptRecord("dense HNSW neighbor range overflow".into())
+        })?;
+        if neighbors_end > graph.len() {
+            return Err(EngineError::CorruptRecord(format!(
+                "dense HNSW neighbor range [{}, {}) exceeds graph length {}",
+                neighbors_start,
+                neighbors_end,
+                graph.len()
+            )));
+        }
         if current_level == level {
             return Ok((neighbors_start, neighbor_count));
         }
@@ -1686,51 +1818,43 @@ impl From<DenseQueryPoint> for PointMeta {
     }
 }
 
-fn write_hnsw_files(
-    seg_dir: &Path,
+fn write_hnsw_payloads(
+    meta_w: &mut impl Write,
+    graph_w: &mut impl Write,
     config: &DenseVectorConfig,
     built: &BuiltHnsw,
 ) -> Result<(), EngineError> {
-    let meta_file = File::create(seg_dir.join(DENSE_HNSW_META_FILENAME))?;
-    let graph_file = File::create(seg_dir.join(DENSE_HNSW_GRAPH_FILENAME))?;
-    let mut meta_w = BufWriter::new(meta_file);
-    let mut graph_w = BufWriter::new(graph_file);
-
     meta_w.write_all(&DENSE_HNSW_MAGIC)?;
-    write_u32(&mut meta_w, DENSE_HNSW_VERSION)?;
-    write_u64(&mut meta_w, built.header.point_count)?;
-    write_u32(&mut meta_w, built.header.entry_point)?;
-    write_u16(&mut meta_w, built.header.max_level)?;
-    write_u16(&mut meta_w, built.header.m)?;
-    write_u16(&mut meta_w, built.header.ef_construction)?;
-    write_u8(&mut meta_w, metric_to_u8(config.metric))?;
-    write_u8(&mut meta_w, 0)?;
-    write_u32(&mut meta_w, config.dimension)?;
-    write_u32(&mut meta_w, 0)?;
+    write_u32(meta_w, DENSE_HNSW_VERSION)?;
+    write_u64(meta_w, built.header.point_count)?;
+    write_u32(meta_w, built.header.entry_point)?;
+    write_u16(meta_w, built.header.max_level)?;
+    write_u16(meta_w, built.header.m)?;
+    write_u16(meta_w, built.header.ef_construction)?;
+    write_u8(meta_w, metric_to_u8(config.metric))?;
+    write_u8(meta_w, 0)?;
+    write_u32(meta_w, config.dimension)?;
+    write_u32(meta_w, 0)?;
 
     for point in &built.point_metas {
-        write_u64(&mut meta_w, point.node_id)?;
-        write_u64(&mut meta_w, point.dense_vector_offset)?;
-        write_u64(&mut meta_w, point.level_offset)?;
-        write_u16(&mut meta_w, point.max_level)?;
-        write_u16(&mut meta_w, 0)?;
-        write_u32(&mut meta_w, 0)?;
+        write_u64(meta_w, point.node_id)?;
+        write_u64(meta_w, point.dense_vector_offset)?;
+        write_u64(meta_w, point.level_offset)?;
+        write_u16(meta_w, point.max_level)?;
+        write_u16(meta_w, 0)?;
+        write_u32(meta_w, 0)?;
     }
 
     for levels in &built.graph {
         for neighbors in levels {
-            write_u16(&mut graph_w, neighbors.len() as u16)?;
-            write_u16(&mut graph_w, 0)?;
+            write_u16(graph_w, neighbors.len() as u16)?;
+            write_u16(graph_w, 0)?;
             for &neighbor in neighbors {
-                write_u32(&mut graph_w, neighbor as u32)?;
+                write_u32(graph_w, neighbor as u32)?;
             }
         }
     }
 
-    meta_w.flush()?;
-    meta_w.get_ref().sync_all()?;
-    graph_w.flush()?;
-    graph_w.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -1870,12 +1994,11 @@ fn read_u64_at(data: &[u8], offset: usize) -> Result<u64, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment_writer::{
-        write_segment_without_degree_sidecar_for_test as write_segment,
-        NODE_DENSE_VECTOR_BLOB_FILENAME,
-    };
+    use crate::segment_writer::write_segment_without_degree_sidecar_for_test as write_segment;
     use crate::types::NodeIdSet;
-    use crate::types::{DenseMetric, HnswConfig, NodeRecord, WalOp, DEFAULT_DENSE_EF_SEARCH};
+    use crate::types::{
+        DenseMetric, HnswConfig, NodeLabelSet, NodeRecord, WalOp, DEFAULT_DENSE_EF_SEARCH,
+    };
     use crate::{memtable::Memtable, types::DenseVectorConfig};
     use std::collections::BTreeMap;
     use std::env;
@@ -1893,7 +2016,7 @@ mod tests {
     fn node(id: u64, key: &str, dense: Vec<f32>) -> NodeRecord {
         NodeRecord {
             id,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: key.to_string(),
             props: BTreeMap::new(),
             created_at: 1,
@@ -1902,6 +2025,50 @@ mod tests {
             dense_vector: Some(dense),
             sparse_vector: None,
             last_write_seq: 0,
+        }
+    }
+
+    fn read_component_payload(path: &std::path::Path) -> Vec<u8> {
+        let data = fs::read(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        if data.len() >= crate::segment_components::COMPONENT_IDENTITY_HEADER_LEN
+            && data[0..crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC.len()]
+                == crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC
+        {
+            let header = crate::segment_components::decode_identity_header(&data).unwrap();
+            let start = header.payload_offset as usize;
+            let end = start + header.payload_len as usize;
+            return data[start..end].to_vec();
+        }
+        data
+    }
+
+    fn read_manifest_component_payload(
+        seg_dir: &std::path::Path,
+        kind: crate::segment_components::SegmentComponentKind,
+    ) -> Vec<u8> {
+        let manifest_bytes =
+            fs::read(seg_dir.join(crate::segment_components::SEGMENT_COMPONENT_MANIFEST_FILENAME))
+                .unwrap();
+        let manifest =
+            crate::segment_components::decode_manifest_envelope(&manifest_bytes).unwrap();
+        let record = manifest
+            .components
+            .iter()
+            .find(|record| record.kind == kind)
+            .unwrap_or_else(|| panic!("missing component {:?}", kind));
+        match &record.handle {
+            crate::segment_components::ComponentHandleV1::ExternalFile {
+                relative_path, ..
+            } => read_component_payload(&seg_dir.join(relative_path)),
+            crate::segment_components::ComponentHandleV1::PackedRange { offset, len, .. } => {
+                let core = read_component_payload(
+                    &seg_dir.join(crate::segment_components::PACKED_CORE_FILENAME),
+                );
+                let start = *offset as usize;
+                let end = start + *len as usize;
+                core[start..end].to_vec()
+            }
         }
     }
 
@@ -2091,9 +2258,12 @@ mod tests {
         write_segment(&seg_dir, 1, &mt, Some(&config)).unwrap();
         let build_elapsed = build_started.elapsed();
 
-        let meta = fs::read(seg_dir.join(DENSE_HNSW_META_FILENAME)).unwrap();
-        let graph = fs::read(seg_dir.join(DENSE_HNSW_GRAPH_FILENAME)).unwrap();
-        let dense_blob = fs::read(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME)).unwrap();
+        let meta = read_component_payload(&seg_dir.join(DENSE_HNSW_META_FILENAME));
+        let graph = read_component_payload(&seg_dir.join(DENSE_HNSW_GRAPH_FILENAME));
+        let dense_blob = read_manifest_component_payload(
+            &seg_dir,
+            crate::segment_components::SegmentComponentKind::NodeDenseVectorBlob,
+        );
         let header = read_header(&meta).unwrap();
         let points = load_dense_hnsw_query_points(&meta, header).unwrap();
 
@@ -2246,9 +2416,12 @@ mod tests {
         write_segment(&seg_dir, 1, &mt, Some(&config)).unwrap();
         (
             config,
-            fs::read(seg_dir.join(DENSE_HNSW_META_FILENAME)).unwrap(),
-            fs::read(seg_dir.join(DENSE_HNSW_GRAPH_FILENAME)).unwrap(),
-            fs::read(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME)).unwrap(),
+            read_component_payload(&seg_dir.join(DENSE_HNSW_META_FILENAME)),
+            read_component_payload(&seg_dir.join(DENSE_HNSW_GRAPH_FILENAME)),
+            read_manifest_component_payload(
+                &seg_dir,
+                crate::segment_components::SegmentComponentKind::NodeDenseVectorBlob,
+            ),
         )
     }
 
@@ -2305,6 +2478,29 @@ mod tests {
                 assert!(message.contains("unsupported"));
             }
             other => panic!("expected invalid version error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_dense_hnsw_rejects_metadata_length_overflow() {
+        let (config, mut meta, graph, dense_blob) = valid_dense_hnsw_files();
+        let too_many_points = usize::MAX / DENSE_HNSW_POINT_META_SIZE + 1;
+        meta[8..16].copy_from_slice(&u64::try_from(too_many_points).unwrap().to_le_bytes());
+
+        match validate_dense_hnsw_files(
+            &meta,
+            &graph,
+            dense_blob.len(),
+            too_many_points,
+            Some(&config),
+        ) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("overflow") || message.contains("addressable"));
+            }
+            other => panic!(
+                "expected dense HNSW metadata overflow error, got {:?}",
+                other
+            ),
         }
     }
 
@@ -2383,9 +2579,12 @@ mod tests {
             let seg_dir = dir.path().join("seg_0001");
             write_segment(&seg_dir, 1, &mt, Some(&config)).unwrap();
 
-            let meta = fs::read(seg_dir.join(DENSE_HNSW_META_FILENAME)).unwrap();
-            let graph = fs::read(seg_dir.join(DENSE_HNSW_GRAPH_FILENAME)).unwrap();
-            let dense_blob = fs::read(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME)).unwrap();
+            let meta = read_component_payload(&seg_dir.join(DENSE_HNSW_META_FILENAME));
+            let graph = read_component_payload(&seg_dir.join(DENSE_HNSW_GRAPH_FILENAME));
+            let dense_blob = read_manifest_component_payload(
+                &seg_dir,
+                crate::segment_components::SegmentComponentKind::NodeDenseVectorBlob,
+            );
 
             let mut total_recall = 0.0f32;
             let query_count = 8;
@@ -2458,9 +2657,12 @@ mod tests {
 
         write_segment(&seg_dir, 1, &mt, Some(&config)).unwrap();
 
-        let meta = fs::read(seg_dir.join(DENSE_HNSW_META_FILENAME)).unwrap();
-        let graph = fs::read(seg_dir.join(DENSE_HNSW_GRAPH_FILENAME)).unwrap();
-        let dense_blob = fs::read(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME)).unwrap();
+        let meta = read_component_payload(&seg_dir.join(DENSE_HNSW_META_FILENAME));
+        let graph = read_component_payload(&seg_dir.join(DENSE_HNSW_GRAPH_FILENAME));
+        let dense_blob = read_manifest_component_payload(
+            &seg_dir,
+            crate::segment_components::SegmentComponentKind::NodeDenseVectorBlob,
+        );
         let query = vec![1.0, 0.0];
 
         let ann_hits = search_dense_hnsw(&meta, &graph, &dense_blob, &query, 8, 4).unwrap();
@@ -2500,9 +2702,12 @@ mod tests {
 
         write_segment(&seg_dir, 1, &mt, Some(&config)).unwrap();
 
-        let meta = fs::read(seg_dir.join(DENSE_HNSW_META_FILENAME)).unwrap();
-        let graph = fs::read(seg_dir.join(DENSE_HNSW_GRAPH_FILENAME)).unwrap();
-        let dense_blob = fs::read(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME)).unwrap();
+        let meta = read_component_payload(&seg_dir.join(DENSE_HNSW_META_FILENAME));
+        let graph = read_component_payload(&seg_dir.join(DENSE_HNSW_GRAPH_FILENAME));
+        let dense_blob = read_manifest_component_payload(
+            &seg_dir,
+            crate::segment_components::SegmentComponentKind::NodeDenseVectorBlob,
+        );
         let mut total_recall = 0.0f32;
 
         for index in [8usize, 24, 32, 48, 64, 96, 128, 160, 192, 208, 224, 240] {
@@ -2670,8 +2875,11 @@ mod tests {
         );
         write_segment(&seg_dir, 1, &mt, Some(&config)).unwrap();
 
-        let meta = fs::read(seg_dir.join(DENSE_HNSW_META_FILENAME)).unwrap();
-        let dense_blob = fs::read(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME)).unwrap();
+        let meta = read_component_payload(&seg_dir.join(DENSE_HNSW_META_FILENAME));
+        let dense_blob = read_manifest_component_payload(
+            &seg_dir,
+            crate::segment_components::SegmentComponentKind::NodeDenseVectorBlob,
+        );
 
         let hits = exact_dense_search_above_cutoff(
             &meta,
@@ -2776,9 +2984,12 @@ mod tests {
         }
         write_segment(&seg_dir, 1, &mt, Some(&config)).unwrap();
 
-        let meta = fs::read(seg_dir.join(DENSE_HNSW_META_FILENAME)).unwrap();
-        let graph_bytes = fs::read(seg_dir.join(DENSE_HNSW_GRAPH_FILENAME)).unwrap();
-        let dense_blob = fs::read(seg_dir.join(NODE_DENSE_VECTOR_BLOB_FILENAME)).unwrap();
+        let meta = read_component_payload(&seg_dir.join(DENSE_HNSW_META_FILENAME));
+        let graph_bytes = read_component_payload(&seg_dir.join(DENSE_HNSW_GRAPH_FILENAME));
+        let dense_blob = read_manifest_component_payload(
+            &seg_dir,
+            crate::segment_components::SegmentComponentKind::NodeDenseVectorBlob,
+        );
 
         let query = vec![0.5f32; 8];
         let ann_hits = search_dense_hnsw(&meta, &graph_bytes, &dense_blob, &query, 32, 10).unwrap();

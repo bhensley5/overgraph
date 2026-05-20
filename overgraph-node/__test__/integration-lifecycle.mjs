@@ -40,9 +40,9 @@ describe('Full lifecycle integration', () => {
 
     const nodes = [];
     for (let i = 0; i < 500; i++) {
-      const typeId = (i % 5) + 1; // types 1-5
+      const label = ['Person', 'Company', 'Document', 'Post', 'User'][i % 5];
       nodes.push({
-        typeId,
+        labels: [label],
         key: `node-${i}`,
         props: { idx: i, label: `Node ${i}`, active: i % 3 !== 0 },
         weight: (i % 10) / 10.0,
@@ -72,7 +72,7 @@ describe('Full lifecycle integration', () => {
       edges.push({
         from: nodeIds[fromIdx],
         to: nodeIds[toIdx],
-        typeId: (i % 3) + 10, // edge types 10, 11, 12
+        label: ['WORKS_AT', 'MENTIONS', 'REFERENCES'][i % 3],
         props: { order: i },
         weight: 1.0 + (i % 5) * 0.1,
       });
@@ -97,7 +97,7 @@ describe('Full lifecycle integration', () => {
     assert.ok(nbrs.length > 0, 'node 0 should have outgoing neighbors');
 
     // Neighbors with type filter
-    const filtered = await db.neighborsAsync(nodeIds[0], { direction: 'outgoing', typeFilter: [10] });
+    const filtered = await db.neighborsAsync(nodeIds[0], { direction: 'outgoing', edgeLabelFilter: ['WORKS_AT'] });
     assert.ok(filtered.length <= nbrs.length);
 
     // Neighbors with limit
@@ -134,19 +134,19 @@ describe('Full lifecycle integration', () => {
 
     // Find all type-1 nodes where active=true
     // Type 1 nodes: indices 0, 5, 10, ... (every 5th). Active: idx % 3 !== 0
-    const activeType1 = await db.findNodesAsync(1, 'active', true);
+    const activeType1 = await db.findNodesAsync('Person', 'active', true);
     assert.ok(activeType1.length > 0);
 
     // Verify they're actually active type-1 nodes
     for (const id of activeType1) {
       const n = await db.getNodeAsync(id);
       assert.ok(n);
-      assert.equal(n.typeId, 1);
+      assert.ok(n.labels.includes('Person'));
       assert.equal(n.props.active, true);
     }
 
     // Find by string property
-    const specific = await db.findNodesAsync(1, 'label', 'Node 0');
+    const specific = await db.findNodesAsync('Person', 'label', 'Node 0');
     assert.equal(specific.length, 1);
 
     db.close();
@@ -178,7 +178,7 @@ describe('Full lifecycle integration', () => {
 
     // Insert a few more nodes to create a second segment
     for (let i = 0; i < 20; i++) {
-      db.upsertNode(1, `extra-${i}`);
+      db.upsertNode('Person', `extra-${i}`);
     }
     await db.flushAsync();
 
@@ -215,7 +215,7 @@ describe('Full lifecycle integration', () => {
     assert.ok(nbrs.length > 0, 'neighbors should work after reopen');
 
     // Verify find_nodes still works after compaction + reopen
-    const found = await db.findNodesAsync(1, 'label', 'Node 0');
+    const found = await db.findNodesAsync('Person', 'label', 'Node 0');
     assert.equal(found.length, 1);
 
     // Verify edge data survived

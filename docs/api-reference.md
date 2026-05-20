@@ -18,20 +18,29 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
 - [Database Lifecycle](#database-lifecycle)
   - [open](#open)
   - [close](#close)
+  - [close_fast](#close_fast)
   - [stats](#stats)
 - [Configuration](#configuration)
   - [DbOptions](#dboptions)
   - [WalSyncMode](#walsyncmode)
   - [DenseVectorConfig](#densevectorconfig)
 - [Data Model](#data-model)
-  - [NodeRecord](#noderecord)
-  - [EdgeRecord](#edgerecord)
+  - [Node Records](#node-records)
+  - [Edge Records](#edge-records)
   - [PropValue](#propvalue)
+  - [IntoNodeLabels](#intonodelabels-rust-only)
   - [Direction](#direction)
+  - [NodeLabelFilter / LabelMatchMode](#nodelabelfilter--labelmatchmode)
+- [Catalog APIs](#catalog-apis)
+  - [ensure_node_label / ensure_edge_label](#ensure_node_label--ensure_edge_label)
+  - [get_node_label_id / get_edge_label_id](#get_node_label_id--get_edge_label_id)
+  - [get_node_label / get_edge_label](#get_node_label--get_edge_label)
+  - [list_node_labels / list_edge_labels](#list_node_labels--list_edge_labels)
 - [Node Operations](#node-operations)
   - [upsert_node](#upsert_node)
   - [get_node](#get_node)
   - [get_node_by_key](#get_node_by_key)
+  - [add_node_label / remove_node_label](#add_node_label--remove_node_label)
   - [delete_node](#delete_node)
   - [batch_upsert_nodes](#batch_upsert_nodes)
   - [get_nodes](#get_nodes)
@@ -47,20 +56,25 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
 - [Atomic Operations](#atomic-operations)
   - [graph_patch](#graph_patch)
   - [write transactions](#write-transactions)
-- [Type-Based Queries](#type-based-queries)
-  - [nodes_by_type](#nodes_by_type)
-  - [edges_by_type](#edges_by_type)
-  - [get_nodes_by_type](#get_nodes_by_type)
-  - [get_edges_by_type](#get_edges_by_type)
-  - [count_nodes_by_type](#count_nodes_by_type)
-  - [count_edges_by_type](#count_edges_by_type)
+- [Label and Edge-Label Queries](#label-and-edge-label-queries)
+  - [nodes_by_labels](#nodes_by_labels)
+  - [edges_by_label](#edges_by_label)
+  - [get_nodes_by_labels](#get_nodes_by_labels)
+  - [get_edges_by_label](#get_edges_by_label)
+  - [count_nodes_by_labels](#count_nodes_by_labels)
+  - [count_edges_by_label](#count_edges_by_label)
 - [Property Index Management](#property-index-management)
   - [ensure_node_property_index](#ensure_node_property_index)
   - [drop_node_property_index](#drop_node_property_index)
   - [list_node_property_indexes](#list_node_property_indexes)
   - [NodePropertyIndexInfo](#nodepropertyindexinfo)
+  - [ensure_edge_property_index](#ensure_edge_property_index)
+  - [drop_edge_property_index](#drop_edge_property_index)
+  - [list_edge_property_indexes](#list_edge_property_indexes)
+  - [EdgePropertyIndexInfo](#edgepropertyindexinfo)
   - [PropertyRangeBound](#propertyrangebound)
   - [PropertyRangeCursor](#propertyrangecursor)
+  - [PropertyRangePageRequest](#propertyrangepagerequest-rust-only)
   - [PropertyRangePageResult](#propertyrangepageresult)
 - [Property & Time Queries](#property--time-queries)
   - [find_nodes](#find_nodes)
@@ -71,20 +85,26 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
     - [query_node_ids](#query_node_ids)
     - [query_nodes](#query_nodes)
     - [explain_node_query](#explain_node_query)
+  - [Direct Edge Queries](#direct-edge-queries)
+    - [query_edge_ids](#query_edge_ids)
+    - [query_edges](#query_edges)
+    - [explain_edge_query](#explain_edge_query)
   - [Graph Pattern Queries](#graph-pattern-queries)
     - [query_pattern](#query_pattern)
     - [explain_pattern_query](#explain_pattern_query)
   - [Query Request Types and Plans](#query-request-types-and-plans)
     - [NodeQuery](#nodequery)
     - [NodeFilter / QueryNodeFilter](#nodefilter--querynodefilter)
+    - [EdgeQuery](#edgequery)
+    - [EdgeFilter / QueryEdgeFilter](#edgefilter--queryedgefilter)
     - [GraphPatternQuery](#graphpatternquery)
     - [QueryPlan](#queryplan)
     - [Validation notes](#validation-notes)
 - [Pagination](#pagination)
-  - [nodes_by_type_paged](#nodes_by_type_paged)
-  - [edges_by_type_paged](#edges_by_type_paged)
-  - [get_nodes_by_type_paged](#get_nodes_by_type_paged)
-  - [get_edges_by_type_paged](#get_edges_by_type_paged)
+  - [nodes_by_labels_paged](#nodes_by_labels_paged)
+  - [edges_by_label_paged](#edges_by_label_paged)
+  - [get_nodes_by_labels_paged](#get_nodes_by_labels_paged)
+  - [get_edges_by_label_paged](#get_edges_by_label_paged)
   - [find_nodes_paged](#find_nodes_paged)
   - [find_nodes_range_paged](#find_nodes_range_paged)
   - [find_nodes_by_time_range_paged](#find_nodes_by_time_range_paged)
@@ -122,10 +142,18 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
   - [compact_with_progress](#compact_with_progress)
   - [ingest_mode](#ingest_mode)
   - [end_ingest](#end_ingest)
+  - [scrub](#scrub)
 - [Introspection](#introspection)
   - [node_count](#node_count)
   - [edge_count](#edge_count)
+  - [next_node_id](#next_node_id)
+  - [next_edge_id](#next_edge_id)
   - [segment_count](#segment_count)
+  - [segment_tombstone_node_count](#segment_tombstone_node_count)
+  - [segment_tombstone_edge_count](#segment_tombstone_edge_count)
+  - [path](#path)
+  - [manifest](#manifest)
+  - [manifest::load_manifest_readonly](#manifestload_manifest_readonly-rust-only)
 - [Binary Batch Ingestion](#binary-batch-ingestion)
   - [batch_upsert_nodes_binary](#batch_upsert_nodes_binary)
   - [batch_upsert_edges_binary](#batch_upsert_edges_binary)
@@ -139,7 +167,7 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
 **Rust** - add to `Cargo.toml`:
 ```toml
 [dependencies]
-overgraph = "0.4"
+overgraph = "0.7"
 ```
 
 **Node.js**:
@@ -227,7 +255,7 @@ const db = OverGraph.open('./my-graph', {
   groupCommitIntervalMs: 50,
   edgeUniqueness: true,
   denseVector: { dimension: 384, metric: 'cosine' },
-  compactAfterNFlushes: 5,
+  compactAfterNFlushes: 4,
 });
 ```
 
@@ -240,7 +268,7 @@ db = OverGraph.open(
     edge_uniqueness=True,
     dense_vector_dimension=384,
     dense_vector_metric="cosine",
-    compact_after_n_flushes=5,
+    compact_after_n_flushes=4,
 )
 ```
 
@@ -299,11 +327,24 @@ db.close(force=True) # cancels compaction
 **Python** supports context manager syntax:
 ```python
 with OverGraph.open("./my-graph") as db:
-    db.upsert_node(1, "alice")
+    # Also accepts multiple labels: ["User", "Admin"]
+    db.upsert_node("User", "alice")
 # db.close() called automatically on exit
 ```
 
 **Node.js** has no built-in equivalent; call `close()` or `closeAsync()` explicitly in a `finally` block.
+
+---
+
+### close_fast
+
+Rust-only fast close. This is the same behavior exposed by `close({ force: true })` in Node.js and `close(force=True)` in Python.
+
+```rust
+db.close_fast()?;
+```
+
+It cancels any in-progress background compaction, syncs the active WAL, and persists a manifest that retains the WAL generations needed for replay on the next open.
 
 ---
 
@@ -313,7 +354,7 @@ Returns a read-only snapshot of current database statistics.
 
 **Rust**
 ```rust
-let s = db.stats();
+let s = db.stats()?;
 println!("segments: {}, WAL bytes: {}", s.segment_count, s.pending_wal_bytes);
 ```
 
@@ -366,7 +407,7 @@ Options passed to [`open()`](#open). All fields are optional with sensible defau
 | memtable_flush_threshold | `usize` | `memtableFlushThreshold` | `memtable_flush_threshold` | `134217728` (128 MB) | When the active memtable exceeds this size in bytes, it is sealed and queued for flush to a segment. |
 | memtable_hard_cap_bytes | `usize` | `memtableHardCapBytes` | `memtable_hard_cap_bytes` | `536870912` (512 MB) | Writes block when the active memtable exceeds this size and the flush queue is full. Prevents unbounded memory growth under heavy write load. Set to `0` to disable. |
 | max_immutable_memtables | `usize` | `maxImmutableMemtables` | `max_immutable_memtables` | `4` | Maximum number of sealed memtables allowed before the flush thread must drain one. Controls memory usage under write bursts. |
-| edge_uniqueness | `bool` | `edgeUniqueness` | `edge_uniqueness` | `false` | When `true`, `upsert_edge` enforces at most one edge per `(from, to, type_id)` triple. An upsert with the same triple updates the existing edge. When `false`, every `upsert_edge` call creates a new edge. |
+| edge_uniqueness | `bool` | `edgeUniqueness` | `edge_uniqueness` | `false` | When `true`, `upsert_edge` enforces at most one edge per `(from, to, label)` triple. An upsert with the same triple updates the existing edge. When `false`, every `upsert_edge` call creates a new edge. |
 | compact_after_n_flushes | `u32` | `compactAfterNFlushes` | `compact_after_n_flushes` | `4` | Trigger background compaction after this many flushes. Set to `0` to disable auto-compaction. |
 | dense_vector | `Option<DenseVectorConfig>` | `denseVector` | See below | `None` | Enable dense vector search. See [DenseVectorConfig](#densevectorconfig). In Python, use separate kwargs: `dense_vector_dimension` and `dense_vector_metric`. |
 
@@ -379,7 +420,9 @@ Controls the trade-off between durability and write throughput.
 | Immediate | `WalSyncMode::Immediate` | `"immediate"` | `"immediate"` | Every write triggers an `fsync`. Maximum crash safety. Data is durable before the write call returns. Lower throughput (~4ms per write on typical SSDs). |
 | GroupCommit | `WalSyncMode::GroupCommit { .. }` | `"group-commit"` | `"group_commit"` | Writes are buffered and fsynced on a timer or when the buffer fills. Higher throughput (batched fsync amortizes the cost across many writes). A crash can lose at most one group-commit interval of writes. |
 
-**GroupCommit parameters** (Rust only; Node.js/Python expose these as top-level options):
+Current Node.js connector parsing treats unknown `walSyncMode` strings as group commit. Python validates `wal_sync_mode` and rejects unknown strings.
+
+**GroupCommit parameters** (Node.js/Python expose these as top-level options):
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -394,17 +437,19 @@ Configures the HNSW index for dense vector search. Set once at database creation
 | Parameter | Rust | Node.js | Python | Default | Description |
 |-----------|------|---------|--------|---------|-------------|
 | dimension | `u32` | `dimension: number` | `dense_vector_dimension: int` | — (required if enabling vectors) | Dimensionality of dense vectors. Every node's `dense_vector` must have exactly this many elements. |
-| metric | `DenseMetric` | `metric: string` | `dense_vector_metric: str` | `Cosine` | Distance metric for similarity. One of: `Cosine`, `Euclidean`, `DotProduct`. |
+| metric | `DenseMetric` | `metric: string` | `dense_vector_metric: str` | `Cosine` | Distance metric for similarity. Rust uses enum variants. Node.js and Python use lower-case strings. |
 
 **DenseMetric values:**
 
-| Metric | Description | Score semantics |
-|--------|-------------|-----------------|
-| `Cosine` | Cosine similarity. Vectors are L2-normalized before comparison. | Higher = more similar (range: -1 to 1). |
-| `Euclidean` | L2 (Euclidean) distance. | Lower = more similar (range: 0 to ∞). Results are returned as negative distance so higher scores remain "better." |
-| `DotProduct` | Raw inner product. Useful when vectors are already normalized or when magnitude matters. | Higher = more similar. |
+| Metric | Rust | Node.js / Python | Score semantics |
+|--------|------|------------------|-----------------|
+| Cosine | `DenseMetric::Cosine` | `"cosine"` | Higher = more similar (range: -1 to 1). |
+| Euclidean | `DenseMetric::Euclidean` | `"euclidean"` | Lower distance is more similar. Results are returned as negative distance so higher scores remain "better." |
+| Dot product | `DenseMetric::DotProduct` | `"dot_product"` | Higher = more similar. |
 
-**HNSW parameters** (Rust only; Node.js/Python use defaults):
+Current Node.js and Python connector parsers fall back to cosine for unknown metric strings.
+
+**HNSW parameters** (Node.js/Python use defaults):
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -415,56 +460,66 @@ Configures the HNSW index for dense vector search. Set once at database creation
 
 ## Data Model
 
-### NodeRecord
+### Node Records
 
-A node stored in the graph. Returned by read operations.
+A public, hydrated node record returned by read operations.
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
 | id | `u64` | `number` | `int` | Unique, auto-assigned node ID. Monotonically increasing. |
-| type_id | `u32` | `number` | `int` | User-defined type identifier. Use constants (e.g., `USER = 1`) for readability. |
-| key | `String` | `string` | `str` | Unique key within the type. The `(type_id, key)` pair uniquely identifies a node. |
+| labels | `Vec<String>` | `string[]` | `list[str]` | Complete node label set. |
+| key | `String` | `string` | `str` | Unique key within the node's label identity. Do not repeat the label in the key unless it is part of an external source ID. |
 | props | `BTreeMap<String, PropValue>` | `Record<string, any>` | `dict[str, Any]` | User-defined properties. See [PropValue](#propvalue) for supported types. Lazily deserialized from MessagePack on first access. |
 | weight | `f32` | `number` | `float` | Numeric weight. Default `1.0`. Used by pruning policies and scoring algorithms. |
 | created_at | `i64` | `number` | `int` | Timestamp (ms) when the node was first created. |
 | updated_at | `i64` | `number` | `int` | Timestamp (ms) of the most recent upsert. |
-| dense_vector | `Option<DenseVector>` | — | — | Dense vector (Rust only). Node.js and Python access vectors through vector search, not direct record access. |
-| sparse_vector | `Option<SparseVector>` | — | — | Sparse vector (Rust only). |
+| dense_vector / denseVector | `Option<DenseVector>` | `number[] \| null` | `list[float] \| None` | Dense vector stored on the node. |
+| sparse_vector / sparseVector | `Option<SparseVector>` | `SparseEntry[] \| null` | `list[tuple[int, float]] \| None` | Sparse vector stored on the node. |
 
-### EdgeRecord
+Rust returns `NodeView`; Node.js returns `NodeView`; Python returns `NodeView`.
 
-An edge (relationship) stored in the graph.
+### Edge Records
+
+A public, hydrated edge record returned by read operations.
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
 | id | `u64` | `number` | `int` | Unique, auto-assigned edge ID. |
 | from / from_id | `u64` | `from: number` | `from_id: int` | Source node ID. |
 | to / to_id | `u64` | `to: number` | `to_id: int` | Destination node ID. |
-| type_id | `u32` | `number` | `int` | User-defined edge type. |
+| label | `String` | `label: string` | `label: str` | Public edge label. |
 | props | `BTreeMap<String, PropValue>` | `Record<string, any>` | `dict[str, Any]` | User-defined properties. |
 | weight | `f32` | `number` | `float` | Edge weight. Default `1.0`. |
-| valid_from | `i64` | `number` | `int` | Start of the edge's validity window (ms). `0` means "always valid from the beginning of time." |
-| valid_to | `i64` | `number` | `int` | End of the edge's validity window (ms). `i64::MAX` means "no expiration." |
+| valid_from | `i64` | `number` | `int` | Start of the edge's validity window (ms). If omitted when writing, OverGraph uses the edge's `created_at` timestamp. |
+| valid_to | `i64` | `number` | `int` | End of the edge's validity window (ms). If omitted when writing, OverGraph uses `i64::MAX` / no expiration. |
 | created_at | `i64` | `number` | `int` | Creation timestamp (ms). |
 | updated_at | `i64` | `number` | `int` | Last update timestamp (ms). |
 
+Rust returns `EdgeView`; Node.js returns `EdgeView`; Python returns `EdgeView`.
+
 ### PropValue
 
-Property values are strongly typed. The following types are supported across all three languages:
+Property values are strongly typed in the Rust core. Connector inputs use their host-language conversion rules and do not expose every Rust variant as a distinct writable type.
 
 | Type | Rust | Node.js | Python | Notes |
 |------|------|---------|--------|-------|
 | Null | `PropValue::Null` | `null` | `None` | |
 | Boolean | `PropValue::Bool(bool)` | `boolean` | `bool` | |
-| Integer | `PropValue::Int(i64)` | `number` | `int` | 64-bit signed. |
-| Unsigned | `PropValue::UInt(u64)` | `number` | `int` | 64-bit unsigned. |
+| Integer | `PropValue::Int(i64)` | `number` | `int` | Node.js and normal Python integer inputs write signed integers. |
+| Unsigned | `PropValue::UInt(u64)` | Readable as `number` | Readable as `int` | Rust can construct this directly. Connector property inputs do not provide a separate unsigned marker. |
 | Float | `PropValue::Float(f64)` | `number` | `float` | 64-bit IEEE 754. |
 | String | `PropValue::String(String)` | `string` | `str` | UTF-8. |
-| Bytes | `PropValue::Bytes(Vec<u8>)` | `Buffer` | `bytes` | Raw byte data. |
+| Bytes | `PropValue::Bytes(Vec<u8>)` | Readable as JSON array | `bytes` | Python can write `bytes`. Node.js property input is JSON-like and does not currently convert `Buffer` to `PropValue::Bytes`. |
 | Array | `PropValue::Array(Vec<PropValue>)` | `any[]` | `list` | Heterogeneous array. |
 | Map | `PropValue::Map(BTreeMap<String, PropValue>)` | `object` | `dict` | Nested properties. |
 
 Properties are encoded with [MessagePack](https://msgpack.org) internally and converted lazily when accessed from Node.js or Python.
+
+Connector property conversion is intentionally host-language shaped. Node.js writes JSON-like values (`null`, booleans, numbers, strings, arrays, and objects); it does not currently use `Buffer` as a bytes marker or expose a separate unsigned-integer marker. Python writes the same common values plus `bytes`; normal Python `int` inputs write signed integers. Rust callers can construct every `PropValue` variant directly.
+
+### IntoNodeLabels (Rust only)
+
+Rust node-label APIs accept `impl IntoNodeLabels` for single-label and multi-label calls. Accepted input forms are `&str`, `String`, `&String`, `&[&str]`, `&[String]`, `Vec<String>`, `&[&str; N]`, and `&[String; N]`.
 
 ### Direction
 
@@ -476,17 +531,144 @@ Controls edge traversal direction. Used across traversal and graph analytics API
 | Incoming | `Direction::Incoming` | `"incoming"` | `"incoming"` | Follow edges in the `to → from` direction. |
 | Both | `Direction::Both` | `"both"` | `"both"` | Follow edges in both directions (treat graph as undirected). |
 
+### NodeLabelFilter / LabelMatchMode
+
+Use `NodeLabelFilter` when callers need explicit `Any` or `All` semantics over node labels.
+
+```rust
+let any_user_or_admin = NodeLabelFilter {
+    labels: vec!["User".into(), "Admin".into()],
+    mode: LabelMatchMode::Any,
+};
+
+let both_user_and_admin = NodeLabelFilter {
+    labels: vec!["User".into(), "Admin".into()],
+    mode: LabelMatchMode::All,
+};
+```
+
+```python
+any_user_or_admin = {"labels": ["User", "Admin"], "mode": "any"}
+both_user_and_admin = {"labels": ["User", "Admin"], "mode": "all"}
+```
+
+```javascript
+const anyUserOrAdmin = { labels: ['User', 'Admin'], mode: 'any' };
+const bothUserAndAdmin = { labels: ['User', 'Admin'], mode: 'all' };
+```
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| labels | `Vec<String>` | `labels: string[]` | `"labels": list[str]` | Public node labels to match. Must be non-empty and contain no duplicates. |
+| mode | `LabelMatchMode` | `mode: "any" \| "all"` | `"mode": "any" \| "all"` | `Any`/`"any"` matches nodes with at least one listed label. `All`/`"all"` matches nodes with every listed label. |
+
+---
+
+## Catalog APIs
+
+Catalog APIs explicitly manage or inspect the node-label and edge-label token catalog. Ordinary graph APIs accept and return names; catalog diagnostics are the only public surface that exposes numeric token IDs.
+
+### ensure_node_label / ensure_edge_label
+
+Ensure a catalog token exists for a public node label or edge label and return its diagnostic token ID.
+
+```rust
+let user_label_id = db.ensure_node_label("User")?;
+let created_label_id = db.ensure_edge_label("CREATED")?;
+```
+
+```javascript
+const userLabelId = db.ensureNodeLabel('User');
+const createdLabelId = db.ensureEdgeLabel('CREATED');
+```
+
+```python
+user_label_id = db.ensure_node_label("User")
+created_label_id = db.ensure_edge_label("CREATED")
+```
+
+These methods are optional for normal writes: `upsert_node`, `upsert_edge`, batch writes, graph patch, and write transactions auto-create missing names durably. Use explicit ensures when you want catalog IDs for diagnostics or want to prepare names before writes.
+
+### get_node_label_id / get_edge_label_id
+
+Read-only lookup from public name to diagnostic token ID.
+
+```rust
+let id = db.get_node_label_id("User")?;
+let edge_id = db.get_edge_label_id("CREATED")?;
+```
+
+```javascript
+const id = db.getNodeLabelId('User');
+const edgeId = db.getEdgeLabelId('CREATED');
+```
+
+```python
+id = db.get_node_label_id("User")
+edge_id = db.get_edge_label_id("CREATED")
+```
+
+Returns `None`/`null` when the name is unknown.
+
+### get_node_label / get_edge_label
+
+Diagnostic reverse lookup from token ID to public name.
+
+```rust
+let label = db.get_node_label(label_id)?;
+let edge_label = db.get_edge_label(label_id)?;
+```
+
+```javascript
+const label = db.getNodeLabel(labelId);
+const edgeLabel = db.getEdgeLabel(labelId);
+```
+
+```python
+label = db.get_node_label(label_id)
+edge_label = db.get_edge_label(label_id)
+```
+
+The node and edge `label_id` / `labelId` arguments are catalog token IDs, not normal graph API inputs.
+
+### list_node_labels / list_edge_labels
+
+List published catalog entries.
+
+```rust
+let labels = db.list_node_labels()?;
+let edge_labels = db.list_edge_labels()?;
+```
+
+```javascript
+const labels = db.listNodeLabels();
+const edgeLabels = db.listEdgeLabels();
+```
+
+```python
+labels = db.list_node_labels()
+edge_labels = db.list_edge_labels()
+```
+
+| Entry | Rust fields | Node.js fields | Python fields |
+|-------|-------------|----------------|---------------|
+| Node label | `label`, `label_id` | `label`, `labelId` | `label`, `label_id` |
+| Edge label | `label`, `label_id` | `label`, `labelId` | `label`, `label_id` |
+
+`label_id` and `labelId` in these entries are diagnostic catalog metadata. Do not use them as input to ordinary node, edge, query, traversal, or vector APIs.
+
 ---
 
 ## Node Operations
 
 ### upsert_node
 
-Creates a new node or updates an existing one. Nodes are identified by the `(type_id, key)` pair. If a node with the same type and key already exists, it is updated in place (preserving its ID).
+Creates a new node or updates an existing one. If the key already resolves to the same node through any supplied label, the node is updated in place; if the same key resolves to different nodes across supplied labels, the write is rejected as a conflict.
 
 **Rust**
 ```rust
-let id = db.upsert_node(USER, "alice", UpsertNodeOptions {
+// Also accepts multiple labels: &["User", "Admin"]
+let id = db.upsert_node("User", "alice", UpsertNodeOptions {
     props: BTreeMap::from([("role".into(), PropValue::String("admin".into()))]),
     weight: 1.0,
     ..Default::default()
@@ -495,7 +677,8 @@ let id = db.upsert_node(USER, "alice", UpsertNodeOptions {
 
 **Node.js**
 ```javascript
-const id = db.upsertNode(USER, 'alice', {
+// Also accepts multiple labels: ['User', 'Admin']
+const id = db.upsertNode('User', 'alice', {
   props: { role: 'admin' },
   weight: 1.0,
 });
@@ -503,15 +686,16 @@ const id = db.upsertNode(USER, 'alice', {
 
 **Python**
 ```python
-id = db.upsert_node(USER, "alice", props={"role": "admin"}, weight=1.0)
+# Also accepts multiple labels: ["User", "Admin"]
+id = db.upsert_node("User", "alice", props={"role": "admin"}, weight=1.0)
 ```
 
 #### Parameters
 
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
-| type_id | `u32` | `number` | `int` | Yes | — | User-defined type identifier. Arbitrary integer (0–4,294,967,295). Define as constants for readability. |
-| key | `&str` | `string` | `str` | Yes | — | Unique key within the type. The `(type_id, key)` pair is the node's identity. If a node with this pair exists, it is updated. |
+| labels | `impl IntoNodeLabels` | `string \| string[]` | `str \| list[str]` | Yes | — | One or more public node labels. |
+| key | `&str` | `string` | `str` | Yes | — | Unique key scoped by node labels. If the supplied label set and key resolve to an existing node, it is updated. |
 | props | `BTreeMap<String, PropValue>` | `Record<string, any>` | `dict[str, Any]` | No | `{}` | Arbitrary key-value properties. On update, the entire props map is replaced (not merged). |
 | weight | `f32` | `number` | `float` | No | `1.0` | Numeric weight. Used by pruning policies (`max_weight`) and scoring algorithms. |
 | dense_vector | `Option<Vec<f32>>` | `number[]` | `list[float]` | No | `None` | Dense vector for similarity search. Length must match the `dimension` configured at `open()`. Requires `dense_vector` to be enabled in DbOptions. |
@@ -532,7 +716,7 @@ The node's ID. If the node was newly created, this is a fresh ID. If the node al
 
 #### Behavior
 
-- **Upsert semantics**: On insert, allocates a new ID, sets `created_at` and `updated_at` to the current time. On update, keeps the original `created_at`, refreshes `updated_at`, and replaces all fields (props, weight, vectors).
+- **Upsert semantics**: On insert, allocates a new ID, sets `created_at` and `updated_at` to the current time. On update, keeps the original `created_at`, refreshes `updated_at`, and replaces labels, props, weight, and vectors.
 - **Atomicity**: The write is applied to the WAL and memtable in a single operation.
 - **Performance**: ~4ms per call in `Immediate` sync mode (dominated by `fsync`). Use [`batch_upsert_nodes`](#batch_upsert_nodes) for bulk operations where a single fsync is shared across the batch.
 
@@ -545,21 +729,21 @@ Retrieves a node by its ID.
 **Rust**
 ```rust
 if let Some(node) = db.get_node(id)? {
-    println!("key={}, type={}", node.key, node.type_id);
+    println!("labels={:?}, key={}", node.labels, node.key);
 }
 ```
 
 **Node.js**
 ```javascript
 const node = db.getNode(id);
-if (node) console.log(node.key, node.typeId);
+if (node) console.log(node.labels, node.key);
 ```
 
 **Python**
 ```python
 node = db.get_node(id)
 if node:
-    print(node.key, node.type_id)
+    print(node.labels, node.key)
 ```
 
 #### Parameters
@@ -572,7 +756,7 @@ if node:
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<Option<NodeRecord>, EngineError>` | `NodeRecord \| null` | `NodeRecord \| None` |
+| `Result<Option<NodeView>, EngineError>` | `NodeView \| null` | `NodeView \| None` |
 
 Returns `None`/`null` if the node does not exist or has been deleted.
 
@@ -584,37 +768,78 @@ Returns `None`/`null` if the node does not exist or has been deleted.
 
 ### get_node_by_key
 
-Looks up a node by its `(type_id, key)` pair. Uses the type index for fast lookup.
+Looks up a node by its `(label, key)` pair. Uses the label-scoped key lookup/index for fast lookup.
 
 **Rust**
 ```rust
-let node = db.get_node_by_key(USER, "alice")?;
+let node = db.get_node_by_key("User", "alice")?;
 ```
 
 **Node.js**
 ```javascript
-const node = db.getNodeByKey(USER, 'alice');
+const node = db.getNodeByKey('User', 'alice');
 ```
 
 **Python**
 ```python
-node = db.get_node_by_key(USER, "alice")
+node = db.get_node_by_key("User", "alice")
 ```
 
 #### Parameters
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| type_id | `u32` | `number` | `int` | Yes | Node type identifier. |
-| key | `&str` | `string` | `str` | Yes | Node key within the type. |
+| label | `&str` | `string` | `str` | Yes | Node label. |
+| key | `&str` | `string` | `str` | Yes | Node key within the label. |
 
 #### Returns
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<Option<NodeRecord>, EngineError>` | `NodeRecord \| null` | `NodeRecord \| None` |
+| `Result<Option<NodeView>, EngineError>` | `NodeView \| null` | `NodeView \| None` |
 
-Returns `None`/`null` if no node with that `(type_id, key)` exists.
+Returns `None`/`null` if no node with that `(label, key)` exists.
+
+---
+
+### add_node_label / remove_node_label
+
+Node label-set mutation helpers. These update a node's label set without changing its ID, key, properties, weight, or vectors.
+
+```rust
+let added = db.add_node_label(node_id, "Admin")?;
+let removed = db.remove_node_label(node_id, "Trial")?;
+```
+
+```javascript
+const added = db.addNodeLabel(nodeId, 'Admin');
+const removed = db.removeNodeLabel(nodeId, 'Trial');
+```
+
+```python
+added = db.add_node_label(node_id, "Admin")
+removed = db.remove_node_label(node_id, "Trial")
+```
+
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Description |
+|-----------|------|---------|--------|----------|-------------|
+| id | `u64` | `number` | `int` | Yes | Node ID to mutate. |
+| label | `&str` | `string` | `str` | Yes | Public node label to add or remove. |
+
+#### Returns
+
+| Rust | Node.js | Python | Description |
+|------|---------|--------|-------------|
+| `Result<bool, EngineError>` | `boolean` | `bool` | `true` when the node's label set changed, `false` when the requested label was already present for add or absent for remove. |
+
+#### Behavior
+
+- Adding a label auto-creates the label token when needed.
+- Adding a label fails if another node already owns the same `(label, key)` identity.
+- Removing an unknown or absent label returns `false`.
+- Removing the last remaining node label returns an error.
 
 ---
 
@@ -665,17 +890,31 @@ Upserts multiple nodes in a single batch with one WAL fsync. Significantly faste
 **Rust**
 ```rust
 let inputs = vec![
-    NodeInput { type_id: USER, key: "alice".into(), weight: 1.0, ..Default::default() },
-    NodeInput { type_id: USER, key: "bob".into(), weight: 0.8, ..Default::default() },
+    NodeInput {
+        labels: vec!["User".into()],
+        key: "alice".into(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    },
+    NodeInput {
+        labels: vec!["User".into(), "Admin".into()],
+        key: "bob".into(),
+        props: BTreeMap::from([("role".into(), PropValue::String("viewer".into()))]),
+        weight: 0.8,
+        dense_vector: None,
+        sparse_vector: None,
+    },
 ];
-let ids = db.batch_upsert_nodes(&inputs)?;
+let ids = db.batch_upsert_nodes(inputs)?;
 ```
 
 **Node.js**
 ```javascript
 const ids = db.batchUpsertNodes([
-  { typeId: USER, key: 'alice', weight: 1.0 },
-  { typeId: USER, key: 'bob', weight: 0.8, props: { role: 'viewer' } },
+  { labels: ['User'], key: 'alice', weight: 1.0 },
+  { labels: ['User', 'Admin'], key: 'bob', weight: 0.8, props: { role: 'viewer' } },
 ]);
 // ids is a Float64Array
 ```
@@ -683,8 +922,8 @@ const ids = db.batchUpsertNodes([
 **Python**
 ```python
 ids = db.batch_upsert_nodes([
-    {"type_id": USER, "key": "alice", "weight": 1.0},
-    {"type_id": USER, "key": "bob", "weight": 0.8, "props": {"role": "viewer"}},
+    {"labels": ["User"], "key": "alice", "weight": 1.0},
+    {"labels": ["User", "Admin"], "key": "bob", "weight": 0.8, "props": {"role": "viewer"}},
 ])
 ```
 
@@ -692,13 +931,13 @@ ids = db.batch_upsert_nodes([
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| nodes | `&[NodeInput]` | `NodeInput[]` | `list[dict]` | Yes | Array of node inputs. Each element has the same fields as [`upsert_node`](#upsert_node) parameters. |
+| nodes | `Vec<NodeInput>` | `NodeInput[]` | `list[dict]` | Yes | Array of node inputs. Each element has the same fields as [`upsert_node`](#upsert_node) parameters. |
 
 **NodeInput fields:**
 
 | Field | Rust | Node.js | Python dict key | Required | Default | Description |
 |-------|------|---------|-----------------|----------|---------|-------------|
-| type_id | `u32` | `typeId: number` | `"type_id"` | Yes | — | Node type. |
+| labels | `labels: Vec<String>` | `labels: string \| string[]` | `"labels"` | Yes | — | One or more node labels. Node.js accepts a single string or a non-empty string array for dict-based node inputs. |
 | key | `String` | `key: string` | `"key"` | Yes | — | Node key. |
 | props | `BTreeMap<String, PropValue>` | `props: object` | `"props"` | No | `{}` | Properties. |
 | weight | `f32` | `weight: number` | `"weight"` | No | `1.0` | Weight. |
@@ -726,19 +965,19 @@ Batch-retrieves multiple nodes by ID. Uses a sorted merge-walk across all data s
 **Rust**
 ```rust
 let nodes = db.get_nodes(&[1, 2, 3])?;
-// nodes[0] is Option<NodeRecord> for ID 1, etc.
+// nodes[0] is Option<NodeView> for ID 1, etc.
 ```
 
 **Node.js**
 ```javascript
 const nodes = db.getNodes([1, 2, 3]);
-// nodes[0] is NodeRecord | null for ID 1, etc.
+// nodes[0] is NodeView | null for ID 1, etc.
 ```
 
 **Python**
 ```python
 nodes = db.get_nodes([1, 2, 3])
-# nodes[0] is NodeRecord | None for ID 1, etc.
+# nodes[0] is NodeView | None for ID 1, etc.
 ```
 
 #### Parameters
@@ -751,7 +990,7 @@ nodes = db.get_nodes([1, 2, 3])
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<Vec<Option<NodeRecord>>, EngineError>` | `(NodeRecord \| null)[]` | `list[NodeRecord \| None]` |
+| `Result<Vec<Option<NodeView>>, EngineError>` | `(NodeView \| null)[]` | `list[NodeView \| None]` |
 
 An array the same length as the input, where each element is the node record or `None`/`null` if that ID doesn't exist.
 
@@ -759,40 +998,46 @@ An array the same length as the input, where each element is the node record or 
 
 ### get_nodes_by_keys
 
-Batch-retrieves multiple nodes by `(type_id, key)` pairs.
+Batch-retrieves multiple nodes by `(label, key)` pairs.
 
 **Rust**
 ```rust
-let nodes = db.get_nodes_by_keys(&[(USER, "alice".into()), (USER, "bob".into())])?;
+let nodes = db.get_nodes_by_keys(&[
+    NodeKeyQuery { label: "User".into(), key: "alice".into() },
+    NodeKeyQuery { label: "User".into(), key: "bob".into() },
+])?;
 ```
 
 **Node.js**
 ```javascript
 const nodes = db.getNodesByKeys([
-  { typeId: USER, key: 'alice' },
-  { typeId: USER, key: 'bob' },
+  { label: 'User', key: 'alice' },
+  { label: 'User', key: 'bob' },
 ]);
 ```
 
 **Python**
 ```python
-nodes = db.get_nodes_by_keys([(USER, "alice"), (USER, "bob")])
+nodes = db.get_nodes_by_keys([
+    {"labels": ["User"], "key": "alice"},
+    {"labels": ["User"], "key": "bob"},
+])
 ```
 
 #### Parameters
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| keys | `&[(u32, String)]` | `KeyQuery[]` | `list[tuple[int, str]]` | Yes | Array of `(type_id, key)` pairs. |
+| keys | `&[NodeKeyQuery]` | `KeyQuery[]` | `list[dict]` | Yes | Array of key lookups. Python uses `{"labels": "User" \| ["User"], "key": ...}` and requires exactly one label because keys are label-scoped. |
 
 **KeyQuery** (Node.js):
 ```typescript
-{ typeId: number, key: string }
+{ label: string, key: string }
 ```
 
 #### Returns
 
-Same shape as [`get_nodes`](#get_nodes): an array of `NodeRecord | None` in input order.
+Same shape as [`get_nodes`](#get_nodes): an array of node records or `None`/`null` in input order.
 
 ---
 
@@ -800,11 +1045,11 @@ Same shape as [`get_nodes`](#get_nodes): an array of `NodeRecord | None` in inpu
 
 ### upsert_edge
 
-Creates a new edge or updates an existing one. When `edge_uniqueness` is enabled, edges are identified by the `(from, to, type_id)` triple.
+Creates a new edge or updates an existing one. When `edge_uniqueness` is enabled, edges are identified by the `(from, to, label)` triple.
 
 **Rust**
 ```rust
-let id = db.upsert_edge(alice_id, project_id, WORKS_ON, UpsertEdgeOptions {
+let id = db.upsert_edge(alice_id, project_id, "WORKS_ON", UpsertEdgeOptions {
     props: BTreeMap::from([("since".into(), PropValue::String("2024".into()))]),
     weight: 1.0,
     ..Default::default()
@@ -813,7 +1058,7 @@ let id = db.upsert_edge(alice_id, project_id, WORKS_ON, UpsertEdgeOptions {
 
 **Node.js**
 ```javascript
-const id = db.upsertEdge(aliceId, projectId, WORKS_ON, {
+const id = db.upsertEdge(aliceId, projectId, 'WORKS_ON', {
   props: { since: '2024' },
   weight: 1.0,
 });
@@ -821,7 +1066,7 @@ const id = db.upsertEdge(aliceId, projectId, WORKS_ON, {
 
 **Python**
 ```python
-id = db.upsert_edge(alice_id, project_id, WORKS_ON,
+id = db.upsert_edge(alice_id, project_id, "WORKS_ON",
     props={"since": "2024"}, weight=1.0)
 ```
 
@@ -831,10 +1076,10 @@ id = db.upsert_edge(alice_id, project_id, WORKS_ON,
 |-----------|------|---------|--------|----------|---------|-------------|
 | from | `u64` | `number` | `int` | Yes | — | Source node ID. |
 | to | `u64` | `number` | `int` | Yes | — | Destination node ID. |
-| type_id | `u32` | `number` | `int` | Yes | — | Edge type identifier. |
+| label | `&str` | `string` | `str` | Yes | — | Public edge label such as `"WORKS_ON"` or `"KNOWS"`. |
 | props | `BTreeMap<String, PropValue>` | `Record<string, any>` | `dict[str, Any]` | No | `{}` | Edge properties. Replaced entirely on update. |
 | weight | `f32` | `number` | `float` | No | `1.0` | Edge weight. Used by shortest path (as cost), top-k scoring, and pruning. |
-| valid_from | `Option<i64>` | `number` | `int` | No | `0` (always valid) | Start of the edge's temporal validity window (ms). Edges with `valid_from > at_epoch` are excluded from temporal queries. |
+| valid_from | `Option<i64>` | `number` | `int` | No | edge `created_at` | Start of the edge's temporal validity window (ms). Edges with `valid_from > at_epoch` are excluded from temporal queries. |
 | valid_to | `Option<i64>` | `number` | `int` | No | `i64::MAX` (no expiration) | End of the validity window (ms). Edges with `valid_to <= at_epoch` are excluded from temporal queries. See [`invalidate_edge`](#invalidate_edge). |
 
 #### Returns
@@ -847,7 +1092,7 @@ The edge ID.
 
 #### Behavior
 
-- **With `edge_uniqueness` enabled**: If an edge with the same `(from, to, type_id)` exists, it is updated and the existing ID is returned. Otherwise a new edge is created.
+- **With `edge_uniqueness` enabled**: If an edge with the same `(from, to, label)` exists, it is updated and the existing ID is returned. Otherwise a new edge is created.
 - **With `edge_uniqueness` disabled** (default): Every call creates a new edge (parallel edges are allowed).
 
 ---
@@ -879,27 +1124,27 @@ edge = db.get_edge(edge_id)
 
 #### Returns
 
-`EdgeRecord | None`. Returns `None`/`null` if the edge doesn't exist or has been deleted.
+`EdgeView` / `EdgeView` / `EdgeView`, or `None`/`null` if the edge doesn't exist or has been deleted.
 
 ---
 
 ### get_edge_by_triple
 
-Looks up an edge by its `(from, to, type_id)` triple. Only meaningful when `edge_uniqueness` is enabled.
+Looks up an edge by its `(from, to, label)` triple. Only meaningful when `edge_uniqueness` is enabled.
 
 **Rust**
 ```rust
-let edge = db.get_edge_by_triple(alice_id, project_id, WORKS_ON)?;
+let edge = db.get_edge_by_triple(alice_id, project_id, "WORKS_ON")?;
 ```
 
 **Node.js**
 ```javascript
-const edge = db.getEdgeByTriple(aliceId, projectId, WORKS_ON);
+const edge = db.getEdgeByTriple(aliceId, projectId, 'WORKS_ON');
 ```
 
 **Python**
 ```python
-edge = db.get_edge_by_triple(alice_id, project_id, WORKS_ON)
+edge = db.get_edge_by_triple(alice_id, project_id, "WORKS_ON")
 ```
 
 #### Parameters
@@ -908,11 +1153,11 @@ edge = db.get_edge_by_triple(alice_id, project_id, WORKS_ON)
 |-----------|------|---------|--------|----------|-------------|
 | from | `u64` | `number` | `int` | Yes | Source node ID. |
 | to | `u64` | `number` | `int` | Yes | Destination node ID. |
-| type_id | `u32` | `number` | `int` | Yes | Edge type. |
+| label | `&str` | `string` | `str` | Yes | Edge label. |
 
 #### Returns
 
-`EdgeRecord | None`.
+`EdgeView` / `EdgeView` / `EdgeView`, or `None`/`null`.
 
 ---
 
@@ -978,7 +1223,7 @@ updated = db.invalidate_edge(edge_id, int(time.time() * 1000))
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<Option<EdgeRecord>, EngineError>` | `EdgeRecord \| null` | `EdgeRecord \| None` |
+| `Result<Option<EdgeView>, EngineError>` | `EdgeView \| null` | `EdgeView \| None` |
 
 The updated edge record, or `None`/`null` if the edge doesn't exist.
 
@@ -1000,25 +1245,41 @@ Upserts multiple edges in a single batch with one WAL fsync.
 **Rust**
 ```rust
 let inputs = vec![
-    EdgeInput { from: 1, to: 2, type_id: WORKS_ON, weight: 1.0, ..Default::default() },
-    EdgeInput { from: 1, to: 3, type_id: WORKS_ON, weight: 0.5, ..Default::default() },
+    EdgeInput {
+        from: 1,
+        to: 2,
+        label: "WORKS_ON".into(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        valid_from: None,
+        valid_to: None,
+    },
+    EdgeInput {
+        from: 1,
+        to: 3,
+        label: "WORKS_ON".into(),
+        props: BTreeMap::new(),
+        weight: 0.5,
+        valid_from: None,
+        valid_to: None,
+    },
 ];
-let ids = db.batch_upsert_edges(&inputs)?;
+let ids = db.batch_upsert_edges(inputs)?;
 ```
 
 **Node.js**
 ```javascript
 const ids = db.batchUpsertEdges([
-  { from: 1, to: 2, typeId: WORKS_ON, weight: 1.0 },
-  { from: 1, to: 3, typeId: WORKS_ON, weight: 0.5 },
+  { from: 1, to: 2, label: 'WORKS_ON', weight: 1.0 },
+  { from: 1, to: 3, label: 'WORKS_ON', weight: 0.5 },
 ]);
 ```
 
 **Python**
 ```python
 ids = db.batch_upsert_edges([
-    {"from_id": 1, "to_id": 2, "type_id": WORKS_ON, "weight": 1.0},
-    {"from_id": 1, "to_id": 3, "type_id": WORKS_ON, "weight": 0.5},
+    {"from_id": 1, "to_id": 2, "label": "WORKS_ON", "weight": 1.0},
+    {"from_id": 1, "to_id": 3, "label": "WORKS_ON", "weight": 0.5},
 ])
 ```
 
@@ -1026,7 +1287,7 @@ ids = db.batch_upsert_edges([
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| edges | `&[EdgeInput]` | `EdgeInput[]` | `list[dict]` | Yes | Array of edge inputs. |
+| edges | `Vec<EdgeInput>` | `EdgeInput[]` | `list[dict]` | Yes | Array of edge inputs. |
 
 **EdgeInput fields:**
 
@@ -1034,10 +1295,10 @@ ids = db.batch_upsert_edges([
 |-------|------|---------|-----------------|----------|---------|-------------|
 | from | `u64` | `from: number` | `"from_id"` | Yes | — | Source node ID. |
 | to | `u64` | `to: number` | `"to_id"` | Yes | — | Destination node ID. |
-| type_id | `u32` | `typeId: number` | `"type_id"` | Yes | — | Edge type. |
+| label | `String` | `label: string` | `"label"` | Yes | — | Edge label. |
 | props | `BTreeMap<String, PropValue>` | `props: object` | `"props"` | No | `{}` | Properties. |
 | weight | `f32` | `weight: number` | `"weight"` | No | `1.0` | Weight. |
-| valid_from | `Option<i64>` | `validFrom: number` | `"valid_from"` | No | `0` | Validity start. |
+| valid_from | `Option<i64>` | `validFrom: number` | `"valid_from"` | No | edge `created_at` | Validity start. |
 | valid_to | `Option<i64>` | `validTo: number` | `"valid_to"` | No | `i64::MAX` | Validity end. |
 
 #### Returns
@@ -1077,7 +1338,7 @@ edges = db.get_edges([10, 20, 30])
 
 #### Returns
 
-Array of `EdgeRecord | None` in input order.
+Array of edge records or `None`/`null` in input order.
 
 ---
 
@@ -1089,9 +1350,24 @@ Applies multiple operations atomically in a single WAL batch: node upserts, edge
 
 **Rust**
 ```rust
-let result = db.graph_patch(&GraphPatch {
-    upsert_nodes: vec![NodeInput { type_id: USER, key: "carol".into(), ..Default::default() }],
-    upsert_edges: vec![EdgeInput { from: 1, to: 2, type_id: WORKS_ON, ..Default::default() }],
+let result = db.graph_patch(GraphPatch {
+    upsert_nodes: vec![NodeInput {
+        labels: vec!["User".into(), "Admin".into()],
+        key: "carol".into(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }],
+    upsert_edges: vec![EdgeInput {
+        from: 1,
+        to: 2,
+        label: "WORKS_ON".into(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        valid_from: None,
+        valid_to: None,
+    }],
     invalidate_edges: vec![(edge_id, now_ms)],
     delete_node_ids: vec![old_node_id],
     delete_edge_ids: vec![old_edge_id],
@@ -1101,8 +1377,8 @@ let result = db.graph_patch(&GraphPatch {
 **Node.js**
 ```javascript
 const result = db.graphPatch({
-  upsertNodes: [{ typeId: USER, key: 'carol' }],
-  upsertEdges: [{ from: 1, to: 2, typeId: WORKS_ON }],
+  upsertNodes: [{ labels: ['User'], key: 'carol' }],
+  upsertEdges: [{ from: 1, to: 2, label: 'WORKS_ON' }],
   invalidateEdges: [{ edgeId: 5, validTo: Date.now() }],
   deleteNodeIds: [oldNodeId],
   deleteEdgeIds: [oldEdgeId],
@@ -1112,8 +1388,8 @@ const result = db.graphPatch({
 **Python**
 ```python
 result = db.graph_patch({
-    "upsert_nodes": [{"type_id": USER, "key": "carol"}],
-    "upsert_edges": [{"from_id": 1, "to_id": 2, "type_id": WORKS_ON}],
+    "upsert_nodes": [{"labels": ["User"], "key": "carol"}],
+    "upsert_edges": [{"from_id": 1, "to_id": 2, "label": "WORKS_ON"}],
     "invalidate_edges": [{"edge_id": 5, "valid_to": int(time.time() * 1000)}],
     "delete_node_ids": [old_node_id],
     "delete_edge_ids": [old_edge_id],
@@ -1162,10 +1438,15 @@ Transaction reads are intentionally bounded. A transaction can read committed st
 **Rust**
 ```rust
 let mut txn = db.begin_write_txn()?;
-let alice = txn.upsert_node_as("alice", USER, "alice", UpsertNodeOptions::default())?;
-let bob = txn.upsert_node_as("bob", USER, "bob", UpsertNodeOptions::default())?;
-txn.upsert_edge_as("knows", alice, bob, KNOWS, UpsertEdgeOptions::default())?;
-let staged = txn.get_node_by_key(USER, "alice")?;
+let alice = txn.upsert_node_as("alice", &["User", "Admin"], "alice", UpsertNodeOptions::default())?;
+let bob = txn.upsert_node_as("bob", "User", "bob", UpsertNodeOptions::default())?;
+txn.upsert_edge_as("knows", alice.clone(), bob.clone(), "KNOWS", UpsertEdgeOptions::default())?;
+assert!(txn.add_node_label(alice.clone(), "Manager")?);
+assert!(txn.remove_node_label(alice.clone(), "Admin")?);
+let staged = txn.get_node_by_key("User", "alice")?;
+if let Some(view) = &staged {
+    println!("staged labels: {:?}", view.labels);
+}
 let result = txn.commit()?;
 ```
 
@@ -1173,10 +1454,11 @@ let result = txn.commit()?;
 ```javascript
 const txn = db.beginWriteTxn();
 txn.stage([
-  { op: 'upsertNode', alias: 'alice', typeId: USER, key: 'alice' },
-  { op: 'upsertNode', alias: 'bob', typeId: USER, key: 'bob' },
-  { op: 'upsertEdge', alias: 'knows', from: { local: 'alice' }, to: { local: 'bob' }, typeId: KNOWS },
+  { op: 'upsertNode', alias: 'alice', labels: ['User', 'Admin'], key: 'alice' },
+  { op: 'upsertNode', alias: 'bob', labels: ['User'], key: 'bob' },
+  { op: 'upsertEdge', alias: 'knows', from: { local: 'alice' }, to: { local: 'bob' }, label: 'KNOWS' },
 ]);
+txn.addNodeLabel({ local: 'bob' }, 'Trial');
 const staged = txn.getNode({ local: 'alice' });
 const result = txn.commit();
 ```
@@ -1185,10 +1467,11 @@ const result = txn.commit();
 ```python
 txn = db.begin_write_txn()
 txn.stage([
-    {"op": "upsert_node", "alias": "alice", "type_id": USER, "key": "alice"},
-    {"op": "upsert_node", "alias": "bob", "type_id": USER, "key": "bob"},
-    {"op": "upsert_edge", "alias": "knows", "from": {"local": "alice"}, "to": {"local": "bob"}, "type_id": KNOWS},
+    {"op": "upsert_node", "alias": "alice", "labels": ["User", "Admin"], "key": "alice"},
+    {"op": "upsert_node", "alias": "bob", "labels": ["User"], "key": "bob"},
+    {"op": "upsert_edge", "alias": "knows", "from": {"local": "alice"}, "to": {"local": "bob"}, "label": "KNOWS"},
 ])
+txn.add_node_label({"local": "bob"}, "Trial")
 staged = txn.get_node({"local": "alice"})
 result = txn.commit()
 ```
@@ -1199,19 +1482,35 @@ result = txn.commit()
 |-----------|------|---------|--------|
 | Begin | `begin_write_txn()` | `beginWriteTxn()` | `begin_write_txn()` |
 | Stage node | `upsert_node`, `upsert_node_as` | `upsertNode`, `upsertNodeAs` | `upsert_node`, `upsert_node_as` |
+| Mutate node labels | `add_node_label`, `remove_node_label` | `addNodeLabel`, `removeNodeLabel` | `add_node_label`, `remove_node_label` |
 | Stage edge | `upsert_edge`, `upsert_edge_as` | `upsertEdge`, `upsertEdgeAs` | `upsert_edge`, `upsert_edge_as` |
 | Bulk ordered stage | `stage_intents(Vec<TxnIntent>)` | `stage(operations)` | `stage(operations)` |
 | Reads | `get_node`, `get_edge`, `get_node_by_key`, `get_edge_by_triple` | same camelCase names | same snake_case names |
 | Finish | `commit`, `rollback` | `commit`, `rollback` | `commit`, `rollback` |
 
+#### Rust Transaction DTOs
+
+Rust exposes the transaction reference and intent objects directly:
+
+| Object | Variants / fields | Description |
+|--------|-------------------|-------------|
+| `TxnNodeRef` | `Id(u64)`, `Key { label, key }`, `Local(TxnLocalRef)` | Node target for transaction writes and bounded transaction reads. `Key` is single-label scoped. |
+| `TxnEdgeRef` | `Id(u64)`, `Triple { from, to, label }`, `Local(TxnLocalRef)` | Edge target by ID, by endpoint refs plus edge label, or by local transaction ref. |
+| `TxnIntent::UpsertNode` | `alias`, `labels`, `key`, `options` | Ordered staged node upsert. `labels` is the complete node-label set for the write. |
+| `TxnIntent::UpsertEdge` | `alias`, `from`, `to`, `label`, `options` | Ordered staged edge upsert using transaction node refs. |
+| `TxnIntent::DeleteNode` | `target` | Ordered staged node delete. |
+| `TxnIntent::DeleteEdge` | `target` | Ordered staged edge delete. |
+| `TxnIntent::InvalidateEdge` | `target`, `valid_to` | Ordered staged temporal edge invalidation. |
+
 #### Builder Methods
 
 | Method | Required inputs | Optional inputs | Returns |
 |--------|-----------------|-----------------|---------|
-| `upsert_node` / `upsertNode` | `type_id` / `typeId`, `key` | node upsert options: `props`, `weight`, `dense_vector` / `denseVector`, `sparse_vector` / `sparseVector` | node ref addressable by key |
-| `upsert_node_as` / `upsertNodeAs` | `alias`, `type_id` / `typeId`, `key` | node upsert options | local node ref `{ local: alias }` |
-| `upsert_edge` / `upsertEdge` | `from`, `to`, `type_id` / `typeId` | edge upsert options: `props`, `weight`, `valid_from` / `validFrom`, `valid_to` / `validTo` | edge ref addressable by triple |
-| `upsert_edge_as` / `upsertEdgeAs` | `alias`, `from`, `to`, `type_id` / `typeId` | edge upsert options | local edge ref `{ local: alias }` |
+| `upsert_node` / `upsertNode` | `labels`, `key` | node upsert options: `props`, `weight`, `dense_vector` / `denseVector`, `sparse_vector` / `sparseVector` | node ref addressable by key |
+| `upsert_node_as` / `upsertNodeAs` | `alias`, `labels`, `key` | node upsert options | local node ref `{ local: alias }` |
+| `add_node_label` / `remove_node_label` | node ref, `label` | — | `bool` changed flag |
+| `upsert_edge` / `upsertEdge` | `from`, `to`, `label` | edge upsert options: `props`, `weight`, `valid_from` / `validFrom`, `valid_to` / `validTo` | edge ref addressable by triple |
+| `upsert_edge_as` / `upsertEdgeAs` | `alias`, `from`, `to`, `label` | edge upsert options | local edge ref `{ local: alias }` |
 | `delete_node` / `deleteNode` | node ref | — | `void` / `None` |
 | `delete_edge` / `deleteEdge` | edge ref | — | `void` / `None` |
 | `invalidate_edge` / `invalidateEdge` | edge ref, `valid_to` / `validTo` | — | `void` / `None` |
@@ -1228,11 +1527,14 @@ References are one of:
 | Ref kind | Node.js | Python |
 |----------|---------|--------|
 | Node by ID | `{ id }` | `{"id": id}` |
-| Node by key | `{ typeId, key }` | `{"type_id": type_id, "key": key}` |
+| Node by key | `{ labels, key }` | `{"labels": label_or_single_label_list, "key": key}` |
 | Node local alias | `{ local }` | `{"local": local}` |
 | Edge by ID | `{ id }` | `{"id": id}` |
-| Edge by triple | `{ from, to, typeId }` | `{"from": from, "to": to, "type_id": type_id}` |
+| Edge by triple | `{ from, to, label }` | `{"from": from, "to": to, "label": label}` |
 | Edge local alias | `{ local }` | `{"local": local}` |
+
+Node-by-key transaction refs use `labels` and `key` but are still single-label scoped:
+`labels` may be a string or a one-item list/array.
 
 Aliases are optional, process-local, and never persisted. When present, aliases must be unique within the transaction across node aliases and unique across edge aliases.
 
@@ -1240,16 +1542,16 @@ Aliases are optional, process-local, and never persisted. When present, aliases 
 
 `get_node` and `get_node_by_key` on a transaction return a transaction node view:
 
-| Field | Node.js | Python | Description |
-|-------|---------|--------|-------------|
-| id | `id?: number` | `"id": int \| None` | Committed node ID when already known; `None`/omitted for staged creates that allocate an ID at commit. |
-| local | `local?: string` | `"local": str \| None` | Local alias for aliased staged records. Internal unaliased slots are not exposed as strings. |
-| type_id | `typeId` | `"type_id"` | Node type. |
-| key | `key` | `"key"` | Node key. |
-| props | `props` | `"props"` | Node properties visible inside the transaction. |
-| created_at / updated_at | `createdAt?` / `updatedAt?` | `"created_at"` / `"updated_at"` | Present for committed records; absent/`None` for staged creates before commit. |
-| weight | `weight` | `"weight"` | Node weight. |
-| dense_vector / sparse_vector | `denseVector?` / `sparseVector?` | `"dense_vector"` / `"sparse_vector"` | Staged or committed vectors when present. |
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| id | `Option<u64>` | `id?: number` | `"id": int \| None` | Committed node ID when already known; `None`/omitted for staged creates that allocate an ID at commit. |
+| local | `Option<TxnLocalRef>` | `local?: string` | `"local": str \| None` | Local alias for aliased staged records. Internal unaliased slots are not exposed as strings. |
+| labels | `Vec<String>` | `labels: string[]` | `"labels": list[str]` | Complete node label set visible inside the transaction. |
+| key | `String` | `key` | `"key"` | Node key. |
+| props | `BTreeMap<String, PropValue>` | `props` | `"props"` | Node properties visible inside the transaction. |
+| created_at / updated_at | `Option<i64>` | `createdAt?` / `updatedAt?` | `"created_at"` / `"updated_at"` | Present for committed records; absent/`None` for staged creates before commit. |
+| weight | `f32` | `weight` | `"weight"` | Node weight. |
+| dense_vector / sparse_vector | `Option<DenseVector>` / `Option<SparseVector>` | `denseVector?` / `sparseVector?` | `"dense_vector"` / `"sparse_vector"` | Staged or committed vectors when present. |
 
 `get_edge` and `get_edge_by_triple` return a transaction edge view:
 
@@ -1258,7 +1560,7 @@ Aliases are optional, process-local, and never persisted. When present, aliases 
 | id | `id?: number` | `"id": int \| None` | Committed edge ID when already known; `None`/omitted for staged creates that allocate an ID at commit. |
 | local | `local?: string` | `"local": str \| None` | Local alias for aliased staged records. |
 | from / to | `from` / `to` | `"from"` / `"to"` | Endpoint refs visible inside the transaction. |
-| type_id | `typeId` | `"type_id"` | Edge type. |
+| label | `label` | `"label"` | Edge label. |
 | props | `props` | `"props"` | Edge properties visible inside the transaction. |
 | created_at / updated_at | `createdAt?` / `updatedAt?` | `"created_at"` / `"updated_at"` | Present for committed records; absent/`None` for staged creates before commit. |
 | weight | `weight` | `"weight"` | Edge weight. |
@@ -1281,33 +1583,36 @@ After `commit()` or `rollback()`, the transaction handle is closed. Further use 
 
 ---
 
-## Type-Based Queries
+## Label and Edge-Label Queries
 
-### nodes_by_type
+### nodes_by_labels
 
-Returns all node IDs of a given type.
+Returns all node IDs containing every supplied node label.
 
 **Rust**
 ```rust
-let ids: Vec<u64> = db.nodes_by_type(USER)?;
+let ids: Vec<u64> = db.nodes_by_labels("User")?;
+let admin_ids: Vec<u64> = db.nodes_by_labels(vec!["User".into(), "Admin".into()])?;
 ```
 
 **Node.js**
 ```javascript
-const ids = db.nodesByType(USER); // Float64Array
+const ids = db.nodesByLabels('User'); // Float64Array
+const adminIds = db.nodesByLabels(['User', 'Admin']);
 ```
 
 **Python**
 ```python
-ids = db.nodes_by_type(USER)  # IdArray (lazy)
+ids = db.nodes_by_labels("User")  # IdArray (lazy)
 ids_list = ids.to_list()      # materialize to list[int]
+admin_ids = db.nodes_by_labels(["User", "Admin"])
 ```
 
 #### Parameters
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| type_id | `u32` | `number` | `int` | Yes | Node type to query. |
+| labels | `impl IntoNodeLabels` | `string \| string[]` | `str \| list[str]` | Yes | Label or labels to match. Nodes must contain every supplied node label. |
 
 #### Returns
 
@@ -1315,102 +1620,202 @@ ids_list = ids.to_list()      # materialize to list[int]
 |------|---------|--------|
 | `Result<Vec<u64>, EngineError>` | `Float64Array` | `IdArray` |
 
-All node IDs of the given type. Filtered (excludes deleted/pruned nodes).
+All matching node IDs. Filtered (excludes deleted/pruned nodes).
 
 **Python `IdArray`**: A lazy wrapper that avoids copying IDs to Python memory until accessed. Supports `len()`, indexing (`arr[i]`), iteration, `in` operator, and `to_list()`.
 
 #### Performance
 
-O(type index size), not O(total nodes). Uses the per-type index.
+Single-label input uses the direct per-label fast path. Multi-label input uses `All` semantics, drives from the best label posting, and metadata-verifies current label membership. Use [`query_node_ids`](#query_node_ids) with `NodeLabelFilter` when `Any` semantics are needed.
 
 ---
 
-### edges_by_type
+### edges_by_label
 
-Returns all edge IDs of a given type.
+Returns all edge IDs of a given edge label.
 
+**Rust**
 ```rust
-let ids = db.edges_by_type(WORKS_ON)?;
+let ids: Vec<u64> = db.edges_by_label("WORKS_ON")?;
 ```
 
+**Node.js**
 ```javascript
-const ids = db.edgesByType(WORKS_ON);
+const ids = db.edgesByLabel('WORKS_ON'); // Float64Array
 ```
 
+**Python**
 ```python
-ids = db.edges_by_type(WORKS_ON)
+ids = db.edges_by_label("WORKS_ON")  # IdArray (lazy)
+ids_list = ids.to_list()             # materialize to list[int]
 ```
 
-Same signature pattern as [`nodes_by_type`](#nodes_by_type). Filtered (excludes dangling edges from deleted nodes).
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Description |
+|-----------|------|---------|--------|----------|-------------|
+| label | `&str` | `string` | `str` | Yes | Public edge label to match, such as `"WORKS_ON"` or `"KNOWS"`. |
+
+#### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<Vec<u64>, EngineError>` | `Float64Array` | `IdArray` |
+
+All matching live edge IDs. Tombstoned edges are excluded. Unknown edge labels return an empty result.
+
+**Python `IdArray`**: A lazy wrapper that avoids copying IDs to Python memory until accessed. Supports `len()`, indexing (`arr[i]`), iteration, `in` operator, and `to_list()`.
+
+#### Performance
+
+Uses the edge-label posting index and does not hydrate edge records. Edges have exactly one public label, so this API accepts a single label string. Use [`query_edge_ids`](#query_edge_ids) when you need additional edge predicates.
 
 ---
 
-### get_nodes_by_type
+### get_nodes_by_labels
 
-Returns full node records for all nodes of a given type.
+Returns full node records for nodes containing every supplied node label.
 
 ```rust
-let nodes: Vec<NodeRecord> = db.get_nodes_by_type(USER)?;
+let nodes: Vec<NodeView> = db.get_nodes_by_labels("User")?;
+let admin_nodes: Vec<NodeView> =
+    db.get_nodes_by_labels(vec!["User".into(), "Admin".into()])?;
 ```
 
 ```javascript
-const nodes = db.getNodesByType(USER); // NodeRecord[]
+const nodes = db.getNodesByLabels('User'); // NodeView[]
+const admins = db.getNodesByLabels(['User', 'Admin']);
 ```
 
 ```python
-nodes = db.get_nodes_by_type(USER)  # list[NodeRecord]
+nodes = db.get_nodes_by_labels("User")  # list[NodeView]
+admins = db.get_nodes_by_labels(["User", "Admin"])
 ```
 
 #### Parameters
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| type_id | `u32` / `number` / `int` | Yes | Node type. |
+| labels | `impl IntoNodeLabels` / `string \| string[]` / `str \| list[str]` | Yes | Label or labels to match. Nodes must contain every supplied node label. |
 
 #### Returns
 
-Array of full `NodeRecord` objects. Includes all fields (id, key, props, weight, timestamps, vectors).
+Array of full node records. Includes all public fields (id, labels, key, props, weight, timestamps, vectors).
+
+Multi-label input always uses `All` semantics. Use [`query_nodes`](#query_nodes) with `NodeLabelFilter` when `Any` semantics are needed.
 
 ---
 
-### get_edges_by_type
+### get_edges_by_label
 
-Returns full edge records for all edges of a given type. Same pattern as `get_nodes_by_type`.
+Returns full edge records for all edges of a given edge label.
+
+**Rust**
+```rust
+let edges: Vec<EdgeView> = db.get_edges_by_label("WORKS_ON")?;
+```
+
+**Node.js**
+```javascript
+const edges = db.getEdgesByLabel('WORKS_ON'); // EdgeView[]
+```
+
+**Python**
+```python
+edges = db.get_edges_by_label("WORKS_ON")  # list[EdgeView]
+```
+
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Description |
+|-----------|------|---------|--------|----------|-------------|
+| label | `&str` | `string` | `str` | Yes | Public edge label to match. |
+
+#### Returns
+
+Array of full edge records. Includes all public edge fields: id, endpoints (`from`/`to` in Rust and Node.js, `from_id`/`to_id` in Python), label, props, weight, timestamps, and validity window.
+
+Unknown edge labels return an empty array. Tombstoned edges are excluded.
+
+#### Performance
+
+Uses the edge-label posting index to collect matching IDs, then batch-hydrates the matching records. Use [`edges_by_label`](#edges_by_label) when IDs are enough.
 
 ---
 
-### count_nodes_by_type
+### count_nodes_by_labels
 
-Returns the count of nodes of a given type. More efficient than fetching all IDs and measuring the length.
+Returns the count of nodes containing every supplied node label.
 
 ```rust
-let count: u64 = db.count_nodes_by_type(USER)?;
+let count: u64 = db.count_nodes_by_labels("User")?;
+let admin_count: u64 =
+    db.count_nodes_by_labels(vec!["User".into(), "Admin".into()])?;
 ```
 
 ```javascript
-const count = db.countNodesByType(USER);
+const count = db.countNodesByLabels('User');
 ```
 
 ```python
-count = db.count_nodes_by_type(USER)
+count = db.count_nodes_by_labels("User")
+admin_count = db.count_nodes_by_labels(["User", "Admin"])
 ```
+
+Count uses metadata-only verification and does not hydrate node records or allocate the final ID result vector. Multi-label input always uses `All` semantics. Use [`query_node_ids`](#query_node_ids) with `NodeLabelFilter` when `Any` semantics are needed.
 
 ---
 
-### count_edges_by_type
+### count_edges_by_label
 
-Returns the count of edges of a given type. Same pattern as `count_nodes_by_type`.
+Returns the count of live edges of a given edge label.
+
+**Rust**
+```rust
+let count: u64 = db.count_edges_by_label("WORKS_ON")?;
+```
+
+**Node.js**
+```javascript
+const count = db.countEdgesByLabel('WORKS_ON');
+```
+
+**Python**
+```python
+count = db.count_edges_by_label("WORKS_ON")
+```
+
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Description |
+|-----------|------|---------|--------|----------|-------------|
+| label | `&str` | `string` | `str` | Yes | Public edge label to count. |
+
+#### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<u64, EngineError>` | `number` | `int` |
+
+Unknown edge labels return `0`. Tombstoned edges are excluded.
+
+#### Performance
+
+Counts through the edge-label posting path without hydrating edge records.
 
 ---
 
 ## Property Index Management
 
-Property indexes are optional declarations on node properties. Public query methods stay the same whether or not you declare an index.
+Property indexes are optional declarations on node or edge properties. Public query methods stay the same whether or not you declare an index.
 
 Lifecycle rules:
 - `ensure_node_property_index` registers an equality or numeric range declaration and starts background build work when needed.
+- `ensure_edge_property_index` does the same for edge properties, scoped by edge label.
 - `list_node_property_indexes` exposes declaration kind, range domain, lifecycle state, and any last error from the published read snapshot, so `Ready` means new public reads can use the same ready catalog.
+- `list_edge_property_indexes` exposes the same state for edge declarations.
 - `find_nodes`, `find_nodes_paged`, `find_nodes_range`, and `find_nodes_range_paged` use declaration-backed execution only when a matching declaration is `Ready`.
+- `query_edge_ids`, `query_edges`, and `query_pattern` may use ready edge-property declarations as candidate sources while still verifying final edge filters.
 - If a declaration is absent, `Building`, `Failed`, or cannot be used for a specific lookup, OverGraph falls back to the same public query API for that call.
 
 ### ensure_node_property_index
@@ -1420,13 +1825,13 @@ Ensures an optional secondary index declaration for a node property.
 **Rust**
 ```rust
 let eq = db.ensure_node_property_index(
-    USER,
+    "User",
     "role",
     SecondaryIndexKind::Equality,
 )?;
 
 let range = db.ensure_node_property_index(
-    USER,
+    "User",
     "score",
     SecondaryIndexKind::Range {
         domain: SecondaryIndexRangeDomain::Int,
@@ -1436,9 +1841,9 @@ let range = db.ensure_node_property_index(
 
 **Node.js**
 ```javascript
-const eq = db.ensureNodePropertyIndex(USER, 'role', { kind: 'equality' });
+const eq = db.ensureNodePropertyIndex('User', 'role', { kind: 'equality' });
 
-const range = db.ensureNodePropertyIndex(USER, 'score', {
+const range = db.ensureNodePropertyIndex('User', 'score', {
   kind: 'range',
   domain: 'int',
 });
@@ -1446,10 +1851,10 @@ const range = db.ensureNodePropertyIndex(USER, 'score', {
 
 **Python**
 ```python
-eq = db.ensure_node_property_index(USER, "role", "equality")
+eq = db.ensure_node_property_index("User", "role", "equality")
 
 range_info = db.ensure_node_property_index(
-    USER,
+    "User",
     "score",
     "range",
     domain="int",
@@ -1460,7 +1865,7 @@ range_info = db.ensure_node_property_index(
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| type_id | `u32` | `number` | `int` | Yes | Restrict the declaration to this node type. |
+| label | `&str` | `string` | `str` | Yes | Restrict the declaration to this node label. |
 | prop_key | `&str` | `string` | `str` | Yes | Property key to declare. |
 | kind | `SecondaryIndexKind` | `{ kind: string, domain?: string }` | `str` plus optional `domain=` | Yes | Equality declaration or numeric range declaration. |
 
@@ -1468,7 +1873,7 @@ range_info = db.ensure_node_property_index(
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<NodePropertyIndexInfo, EngineError>` | `JsNodePropertyIndexInfo` | `PyNodePropertyIndexInfo` |
+| `Result<NodePropertyIndexInfo, EngineError>` | `NodePropertyIndexInfo` | `NodePropertyIndexInfo` |
 
 The current declaration info.
 
@@ -1478,7 +1883,7 @@ The current declaration info.
 - Range declarations use `SecondaryIndexKind::Range { domain: ... }`, `{ kind: 'range', domain: 'int' | 'uint' | 'float' }`, or `"range"` plus `domain="int" | "uint" | "float"`.
 - Re-ensuring an existing declaration returns the existing declaration info.
 - Re-ensuring a `Failed` declaration retries it by moving it back to `Building`.
-- A `(type_id, prop_key)` pair may have at most one range declaration domain. Trying to ensure the same property with a different range domain returns an error.
+- A `(label, prop_key)` pair may have at most one range declaration domain. Trying to ensure the same property with a different range domain returns an error.
 - A declaration becoming `Ready` is what enables declaration-backed routing. Callers do not switch to a different query method.
 
 ---
@@ -1490,7 +1895,7 @@ Drops an optional node-property secondary index declaration.
 **Rust**
 ```rust
 let removed = db.drop_node_property_index(
-    USER,
+    "User",
     "role",
     SecondaryIndexKind::Equality,
 )?;
@@ -1498,12 +1903,12 @@ let removed = db.drop_node_property_index(
 
 **Node.js**
 ```javascript
-const removed = db.dropNodePropertyIndex(USER, 'role', { kind: 'equality' });
+const removed = db.dropNodePropertyIndex('User', 'role', { kind: 'equality' });
 ```
 
 **Python**
 ```python
-removed = db.drop_node_property_index(USER, "role", "equality")
+removed = db.drop_node_property_index("User", "role", "equality")
 ```
 
 #### Parameters
@@ -1520,7 +1925,7 @@ Same parameters and kind values as [`ensure_node_property_index`](#ensure_node_p
 
 #### Behavior
 
-- Dropping a declaration removes the optional declaration state and future declaration-backed routing for that property.
+- Dropping a declaration removes the optional declaration state and subsequent declaration-backed routing for that property.
 - Property queries continue to work after a drop. They fall back to scan through the same public query APIs.
 
 ---
@@ -1531,7 +1936,7 @@ Lists all optional node-property secondary index declarations.
 
 **Rust**
 ```rust
-let indexes = db.list_node_property_indexes();
+let indexes = db.list_node_property_indexes()?;
 ```
 
 **Node.js**
@@ -1548,7 +1953,7 @@ indexes = db.list_node_property_indexes()
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Vec<NodePropertyIndexInfo>` | `Array<JsNodePropertyIndexInfo>` | `list[PyNodePropertyIndexInfo]` |
+| `Vec<NodePropertyIndexInfo>` | `Array<NodePropertyIndexInfo>` | `list[NodePropertyIndexInfo]` |
 
 One entry per declaration.
 
@@ -1561,7 +1966,7 @@ User-facing declaration information returned by [`ensure_node_property_index`](#
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
 | index_id | `u64` | `indexId: number` | `index_id: int` | Stable declaration ID. |
-| type_id | `u32` | `typeId: number` | `type_id: int` | Declared node type. |
+| label | `String` | `label: string` | `label: str` | Declared node label. |
 | prop_key | `String` | `propKey: string` | `prop_key: str` | Declared property key. |
 | kind | `SecondaryIndexKind` | `kind: string` | `kind: str` | `equality` or `range`. |
 | domain | Encoded in `SecondaryIndexKind::Range` | `domain?: string` | `domain: str \| None` | Range domain for range declarations. Omitted / `None` for equality. |
@@ -1572,6 +1977,130 @@ State meanings:
 - `building`: the declaration exists, but the declaration-backed path is not live yet.
 - `ready`: the declaration-backed path has full live coverage and may be used by matching queries.
 - `failed`: the declaration could not be built or validated. Matching queries fall back to scan until the declaration is retried or dropped.
+
+---
+
+### ensure_edge_property_index
+
+Ensures an optional secondary index declaration for an edge property, scoped to one edge label.
+
+**Rust**
+```rust
+let eq = db.ensure_edge_property_index(
+    "WORKS_AT",
+    "role",
+    SecondaryIndexKind::Equality,
+)?;
+
+let range = db.ensure_edge_property_index(
+    "WORKS_AT",
+    "score",
+    SecondaryIndexKind::Range {
+        domain: SecondaryIndexRangeDomain::Int,
+    },
+)?;
+```
+
+**Node.js**
+```javascript
+const eq = db.ensureEdgePropertyIndex('WORKS_AT', 'role', { kind: 'equality' });
+
+const range = db.ensureEdgePropertyIndex('WORKS_AT', 'score', {
+  kind: 'range',
+  domain: 'int',
+});
+```
+
+**Python**
+```python
+eq = db.ensure_edge_property_index("WORKS_AT", "role", "equality")
+
+range_info = db.ensure_edge_property_index(
+    "WORKS_AT",
+    "score",
+    "range",
+    domain="int",
+)
+```
+
+Parameters, kind values, lifecycle states, and domain validation match [`ensure_node_property_index`](#ensure_node_property_index), except `label` is the edge label.
+
+#### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<EdgePropertyIndexInfo, EngineError>` | `EdgePropertyIndexInfo` | `EdgePropertyIndexInfo` |
+
+#### Behavior
+
+- Edge property declarations are edge-label-scoped. A property filter without an edge label cannot use an edge-label-scoped edge-property declaration as a direct-query anchor.
+- Ready edge declarations are candidate sources only. `query_edge_ids`, `query_edges`, and graph pattern execution still verify edge metadata and edge property predicates before returning results.
+- Direct `EdgeQuery` anchor legality is unchanged: edge property indexes improve planning inside legal direct edge queries, but do not make filter-only direct edge queries legal by themselves.
+- Graph patterns may choose a ready edge-property equality or range source as an edge anchor when it is cheaper than node-anchor expansion.
+
+---
+
+### drop_edge_property_index
+
+Drops an optional edge-property secondary index declaration.
+
+**Rust**
+```rust
+let removed = db.drop_edge_property_index(
+    "WORKS_AT",
+    "role",
+    SecondaryIndexKind::Equality,
+)?;
+```
+
+**Node.js**
+```javascript
+const removed = db.dropEdgePropertyIndex('WORKS_AT', 'role', { kind: 'equality' });
+```
+
+**Python**
+```python
+removed = db.drop_edge_property_index("WORKS_AT", "role", "equality")
+```
+
+Same parameters and kind values as [`ensure_edge_property_index`](#ensure_edge_property_index). Returns `true` if a declaration existed and was removed, `false` otherwise.
+
+---
+
+### list_edge_property_indexes
+
+Lists all optional edge-property secondary index declarations.
+
+**Rust**
+```rust
+let indexes = db.list_edge_property_indexes()?;
+```
+
+**Node.js**
+```javascript
+const indexes = db.listEdgePropertyIndexes();
+```
+
+**Python**
+```python
+indexes = db.list_edge_property_indexes()
+```
+
+#### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<Vec<EdgePropertyIndexInfo>, EngineError>` | `Array<EdgePropertyIndexInfo>` | `list[EdgePropertyIndexInfo]` |
+
+One entry per edge declaration.
+
+---
+
+### EdgePropertyIndexInfo
+
+User-facing declaration information returned by [`ensure_edge_property_index`](#ensure_edge_property_index) and [`list_edge_property_indexes`](#list_edge_property_indexes).
+
+Fields match [`NodePropertyIndexInfo`](#nodepropertyindexinfo), with the edge-label scope exposed as `label`: `index_id` / `indexId`, `label`, `prop_key` / `propKey`, `kind`, `domain`, `state`, and `last_error` / `lastError`.
 
 ---
 
@@ -1593,8 +2122,8 @@ const upper = { value: 20, inclusive: false, domain: 'int' };
 
 **Python**
 ```python
-lower = PyPropertyRangeBound(10, domain="int")
-upper = PyPropertyRangeBound(20, inclusive=False, domain="int")
+lower = PropertyRangeBound(10, domain="int")
+upper = PropertyRangeBound(20, inclusive=False, domain="int")
 ```
 
 | Field | Rust | Node.js | Python | Description |
@@ -1628,7 +2157,7 @@ PropertyRangeCursor {
 
 **Python**
 ```python
-PyPropertyRangeCursor(20, 42, domain="int")
+PropertyRangeCursor(20, 42, domain="int")
 ```
 
 | Field | Rust | Node.js | Python | Description |
@@ -1639,6 +2168,24 @@ PyPropertyRangeCursor(20, 42, domain="int")
 
 ---
 
+### PropertyRangePageRequest (Rust only)
+
+Rust request object for [`find_nodes_range_paged`](#find_nodes_range_paged).
+
+```rust
+PropertyRangePageRequest {
+    limit: Some(100),
+    after: None,
+}
+```
+
+| Field | Rust | Description |
+|-------|------|-------------|
+| limit | `Option<usize>` | Maximum node IDs to return. `None` means no explicit page size. |
+| after | `Option<PropertyRangeCursor>` | Cursor from the previous page. `None` starts at the lower bound. |
+
+---
+
 ### PropertyRangePageResult
 
 Result object returned by [`find_nodes_range_paged`](#find_nodes_range_paged).
@@ -1646,7 +2193,7 @@ Result object returned by [`find_nodes_range_paged`](#find_nodes_range_paged).
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
 | items | `Vec<u64>` | `Float64Array` | `IdArray` | Node IDs in range order for this page. |
-| next_cursor | `Option<PropertyRangeCursor>` | `nextCursor?: JsPropertyRangeCursor` | `next_cursor: PyPropertyRangeCursor \| None` | Cursor for the next page. Omitted / `None` on the last page. |
+| next_cursor | `Option<PropertyRangeCursor>` | `nextCursor?: PropertyRangeCursor` | `next_cursor: PropertyRangeCursor \| None` | Cursor for the next page. Omitted / `None` on the last page. |
 
 ---
 
@@ -1656,12 +2203,12 @@ Equality and numeric range queries are index-transparent. Callers do not choose 
 
 ### find_nodes
 
-Finds all nodes of a given type where a specific property matches a given value (exact match).
+Finds all nodes with a given label where a specific property matches a given value (exact match).
 
 **Rust**
 ```rust
 let ids = db.find_nodes(
-    USER,
+    "User",
     "role",
     &PropValue::String("admin".into()),
 )?;
@@ -1669,19 +2216,19 @@ let ids = db.find_nodes(
 
 **Node.js**
 ```javascript
-const ids = db.findNodes(USER, 'role', 'admin'); // Float64Array
+const ids = db.findNodes('User', 'role', 'admin'); // Float64Array
 ```
 
 **Python**
 ```python
-ids = db.find_nodes(USER, "role", "admin")  # IdArray
+ids = db.find_nodes("User", "role", "admin")  # IdArray
 ```
 
 #### Parameters
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| type_id | `u32` | `number` | `int` | Yes | Restrict search to this node type. |
+| label | `&str` | `string` | `str` | Yes | Restrict search to this node label. |
 | prop_key | `&str` | `string` | `str` | Yes | Property key to match on. |
 | prop_value | `PropValue` | `any` | `Any` | Yes | Exact value to match. Type must match (string "1" does not match integer 1). |
 
@@ -1691,20 +2238,20 @@ ids = db.find_nodes(USER, "role", "admin")  # IdArray
 |------|---------|--------|
 | `Result<Vec<u64>, EngineError>` | `Float64Array` | `IdArray` |
 
-Matching node IDs. If a matching equality declaration is `Ready`, OverGraph uses the declaration-backed index path. Otherwise it scans nodes of the requested type.
+Matching node IDs. If a matching equality declaration is `Ready`, OverGraph uses the declaration-backed index path. Otherwise it scans nodes of the requested label.
 
 ---
 
 ### find_nodes_range
 
-Finds all nodes of a given type where a numeric property falls within a range.
+Finds all nodes with a given label where a numeric property falls within a range.
 
 Results are ordered by `(property_value asc, node_id asc)`.
 
 **Rust**
 ```rust
 let ids = db.find_nodes_range(
-    USER,
+    "User",
     "score",
     Some(&PropertyRangeBound::Included(PropValue::Int(10))),
     Some(&PropertyRangeBound::Excluded(PropValue::Int(20))),
@@ -1714,7 +2261,7 @@ let ids = db.find_nodes_range(
 **Node.js**
 ```javascript
 const ids = db.findNodesRange(
-  USER,
+  'User',
   'score',
   { value: 10, inclusive: true, domain: 'int' },
   { value: 20, inclusive: false, domain: 'int' },
@@ -1724,10 +2271,10 @@ const ids = db.findNodesRange(
 **Python**
 ```python
 ids = db.find_nodes_range(
-    USER,
+    "User",
     "score",
-    PyPropertyRangeBound(10, domain="int"),
-    PyPropertyRangeBound(20, inclusive=False, domain="int"),
+    PropertyRangeBound(10, domain="int"),
+    PropertyRangeBound(20, inclusive=False, domain="int"),
 )
 ```
 
@@ -1735,10 +2282,10 @@ ids = db.find_nodes_range(
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| type_id | `u32` | `number` | `int` | Yes | Restrict search to this node type. |
+| label | `&str` | `string` | `str` | Yes | Restrict search to this node label. |
 | prop_key | `&str` | `string` | `str` | Yes | Numeric property key to query. |
-| lower | `Option<&PropertyRangeBound>` | `JsPropertyRangeBound \| null \| undefined` | `PyPropertyRangeBound \| None` | No | Lower bound. Omit for an unbounded start. |
-| upper | `Option<&PropertyRangeBound>` | `JsPropertyRangeBound \| null \| undefined` | `PyPropertyRangeBound \| None` | No | Upper bound. Omit for an unbounded end. |
+| lower | `Option<&PropertyRangeBound>` | `PropertyRangeBound \| null \| undefined` | `PropertyRangeBound \| None` | No | Lower bound. Omit for an unbounded start. |
+| upper | `Option<&PropertyRangeBound>` | `PropertyRangeBound \| null \| undefined` | `PropertyRangeBound \| None` | No | Upper bound. Omit for an unbounded end. |
 
 #### Returns
 
@@ -1754,32 +2301,32 @@ Matching node IDs in range order.
 - Numeric domains are exact. `int`, `uint`, and `float` are separate query domains.
 - If both bounds are present, they must use the same domain.
 - If a matching range declaration is `Ready`, OverGraph uses the declaration-backed range path.
-- If no matching `Ready` declaration exists, OverGraph falls back to a scan of nodes of the requested type.
+- If no matching `Ready` declaration exists, OverGraph falls back to a scan of nodes of the requested label.
 - Invalid bound combinations return an error.
 
 ---
 
 ### find_nodes_by_time_range
 
-Finds all nodes of a given type with `updated_at` within a time range.
+Finds all nodes with a given label and `updated_at` within a time range.
 
 ```rust
-let ids = db.find_nodes_by_time_range(USER, start_ms, end_ms)?;
+let ids = db.find_nodes_by_time_range("User", start_ms, end_ms)?;
 ```
 
 ```javascript
-const ids = db.findNodesByTimeRange(USER, startMs, endMs);
+const ids = db.findNodesByTimeRange('User', startMs, endMs);
 ```
 
 ```python
-ids = db.find_nodes_by_time_range(USER, start_ms, end_ms)
+ids = db.find_nodes_by_time_range("User", start_ms, end_ms)
 ```
 
 #### Parameters
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| type_id | `u32` | `number` | `int` | Yes | Node type. |
+| label | `&str` | `string` | `str` | Yes | Node label. |
 | from_ms | `i64` | `number` | `int` | Yes | Start of range (inclusive), ms since epoch. |
 | to_ms | `i64` | `number` | `int` | Yes | End of range (inclusive), ms since epoch. |
 
@@ -1791,22 +2338,23 @@ Node IDs matching the time range. Uses the timestamp index.
 
 ## Queries
 
-Query APIs combine explicit IDs, keys, type constraints, property filters, timestamp filters, and
+Query APIs combine explicit IDs, label-scoped keys, label/edge-label constraints, property filters, timestamp filters, and
 bounded graph patterns through normal function-call and object APIs. OverGraph still has no query
 string parser.
 
+Query APIs return matching IDs, hydrated records, or bounded pattern ID bindings only.
+Projection/query-row result APIs are not part of this surface.
+
 Node queries use a recursive `filter` tree.
 
-Top-level request fields such as `type_id` / `typeId`, `ids`, and `keys` are not part of the
+Top-level request fields such as node `label_filter`, edge `label`, `ids`, and `keys` are not part of the
 filter tree. They are top-level constraints and are ANDed with the filter. Within `ids` and
 `keys`, values are OR alternatives.
 
-Use `filter` for all node predicates in node queries and node patterns. The old node-level
-connector `where` and `predicates` fields are no longer supported for node filters. Edge patterns
-still support their existing edge-scoped `where` / `predicates` post-filters.
+Use `filter` for all node and edge predicates.
 
 Query APIs use the same published read snapshot and visibility rules as direct read APIs.
-Internally, OverGraph may use explicit IDs, key lookup, the node type index, ready property
+Internally, OverGraph may use explicit IDs, key lookup, the node-label index, ready property
 equality/range indexes, the timestamp index, sorted intersection, sorted union, fallback scans, or
 bounded adjacency expansion. Candidate indexes are verified after candidate planning; indexes are
 never trusted as final truth.
@@ -1822,8 +2370,9 @@ Node queries are the API-first query surface for combining top-level constraints
 node `filter` tree. They are useful when a request needs more than one constraint, when an index may
 help but should remain optional, or when the same filter should be explained.
 
-Graph pattern queries use the same node filter model on pattern nodes, then expand bounded edge
-constraints. Edge property checks remain edge-scoped post-filters in Phase 24.
+Direct edge queries and graph pattern edge constraints use the canonical edge `filter` tree for
+edge metadata and property predicates. Maintained edge-property indexes are used when available;
+otherwise predicates are verified over the planned edge universe.
 
 ### Choosing the Right Query API
 
@@ -1835,6 +2384,15 @@ shares the same plan and verifier as `query_node_ids`; only the final payload di
 
 Use [`explain_node_query`](#explain_node_query) to inspect the selected physical plan and warnings
 without executing the page.
+
+Use [`query_edge_ids`](#query_edge_ids) when you need matching edge IDs from explicit edge IDs, edge-label
+constraints, endpoint constraints, or an explicit full-scan opt-in.
+
+Use [`query_edges`](#query_edges) for the same edge query shape when you need hydrated edge records.
+Metadata-only filters hydrate only the final page. Property filters hydrate bounded verifier
+candidates.
+
+Use [`explain_edge_query`](#explain_edge_query) to inspect direct edge query planning.
 
 Use direct property and time queries such as [`find_nodes`](#find_nodes),
 [`find_nodes_range`](#find_nodes_range), and
@@ -1853,7 +2411,10 @@ Runs a node query and returns matching node IDs.
 **Rust**
 ```rust
 let page = db.query_node_ids(&NodeQuery {
-    type_id: Some(USER),
+    label_filter: Some(NodeLabelFilter {
+        labels: vec!["User".into()],
+        mode: LabelMatchMode::All,
+    }),
     filter: Some(NodeFilterExpr::And(vec![
         NodeFilterExpr::PropertyEquals {
             key: "status".into(),
@@ -1873,7 +2434,7 @@ let page = db.query_node_ids(&NodeQuery {
 **Node.js**
 ```javascript
 const page = db.queryNodeIds({
-  typeId: USER,
+  labelFilter: { labels: ['User'], mode: 'all' },
   filter: {
     and: [
       { property: 'status', eq: 'active' },
@@ -1887,7 +2448,7 @@ const page = db.queryNodeIds({
 **Python**
 ```python
 page = db.query_node_ids({
-    "type_id": USER,
+    "label_filter": {"labels": ["User"], "mode": "all"},
     "filter": {
         "and": [
             {"property": "status", "eq": "active"},
@@ -1908,7 +2469,7 @@ page = db.query_node_ids({
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<QueryNodeIdsResult, EngineError>` | `JsIdPageResult` | `PyIdPageResult` |
+| `Result<QueryNodeIdsResult, EngineError>` | `IdPageResult` | `IdPageResult` |
 
 Result fields:
 
@@ -1927,7 +2488,10 @@ matching nodes.
 **Rust**
 ```rust
 let page = db.query_nodes(&NodeQuery {
-    type_id: Some(USER),
+    label_filter: Some(NodeLabelFilter {
+        labels: vec!["Document".into(), "Published".into()],
+        mode: LabelMatchMode::All,
+    }),
     filter: Some(NodeFilterExpr::PropertyEquals {
         key: "status".into(),
         value: PropValue::String("active".into()),
@@ -1940,7 +2504,7 @@ let page = db.query_nodes(&NodeQuery {
 **Node.js**
 ```javascript
 const page = db.queryNodes({
-  typeId: MEMORY,
+  labelFilter: { labels: ['Document', 'Published'], mode: 'all' },
   filter: {
     and: [
       { property: 'status', in: ['active', 'trial'] },
@@ -1960,7 +2524,7 @@ const page = db.queryNodes({
 **Python**
 ```python
 page = db.query_nodes({
-    "type_id": MEMORY,
+    "label_filter": {"labels": ["Document", "Published"], "mode": "all"},
     "filter": {
         "and": [
             {"property": "status", "in": ["active", "trial"]},
@@ -1987,13 +2551,13 @@ page = db.query_nodes({
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<QueryNodesResult, EngineError>` | `JsNodePageResult` | `PyNodePageResult` |
+| `Result<QueryNodesResult, EngineError>` | `NodePageResult` | `NodePageResult` |
 
 Result fields:
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
-| items | `items: Vec<NodeRecord>` | `items: JsNodeRecord[]` | `items: list[PyNodeRecord]` | Hydrated final page of matching nodes. |
+| items | `items: Vec<NodeView>` | `items: NodeView[]` | `items: list[NodeView]` | Hydrated final page of matching nodes. |
 | cursor | `next_cursor: Option<u64>` | `nextCursor: number \| null` | `next_cursor: int \| None` | Cursor for the next page. Pass it as `after`. |
 
 Connector node records expose top-level fields eagerly. Property maps are converted only when the
@@ -2014,7 +2578,7 @@ let plan = db.explain_node_query(&query)?;
 **Node.js**
 ```javascript
 const plan = db.explainNodeQuery({
-  typeId: USER,
+  labelFilter: { labels: ['User'], mode: 'all' },
   filter: { property: 'status', eq: 'active' },
 });
 ```
@@ -2022,7 +2586,7 @@ const plan = db.explainNodeQuery({
 **Python**
 ```python
 plan = db.explain_node_query({
-    "type_id": USER,
+    "label_filter": {"labels": ["User"], "mode": "all"},
     "filter": {"property": "status", "eq": "active"},
 })
 ```
@@ -2037,6 +2601,112 @@ See [QueryPlan](#queryplan).
 
 ---
 
+### Direct Edge Queries
+
+#### query_edge_ids
+
+Runs a direct edge query and returns matching edge IDs in ascending edge ID order.
+
+**Rust**
+```rust
+let page = db.query_edge_ids(&EdgeQuery {
+    label: Some("WORKS_AT".into()),
+    from_ids: vec![person_id],
+    filter: Some(EdgeFilterExpr::And(vec![
+        EdgeFilterExpr::WeightRange { lower: Some(1.0), upper: None },
+        EdgeFilterExpr::ValidAt { epoch_ms },
+    ])),
+    page: PageRequest { limit: Some(100), after: None },
+    ..Default::default()
+})?;
+```
+
+**Node.js**
+```javascript
+const page = db.queryEdgeIds({
+  label: 'WORKS_AT',
+  fromIds: [personId],
+  filter: {
+    and: [
+      { weight: { gte: 1.0 } },
+      { validAt: epochMs },
+    ],
+  },
+  limit: 100,
+});
+```
+
+**Python**
+```python
+page = db.query_edge_ids({
+    "label": "WORKS_AT",
+    "from_ids": [person_id],
+    "filter": {
+        "and": [
+            {"weight": {"gte": 1.0}},
+            {"valid_at": epoch_ms},
+        ],
+    },
+    "limit": 100,
+})
+```
+
+#### query_edges
+
+Runs the same direct edge query as [`query_edge_ids`](#query_edge_ids), then hydrates the final page
+of matching edge records.
+
+**Node.js**
+```javascript
+const page = db.queryEdges({
+  label: 'WORKS_AT',
+  endpointIds: [personId],
+  filter: { property: 'role', eq: 'lead' },
+  limit: 25,
+});
+```
+
+**Python**
+```python
+page = db.query_edges({
+    "label": "WORKS_AT",
+    "endpoint_ids": [person_id],
+    "filter": {"property": "role", "eq": "lead"},
+    "limit": 25,
+})
+```
+
+#### explain_edge_query
+
+Returns the deterministic planner tree, estimates, and warnings for a direct edge query.
+
+**Rust**
+```rust
+let plan = db.explain_edge_query(&query)?;
+```
+
+**Node.js**
+```javascript
+const plan = db.explainEdgeQuery({ label: 'WORKS_AT', fromIds: [personId] });
+```
+
+**Python**
+```python
+plan = db.explain_edge_query({"label": "WORKS_AT", "from_ids": [person_id]})
+```
+
+##### Returns
+
+| Rust | Node.js | Python |
+|------|---------|--------|
+| `Result<QueryEdgeIdsResult, EngineError>` | `IdPageResult` | `IdPageResult` |
+| `Result<QueryEdgesResult, EngineError>` | `EdgePageResult` | `EdgePageResult` |
+| `Result<QueryPlan, EngineError>` | `object` | `dict` |
+
+Rust `QueryEdgeIdsResult` contains `edge_ids: Vec<u64>` and `next_cursor: Option<u64>`. Rust `QueryEdgesResult` contains `edges: Vec<EdgeView>` and `next_cursor: Option<u64>`. Node.js and Python page result objects use `items` for the returned IDs or edges.
+
+---
+
 ### Graph Pattern Queries
 
 #### query_pattern
@@ -2045,8 +2715,9 @@ Runs a bounded, connected graph pattern query and returns ID bindings for node a
 aliases. Pattern v1 returns IDs only. Hydrate bound IDs with [`get_nodes`](#get_nodes) and
 [`get_edges`](#get_edges) when needed.
 
-Node patterns use the same recursive `filter` tree as node queries. Edge pattern `where` /
-`predicates` remain Phase 24 edge-scoped post-filters after bounded expansion.
+Node patterns use the same recursive `filter` tree as node queries. Edge patterns use canonical
+`filter` with the same shape as direct edge queries. Edge pattern `label_filter` is a simple
+edge-label list, not a `NodeLabelFilter`.
 
 **Rust**
 ```rust
@@ -2054,7 +2725,10 @@ let result = db.query_pattern(&GraphPatternQuery {
     nodes: vec![
         NodePattern {
             alias: "person".into(),
-            type_id: Some(USER),
+            label_filter: Some(NodeLabelFilter {
+                labels: vec!["User".into(), "Admin".into()],
+                mode: LabelMatchMode::All,
+            }),
             ids: vec![],
             keys: vec![],
             filter: Some(NodeFilterExpr::Or(vec![
@@ -2070,7 +2744,10 @@ let result = db.query_pattern(&GraphPatternQuery {
         },
         NodePattern {
             alias: "company".into(),
-            type_id: Some(COMPANY),
+            label_filter: Some(NodeLabelFilter {
+                labels: vec!["Company".into()],
+                mode: LabelMatchMode::All,
+            }),
             ids: vec![],
             keys: vec!["acme".into()],
             filter: None,
@@ -2081,11 +2758,11 @@ let result = db.query_pattern(&GraphPatternQuery {
         from_alias: "person".into(),
         to_alias: "company".into(),
         direction: Direction::Outgoing,
-        type_filter: Some(vec![WORKS_AT]),
-        property_predicates: vec![EdgePostFilterPredicate::PropertyEquals {
+        label_filter: vec!["WORKS_AT".into()],
+        filter: Some(EdgeFilterExpr::PropertyEquals {
             key: "role".into(),
             value: PropValue::String("engineer".into()),
-        }],
+        }),
     }],
     at_epoch: None,
     limit: 100,
@@ -2099,7 +2776,7 @@ const result = db.queryPattern({
   nodes: [
     {
       alias: 'person',
-      typeId: USER,
+      labelFilter: { labels: ['User'], mode: 'all' },
       filter: {
         or: [
           { property: 'status', eq: 'active' },
@@ -2109,7 +2786,7 @@ const result = db.queryPattern({
     },
     {
       alias: 'company',
-      typeId: COMPANY,
+      labelFilter: { labels: ['Company'], mode: 'all' },
       keys: ['acme'],
     },
   ],
@@ -2119,10 +2796,8 @@ const result = db.queryPattern({
       fromAlias: 'person',
       toAlias: 'company',
       direction: 'outgoing',
-      typeFilter: [WORKS_AT],
-
-      // Edge post-filter remains Phase 23 edge-scoped shape.
-      where: { role: { eq: 'engineer' } },
+      labelFilter: ['WORKS_AT'],
+      filter: { property: 'role', eq: 'engineer' },
     },
   ],
   limit: 100,
@@ -2135,7 +2810,7 @@ result = db.query_pattern({
     "nodes": [
         {
             "alias": "person",
-            "type_id": USER,
+            "label_filter": {"labels": ["User"], "mode": "all"},
             "filter": {
                 "or": [
                     {"property": "status", "eq": "active"},
@@ -2145,7 +2820,7 @@ result = db.query_pattern({
         },
         {
             "alias": "company",
-            "type_id": COMPANY,
+            "label_filter": {"labels": ["Company"], "mode": "all"},
             "keys": ["acme"],
         },
     ],
@@ -2155,10 +2830,8 @@ result = db.query_pattern({
             "from_alias": "person",
             "to_alias": "company",
             "direction": "outgoing",
-            "type_filter": [WORKS_AT],
-
-            # Edge post-filter remains edge-scoped.
-            "where": {"role": {"eq": "engineer"}},
+            "label_filter": ["WORKS_AT"],
+            "filter": {"property": "role", "eq": "engineer"},
         },
     ],
     "limit": 100,
@@ -2228,17 +2901,18 @@ Node query request fields:
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
-| type_id | `Option<u32>` | `typeId?: number` | `type_id?: int` | Optional type constraint. Required when using `keys`. |
+| label_filter / labelFilter | `Option<NodeLabelFilter>` | `labelFilter?: { labels: string[], mode: "any" \| "all" }` | `label_filter?: {"labels": list[str], "mode": "any" \| "all"}` | Node-label constraint with explicit `Any` / `All` semantics. A one-label `All` filter uses the single-label fast path. |
 | ids | `Vec<u64>` | `ids?: number[]` | `ids?: list[int]` | Explicit node ID candidates. OR within the list. |
-| keys | `Vec<String>` | `keys?: string[]` | `keys?: list[str]` | Type-scoped key candidates. OR within the list. |
+| keys | `Vec<String>` | `keys?: string[]` | `keys?: list[str]` | Label-scoped key candidates. OR within the list. |
 | filter | `Option<NodeFilterExpr>` | `filter?: QueryNodeFilter \| null` | `filter?: QueryNodeFilter \| None` | Recursive node filter tree. Omit or pass null/None for no filter. |
 | limit | `page.limit` | `limit?: number` | `limit?: int` | Page size. Omit for unlimited. Connector `0` means unlimited. |
 | after | `page.after` | `after?: number` | `after?: int` | Cursor from a previous page. Returns items with node IDs strictly greater than `after`. |
-| allow_full_scan | `bool` | `allowFullScan?: boolean` | `allow_full_scan?: bool` | Required for type-less full scan fallback. |
+| allow_full_scan | `bool` | `allowFullScan?: boolean` | `allow_full_scan?: bool` | Required for unanchored full scan fallback. |
 
-Top-level `type_id` / `typeId`, `ids`, and `keys` are ANDed with `filter`. Type-less verify-only
-filters require `allow_full_scan` / `allowFullScan` unless `ids` or `keys` provide a legal bounded
-universe.
+Top-level `label_filter` / `labelFilter`, `ids`, and `keys` are ANDed with `filter`.
+A one-label `All` filter uses the direct node-label fast path. Key lookups require exactly one resolved node label.
+Label-less verify-only filters require `allow_full_scan` / `allowFullScan` unless `ids` or `keys`
+provide a legal bounded universe.
 
 ---
 
@@ -2289,13 +2963,13 @@ The built-in timestamp filter is a structural field. User property names always 
 ```javascript
 // Built-in node timestamp:
 db.queryNodeIds({
-  typeId: NOTE,
+  labelFilter: { labels: ['Document'], mode: 'all' },
   filter: { updatedAt: { gte: startMs, lt: endMs } },
 });
 
 // User property literally named "updatedAt":
 db.queryNodeIds({
-  typeId: NOTE,
+  labelFilter: { labels: ['Document'], mode: 'all' },
   filter: { property: 'updatedAt', eq: 'manual-value' },
 });
 ```
@@ -2304,16 +2978,65 @@ db.queryNodeIds({
 ```python
 # Built-in node timestamp:
 db.query_node_ids({
-    "type_id": NOTE,
+    "label_filter": {"labels": ["Document"], "mode": "all"},
     "filter": {"updated_at": {"gte": start_ms, "lt": end_ms}},
 })
 
 # User property literally named "updated_at":
 db.query_node_ids({
-    "type_id": NOTE,
+    "label_filter": {"labels": ["Document"], "mode": "all"},
     "filter": {"property": "updated_at", "eq": "manual-value"},
 })
 ```
+
+---
+
+#### EdgeQuery
+
+Direct edge query request fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| label | `Option<String>` | `label?: string` | `label?: str` | Optional edge-label constraint. |
+| ids | `Vec<u64>` | `ids?: number[]` | `ids?: list[int]` | Explicit edge ID candidates. OR within the list. |
+| from_ids | `Vec<u64>` | `fromIds?: number[]` | `from_ids?: list[int]` | Source endpoint candidates. OR within the list. |
+| to_ids | `Vec<u64>` | `toIds?: number[]` | `to_ids?: list[int]` | Target endpoint candidates. OR within the list. |
+| endpoint_ids | `Vec<u64>` | `endpointIds?: number[]` | `endpoint_ids?: list[int]` | Either-endpoint candidates. OR within the list. |
+| filter | `Option<EdgeFilterExpr>` | `filter?: QueryEdgeFilter \| null` | `filter?: QueryEdgeFilter \| None` | Recursive edge filter tree. |
+| limit | `page.limit` | `limit?: number` | `limit?: int` | Page size. Omit for unlimited. Connector `0` means unlimited. |
+| after | `page.after` | `after?: number` | `after?: int` | Cursor from a previous page. Returns edge IDs strictly greater than `after`. |
+| allow_full_scan | `bool` | `allowFullScan?: boolean` | `allow_full_scan?: bool` | Required for direct filter-only or unanchored full scans. |
+
+Top-level edge anchors are ANDed with `filter`; values inside each list are ORed. A filter-only
+direct edge query requires explicit full-scan opt-in even when metadata sidecars are available.
+
+---
+
+#### EdgeFilter / QueryEdgeFilter
+
+Rust uses `EdgeFilterExpr`. Node.js and Python use the canonical recursive `QueryEdgeFilter`
+object shape.
+
+| Filter shape | Node.js | Python | Meaning |
+|--------------|---------|--------|---------|
+| Equality | `{ property: "role", eq: "lead" }` | `{"property": "role", "eq": "lead"}` | Edge property exactly equals value |
+| IN | `{ property: "role", in: ["lead", "owner"] }` | `{"property": "role", "in": ["lead", "owner"]}` | Edge property equals any listed value |
+| Range | `{ property: "score", gte: 50 }` | `{"property": "score", "gte": 50}` | Edge property range comparison |
+| Exists | `{ property: "role", exists: true }` | `{"property": "role", "exists": True}` | Edge property key is present |
+| Missing | `{ property: "role", missing: true }` | `{"property": "role", "missing": True}` | Edge property key is absent |
+| Weight range | `{ weight: { gte: 1.0 } }` | `{"weight": {"gte": 1.0}}` | Built-in edge weight range |
+| Updated-at range | `{ updatedAt: { gte: ms } }` | `{"updated_at": {"gte": ms}}` | Built-in edge update timestamp range |
+| Valid-at | `{ validAt: ms }` | `{"valid_at": ms}` | Half-open validity check: `valid_from <= ms < valid_to` |
+| Valid-from range | `{ validFrom: { gte: ms } }` | `{"valid_from": {"gte": ms}}` | Built-in `valid_from` range |
+| Valid-to range | `{ validTo: { gt: ms } }` | `{"valid_to": {"gt": ms}}` | Built-in `valid_to` range |
+| AND | `{ and: [filter, ...] }` | `{"and": [filter, ...]}` | All children must match |
+| OR | `{ or: [filter, ...] }` | `{"or": [filter, ...]}` | Any child may match |
+| NOT | `{ not: filter }` | `{"not": filter}` | Child must not match |
+
+Weight ranges reject NaN. `-0.0` and `+0.0` compare as the same value. Ready edge-property
+declarations may provide equality, `IN`, and range candidate sources for edge-label-scoped edge filters;
+metadata filters may use private edge metadata sources when available. All edge filters still run
+final verification for correctness.
 
 ---
 
@@ -2334,9 +3057,9 @@ Node pattern fields:
 | Field | Description |
 |-------|-------------|
 | alias | Non-empty unique node alias. |
-| type_id / typeId | Optional node type constraint. |
+| label_filter | `NodeLabelFilter` with explicit `Any` / `All` semantics. A one-label `All` filter uses the single-label fast path. |
 | ids | Explicit node IDs. |
-| keys | Type-scoped keys. Requires `type_id` / `typeId`. |
+| keys | Label-scoped keys. Requires exactly one resolved node label from `label_filter`. |
 | filter | Recursive node filter tree. Omit/null/None means no node filter. |
 
 Edge pattern fields:
@@ -2347,8 +3070,8 @@ Edge pattern fields:
 | from_alias / fromAlias | Source alias in the pattern direction. |
 | to_alias / toAlias | Target alias in the pattern direction. |
 | direction | `outgoing`, `incoming`, or `both`, relative to `from_alias`. |
-| type_filter / typeFilter | Optional edge type list. |
-| predicates / where | Bounded edge property post-filters. |
+| label_filter / labelFilter | Optional edge-label list. |
+| filter | Canonical recursive edge filter tree. |
 
 Pattern validation:
 
@@ -2357,10 +3080,9 @@ Pattern validation:
 - Pattern v1 must be one connected component with at least one edge.
 - Distinct node aliases bind distinct node IDs.
 - Reusing the same alias in multiple edges means the same node binding.
-- Unbounded initial nodes without a legal bounded universe are rejected. A type-less verify-only
+- Unbounded initial nodes without a legal bounded universe are rejected. A label-less verify-only
   target filter is legal only after bounded edge expansion has produced target IDs.
-- Edge property `where` / `predicates` are edge-scoped post-filters. Phase 24 does not support
-  `filter` on edge patterns.
+- Edge `filter` is canonical.
 
 ---
 
@@ -2370,10 +3092,12 @@ Explain APIs return:
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
-| kind | `kind` | `kind` | `kind` | `node_query` or `pattern_query` in connectors. |
+| kind | `kind` | `kind` | `kind` | `node_query`, `edge_query`, or `pattern_query`. |
 | root | `root` | `root` | `root` | Recursive plan node. |
 | estimated candidates | `estimated_candidates` | `estimatedCandidates` | `estimated_candidates` | Optional candidate count estimate. |
-| warnings | `warnings` | `warnings` | `warnings` | Stable lower_snake warning strings in connectors. |
+| warnings | `warnings` | `warnings` | `warnings` | Stable lower_snake warning strings. |
+| notes | `notes` | `notes` | `notes` | Stable lower_snake informational planner notes. |
+| public inputs | `public_inputs` | `publicInputs` | `public_inputs` | Normalized public node-label and edge-label names referenced during planning. |
 
 Plan node kinds include:
 
@@ -2381,19 +3105,34 @@ Plan node kinds include:
 |----------------|---------|
 | `empty_result` | Impossible filter or empty candidate universe. |
 | `explicit_ids` | Explicit ID candidate universe. |
-| `key_lookup` | Type-scoped key lookup. |
-| `node_type_index` | Type index candidate source. |
+| `key_lookup` | Label-scoped key lookup. |
+| `node_label_index` | Label index candidate source. |
+| `node_label_any_index` | Node-label `Any` candidate source. |
 | `property_equality_index` | Ready equality property index candidate source. |
 | `property_range_index` | Ready range property index candidate source. |
 | `timestamp_index` | Built-in timestamp index candidate source. |
+| `explicit_edge_ids` | Explicit edge ID candidate universe. |
+| `edge_label_index` | Edge label index candidate source. |
+| `edge_triple_index` | Exact `(from, to, label)` edge lookup source. |
+| `edge_endpoint_adjacency` | Endpoint adjacency candidate source. |
+| `edge_weight_index` | Optional edge weight sidecar candidate source. |
+| `edge_updated_at_index` | Optional edge update-time sidecar candidate source. |
+| `edge_validity_index` | Optional edge validity sidecar candidate source. |
+| `edge_metadata_scan` | Edge metadata scan candidate source. |
+| `edge_property_equality_index` | Ready edge-property equality declaration candidate source. |
+| `edge_property_range_index` | Ready edge-property range declaration candidate source. |
 | `intersect` | Sorted intersection of bounded candidate sources. |
 | `union` | Sorted union of bounded OR/IN candidate sources. |
 | `verify_node_filter` | Final visible-record verification of the full node filter. |
+| `verify_edge_filter` | Final visible-edge metadata/property verification. |
 | `adjacency_expansion` | Bounded graph-pattern edge expansion. |
 | `pattern_expand` | Pattern execution expansion step. |
+| `pattern_edge_anchor` | Pattern execution started from a planned edge source. |
 | `verify_edge_predicates` | Edge post-filter verification. |
-| `fallback_type_scan` | Type-scoped scan universe. |
+| `fallback_node_label_scan` | Label-scoped scan universe. |
 | `fallback_full_node_scan` | Explicit full node scan universe. |
+| `fallback_edge_label_scan` | Edge-label-scoped edge scan universe. |
+| `fallback_full_edge_scan` | Explicit full edge scan universe. |
 
 Warning strings include:
 
@@ -2412,6 +3151,17 @@ Warning strings include:
 | `verify_only_filter` | Some filter subtree ran only through verification. |
 | `boolean_branch_fallback` | Boolean branch or OR was cheaper or safer as verifier fallback. |
 | `planning_probe_budget_exceeded` | Planning probe/union budget forced fallback. |
+| `unknown_node_label` | A requested node label is not present in the catalog. |
+| `unknown_edge_label` | A requested edge label is not present in the catalog. |
+
+Note strings include:
+
+| Note | Meaning |
+|------|---------|
+| `node_label_any_dedupe_before_pagination` | `Any` node-label planning deduplicates candidates before pagination. |
+| `node_label_any_final_verification` | `Any` node-label results are verified against final visible node records. |
+| `node_label_all_superset_verification` | `All` node-label planning used a superset index source followed by final verification. |
+| `stale_node_label_membership_verification` | Node-label index membership may include stale entries and is verified against visible records. |
 
 ---
 
@@ -2454,36 +3204,42 @@ The pattern is the same across all paginated methods:
 - `find_nodes_range_paged` uses a structured range cursor keyed by `(value, node_id)`.
 - The result includes `items` and `next_cursor` (`None`/`null` when there are no more pages).
 
-### nodes_by_type_paged
+### nodes_by_labels_paged
 
-Paginated version of [`nodes_by_type`](#nodes_by_type). Returns IDs only.
+Paginated node-label scan. Returns IDs only.
 
 ```rust
-let page = db.nodes_by_type_paged(USER, &PageRequest { limit: Some(100), after: None })?;
+let page = db.nodes_by_labels_paged("User", &PageRequest { limit: Some(100), after: None })?;
+let admin_page = db.nodes_by_labels_paged(
+    vec!["User".into(), "Admin".into()],
+    &PageRequest { limit: Some(100), after: None },
+)?;
 // page.items: Vec<u64>, page.next_cursor: Option<u64>
 ```
 
 ```javascript
-let page = db.nodesByTypePaged(USER, 100); // limit=100, no cursor
+let page = db.nodesByLabelsPaged('User', 100); // limit=100, no cursor
+let adminPage = db.nodesByLabelsPaged(['User', 'Admin'], 100);
 // page = { items: Float64Array, nextCursor: number | null }
 
 // Next page:
-page = db.nodesByTypePaged(USER, 100, page.nextCursor);
+page = db.nodesByLabelsPaged('User', 100, page.nextCursor);
 ```
 
 ```python
-page = db.nodes_by_type_paged(USER, limit=100)
+page = db.nodes_by_labels_paged("User", limit=100)
+admin_page = db.nodes_by_labels_paged(["User", "Admin"], limit=100)
 # page.items: IdArray, page.next_cursor: int | None
 
 # Next page:
-page = db.nodes_by_type_paged(USER, limit=100, after=page.next_cursor)
+page = db.nodes_by_labels_paged("User", limit=100, after=page.next_cursor)
 ```
 
 #### Parameters
 
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
-| type_id | `u32` | `number` | `int` | Yes | — | Node type. |
+| labels | `impl IntoNodeLabels` | `string \| string[]` | `str \| list[str]` | Yes | — | Label or labels to match. Nodes must contain every supplied node label. |
 | limit | `Option<usize>` | `number` | `int` | No | Unlimited | Maximum items per page. |
 | after | `Option<u64>` | `number` | `int` | No | `None` (start from beginning) | Cursor. Returns items with IDs strictly greater than this value. Use `next_cursor` from a previous result. |
 
@@ -2496,36 +3252,118 @@ page = db.nodes_by_type_paged(USER, limit=100, after=page.next_cursor)
 
 ---
 
-### edges_by_type_paged
+### edges_by_label_paged
 
-Paginated version of [`edges_by_type`](#edges_by_type). Same pattern as `nodes_by_type_paged`.
-
----
-
-### get_nodes_by_type_paged
-
-Paginated version of [`get_nodes_by_type`](#get_nodes_by_type). Returns full `NodeRecord` objects.
+Paginated edge-label scan. Returns edge IDs only.
 
 ```rust
-let page = db.get_nodes_by_type_paged(USER, &PageRequest { limit: Some(50), after: None })?;
-// page.items: Vec<NodeRecord>
+let page = db.edges_by_label_paged(
+    "WORKS_ON",
+    &PageRequest { limit: Some(100), after: None },
+)?;
+// page.items: Vec<u64>, page.next_cursor: Option<u64>
 ```
 
 ```javascript
-const page = db.getNodesByTypePaged(USER, 50);
-// page.items: NodeRecord[]
+let page = db.edgesByLabelPaged('WORKS_ON', 100); // limit=100, no cursor
+// page = { items: Float64Array, nextCursor: number | null }
+
+// Next page:
+page = db.edgesByLabelPaged('WORKS_ON', 100, page.nextCursor);
 ```
 
 ```python
-page = db.get_nodes_by_type_paged(USER, limit=50)
-# page.items: list[NodeRecord]
+page = db.edges_by_label_paged("WORKS_ON", limit=100)
+# page.items: IdArray, page.next_cursor: int | None
+
+# Next page:
+page = db.edges_by_label_paged("WORKS_ON", limit=100, after=page.next_cursor)
+```
+
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Default | Description |
+|-----------|------|---------|--------|----------|---------|-------------|
+| label | `&str` | `string` | `str` | Yes | - | Public edge label to match. |
+| limit | `Option<usize>` | `number` | `int` | No | Unlimited | Maximum edge IDs per page. |
+| after | `Option<u64>` | `number` | `int` | No | `None` (start from beginning) | Cursor. Returns edge IDs strictly greater than this value. Use `next_cursor` from a previous result. |
+
+#### Returns: PageResult
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| items | `Vec<u64>` | `Float64Array` | `IdArray` | Edge IDs in this page. |
+| next_cursor | `Option<u64>` | `number \| null` | `int \| None` | Cursor for the next page. `None`/`null` means this is the last page. |
+
+Unknown edge labels return an empty page. Tombstoned edges are excluded. Paged edge-label scans are ordered by edge ID.
+
+---
+
+### get_nodes_by_labels_paged
+
+Paginated hydrated node-label scan. Returns full node records.
+
+```rust
+let page = db.get_nodes_by_labels_paged("User", &PageRequest { limit: Some(50), after: None })?;
+let admin_page = db.get_nodes_by_labels_paged(
+    vec!["User".into(), "Admin".into()],
+    &PageRequest { limit: Some(50), after: None },
+)?;
+// page.items: Vec<NodeView>
+```
+
+```javascript
+const page = db.getNodesByLabelsPaged('User', 50);
+const adminPage = db.getNodesByLabelsPaged(['User', 'Admin'], 50);
+// page.items: NodeView[]
+```
+
+```python
+page = db.get_nodes_by_labels_paged("User", limit=50)
+admin_page = db.get_nodes_by_labels_paged(["User", "Admin"], limit=50)
+# page.items: list[NodeView]
 ```
 
 ---
 
-### get_edges_by_type_paged
+### get_edges_by_label_paged
 
-Paginated version of [`get_edges_by_type`](#get_edges_by_type). Returns full `EdgeRecord` objects.
+Paginated hydrated edge-label scan. Returns full edge records.
+
+```rust
+let page = db.get_edges_by_label_paged(
+    "WORKS_ON",
+    &PageRequest { limit: Some(50), after: None },
+)?;
+// page.items: Vec<EdgeView>
+```
+
+```javascript
+const page = db.getEdgesByLabelPaged('WORKS_ON', 50);
+// page.items: EdgeView[]
+```
+
+```python
+page = db.get_edges_by_label_paged("WORKS_ON", limit=50)
+# page.items: list[EdgeView]
+```
+
+#### Parameters
+
+| Parameter | Rust | Node.js | Python | Required | Default | Description |
+|-----------|------|---------|--------|----------|---------|-------------|
+| label | `&str` | `string` | `str` | Yes | - | Public edge label to match. |
+| limit | `Option<usize>` | `number` | `int` | No | Unlimited | Maximum edge records per page. |
+| after | `Option<u64>` | `number` | `int` | No | `None` (start from beginning) | Cursor. Returns edge records with IDs strictly greater than this value. Use `next_cursor` from a previous result. |
+
+#### Returns: PageResult
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| items | `Vec<EdgeView>` | `EdgeView[]` | `list[EdgeView]` | Full edge records in this page. |
+| next_cursor | `Option<u64>` | `number \| null` | `int \| None` | Cursor for the next page. `None`/`null` means this is the last page. |
+
+Unknown edge labels return an empty page. Tombstoned edges are excluded. The implementation pages IDs first and hydrates only the requested page.
 
 ---
 
@@ -2535,7 +3373,7 @@ Paginated version of [`find_nodes`](#find_nodes).
 
 ```rust
 let page = db.find_nodes_paged(
-    USER,
+    "User",
     "role",
     &PropValue::String("admin".into()),
     &PageRequest { limit: Some(50), after: None },
@@ -2543,11 +3381,11 @@ let page = db.find_nodes_paged(
 ```
 
 ```javascript
-const page = db.findNodesPaged(USER, 'role', 'admin', { limit: 50 });
+const page = db.findNodesPaged('User', 'role', 'admin', { limit: 50 });
 ```
 
 ```python
-page = db.find_nodes_paged(USER, "role", "admin", limit=50)
+page = db.find_nodes_paged("User", "role", "admin", limit=50)
 ```
 
 ---
@@ -2559,7 +3397,7 @@ Paginated version of [`find_nodes_range`](#find_nodes_range).
 **Rust**
 ```rust
 let page = db.find_nodes_range_paged(
-    USER,
+    "User",
     "score",
     Some(&PropertyRangeBound::Included(PropValue::Int(10))),
     Some(&PropertyRangeBound::Excluded(PropValue::Int(20))),
@@ -2573,7 +3411,7 @@ let page = db.find_nodes_range_paged(
 **Node.js**
 ```javascript
 const page = db.findNodesRangePaged(
-  USER,
+  'User',
   'score',
   { value: 10, inclusive: true, domain: 'int' },
   { value: 20, inclusive: false, domain: 'int' },
@@ -2584,10 +3422,10 @@ const page = db.findNodesRangePaged(
 **Python**
 ```python
 page = db.find_nodes_range_paged(
-    USER,
+    "User",
     "score",
-    PyPropertyRangeBound(10, domain="int"),
-    PyPropertyRangeBound(20, inclusive=False, domain="int"),
+    PropertyRangeBound(10, domain="int"),
+    PropertyRangeBound(20, inclusive=False, domain="int"),
     limit=50,
 )
 ```
@@ -2596,26 +3434,26 @@ page = db.find_nodes_range_paged(
 
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
-| type_id | `u32` | `number` | `int` | Yes | — | Restrict search to this node type. |
+| label | `&str` | `string` | `str` | Yes | — | Restrict search to this node label. |
 | prop_key | `&str` | `string` | `str` | Yes | — | Numeric property key to query. |
-| lower | `Option<&PropertyRangeBound>` | `JsPropertyRangeBound \| null \| undefined` | `PyPropertyRangeBound \| None` | No | Unbounded | Lower bound. |
-| upper | `Option<&PropertyRangeBound>` | `JsPropertyRangeBound \| null \| undefined` | `PyPropertyRangeBound \| None` | No | Unbounded | Upper bound. |
+| lower | `Option<&PropertyRangeBound>` | `PropertyRangeBound \| null \| undefined` | `PropertyRangeBound \| None` | No | Unbounded | Lower bound. |
+| upper | `Option<&PropertyRangeBound>` | `PropertyRangeBound \| null \| undefined` | `PropertyRangeBound \| None` | No | Unbounded | Upper bound. |
 | limit | `Option<usize>` | `number` | `int` | No | Unlimited | Maximum items per page. |
-| after | `Option<PropertyRangeCursor>` | `JsPropertyRangeCursor` | `PyPropertyRangeCursor` | No | `None` | Cursor from a previous range page. Reuse the same query arguments when resuming. |
+| after | `Option<PropertyRangeCursor>` | `PropertyRangeCursor` | `PropertyRangeCursor` | No | `None` | Cursor from a previous range page. Reuse the same query arguments when resuming. |
 
 #### Returns: PropertyRangePageResult
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
 | items | `Vec<u64>` | `Float64Array` | `IdArray` | Node IDs in range order for this page. |
-| next_cursor | `Option<PropertyRangeCursor>` | `JsPropertyRangeCursor \| null \| undefined` | `PyPropertyRangeCursor \| None` | Cursor for the next page, or no cursor on the last page. |
+| next_cursor | `Option<PropertyRangeCursor>` | `PropertyRangeCursor \| null \| undefined` | `PropertyRangeCursor \| None` | Cursor for the next page, or no cursor on the last page. |
 
 #### Behavior
 
 - At least one bound is required.
 - Numeric domains are exact. `int`, `uint`, and `float` are separate query domains.
 - If both bounds are present, they must use the same domain.
-- When resuming with `after`, keep the same `type_id`, `prop_key`, bounds, and domain.
+- When resuming with `after`, keep the same `label`, `prop_key`, bounds, and domain.
 - Invalid bound or cursor combinations return an error.
 
 ---
@@ -2625,11 +3463,11 @@ page = db.find_nodes_range_paged(
 Paginated version of [`find_nodes_by_time_range`](#find_nodes_by_time_range).
 
 ```javascript
-const page = db.findNodesByTimeRangePaged(USER, startMs, endMs, { limit: 50 });
+const page = db.findNodesByTimeRangePaged('User', startMs, endMs, { limit: 50 });
 ```
 
 ```python
-page = db.find_nodes_by_time_range_paged(USER, start_ms, end_ms, limit=50)
+page = db.find_nodes_by_time_range_paged("User", start_ms, end_ms, limit=50)
 ```
 
 ---
@@ -2644,7 +3482,7 @@ Retrieves the immediate neighbors of a node (one hop). The most common graph tra
 ```rust
 let entries = db.neighbors(node_id, &NeighborOptions {
     direction: Direction::Outgoing,
-    type_filter: Some(vec![WORKS_ON]),
+    edge_label_filter: Some(vec!["WORKS_ON".into()]),
     limit: Some(10),
     at_epoch: None,
     decay_lambda: None,
@@ -2659,7 +3497,7 @@ for entry in &entries {
 ```javascript
 const list = db.neighbors(nodeId, {
   direction: 'outgoing',
-  typeFilter: [WORKS_ON],
+  edgeLabelFilter: ['WORKS_ON'],
   limit: 10,
 });
 
@@ -2670,7 +3508,7 @@ for (const n of list) {
 
 **Python**
 ```python
-entries = db.neighbors(node_id, direction="outgoing", type_filter=[WORKS_ON], limit=10)
+entries = db.neighbors(node_id, direction="outgoing", edge_label_filter=["WORKS_ON"], limit=10)
 for entry in entries:
     print(entry.node_id, entry.edge_id, entry.weight)
 ```
@@ -2681,10 +3519,10 @@ for entry in entries:
 |-----------|------|---------|--------|----------|---------|-------------|
 | node_id | `u64` | `number` | `int` | Yes | — | Node to query neighbors for. |
 | direction | `Direction` | `string` | `str` | No | `Outgoing` | Traversal direction. `"outgoing"`, `"incoming"`, or `"both"`. |
-| type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` (all types) | Only return neighbors connected by edges of these types. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` (all labels) | Only return neighbors connected by edges with these labels. |
 | limit | `Option<usize>` | `number` | `int` | No | `None` (unlimited) | Maximum number of neighbors to return. |
 | at_epoch | `Option<i64>` | `number` | `int` | No | `None` (current time) | Temporal filter. Only edges whose validity window contains this timestamp are included. `None` means the current wall-clock time. |
-| decay_lambda | `Option<f32>` | `number` | `float` | No | `None` (no decay) | Exponential decay factor. When set, each neighbor's weight is multiplied by `exp(-λ × age_ms)` where `age_ms` is the edge's age. Produces a time-decayed relevance score. |
+| decay_lambda | `Option<f32>` | `number` | `float` | No | `None` (no decay) | Exponential decay factor. When set, each neighbor's weight is multiplied by `exp(-λ × age_hours)` where `age_hours = max(at_epoch - valid_from, 0) / 3_600_000`. |
 
 #### Returns: NeighborEntry
 
@@ -2692,12 +3530,12 @@ for entry in entries:
 |-------|------|---------|--------|-------------|
 | node_id | `u64` | `number` | `int` | ID of the neighboring node. |
 | edge_id | `u64` | `number` | `int` | ID of the connecting edge. |
-| edge_type_id | `u32` | `number` | `int` | Type of the connecting edge. |
+| label | `String` | `label: string` | `label: str` | Label of the connecting edge. |
 | weight | `f32` | `number` | `float` | Edge weight (or decay-adjusted score if `decay_lambda` is set). |
 | valid_from | `i64` | `number` | `int` | Edge validity start (ms). |
 | valid_to | `i64` | `number` | `int` | Edge validity end (ms). |
 
-**Node.js**: Returns `JsNeighborEntry[]` as plain objects, so you can use normal array access like `list[i].nodeId`.
+**Node.js**: Returns `NeighborEntry[]` as plain objects, so you can use normal array access like `list[i].nodeId`.
 
 #### Performance
 
@@ -2711,7 +3549,7 @@ Paginated version of [`neighbors`](#neighbors).
 
 ```javascript
 let page = db.neighborsPaged(nodeId, { direction: 'outgoing', limit: 20 });
-// page.items: JsNeighborEntry[], page.nextCursor: number | null
+// page.items: NeighborEntry[], page.nextCursor: number | null
 console.log(page.items[0].nodeId);
 
 // Next page:
@@ -2747,7 +3585,7 @@ let results = db.neighbors_batch(&[1, 2, 3], &NeighborOptions::default())?;
 **Node.js**
 ```javascript
 const results = db.neighborsBatch([1, 2, 3], { direction: 'outgoing' });
-// results: { queryNodeId: number, neighbors: JsNeighborEntry[] }[]
+// results: { queryNodeId: number, neighbors: NeighborEntry[] }[]
 console.log(results[0].neighbors[0].nodeId);
 ```
 
@@ -2763,9 +3601,9 @@ results = db.neighbors_batch([1, 2, 3], direction="outgoing")
 |-----------|------|---------|--------|----------|-------------|
 | node_ids | `&[u64]` | `number[]` | `list[int]` | Yes | Node IDs to query neighbors for. |
 | direction | `Direction` | `string` | `str` | No | `Outgoing` | Traversal direction. |
-| type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Edge type filter. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` | Edge label filter. |
 | at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter. |
-| decay_lambda | `Option<f32>` | `number` | `float` | No | `None` | Decay factor. |
+| decay_lambda | `Option<f32>` | `number` | `float` | No | `None` | Decay factor. Uses hours from `valid_from` when set. |
 
 #### Returns
 
@@ -2781,7 +3619,7 @@ Returns the top K neighbors of a node ranked by a scoring criterion.
 ```rust
 let top = db.top_k_neighbors(node_id, 5, &TopKOptions {
     direction: Direction::Outgoing,
-    scoring: ScoringMode::Weight,
+    scoring: ScoringMode::DecayAdjusted { lambda: 0.01 },
     ..Default::default()
 })?;
 ```
@@ -2790,14 +3628,21 @@ let top = db.top_k_neighbors(node_id, 5, &TopKOptions {
 ```javascript
 const top = db.topKNeighbors(nodeId, 5, {
   direction: 'outgoing',
-  scoring: 'weight',
+  scoring: 'decay',
+  decayLambda: 0.01,
 });
 console.log(top[0].nodeId, top[0].weight);
 ```
 
 **Python**
 ```python
-top = db.top_k_neighbors(node_id, 5, direction="outgoing", scoring="weight")
+top = db.top_k_neighbors(
+    node_id,
+    5,
+    direction="outgoing",
+    scoring="decay",
+    decay_lambda=0.01,
+)
 ```
 
 #### Parameters
@@ -2807,18 +3652,18 @@ top = db.top_k_neighbors(node_id, 5, direction="outgoing", scoring="weight")
 | node_id | `u64` | `number` | `int` | Yes | — | Source node. |
 | k | `usize` | `number` | `int` | Yes | — | Number of top neighbors to return. |
 | direction | `Direction` | `string` | `str` | No | `Outgoing` | Traversal direction. |
-| type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Edge type filter. |
-| scoring | `ScoringMode` | `string` | `str` | No | `Weight` | Scoring criterion. See below. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` | Edge label filter. |
+| scoring | `ScoringMode` | `string` | `str` | No | `Weight` | Scoring criterion. Rust carries the decay lambda inside `ScoringMode::DecayAdjusted { lambda }`; connectors use `scoring: "decay"` plus `decayLambda` / `decay_lambda`. |
 | at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter. |
-| decay_lambda | `Option<f32>` | `number` | `float` | No | `None` | Required when `scoring = "decay"`. |
+| decay_lambda | — | `number` | `float` | No | `None` | Connector-only option required when `scoring = "decay"`. |
 
 **Scoring modes:**
 
 | Mode | Rust | Node.js / Python | Description |
 |------|------|------------------|-------------|
 | Weight | `ScoringMode::Weight` | `"weight"` | Rank by edge weight (descending). |
-| RecencyDecay | `ScoringMode::RecencyDecay` | `"recency"` | Rank by recency. More recent edges score higher. |
-| — | — | `"decay"` | Exponential decay: `weight × exp(-λ × age_ms)`. Requires `decay_lambda`. |
+| Recency | `ScoringMode::Recency` | `"recency"` | Rank by recency. More recent edges score higher. |
+| DecayAdjusted | `ScoringMode::DecayAdjusted { lambda }` | `"decay"` | Exponential decay: `weight × exp(-λ × age_hours)`, where `age_hours = max(at_epoch - valid_from, 0) / 3_600_000`. Connectors require `decay_lambda`. |
 
 #### Returns
 
@@ -2828,22 +3673,25 @@ Array of `NeighborEntry` sorted by score descending. Length is `min(k, actual_ne
 
 ### traverse
 
-Breadth-first traversal from a starting node up to a maximum depth. Supports pagination, type filtering, temporal filtering, and decay scoring.
+Breadth-first traversal from a starting node up to a maximum depth. Supports pagination, edge-label filtering, emission-only node-label filtering, temporal filtering, and decay scoring.
 
 **Rust**
 ```rust
 let result = db.traverse(start_id, &TraverseOptions {
     min_depth: 1,
     direction: Direction::Outgoing,
-    edge_type_filter: Some(vec![WORKS_ON]),
-    node_type_filter: None,
+    edge_label_filter: Some(vec!["WORKS_ON".into()]),
+    emit_node_label_filter: Some(NodeLabelFilter {
+        labels: vec!["User".into(), "Admin".into()],
+        mode: LabelMatchMode::Any,
+    }),
     at_epoch: None,
     decay_lambda: None,
     limit: Some(100),
     cursor: None,
 })?;
 
-for hit in &result {
+for hit in &result.items {
     println!("node={}, depth={}", hit.node_id, hit.depth);
 }
 ```
@@ -2853,7 +3701,8 @@ for hit in &result {
 const result = db.traverse(startId, 3, {
   minDepth: 1,
   direction: 'outgoing',
-  edgeTypeFilter: [WORKS_ON],
+  edgeLabelFilter: ['WORKS_ON'],
+  emitNodeLabelFilter: { labels: ['User', 'Admin'], mode: 'any' },
   limit: 100,
 });
 
@@ -2871,7 +3720,9 @@ if (result.nextCursor) {
 ```python
 result = db.traverse(start_id, max_depth=3,
     min_depth=1, direction="outgoing",
-    edge_type_filter=[WORKS_ON], limit=100)
+    edge_label_filter=["WORKS_ON"],
+    emit_node_label_filter={"labels": ["User", "Admin"], "mode": "any"},
+    limit=100)
 
 for hit in result.items:
     print(hit.node_id, hit.depth, hit.via_edge_id)
@@ -2889,10 +3740,10 @@ if result.next_cursor:
 | max_depth | (part of TraverseOptions in Rust) | `number` | `int` | Yes | — | Maximum number of hops from the start node. `1` = immediate neighbors, `2` = neighbors of neighbors, etc. |
 | min_depth | `u32` | `number` | `int` | No | `1` | Minimum depth to include in results. Set to `0` to include the start node itself. |
 | direction | `Direction` | `string` | `str` | No | `Outgoing` | Edge traversal direction. |
-| edge_type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` (all types) | Only follow edges of these types. |
-| node_type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` (all types) | Only include nodes of these types in results (edges to other types are still followed). |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` (all labels) | Only follow edges with these labels. |
+| emit_node_label_filter | `Option<NodeLabelFilter>` | `emitNodeLabelFilter: { labels: string[], mode: "any" \| "all" }` | `emit_node_label_filter: dict` | No | `None` (all labels) | Node-label filter for emitted nodes. Traversal may still pass through non-emitted labels. |
 | at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter for edge validity. |
-| decay_lambda | `Option<f64>` | `number` | `float` | No | `None` | Exponential decay scoring. When set, each hit receives a score: `exp(-λ × Σ age_ms)` accumulated along the path. |
+| decay_lambda | `Option<f64>` | `number` | `float` | No | `None` | Depth-based traversal score. When set, each hit receives `exp(-λ × depth)`. |
 | limit | `Option<usize>` | `number` | `int` | No | `None` (unlimited) | Maximum results per page. Use with `cursor` for pagination. |
 | cursor | `Option<TraversalCursor>` | `TraversalCursor` | `TraversalCursor` | No | `None` | Resume traversal from a previous page. |
 
@@ -2915,9 +3766,13 @@ Extracts a complete subgraph (all reachable nodes and edges) rooted at a given n
 
 **Rust**
 ```rust
-let sg = db.extract_subgraph(root_id, &SubgraphOptions {
+let sg = db.extract_subgraph(root_id, 3, &SubgraphOptions {
     direction: Direction::Outgoing,
-    edge_type_filter: None,
+    edge_label_filter: None,
+    node_label_filter: Some(NodeLabelFilter {
+        labels: vec!["User".into()],
+        mode: LabelMatchMode::Any,
+    }),
     at_epoch: None,
 })?;
 println!("{} nodes, {} edges", sg.nodes.len(), sg.edges.len());
@@ -2925,13 +3780,21 @@ println!("{} nodes, {} edges", sg.nodes.len(), sg.edges.len());
 
 **Node.js**
 ```javascript
-const sg = db.extractSubgraph(rootId, 3, { direction: 'outgoing' });
+const sg = db.extractSubgraph(rootId, 3, {
+  direction: 'outgoing',
+  nodeLabelFilter: { labels: ['User'], mode: 'any' },
+});
 console.log(sg.nodes.length, 'nodes,', sg.edges.length, 'edges');
 ```
 
 **Python**
 ```python
-sg = db.extract_subgraph(root_id, max_depth=3, direction="outgoing")
+sg = db.extract_subgraph(
+    root_id,
+    max_depth=3,
+    direction="outgoing",
+    node_label_filter={"labels": ["User"], "mode": "any"},
+)
 print(len(sg.nodes), "nodes,", len(sg.edges), "edges")
 ```
 
@@ -2940,17 +3803,18 @@ print(len(sg.nodes), "nodes,", len(sg.edges), "edges")
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
 | start_node_id | `u64` | `number` | `int` | Yes | — | Root node. |
-| max_depth | — (in SubgraphOptions) | `number` | `int` | Yes | — | Maximum hops from root. |
+| max_depth | `u32` | `number` | `int` | Yes | — | Maximum hops from root. |
 | direction | `Direction` | `string` | `str` | No | `Outgoing` | Direction. |
-| edge_type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Edge type filter. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` | Edge label filter. |
+| node_label_filter | `Option<NodeLabelFilter>` | `nodeLabelFilter: { labels: string[], mode: "any" \| "all" }` | `node_label_filter: dict` | No | `None` | Node-label filter for nodes to include and expand through. |
 | at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter. |
 
 #### Returns: Subgraph
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
-| nodes | `NodeIdMap<NodeRecord>` | `NodeRecord[]` | `list[NodeRecord]` | All nodes in the subgraph (full records). |
-| edges | `Vec<EdgeRecord>` or tuples | `EdgeRecord[]` | `list[EdgeRecord]` | All edges in the subgraph (full records). |
+| nodes | `Vec<NodeView>` | `NodeView[]` | `list[NodeView]` | All nodes in the subgraph (full records). |
+| edges | `Vec<EdgeView>` | `EdgeView[]` | `list[EdgeView]` | All edges in the subgraph (full records). |
 
 ### shortest_path
 
@@ -2967,7 +3831,7 @@ let path = db.shortest_path(from_id, to_id, &ShortestPathOptions {
 })?;
 
 if let Some(p) = path {
-    println!("path: {:?}, cost: {}", p.nodes, p.cost);
+    println!("path: {:?}, cost: {}", p.nodes, p.total_cost);
 }
 ```
 
@@ -2998,7 +3862,7 @@ if path:
 | from | `u64` | `number` | `int` | Yes | — | Source node ID. |
 | to | `u64` | `number` | `int` | Yes | — | Destination node ID. |
 | direction | `Direction` | `string` | `str` | No | `Outgoing` | Direction to follow edges. |
-| type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Only traverse these edge types. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` | Only traverse these edge labels. |
 | weight_field | `Option<String>` | `string` | `str` | No | `None` | Property key on edges to use as cost. When `None`, uses `edge.weight`. When set, reads the named property as the edge cost (must be numeric). |
 | at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter. |
 | max_depth | `Option<u32>` | `number` | `int` | No | `None` (unlimited) | Stop searching after this many hops. Prevents runaway searches on deep graphs. |
@@ -3077,7 +3941,7 @@ connected = db.is_connected(from_id, to_id, direction="both", max_depth=5)
 | from | `u64` | `number` | `int` | Yes | — | Source node. |
 | to | `u64` | `number` | `int` | Yes | — | Destination node. |
 | direction | `Direction` | `string` | `str` | No | `Outgoing` | Direction. |
-| type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Edge type filter. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` | Edge label filter. |
 | at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter. |
 | max_depth | `Option<u32>` | `number` | `int` | No | `None` | Maximum search depth. |
 
@@ -3111,7 +3975,7 @@ d = db.degree(node_id, direction="both")
 |-----------|------|---------|--------|----------|---------|-------------|
 | node_id | `u64` | `number` | `int` | Yes | — | Node to count edges for. |
 | direction | `Direction` | `string` | `str` | No | `Outgoing` | Which edges to count. |
-| type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Only count edges of these types. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` | Only count edges with these labels. |
 | at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter. |
 
 #### Returns
@@ -3124,7 +3988,7 @@ The edge count.
 
 #### Performance
 
-Metadata-only fast path for unfiltered, non-temporal queries when all visible segments have valid degree sidecars. O(edges) walk fallback when filtering by type, using a temporal epoch, running with active prune policies, reading a node with temporal incident edges, or reading through a segment whose degree sidecar is missing/corrupt.
+Metadata-only fast path for unfiltered, non-temporal queries when all visible segments have valid degree sidecars. O(edges) walk fallback when filtering by edge label, using a temporal epoch, running with active prune policies, reading a node with temporal incident edges, or reading through a segment whose degree sidecar is missing/corrupt.
 
 ---
 
@@ -3197,19 +4061,27 @@ Computes all [weakly connected components](https://en.wikipedia.org/wiki/Connect
 
 **Rust**
 ```rust
-let components = db.connected_components(&ComponentOptions::default())?;
+let components = db.connected_components(&ComponentOptions {
+    node_label_filter: Some(NodeLabelFilter {
+        labels: vec!["User".into()],
+        mode: LabelMatchMode::Any,
+    }),
+    ..Default::default()
+})?;
 // components: NodeIdMap<u64> - node_id to component_id
 ```
 
 **Node.js**
 ```javascript
-const entries = db.connectedComponents();
+const entries = db.connectedComponents({
+  nodeLabelFilter: { labels: ['User'], mode: 'any' },
+});
 // entries: { nodeId: number, componentId: number }[]
 ```
 
 **Python**
 ```python
-components = db.connected_components()
+components = db.connected_components(node_label_filter={"labels": ["User"], "mode": "any"})
 # components: dict[int, int] - node_id to component_id
 ```
 
@@ -3217,8 +4089,8 @@ components = db.connected_components()
 
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
-| edge_type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Only consider these edge types when determining connectivity. |
-| node_type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Only include nodes of these types. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` | Only consider these edge labels when determining connectivity. |
+| node_label_filter | `Option<NodeLabelFilter>` | `nodeLabelFilter: { labels: string[], mode: "any" \| "all" }` | `node_label_filter: dict` | No | `None` | Node-label filter for nodes included in components. |
 | at_epoch | `Option<i64>` | `number` | `int` | No | `None` | Temporal filter. |
 
 #### Returns
@@ -3232,7 +4104,13 @@ A mapping from every node ID to its component ID. The component ID is the smalle
 Returns all nodes in the same connected component as a given node.
 
 ```rust
-let component_id = db.component_of(node_id, &ComponentOptions::default())?;
+let node_ids = db.component_of(node_id, &ComponentOptions {
+    node_label_filter: Some(NodeLabelFilter {
+        labels: vec!["User".into()],
+        mode: LabelMatchMode::Any,
+    }),
+    ..Default::default()
+})?;
 ```
 
 ```javascript
@@ -3240,7 +4118,7 @@ const nodeIds = db.componentOf(nodeId); // Float64Array
 ```
 
 ```python
-node_ids = db.component_of(node_id)  # list[int]
+node_ids = db.component_of(node_id, node_label_filter={"labels": ["User"], "mode": "any"})  # list[int]
 ```
 
 #### Parameters
@@ -3255,9 +4133,9 @@ Same as [`connected_components`](#connected_components), plus:
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<u64, EngineError>` (component ID) | `Float64Array` (all node IDs) | `list[int]` (all node IDs) |
+| `Result<Vec<u64>, EngineError>` | `Float64Array` | `list[int]` |
 
-Note: The Rust API returns just the component ID (representative node), while Node.js and Python return all node IDs in the component.
+All three surfaces return the sorted node IDs in the same connected component as the requested node.
 
 ---
 
@@ -3315,19 +4193,20 @@ for nid, score in zip(result.node_ids, result.scores):
 | max_iterations | `u32` | `number` | `int` | No | `20` | Maximum power iterations for exact mode. The algorithm stops when it converges or reaches this limit. |
 | epsilon | `f64` | `number` | `float` | No | `1e-6` | Convergence threshold. Iteration stops when the L1 norm of the score change vector drops below this value. |
 | approx_residual_tolerance | `f64` | `number` | `float` | No | `1e-5` | Approximate-mode stopping tolerance for forward push. Smaller values improve fidelity and increase work. |
-| edge_type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Only follow these edge types during the walk. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` | Only follow these edge labels during the walk. |
 | max_results | `Option<usize>` | `number` | `int` | No | `None` (all) | Return only the top N nodes by score. |
 
 #### Returns: PprResult
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
-| node_ids | `Vec<u64>` | `Float64Array` | `list[int]` | Node IDs sorted by score (descending). |
-| scores | `Vec<f64>` | `Float64Array` | `list[float]` | Corresponding scores. Exact PPR sums to 1.0 (or very close); approximate PPR is optimized for ranking quality rather than strict normalization. |
+| scores | `Vec<(u64, f64)>` | — | — | Rust scored node pairs sorted by score descending. |
+| node IDs | — | `nodeIds: Float64Array` | `node_ids: list[int]` | Connector node IDs sorted by score descending. |
+| scores | — | `scores: Float64Array` | `scores: list[float]` | Connector scores corresponding to node IDs. Exact PPR sums to 1.0 (or very close); approximate PPR is optimized for ranking quality rather than strict normalization. |
 | iterations | `u32` | `number` | `int` | Number of exact power iterations performed. Approximate mode returns `0`. |
 | converged | `bool` | `boolean` | `bool` | Exact mode: whether the algorithm converged within `max_iterations`. Approximate mode: `true` when no node remains above the residual tolerance. |
 | algorithm | `PprAlgorithm` | `string` | `str` | Which algorithm produced the result. |
-| approx | `Option<PprApproxMeta>` | `JsPprApproxMeta \| null` | `PyPprApproxMeta \| None` | Approximate-mode metadata. `None`/`null` in exact mode. |
+| approx | `Option<PprApproxMeta>` | `PprApproxMeta \| null` | `PprApproxMeta \| None` | Approximate-mode metadata. `None`/`null` in exact mode. |
 
 ---
 
@@ -3337,33 +4216,85 @@ Exports the graph's adjacency structure as flat arrays. Useful for bulk analysis
 
 **Rust**
 ```rust
-let export = db.export_adjacency()?; // uses default options
+let export = db.export_adjacency(&ExportOptions {
+    node_label_filter: Some(NodeLabelFilter {
+        labels: vec!["User".into(), "Admin".into()],
+        mode: LabelMatchMode::Any,
+    }),
+    include_weights: true,
+    ..Default::default()
+})?;
+println!("node label side table: {:?}", export.node_labels);
+println!("per-node label indexes: {:?}", export.node_label_indexes);
 ```
 
 **Node.js**
 ```javascript
-const adj = db.exportAdjacency({ includeWeights: true });
+const adj = db.exportAdjacency({
+  nodeLabelFilter: { labels: ['User', 'Admin'], mode: 'any' },
+  includeWeights: true,
+});
 // adj.nodeIds: Float64Array
+// adj.edgeLabels: string[]
 // adj.edgeFrom: Float64Array
 // adj.edgeTo: Float64Array
-// adj.edgeTypeIds: Uint32Array
-// adj.edgeWeights: Float64Array | null
+// adj.edgeLabelIndexes: Uint32Array
+// adj.edgeWeights: Float64Array | undefined
 ```
 
 **Python**
 ```python
-adj = db.export_adjacency(include_weights=True)
+adj = db.export_adjacency(
+    node_label_filter={"labels": ["User", "Admin"], "mode": "any"},
+    include_weights=True,
+)
 # adj.node_ids: list[int]
-# adj.edges: list[ExportEdge] - each has from_id, to_id, type_id, weight
+# adj.node_labels: list[str]
+# adj.node_label_indexes: list[list[int]]
+# adj.edge_labels: list[str]
+# adj.edges: list[ExportEdge] - each has from_id, to_id, edge_label_index, weight
 ```
 
 #### Parameters
 
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
-| node_type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Only export nodes of these types. |
-| edge_type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Only export edges of these types. |
+| node_label_filter | `Option<NodeLabelFilter>` | `nodeLabelFilter: { labels: string[], mode: "any" \| "all" }` | `node_label_filter: dict` | No | `None` | Node-label filter for exported nodes. |
+| edge_label_filter | `Option<Vec<String>>` | `edgeLabelFilter: string[]` | `edge_label_filter: list[str]` | No | `None` | Only export edges with these labels. |
 | include_weights | `bool` | `boolean` | `bool` | No | `true` | Include edge weights in the export. Set to `false` to save memory/bandwidth when weights aren't needed. |
+
+#### Returns: AdjacencyExport
+
+Rust:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| node_ids | `Vec<u64>` | Live node IDs in the exported graph. |
+| node_labels | `Vec<String>` | Export-local node-label side table. |
+| node_label_indexes | `Vec<Vec<u32>>` | Per-node label side-table indexes, aligned with `node_ids`. |
+| edge_labels | `Vec<String>` | Export-local edge-label side table. |
+| edges | `Vec<ExportEdge>` | Exported edges. Each `ExportEdge.edge_label_index` references `edge_labels`. |
+
+Node.js:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| nodeIds | `Float64Array` | Live node IDs in the exported graph. |
+| edgeLabels | `string[]` | Export-local edge-label side table. |
+| edgeFrom | `Float64Array` | Source node IDs, aligned with `edgeTo` and `edgeLabelIndexes`. |
+| edgeTo | `Float64Array` | Destination node IDs. |
+| edgeLabelIndexes | `Uint32Array` | Edge-label side-table indexes, aligned with `edgeFrom` / `edgeTo`. |
+| edgeWeights | `Float64Array \| undefined` | Edge weights when `includeWeights` is true. |
+
+Python:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| node_ids | `list[int]` | Live node IDs in the exported graph. |
+| node_labels | `list[str]` | Export-local node-label side table. |
+| node_label_indexes | `list[list[int]]` | Per-node label side-table indexes, aligned with `node_ids`. |
+| edge_labels | `list[str]` | Export-local edge-label side table. |
+| edges | `list[ExportEdge]` | Exported edges. Each edge has `from_id`, `to_id`, `edge_label_index`, and optional `weight`. |
 
 ---
 
@@ -3379,17 +4310,28 @@ Performs similarity search using dense vectors (HNSW approximate nearest neighbo
 let hits = db.vector_search(&VectorSearchRequest {
     mode: VectorSearchMode::Dense,
     dense_query: Some(vec![0.1, 0.2, 0.3, /* ... 384 dims */]),
+    sparse_query: None,
     k: 10,
+    label_filter: None,
     ef_search: Some(100),
-    ..Default::default()
+    scope: None,
+    dense_weight: None,
+    sparse_weight: None,
+    fusion_mode: None,
 })?;
 
 // Sparse search
 let hits = db.vector_search(&VectorSearchRequest {
     mode: VectorSearchMode::Sparse,
+    dense_query: None,
     sparse_query: Some(vec![(42, 0.9), (128, 0.5)]),
     k: 10,
-    ..Default::default()
+    label_filter: None,
+    ef_search: None,
+    scope: None,
+    dense_weight: None,
+    sparse_weight: None,
+    fusion_mode: None,
 })?;
 
 // Hybrid search
@@ -3398,10 +4340,15 @@ let hits = db.vector_search(&VectorSearchRequest {
     dense_query: Some(embedding),
     sparse_query: Some(sparse_terms),
     k: 10,
+    label_filter: Some(NodeLabelFilter {
+        labels: vec!["Document".into(), "Published".into()],
+        mode: LabelMatchMode::All,
+    }),
+    ef_search: None,
+    scope: None,
     dense_weight: Some(0.7),
     sparse_weight: Some(0.3),
     fusion_mode: Some(FusionMode::WeightedScoreFusion),
-    ..Default::default()
 })?;
 ```
 
@@ -3423,6 +4370,7 @@ const hits = db.vectorSearch('sparse', {
 // Hybrid search with graph scope
 const hits = db.vectorSearch('hybrid', {
   k: 10,
+  labelFilter: { labels: ['User', 'Project'], mode: 'any' },
   denseQuery: embedding,
   sparseQuery: sparseTerms,
   denseWeight: 0.7,
@@ -3448,6 +4396,7 @@ hits = db.vector_search("sparse", k=10, sparse_query=[(42, 0.9), (128, 0.5)])
 hits = db.vector_search("hybrid", k=10,
     dense_query=embedding,
     sparse_query=sparse_terms,
+    label_filter={"labels": ["Document", "Published"], "mode": "all"},
     dense_weight=0.7, sparse_weight=0.3,
     fusion_mode="weighted_score",
     scope_start_node_id=root_id,
@@ -3463,8 +4412,8 @@ hits = db.vector_search("hybrid", k=10,
 | k | `usize` | `number` | `int` | Yes | — | Number of top results to return. |
 | dense_query | `Option<Vec<f32>>` | `number[]` | `list[float]` | Required for `dense`/`hybrid` | `None` | Query vector for dense search. Must have the same dimension as configured at `open()`. |
 | sparse_query | `Option<Vec<(u32, f32)>>` | `SparseEntry[]` | `list[tuple[int, float]]` | Required for `sparse`/`hybrid` | `None` | Query vector for sparse search. List of `(dimension_index, value)` pairs. |
-| type_filter | `Option<Vec<u32>>` | `number[]` | `list[int]` | No | `None` | Restrict results to nodes of these types. |
-| ef_search | `Option<usize>` | `number` | `int` | No | `2 × k` | HNSW search expansion factor. Higher values improve recall at the cost of latency. Only applies to dense/hybrid modes. |
+| label_filter | `Option<NodeLabelFilter>` | `labelFilter: { labels: string[], mode: "any" \| "all" }` | `label_filter: dict` | No | `None` | Node-label filter. |
+| ef_search | `Option<usize>` | `number` | `int` | No | `128` | HNSW search expansion factor. The effective dense fetch limit is at least `k` and at least `8`. Higher values improve recall at the cost of latency. Only applies to dense/hybrid modes. |
 
 **Hybrid fusion parameters** (only used when `mode = "hybrid"`):
 
@@ -3489,7 +4438,7 @@ hits = db.vector_search("hybrid", k=10,
 | scope.start_node_id | `u64` | `scope.startNodeId: number` | `scope_start_node_id: int` | No | `None` | Root node for scope traversal. When set, only nodes reachable from this node within `max_depth` are candidates. |
 | scope.max_depth | `u32` | `scope.maxDepth: number` | `scope_max_depth: int` | Required if scope set | — | Maximum hops from the scope root. |
 | scope.direction | `Direction` | `scope.direction: string` | `scope_direction: str` | No | `Outgoing` | Direction for scope traversal. |
-| scope.edge_type_filter | `Option<Vec<u32>>` | `scope.edgeTypeFilter: number[]` | `scope_edge_type_filter: list[int]` | No | `None` | Edge types for scope traversal. |
+| scope.edge_label_filter | `Option<Vec<String>>` | `scope.edgeLabelFilter: string[]` | `scope_edge_label_filter: list[str]` | No | `None` | Edge labels for scope traversal. |
 | scope.at_epoch | `Option<i64>` | `scope.atEpoch: number` | `scope_at_epoch: int` | No | `None` | Temporal filter for scope. |
 
 #### Returns: VectorHit
@@ -3513,7 +4462,7 @@ Immediately deletes nodes matching the specified criteria. Cascade-deletes all i
 let result = db.prune(&PrunePolicy {
     max_age_ms: Some(7 * 24 * 60 * 60 * 1000), // 7 days
     max_weight: Some(0.1),                       // weight <= 0.1
-    type_id: Some(CONVERSATION),                  // only conversations
+    label: Some("Conversation".into()),           // only conversations
 })?;
 println!("pruned {} nodes, {} edges", result.nodes_pruned, result.edges_pruned);
 ```
@@ -3522,7 +4471,7 @@ println!("pruned {} nodes, {} edges", result.nodes_pruned, result.edges_pruned);
 const result = db.prune({
   maxAgeMs: 7 * 24 * 60 * 60 * 1000,
   maxWeight: 0.1,
-  typeId: CONVERSATION,
+  label: 'Conversation',
 });
 ```
 
@@ -3530,7 +4479,7 @@ const result = db.prune({
 result = db.prune(
     max_age_ms=7 * 24 * 60 * 60 * 1000,
     max_weight=0.1,
-    type_id=CONVERSATION,
+    label="Conversation",
 )
 ```
 
@@ -3540,7 +4489,7 @@ result = db.prune(
 |-----------|------|---------|--------|----------|---------|-------------|
 | max_age_ms | `Option<i64>` | `number` | `int` | No* | `None` | Delete nodes older than `now - max_age_ms` milliseconds. Age is computed from `updated_at`. |
 | max_weight | `Option<f32>` | `number` | `float` | No* | `None` | Delete nodes with `weight <= max_weight`. |
-| type_id | `Option<u32>` | `number` | `int` | No | `None` (all types) | Restrict pruning to a single node type. |
+| label | `Option<String>` | `string` | `str` | No | `None` (all labels) | Restrict pruning to a single node label. |
 
 \* At least one of `max_age_ms` or `max_weight` must be provided. This guards against accidental mass deletion (calling `prune({})` with no criteria is an error).
 
@@ -3562,22 +4511,22 @@ Registers a named prune policy that is automatically applied during [compaction]
 ```rust
 db.set_prune_policy("stale-conversations", PrunePolicy {
     max_age_ms: Some(30 * 24 * 60 * 60 * 1000), // 30 days
-    type_id: Some(CONVERSATION),
-    ..Default::default()
+    max_weight: None,
+    label: Some("Conversation".into()),
 })?;
 ```
 
 ```javascript
 db.setPrunePolicy('stale-conversations', {
   maxAgeMs: 30 * 24 * 60 * 60 * 1000,
-  typeId: CONVERSATION,
+  label: 'Conversation',
 });
 ```
 
 ```python
 db.set_prune_policy("stale-conversations",
     max_age_ms=30 * 24 * 60 * 60 * 1000,
-    type_id=CONVERSATION)
+    label="Conversation")
 ```
 
 #### Parameters
@@ -3629,33 +4578,35 @@ existed = db.remove_prune_policy("stale-conversations")
 Lists all registered prune policies.
 
 ```rust
-let policies = db.list_prune_policies();
-for (name, policy) in &policies {
-    println!("{}: max_age_ms={:?}", name, policy.max_age_ms);
+let policies = db.list_prune_policies()?;
+for info in &policies {
+    println!("{}: max_age_ms={:?}", info.name, info.policy.max_age_ms);
 }
 ```
 
 ```javascript
 const policies = db.listPrunePolicies();
-// [{ name: string, policy: { maxAgeMs?, maxWeight?, typeId? } }]
+// [{ name: string, policy: { maxAgeMs?, maxWeight?, label? } }]
 ```
 
 ```python
 policies = db.list_prune_policies()
 for p in policies:
-    print(p.name, p.max_age_ms, p.max_weight, p.type_id)
+    print(p.name, p.max_age_ms, p.max_weight, p.label)
 ```
 
 #### Returns
 
-Array of named policies. Each entry includes:
+Array of named policies. Rust and Node.js entries contain a nested policy object; Python flattens
+policy fields onto each entry.
 
-| Field | Rust | Node.js | Python | Description |
-|-------|------|---------|--------|-------------|
-| name | `String` | `string` | `str` | Policy name. |
-| max_age_ms | `Option<i64>` | `number \| undefined` | `int \| None` | Age threshold. |
-| max_weight | `Option<f32>` | `number \| undefined` | `float \| None` | Weight threshold. |
-| type_id | `Option<u32>` | `number \| undefined` | `int \| None` | Type scope. |
+| Field path | Rust | Node.js | Python | Description |
+|------------|------|---------|--------|-------------|
+| name | `info.name: String` | `entry.name: string` | `p.name: str` | Policy name. |
+| policy | `info.policy: PrunePolicy` | `entry.policy: PrunePolicy` | — | Nested policy object in Rust and Node.js. |
+| max age | `info.policy.max_age_ms: Option<i64>` | `entry.policy.maxAgeMs?: number` | `p.max_age_ms: int \| None` | Age threshold. |
+| max weight | `info.policy.max_weight: Option<f32>` | `entry.policy.maxWeight?: number` | `p.max_weight: float \| None` | Weight threshold. |
+| label | `info.policy.label: Option<String>` | `entry.policy.label?: string` | `p.label: str \| None` | Node-label scope. |
 
 ---
 
@@ -3697,7 +4648,7 @@ db.flush();
 ```
 
 ```python
-info = db.flush()  # PySegmentInfo | None
+info = db.flush()  # SegmentInfo | None
 ```
 
 #### Returns
@@ -3706,13 +4657,15 @@ info = db.flush()  # PySegmentInfo | None
 |------|---------|--------|-------------|
 | `Result<Option<SegmentInfo>, EngineError>` | `void` | `SegmentInfo \| None` | Info about the written segment, or `None` if the memtable was empty. |
 
-**SegmentInfo** (Python only):
+**SegmentInfo** (Rust/Python):
 
-| Field | Type | Description |
-|-------|------|-------------|
-| id | `int` | Segment ID on disk. |
-| node_count | `int` | Nodes in the segment. |
-| edge_count | `int` | Edges in the segment. |
+| Field | Rust | Python | Description |
+|-------|------|--------|-------------|
+| id | `u64` | `int` | Segment ID on disk. |
+| node_count | `u64` | `int` | Nodes in the segment. |
+| edge_count | `u64` | `int` | Edges in the segment. |
+| segment_format_version | `u32` | — | Rust segment format version. |
+| segment_data_id | `[u8; 32]` | — | Rust segment data identifier. |
 
 ---
 
@@ -3850,6 +4803,81 @@ stats = db.end_ingest()  # CompactionStats | None
 
 ---
 
+### scrub
+
+Runs an offline integrity check across all segments. Recomputes SHA-256 payload digests for every component and compares them to the digests recorded at write time. Reports mismatches without modifying any data.
+
+**Rust**
+```rust
+let report = db.scrub()?;
+println!("checked: {}, failed: {}", report.total_components_checked, report.total_components_failed);
+for seg in &report.segments {
+    for f in &seg.findings {
+        eprintln!("segment {}: {} — {}", seg.segment_id, f.finding_type, f.detail);
+    }
+}
+```
+
+**Node.js**
+```javascript
+const report = db.scrub();
+console.log(`checked: ${report.totalComponentsChecked}, failed: ${report.totalComponentsFailed}`);
+
+// async
+const report = await db.scrubAsync();
+```
+
+**Python**
+```python
+report = db.scrub()
+print(f"checked: {report.total_components_checked}, failed: {report.total_components_failed}")
+
+# async
+report = await db.scrub()
+```
+
+#### Parameters
+
+None.
+
+#### Returns: ScrubReport
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| segments | `Vec<SegmentScrubResult>` | `Array<SegmentScrubResult>` | `list[SegmentScrubResult]` | Per-segment results. |
+| total_components_checked | `u64` | `number` | `int` | Total components examined. |
+| total_components_ok | `u64` | `number` | `int` | Components that passed all checks. |
+| total_components_failed | `u64` | `number` | `int` | Components with at least one finding. |
+| total_bytes_digested | `u64` | `number` | `int` | Total payload bytes hashed during the scrub. |
+| duration_ms | `u64` | `number` | `int` | Wall-clock time of the scrub in milliseconds. |
+
+#### SegmentScrubResult
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| segment_id | `u64` | `number` | `int` | Segment that was checked. |
+| findings | `Vec<ComponentScrubFinding>` | `Array<ComponentScrubFinding>` | `list[ComponentScrubFinding]` | Problems found (empty if healthy). |
+| components_ok | `u64` | `number` | `int` | Components that passed in this segment. |
+| bytes_digested | `u64` | `number` | `int` | Payload bytes hashed in this segment. |
+
+#### ComponentScrubFinding
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| component_kind | `String` | `string` | `str` | Which component type had the problem (e.g. `"NodeRecords"`, `"PlannerStats"`). |
+| finding_type | `ScrubFindingType` | `string` | `str` | Classification: `PayloadDigestMismatch`, `ComponentIdMismatch`, `DependencyDigestMismatch`, `IdentityHeaderMismatch`, `ContainerIdMismatch`, `SegmentIdentityMismatch`, `RangeOverflow`, `RangeOverlap`, `FileMissing`, or `IoError`. |
+| detail | `String` | `string` | `str` | Human-readable description of the finding. |
+
+#### Behavior
+
+- Scrub is **read-only** — it never modifies data on disk.
+- Scrub is **offline** — it is never called automatically during open, query, flush, or compaction. You must call it explicitly.
+- Segments are checked in parallel using a shared thread pool. The work is I/O-bound (streaming 64KB-buffered reads + SHA-256), not CPU-bound.
+- A healthy database returns `total_components_failed == 0` and an empty `findings` array for every segment.
+- If a segment directory is missing (e.g. deleted concurrently), the scrub reports a `FileMissing` finding rather than panicking.
+
+---
+
 ## Introspection
 
 These methods provide quick diagnostic information. They are **approximate** and counts may slightly overcount when the same ID appears in multiple memtables or segments.
@@ -3857,7 +4885,7 @@ These methods provide quick diagnostic information. They are **approximate** and
 ### node_count
 
 ```rust
-let count = db.node_count(); // usize
+let count = db.node_count()?; // usize
 ```
 
 Approximate count of live nodes across all data sources.
@@ -3865,30 +4893,101 @@ Approximate count of live nodes across all data sources.
 ### edge_count
 
 ```rust
-let count = db.edge_count(); // usize
+let count = db.edge_count()?; // usize
 ```
 
 Approximate count of live edges.
 
+### next_node_id
+
+```rust
+let next = db.next_node_id()?; // u64
+```
+
+Rust-only diagnostic: the next auto-assigned node ID that would be used by a new node write.
+
+### next_edge_id
+
+```rust
+let next = db.next_edge_id()?; // u64
+```
+
+Rust-only diagnostic: the next auto-assigned edge ID that would be used by a new edge write.
+
 ### segment_count
 
 ```rust
-let count = db.segment_count(); // usize
+let count = db.segment_count()?; // usize
 ```
 
 Number of on-disk segments. After compaction, this is typically 0 or 1.
+
+### segment_tombstone_node_count
+
+```rust
+let count = db.segment_tombstone_node_count()?; // usize
+```
+
+Rust-only diagnostic: deleted node records currently retained in immutable segments.
+
+### segment_tombstone_edge_count
+
+```rust
+let count = db.segment_tombstone_edge_count()?; // usize
+```
+
+Rust-only diagnostic: deleted edge records currently retained in immutable segments.
+
+### path
+
+```rust
+let path = db.path();
+```
+
+Returns the database directory path as `&Path`.
+
+### manifest
+
+Rust diagnostic API for reading the current raw manifest state.
+
+```rust
+let manifest = db.manifest()?;
+println!("label token schema: {}", manifest.label_token_schema_version);
+```
+
+#### Returns: ManifestState
+
+`ManifestState` is a raw diagnostic object. Ordinary graph APIs accept public label names, not these internal numeric IDs.
+
+| Field | Rust | Description |
+|-------|------|-------------|
+| label_token_schema_version | `u32` | Node-label / edge-label catalog schema marker. |
+| node_label_tokens | `BTreeMap<String, u32>` | Public node label to internal `label_id`. |
+| edge_label_tokens | `BTreeMap<String, u32>` | Public edge label to internal `label_id`. |
+| secondary_indexes | `Vec<SecondaryIndexManifestEntry>` | Raw optional secondary-index declarations. Node targets use `SecondaryIndexTarget::NodeProperty { label_id, prop_key }`; edge targets use `SecondaryIndexTarget::EdgeProperty { label_id, prop_key }`. |
+| segments | `Vec<SegmentInfo>` | Published segment metadata. |
+
+### manifest::load_manifest_readonly (Rust only)
+
+Diagnostic read-only manifest loader that inspects the manifest priority chain without writing to disk.
+
+```rust
+let manifest = overgraph::manifest::load_manifest_readonly(Path::new("./my-graph"))?;
+```
+
+Returns `Result<Option<ManifestState>, EngineError>`. The returned manifest is a raw diagnostic view and may contain internal numeric token IDs.
 
 ---
 
 ## Binary Batch Ingestion
 
-High-performance binary format for batch upserts. Avoids JSON parsing overhead. Useful when ingesting data from a custom pipeline.
+High-performance connector-only binary format for batch upserts. Avoids JSON parsing overhead. Useful when ingesting data from a custom pipeline. Rust callers use the structured `batch_upsert_nodes` and `batch_upsert_edges` APIs directly.
 
 ### batch_upsert_nodes_binary
 
 ```javascript
 const buf = Buffer.alloc(/* ... */);
-// Format: [count: u32_LE][per node: type_id: u32_LE, weight: f32_LE, key_len: u16_LE, key: utf8, props_len: u32_LE, props: json_utf8]
+// Format: "OGNB", version 2, count, then per-node labels/key/props payloads.
 const ids = db.batchUpsertNodesBinary(buf);
 ```
 
@@ -3901,10 +5000,15 @@ ids = db.batch_upsert_nodes_binary(buf)
 
 ```
 ┌──────────────────────────────────────┐
+│ magic: "OGNB"                        │
+│ version: u16 = 2                     │
 │ count: u32                           │  ← number of nodes in this batch
 ├──────────────────────────────────────┤
 │ For each node:                       │
-│   type_id:   u32                     │
+│   label_count: u8                    │
+│   repeated label_count times:        │
+│     label_len: u16                   │
+│     label: [u8; label_len] (UTF-8)   │
 │   weight:    f32                     │
 │   key_len:   u16                     │
 │   key:       [u8; key_len]  (UTF-8)  │
@@ -3916,6 +5020,8 @@ ids = db.batch_upsert_nodes_binary(buf)
 #### Returns
 
 Array of node IDs (same order as packed nodes).
+
+Version 1 node buffers are rejected. Use version 2 for every connector so each packed node carries its full label set.
 
 ---
 
@@ -3933,12 +5039,15 @@ ids = db.batch_upsert_edges_binary(buf)
 
 ```
 ┌──────────────────────────────────────────┐
+│ magic: "OGEB"                            │
+│ version: u16 = 1                         │
 │ count: u32                               │
 ├──────────────────────────────────────────┤
 │ For each edge:                           │
 │   from:       u64                        │
 │   to:         u64                        │
-│   type_id:    u32                        │
+│   label_len:  u16                       │
+│   label:      [u8; label_len] (UTF-8)   │
 │   weight:     f32                        │
 │   valid_from: i64                        │
 │   valid_to:   i64                        │
@@ -3946,6 +5055,8 @@ ids = db.batch_upsert_edges_binary(buf)
 │   props:      [u8; props_len]  (JSON)    │
 └──────────────────────────────────────────┘
 ```
+
+In the packed binary edge format only, `valid_from = 0` and `valid_to = 0` are sentinels for the engine defaults. `valid_from = 0` means "use the edge's `created_at` timestamp"; `valid_to = 0` means "use `i64::MAX` / no expiration." Because of these sentinels, epoch `0` cannot be represented as an explicit edge validity bound in this packed format.
 
 ---
 
@@ -3969,6 +5080,7 @@ All methods can fail. Errors are returned differently across languages:
 | `SerializationError(String)` | Property encoding/decoding failed. |
 | `ManifestError(String)` | Manifest file is corrupt or incompatible. |
 | `DatabaseNotFound(String)` | Directory doesn't exist and `create_if_missing` is false. |
+| `DatabaseClosed` | Operation attempted after the engine was closed. |
 | `InvalidOperation(String)` | Invalid API usage (e.g., writing to a closed database). |
 | `TxnConflict(String)` | Explicit write transaction conflict. No WAL entry was appended and the transaction did not commit. |
 | `TxnClosed` | Explicit write transaction was already committed or rolled back. |
@@ -4025,20 +5137,21 @@ const node = await db.getNodeAsync(42);
 
 Async methods run on the libuv thread pool. Write operations acquire an exclusive lock; read operations acquire a shared lock (allowing concurrent reads).
 
-**Available async methods:** `closeAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `beginWriteTxnAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `ensureNodePropertyIndexAsync`, `dropNodePropertyIndexAsync`, `listNodePropertyIndexesAsync`, `findNodesRangeAsync`, `findNodesRangePagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByTypeAsync`, `edgesByTypeAsync`, `getNodesByTypeAsync`, `getEdgesByTypeAsync`, `countNodesByTypeAsync`, `countEdgesByTypeAsync`, `nodesByTypePagedAsync`, `edgesByTypePagedAsync`, `getNodesByTypePagedAsync`, `getEdgesByTypePagedAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
+**Available async methods:** `closeAsync`, `ensureNodeLabelAsync`, `ensureEdgeLabelAsync`, `getNodeLabelIdAsync`, `getEdgeLabelIdAsync`, `getNodeLabelAsync`, `getEdgeLabelAsync`, `listNodeLabelsAsync`, `listEdgeLabelsAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `addNodeLabelAsync`, `removeNodeLabelAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `batchUpsertNodesBinaryAsync`, `batchUpsertEdgesBinaryAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `beginWriteTxnAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `ensureNodePropertyIndexAsync`, `dropNodePropertyIndexAsync`, `listNodePropertyIndexesAsync`, `ensureEdgePropertyIndexAsync`, `dropEdgePropertyIndexAsync`, `listEdgePropertyIndexesAsync`, `findNodesRangeAsync`, `findNodesRangePagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByLabelsAsync`, `edgesByLabelAsync`, `getNodesByLabelsAsync`, `getEdgesByLabelAsync`, `countNodesByLabelsAsync`, `countEdgesByLabelAsync`, `nodesByLabelsPagedAsync`, `edgesByLabelPagedAsync`, `getNodesByLabelsPagedAsync`, `getEdgesByLabelPagedAsync`, `queryNodeIdsAsync`, `queryNodesAsync`, `queryEdgeIdsAsync`, `queryEdgesAsync`, `queryPatternAsync`, `explainNodeQueryAsync`, `explainEdgeQueryAsync`, `explainPatternQueryAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
 
 `WriteTxn` handles expose async counterparts for the full transaction surface: `upsertNodeAsync`, `upsertNodeAsAsync`, `upsertEdgeAsync`, `upsertEdgeAsAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `stageAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `commitAsync`, and `rollbackAsync`. Async transaction operations on one handle execute in call order.
 
 ### Python
 
-The `AsyncOverGraph` class wraps every `OverGraph` method with `asyncio.to_thread()`. `begin_write_txn()` returns an `AsyncWriteTxn` whose methods mirror `PyWriteTxn`:
+The `AsyncOverGraph` class wraps every `OverGraph` method with `asyncio.to_thread()`. `begin_write_txn()` returns an `AsyncWriteTxn` whose methods mirror `WriteTxn`:
 
 ```python
 from overgraph import AsyncOverGraph
 
 async def main():
     async with await AsyncOverGraph.open("./my-graph") as db:
-        node_id = await db.upsert_node(1, "alice")
+        # Also accepts multiple labels: ["User", "Admin"]
+        node_id = await db.upsert_node("User", "alice")
         node = await db.get_node(node_id)
         neighbors = await db.neighbors(node_id)
 
@@ -4063,35 +5176,51 @@ asyncio.run(main())
 | | `stats` | Runtime statistics |
 | **Nodes** | `upsert_node` | Create or update node |
 | | `get_node` | Get node by ID |
-| | `get_node_by_key` | Get node by type + key |
+| | `get_node_by_key` | Get node by label + key |
+| | `add_node_label` | Add a node label to an existing node |
+| | `remove_node_label` | Remove a node label from an existing node |
 | | `delete_node` | Delete node (cascade edges) |
 | | `batch_upsert_nodes` | Batch create/update nodes |
 | | `get_nodes` | Batch get nodes by ID |
-| | `get_nodes_by_keys` | Batch get nodes by type + key |
+| | `get_nodes_by_keys` | Batch get nodes by label + key |
 | **Edges** | `upsert_edge` | Create or update edge |
 | | `get_edge` | Get edge by ID |
-| | `get_edge_by_triple` | Get edge by from + to + type |
+| | `get_edge_by_triple` | Get edge by from + to + edge label |
 | | `delete_edge` | Delete edge |
 | | `invalidate_edge` | Close validity window |
 | | `batch_upsert_edges` | Batch create/update edges |
 | | `get_edges` | Batch get edges by ID |
 | **Atomic** | `graph_patch` | Multi-op atomic batch |
 | | `begin_write_txn` / `beginWriteTxn` | Explicit ordered write transaction |
-| **Type-Based Queries** | `nodes_by_type` | All node IDs of a type |
-| | `edges_by_type` | All edge IDs of a type |
-| | `get_nodes_by_type` | All node records of a type |
-| | `get_edges_by_type` | All edge records of a type |
-| | `count_nodes_by_type` | Count nodes of a type |
-| | `count_edges_by_type` | Count edges of a type |
-| **Property Indexes** | `ensure_node_property_index` | Declare optional equality or range index |
-| | `drop_node_property_index` | Remove optional property index declaration |
-| | `list_node_property_indexes` | Inspect declaration state |
+| **Catalog** | `ensure_node_label` / `ensureNodeLabel` | Ensure node label token |
+| | `ensure_edge_label` / `ensureEdgeLabel` | Ensure edge label token |
+| | `get_node_label_id` / `getNodeLabelId` | Diagnostic name-to-ID lookup |
+| | `get_edge_label_id` / `getEdgeLabelId` | Diagnostic name-to-ID lookup |
+| | `get_node_label` / `getNodeLabel` | Diagnostic ID-to-name lookup |
+| | `get_edge_label` / `getEdgeLabel` | Diagnostic ID-to-name lookup |
+| | `list_node_labels` / `listNodeLabels` | List node-label catalog entries |
+| | `list_edge_labels` / `listEdgeLabels` | List edge-label catalog entries |
+| **Label and Edge-Label Queries** | `nodes_by_labels` | Node ID convenience query |
+| | `edges_by_label` | All edge IDs of an edge label |
+| | `get_nodes_by_labels` | Hydrated node convenience query |
+| | `get_edges_by_label` | All edge records of an edge label |
+| | `count_nodes_by_labels` | Node count convenience query |
+| | `count_edges_by_label` | Count edges of an edge label |
+| **Property Indexes** | `ensure_node_property_index` | Declare optional node equality or range index |
+| | `drop_node_property_index` | Remove optional node property index declaration |
+| | `list_node_property_indexes` | Inspect node declaration state |
+| | `ensure_edge_property_index` | Declare optional edge equality or range index |
+| | `drop_edge_property_index` | Remove optional edge property index declaration |
+| | `list_edge_property_indexes` | Inspect edge declaration state |
 | **Property & Time Queries** | `find_nodes` | Property search |
 | | `find_nodes_range` | Numeric property range search |
 | | `find_nodes_by_time_range` | Time range search |
 | **Queries** | `query_node_ids` | Node query returning IDs |
 | | `query_nodes` | Node query returning hydrated nodes |
 | | `explain_node_query` | Explain a node query plan |
+| | `query_edge_ids` | Edge query returning IDs |
+| | `query_edges` | Edge query returning hydrated edges |
+| | `explain_edge_query` | Explain an edge query plan |
 | | `query_pattern` | Bounded graph pattern query |
 | | `explain_pattern_query` | Explain a graph pattern plan |
 | **Pagination** | `*_paged` | Paginated variants |
@@ -4123,5 +5252,13 @@ asyncio.run(main())
 | | `compact_with_progress` | Merge with progress |
 | | `ingest_mode` | Enter bulk mode |
 | | `end_ingest` | Exit bulk mode + compact |
-| **Binary** | `batch_upsert_nodes_binary` | Binary batch nodes |
-| | `batch_upsert_edges_binary` | Binary batch edges |
+| | `scrub` | Validate database integrity |
+| **Introspection** | `path` | Database directory path |
+| | `manifest` | Rust raw manifest diagnostics |
+| | `next_node_id` | Rust next node ID diagnostic |
+| | `next_edge_id` | Rust next edge ID diagnostic |
+| | `segment_tombstone_node_count` | Rust segment node tombstone diagnostic |
+| | `segment_tombstone_edge_count` | Rust segment edge tombstone diagnostic |
+| | `manifest::load_manifest_readonly` | Rust read-only manifest diagnostic |
+| **Binary** | `batch_upsert_nodes_binary` | Connector-only binary batch nodes |
+| | `batch_upsert_edges_binary` | Connector-only binary batch edges |

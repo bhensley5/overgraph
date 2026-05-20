@@ -40,7 +40,7 @@ def run_bench(fn, warmup: int, iters: int) -> dict[str, float]:
 
 def txn_ops(batch: int, node_count: int, edge_count: int) -> list[dict]:
     ops = [
-        {"op": "upsert_node", "alias": f"n{i}", "type_id": 1, "key": f"txn:{batch}:n:{i}"}
+        {"op": "upsert_node", "alias": f"n{i}", "label": "Person", "key": f"txn:{batch}:n:{i}"}
         for i in range(node_count)
     ]
     ops.extend(
@@ -49,7 +49,7 @@ def txn_ops(batch: int, node_count: int, edge_count: int) -> list[dict]:
             "alias": f"e{i}",
             "from": {"local": f"n{i % node_count}"},
             "to": {"local": f"n{(i + 1) % node_count}"},
-            "type_id": 7,
+            "label": "WORKS_AT",
         }
         for i in range(edge_count)
     )
@@ -107,10 +107,10 @@ def commit_ops(db: OverGraph, i: int, nodes: int, edges: int) -> None:
 
 
 def conflict(db: OverGraph, i: int) -> None:
-    db.upsert_node(9, "conflict", props={"i": i})
+    db.upsert_node("Person", "conflict", props={"i": i})
     txn = db.begin_write_txn()
-    txn.upsert_node(9, "conflict", props={"txn": i})
-    db.upsert_node(9, "conflict", props={"other": i})
+    txn.upsert_node("Person", "conflict", props={"txn": i})
+    db.upsert_node("Person", "conflict", props={"other": i})
     try:
         txn.commit()
         raise AssertionError("expected conflict")

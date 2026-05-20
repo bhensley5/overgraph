@@ -27,14 +27,14 @@ describe('neighbors, decay_lambda', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-decay-'));
     db = freshDb(tmpDir, 'decay');
 
-    center = db.upsertNode(1, 'center');
-    spoke1 = db.upsertNode(1, 'spoke1');
-    spoke2 = db.upsertNode(1, 'spoke2');
+    center = db.upsertNode('Person', 'center');
+    spoke1 = db.upsertNode('Person', 'spoke1');
+    spoke2 = db.upsertNode('Person', 'spoke2');
 
     // spoke1: recent edge (1 hour old)
-    db.upsertEdge(center, spoke1, 10, { weight: 1.0, validFrom: recentFrom });
+    db.upsertEdge(center, spoke1, 'WORKS_AT', { weight: 1.0, validFrom: recentFrom });
     // spoke2: old edge (100 hours old)
-    db.upsertEdge(center, spoke2, 10, { weight: 1.0, validFrom: oldFrom });
+    db.upsertEdge(center, spoke2, 'WORKS_AT', { weight: 1.0, validFrom: oldFrom });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -78,14 +78,14 @@ describe('neighbors, at_epoch temporal filtering', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-epoch-'));
     db = freshDb(tmpDir, 'epoch');
 
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
 
     // A->B valid [1000, 5000)
-    db.upsertEdge(a, b, 10, { weight: 1.0, validFrom: 1000, validTo: 5000 });
+    db.upsertEdge(a, b, 'WORKS_AT', { weight: 1.0, validFrom: 1000, validTo: 5000 });
     // A->C valid [3000, 9000)
-    db.upsertEdge(a, c, 10, { weight: 1.0, validFrom: 3000, validTo: 9000 });
+    db.upsertEdge(a, c, 'WORKS_AT', { weight: 1.0, validFrom: 3000, validTo: 9000 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -129,8 +129,8 @@ describe('prune, maxAgeMs', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('maxAgeMs prunes nodes older than the threshold', async () => {
-    const id1 = db.upsertNode(1, 'age-a', { weight: 1.0 });
-    const id2 = db.upsertNode(1, 'age-b', { weight: 1.0 });
+    const id1 = db.upsertNode('Person', 'age-a', { weight: 1.0 });
+    const id2 = db.upsertNode('Person', 'age-b', { weight: 1.0 });
 
     // Wait so nodes are clearly older than the threshold
     await sleep(50);
@@ -142,8 +142,8 @@ describe('prune, maxAgeMs', () => {
   });
 
   it('maxAgeMs=999999999 keeps everything (nothing is that old)', () => {
-    const id1 = db.upsertNode(1, 'age-c', { weight: 1.0 });
-    const id2 = db.upsertNode(1, 'age-d', { weight: 1.0 });
+    const id1 = db.upsertNode('Person', 'age-c', { weight: 1.0 });
+    const id2 = db.upsertNode('Person', 'age-d', { weight: 1.0 });
 
     const result = db.prune({ maxAgeMs: 999999999 });
     assert.equal(result.nodesPruned, 0);
@@ -167,9 +167,9 @@ describe('prune, combined maxAgeMs AND maxWeight', () => {
 
   it('only prunes nodes matching BOTH criteria', async () => {
     // Low weight node (matches weight criterion)
-    const lowWeight = db.upsertNode(1, 'low-w', { weight: 0.1 });
+    const lowWeight = db.upsertNode('Person', 'low-w', { weight: 0.1 });
     // High weight node (does not match weight criterion)
-    const highWeight = db.upsertNode(1, 'high-w', { weight: 0.9 });
+    const highWeight = db.upsertNode('Person', 'high-w', { weight: 0.9 });
 
     // Wait so nodes are old enough
     await sleep(50);
@@ -185,7 +185,7 @@ describe('prune, combined maxAgeMs AND maxWeight', () => {
   });
 
   it('very large maxAgeMs prevents pruning even when weight matches', () => {
-    const node = db.upsertNode(1, 'combo-safe', { weight: 0.1 });
+    const node = db.upsertNode('Person', 'combo-safe', { weight: 0.1 });
 
     // Weight criterion matches (0.1 <= 0.5), but maxAgeMs is huge so node is too young
     const result = db.prune({ maxAgeMs: 999999999999, maxWeight: 0.5 });
@@ -207,13 +207,13 @@ describe('batchUpsertNodesBinary, format errors', () => {
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('throws on truncated buffer (less than 4 bytes for count)', () => {
+  it('throws on truncated binary header', () => {
     assert.throws(
       () => db.batchUpsertNodesBinary(Buffer.alloc(2)),
     );
   });
 
-  it('throws on absurd count header', () => {
+  it('throws on invalid binary magic header', () => {
     assert.throws(
       () => db.batchUpsertNodesBinary(Buffer.from([0xff, 0xff, 0xff, 0x7f])),
     );
@@ -232,11 +232,11 @@ describe('personalizedPagerank, dampingFactor edge cases', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-ppr-damp-'));
     db = freshDb(tmpDir, 'ppr-damp');
 
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 1, { weight: 1.0 });
-    db.upsertEdge(b, c, 1, { weight: 1.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'LINKS_TO', { weight: 1.0 });
+    db.upsertEdge(b, c, 'LINKS_TO', { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -312,27 +312,27 @@ describe('personalizedPagerank, dampingFactor edge cases', () => {
 // 7. Pagination cursor tampering
 // =============================================================================
 
-describe('nodesByTypePaged, cursor edge cases', () => {
+describe('nodesByLabelsPaged, cursor edge cases', () => {
   let tmpDir, db;
 
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-cursor-'));
     db = freshDb(tmpDir, 'cursor');
     for (let i = 0; i < 10; i++) {
-      db.upsertNode(1, `node-${i}`);
+      db.upsertNode('Person', `node-${i}`);
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('cursor past all IDs returns empty result', () => {
-    const page = db.nodesByTypePaged(1, 3, 999999999);
+    const page = db.nodesByLabelsPaged('Person', 3, 999999999);
     assert.equal(page.items.length, 0);
     assert.equal(page.nextCursor, undefined);
   });
 
   it('cursor=0 works like no cursor (returns first page)', () => {
-    const pageNoCursor = db.nodesByTypePaged(1, 3);
-    const pageCursor0 = db.nodesByTypePaged(1, 3, 0);
+    const pageNoCursor = db.nodesByLabelsPaged('Person', 3);
+    const pageCursor0 = db.nodesByLabelsPaged('Person', 3, 0);
 
     assert.equal(pageCursor0.items.length, pageNoCursor.items.length);
     // Both should return the same set of IDs
@@ -353,8 +353,8 @@ describe('self-loops', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-selfloop-'));
     db = freshDb(tmpDir, 'selfloop');
-    a = db.upsertNode(1, 'self');
-    db.upsertEdge(a, a, 10, { weight: 1.0 });
+    a = db.upsertNode('Person', 'self');
+    db.upsertEdge(a, a, 'WORKS_AT', { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -394,7 +394,7 @@ describe('concurrent async stress', () => {
   it('50 parallel upsertNodeAsync calls all succeed', async () => {
     const promises = [];
     for (let i = 0; i < 50; i++) {
-      promises.push(db.upsertNodeAsync(1, `stress-${i}`, { props: { idx: i } }));
+      promises.push(db.upsertNodeAsync('Person', `stress-${i}`, { props: { idx: i } }));
     }
     const ids = await Promise.all(promises);
 
@@ -413,7 +413,7 @@ describe('concurrent async stress', () => {
     for (const id of ids) {
       const node = db.getNode(id);
       assert.ok(node, `node ${id} should be retrievable`);
-      assert.equal(node.typeId, 1);
+      assert.ok(node.labels.includes('Person'));
     }
   });
 });

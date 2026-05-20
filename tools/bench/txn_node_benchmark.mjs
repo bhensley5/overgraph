@@ -33,7 +33,7 @@ function runBench(fn, warmup, iters) {
 function txnOps(batch, nodeCount, edgeCount) {
   const ops = [];
   for (let i = 0; i < nodeCount; i++) {
-    ops.push({ op: 'upsertNode', alias: `n${i}`, typeId: 1, key: `txn:${batch}:n:${i}` });
+    ops.push({ op: 'upsertNode', alias: `n${i}`, label: 'Person', key: `txn:${batch}:n:${i}` });
   }
   for (let i = 0; i < edgeCount; i++) {
     ops.push({
@@ -41,7 +41,7 @@ function txnOps(batch, nodeCount, edgeCount) {
       alias: `e${i}`,
       from: { local: `n${i % nodeCount}` },
       to: { local: `n${(i + 1) % nodeCount}` },
-      typeId: 7,
+      label: 'WORKS_AT',
     });
   }
   return ops;
@@ -72,10 +72,10 @@ function main() {
     scenarios.push({
       scenario_id: 'S-TXN-002',
       stats: runBench((i) => {
-        db.upsertNode(9, 'conflict', { props: { i } });
+        db.upsertNode('Person', 'conflict', { props: { i } });
         const txn = db.beginWriteTxn();
-        txn.upsertNode(9, 'conflict', { props: { txn: i } });
-        db.upsertNode(9, 'conflict', { props: { other: i } });
+        txn.upsertNode('Person', 'conflict', { props: { txn: i } });
+        db.upsertNode('Person', 'conflict', { props: { other: i } });
         try {
           txn.commit();
           throw new Error('expected conflict');

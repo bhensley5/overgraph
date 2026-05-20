@@ -1,13 +1,22 @@
 // Lifecycle tests: open/close, WAL, flush, compaction, restart, group commit, backpressure.
 
-type LegacyNode = (u64, u32, Vec<(String, PropValue)>);
+fn lifecycle_filter_names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
+}
+
+fn lifecycle_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFilter {
+    NodeLabelFilter {
+        labels: lifecycle_filter_names(names),
+        mode,
+    }
+}
 
 fn traverse_depth_two(
     engine: &DatabaseEngine,
     start: u64,
     direction: Direction,
-    edge_type_filter: Option<&[u32]>,
-    node_type_filter: Option<&[u32]>,
+    edge_label_filter: Option<&[&str]>,
+    node_label_filter: Option<&[&str]>,
     limit: usize,
     at_epoch: Option<i64>,
 ) -> Vec<TraversalHit> {
@@ -18,8 +27,9 @@ fn traverse_depth_two(
             &TraverseOptions {
                 min_depth: 2,
                 direction,
-                edge_type_filter: edge_type_filter.map(|s| s.to_vec()),
-                node_type_filter: node_type_filter.map(|s| s.to_vec()),
+                edge_label_filter: edge_label_filter.map(lifecycle_filter_names),
+                emit_node_label_filter: node_label_filter
+                    .map(|labels| lifecycle_node_label_filter(labels, LabelMatchMode::Any)),
                 at_epoch,
                 decay_lambda: None,
                 limit: (limit > 0).then_some(limit),
@@ -52,6 +62,34 @@ fn wait_for_property_index_state(
             index_id,
             expected_state,
             engine.list_node_property_indexes().unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_edge_property_index_state(
+    engine: &DatabaseEngine,
+    index_id: u64,
+    expected_state: SecondaryIndexState,
+) -> EdgePropertyIndexInfo {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(info) = engine
+            .list_edge_property_indexes()
+            .unwrap()
+            .into_iter()
+            .find(|info| info.index_id == index_id)
+        {
+            if info.state == expected_state {
+                return info;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for edge property index {} to reach {:?}; current indexes: {:?}",
+            index_id,
+            expected_state,
+            engine.list_edge_property_indexes().unwrap()
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -94,17 +132,269 @@ fn wait_for_published_property_index_state(
 fn corrupt_sidecar_header_in_place(path: &std::path::Path) {
     use std::io::{Seek, SeekFrom, Write};
 
+    let payload_offset = component_payload_offset_for_test(path);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .unwrap();
     assert!(
-        file.metadata().unwrap().len() >= 8,
+        file.metadata().unwrap().len() >= payload_offset + 8,
         "sidecar must be large enough for an in-place header corruption"
     );
-    file.seek(SeekFrom::Start(0)).unwrap();
+    file.seek(SeekFrom::Start(payload_offset)).unwrap();
     file.write_all(&1_000_000u64.to_le_bytes()).unwrap();
     file.sync_all().unwrap();
+}
+
+fn component_payload_offset_for_test(path: &std::path::Path) -> u64 {
+    let data = std::fs::read(path).unwrap();
+    if data.len() >= crate::segment_components::COMPONENT_IDENTITY_HEADER_LEN
+        && data[0..crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC.len()]
+            == crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC
+    {
+        crate::segment_components::decode_identity_header(&data)
+            .unwrap()
+            .payload_offset
+    } else {
+        0
+    }
+}
+
+fn corrupt_equality_sidecar_tail_group_order_in_place(path: &std::path::Path, value_hash: u64) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    const SECONDARY_EQ_ENTRY_SIZE: usize = 20;
+    let data = std::fs::read(path).unwrap();
+    let payload_offset = component_payload_offset_for_test(path) as usize;
+    let payload = &data[payload_offset..];
+    assert!(payload.len() >= 8, "equality sidecar payload missing count");
+    let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+    let index_bytes = 8 + count * SECONDARY_EQ_ENTRY_SIZE;
+    assert!(
+        payload.len() >= index_bytes,
+        "equality sidecar payload missing index"
+    );
+
+    for index in 0..count {
+        let entry_off = 8 + index * SECONDARY_EQ_ENTRY_SIZE;
+        let entry_value_hash =
+            u64::from_le_bytes(payload[entry_off..entry_off + 8].try_into().unwrap());
+        if entry_value_hash != value_hash {
+            continue;
+        }
+        let group_offset =
+            u64::from_le_bytes(payload[entry_off + 8..entry_off + 16].try_into().unwrap())
+                as usize;
+        let id_count =
+            u32::from_le_bytes(payload[entry_off + 16..entry_off + 20].try_into().unwrap())
+                as usize;
+        assert!(
+            id_count >= 2,
+            "target equality sidecar group must have at least two IDs"
+        );
+        assert!(
+            payload.len() >= group_offset + 16,
+            "target equality sidecar group missing first two IDs"
+        );
+        let first = u64::from_le_bytes(payload[group_offset..group_offset + 8].try_into().unwrap());
+        let second =
+            u64::from_le_bytes(payload[group_offset + 8..group_offset + 16].try_into().unwrap());
+        assert!(
+            first < second,
+            "test setup expects initially sorted equality postings"
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start((payload_offset + group_offset) as u64))
+            .unwrap();
+        file.write_all(&second.to_le_bytes()).unwrap();
+        file.write_all(&first.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+        return;
+    }
+
+    panic!("target equality sidecar group hash {value_hash} not found");
+}
+
+fn corrupt_range_sidecar_tail_sort_order_in_place(path: &std::path::Path) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    const SECONDARY_RANGE_ENTRY_SIZE: usize = 16;
+    let data = std::fs::read(path).unwrap();
+    let payload_offset = component_payload_offset_for_test(path) as usize;
+    let payload = &data[payload_offset..];
+    assert!(payload.len() >= 8, "range sidecar payload missing count");
+    let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+    assert!(
+        count >= 3,
+        "range sidecar test needs at least three entries to corrupt an unqueried tail"
+    );
+    let index_bytes = 8 + count * SECONDARY_RANGE_ENTRY_SIZE;
+    assert!(
+        payload.len() >= index_bytes,
+        "range sidecar payload missing fixed entries"
+    );
+    let previous_off = 8 + (count - 2) * SECONDARY_RANGE_ENTRY_SIZE;
+    let tail_off = 8 + (count - 1) * SECONDARY_RANGE_ENTRY_SIZE;
+    let previous_encoded =
+        u64::from_le_bytes(payload[previous_off..previous_off + 8].try_into().unwrap());
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.seek(SeekFrom::Start((payload_offset + tail_off) as u64))
+        .unwrap();
+    file.write_all(&previous_encoded.to_le_bytes()).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn component_payload_from_bytes_for_test(data: Vec<u8>) -> Vec<u8> {
+    if data.len() >= crate::segment_components::COMPONENT_IDENTITY_HEADER_LEN
+        && data[0..crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC.len()]
+            == crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC
+    {
+        let header = crate::segment_components::decode_identity_header(&data).unwrap();
+        let start = header.payload_offset as usize;
+        let end = start + header.payload_len as usize;
+        return data[start..end].to_vec();
+    }
+    data
+}
+
+fn try_read_manifest_component_payload_for_test(
+    seg_dir: &std::path::Path,
+    kind: SegmentComponentKind,
+) -> Option<Vec<u8>> {
+    let manifest = read_component_manifest_for_test(seg_dir);
+    let record = manifest
+        .components
+        .iter()
+        .find(|record| record.kind == kind)?;
+    match &record.handle {
+        crate::segment_components::ComponentHandleV1::ExternalFile { relative_path, .. } => {
+            let data = std::fs::read(seg_dir.join(relative_path)).unwrap();
+            Some(component_payload_from_bytes_for_test(data))
+        }
+        crate::segment_components::ComponentHandleV1::PackedRange { offset, len, .. } => {
+            let core = std::fs::read(seg_dir.join(crate::segment_components::PACKED_CORE_FILENAME))
+                .unwrap();
+            let core_payload = component_payload_from_bytes_for_test(core);
+            let start = *offset as usize;
+            let end = start + *len as usize;
+            Some(core_payload[start..end].to_vec())
+        }
+    }
+}
+
+fn read_external_component_payload_for_test(path: &std::path::Path) -> Vec<u8> {
+    let data = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {}", path.display(), error));
+    component_payload_from_bytes_for_test(data)
+}
+
+fn read_manifest_component_payload_for_test(
+    seg_dir: &std::path::Path,
+    kind: SegmentComponentKind,
+) -> Vec<u8> {
+    let missing_kind = kind.clone();
+    try_read_manifest_component_payload_for_test(seg_dir, kind)
+        .unwrap_or_else(|| panic!("missing component payload {:?}", missing_kind))
+}
+
+fn read_component_manifest_for_test(
+    seg_dir: &std::path::Path,
+) -> crate::segment_components::SegmentComponentManifestV1 {
+    let data =
+        std::fs::read(seg_dir.join(crate::segment_components::SEGMENT_COMPONENT_MANIFEST_FILENAME))
+            .unwrap();
+    crate::segment_components::decode_manifest_envelope(&data).unwrap()
+}
+
+#[derive(Debug, Clone)]
+struct PackedCoreSnapshot {
+    bytes: Vec<u8>,
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
+fn packed_core_snapshot_for_test(seg_dir: &std::path::Path) -> PackedCoreSnapshot {
+    let path = seg_dir.join(crate::segment_components::PACKED_CORE_FILENAME);
+    let metadata = std::fs::metadata(&path)
+        .unwrap_or_else(|error| panic!("failed to stat {}: {}", path.display(), error));
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {}", path.display(), error));
+    assert_eq!(
+        metadata.len(),
+        bytes.len() as u64,
+        "segment.core metadata length should match bytes read"
+    );
+    PackedCoreSnapshot {
+        bytes,
+        len: metadata.len(),
+        modified: metadata.modified().expect("segment.core modified time"),
+    }
+}
+
+fn assert_packed_core_unchanged_for_test(
+    seg_dir: &std::path::Path,
+    before: &PackedCoreSnapshot,
+    label: &str,
+) {
+    let after = packed_core_snapshot_for_test(seg_dir);
+    assert_eq!(after.len, before.len, "{label} changed segment.core length");
+    assert_eq!(
+        after.modified, before.modified,
+        "{label} changed segment.core mtime"
+    );
+    assert_eq!(
+        after.bytes, before.bytes,
+        "{label} changed segment.core bytes"
+    );
+}
+
+fn assert_no_legacy_property_components(seg_dir: &std::path::Path) {
+    let manifest = read_component_manifest_for_test(seg_dir);
+    assert!(manifest.components.iter().all(|record| {
+        !matches!(
+            record.kind,
+            SegmentComponentKind::LegacyNodePropertyIndex
+                | SegmentComponentKind::NodePropertyHashMetadata
+        )
+    }));
+}
+
+fn read_u64_le_for_test(data: &[u8], offset: usize, label: &str) -> u64 {
+    let end = offset
+        .checked_add(8)
+        .unwrap_or_else(|| panic!("{label} u64 offset overflow at {offset}"));
+    let bytes = data
+        .get(offset..end)
+        .unwrap_or_else(|| panic!("{label} missing u64 at [{offset}, {end})"));
+    u64::from_le_bytes(bytes.try_into().unwrap())
+}
+
+fn read_u32_le_for_test(data: &[u8], offset: usize, label: &str) -> u32 {
+    let end = offset
+        .checked_add(4)
+        .unwrap_or_else(|| panic!("{label} u32 offset overflow at {offset}"));
+    let bytes = data
+        .get(offset..end)
+        .unwrap_or_else(|| panic!("{label} missing u32 at [{offset}, {end})"));
+    u32::from_le_bytes(bytes.try_into().unwrap())
+}
+
+fn read_u16_le_for_test(data: &[u8], offset: usize, label: &str) -> u16 {
+    let end = offset
+        .checked_add(2)
+        .unwrap_or_else(|| panic!("{label} u16 offset overflow at {offset}"));
+    let bytes = data
+        .get(offset..end)
+        .unwrap_or_else(|| panic!("{label} missing u16 at [{offset}, {end})"));
+    u16::from_le_bytes(bytes.try_into().unwrap())
 }
 
 fn wait_for_pending_secondary_index_followup_count(
@@ -137,71 +427,6 @@ fn wait_for_path_absent(path: &std::path::Path) {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-}
-
-fn install_legacy_property_hash_sidecars(
-    seg_dir: &std::path::Path,
-    nodes: &[LegacyNode],
-) {
-    const LEGACY_NODE_META_ENTRY_SIZE: usize = 60;
-    const LEGACY_PROP_INDEX_ENTRY_SIZE: usize = 32;
-
-    let mut sorted_nodes = nodes.to_vec();
-    sorted_nodes.sort_unstable_by_key(|(node_id, _, _)| *node_id);
-
-    let mut node_meta = std::fs::read(seg_dir.join("node_meta.dat")).unwrap();
-    let node_count = u64::from_le_bytes(node_meta[0..8].try_into().unwrap()) as usize;
-    assert_eq!(node_count, sorted_nodes.len());
-
-    let mut prop_hash_bytes = Vec::new();
-    let mut prop_hash_offset = 0u64;
-    let mut prop_groups: BTreeMap<(u32, u64, u64), Vec<u64>> = BTreeMap::new();
-
-    for (index, (node_id, type_id, props)) in sorted_nodes.iter().enumerate() {
-        let entry_off = 8 + index * LEGACY_NODE_META_ENTRY_SIZE;
-        let prop_hash_count = props.len() as u32;
-        node_meta[entry_off + 38..entry_off + 46].copy_from_slice(&prop_hash_offset.to_le_bytes());
-        node_meta[entry_off + 46..entry_off + 50].copy_from_slice(&prop_hash_count.to_le_bytes());
-
-        for (key, value) in props {
-            let key_hash = hash_prop_key(key);
-            let value_hash = hash_prop_value(value);
-            prop_hash_bytes.extend_from_slice(&key_hash.to_le_bytes());
-            prop_hash_bytes.extend_from_slice(&value_hash.to_le_bytes());
-            prop_groups
-                .entry((*type_id, key_hash, value_hash))
-                .or_default()
-                .push(*node_id);
-            prop_hash_offset += 16;
-        }
-    }
-
-    for ids in prop_groups.values_mut() {
-        ids.sort_unstable();
-        ids.dedup();
-    }
-
-    std::fs::write(seg_dir.join("node_meta.dat"), node_meta).unwrap();
-    std::fs::write(seg_dir.join("node_prop_hashes.dat"), prop_hash_bytes).unwrap();
-
-    let mut prop_index = Vec::new();
-    prop_index.extend_from_slice(&(prop_groups.len() as u64).to_le_bytes());
-    let data_start = 8 + prop_groups.len() as u64 * LEGACY_PROP_INDEX_ENTRY_SIZE as u64;
-    let mut data_offset = data_start;
-    for ((type_id, key_hash, value_hash), ids) in &prop_groups {
-        prop_index.extend_from_slice(&type_id.to_le_bytes());
-        prop_index.extend_from_slice(&key_hash.to_le_bytes());
-        prop_index.extend_from_slice(&value_hash.to_le_bytes());
-        prop_index.extend_from_slice(&data_offset.to_le_bytes());
-        prop_index.extend_from_slice(&(ids.len() as u32).to_le_bytes());
-        data_offset += ids.len() as u64 * 8;
-    }
-    for ids in prop_groups.values() {
-        for node_id in ids {
-            prop_index.extend_from_slice(&node_id.to_le_bytes());
-        }
-    }
-    std::fs::write(seg_dir.join("prop_index.dat"), prop_index).unwrap();
 }
 
 // --- Low-level write_op API tests ---
@@ -301,9 +526,18 @@ fn test_open_canonicalizes_vector_payloads_from_wal_replay() {
     let mut writer = WalWriter::open_generation(&db_path, 0).unwrap();
     writer
         .append(
+            &WalOp::EnsureNodeLabel {
+                label: "Person".to_string(),
+                label_id: 1,
+            },
+            1,
+        )
+        .unwrap();
+    writer
+        .append(
             &WalOp::UpsertNode(NodeRecord {
                 id: 7,
-                type_id: 1,
+                label_ids: NodeLabelSet::single(1).unwrap(),
                 key: "manual-vector".to_string(),
                 props: BTreeMap::new(),
                 created_at: 100,
@@ -313,7 +547,7 @@ fn test_open_canonicalizes_vector_payloads_from_wal_replay() {
                 sparse_vector: Some(vec![(4, 0.25), (2, 2.0), (4, 0.5), (7, 0.0)]),
                 last_write_seq: 0,
             }),
-            1,
+            2,
         )
         .unwrap();
     writer.sync().unwrap();
@@ -327,7 +561,7 @@ fn test_open_canonicalizes_vector_payloads_from_wal_replay() {
 }
 
 #[test]
-fn test_open_rejects_compacted_dense_segment_missing_hnsw_graph() {
+fn test_open_tolerates_compacted_dense_segment_missing_hnsw_graph() {
     let dir = TempDir::new().unwrap();
     let opts = DbOptions {
         compact_after_n_flushes: 0,
@@ -342,7 +576,7 @@ fn test_open_rejects_compacted_dense_segment_missing_hnsw_graph() {
 
     engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -354,7 +588,7 @@ fn test_open_rejects_compacted_dense_segment_missing_hnsw_graph() {
     engine.flush().unwrap();
     engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -372,11 +606,9 @@ fn test_open_rejects_compacted_dense_segment_missing_hnsw_graph() {
     let seg_dir = crate::segment_writer::segment_dir(dir.path(), seg_id);
     std::fs::remove_file(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap();
 
-    match DatabaseEngine::open(dir.path(), &opts) {
-        Err(EngineError::CorruptRecord(_)) => {}
-        Err(other) => panic!("expected CorruptRecord, got {}", other),
-        Ok(_) => panic!("expected reopen to fail for missing dense HNSW graph"),
-    }
+    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    assert!(reopened.get_node_by_key("Person", "b").unwrap().is_some());
+    reopened.close().unwrap();
 }
 
 #[test]
@@ -395,7 +627,7 @@ fn test_open_rejects_compacted_dense_segment_truncated_vector_blob() {
 
     engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -407,7 +639,7 @@ fn test_open_rejects_compacted_dense_segment_truncated_vector_blob() {
     engine.flush().unwrap();
     engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -423,10 +655,29 @@ fn test_open_rejects_compacted_dense_segment_truncated_vector_blob() {
     drop(engine);
 
     let seg_dir = crate::segment_writer::segment_dir(dir.path(), seg_id);
-    let dense_blob_path = seg_dir.join(crate::segment_writer::NODE_DENSE_VECTOR_BLOB_FILENAME);
-    let mut dense_blob = std::fs::read(&dense_blob_path).unwrap();
-    dense_blob.truncate(dense_blob.len() - 4);
-    std::fs::write(&dense_blob_path, dense_blob).unwrap();
+    let manifest = read_component_manifest_for_test(&seg_dir);
+    let record = manifest
+        .components
+        .iter()
+        .find(|record| record.kind == SegmentComponentKind::NodeDenseVectorBlob)
+        .expect("dense vector blob component should exist");
+    let crate::segment_components::ComponentHandleV1::PackedRange { offset, len, .. } =
+        &record.handle
+    else {
+        panic!("compacted dense vector source truth should be packed");
+    };
+    assert!(*len >= 4);
+    let core_path = seg_dir.join(crate::segment_components::PACKED_CORE_FILENAME);
+    let truncated_payload_len = *offset + *len - 4;
+    let truncated_file_len = crate::segment_components::COMPONENT_IDENTITY_HEADER_LEN as u64
+        + truncated_payload_len;
+    assert!(truncated_file_len < std::fs::metadata(&core_path).unwrap().len());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&core_path)
+        .unwrap()
+        .set_len(truncated_file_len)
+        .unwrap();
 
     match DatabaseEngine::open(dir.path(), &opts) {
         Err(EngineError::CorruptRecord(_)) => {}
@@ -436,7 +687,7 @@ fn test_open_rejects_compacted_dense_segment_truncated_vector_blob() {
 }
 
 #[test]
-fn test_open_rejects_standard_compacted_dense_segment_missing_hnsw_graph() {
+fn test_open_tolerates_standard_compacted_dense_segment_missing_hnsw_graph() {
     let dir = TempDir::new().unwrap();
     let opts = DbOptions {
         compact_after_n_flushes: 0,
@@ -451,7 +702,7 @@ fn test_open_rejects_standard_compacted_dense_segment_missing_hnsw_graph() {
 
     let node_id = engine
         .upsert_node(
-            1,
+            "Person",
             "shared",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -463,7 +714,7 @@ fn test_open_rejects_standard_compacted_dense_segment_missing_hnsw_graph() {
     engine.flush().unwrap();
     engine
         .upsert_node(
-            1,
+            "Person",
             "shared",
             UpsertNodeOptions {
                 weight: 0.75,
@@ -476,7 +727,7 @@ fn test_open_rejects_standard_compacted_dense_segment_missing_hnsw_graph() {
 
     assert_eq!(
         node_id,
-        engine.get_node_by_key(1, "shared").unwrap().unwrap().id
+        engine.get_node_by_key("Person", "shared").unwrap().unwrap().id
     );
     assert_eq!(compaction_path_for(&engine), CompactionPath::UnifiedV3);
 
@@ -488,11 +739,12 @@ fn test_open_rejects_standard_compacted_dense_segment_missing_hnsw_graph() {
     let seg_dir = crate::segment_writer::segment_dir(dir.path(), seg_id);
     std::fs::remove_file(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap();
 
-    match DatabaseEngine::open(dir.path(), &opts) {
-        Err(EngineError::CorruptRecord(_)) => {}
-        Err(other) => panic!("expected CorruptRecord, got {}", other),
-        Ok(_) => panic!("expected reopen to fail for standard-compacted dense segment"),
-    }
+    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    assert_eq!(
+        node_id,
+        reopened.get_node_by_key("Person", "shared").unwrap().unwrap().id
+    );
+    reopened.close().unwrap();
 }
 
 #[test]
@@ -519,7 +771,7 @@ fn test_open_rejects_invalid_vector_payloads_from_wal_replay() {
         .append(
             &WalOp::UpsertNode(NodeRecord {
                 id: 8,
-                type_id: 1,
+                label_ids: NodeLabelSet::single(1).unwrap(),
                 key: "bad-vector".to_string(),
                 props: BTreeMap::new(),
                 created_at: 100,
@@ -567,7 +819,7 @@ fn test_open_rejects_malformed_vector_frame_from_wal_replay() {
     // V3 WAL frame: [seq:u64][walop_bytes]. The whole thing is the CRC-protected payload.
     let walop_bytes = crate::encoding::encode_wal_op(&WalOp::UpsertNode(NodeRecord {
         id: 9,
-        type_id: 1,
+        label_ids: NodeLabelSet::single(1).unwrap(),
         key: "bad-frame".to_string(),
         props: BTreeMap::new(),
         created_at: 100,
@@ -613,14 +865,11 @@ fn test_write_and_read_back() {
 
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    engine
-        .write_op(&WalOp::UpsertNode(make_node(1, "alice")))
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(1, "alice")))
         .unwrap();
-    engine
-        .write_op(&WalOp::UpsertNode(make_node(2, "bob")))
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(2, "bob")))
         .unwrap();
-    engine
-        .write_op(&WalOp::UpsertEdge(make_edge(1, 1, 2)))
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(make_edge(1, 1, 2)))
         .unwrap();
 
     assert_eq!(engine.node_count().unwrap(), 2);
@@ -643,24 +892,20 @@ fn test_delete_operations() {
 
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    engine
-        .write_op(&WalOp::UpsertNode(make_node(1, "alice")))
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(1, "alice")))
         .unwrap();
-    engine
-        .write_op(&WalOp::UpsertEdge(make_edge(1, 1, 1)))
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(make_edge(1, 1, 1)))
         .unwrap();
 
     assert!(engine.get_node(1).unwrap().is_some());
     assert!(engine.get_edge(1).unwrap().is_some());
 
-    engine
-        .write_op(&WalOp::DeleteNode {
+    write_internal_wal_op(&engine, &WalOp::DeleteNode {
             id: 1,
             deleted_at: 9999,
         })
         .unwrap();
-    engine
-        .write_op(&WalOp::DeleteEdge {
+    write_internal_wal_op(&engine, &WalOp::DeleteEdge {
             id: 1,
             deleted_at: 9999,
         })
@@ -682,13 +927,11 @@ fn test_close_and_reopen_recovers_state() {
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         for i in 1..=10 {
-            engine
-                .write_op(&WalOp::UpsertNode(make_node(i, &format!("node:{}", i))))
+            write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(i, &format!("node:{}", i))))
                 .unwrap();
         }
         for i in 1..=5 {
-            engine
-                .write_op(&WalOp::UpsertEdge(make_edge(i, i, i + 5)))
+            write_internal_wal_op(&engine, &WalOp::UpsertEdge(make_edge(i, i, i + 5)))
                 .unwrap();
         }
         engine.close().unwrap();
@@ -731,11 +974,9 @@ fn test_manifest_id_counters_survive_restart() {
 
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        engine
-            .write_op(&WalOp::UpsertNode(make_node(42, "high_id")))
+        write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(42, "high_id")))
             .unwrap();
-        engine
-            .write_op(&WalOp::UpsertEdge(make_edge(99, 42, 42)))
+        write_internal_wal_op(&engine, &WalOp::UpsertEdge(make_edge(99, 42, 42)))
             .unwrap();
         engine.close().unwrap();
     }
@@ -755,14 +996,11 @@ fn test_wal_replay_with_deletes() {
 
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        engine
-            .write_op(&WalOp::UpsertNode(make_node(1, "will_delete")))
+        write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(1, "will_delete")))
             .unwrap();
-        engine
-            .write_op(&WalOp::UpsertNode(make_node(2, "will_keep")))
+        write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(2, "will_keep")))
             .unwrap();
-        engine
-            .write_op(&WalOp::DeleteNode {
+        write_internal_wal_op(&engine, &WalOp::DeleteNode {
                 id: 1,
                 deleted_at: 5000,
             })
@@ -774,8 +1012,8 @@ fn test_wal_replay_with_deletes() {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         assert!(engine.get_node(1).unwrap().is_none());
         assert!(engine.get_node(2).unwrap().is_some());
-        // After close() flushes to segments, use get_nodes_by_type for total count
-        assert_eq!(engine.get_nodes_by_type(1).unwrap().len(), 1);
+        // After close() flushes to segments, use get_nodes_by_labels for total count
+        assert_eq!(engine.get_nodes_by_labels("Person").unwrap().len(), 1);
         engine.close().unwrap();
     }
 }
@@ -790,16 +1028,16 @@ fn test_write_op_batch() {
     let ops: Vec<WalOp> = (1..=50)
         .map(|i| WalOp::UpsertNode(make_node(i, &format!("batch:{}", i))))
         .collect();
-    engine.write_op_batch(&ops).unwrap();
+    write_internal_wal_op_batch(&engine, &ops).unwrap();
 
     assert_eq!(engine.node_count().unwrap(), 50);
     assert_eq!(engine.get_node(25).unwrap().unwrap().key, "batch:25");
 
     engine.close().unwrap();
 
-    // Verify recovery (close flushes to segments, use get_nodes_by_type)
+    // Verify recovery (close flushes to segments, use get_nodes_by_labels)
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-    assert_eq!(engine.get_nodes_by_type(1).unwrap().len(), 50);
+    assert_eq!(engine.get_nodes_by_labels("Person").unwrap().len(), 50);
     engine.close().unwrap();
 }
 
@@ -817,14 +1055,14 @@ fn test_write_op_batch_survives_restart() {
         for i in 1..=10 {
             ops.push(WalOp::UpsertEdge(make_edge(i, i, i + 10)));
         }
-        engine.write_op_batch(&ops).unwrap();
+        write_internal_wal_op_batch(&engine, &ops).unwrap();
         engine.close().unwrap();
     }
 
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         // close() flushes to segments; use cross-source counts
-        assert_eq!(engine.get_nodes_by_type(1).unwrap().len(), 20);
+        assert_eq!(engine.get_nodes_by_labels("Person").unwrap().len(), 20);
         // Verify edges individually (edge_count is memtable-only)
         for i in 1..=10 {
             assert!(engine.get_edge(i).unwrap().is_some(), "edge {} missing", i);
@@ -850,7 +1088,7 @@ fn test_write_op_batch_normalizes_node_vectors() {
         let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
         let ops = vec![WalOp::UpsertNode(NodeRecord {
             id: 1,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: "vector-batch".to_string(),
             props: BTreeMap::new(),
             created_at: 100,
@@ -860,7 +1098,7 @@ fn test_write_op_batch_normalizes_node_vectors() {
             sparse_vector: Some(vec![(8, 0.0), (3, 1.0), (3, 2.0)]),
             last_write_seq: 0,
         })];
-        engine.write_op_batch(&ops).unwrap();
+        write_internal_wal_op_batch(&engine, &ops).unwrap();
 
         let node = engine.get_node(1).unwrap().unwrap();
         assert_eq!(node.dense_vector, Some(vec![0.1, 0.2]));
@@ -882,12 +1120,11 @@ fn test_upsert_overwrites_on_replay() {
 
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        engine
-            .write_op(&WalOp::UpsertNode(make_node(1, "v1")))
+        write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(1, "v1")))
             .unwrap();
         let mut updated = make_node(1, "v2");
         updated.weight = 0.99;
-        engine.write_op(&WalOp::UpsertNode(updated)).unwrap();
+        write_internal_wal_op(&engine, &WalOp::UpsertNode(updated)).unwrap();
         engine.close().unwrap();
     }
 
@@ -897,7 +1134,7 @@ fn test_upsert_overwrites_on_replay() {
         assert_eq!(node.key, "v2");
         assert!((node.weight - 0.99).abs() < f32::EPSILON);
         // close() flushes to segments; use cross-source count
-        assert_eq!(engine.get_nodes_by_type(1).unwrap().len(), 1);
+        assert_eq!(engine.get_nodes_by_labels("Person").unwrap().len(), 1);
         engine.close().unwrap();
     }
 }
@@ -913,7 +1150,7 @@ fn test_flush_creates_segment() {
 
     engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -923,7 +1160,7 @@ fn test_flush_creates_segment() {
         .unwrap();
     engine
         .upsert_node(
-            1,
+            "Person",
             "bob",
             UpsertNodeOptions {
                 weight: 0.6,
@@ -966,7 +1203,7 @@ fn test_data_readable_after_flush() {
 
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -976,7 +1213,7 @@ fn test_data_readable_after_flush() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "bob",
             UpsertNodeOptions {
                 weight: 0.6,
@@ -985,7 +1222,7 @@ fn test_data_readable_after_flush() {
         )
         .unwrap();
     let eid = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     engine.flush().unwrap();
@@ -1011,7 +1248,7 @@ fn test_neighbors_after_flush() {
 
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1021,7 +1258,7 @@ fn test_neighbors_after_flush() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1031,7 +1268,7 @@ fn test_neighbors_after_flush() {
         .unwrap();
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "c",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1040,13 +1277,13 @@ fn test_neighbors_after_flush() {
         )
         .unwrap();
     engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     engine
         .upsert_edge(
             a,
             c,
-            20,
+            "REPORTS_TO",
             UpsertEdgeOptions {
                 weight: 0.8,
                 ..Default::default()
@@ -1062,18 +1299,18 @@ fn test_neighbors_after_flush() {
     assert!(ids.contains(&b));
     assert!(ids.contains(&c));
 
-    // Type filter should still work
-    let typed = engine
+    // Edge-label filter should still work
+    let labeled = engine
         .neighbors(
             a,
             &NeighborOptions {
-                type_filter: Some(vec![10]),
+                edge_label_filter: Some(vec!["KNOWS".to_string()]),
                 ..Default::default()
             },
         )
         .unwrap();
-    assert_eq!(typed.len(), 1);
-    assert_eq!(typed[0].node_id, b);
+    assert_eq!(labeled.len(), 1);
+    assert_eq!(labeled[0].node_id, b);
 
     engine.close().unwrap();
 }
@@ -1088,7 +1325,7 @@ fn test_traverse_depth_two_reproduces_basic_two_hop() {
     // Build chain: a -> b -> c -> d
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1098,7 +1335,7 @@ fn test_traverse_depth_two_reproduces_basic_two_hop() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1108,7 +1345,7 @@ fn test_traverse_depth_two_reproduces_basic_two_hop() {
         .unwrap();
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "c",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1118,7 +1355,7 @@ fn test_traverse_depth_two_reproduces_basic_two_hop() {
         .unwrap();
     let d = engine
         .upsert_node(
-            1,
+            "Person",
             "d",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1127,13 +1364,13 @@ fn test_traverse_depth_two_reproduces_basic_two_hop() {
         )
         .unwrap();
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+        .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
+        .upsert_edge(c, d, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
 
     // 2-hop from a: should reach c (via b), but NOT d (3 hops) or a/b (origin/1-hop)
@@ -1154,7 +1391,7 @@ fn test_traverse_depth_two_excludes_origin_and_hop1() {
     // Build graph with back-edge: a -> b -> a (cycle)
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1164,7 +1401,7 @@ fn test_traverse_depth_two_excludes_origin_and_hop1() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1174,7 +1411,7 @@ fn test_traverse_depth_two_excludes_origin_and_hop1() {
         .unwrap();
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "c",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1183,13 +1420,13 @@ fn test_traverse_depth_two_excludes_origin_and_hop1() {
         )
         .unwrap();
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(b, a, 1, UpsertEdgeOptions::default())
+        .upsert_edge(b, a, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap(); // back to origin
     engine
-        .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+        .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
 
     // 2-hop from a: b is 1-hop, then from b we reach a (origin, excluded) and c
@@ -1210,7 +1447,7 @@ fn test_traverse_depth_two_respects_limit() {
     // a -> b, a -> c, b -> d, b -> e, c -> f
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1220,7 +1457,7 @@ fn test_traverse_depth_two_respects_limit() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1230,7 +1467,7 @@ fn test_traverse_depth_two_respects_limit() {
         .unwrap();
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "c",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1240,7 +1477,7 @@ fn test_traverse_depth_two_respects_limit() {
         .unwrap();
     let d = engine
         .upsert_node(
-            1,
+            "Person",
             "d",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1250,7 +1487,7 @@ fn test_traverse_depth_two_respects_limit() {
         .unwrap();
     let e = engine
         .upsert_node(
-            1,
+            "Person",
             "e",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1260,7 +1497,7 @@ fn test_traverse_depth_two_respects_limit() {
         .unwrap();
     let f = engine
         .upsert_node(
-            1,
+            "Person",
             "f",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1269,19 +1506,19 @@ fn test_traverse_depth_two_respects_limit() {
         )
         .unwrap();
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(a, c, 1, UpsertEdgeOptions::default())
+        .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(b, d, 1, UpsertEdgeOptions::default())
+        .upsert_edge(b, d, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(b, e, 1, UpsertEdgeOptions::default())
+        .upsert_edge(b, e, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(c, f, 1, UpsertEdgeOptions::default())
+        .upsert_edge(c, f, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
 
     // Without limit: 3 2-hop results (d, e, f)
@@ -1296,16 +1533,16 @@ fn test_traverse_depth_two_respects_limit() {
 }
 
 #[test]
-fn test_traverse_depth_two_respects_edge_type_filter() {
+fn test_traverse_depth_two_respects_edge_label_filter() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    // a -[type1]-> b -[type1]-> c, b -[type2]-> d
+    // a -[label1]-> b -[label1]-> c, b -[label2]-> d
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1315,7 +1552,7 @@ fn test_traverse_depth_two_respects_edge_type_filter() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1325,7 +1562,7 @@ fn test_traverse_depth_two_respects_edge_type_filter() {
         .unwrap();
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "c",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1335,7 +1572,7 @@ fn test_traverse_depth_two_respects_edge_type_filter() {
         .unwrap();
     let d = engine
         .upsert_node(
-            1,
+            "Person",
             "d",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1344,17 +1581,25 @@ fn test_traverse_depth_two_respects_edge_type_filter() {
         )
         .unwrap();
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+        .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(b, d, 2, UpsertEdgeOptions::default())
+        .upsert_edge(b, d, "WORKS_AT", UpsertEdgeOptions::default())
         .unwrap();
 
-    // Filter type 1 only: a->b (hop1), b->c (hop2). b->d is type 2, excluded.
-    let hop2 = traverse_depth_two(&engine, a, Direction::Outgoing, Some(&[1]), None, 0, None);
+    // Filter RELATES_TO only: a->b (hop1), b->c (hop2). b->d is WORKS_AT, excluded.
+    let hop2 = traverse_depth_two(
+        &engine,
+        a,
+        Direction::Outgoing,
+        Some(&["RELATES_TO"]),
+        None,
+        0,
+        None,
+    );
     assert_eq!(hop2.len(), 1);
     assert_eq!(hop2[0].node_id, c);
 
@@ -1371,7 +1616,7 @@ fn test_traverse_depth_two_incoming() {
     // Chain: a -> b -> c -> d (incoming 2-hop from d should reach b)
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1381,7 +1626,7 @@ fn test_traverse_depth_two_incoming() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1391,7 +1636,7 @@ fn test_traverse_depth_two_incoming() {
         .unwrap();
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "c",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1401,7 +1646,7 @@ fn test_traverse_depth_two_incoming() {
         .unwrap();
     let d = engine
         .upsert_node(
-            1,
+            "Person",
             "d",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1410,13 +1655,13 @@ fn test_traverse_depth_two_incoming() {
         )
         .unwrap();
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+        .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
+        .upsert_edge(c, d, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
 
     // Incoming 2-hop from d: hop1 = c, hop2 = b (not a, that's 3 hops)
@@ -1441,7 +1686,7 @@ fn test_traverse_depth_two_nonexistent_or_hidden_start() {
     // Add a node but delete it, same result
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1451,7 +1696,7 @@ fn test_traverse_depth_two_nonexistent_or_hidden_start() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1460,7 +1705,7 @@ fn test_traverse_depth_two_nonexistent_or_hidden_start() {
         )
         .unwrap();
     engine
-        .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     engine.delete_node(a).unwrap();
 
@@ -1480,7 +1725,7 @@ fn test_cross_source_reads_memtable_plus_segment() {
     // Write batch 1, flush to segment
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1490,7 +1735,7 @@ fn test_cross_source_reads_memtable_plus_segment() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "bob",
             UpsertNodeOptions {
                 weight: 0.6,
@@ -1499,14 +1744,14 @@ fn test_cross_source_reads_memtable_plus_segment() {
         )
         .unwrap();
     engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     engine.flush().unwrap();
 
     // Write batch 2, stays in memtable
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "charlie",
             UpsertNodeOptions {
                 weight: 0.7,
@@ -1518,7 +1763,7 @@ fn test_cross_source_reads_memtable_plus_segment() {
         .upsert_edge(
             a,
             c,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 0.9,
                 ..Default::default()
@@ -1550,7 +1795,7 @@ fn test_upsert_dedup_across_flush_boundary() {
     // Insert and flush
     let id1 = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1560,12 +1805,12 @@ fn test_upsert_dedup_across_flush_boundary() {
         .unwrap();
     engine.flush().unwrap();
 
-    // Upsert same (type_id, key), should find existing in segment
+    // Upsert same (label, key), should find existing in segment.
     let mut props = BTreeMap::new();
     props.insert("version".to_string(), PropValue::Int(2));
     let id2 = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 props,
@@ -1595,7 +1840,7 @@ fn test_tombstone_hides_segment_data() {
 
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1605,7 +1850,7 @@ fn test_tombstone_hides_segment_data() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "bob",
             UpsertNodeOptions {
                 weight: 0.6,
@@ -1614,7 +1859,7 @@ fn test_tombstone_hides_segment_data() {
         )
         .unwrap();
     let eid = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     engine.flush().unwrap();
 
@@ -1641,7 +1886,7 @@ fn test_tombstone_survives_second_flush() {
 
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1671,7 +1916,7 @@ fn test_multiple_flushes_accumulate_segments() {
     for i in 0..3 {
         let id = engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("batch:{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -1703,7 +1948,7 @@ fn test_flush_updates_manifest() {
 
     engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1730,7 +1975,7 @@ fn test_id_counters_survive_flush() {
     for i in 0..5 {
         engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("n:{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -1745,7 +1990,7 @@ fn test_id_counters_survive_flush() {
     // New allocations should continue from where they left off
     let new_id = engine
         .upsert_node(
-            1,
+            "Person",
             "after_flush",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1770,7 +2015,7 @@ fn test_segment_data_survives_reopen() {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         a = engine
             .upsert_node(
-                1,
+                "Person",
                 "alice",
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -1780,7 +2025,7 @@ fn test_segment_data_survives_reopen() {
             .unwrap();
         b = engine
             .upsert_node(
-                1,
+                "Person",
                 "bob",
                 UpsertNodeOptions {
                     weight: 0.6,
@@ -1789,7 +2034,7 @@ fn test_segment_data_survives_reopen() {
             )
             .unwrap();
         eid = engine
-            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         engine.flush().unwrap();
         engine.close().unwrap();
@@ -1820,7 +2065,7 @@ fn test_deleted_edge_excluded_from_segment_neighbors() {
 
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1830,7 +2075,7 @@ fn test_deleted_edge_excluded_from_segment_neighbors() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1840,7 +2085,7 @@ fn test_deleted_edge_excluded_from_segment_neighbors() {
         .unwrap();
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "c",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1849,10 +2094,10 @@ fn test_deleted_edge_excluded_from_segment_neighbors() {
         )
         .unwrap();
     let e1 = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     engine
-        .upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     engine.flush().unwrap();
 
@@ -1877,7 +2122,7 @@ fn test_upsert_after_delete_across_flush_gets_new_id() {
 
     let id1 = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -1894,7 +2139,7 @@ fn test_upsert_after_delete_across_flush_gets_new_id() {
     // Re-insert same key, should get a fresh ID, not reuse deleted one
     let id2 = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.7,
@@ -1928,7 +2173,7 @@ fn test_auto_flush_triggers_on_threshold() {
     for i in 0..20 {
         let id = engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("node:{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -1968,7 +2213,7 @@ fn test_auto_flush_disabled_when_zero() {
     for i in 0..100 {
         engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("node:{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -2000,7 +2245,7 @@ fn test_compact_requires_two_segments() {
     // 1 segment → no-op
     engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2024,7 +2269,7 @@ fn test_compact_merges_two_segments() {
 
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2036,7 +2281,7 @@ fn test_compact_merges_two_segments() {
 
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "bob",
             UpsertNodeOptions {
                 weight: 0.6,
@@ -2071,7 +2316,7 @@ fn test_compact_applies_tombstones() {
     // Segment 1: alice + bob + edge
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2081,7 +2326,7 @@ fn test_compact_applies_tombstones() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "bob",
             UpsertNodeOptions {
                 weight: 0.6,
@@ -2090,7 +2335,7 @@ fn test_compact_applies_tombstones() {
         )
         .unwrap();
     let eid = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     engine.flush().unwrap();
 
@@ -2139,7 +2384,7 @@ fn test_compact_node_last_write_wins() {
     props_v1.insert("version".to_string(), PropValue::Int(1));
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 props: props_v1,
@@ -2155,7 +2400,7 @@ fn test_compact_node_last_write_wins() {
     props_v2.insert("version".to_string(), PropValue::Int(2));
     engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 props: props_v2,
@@ -2189,7 +2434,7 @@ fn test_compact_preserves_neighbors() {
 
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2199,7 +2444,7 @@ fn test_compact_preserves_neighbors() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2208,13 +2453,13 @@ fn test_compact_preserves_neighbors() {
         )
         .unwrap();
     engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     engine.flush().unwrap();
 
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "c",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2226,7 +2471,7 @@ fn test_compact_preserves_neighbors() {
         .upsert_edge(
             a,
             c,
-            20,
+            "REPORTS_TO",
             UpsertEdgeOptions {
                 weight: 0.8,
                 ..Default::default()
@@ -2243,18 +2488,18 @@ fn test_compact_preserves_neighbors() {
     assert!(ids.contains(&b));
     assert!(ids.contains(&c));
 
-    // Type filter still works after compaction
-    let typed = engine
+    // Edge-label filter still works after compaction
+    let labeled = engine
         .neighbors(
             a,
             &NeighborOptions {
-                type_filter: Some(vec![10]),
+                edge_label_filter: Some(vec!["KNOWS".to_string()]),
                 ..Default::default()
             },
         )
         .unwrap();
-    assert_eq!(typed.len(), 1);
-    assert_eq!(typed[0].node_id, b);
+    assert_eq!(labeled.len(), 1);
+    assert_eq!(labeled[0].node_id, b);
 
     engine.close().unwrap();
 }
@@ -2268,7 +2513,7 @@ fn test_compact_cleans_up_old_segment_dirs() {
 
     engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2279,7 +2524,7 @@ fn test_compact_cleans_up_old_segment_dirs() {
     engine.flush().unwrap();
     engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2313,7 +2558,7 @@ fn test_compact_updates_manifest() {
 
     engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2324,7 +2569,7 @@ fn test_compact_updates_manifest() {
     engine.flush().unwrap();
     engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2357,7 +2602,7 @@ fn test_compact_data_survives_reopen() {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         a = engine
             .upsert_node(
-                1,
+                "Person",
                 "alice",
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -2368,7 +2613,7 @@ fn test_compact_data_survives_reopen() {
         engine.flush().unwrap();
         b = engine
             .upsert_node(
-                1,
+                "Person",
                 "bob",
                 UpsertNodeOptions {
                     weight: 0.6,
@@ -2377,7 +2622,7 @@ fn test_compact_data_survives_reopen() {
             )
             .unwrap();
         engine
-            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         engine.flush().unwrap();
         engine.compact().unwrap();
@@ -2410,7 +2655,7 @@ fn test_compact_three_segments() {
     for i in 0..3 {
         let id = engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("n:{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -2451,7 +2696,7 @@ fn test_compact_with_unflushed_tombstone() {
     // Segment 1: alice + bob
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2461,7 +2706,7 @@ fn test_compact_with_unflushed_tombstone() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "bob",
             UpsertNodeOptions {
                 weight: 0.6,
@@ -2474,7 +2719,7 @@ fn test_compact_with_unflushed_tombstone() {
     // Segment 2: charlie
     engine
         .upsert_node(
-            1,
+            "Person",
             "charlie",
             UpsertNodeOptions {
                 weight: 0.7,
@@ -2516,7 +2761,7 @@ fn test_compact_with_unflushed_update() {
     props_v1.insert("v".to_string(), PropValue::Int(1));
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 props: props_v1,
@@ -2530,7 +2775,7 @@ fn test_compact_with_unflushed_update() {
     // Segment 2: bob
     engine
         .upsert_node(
-            1,
+            "Person",
             "bob",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2545,7 +2790,7 @@ fn test_compact_with_unflushed_update() {
     props_v2.insert("v".to_string(), PropValue::Int(2));
     engine
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 props: props_v2,
@@ -2577,7 +2822,7 @@ fn test_compact_removes_dangling_edges_after_node_delete() {
     // Segment 1: A→B→C chain
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2587,7 +2832,7 @@ fn test_compact_removes_dangling_edges_after_node_delete() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2597,7 +2842,7 @@ fn test_compact_removes_dangling_edges_after_node_delete() {
         .unwrap();
     let c = engine
         .upsert_node(
-            1,
+            "Person",
             "c",
             UpsertNodeOptions {
                 weight: 0.5,
@@ -2606,10 +2851,10 @@ fn test_compact_removes_dangling_edges_after_node_delete() {
         )
         .unwrap();
     let e_ab = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     let e_bc = engine
-        .upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        .upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     engine.flush().unwrap();
 
@@ -2668,7 +2913,7 @@ fn test_orphan_segment_does_not_reuse_id() {
         )
         .unwrap();
         engine
-            .upsert_node(1, "a", UpsertNodeOptions::default())
+            .upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
         engine.flush().unwrap();
         engine.close().unwrap();
@@ -2679,15 +2924,19 @@ fn test_orphan_segment_does_not_reuse_id() {
     // the segment but before updating the manifest).
     let orphan_dir = db_path.join("segments").join("seg_0099");
     std::fs::create_dir_all(&orphan_dir).unwrap();
-    // Write a minimal nodes.dat so it looks like a real segment
-    std::fs::write(orphan_dir.join("nodes.dat"), [0u8; 0]).unwrap();
+    // Write a minimal packed-core marker so it looks like a real segment directory.
+    std::fs::write(
+        orphan_dir.join(crate::segment_components::PACKED_CORE_FILENAME),
+        [0u8; 0],
+    )
+    .unwrap();
 
     // Reopen. next_segment_id should skip past the orphan
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         // Insert more data and flush. Should get segment ID > 99
         engine
-            .upsert_node(1, "b", UpsertNodeOptions::default())
+            .upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
         engine.flush().unwrap();
 
@@ -2746,7 +2995,7 @@ fn test_map_props_roundtrip_memtable_and_segment() {
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let id = engine
         .upsert_node(
-            1,
+            "Person",
             "map_node",
             UpsertNodeOptions {
                 props: props.clone(),
@@ -2789,7 +3038,7 @@ fn install_noop_prune_policy(engine: &mut DatabaseEngine) {
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.0),
-                type_id: Some(u32::MAX),
+                label: Some("SpecialNode1024".to_string()),
             },
         )
         .unwrap();
@@ -2814,10 +3063,9 @@ fn build_clean_compaction_fixture(engine: &mut DatabaseEngine) -> (Vec<u64>, Vec
             let id = next_node_id;
             next_node_id += 1;
             let created_at = 1_000 + (seg as i64 * 100) + (i as i64 * 2);
-            engine
-                .write_op(&WalOp::UpsertNode(NodeRecord {
+            write_internal_wal_op(engine, &WalOp::UpsertNode(NodeRecord {
                     id,
-                    type_id: 1,
+                    label_ids: NodeLabelSet::single(1).unwrap(),
                     key: format!("s{}_n{}", seg, i),
                     props,
                     created_at,
@@ -2836,12 +3084,11 @@ fn build_clean_compaction_fixture(engine: &mut DatabaseEngine) -> (Vec<u64>, Vec
             let eid = next_edge_id;
             next_edge_id += 1;
             let created_at = 5_000 + (seg as i64 * 100) + (i as i64 * 2);
-            engine
-                .write_op(&WalOp::UpsertEdge(EdgeRecord {
+            write_internal_wal_op(engine, &WalOp::UpsertEdge(EdgeRecord {
                     id: eid,
                     from: seg_node_ids[i],
                     to: seg_node_ids[i + 1],
-                    type_id: 1,
+                    label_id: 1,
                     props: BTreeMap::new(),
                     created_at,
                     updated_at: created_at + 1,
@@ -2859,6 +3106,297 @@ fn build_clean_compaction_fixture(engine: &mut DatabaseEngine) -> (Vec<u64>, Vec
     (all_node_ids, all_edge_ids, segment_starts)
 }
 
+fn build_vector_compaction_and_flush_fixture(
+    compact_engine: &DatabaseEngine,
+    flush_engine: &DatabaseEngine,
+) -> (Vec<u64>, Vec<u64>) {
+    let mut compact_node_ids = Vec::new();
+    let mut flush_node_ids = Vec::new();
+    let mut compact_edge_ids = Vec::new();
+    let mut flush_edge_ids = Vec::new();
+    let mut next_node_id = 1u64;
+    let mut next_edge_id = 1u64;
+
+    for seg in 0..3u64 {
+        let mut compact_seg_ids = Vec::new();
+        let mut flush_seg_ids = Vec::new();
+        for i in 0..6u64 {
+            let dense_vector = vec![
+                1.0 + seg as f32 * 0.1,
+                0.2 + i as f32 * 0.03,
+                0.4 + seg as f32 * 0.05,
+                0.6 + i as f32 * 0.02,
+            ];
+            let sparse_vector = vec![
+                (seg as u32, 1.0 + i as f32 * 0.1),
+                (seg as u32 + 10, 0.5 + seg as f32 * 0.05),
+            ];
+            let mut props = BTreeMap::new();
+            props.insert("seg".to_string(), PropValue::UInt(seg));
+            props.insert("slot".to_string(), PropValue::UInt(i));
+            let node_id = next_node_id;
+            next_node_id += 1;
+            let created_at = 10_000 + (seg as i64 * 100) + (i as i64 * 2);
+            let compact_node = NodeRecord {
+                id: node_id,
+                label_ids: NodeLabelSet::single(1).unwrap(),
+                key: format!("s{}_n{}", seg, i),
+                props: props.clone(),
+                created_at,
+                updated_at: created_at + 1,
+                weight: 1.0,
+                dense_vector: Some(dense_vector.clone()),
+                sparse_vector: Some(sparse_vector.clone()),
+                last_write_seq: 0,
+            };
+            let flush_node = NodeRecord {
+                props,
+                dense_vector: Some(dense_vector),
+                sparse_vector: Some(sparse_vector),
+                ..compact_node.clone()
+            };
+
+            write_internal_wal_op(compact_engine, &WalOp::UpsertNode(compact_node)).unwrap();
+            write_internal_wal_op(flush_engine, &WalOp::UpsertNode(flush_node)).unwrap();
+
+            compact_seg_ids.push(node_id);
+            flush_seg_ids.push(node_id);
+            compact_node_ids.push(node_id);
+            flush_node_ids.push(node_id);
+        }
+        for i in 0..3usize {
+            let edge_id = next_edge_id;
+            next_edge_id += 1;
+            let created_at = 20_000 + (seg as i64 * 100) + (i as i64 * 2);
+            let compact_edge = EdgeRecord {
+                id: edge_id,
+                from: compact_seg_ids[i],
+                to: compact_seg_ids[i + 1],
+                label_id: 1,
+                props: BTreeMap::new(),
+                created_at,
+                updated_at: created_at + 1,
+                weight: 0.5 + seg as f32 * 0.1 + i as f32 * 0.05,
+                valid_from: seg as i64,
+                valid_to: i64::MAX,
+                last_write_seq: 0,
+            };
+            let flush_edge = EdgeRecord {
+                from: flush_seg_ids[i],
+                to: flush_seg_ids[i + 1],
+                ..compact_edge.clone()
+            };
+
+            write_internal_wal_op(compact_engine, &WalOp::UpsertEdge(compact_edge)).unwrap();
+            write_internal_wal_op(flush_engine, &WalOp::UpsertEdge(flush_edge)).unwrap();
+
+            compact_edge_ids.push(edge_id);
+            flush_edge_ids.push(edge_id);
+        }
+        compact_engine.flush().unwrap();
+    }
+    flush_engine.flush().unwrap();
+
+    assert_eq!(compact_node_ids, flush_node_ids);
+    assert_eq!(compact_edge_ids, flush_edge_ids);
+    (compact_node_ids, compact_edge_ids)
+}
+
+fn record_payload_spans_for_test(
+    payload: &[u8],
+    label: &str,
+) -> BTreeMap<u64, (u64, u32)> {
+    const RECORD_INDEX_ENTRY_SIZE: usize = 16;
+
+    assert!(
+        payload.len() >= 8,
+        "{label} payload is missing count header"
+    );
+    let count = read_u64_le_for_test(payload, 0, label) as usize;
+    let index_end = 8 + count * RECORD_INDEX_ENTRY_SIZE;
+    assert!(
+        index_end <= payload.len(),
+        "{label} index exceeds payload length: index_end={index_end}, len={}",
+        payload.len()
+    );
+
+    let mut entries = Vec::with_capacity(count);
+    let mut last_id = None;
+    for index in 0..count {
+        let entry_off = 8 + index * RECORD_INDEX_ENTRY_SIZE;
+        let id = read_u64_le_for_test(payload, entry_off, label);
+        let offset = read_u64_le_for_test(payload, entry_off + 8, label);
+        if let Some(previous_id) = last_id {
+            assert!(
+                previous_id < id,
+                "{label} record ids are not strictly sorted: {previous_id} before {id}"
+            );
+        }
+        assert!(
+            offset >= index_end as u64,
+            "{label} record {id} points into index/header: offset={offset}, data_start={index_end}"
+        );
+        assert!(
+            offset <= payload.len() as u64,
+            "{label} record {id} offset exceeds payload length: offset={offset}, len={}",
+            payload.len()
+        );
+        entries.push((id, offset));
+        last_id = Some(id);
+    }
+
+    if count == 0 {
+        assert_eq!(
+            payload.len(),
+            index_end,
+            "{label} empty payload should contain only count header"
+        );
+        return BTreeMap::new();
+    }
+
+    let mut by_offset = entries.clone();
+    by_offset.sort_unstable_by_key(|(_, offset)| *offset);
+    assert_eq!(
+        by_offset[0].1, index_end as u64,
+        "{label} first record should start immediately after the index"
+    );
+
+    let mut spans = BTreeMap::new();
+    for (index, (id, offset)) in by_offset.iter().copied().enumerate() {
+        let next_offset = by_offset
+            .get(index + 1)
+            .map(|(_, next)| *next)
+            .unwrap_or(payload.len() as u64);
+        assert!(
+            next_offset > offset,
+            "{label} record {id} has empty or overlapping span: offset={offset}, next={next_offset}"
+        );
+        let data_len = u32::try_from(next_offset - offset)
+            .unwrap_or_else(|_| panic!("{label} record {id} span exceeds u32"));
+        spans.insert(id, (offset, data_len));
+    }
+    spans
+}
+
+fn record_payload_ids_for_test(payload: &[u8], label: &str) -> Vec<u64> {
+    record_payload_spans_for_test(payload, label)
+        .into_keys()
+        .collect()
+}
+
+fn assert_metadata_offsets_match_record_payload_for_test(
+    seg_dir: &std::path::Path,
+    record_kind: SegmentComponentKind,
+    metadata_kind: SegmentComponentKind,
+    metadata_entry_size: usize,
+    label: &str,
+) -> Vec<u64> {
+    let record_payload = read_manifest_component_payload_for_test(seg_dir, record_kind);
+    let record_spans = record_payload_spans_for_test(&record_payload, label);
+    let metadata_payload = read_manifest_component_payload_for_test(seg_dir, metadata_kind.clone());
+    assert!(
+        metadata_payload.len() >= 8,
+        "{label} metadata payload missing count header"
+    );
+    let count = read_u64_le_for_test(&metadata_payload, 0, label) as usize;
+    assert_eq!(
+        count,
+        record_spans.len(),
+        "{label} metadata count should match record count"
+    );
+
+    let (fixed_entries_offset, fixed_entry_size, expected_metadata_len) =
+        if metadata_kind == SegmentComponentKind::NodeMetadata {
+            assert!(
+                metadata_payload.len() >= 48,
+                "{label} node metadata payload missing v10 header"
+            );
+            let fixed_entry_size = read_u16_le_for_test(&metadata_payload, 8, label) as usize;
+            let label_offset_entry_size =
+                read_u16_le_for_test(&metadata_payload, 10, label) as usize;
+            assert_eq!(fixed_entry_size, 48, "{label} node metadata fixed row size");
+            assert_eq!(
+                label_offset_entry_size, 8,
+                "{label} node metadata label offset row size"
+            );
+            let fixed_entries_offset = read_u64_le_for_test(&metadata_payload, 16, label) as usize;
+            let label_offsets_offset = read_u64_le_for_test(&metadata_payload, 24, label) as usize;
+            let label_ids_offset = read_u64_le_for_test(&metadata_payload, 32, label) as usize;
+            let label_id_count = read_u64_le_for_test(&metadata_payload, 40, label) as usize;
+            assert_eq!(fixed_entries_offset, 48, "{label} fixed table offset");
+            assert_eq!(
+                label_offsets_offset,
+                fixed_entries_offset + count * fixed_entry_size,
+                "{label} label offset table offset"
+            );
+            assert_eq!(
+                label_ids_offset,
+                label_offsets_offset + (count + 1) * label_offset_entry_size,
+                "{label} label ID region offset"
+            );
+            (
+                fixed_entries_offset,
+                fixed_entry_size,
+                label_ids_offset + label_id_count * 4,
+            )
+        } else {
+            (8, metadata_entry_size, 8 + count * metadata_entry_size)
+        };
+
+    assert_eq!(
+        metadata_payload.len(),
+        expected_metadata_len,
+        "{label} metadata payload length mismatch"
+    );
+
+    let mut ids = Vec::with_capacity(count);
+    let mut last_id = None;
+    for index in 0..count {
+        let off = fixed_entries_offset + index * fixed_entry_size;
+        let id = read_u64_le_for_test(&metadata_payload, off, label);
+        let metadata_offset = read_u64_le_for_test(&metadata_payload, off + 8, label);
+        let metadata_len = read_u32_le_for_test(&metadata_payload, off + 16, label);
+        if let Some(previous_id) = last_id {
+            assert!(
+                previous_id < id,
+                "{label} metadata ids are not strictly sorted: {previous_id} before {id}"
+            );
+        }
+        let (record_offset, record_len) = record_spans
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| panic!("{label} metadata references missing record {id}"));
+        assert_eq!(
+            metadata_offset, record_offset,
+            "{label} metadata offset mismatch for record {id}"
+        );
+        assert_eq!(
+            metadata_len, record_len,
+            "{label} metadata length mismatch for record {id}"
+        );
+        ids.push(id);
+        last_id = Some(id);
+    }
+    ids
+}
+
+fn assert_compacted_record_payloads_match_metadata(seg_dir: &std::path::Path) {
+    assert_metadata_offsets_match_record_payload_for_test(
+        seg_dir,
+        SegmentComponentKind::NodeRecords,
+        SegmentComponentKind::NodeMetadata,
+        60,
+        "node records",
+    );
+    assert_metadata_offsets_match_record_payload_for_test(
+        seg_dir,
+        SegmentComponentKind::EdgeRecords,
+        SegmentComponentKind::EdgeMetadata,
+        80,
+        "edge records",
+    );
+}
+
 fn assert_compacted_index_files_match(
     left: &DatabaseEngine,
     right: &DatabaseEngine,
@@ -2870,54 +3408,160 @@ fn assert_compacted_index_files_match(
     assert_segment_common_artifacts_match(&left_dir, &right_dir);
 }
 
-fn assert_segment_common_artifacts_match(left_dir: &std::path::Path, right_dir: &std::path::Path) {
-    for filename in [
-        "format.ver",
-        "key_index.dat",
-        "node_type_index.dat",
-        "edge_type_index.dat",
-        "edge_triple_index.dat",
-        "timestamp_index.dat",
-        "adj_out.idx",
-        "adj_out.dat",
-        "adj_in.idx",
-        "adj_in.dat",
-        "tombstones.dat",
+fn assert_segment_uses_packed_core_layout(seg_dir: &std::path::Path) {
+    assert!(
+        seg_dir
+            .join(crate::segment_components::PACKED_CORE_FILENAME)
+            .exists(),
+        "segment.core missing in {}",
+        seg_dir.display()
+    );
+    let manifest = read_component_manifest_for_test(seg_dir);
+    assert!(matches!(
+        manifest
+            .components
+            .iter()
+            .find(|record| record.kind == SegmentComponentKind::PackedSegmentContainer)
+            .expect("missing PackedSegmentContainer")
+            .handle,
+        crate::segment_components::ComponentHandleV1::ExternalFile { .. }
+    ));
+    for kind in [
+        SegmentComponentKind::NodeRecords,
+        SegmentComponentKind::EdgeRecords,
+        SegmentComponentKind::NodeMetadata,
+        SegmentComponentKind::EdgeMetadata,
+        SegmentComponentKind::Tombstones,
+        SegmentComponentKind::KeyIndex,
+        SegmentComponentKind::NodeLabelIndex,
+        SegmentComponentKind::EdgeLabelIndex,
+        SegmentComponentKind::EdgeTripleIndex,
+        SegmentComponentKind::AdjOutIndex,
+        SegmentComponentKind::AdjOutPostings,
+        SegmentComponentKind::AdjInIndex,
+        SegmentComponentKind::AdjInPostings,
+        SegmentComponentKind::TimestampIndex,
+        SegmentComponentKind::EdgeWeightIndex,
+        SegmentComponentKind::EdgeUpdatedAtIndex,
+        SegmentComponentKind::EdgeValidFromIndex,
+        SegmentComponentKind::EdgeValidToIndex,
     ] {
-        assert_eq!(
-            std::fs::read(left_dir.join(filename)).unwrap(),
-            std::fs::read(right_dir.join(filename)).unwrap(),
-            "{} mismatch",
-            filename
+        let record = manifest
+            .components
+            .iter()
+            .find(|record| record.kind == kind)
+            .unwrap_or_else(|| panic!("missing component {:?}", kind));
+        assert!(
+            matches!(
+                record.handle,
+                crate::segment_components::ComponentHandleV1::PackedRange { .. }
+            ),
+            "{:?} should be packed in {}",
+            kind,
+            seg_dir.display()
         );
     }
+    assert_only_manifested_segment_files(seg_dir, &manifest);
+}
 
-    for filename in ["prop_index.dat", "node_prop_hashes.dat"] {
+fn assert_only_manifested_segment_files(
+    seg_dir: &std::path::Path,
+    manifest: &crate::segment_components::SegmentComponentManifestV1,
+) {
+    let mut expected = std::collections::BTreeSet::from([
+        std::path::PathBuf::from(crate::segment_components::SEGMENT_COMPONENT_MANIFEST_FILENAME),
+    ]);
+    for record in &manifest.components {
+        if let crate::segment_components::ComponentHandleV1::ExternalFile {
+            relative_path, ..
+        } = &record.handle
+        {
+            expected.insert(std::path::PathBuf::from(relative_path));
+        }
+    }
+    for record in &manifest.unknown_optional_components {
+        if record.wire.handle.handle_tag == 1 {
+            if let Some(relative_path) = &record.wire.handle.relative_path {
+                expected.insert(std::path::PathBuf::from(relative_path));
+            }
+        }
+    }
+
+    let mut actual = Vec::new();
+    collect_regular_segment_files(seg_dir, seg_dir, &mut actual);
+    for relative_path in actual {
+        assert!(
+            expected.contains(&relative_path),
+            "unexpected unmanifested segment file {} in {}",
+            relative_path.display(),
+            seg_dir.display()
+        );
+    }
+}
+
+fn collect_regular_segment_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    files: &mut Vec<std::path::PathBuf>,
+) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let file_type = entry.file_type().unwrap();
+        if file_type.is_dir() {
+            collect_regular_segment_files(root, &path, files);
+        } else if file_type.is_file() {
+            files.push(path.strip_prefix(root).unwrap().to_path_buf());
+        }
+    }
+}
+
+fn assert_segment_common_artifacts_match(left_dir: &std::path::Path, right_dir: &std::path::Path) {
+    for kind in [
+        SegmentComponentKind::KeyIndex,
+        SegmentComponentKind::NodeLabelIndex,
+        SegmentComponentKind::EdgeLabelIndex,
+        SegmentComponentKind::EdgeTripleIndex,
+        SegmentComponentKind::EdgeWeightIndex,
+        SegmentComponentKind::EdgeUpdatedAtIndex,
+        SegmentComponentKind::EdgeValidFromIndex,
+        SegmentComponentKind::EdgeValidToIndex,
+        SegmentComponentKind::TimestampIndex,
+        SegmentComponentKind::AdjOutIndex,
+        SegmentComponentKind::AdjOutPostings,
+        SegmentComponentKind::AdjInIndex,
+        SegmentComponentKind::AdjInPostings,
+        SegmentComponentKind::Tombstones,
+    ] {
         assert_eq!(
-            left_dir.join(filename).exists(),
-            right_dir.join(filename).exists(),
-            "{} presence mismatch",
-            filename
+            read_manifest_component_payload_for_test(left_dir, kind.clone()),
+            read_manifest_component_payload_for_test(right_dir, kind.clone()),
+            "{:?} mismatch",
+            kind
         );
     }
 
     // Byte-identical vector artifacts (deterministic).
-    for filename in [
-        crate::segment_writer::NODE_VECTOR_META_FILENAME,
-        crate::segment_writer::NODE_DENSE_VECTOR_BLOB_FILENAME,
-        crate::segment_writer::NODE_SPARSE_VECTOR_BLOB_FILENAME,
-        crate::sparse_postings::SPARSE_POSTING_INDEX_FILENAME,
-        crate::sparse_postings::SPARSE_POSTINGS_FILENAME,
+    for kind in [
+        SegmentComponentKind::NodeVectorMetadata,
+        SegmentComponentKind::NodeDenseVectorBlob,
+        SegmentComponentKind::NodeSparseVectorBlob,
+        SegmentComponentKind::SparsePostingIndex,
+        SegmentComponentKind::SparsePostings,
     ] {
-        let left_exists = left_dir.join(filename).exists();
-        let right_exists = right_dir.join(filename).exists();
-        assert_eq!(left_exists, right_exists, "{} presence mismatch", filename);
-        if left_exists {
+        let left_payload = try_read_manifest_component_payload_for_test(left_dir, kind.clone());
+        let right_payload = try_read_manifest_component_payload_for_test(right_dir, kind.clone());
+        assert_eq!(
+            left_payload.is_some(),
+            right_payload.is_some(),
+            "{:?} presence mismatch",
+            kind
+        );
+        if let (Some(left_payload), Some(right_payload)) = (left_payload, right_payload) {
             assert_eq!(
-                std::fs::read(left_dir.join(filename)).unwrap(),
-                std::fs::read(right_dir.join(filename)).unwrap(),
-                "{} mismatch",
-                filename
+                left_payload, right_payload,
+                "{:?} mismatch",
+                kind
             );
         }
     }
@@ -2981,10 +3625,12 @@ fn assert_segment_common_artifacts_match(left_dir: &std::path::Path, right_dir: 
 
         if left_meta_exists {
             for dir in [left_dir, right_dir] {
-                let meta =
-                    std::fs::read(dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME)).unwrap();
-                let graph =
-                    std::fs::read(dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap();
+                let meta = read_external_component_payload_for_test(
+                    &dir.join(crate::dense_hnsw::DENSE_HNSW_META_FILENAME),
+                );
+                let graph = read_external_component_payload_for_test(
+                    &dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME),
+                );
                 // Verify non-empty and structurally valid (header parses, sizes consistent).
                 assert!(meta.len() >= 36, "HNSW meta too short in {}", dir.display());
                 assert!(!graph.is_empty(), "HNSW graph empty in {}", dir.display());
@@ -2999,37 +3645,60 @@ fn assert_segment_common_artifacts_match(left_dir: &std::path::Path, right_dir: 
     }
 }
 
+fn assert_record_artifacts_match(left_dir: &std::path::Path, right_dir: &std::path::Path) {
+    for kind in [
+        SegmentComponentKind::NodeRecords,
+        SegmentComponentKind::EdgeRecords,
+        SegmentComponentKind::NodeMetadata,
+        SegmentComponentKind::EdgeMetadata,
+    ] {
+        assert_eq!(
+            read_manifest_component_payload_for_test(left_dir, kind.clone()),
+            read_manifest_component_payload_for_test(right_dir, kind.clone()),
+            "{:?} mismatch",
+            kind
+        );
+    }
+}
+
 fn assert_segment_metadata_semantics_match(left: &SegmentReader, right: &SegmentReader) {
     assert_eq!(left.node_meta_count(), right.node_meta_count());
     for index in 0..left.node_meta_count() as usize {
         let left_meta = left.node_meta_at(index).unwrap();
         let right_meta = right.node_meta_at(index).unwrap();
-        assert_eq!(left_meta.0, right_meta.0, "node {} id mismatch", index);
         assert_eq!(
-            left_meta.2, right_meta.2,
+            left_meta.node_id, right_meta.node_id,
+            "node {} id mismatch",
+            index
+        );
+        assert_eq!(
+            left_meta.data_len, right_meta.data_len,
             "node {} data_len mismatch",
             index
         );
-        assert_eq!(left_meta.3, right_meta.3, "node {} type mismatch", index);
         assert_eq!(
-            left_meta.4, right_meta.4,
+            left_meta.label_ids, right_meta.label_ids,
+            "node {} label set mismatch",
+            index
+        );
+        assert_eq!(
+            left_meta.updated_at, right_meta.updated_at,
             "node {} updated_at mismatch",
             index
         );
         assert_eq!(
-            left_meta.5.to_bits(),
-            right_meta.5.to_bits(),
+            left_meta.weight.to_bits(),
+            right_meta.weight.to_bits(),
             "node {} weight mismatch",
             index
         );
-        assert_eq!(left_meta.6, right_meta.6, "node {} key_len mismatch", index);
         assert_eq!(
-            left_meta.8, right_meta.8,
-            "node {} prop_hash_count mismatch",
+            left_meta.key_len, right_meta.key_len,
+            "node {} key_len mismatch",
             index
         );
         assert_eq!(
-            left_meta.9, right_meta.9,
+            left_meta.last_write_seq, right_meta.last_write_seq,
             "node {} last_write_seq mismatch",
             index
         );
@@ -3056,7 +3725,7 @@ fn assert_segment_metadata_semantics_match(left: &SegmentReader, right: &Segment
         );
         assert_eq!(left_meta.3, right_meta.3, "edge {} from mismatch", index);
         assert_eq!(left_meta.4, right_meta.4, "edge {} to mismatch", index);
-        assert_eq!(left_meta.5, right_meta.5, "edge {} type mismatch", index);
+        assert_eq!(left_meta.5, right_meta.5, "edge {} label mismatch", index);
         assert_eq!(
             left_meta.6, right_meta.6,
             "edge {} updated_at mismatch",
@@ -3086,15 +3755,15 @@ fn assert_segment_metadata_semantics_match(left: &SegmentReader, right: &Segment
     }
 }
 
-fn assert_node_batches_match(left: &[Option<NodeRecord>], right: &[Option<NodeRecord>]) {
+fn assert_node_batches_match(left: &[Option<NodeView>], right: &[Option<NodeView>]) {
     assert_eq!(left.len(), right.len());
     for (idx, (left_node, right_node)) in left.iter().zip(right.iter()).enumerate() {
         match (left_node, right_node) {
             (Some(left_node), Some(right_node)) => {
                 assert_eq!(left_node.id, right_node.id, "node {} id mismatch", idx);
                 assert_eq!(
-                    left_node.type_id, right_node.type_id,
-                    "node {} type mismatch",
+                    left_node.labels, right_node.labels,
+                    "node {} labels mismatch",
                     idx
                 );
                 assert_eq!(left_node.key, right_node.key, "node {} key mismatch", idx);
@@ -3116,7 +3785,7 @@ fn assert_node_batches_match(left: &[Option<NodeRecord>], right: &[Option<NodeRe
     }
 }
 
-fn assert_edge_batches_match(left: &[Option<EdgeRecord>], right: &[Option<EdgeRecord>]) {
+fn assert_edge_batches_match(left: &[Option<EdgeView>], right: &[Option<EdgeView>]) {
     assert_eq!(left.len(), right.len());
     for (idx, (left_edge, right_edge)) in left.iter().zip(right.iter()).enumerate() {
         match (left_edge, right_edge) {
@@ -3129,8 +3798,8 @@ fn assert_edge_batches_match(left: &[Option<EdgeRecord>], right: &[Option<EdgeRe
                 );
                 assert_eq!(left_edge.to, right_edge.to, "edge {} to mismatch", idx);
                 assert_eq!(
-                    left_edge.type_id, right_edge.type_id,
-                    "edge {} type mismatch",
+                    left_edge.label, right_edge.label,
+                    "edge {} label mismatch",
                     idx
                 );
                 assert_eq!(
@@ -3174,7 +3843,7 @@ fn test_segments_non_overlapping_detection() {
     for seg in 0..3u64 {
         for i in 0..10 {
             engine
-                .upsert_node(1, &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
                 .unwrap();
         }
         engine.flush().unwrap();
@@ -3197,7 +3866,7 @@ fn test_segments_overlapping_detection() {
     for _seg in 0..3 {
         for i in 0..10 {
             engine
-                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
         engine.flush().unwrap();
@@ -3239,7 +3908,7 @@ fn test_fast_merge_eligibility_rules() {
     for _seg in 0..3 {
         for i in 0..10 {
             overlap_engine
-                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
         overlap_engine.flush().unwrap();
@@ -3268,7 +3937,7 @@ fn test_fast_merge_compaction_correctness() {
         let mut seg_node_ids = Vec::new();
         for i in 0..20 {
             let id = engine
-                .upsert_node(1, &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
                 .unwrap();
             seg_node_ids.push(id);
             all_node_ids.push(id);
@@ -3278,7 +3947,7 @@ fn test_fast_merge_compaction_correctness() {
                 .upsert_edge(
                     seg_node_ids[i],
                     seg_node_ids[i + 1],
-                    1,
+                    "RELATES_TO",
                     UpsertEdgeOptions::default(),
                 )
                 .unwrap();
@@ -3300,6 +3969,10 @@ fn test_fast_merge_compaction_correctness() {
     assert_eq!(stats.nodes_removed, 0);
     assert_eq!(stats.edges_removed, 0);
     assert_eq!(engine.segments_for_test().len(), 1);
+    assert_segment_uses_packed_core_layout(&segment_dir(
+        dir.path(),
+        engine.segments_for_test()[0].segment_id,
+    ));
 
     // Verify all records are accessible (batch read)
     let node_results = engine.get_nodes(&all_node_ids).unwrap();
@@ -3358,7 +4031,7 @@ fn test_fast_merge_with_properties() {
             );
             let id = engine
                 .upsert_node(
-                    1,
+                    "Person",
                     &format!("s{}_n{}", seg, i),
                     UpsertNodeOptions {
                         props,
@@ -3403,14 +4076,14 @@ fn test_fast_merge_survives_reopen() {
             let mut seg_ids = Vec::new();
             for i in 0..10 {
                 let id = engine
-                    .upsert_node(1, &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
+                    .upsert_node("Person", &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
                     .unwrap();
                 ids.push(id);
                 seg_ids.push(id);
             }
             first_nodes.push(seg_ids[0]);
             engine
-                .upsert_edge(seg_ids[0], seg_ids[1], 1, UpsertEdgeOptions::default())
+                .upsert_edge(seg_ids[0], seg_ids[1], "RELATES_TO", UpsertEdgeOptions::default())
                 .unwrap();
             engine.flush().unwrap();
         }
@@ -3438,7 +4111,7 @@ fn test_fast_merge_survives_reopen() {
             .unwrap();
         assert_eq!(nbrs.len(), 1);
     }
-    assert!(engine.get_node_by_key(1, "s0_n0").unwrap().is_some());
+    assert!(engine.get_node_by_key("Person", "s0_n0").unwrap().is_some());
     engine.close().unwrap();
 }
 
@@ -3458,7 +4131,7 @@ fn test_fast_merge_find_nodes_works() {
             props.insert("color".to_string(), PropValue::String(color.to_string()));
             engine
                 .upsert_node(
-                    1,
+                    "Person",
                     &format!("s{}_n{}", seg, i),
                     UpsertNodeOptions {
                         props,
@@ -3474,11 +4147,11 @@ fn test_fast_merge_find_nodes_works() {
 
     // find_nodes should work on the fast-merged segment
     let red = engine
-        .find_nodes(1, "color", &PropValue::String("red".to_string()))
+        .find_nodes("Person", "color", &PropValue::String("red".to_string()))
         .unwrap();
     assert_eq!(red.len(), 20); // 10 red per segment * 2 segments
     let blue = engine
-        .find_nodes(1, "color", &PropValue::String("blue".to_string()))
+        .find_nodes("Person", "color", &PropValue::String("blue".to_string()))
         .unwrap();
     assert_eq!(blue.len(), 20);
 
@@ -3519,8 +4192,8 @@ fn test_fast_merge_matches_v3_for_clean_segments() {
     let fast_edges = fast.get_edges(&edge_ids).unwrap();
     let v3_edges = v3.get_edges(&edge_ids).unwrap();
     assert_edge_batches_match(&fast_edges, &v3_edges);
-    let fast_key = fast.get_node_by_key(1, "s0_n0").unwrap();
-    let v3_key = v3.get_node_by_key(1, "s0_n0").unwrap();
+    let fast_key = fast.get_node_by_key("Person", "s0_n0").unwrap();
+    let v3_key = v3.get_node_by_key("Person", "s0_n0").unwrap();
     assert_node_batches_match(&[fast_key], &[v3_key]);
     for &start in &segment_starts {
         assert_eq!(
@@ -3547,13 +4220,29 @@ fn test_fast_merge_matches_v3_for_clean_segments() {
         );
     }
     assert_eq!(
-        fast.find_nodes(1, "color", &PropValue::String("red".to_string()))
+        fast.find_nodes("Person", "color", &PropValue::String("red".to_string()))
             .unwrap(),
-        v3.find_nodes(1, "color", &PropValue::String("red".to_string()))
+        v3.find_nodes("Person", "color", &PropValue::String("red".to_string()))
             .unwrap()
     );
-    assert_eq!(fast.nodes_by_type(1).unwrap(), v3.nodes_by_type(1).unwrap());
+    assert_eq!(fast.nodes_by_labels("Person").unwrap(), v3.nodes_by_labels("Person").unwrap());
     assert_compacted_index_files_match(&fast, &v3, fast_dir.path(), v3_dir.path());
+    assert_segment_uses_packed_core_layout(&segment_dir(
+        fast_dir.path(),
+        fast.segments_for_test()[0].segment_id,
+    ));
+    assert_compacted_record_payloads_match_metadata(&segment_dir(
+        fast_dir.path(),
+        fast.segments_for_test()[0].segment_id,
+    ));
+    assert_segment_uses_packed_core_layout(&segment_dir(
+        v3_dir.path(),
+        v3.segments_for_test()[0].segment_id,
+    ));
+    assert_compacted_record_payloads_match_metadata(&segment_dir(
+        v3_dir.path(),
+        v3.segments_for_test()[0].segment_id,
+    ));
 
     fast.close().unwrap();
     v3.close().unwrap();
@@ -3602,6 +4291,14 @@ fn test_fast_merge_background_matches_sync() {
     }
     assert_compacted_index_files_match(&sync_engine, &bg_engine, sync_dir.path(), bg_dir.path());
     assert_segment_metadata_semantics_match(&sync_engine.segments_for_test()[0], &bg_engine.segments_for_test()[0]);
+    assert_segment_uses_packed_core_layout(&segment_dir(
+        sync_dir.path(),
+        sync_engine.segments_for_test()[0].segment_id,
+    ));
+    assert_segment_uses_packed_core_layout(&segment_dir(
+        bg_dir.path(),
+        bg_engine.segments_for_test()[0].segment_id,
+    ));
 
     sync_engine.close().unwrap();
     bg_engine.close().unwrap();
@@ -3624,107 +4321,8 @@ fn test_fast_merge_matches_single_flush_artifacts_for_vector_segments() {
 
     let compact_engine = DatabaseEngine::open(compact_dir.path(), &opts).unwrap();
     let flush_engine = DatabaseEngine::open(flush_dir.path(), &opts).unwrap();
-    let mut compact_node_ids = Vec::new();
-    let mut flush_node_ids = Vec::new();
-    let mut compact_edge_ids = Vec::new();
-    let mut flush_edge_ids = Vec::new();
-    let mut next_node_id = 1u64;
-    let mut next_edge_id = 1u64;
-
-    for seg in 0..3u64 {
-        let mut compact_seg_ids = Vec::new();
-        let mut flush_seg_ids = Vec::new();
-        for i in 0..6u64 {
-            let dense_vector = vec![
-                1.0 + seg as f32 * 0.1,
-                0.2 + i as f32 * 0.03,
-                0.4 + seg as f32 * 0.05,
-                0.6 + i as f32 * 0.02,
-            ];
-            let sparse_vector = vec![
-                (seg as u32, 1.0 + i as f32 * 0.1),
-                (seg as u32 + 10, 0.5 + seg as f32 * 0.05),
-            ];
-            let mut props = BTreeMap::new();
-            props.insert("seg".to_string(), PropValue::UInt(seg));
-            props.insert("slot".to_string(), PropValue::UInt(i));
-            let node_id = next_node_id;
-            next_node_id += 1;
-            let created_at = 10_000 + (seg as i64 * 100) + (i as i64 * 2);
-            let compact_node = NodeRecord {
-                id: node_id,
-                type_id: 1,
-                key: format!("s{}_n{}", seg, i),
-                props: props.clone(),
-                created_at,
-                updated_at: created_at + 1,
-                weight: 1.0,
-                dense_vector: Some(dense_vector.clone()),
-                sparse_vector: Some(sparse_vector.clone()),
-                last_write_seq: 0,
-            };
-            let flush_node = NodeRecord {
-                props,
-                dense_vector: Some(dense_vector),
-                sparse_vector: Some(sparse_vector),
-                ..compact_node.clone()
-            };
-
-            compact_engine
-                .write_op(&WalOp::UpsertNode(compact_node))
-                .unwrap();
-            flush_engine
-                .write_op(&WalOp::UpsertNode(flush_node))
-                .unwrap();
-
-            let compact_id = node_id;
-            let flush_id = node_id;
-            compact_seg_ids.push(compact_id);
-            flush_seg_ids.push(flush_id);
-            compact_node_ids.push(compact_id);
-            flush_node_ids.push(flush_id);
-        }
-        for i in 0..3usize {
-            let edge_id = next_edge_id;
-            next_edge_id += 1;
-            let created_at = 20_000 + (seg as i64 * 100) + (i as i64 * 2);
-            let compact_edge = EdgeRecord {
-                id: edge_id,
-                from: compact_seg_ids[i],
-                to: compact_seg_ids[i + 1],
-                type_id: 1,
-                props: BTreeMap::new(),
-                created_at,
-                updated_at: created_at + 1,
-                weight: 0.5 + seg as f32 * 0.1 + i as f32 * 0.05,
-                valid_from: seg as i64,
-                valid_to: i64::MAX,
-                last_write_seq: 0,
-            };
-            let flush_edge = EdgeRecord {
-                from: flush_seg_ids[i],
-                to: flush_seg_ids[i + 1],
-                ..compact_edge.clone()
-            };
-
-            compact_engine
-                .write_op(&WalOp::UpsertEdge(compact_edge))
-                .unwrap();
-            flush_engine
-                .write_op(&WalOp::UpsertEdge(flush_edge))
-                .unwrap();
-
-            let compact_edge_id = edge_id;
-            let flush_edge_id = edge_id;
-            compact_edge_ids.push(compact_edge_id);
-            flush_edge_ids.push(flush_edge_id);
-        }
-        compact_engine.flush().unwrap();
-    }
-    flush_engine.flush().unwrap();
-
-    assert_eq!(compact_node_ids, flush_node_ids);
-    assert_eq!(compact_edge_ids, flush_edge_ids);
+    let (node_ids, edge_ids) =
+        build_vector_compaction_and_flush_fixture(&compact_engine, &flush_engine);
     assert_eq!(
         compaction_path_for(&compact_engine),
         CompactionPath::FastMerge
@@ -3732,18 +4330,48 @@ fn test_fast_merge_matches_single_flush_artifacts_for_vector_segments() {
 
     compact_engine.compact().unwrap().unwrap();
 
-    let compact_nodes = compact_engine.get_nodes(&compact_node_ids).unwrap();
-    let flush_nodes = flush_engine.get_nodes(&flush_node_ids).unwrap();
+    let compact_nodes = compact_engine.get_nodes(&node_ids).unwrap();
+    let flush_nodes = flush_engine.get_nodes(&node_ids).unwrap();
     assert_node_batches_match(&compact_nodes, &flush_nodes);
 
-    let compact_edges = compact_engine.get_edges(&compact_edge_ids).unwrap();
-    let flush_edges = flush_engine.get_edges(&flush_edge_ids).unwrap();
+    let compact_edges = compact_engine.get_edges(&edge_ids).unwrap();
+    let flush_edges = flush_engine.get_edges(&edge_ids).unwrap();
     assert_edge_batches_match(&compact_edges, &flush_edges);
 
-    let compact_seg_dir = segment_dir(compact_dir.path(), compact_engine.segments_for_test()[0].segment_id);
-    let flush_seg_dir = segment_dir(flush_dir.path(), flush_engine.segments_for_test()[0].segment_id);
+    let compact_seg_dir = segment_dir(
+        compact_dir.path(),
+        compact_engine.segments_for_test()[0].segment_id,
+    );
+    let flush_seg_dir = segment_dir(
+        flush_dir.path(),
+        flush_engine.segments_for_test()[0].segment_id,
+    );
     assert_segment_common_artifacts_match(&compact_seg_dir, &flush_seg_dir);
-    assert_segment_metadata_semantics_match(&compact_engine.segments_for_test()[0], &flush_engine.segments_for_test()[0]);
+    assert_compacted_record_payloads_match_metadata(&compact_seg_dir);
+    assert_eq!(
+        record_payload_ids_for_test(
+            &read_manifest_component_payload_for_test(
+                &compact_seg_dir,
+                SegmentComponentKind::NodeRecords,
+            ),
+            "fast-merge node records",
+        ),
+        node_ids
+    );
+    assert_eq!(
+        record_payload_ids_for_test(
+            &read_manifest_component_payload_for_test(
+                &compact_seg_dir,
+                SegmentComponentKind::EdgeRecords,
+            ),
+            "fast-merge edge records",
+        ),
+        edge_ids
+    );
+    assert_segment_metadata_semantics_match(
+        &compact_engine.segments_for_test()[0],
+        &flush_engine.segments_for_test()[0],
+    );
 
     // Semantic HNSW parity: both engines should produce equivalent search results.
     let queries: Vec<Vec<f32>> = vec![
@@ -3757,7 +4385,7 @@ fn test_fast_merge_matches_single_flush_artifacts_for_vector_segments() {
             dense_query: Some(query.clone()),
             sparse_query: None,
             k: 5,
-            type_filter: None,
+            label_filter: None,
             ef_search: None,
             scope: None,
             dense_weight: None,
@@ -3797,6 +4425,63 @@ fn test_fast_merge_matches_single_flush_artifacts_for_vector_segments() {
 }
 
 #[test]
+fn test_v3_matches_single_flush_artifacts_for_vector_segments() {
+    let compact_dir = TempDir::new().unwrap();
+    let flush_dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        edge_uniqueness: true,
+        compact_after_n_flushes: 0,
+        dense_vector: Some(DenseVectorConfig {
+            dimension: 4,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig::default(),
+        }),
+        ..DbOptions::default()
+    };
+
+    let mut compact_engine = DatabaseEngine::open(compact_dir.path(), &opts).unwrap();
+    let flush_engine = DatabaseEngine::open(flush_dir.path(), &opts).unwrap();
+    let (node_ids, edge_ids) =
+        build_vector_compaction_and_flush_fixture(&compact_engine, &flush_engine);
+    install_noop_prune_policy(&mut compact_engine);
+    assert_eq!(
+        compaction_path_for(&compact_engine),
+        CompactionPath::UnifiedV3
+    );
+
+    compact_engine.compact().unwrap().unwrap();
+
+    let compact_nodes = compact_engine.get_nodes(&node_ids).unwrap();
+    let flush_nodes = flush_engine.get_nodes(&node_ids).unwrap();
+    assert_node_batches_match(&compact_nodes, &flush_nodes);
+
+    let compact_edges = compact_engine.get_edges(&edge_ids).unwrap();
+    let flush_edges = flush_engine.get_edges(&edge_ids).unwrap();
+    assert_edge_batches_match(&compact_edges, &flush_edges);
+
+    let compact_seg_dir = segment_dir(
+        compact_dir.path(),
+        compact_engine.segments_for_test()[0].segment_id,
+    );
+    let flush_seg_dir = segment_dir(
+        flush_dir.path(),
+        flush_engine.segments_for_test()[0].segment_id,
+    );
+    assert_segment_uses_packed_core_layout(&compact_seg_dir);
+    assert_segment_uses_packed_core_layout(&flush_seg_dir);
+    assert_segment_common_artifacts_match(&compact_seg_dir, &flush_seg_dir);
+    assert_record_artifacts_match(&compact_seg_dir, &flush_seg_dir);
+    assert_compacted_record_payloads_match_metadata(&compact_seg_dir);
+    assert_segment_metadata_semantics_match(
+        &compact_engine.segments_for_test()[0],
+        &flush_engine.segments_for_test()[0],
+    );
+
+    compact_engine.close().unwrap();
+    flush_engine.close().unwrap();
+}
+
+#[test]
 fn test_standard_path_used_for_overlapping_segments() {
     let dir = TempDir::new().unwrap();
     let opts = DbOptions {
@@ -3809,7 +4494,7 @@ fn test_standard_path_used_for_overlapping_segments() {
     for _seg in 0..3 {
         for i in 0..10 {
             engine
-                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
         engine.flush().unwrap();
@@ -3839,6 +4524,100 @@ fn test_standard_path_used_for_overlapping_segments() {
     engine.close().unwrap();
 }
 
+#[test]
+fn test_v3_filtered_compaction_packed_record_payloads_match_winners() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        compact_after_n_flushes: 0,
+        edge_uniqueness: true,
+        ..DbOptions::default()
+    };
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    let mut node_1_old = make_node(1, "node-1-old");
+    node_1_old.weight = 1.0;
+    let mut node_2 = make_node(2, "node-2");
+    node_2.weight = 2.0;
+    let mut node_3 = make_node(3, "node-3");
+    node_3.weight = 3.0;
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(node_1_old)).unwrap();
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(node_2)).unwrap();
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(node_3)).unwrap();
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(make_edge(10, 1, 2))).unwrap();
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(make_edge(11, 2, 3))).unwrap();
+    let mut edge_12_old = make_edge(12, 3, 1);
+    edge_12_old.weight = 1.25;
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(edge_12_old)).unwrap();
+    engine.flush().unwrap();
+
+    let mut node_1_new = make_node(1, "node-1-new");
+    node_1_new.weight = 4.0;
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(node_1_new)).unwrap();
+    write_internal_wal_op(&engine, &WalOp::DeleteNode {
+            id: 3,
+            deleted_at: 9_000,
+        })
+        .unwrap();
+    write_internal_wal_op(&engine, &WalOp::DeleteEdge {
+            id: 10,
+            deleted_at: 9_001,
+        })
+        .unwrap();
+    let mut edge_12_new = make_edge(12, 2, 1);
+    edge_12_new.weight = 2.5;
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(edge_12_new)).unwrap();
+    engine.flush().unwrap();
+
+    assert_eq!(compaction_path_for(&engine), CompactionPath::UnifiedV3);
+    let stats = engine.compact().unwrap().unwrap();
+    assert_eq!(stats.nodes_kept, 2);
+    assert_eq!(stats.edges_kept, 1);
+
+    let compacted_seg_dir = segment_dir(dir.path(), engine.segments_for_test()[0].segment_id);
+    assert_segment_uses_packed_core_layout(&compacted_seg_dir);
+
+    let node_payload =
+        read_manifest_component_payload_for_test(&compacted_seg_dir, SegmentComponentKind::NodeRecords);
+    let edge_payload =
+        read_manifest_component_payload_for_test(&compacted_seg_dir, SegmentComponentKind::EdgeRecords);
+    assert_eq!(
+        record_payload_ids_for_test(&node_payload, "v3 filtered node records"),
+        vec![1, 2]
+    );
+    assert_eq!(
+        record_payload_ids_for_test(&edge_payload, "v3 filtered edge records"),
+        vec![12]
+    );
+    let node_metadata_ids = assert_metadata_offsets_match_record_payload_for_test(
+        &compacted_seg_dir,
+        SegmentComponentKind::NodeRecords,
+        SegmentComponentKind::NodeMetadata,
+        60,
+        "v3 filtered node records",
+    );
+    let edge_metadata_ids = assert_metadata_offsets_match_record_payload_for_test(
+        &compacted_seg_dir,
+        SegmentComponentKind::EdgeRecords,
+        SegmentComponentKind::EdgeMetadata,
+        80,
+        "v3 filtered edge records",
+    );
+    assert_eq!(node_metadata_ids, vec![1, 2]);
+    assert_eq!(edge_metadata_ids, vec![12]);
+
+    let node_1 = engine.get_node(1).unwrap().unwrap();
+    assert_eq!(node_1.key, "node-1-new");
+    assert_eq!(node_1.weight.to_bits(), 4.0f32.to_bits());
+    assert!(engine.get_node(3).unwrap().is_none());
+    assert!(engine.get_edge(10).unwrap().is_none());
+    assert!(engine.get_edge(11).unwrap().is_none());
+    let edge_12 = engine.get_edge(12).unwrap().unwrap();
+    assert_eq!((edge_12.from, edge_12.to), (2, 1));
+    assert_eq!(edge_12.weight.to_bits(), 2.5f32.to_bits());
+
+    engine.close().unwrap();
+}
+
 // --- Auto-compaction tests ---
 
 #[test]
@@ -3853,7 +4632,7 @@ fn test_auto_compact_triggers_after_n_flushes() {
     // Flush 1 and 2: no compaction yet
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -3861,7 +4640,7 @@ fn test_auto_compact_triggers_after_n_flushes() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -3870,7 +4649,7 @@ fn test_auto_compact_triggers_after_n_flushes() {
     // Flush 3: should trigger auto-compact (3 segments → 1)
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("c{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -3906,7 +4685,7 @@ fn test_auto_compact_disabled_when_zero() {
         for i in 0..5 {
             engine
                 .upsert_node(
-                    1,
+                    "Person",
                     &format!("f{}_n{}", flush, i),
                     UpsertNodeOptions::default(),
                 )
@@ -3933,7 +4712,7 @@ fn test_auto_compact_counter_resets_on_manual_compact() {
     for seg in 0..2u64 {
         for i in 0..5 {
             engine
-                .upsert_node(1, &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
                 .unwrap();
         }
         engine.flush().unwrap();
@@ -3950,7 +4729,7 @@ fn test_auto_compact_counter_resets_on_manual_compact() {
     for seg in 2..6u64 {
         for i in 0..5 {
             engine
-                .upsert_node(1, &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
                 .unwrap();
         }
         engine.flush().unwrap();
@@ -3961,7 +4740,7 @@ fn test_auto_compact_counter_resets_on_manual_compact() {
     // 5th flush triggers auto-compact
     for i in 0..5 {
         engine
-            .upsert_node(1, &format!("s6_n{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("s6_n{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -3986,7 +4765,7 @@ fn test_auto_compact_data_integrity() {
     for seg in 0..6u64 {
         for i in 0..10 {
             let id = engine
-                .upsert_node(1, &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
                 .unwrap();
             all_ids.push(id);
         }
@@ -4019,7 +4798,7 @@ fn test_auto_compact_not_triggered_during_compact_flush() {
     // But we only have 1 segment after flush, so compact() returns None (< 2 segments).
     for i in 0..5 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4029,7 +4808,7 @@ fn test_auto_compact_not_triggered_during_compact_flush() {
     // Second flush: now 2 segments, auto-compact should fire
     for i in 0..5 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4070,7 +4849,7 @@ fn test_bg_compact_basic() {
     // Two flushes to trigger background compaction
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4078,7 +4857,7 @@ fn test_bg_compact_basic() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4118,13 +4897,13 @@ fn test_lifecycle_pump_applies_finished_bg_compact_without_foreground_write() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4159,7 +4938,7 @@ fn test_lifecycle_pump_applies_bg_flush_without_foreground_write() {
     };
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    db.upsert_node(1, "pump_flush", UpsertNodeOptions::default())
+    db.upsert_node("Person", "pump_flush", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     db.enqueue_one_flush().unwrap();
@@ -4174,7 +4953,7 @@ fn test_lifecycle_pump_applies_bg_flush_without_foreground_write() {
     }
 
     assert_eq!(db.segment_count().unwrap(), 1);
-    assert!(db.get_node_by_key(1, "pump_flush").unwrap().is_some());
+    assert!(db.get_node_by_key("Person", "pump_flush").unwrap().is_some());
 
     db.close().unwrap();
 }
@@ -4194,13 +4973,13 @@ fn test_bg_compact_writes_during() {
     // Two flushes to trigger bg compact
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4209,7 +4988,7 @@ fn test_bg_compact_writes_during() {
     // Immediately write more data. Should NOT block
     for i in 0..20 {
         engine
-            .upsert_node(1, &format!("c{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
 
@@ -4250,13 +5029,13 @@ fn test_flushes_while_bg_compact_is_outstanding_count_toward_next_run() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4266,7 +5045,7 @@ fn test_flushes_while_bg_compact_is_outstanding_count_toward_next_run() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("c{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4281,7 +5060,7 @@ fn test_flushes_while_bg_compact_is_outstanding_count_toward_next_run() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("d{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("d{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4313,13 +5092,13 @@ fn test_bg_compact_flush_during() {
     // Two flushes → triggers bg compact
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap(); // bg compact starts here
@@ -4327,7 +5106,7 @@ fn test_bg_compact_flush_during() {
     // Write more data and flush. Adds a NEW segment while bg compact runs
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("c{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap(); // new segment added; bg compact may still be running
@@ -4369,7 +5148,7 @@ fn test_bg_compact_no_double() {
     // First flush: only 1 segment, bg compact needs >= 2, so no bg compact
     for i in 0..5 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4378,7 +5157,7 @@ fn test_bg_compact_no_double() {
     // Second flush: 2 segments, bg compact starts
     for i in 0..5 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4389,7 +5168,7 @@ fn test_bg_compact_no_double() {
     // should NOT start a second bg compact
     for i in 0..5 {
         engine
-            .upsert_node(1, &format!("c{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4434,13 +5213,13 @@ fn test_bg_compact_manual_after_bg() {
     // Two flushes → triggers bg compact
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap(); // bg compact starts
@@ -4448,13 +5227,13 @@ fn test_bg_compact_manual_after_bg() {
     // Add more segments
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("c{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("d{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("d{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4492,13 +5271,13 @@ fn test_bg_compact_drop_waits() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap(); // bg compact starts
@@ -4536,13 +5315,13 @@ fn test_bg_compact_immediate_mode() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4584,13 +5363,13 @@ fn test_bg_compact_group_commit_mode() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4598,7 +5377,7 @@ fn test_bg_compact_group_commit_mode() {
     // Write more data while bg compact may be running
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("c{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
 
@@ -4640,13 +5419,13 @@ fn test_bg_compact_cancel() {
     // Two flushes → triggers bg compact
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("a{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("a{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("b{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("b{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4688,7 +5467,7 @@ fn test_orphan_segment_cleanup_on_open() {
     // Write + flush to create a real segment
     for i in 0..5 {
         engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4742,7 +5521,7 @@ fn test_orphan_cleanup_preserves_valid_segments() {
     for seg in 0..3 {
         for i in 0..5 {
             engine
-                .upsert_node(1, &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("s{}_n{}", seg, i), UpsertNodeOptions::default())
                 .unwrap();
         }
         engine.flush().unwrap();
@@ -4807,13 +5586,13 @@ fn test_immediate_mode_basic_operations() {
 
     // Write nodes and edges
     let n1 = engine
-        .upsert_node(1, "alice", UpsertNodeOptions::default())
+        .upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
     let n2 = engine
-        .upsert_node(1, "bob", UpsertNodeOptions::default())
+        .upsert_node("Person", "bob", UpsertNodeOptions::default())
         .unwrap();
     let e1 = engine
-        .upsert_edge(n1, n2, 1, UpsertEdgeOptions::default())
+        .upsert_edge(n1, n2, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
 
     // Read back immediately
@@ -4844,7 +5623,7 @@ fn test_immediate_mode_batch_operations() {
 
     let inputs: Vec<NodeInput> = (0..50)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: format!("node_{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -4853,7 +5632,7 @@ fn test_immediate_mode_batch_operations() {
         })
         .collect();
 
-    let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
     assert_eq!(ids.len(), 50);
 
     for &id in &ids {
@@ -4870,14 +5649,14 @@ fn test_immediate_mode_flush_compact_cycle() {
     // Insert, flush, insert more, flush, compact
     for i in 0..100 {
         engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
 
     for i in 100..200 {
         engine
-            .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -4914,7 +5693,7 @@ fn test_group_commit_basic_write_close_reopen() {
     let mut ids = Vec::new();
     for i in 0..20 {
         let id = engine
-            .upsert_node(1, &format!("gc_node_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("gc_node_{}", i), UpsertNodeOptions::default())
             .unwrap();
         ids.push(id);
     }
@@ -4954,16 +5733,16 @@ fn test_group_commit_with_edges() {
     let (dir, engine) = temp_db_group_commit();
 
     let n1 = engine
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let n2 = engine
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let e1 = engine
         .upsert_edge(
             n1,
             n2,
-            1,
+            "RELATES_TO",
             UpsertEdgeOptions {
                 weight: 0.5,
                 ..Default::default()
@@ -5001,7 +5780,7 @@ fn test_group_commit_batch_operations() {
 
     let inputs: Vec<NodeInput> = (0..100)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: format!("batch_{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -5010,7 +5789,7 @@ fn test_group_commit_batch_operations() {
         })
         .collect();
 
-    let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
     assert_eq!(ids.len(), 100);
 
     engine.close().unwrap();
@@ -5042,7 +5821,7 @@ fn test_sync_forces_immediate_flush() {
 
     // Write a node
     let id = engine
-        .upsert_node(1, "sync_test", UpsertNodeOptions::default())
+        .upsert_node("Person", "sync_test", UpsertNodeOptions::default())
         .unwrap();
 
     // Force sync. After this, data must be on disk
@@ -5073,7 +5852,7 @@ fn test_sync_noop_in_immediate_mode() {
     let (_dir, engine) = temp_db_immediate();
 
     engine
-        .upsert_node(1, "test", UpsertNodeOptions::default())
+        .upsert_node("Person", "test", UpsertNodeOptions::default())
         .unwrap();
     // sync() should be a no-op in Immediate mode and not error
     engine.sync().unwrap();
@@ -5087,7 +5866,7 @@ fn test_group_commit_flush_cycle() {
     // Write → flush → write → flush under GroupCommit
     for i in 0..50 {
         engine
-            .upsert_node(1, &format!("pre_flush_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("pre_flush_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
@@ -5095,7 +5874,7 @@ fn test_group_commit_flush_cycle() {
     for i in 0..50 {
         engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("post_flush_{}", i),
                 UpsertNodeOptions::default(),
             )
@@ -5135,7 +5914,7 @@ fn test_drop_joins_sync_thread() {
 
     for i in 0..10 {
         engine
-            .upsert_node(1, &format!("drop_test_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("drop_test_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
 
@@ -5177,7 +5956,7 @@ fn test_backpressure_blocks_writer_at_hard_cap() {
     // will drain them. If backpressure is broken, buffered_bytes grows unbounded.
     for i in 0..200 {
         engine
-            .upsert_node(1, &format!("bp_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("bp_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
 
@@ -5203,7 +5982,7 @@ fn test_clean_shutdown_drains_all_buffered_data() {
     // Write 100 nodes rapidly (most will be buffered, not yet synced)
     for i in 0..100 {
         engine
-            .upsert_node(1, &format!("drain_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("drain_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
 
@@ -5256,7 +6035,7 @@ fn test_drop_drains_buffered_data() {
         for i in 0..50 {
             engine
                 .upsert_node(
-                    1,
+                    "Person",
                     &format!("drop_drain_{}", i),
                     UpsertNodeOptions::default(),
                 )
@@ -5299,7 +6078,8 @@ fn test_sync_failure_poisons_engine() {
     use crate::wal_sync::WalSyncState;
 
     let dir = TempDir::new().unwrap();
-    let writer = WalWriter::open(dir.path()).unwrap();
+    let wal_dir = TempDir::new().unwrap();
+    let writer = WalWriter::open_generation(wal_dir.path(), 0).unwrap();
 
     let state = WalSyncState {
         wal_writer: writer,
@@ -5329,7 +6109,7 @@ fn test_sync_failure_poisons_engine() {
     engine.reset_publish_counters_for_test();
 
     // Attempt to write. Should get WalSyncFailed error
-    let result = engine.upsert_node(1, "should_fail", UpsertNodeOptions::default());
+    let result = engine.upsert_node("Person", "should_fail", UpsertNodeOptions::default());
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
@@ -5342,7 +6122,7 @@ fn test_sync_failure_poisons_engine() {
     let counters = engine.publish_counter_snapshot_for_test();
     assert!(std::sync::Arc::ptr_eq(&before.view.sources, &after.view.sources));
     assert_eq!(before.engine_seq, after.engine_seq);
-    assert!(engine.get_node_by_key(1, "should_fail").unwrap().is_none());
+    assert!(engine.get_node_by_key("Person", "should_fail").unwrap().is_none());
     assert!(counters.skipped >= 1);
     assert_eq!(counters.snapshot_only, 0);
     assert_eq!(counters.rebuild_sources, 0);
@@ -5359,7 +6139,7 @@ fn test_integration_1000_writes_group_commit() {
         props.insert("index".to_string(), PropValue::Int(i as i64));
         engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("int_{}", i),
                 UpsertNodeOptions {
                     props,
@@ -5398,13 +6178,13 @@ fn test_integration_1000_writes_group_commit() {
 
 #[test]
 fn test_integration_write_flush_write_flush_group_commit() {
-    // Exercises truncate_and_reset through multiple flush cycles
+    // Exercises generation WAL rotation through multiple flush cycles.
     let (dir, engine) = temp_db_group_commit();
 
     // Cycle 1: write → flush
     for i in 0..100 {
         engine
-            .upsert_node(1, &format!("c1_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c1_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     let seg1 = engine.flush().unwrap();
@@ -5413,7 +6193,7 @@ fn test_integration_write_flush_write_flush_group_commit() {
     // Cycle 2: write → flush
     for i in 0..100 {
         engine
-            .upsert_node(1, &format!("c2_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c2_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     let seg2 = engine.flush().unwrap();
@@ -5422,7 +6202,7 @@ fn test_integration_write_flush_write_flush_group_commit() {
     // Cycle 3: write → flush
     for i in 0..100 {
         engine
-            .upsert_node(1, &format!("c3_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("c3_{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     let seg3 = engine.flush().unwrap();
@@ -5462,7 +6242,7 @@ fn test_group_commit_delete_and_compact_cycle() {
     let mut ids = Vec::new();
     for i in 0..100 {
         let id = engine
-            .upsert_node(1, &format!("gc_del_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("gc_del_{}", i), UpsertNodeOptions::default())
             .unwrap();
         ids.push(id);
     }
@@ -5608,7 +6388,7 @@ fn test_backpressure_flush_triggers_at_hard_cap_immediate() {
     for i in 0..50 {
         let id = engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("bp_imm_{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -5658,7 +6438,7 @@ fn test_backpressure_flush_triggers_at_hard_cap_group_commit() {
     for i in 0..50 {
         let id = engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("bp_gc_{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -5720,7 +6500,7 @@ fn test_backpressure_disabled_when_zero() {
     for i in 0..100 {
         engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("no_bp_{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -5754,7 +6534,7 @@ fn test_backpressure_fires_before_soft_threshold() {
     for i in 0..30 {
         engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("early_bp_{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -5791,7 +6571,7 @@ fn test_backpressure_with_edges_and_deletes() {
     for i in 0..20 {
         let id = engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("n_{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -5809,7 +6589,7 @@ fn test_backpressure_with_edges_and_deletes() {
             .upsert_edge(
                 node_ids[i],
                 node_ids[i + 1],
-                1,
+                "RELATES_TO",
                 UpsertEdgeOptions {
                     weight: 0.5,
                     ..Default::default()
@@ -5856,7 +6636,7 @@ fn test_backpressure_with_batch_upserts() {
     // First batch: fills memtable
     let inputs1: Vec<NodeInput> = (0..20)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: format!("batch1_{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -5864,12 +6644,12 @@ fn test_backpressure_with_batch_upserts() {
             sparse_vector: None,
         })
         .collect();
-    let ids1 = engine.batch_upsert_nodes(&inputs1).unwrap();
+    let ids1 = engine.batch_upsert_nodes(inputs1).unwrap();
 
     // Second batch: should trigger backpressure flush before appending
     let inputs2: Vec<NodeInput> = (0..20)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: format!("batch2_{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -5877,7 +6657,7 @@ fn test_backpressure_with_batch_upserts() {
             sparse_vector: None,
         })
         .collect();
-    let ids2 = engine.batch_upsert_nodes(&inputs2).unwrap();
+    let ids2 = engine.batch_upsert_nodes(inputs2).unwrap();
 
     assert!(
         engine.segment_count().unwrap() >= 1,
@@ -5916,7 +6696,7 @@ fn test_backpressure_flush_then_write_cycle_group_commit() {
     for i in 0..200 {
         let id = engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("stress_{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -5983,7 +6763,7 @@ fn test_backpressure_interacts_with_auto_compact() {
     for i in 0..100 {
         engine
             .upsert_node(
-                1,
+                "Person",
                 &format!("ac_{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -6024,20 +6804,42 @@ fn test_backpressure_invalidate_edge() {
     let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let n1 = engine
-        .upsert_node(1, "src", UpsertNodeOptions::default())
+        .upsert_node("Person", "src", UpsertNodeOptions::default())
         .unwrap();
     let n2 = engine
-        .upsert_node(1, "dst", UpsertNodeOptions::default())
+        .upsert_node("Person", "dst", UpsertNodeOptions::default())
         .unwrap();
 
     // Create many edges to fill memtable
     let mut edge_ids = Vec::new();
-    for i in 0..20 {
+    let edge_labels = [
+        "RELATES_TO",
+        "WORKS_AT",
+        "LIKES",
+        "MENTIONS",
+        "OWNS",
+        "FOLLOWS",
+        "FRIENDS_WITH",
+        "COLLABORATES_WITH",
+        "RELATED_TO",
+        "KNOWS",
+        "BLOCKS",
+        "DEPENDS_ON",
+        "ASSIGNED_TO",
+        "REVIEWED_BY",
+        "PUBLISHED_BY",
+        "TAGGED_WITH",
+        "EDGE_LABEL_17",
+        "EDGE_LABEL_18",
+        "EDGE_LABEL_19",
+        "REPORTS_TO",
+    ];
+    for label in edge_labels {
         let eid = engine
             .upsert_edge(
                 n1,
                 n2,
-                i as u32,
+                label,
                 UpsertEdgeOptions {
                     weight: 0.5,
                     ..Default::default()
@@ -6069,13 +6871,13 @@ fn test_compact_all_records_tombstoned() {
     let db = open_imm(&dir.path().join("db"));
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let e = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
@@ -6094,7 +6896,7 @@ fn test_compact_all_records_tombstoned() {
 
     // DB should still be functional after compaction of all-tombstone data
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     assert!(db.get_node(c).unwrap().is_some());
     db.close().unwrap();
@@ -6108,18 +6910,18 @@ fn test_engine_seq_monotonic_across_writes() {
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let id1 = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let id2 = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let id3 = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
 
-    let seq1 = db.get_node(id1).unwrap().unwrap().last_write_seq;
-    let seq2 = db.get_node(id2).unwrap().unwrap().last_write_seq;
-    let seq3 = db.get_node(id3).unwrap().unwrap().last_write_seq;
+    let seq1 = internal_node_record(&db, id1).unwrap().unwrap().last_write_seq;
+    let seq2 = internal_node_record(&db, id2).unwrap().unwrap().last_write_seq;
+    let seq3 = internal_node_record(&db, id3).unwrap().unwrap().last_write_seq;
 
     assert!(seq1 > 0, "seq must be > 0");
     assert!(seq2 > seq1, "seq2 ({}) must be > seq1 ({})", seq2, seq1);
@@ -6133,17 +6935,17 @@ fn test_engine_seq_survives_flush() {
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
-    db.upsert_node(1, "a", UpsertNodeOptions::default())
+    db.upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_node(1, "b", UpsertNodeOptions::default())
+    db.upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
     // After flush, next write should continue with higher seq
     let id3 = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    let seq3 = db.get_node(id3).unwrap().unwrap().last_write_seq;
+    let seq3 = internal_node_record(&db, id3).unwrap().unwrap().last_write_seq;
     assert!(
         seq3 >= 3,
         "seq after flush must continue monotonically, got {}",
@@ -6158,9 +6960,9 @@ fn test_engine_seq_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
-        db.upsert_node(1, "a", UpsertNodeOptions::default())
+        db.upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_node(1, "b", UpsertNodeOptions::default())
+        db.upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
         db.close().unwrap();
@@ -6168,9 +6970,9 @@ fn test_engine_seq_survives_reopen() {
     {
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         let id3 = db
-            .upsert_node(1, "c", UpsertNodeOptions::default())
+            .upsert_node("Person", "c", UpsertNodeOptions::default())
             .unwrap();
-        let seq3 = db.get_node(id3).unwrap().unwrap().last_write_seq;
+        let seq3 = internal_node_record(&db, id3).unwrap().unwrap().last_write_seq;
         // After reopen with flush, manifest persisted next_engine_seq,
         // so seq must continue from where it left off
         assert!(seq3 >= 3, "seq after reopen must be >= 3, got {}", seq3);
@@ -6183,9 +6985,9 @@ fn test_engine_seq_correct_after_replay() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
-        db.upsert_node(1, "a", UpsertNodeOptions::default())
+        db.upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_node(1, "b", UpsertNodeOptions::default())
+        db.upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
         // Close WITHOUT flush; WAL will be replayed on reopen.
         db.close().unwrap();
@@ -6193,16 +6995,16 @@ fn test_engine_seq_correct_after_replay() {
     {
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         // After replay, the memtable records should have seqs assigned
-        let n1 = db.get_node(1).unwrap().unwrap();
-        let n2 = db.get_node(2).unwrap().unwrap();
+        let n1 = internal_node_record(&db, 1).unwrap().unwrap();
+        let n2 = internal_node_record(&db, 2).unwrap().unwrap();
         assert!(n1.last_write_seq > 0);
         assert!(n2.last_write_seq > n1.last_write_seq);
 
         // New writes should continue beyond replayed seqs
         let id3 = db
-            .upsert_node(1, "c", UpsertNodeOptions::default())
+            .upsert_node("Person", "c", UpsertNodeOptions::default())
             .unwrap();
-        let seq3 = db.get_node(id3).unwrap().unwrap().last_write_seq;
+        let seq3 = internal_node_record(&db, id3).unwrap().unwrap().last_write_seq;
         assert!(seq3 > n2.last_write_seq);
         db.close().unwrap();
     }
@@ -6217,59 +7019,68 @@ fn test_last_write_seq_exact_equality_across_reopen() {
 
     let (seq_a, seq_b, seq_c);
 
-    // Phase 1: write 3 nodes, capture exact seqs, close_fast (no flush)
+    // Step 1: write 3 nodes, capture exact seqs, close_fast (no flush)
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let id_a = db
-            .upsert_node(1, "a", UpsertNodeOptions::default())
+            .upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
         let id_b = db
-            .upsert_node(1, "b", UpsertNodeOptions::default())
+            .upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
         let id_c = db
-            .upsert_node(1, "c", UpsertNodeOptions::default())
+            .upsert_node("Person", "c", UpsertNodeOptions::default())
             .unwrap();
-        seq_a = db.get_node(id_a).unwrap().unwrap().last_write_seq;
-        seq_b = db.get_node(id_b).unwrap().unwrap().last_write_seq;
-        seq_c = db.get_node(id_c).unwrap().unwrap().last_write_seq;
+        seq_a = internal_node_record(&db, id_a).unwrap().unwrap().last_write_seq;
+        seq_b = internal_node_record(&db, id_b).unwrap().unwrap().last_write_seq;
+        seq_c = internal_node_record(&db, id_c).unwrap().unwrap().last_write_seq;
         assert!(seq_a < seq_b && seq_b < seq_c);
         db.close_fast().unwrap();
     }
 
-    // Phase 2: reopen (WAL replay). Seqs must be exactly the same.
+    // Step 2: reopen (WAL replay). Seqs must be exactly the same.
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         assert_eq!(
-            db.get_node(1).unwrap().unwrap().last_write_seq,
+            internal_node_record(&db, 1).unwrap().unwrap().last_write_seq,
             seq_a,
             "node a seq changed after replay"
         );
         assert_eq!(
-            db.get_node(2).unwrap().unwrap().last_write_seq,
+            internal_node_record(&db, 2).unwrap().unwrap().last_write_seq,
             seq_b,
             "node b seq changed after replay"
         );
         assert_eq!(
-            db.get_node(3).unwrap().unwrap().last_write_seq,
+            internal_node_record(&db, 3).unwrap().unwrap().last_write_seq,
             seq_c,
             "node c seq changed after replay"
         );
 
         // New write must continue strictly after
         let id_d = db
-            .upsert_node(1, "d", UpsertNodeOptions::default())
+            .upsert_node("Person", "d", UpsertNodeOptions::default())
             .unwrap();
-        let seq_d = db.get_node(id_d).unwrap().unwrap().last_write_seq;
+        let seq_d = internal_node_record(&db, id_d).unwrap().unwrap().last_write_seq;
         assert!(seq_d > seq_c, "new write seq must be > replayed max");
         db.close_fast().unwrap();
     }
 
-    // Phase 3: reopen again, still exact (double replay).
+    // Step 3: reopen again, still exact (double replay).
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert_eq!(db.get_node(1).unwrap().unwrap().last_write_seq, seq_a);
-        assert_eq!(db.get_node(2).unwrap().unwrap().last_write_seq, seq_b);
-        assert_eq!(db.get_node(3).unwrap().unwrap().last_write_seq, seq_c);
+        assert_eq!(
+            internal_node_record(&db, 1).unwrap().unwrap().last_write_seq,
+            seq_a
+        );
+        assert_eq!(
+            internal_node_record(&db, 2).unwrap().unwrap().last_write_seq,
+            seq_b
+        );
+        assert_eq!(
+            internal_node_record(&db, 3).unwrap().unwrap().last_write_seq,
+            seq_c
+        );
         db.close().unwrap();
     }
 }
@@ -6286,14 +7097,14 @@ fn test_last_write_seq_exact_across_freeze_reopen() {
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let id_f = db
-            .upsert_node(1, "frozen_node", UpsertNodeOptions::default())
+            .upsert_node("Person", "frozen_node", UpsertNodeOptions::default())
             .unwrap();
-        seq_frozen = db.get_node(id_f).unwrap().unwrap().last_write_seq;
+        seq_frozen = internal_node_record(&db, id_f).unwrap().unwrap().last_write_seq;
         db.freeze_memtable().unwrap();
         let id_a = db
-            .upsert_node(1, "active_node", UpsertNodeOptions::default())
+            .upsert_node("Person", "active_node", UpsertNodeOptions::default())
             .unwrap();
-        seq_active = db.get_node(id_a).unwrap().unwrap().last_write_seq;
+        seq_active = internal_node_record(&db, id_a).unwrap().unwrap().last_write_seq;
         assert!(seq_active > seq_frozen);
         db.close_fast().unwrap();
     }
@@ -6301,8 +7112,8 @@ fn test_last_write_seq_exact_across_freeze_reopen() {
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         // Frozen node is in immutable_epochs, active node in memtable
-        let f = db.get_node_by_key(1, "frozen_node").unwrap().unwrap();
-        let a = db.get_node_by_key(1, "active_node").unwrap().unwrap();
+        let f = internal_node_record(&db, 1).unwrap().unwrap();
+        let a = internal_node_record(&db, 2).unwrap().unwrap();
         assert_eq!(f.last_write_seq, seq_frozen, "frozen seq changed on replay");
         assert_eq!(a.last_write_seq, seq_active, "active seq changed on replay");
 
@@ -6313,8 +7124,8 @@ fn test_last_write_seq_exact_across_freeze_reopen() {
 
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let f = db.get_node_by_key(1, "frozen_node").unwrap().unwrap();
-        let a = db.get_node_by_key(1, "active_node").unwrap().unwrap();
+        let f = internal_node_record(&db, 1).unwrap().unwrap();
+        let a = internal_node_record(&db, 2).unwrap().unwrap();
         assert_eq!(
             f.last_write_seq, seq_frozen,
             "frozen seq changed after flush+reopen"
@@ -6333,23 +7144,23 @@ fn test_compaction_preserves_last_write_seq() {
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let id1 = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
-    let seq1 = db.get_node(id1).unwrap().unwrap().last_write_seq;
+    let seq1 = internal_node_record(&db, id1).unwrap().unwrap().last_write_seq;
     db.flush().unwrap();
 
     let id2 = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
-    let seq2 = db.get_node(id2).unwrap().unwrap().last_write_seq;
+    let seq2 = internal_node_record(&db, id2).unwrap().unwrap().last_write_seq;
     db.flush().unwrap();
 
     // Both nodes are now in segments. Compact.
     db.compact().unwrap();
 
     // After compaction, seqs should be preserved
-    let n1 = db.get_node(id1).unwrap().unwrap();
-    let n2 = db.get_node(id2).unwrap().unwrap();
+    let n1 = internal_node_record(&db, id1).unwrap().unwrap();
+    let n2 = internal_node_record(&db, id2).unwrap().unwrap();
     assert_eq!(n1.last_write_seq, seq1);
     assert_eq!(n2.last_write_seq, seq2);
 
@@ -6363,7 +7174,7 @@ fn test_batch_ops_get_distinct_seq() {
 
     let inputs: Vec<NodeInput> = (0..5)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: format!("n{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -6372,11 +7183,11 @@ fn test_batch_ops_get_distinct_seq() {
         })
         .collect();
 
-    let ids = db.batch_upsert_nodes(&inputs).unwrap();
+    let ids = db.batch_upsert_nodes(inputs).unwrap();
 
     let seqs: Vec<u64> = ids
         .iter()
-        .map(|&id| db.get_node(id).unwrap().unwrap().last_write_seq)
+        .map(|&id| internal_node_record(&db, id).unwrap().unwrap().last_write_seq)
         .collect();
 
     // Each op in the batch should get a distinct, increasing seq
@@ -6397,26 +7208,26 @@ fn test_compaction_preserves_edge_last_write_seq() {
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let nid1 = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let nid2 = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let eid = db
-        .upsert_edge(nid1, nid2, 1, UpsertEdgeOptions::default())
+        .upsert_edge(nid1, nid2, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
-    let edge_seq = db.get_edge(eid).unwrap().unwrap().last_write_seq;
+    let edge_seq = internal_edge_record(&db, eid).unwrap().unwrap().last_write_seq;
     assert!(edge_seq > 0);
     db.flush().unwrap();
 
     // Add second segment so compaction has something to merge
-    db.upsert_node(1, "c", UpsertNodeOptions::default())
+    db.upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
     db.compact().unwrap();
 
-    let edge_after = db.get_edge(eid).unwrap().unwrap();
+    let edge_after = internal_edge_record(&db, eid).unwrap().unwrap();
     assert_eq!(edge_after.last_write_seq, edge_seq);
 
     db.close().unwrap();
@@ -6426,20 +7237,23 @@ fn test_compaction_preserves_edge_last_write_seq() {
 
 #[test]
 fn test_get_edge_hydrates_last_write_seq_from_segment() {
-    // Regression: M1. get_edge() must hydrate last_write_seq from edge_meta.dat.
+    // Regression: M1. get_edge() must hydrate last_write_seq from edge metadata.
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let nid1 = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let nid2 = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let eid = db
-        .upsert_edge(nid1, nid2, 1, UpsertEdgeOptions::default())
+        .upsert_edge(nid1, nid2, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
-    let memtable_seq = db.get_edge(eid).unwrap().unwrap().last_write_seq;
+    let memtable_seq = internal_edge_record(&db, eid)
+        .unwrap()
+        .unwrap()
+        .last_write_seq;
     assert!(
         memtable_seq > 0,
         "edge in memtable must have last_write_seq > 0"
@@ -6447,8 +7261,8 @@ fn test_get_edge_hydrates_last_write_seq_from_segment() {
 
     db.flush().unwrap();
 
-    // Edge is now in a segment. get_edge must hydrate last_write_seq from edge_meta.dat.
-    let segment_edge = db.get_edge(eid).unwrap().unwrap();
+    // Edge is now in a segment. get_edge must hydrate last_write_seq from edge metadata.
+    let segment_edge = internal_edge_record(&db, eid).unwrap().unwrap();
     assert_eq!(
         segment_edge.last_write_seq, memtable_seq,
         "get_edge from segment must preserve last_write_seq (got {}, expected {})",
@@ -6460,22 +7274,22 @@ fn test_get_edge_hydrates_last_write_seq_from_segment() {
 
 #[test]
 fn test_get_nodes_batch_hydrates_last_write_seq_from_segment() {
-    // Regression: M2. get_nodes_batch must hydrate last_write_seq from node_meta.dat.
+    // Regression: M2. get_nodes_batch must hydrate last_write_seq from node metadata.
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let id1 = db
-        .upsert_node(1, "n1", UpsertNodeOptions::default())
+        .upsert_node("Person", "n1", UpsertNodeOptions::default())
         .unwrap();
     let id2 = db
-        .upsert_node(1, "n2", UpsertNodeOptions::default())
+        .upsert_node("Person", "n2", UpsertNodeOptions::default())
         .unwrap();
     let id3 = db
-        .upsert_node(1, "n3", UpsertNodeOptions::default())
+        .upsert_node("Person", "n3", UpsertNodeOptions::default())
         .unwrap();
-    let seq1 = db.get_node(id1).unwrap().unwrap().last_write_seq;
-    let seq2 = db.get_node(id2).unwrap().unwrap().last_write_seq;
-    let seq3 = db.get_node(id3).unwrap().unwrap().last_write_seq;
+    let seq1 = internal_node_record(&db, id1).unwrap().unwrap().last_write_seq;
+    let seq2 = internal_node_record(&db, id2).unwrap().unwrap().last_write_seq;
+    let seq3 = internal_node_record(&db, id3).unwrap().unwrap().last_write_seq;
 
     db.flush().unwrap();
 
@@ -6502,36 +7316,45 @@ fn test_get_nodes_batch_hydrates_last_write_seq_from_segment() {
 
 #[test]
 fn test_get_edges_batch_hydrates_last_write_seq_from_segment() {
-    // Regression: M3. get_edges_batch must hydrate last_write_seq from edge_meta.dat.
+    // Regression: M3. get_edges_batch must hydrate last_write_seq from edge metadata.
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
     let nid1 = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let nid2 = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let nid3 = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     let eid1 = db
-        .upsert_edge(nid1, nid2, 1, UpsertEdgeOptions::default())
+        .upsert_edge(nid1, nid2, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     let eid2 = db
-        .upsert_edge(nid2, nid3, 1, UpsertEdgeOptions::default())
+        .upsert_edge(nid2, nid3, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
     let eid3 = db
-        .upsert_edge(nid1, nid3, 1, UpsertEdgeOptions::default())
+        .upsert_edge(nid1, nid3, "RELATES_TO", UpsertEdgeOptions::default())
         .unwrap();
-    let eseq1 = db.get_edge(eid1).unwrap().unwrap().last_write_seq;
-    let eseq2 = db.get_edge(eid2).unwrap().unwrap().last_write_seq;
-    let eseq3 = db.get_edge(eid3).unwrap().unwrap().last_write_seq;
+    let eseq1 = internal_edge_record(&db, eid1)
+        .unwrap()
+        .unwrap()
+        .last_write_seq;
+    let eseq2 = internal_edge_record(&db, eid2)
+        .unwrap()
+        .unwrap()
+        .last_write_seq;
+    let eseq3 = internal_edge_record(&db, eid3)
+        .unwrap()
+        .unwrap()
+        .last_write_seq;
 
     db.flush().unwrap();
 
     // Batch read from segment via get_edges (uses get_edges_batch internally)
-    let results = db.get_edges(&[eid1, eid2, eid3]).unwrap();
+    let results = internal_edge_records(&db, &[eid1, eid2, eid3]).unwrap();
     assert_eq!(
         results[0].as_ref().unwrap().last_write_seq,
         eseq1,
@@ -6559,7 +7382,7 @@ fn test_tombstone_last_write_seq_survives_flush_reopen() {
     {
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         let id = db
-            .upsert_node(1, "doomed", UpsertNodeOptions::default())
+            .upsert_node("Person", "doomed", UpsertNodeOptions::default())
             .unwrap();
         db.delete_node(id).unwrap();
         // The delete op gets its own engine_seq
@@ -6594,7 +7417,7 @@ fn test_tombstone_survives_flush_reopen() {
     {
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         deleted_id = db
-            .upsert_node(1, "doomed", UpsertNodeOptions::default())
+            .upsert_node("Person", "doomed", UpsertNodeOptions::default())
             .unwrap();
         db.delete_node(deleted_id).unwrap();
         db.flush().unwrap();
@@ -6618,7 +7441,7 @@ fn test_source_list_find_node_across_segments() {
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     let id = db
-        .upsert_node(1, "seg-node", UpsertNodeOptions::default())
+        .upsert_node("Person", "seg-node", UpsertNodeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
@@ -6628,7 +7451,7 @@ fn test_source_list_find_node_across_segments() {
 
     // Upsert same key again (goes to memtable, segment has older version)
     db.upsert_node(
-        1,
+        "Person",
         "seg-node",
         UpsertNodeOptions {
             weight: 2.0,
@@ -6647,7 +7470,7 @@ fn test_source_list_find_node_tombstoned_in_memtable_segment_has_record() {
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     let id = db
-        .upsert_node(1, "will-die", UpsertNodeOptions::default())
+        .upsert_node("Person", "will-die", UpsertNodeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
@@ -6671,46 +7494,46 @@ fn test_source_list_find_edge_by_triple_across_segment() {
     )
     .unwrap();
     let n1 = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let n2 = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
-    let eid = db.upsert_edge(n1, n2, 1, Default::default()).unwrap();
+    let eid = db.upsert_edge(n1, n2, "RELATES_TO", Default::default()).unwrap();
     db.flush().unwrap();
 
     // Edge is in segment. get_edge_by_triple uses SourceList.find_edge_by_triple.
-    let edge = db.get_edge_by_triple(n1, n2, 1).unwrap().unwrap();
+    let edge = db.get_edge_by_triple(n1, n2, "RELATES_TO").unwrap().unwrap();
     assert_eq!(edge.id, eid);
 
     // Delete the edge, then check triple lookup returns None
     db.delete_edge(eid).unwrap();
-    assert!(db.get_edge_by_triple(n1, n2, 1).unwrap().is_none());
+    assert!(db.get_edge_by_triple(n1, n2, "RELATES_TO").unwrap().is_none());
 
     db.close().unwrap();
 }
 
 #[test]
-fn test_source_list_find_node_by_key_across_segment() {
+fn test_source_list_find_node_by_label_key_across_segment() {
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     let id = db
-        .upsert_node(1, "keyed", UpsertNodeOptions::default())
+        .upsert_node("Person", "keyed", UpsertNodeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
     // Key lookup should find the node in the segment
-    let node = db.get_node_by_key(1, "keyed").unwrap().unwrap();
+    let node = db.get_node_by_key("Person", "keyed").unwrap().unwrap();
     assert_eq!(node.id, id);
 
     // Delete and verify key lookup returns None
     db.delete_node(id).unwrap();
-    assert!(db.get_node_by_key(1, "keyed").unwrap().is_none());
+    assert!(db.get_node_by_key("Person", "keyed").unwrap().is_none());
 
     db.close().unwrap();
 }
 
-// --- WAL generation / freeze / immutable memtable tests (Phase 21 CP3) ---
+// --- WAL generation / freeze / immutable memtable tests ---
 
 #[test]
 fn test_freeze_creates_immutable_memtable() {
@@ -6719,9 +7542,9 @@ fn test_freeze_creates_immutable_memtable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write some data
-    db.upsert_node(1, "alice", UpsertNodeOptions::default())
+    db.upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_node(1, "bob", UpsertNodeOptions::default())
+    db.upsert_node("Person", "bob", UpsertNodeOptions::default())
         .unwrap();
 
     assert_eq!(db.immutable_memtable_count(), 0);
@@ -6759,15 +7582,20 @@ fn test_write_after_freeze_goes_to_new_generation() {
     let db_path = dir.path().join("freeze_write");
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
+    // This test is about data writes crossing WAL generations. Seed the label
+    // token through the internal catalog so the first public write does not add
+    // a token-definition WAL op to generation 0.
+    seed_internal_node_labels(&db, &[1]).unwrap();
+
     // Write before freeze
     let id_a = db
-        .upsert_node(1, "alice", UpsertNodeOptions::default())
+        .upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
 
     // Write after freeze - should go to new active memtable
     let id_b = db
-        .upsert_node(1, "bob", UpsertNodeOptions::default())
+        .upsert_node("Person", "bob", UpsertNodeOptions::default())
         .unwrap();
 
     // Active memtable should only have the post-freeze write
@@ -6806,10 +7634,10 @@ fn test_flush_with_wal_generations() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write some data, freeze, then write more
-    db.upsert_node(1, "alice", UpsertNodeOptions::default())
+    db.upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
-    db.upsert_node(1, "bob", UpsertNodeOptions::default())
+    db.upsert_node("Person", "bob", UpsertNodeOptions::default())
         .unwrap();
 
     // Flush should process all (freeze active + flush both immutables)
@@ -6820,7 +7648,7 @@ fn test_flush_with_wal_generations() {
     assert_eq!(db.immutable_memtable_count(), 0);
 
     // Both nodes should be readable from segments
-    let nodes = db.get_nodes_by_type(1).unwrap();
+    let nodes = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(nodes.len(), 2);
 
     // Old WAL generation files should be retired
@@ -6841,10 +7669,10 @@ fn test_replay_multiple_wal_generations() {
     // Session 1: write data, freeze (creates gen 0 frozen + gen 1 active), close without flush
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "alice", UpsertNodeOptions::default())
+        db.upsert_node("Person", "alice", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
-        db.upsert_node(1, "bob", UpsertNodeOptions::default())
+        db.upsert_node("Person", "bob", UpsertNodeOptions::default())
             .unwrap();
 
         // close_fast: doesn't flush immutables, just syncs active WAL and writes manifest
@@ -6863,82 +7691,18 @@ fn test_replay_multiple_wal_generations() {
     // Session 2: reopen, verify all data is present via WAL replay
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let nodes = db.get_nodes_by_type(1).unwrap();
+        let nodes = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(
             nodes.len(),
             2,
             "both nodes should be replayed from WAL generations"
         );
 
-        let alice = db.get_node_by_key(1, "alice").unwrap();
+        let alice = db.get_node_by_key("Person", "alice").unwrap();
         assert!(alice.is_some(), "alice should be found after WAL replay");
-        let bob = db.get_node_by_key(1, "bob").unwrap();
+        let bob = db.get_node_by_key("Person", "bob").unwrap();
         assert!(bob.is_some(), "bob should be found after WAL replay");
 
-        db.close().unwrap();
-    }
-}
-
-#[test]
-fn test_data_wal_migration() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("migration_test");
-
-    // Simulate old-format DB: create a data.wal file manually
-    std::fs::create_dir_all(&db_path).unwrap();
-
-    // Write a legacy data.wal with a node
-    {
-        let mut writer = WalWriter::open(&db_path).unwrap();
-        let node = NodeRecord {
-            id: 1,
-            type_id: 1,
-            key: "legacy_node".to_string(),
-            props: BTreeMap::new(),
-            created_at: 1000,
-            updated_at: 1001,
-            weight: 0.5,
-            dense_vector: None,
-            sparse_vector: None,
-            last_write_seq: 0,
-        };
-        writer.append(&WalOp::UpsertNode(node), 1).unwrap();
-        writer.sync().unwrap();
-    }
-
-    // Verify data.wal exists and wal_0.wal does not
-    assert!(db_path.join("data.wal").exists());
-    assert!(!wal_generation_path(&db_path, 0).exists());
-
-    // Open with the engine; should trigger migration.
-    {
-        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-
-        // data.wal should have been renamed to wal_0.wal
-        assert!(
-            !db_path.join("data.wal").exists(),
-            "data.wal should be migrated away"
-        );
-        assert!(
-            wal_generation_path(&db_path, 0).exists(),
-            "wal_0.wal should exist after migration"
-        );
-
-        // Node should be readable from replayed WAL
-        let node = db.get_node_by_key(1, "legacy_node").unwrap();
-        assert!(
-            node.is_some(),
-            "legacy node should be found after migration replay"
-        );
-
-        db.close().unwrap();
-    }
-
-    // Reopen to verify it works with the new format
-    {
-        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let node = db.get_node_by_key(1, "legacy_node").unwrap();
-        assert!(node.is_some(), "legacy node should persist across reopens");
         db.close().unwrap();
     }
 }
@@ -6957,10 +7721,10 @@ fn test_freeze_and_read_from_immutable() {
 
     // Write nodes
     let id_a = db
-        .upsert_node(1, "alice", UpsertNodeOptions::default())
+        .upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
     let id_b = db
-        .upsert_node(1, "bob", UpsertNodeOptions::default())
+        .upsert_node("Person", "bob", UpsertNodeOptions::default())
         .unwrap();
 
     // Freeze: data moves to immutable epoch.
@@ -6990,18 +7754,18 @@ fn test_freeze_and_read_from_immutable() {
     assert_eq!(bob.unwrap().key, "bob");
 
     // Key lookups should also work
-    let alice_by_key = db.get_node_by_key(1, "alice").unwrap();
+    let alice_by_key = db.get_node_by_key("Person", "alice").unwrap();
     assert!(
         alice_by_key.is_some(),
         "alice should be findable by key while in-flight"
     );
 
-    // Type query should return both
-    let all = db.get_nodes_by_type(1).unwrap();
+    // Label query should return both
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(
         all.len(),
         2,
-        "get_nodes_by_type should see in-flight epoch data"
+        "get_nodes_by_labels should see in-flight epoch data"
     );
 
     // Release worker, verify data moves to segment
@@ -7030,23 +7794,23 @@ fn test_multiple_freezes_before_flush() {
     let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Write and freeze three times
-    db.upsert_node(1, "a", UpsertNodeOptions::default())
+    db.upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_epoch_count(), 1);
 
-    db.upsert_node(1, "b", UpsertNodeOptions::default())
+    db.upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_epoch_count(), 2);
 
-    db.upsert_node(1, "c", UpsertNodeOptions::default())
+    db.upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_epoch_count(), 3);
 
     // All data should be readable across 3 immutable epochs
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(
         all.len(),
         3,
@@ -7066,7 +7830,7 @@ fn test_multiple_freezes_before_flush() {
     // All 3 epochs still visible while first is in-flight
     assert_eq!(db.immutable_epoch_count(), 3);
     assert_eq!(db.in_flight_count(), 3);
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all.len(), 3, "all nodes visible during in-flight flush");
 
     // Release and drain
@@ -7076,7 +7840,7 @@ fn test_multiple_freezes_before_flush() {
 
     // Data should now be in segments
     assert_eq!(db.segment_count().unwrap(), 3);
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all.len(), 3);
 
     db.close().unwrap();
@@ -7090,9 +7854,9 @@ fn test_wal_generation_survives_close_fast() {
     // Write data and close_fast (no flush)
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "node1", UpsertNodeOptions::default())
+        db.upsert_node("Person", "node1", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_node(1, "node2", UpsertNodeOptions::default())
+        db.upsert_node("Person", "node2", UpsertNodeOptions::default())
             .unwrap();
         db.close_fast().unwrap();
     }
@@ -7100,7 +7864,7 @@ fn test_wal_generation_survives_close_fast() {
     // Reopen and verify data is present
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 2, "data should survive close_fast + reopen");
         db.close().unwrap();
     }
@@ -7113,7 +7877,7 @@ fn test_flush_retires_wal_generations() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Write data
-    db.upsert_node(1, "node1", UpsertNodeOptions::default())
+    db.upsert_node("Person", "node1", UpsertNodeOptions::default())
         .unwrap();
 
     // After flush, the old WAL generation should be deleted
@@ -7153,7 +7917,7 @@ fn test_bg_flush_writes_continue_during_flush() {
 
     // Write first batch and freeze
     for i in 0..50 {
-        db.upsert_node(1, &format!("pre:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("pre:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.freeze_memtable().unwrap();
@@ -7166,12 +7930,12 @@ fn test_bg_flush_writes_continue_during_flush() {
 
     // Write more data to the active memtable while flush is in-flight
     for i in 0..50 {
-        db.upsert_node(1, &format!("post:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("post:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
 
     // All 100 nodes visible: 50 from in-flight immutable epoch + 50 from active
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(
         all.len(),
         100,
@@ -7184,7 +7948,7 @@ fn test_bg_flush_writes_continue_during_flush() {
     db.flush().unwrap();
 
     // All 100 nodes still visible, now from segments
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all.len(), 100, "all nodes should be visible after bg flush");
     assert!(db.segment_count().unwrap() >= 2, "should have at least 2 segments");
     assert_eq!(db.immutable_epoch_count(), 0);
@@ -7210,7 +7974,7 @@ fn test_bg_flush_multiple_immutables() {
     for batch in 0..4 {
         for i in 0..10 {
             db.upsert_node(
-                1,
+                "Person",
                 &format!("batch{}:node{}", batch, i),
                 UpsertNodeOptions::default(),
             )
@@ -7231,7 +7995,7 @@ fn test_bg_flush_multiple_immutables() {
     // All 4 epochs in-flight, all 40 nodes visible
     assert_eq!(db.immutable_epoch_count(), 4);
     assert_eq!(db.in_flight_count(), 4);
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all.len(), 40, "all 40 nodes visible during in-flight flush");
 
     // Release and drain all
@@ -7246,7 +8010,7 @@ fn test_bg_flush_multiple_immutables() {
     );
 
     // All 40 nodes in segments
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all.len(), 40, "all 40 nodes should be present in segments");
 
     // Reopen and verify persistence
@@ -7254,7 +8018,7 @@ fn test_bg_flush_multiple_immutables() {
     db.close().unwrap();
 
     let db2 = DatabaseEngine::open(&path, &DbOptions::default()).unwrap();
-    let all2 = db2.get_nodes_by_type(1).unwrap();
+    let all2 = db2.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all2.len(), 40, "all 40 nodes should survive reopen");
     db2.close().unwrap();
 }
@@ -7268,7 +8032,7 @@ fn test_bg_flush_close_drains_all() {
 
     // Write data
     for i in 0..20 {
-        db.upsert_node(1, &format!("drain:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("drain:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
 
@@ -7276,7 +8040,7 @@ fn test_bg_flush_close_drains_all() {
     db.flush().unwrap();
 
     // All data should be in segments now
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all.len(), 20);
 
     // Close should succeed without losing data
@@ -7285,7 +8049,7 @@ fn test_bg_flush_close_drains_all() {
 
     // Reopen and verify
     let db2 = DatabaseEngine::open(&path, &DbOptions::default()).unwrap();
-    let all2 = db2.get_nodes_by_type(1).unwrap();
+    let all2 = db2.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all2.len(), 20, "all nodes should survive close + reopen");
     db2.close().unwrap();
 }
@@ -7301,7 +8065,7 @@ fn test_bg_flush_close_fast_preserves_recovery() {
 
         // Write data to memtable but don't flush
         for i in 0..15 {
-            db.upsert_node(1, &format!("fast:{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("fast:{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
 
@@ -7312,7 +8076,7 @@ fn test_bg_flush_close_fast_preserves_recovery() {
     // Reopen: WAL replay should recover all data.
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(
             all.len(),
             15,
@@ -7333,14 +8097,14 @@ fn test_bg_flush_close_fast_with_frozen_memtables() {
 
         // Write and freeze
         for i in 0..10 {
-            db.upsert_node(1, &format!("frozen:{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("frozen:{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
         db.freeze_memtable().unwrap();
 
         // Write more to active memtable
         for i in 10..20 {
-            db.upsert_node(1, &format!("active:{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("active:{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
 
@@ -7351,7 +8115,7 @@ fn test_bg_flush_close_fast_with_frozen_memtables() {
     // Reopen: WAL should recover all data from both generations.
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(
             all.len(),
             20,
@@ -7368,7 +8132,7 @@ fn test_shutdown_bg_flush_resets_stale_in_flight_epochs() {
 
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "stale-in-flight", UpsertNodeOptions::default())
+        db.upsert_node("Person", "stale-in-flight", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
 
@@ -7389,7 +8153,7 @@ fn test_shutdown_bg_flush_resets_stale_in_flight_epochs() {
 
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let node = db.get_node_by_key(1, "stale-in-flight").unwrap();
+        let node = db.get_node_by_key("Person", "stale-in-flight").unwrap();
         assert!(node.is_some());
         db.close().unwrap();
     }
@@ -7405,18 +8169,18 @@ fn test_stale_frozen_epochs_cleaned_on_reopen_then_flush_works() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("stale_epoch");
 
-    // Phase 1: write, freeze, close_fast (leaves FrozenPendingFlush)
+    // Step 1: write, freeze, close_fast (leaves FrozenPendingFlush)
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "before_crash", UpsertNodeOptions::default())
+        db.upsert_node("Person", "before_crash", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
-        db.upsert_node(1, "active_at_crash", UpsertNodeOptions::default())
+        db.upsert_node("Person", "active_at_crash", UpsertNodeOptions::default())
             .unwrap();
         db.close_fast().unwrap();
     }
 
-    // Phase 2: reopen. Frozen epoch is rebuilt as immutable, not cleaned up.
+    // Step 2: reopen. Frozen epoch is rebuilt as immutable, not cleaned up.
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
@@ -7430,22 +8194,22 @@ fn test_stale_frozen_epochs_cleaned_on_reopen_then_flush_works() {
         assert_eq!(db.immutable_epoch_count(), 1);
 
         // Both nodes should be recovered via WAL replay
-        assert!(db.get_node_by_key(1, "before_crash").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "active_at_crash").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "before_crash").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "active_at_crash").unwrap().is_some());
 
         // Now do a new write cycle: freeze + flush should work cleanly
-        db.upsert_node(1, "after_reopen", UpsertNodeOptions::default())
+        db.upsert_node("Person", "after_reopen", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
-        db.upsert_node(1, "post_freeze", UpsertNodeOptions::default())
+        db.upsert_node("Person", "post_freeze", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Verify all 4 nodes present
-        assert!(db.get_node_by_key(1, "before_crash").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "active_at_crash").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "after_reopen").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "post_freeze").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "before_crash").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "active_at_crash").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "after_reopen").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "post_freeze").unwrap().is_some());
 
         // All epochs drained after flush
         assert!(
@@ -7456,10 +8220,10 @@ fn test_stale_frozen_epochs_cleaned_on_reopen_then_flush_works() {
         db.close().unwrap();
     }
 
-    // Phase 3: final reopen to confirm persistence
+    // Step 3: final reopen to confirm persistence
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 4, "all 4 nodes should survive full cycle");
         db.close().unwrap();
     }
@@ -7472,29 +8236,29 @@ fn test_repeated_crash_after_freeze_preserves_data() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("double_crash");
 
-    // Phase 1: write, freeze, simulate crash
+    // Step 1: write, freeze, simulate crash
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "survivor", UpsertNodeOptions::default())
+        db.upsert_node("Person", "survivor", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
         db.close_fast().unwrap();
     }
 
-    // Phase 2: reopen (rebuilds frozen as immutable), then crash again
+    // Step 2: reopen (rebuilds frozen as immutable), then crash again
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert!(db.get_node_by_key(1, "survivor").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "survivor").unwrap().is_some());
         assert_eq!(db.immutable_epoch_count(), 1);
         // Crash without flushing; close_fast doesn't flush.
         db.close_fast().unwrap();
     }
 
-    // Phase 3: reopen again. Data must survive the double crash.
+    // Step 3: reopen again. Data must survive the double crash.
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         assert!(
-            db.get_node_by_key(1, "survivor").unwrap().is_some(),
+            db.get_node_by_key("Person", "survivor").unwrap().is_some(),
             "data must survive two crashes without flush"
         );
         assert_eq!(db.immutable_epoch_count(), 1);
@@ -7506,10 +8270,10 @@ fn test_repeated_crash_after_freeze_preserves_data() {
         db.close().unwrap();
     }
 
-    // Phase 4: final verification
+    // Step 4: final verification
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert!(db.get_node_by_key(1, "survivor").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "survivor").unwrap().is_some());
         db.close().unwrap();
     }
 }
@@ -7533,7 +8297,7 @@ fn test_multi_freeze_flush_retires_each_wal_gen() {
 
     // Freeze 3 separate batches → creates WAL gens 0, 1, 2 (active = 3)
     for batch in 0..3 {
-        db.upsert_node(1, &format!("batch{}", batch), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("batch{}", batch), UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
     }
@@ -7579,7 +8343,7 @@ fn test_multi_freeze_flush_retires_each_wal_gen() {
     // All data visible from immutable epochs
     for batch in 0..3 {
         assert!(
-            db.get_node_by_key(1, &format!("batch{}", batch))
+            db.get_node_by_key("Person", &format!("batch{}", batch))
                 .unwrap()
                 .is_some(),
             "batch{} should be visible during in-flight",
@@ -7616,7 +8380,7 @@ fn test_multi_freeze_flush_retires_each_wal_gen() {
     assert_eq!(db.segment_count().unwrap(), 3);
     for batch in 0..3 {
         assert!(
-            db.get_node_by_key(1, &format!("batch{}", batch))
+            db.get_node_by_key("Person", &format!("batch{}", batch))
                 .unwrap()
                 .is_some(),
             "batch{} should be visible in segments",
@@ -7643,7 +8407,7 @@ fn test_flush_wait_loop_handles_worker_failure() {
     let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Create one epoch and inject a failure
-    db.upsert_node(1, "fail_node", UpsertNodeOptions::default())
+    db.upsert_node("Person", "fail_node", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
 
@@ -7658,7 +8422,7 @@ fn test_flush_wait_loop_handles_worker_failure() {
     assert_eq!(db.immutable_epoch_count(), 1);
     assert_eq!(db.in_flight_count(), 0);
     assert!(
-        db.get_node_by_key(1, "fail_node").unwrap().is_some(),
+        db.get_node_by_key("Person", "fail_node").unwrap().is_some(),
         "data should remain visible after worker failure"
     );
 
@@ -7667,7 +8431,7 @@ fn test_flush_wait_loop_handles_worker_failure() {
     assert_eq!(db.immutable_epoch_count(), 0);
     assert_eq!(db.segment_count().unwrap(), 1);
     assert!(
-        db.get_node_by_key(1, "fail_node").unwrap().is_some(),
+        db.get_node_by_key("Person", "fail_node").unwrap().is_some(),
         "data should be in segment after retry"
     );
 
@@ -7689,7 +8453,7 @@ fn test_write_after_reported_flush_failure_retries_in_background() {
     };
     let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-    db.upsert_node(1, "fail_node", UpsertNodeOptions::default())
+    db.upsert_node("Person", "fail_node", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
 
@@ -7702,7 +8466,7 @@ fn test_write_after_reported_flush_failure_retries_in_background() {
 
     // Subsequent ordinary write should not be wedged by the already-reported
     // sticky error. It should restart the worker and enqueue the failed epoch.
-    db.upsert_node(1, "retry_trigger", UpsertNodeOptions::default())
+    db.upsert_node("Person", "retry_trigger", UpsertNodeOptions::default())
         .unwrap();
     assert_eq!(
         db.in_flight_count(),
@@ -7714,17 +8478,17 @@ fn test_write_after_reported_flush_failure_retries_in_background() {
     assert!(seg.is_some(), "retried epoch should flush successfully");
     assert_eq!(db.immutable_epoch_count(), 0);
     assert!(
-        db.get_node_by_key(1, "fail_node").unwrap().is_some(),
+        db.get_node_by_key("Person", "fail_node").unwrap().is_some(),
         "failed epoch data should be published after retry"
     );
 
     // Sticky error should clear after successful adoption of the failed epoch.
-    db.upsert_node(1, "after_clear", UpsertNodeOptions::default())
+    db.upsert_node("Person", "after_clear", UpsertNodeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
-    assert!(db.get_node_by_key(1, "retry_trigger").unwrap().is_some());
-    assert!(db.get_node_by_key(1, "after_clear").unwrap().is_some());
+    assert!(db.get_node_by_key("Person", "retry_trigger").unwrap().is_some());
+    assert!(db.get_node_by_key("Person", "after_clear").unwrap().is_some());
 
     db.close().unwrap();
 }
@@ -7738,13 +8502,13 @@ fn test_get_edges_batch_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let e1 = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: edge e1 moves to immutable memtable
@@ -7752,10 +8516,10 @@ fn test_get_edges_batch_sees_immutable() {
 
     // Create another edge in active memtable
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     let e2 = db
-        .upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // get_edges should see both
@@ -7783,12 +8547,12 @@ fn test_neighbors_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: adjacency moves to immutable memtable
@@ -7796,9 +8560,9 @@ fn test_neighbors_sees_immutable() {
 
     // Create another edge in active memtable
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // neighbors() should see both edges
@@ -7839,7 +8603,7 @@ fn test_find_nodes_sees_immutable() {
     );
     let _id_a = db
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 props: props.clone(),
@@ -7853,7 +8617,7 @@ fn test_find_nodes_sees_immutable() {
 
     let _id_b = db
         .upsert_node(
-            1,
+            "Person",
             "b",
             UpsertNodeOptions {
                 props: props.clone(),
@@ -7864,7 +8628,7 @@ fn test_find_nodes_sees_immutable() {
 
     // find_nodes should see both
     let found = db
-        .find_nodes(1, "status", &PropValue::String("active".to_string()))
+        .find_nodes("Person", "status", &PropValue::String("active".to_string()))
         .unwrap();
     assert_eq!(
         found.len(),
@@ -7876,63 +8640,63 @@ fn test_find_nodes_sees_immutable() {
 }
 
 #[test]
-fn test_nodes_by_type_paged_sees_immutable() {
+fn test_nodes_by_labels_paged_sees_immutable() {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("type_paged_imm");
+    let db_path = dir.path().join("label_paged_imm");
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    db.upsert_node(1, "a", UpsertNodeOptions::default())
+    db.upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_node(1, "b", UpsertNodeOptions::default())
+    db.upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
 
     // Freeze
     db.freeze_memtable().unwrap();
 
-    db.upsert_node(1, "c", UpsertNodeOptions::default())
+    db.upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
 
-    // nodes_by_type_paged should see all 3
-    let page = db.nodes_by_type_paged(1, &PageRequest::default()).unwrap();
+    // nodes_by_labels_paged should see all 3
+    let page = db.nodes_by_labels_paged("Person", &PageRequest::default()).unwrap();
     assert_eq!(
         page.items.len(),
         3,
-        "nodes_by_type_paged should see nodes from both active and immutable memtables"
+        "nodes_by_labels_paged should see nodes from both active and immutable memtables"
     );
 
     db.close().unwrap();
 }
 
 #[test]
-fn test_edges_by_type_paged_sees_immutable() {
+fn test_edges_by_label_paged_sees_immutable() {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("edge_type_paged_imm");
+    let db_path = dir.path().join("edge_label_paged_imm");
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze
     db.freeze_memtable().unwrap();
 
-    db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
-    // edges_by_type_paged should see both edges
-    let page = db.edges_by_type_paged(10, &PageRequest::default()).unwrap();
+    // edges_by_label_paged should see both edges
+    let page = db.edges_by_label_paged("KNOWS", &PageRequest::default()).unwrap();
     assert_eq!(
         page.items.len(),
         2,
-        "edges_by_type_paged should see edges from both active and immutable memtables"
+        "edges_by_label_paged should see edges from both active and immutable memtables"
     );
 
     db.close().unwrap();
@@ -7945,20 +8709,20 @@ fn test_neighbors_batch_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     db.freeze_memtable().unwrap();
 
-    db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     let results = db
@@ -7997,7 +8761,7 @@ fn test_dense_search_sees_immutable() {
 
     // Insert a node with dense vector
     db.upsert_node(
-        1,
+        "Person",
         "vec_a",
         UpsertNodeOptions {
             dense_vector: Some(vec![1.0, 0.0, 0.0]),
@@ -8011,7 +8775,7 @@ fn test_dense_search_sees_immutable() {
 
     // Insert another node with dense vector in active memtable
     db.upsert_node(
-        1,
+        "Person",
         "vec_b",
         UpsertNodeOptions {
             dense_vector: Some(vec![0.0, 1.0, 0.0]),
@@ -8027,7 +8791,7 @@ fn test_dense_search_sees_immutable() {
             dense_query: Some(vec![1.0, 0.0, 0.0]),
             sparse_query: None,
             k: 10,
-            type_filter: None,
+            label_filter: None,
             ef_search: None,
             scope: None,
             dense_weight: None,
@@ -8052,7 +8816,7 @@ fn test_sparse_search_sees_immutable() {
 
     // Insert node with sparse vector
     db.upsert_node(
-        1,
+        "Person",
         "sp_a",
         UpsertNodeOptions {
             sparse_vector: Some(vec![(0, 1.0), (1, 0.5)]),
@@ -8066,7 +8830,7 @@ fn test_sparse_search_sees_immutable() {
 
     // Insert another node with sparse vector in active memtable
     db.upsert_node(
-        1,
+        "Person",
         "sp_b",
         UpsertNodeOptions {
             sparse_vector: Some(vec![(0, 0.5), (2, 1.0)]),
@@ -8082,7 +8846,7 @@ fn test_sparse_search_sees_immutable() {
             dense_query: None,
             sparse_query: Some(vec![(0, 1.0)]),
             k: 10,
-            type_filter: None,
+            label_filter: None,
             ef_search: None,
             scope: None,
             dense_weight: None,
@@ -8106,21 +8870,21 @@ fn test_degree_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze
     db.freeze_memtable().unwrap();
 
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // degree should count both edges
@@ -8148,15 +8912,15 @@ fn test_top_k_neighbors_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     db.upsert_edge(
         a,
         b,
-        10,
+        "KNOWS",
         UpsertEdgeOptions {
             weight: 0.5,
             ..Default::default()
@@ -8168,12 +8932,12 @@ fn test_top_k_neighbors_sees_immutable() {
     db.freeze_memtable().unwrap();
 
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     db.upsert_edge(
         a,
         c,
-        10,
+        "KNOWS",
         UpsertEdgeOptions {
             weight: 0.8,
             ..Default::default()
@@ -8206,17 +8970,17 @@ fn test_find_nodes_by_time_range_sees_immutable() {
     let db_path = dir.path().join("time_range_imm");
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    db.upsert_node(1, "a", UpsertNodeOptions::default())
+    db.upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
 
     // Freeze
     db.freeze_memtable().unwrap();
 
-    db.upsert_node(1, "b", UpsertNodeOptions::default())
+    db.upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
 
     // Both should appear in a wide time range query
-    let found = db.find_nodes_by_time_range(1, 0, i64::MAX).unwrap();
+    let found = db.find_nodes_by_time_range("Person", 0, i64::MAX).unwrap();
     assert_eq!(
         found.len(),
         2,
@@ -8234,10 +8998,10 @@ fn test_immutable_tombstones_respected() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
 
     // Flush a and b to segments
@@ -8249,8 +9013,8 @@ fn test_immutable_tombstones_respected() {
     // Freeze: tombstone for b moves to immutable memtable
     db.freeze_memtable().unwrap();
 
-    // b should not be visible via nodes_by_type
-    let all = db.nodes_by_type(1).unwrap();
+    // b should not be visible via nodes_by_labels
+    let all = db.nodes_by_labels("Person").unwrap();
     assert_eq!(
         all.len(),
         1,
@@ -8280,7 +9044,7 @@ fn test_multiple_immutable_memtables_newest_wins() {
     // Write node A with weight 1.0
     let id_a = db
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 1.0,
@@ -8294,7 +9058,7 @@ fn test_multiple_immutable_memtables_newest_wins() {
 
     // Update node A with weight 2.0
     db.upsert_node(
-        1,
+        "Person",
         "a",
         UpsertNodeOptions {
             weight: 2.0,
@@ -8315,8 +9079,8 @@ fn test_multiple_immutable_memtables_newest_wins() {
         node.weight
     );
 
-    // Also test that nodes_by_type sees exactly 1 node (not duplicated)
-    let all = db.nodes_by_type(1).unwrap();
+    // Also test that nodes_by_labels sees exactly 1 node (not duplicated)
+    let all = db.nodes_by_labels("Person").unwrap();
     assert_eq!(
         all.len(),
         1,
@@ -8327,7 +9091,7 @@ fn test_multiple_immutable_memtables_newest_wins() {
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), PropValue::String("red".to_string()));
     db.upsert_node(
-        1,
+        "Person",
         "b",
         UpsertNodeOptions {
             props,
@@ -8337,7 +9101,7 @@ fn test_multiple_immutable_memtables_newest_wins() {
     .unwrap();
 
     // Now active has B, immutable[0] has A (weight 2.0), immutable[1] has A (weight 1.0)
-    let found = db.nodes_by_type(1).unwrap();
+    let found = db.nodes_by_labels("Person").unwrap();
     assert_eq!(
         found.len(),
         2,
@@ -8355,7 +9119,7 @@ fn test_multiple_immutable_tombstone_shadows_older() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let id = db
-        .upsert_node(1, "doomed", UpsertNodeOptions::default())
+        .upsert_node("Person", "doomed", UpsertNodeOptions::default())
         .unwrap();
 
     // Freeze → immutable 1 (oldest, has the record)
@@ -8370,7 +9134,7 @@ fn test_multiple_immutable_tombstone_shadows_older() {
         db.get_node(id).unwrap().is_none(),
         "tombstone in newer immutable should shadow record in older immutable"
     );
-    assert_eq!(db.nodes_by_type(1).unwrap().len(), 0);
+    assert_eq!(db.nodes_by_labels("Person").unwrap().len(), 0);
 
     db.close().unwrap();
 }
@@ -8383,27 +9147,27 @@ fn test_export_adjacency_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: edge a→b moves to immutable
     db.freeze_memtable().unwrap();
 
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     let export = db.export_adjacency(&ExportOptions::default()).unwrap();
     // Should have 3 nodes and 2 edges (a→b from immutable, a→c from active)
     assert_eq!(export.node_ids.len(), 3, "export should see all 3 nodes");
-    let edges_from_a: Vec<_> = export.edges.iter().filter(|e| e.0 == a).collect();
+    let edges_from_a: Vec<_> = export.edges.iter().filter(|e| e.from == a).collect();
     assert_eq!(
         edges_from_a.len(),
         2,
@@ -8421,21 +9185,21 @@ fn test_connected_components_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: edge a→b moves to immutable
     db.freeze_memtable().unwrap();
 
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // All three should be in the same component via a→b (immutable) + b→c (active)
@@ -8462,21 +9226,21 @@ fn test_shortest_path_through_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: edge a→b moves to immutable
     db.freeze_memtable().unwrap();
 
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // shortest_path(a, c) should find 2-hop path via b
@@ -8516,7 +9280,7 @@ fn test_find_nodes_paged_sees_immutable() {
     props.insert("role".to_string(), PropValue::String("admin".to_string()));
 
     db.upsert_node(
-        1,
+        "Person",
         "user_a",
         UpsertNodeOptions {
             props: props.clone(),
@@ -8529,7 +9293,7 @@ fn test_find_nodes_paged_sees_immutable() {
     db.freeze_memtable().unwrap();
 
     db.upsert_node(
-        1,
+        "Person",
         "user_b",
         UpsertNodeOptions {
             props: props.clone(),
@@ -8540,8 +9304,7 @@ fn test_find_nodes_paged_sees_immutable() {
 
     // find_nodes_paged should see both
     let page = db
-        .find_nodes_paged(
-            1,
+        .find_nodes_paged("Person",
             "role",
             &PropValue::String("admin".to_string()),
             &PageRequest::default(),
@@ -8567,7 +9330,7 @@ fn test_upsert_node_dedup_across_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let id1 = db
-        .upsert_node(1, "alice", UpsertNodeOptions::default())
+        .upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
 
     // Freeze: alice moves to immutable memtable
@@ -8576,7 +9339,7 @@ fn test_upsert_node_dedup_across_immutable() {
     // Upsert alice again; should find her in immutable and reuse ID.
     let id2 = db
         .upsert_node(
-            1,
+            "Person",
             "alice",
             UpsertNodeOptions {
                 weight: 0.9,
@@ -8613,13 +9376,13 @@ fn test_edge_uniqueness_across_immutable() {
     let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let e1 = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: edge e1 moves to immutable memtable
@@ -8630,7 +9393,7 @@ fn test_edge_uniqueness_across_immutable() {
         .upsert_edge(
             a,
             b,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 0.7,
                 ..Default::default()
@@ -8661,7 +9424,7 @@ fn test_batch_upsert_node_dedup_across_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let id_alice = db
-        .upsert_node(1, "alice", UpsertNodeOptions::default())
+        .upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
 
     // Freeze
@@ -8670,7 +9433,7 @@ fn test_batch_upsert_node_dedup_across_immutable() {
     // Batch upsert that includes alice (should reuse ID) + new node bob
     let inputs = vec![
         NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: "alice".to_string(),
             props: BTreeMap::new(),
             weight: 0.8,
@@ -8678,7 +9441,7 @@ fn test_batch_upsert_node_dedup_across_immutable() {
             sparse_vector: None,
         },
         NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: "bob".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -8686,7 +9449,7 @@ fn test_batch_upsert_node_dedup_across_immutable() {
             sparse_vector: None,
         },
     ];
-    let ids = db.batch_upsert_nodes(&inputs).unwrap();
+    let ids = db.batch_upsert_nodes(inputs).unwrap();
 
     assert_eq!(
         ids[0], id_alice,
@@ -8709,27 +9472,27 @@ fn test_batch_upsert_edge_uniqueness_across_immutable() {
     let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     let e1 = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze
     db.freeze_memtable().unwrap();
 
-    // Batch: re-upsert (a->b, type 10) + new (a->c, type 10)
+    // Batch: re-upsert (a->b, label 10) + new (a->c, label 10)
     let inputs = vec![
         EdgeInput {
             from: a,
             to: b,
-            type_id: 10,
+            label: "KNOWS".to_string(),
             props: BTreeMap::new(),
             weight: 0.5,
             valid_from: None,
@@ -8738,14 +9501,14 @@ fn test_batch_upsert_edge_uniqueness_across_immutable() {
         EdgeInput {
             from: a,
             to: c,
-            type_id: 10,
+            label: "KNOWS".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         },
     ];
-    let ids = db.batch_upsert_edges(&inputs).unwrap();
+    let ids = db.batch_upsert_edges(inputs).unwrap();
 
     assert_eq!(
         ids[0], e1,
@@ -8765,16 +9528,16 @@ fn test_delete_node_cascades_immutable_edges() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     let e1 = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: edge e1 (a->b) moves to immutable memtable
@@ -8782,7 +9545,7 @@ fn test_delete_node_cascades_immutable_edges() {
 
     // Add another edge in active memtable
     let e2 = db
-        .upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Delete node a; should cascade-delete both e1 (immutable) and e2 (active).
@@ -8819,13 +9582,13 @@ fn test_invalidate_edge_in_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let e1 = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: edge e1 moves to immutable memtable
@@ -8856,13 +9619,13 @@ fn test_graph_patch_dedup_across_immutable() {
     let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     let a_id = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b_id = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let e1 = db
-        .upsert_edge(a_id, b_id, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a_id, b_id, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze
@@ -8873,7 +9636,7 @@ fn test_graph_patch_dedup_across_immutable() {
     let patch = GraphPatch {
         upsert_nodes: vec![
             NodeInput {
-                type_id: 1,
+                labels: vec!["Person".to_string()],
                 key: "a".to_string(),
                 props: BTreeMap::new(),
                 weight: 0.5,
@@ -8881,7 +9644,7 @@ fn test_graph_patch_dedup_across_immutable() {
                 sparse_vector: None,
             },
             NodeInput {
-                type_id: 1,
+                labels: vec!["Person".to_string()],
                 key: "c".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -8892,7 +9655,7 @@ fn test_graph_patch_dedup_across_immutable() {
         upsert_edges: vec![EdgeInput {
             from: a_id,
             to: b_id,
-            type_id: 10,
+            label: "KNOWS".to_string(),
             props: BTreeMap::new(),
             weight: 0.3,
             valid_from: None,
@@ -8903,7 +9666,7 @@ fn test_graph_patch_dedup_across_immutable() {
         delete_edge_ids: vec![],
     };
 
-    let result = db.graph_patch(&patch).unwrap();
+    let result = db.graph_patch(patch).unwrap();
 
     assert_eq!(
         result.node_ids[0], a_id,
@@ -8926,13 +9689,13 @@ fn test_graph_patch_delete_cascades_immutable_edges() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let e1 = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: edge e1 moves to immutable memtable
@@ -8946,7 +9709,7 @@ fn test_graph_patch_delete_cascades_immutable_edges() {
         delete_node_ids: vec![a],
         delete_edge_ids: vec![],
     };
-    db.graph_patch(&patch).unwrap();
+    db.graph_patch(patch).unwrap();
 
     assert!(
         db.get_node(a).unwrap().is_none(),
@@ -8962,16 +9725,16 @@ fn test_graph_patch_delete_cascades_immutable_edges() {
 
 #[test]
 fn test_prune_finds_targets_in_immutable_memtable() {
-    // Prune with no type_id filter must scan immutable memtables for targets.
+    // Prune with no label filter must scan immutable memtables for targets.
     // This is the bug we fixed: collect_prune_targets skipped immutable memtables
-    // in the else (no type_id) branch.
+    // in the else (no label) branch.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("prune_imm");
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     // Insert a low-weight node
     db.upsert_node(
-        1,
+        "Person",
         "old_low",
         UpsertNodeOptions {
             weight: 0.1,
@@ -8985,7 +9748,7 @@ fn test_prune_finds_targets_in_immutable_memtable() {
 
     // Insert a high-weight node in active memtable
     db.upsert_node(
-        1,
+        "Person",
         "new_high",
         UpsertNodeOptions {
             weight: 5.0,
@@ -8994,12 +9757,12 @@ fn test_prune_finds_targets_in_immutable_memtable() {
     )
     .unwrap();
 
-    // Prune nodes with weight <= 0.5 (no type filter)
+    // Prune nodes with weight <= 0.5 (no label filter)
     let result = db
         .prune(&PrunePolicy {
             max_age_ms: None,
             max_weight: Some(0.5),
-            type_id: None,
+            label: None,
         })
         .unwrap();
 
@@ -9009,7 +9772,7 @@ fn test_prune_finds_targets_in_immutable_memtable() {
     );
 
     // The low-weight node should be gone, high-weight should survive
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all.len(), 1, "only the high-weight node should survive");
     assert_eq!(all[0].key, "new_high");
 
@@ -9027,7 +9790,7 @@ fn test_prune_respects_tombstones_in_immutable_memtable() {
     // Create and flush a low-weight node to segment
     let id = db
         .upsert_node(
-            1,
+            "Person",
             "target",
             UpsertNodeOptions {
                 weight: 0.1,
@@ -9048,7 +9811,7 @@ fn test_prune_respects_tombstones_in_immutable_memtable() {
         .prune(&PrunePolicy {
             max_age_ms: None,
             max_weight: Some(0.5),
-            type_id: None,
+            label: None,
         })
         .unwrap();
 
@@ -9069,10 +9832,10 @@ fn test_id_allocation_stable_across_freeze() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
 
     // Freeze
@@ -9080,10 +9843,10 @@ fn test_id_allocation_stable_across_freeze() {
 
     // New nodes after freeze should get IDs > existing IDs
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     let d = db
-        .upsert_node(1, "d", UpsertNodeOptions::default())
+        .upsert_node("Person", "d", UpsertNodeOptions::default())
         .unwrap();
 
     assert!(
@@ -9096,11 +9859,11 @@ fn test_id_allocation_stable_across_freeze() {
 
     // Same for edges
     let e1 = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     let e2 = db
-        .upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        .upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     assert!(
         e2 > e1,
@@ -9108,7 +9871,7 @@ fn test_id_allocation_stable_across_freeze() {
     );
 
     // All 4 nodes should be readable
-    assert_eq!(db.get_nodes_by_type(1).unwrap().len(), 4);
+    assert_eq!(db.get_nodes_by_labels("Person").unwrap().len(), 4);
 
     db.close().unwrap();
 }
@@ -9127,17 +9890,17 @@ fn test_traversal_sees_immutable_edges() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
-    db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: both edges move to immutable memtable
@@ -9176,13 +9939,13 @@ fn test_graph_patch_invalidate_edge_in_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let e1 = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze
@@ -9196,7 +9959,7 @@ fn test_graph_patch_invalidate_edge_in_immutable() {
         delete_node_ids: vec![],
         delete_edge_ids: vec![],
     };
-    db.graph_patch(&patch).unwrap();
+    db.graph_patch(patch).unwrap();
 
     // Edge should still exist but have valid_to = 500
     let edge = db.get_edge(e1).unwrap().unwrap();
@@ -9219,37 +9982,37 @@ fn test_dedup_across_active_immutable_and_segments() {
 
     // Tier 1: write and flush to segment
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let seg_edge = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
     // Tier 2: write and freeze to immutable
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     let imm_edge = db
-        .upsert_edge(a, c, 20, UpsertEdgeOptions::default())
+        .upsert_edge(a, c, "REPORTS_TO", UpsertEdgeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
 
     // Tier 3: write to active memtable
     let d = db
-        .upsert_node(1, "d", UpsertNodeOptions::default())
+        .upsert_node("Person", "d", UpsertNodeOptions::default())
         .unwrap();
     let act_edge = db
-        .upsert_edge(a, d, 30, UpsertEdgeOptions::default())
+        .upsert_edge(a, d, "RATES", UpsertEdgeOptions::default())
         .unwrap();
 
     // Re-upsert node "a"; should find it in segment and reuse ID.
     let a2 = db
         .upsert_node(
-            1,
+            "Person",
             "a",
             UpsertNodeOptions {
                 weight: 0.99,
@@ -9261,7 +10024,7 @@ fn test_dedup_across_active_immutable_and_segments() {
 
     // Re-upsert edge a->c; should find it in immutable memtable.
     let imm_edge2 = db
-        .upsert_edge(a, c, 20, UpsertEdgeOptions::default())
+        .upsert_edge(a, c, "REPORTS_TO", UpsertEdgeOptions::default())
         .unwrap();
     assert_eq!(
         imm_edge, imm_edge2,
@@ -9270,12 +10033,12 @@ fn test_dedup_across_active_immutable_and_segments() {
 
     // Re-upsert edge a->b; should find it in segment.
     let seg_edge2 = db
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     assert_eq!(seg_edge, seg_edge2, "must reuse edge ID from segment");
 
     // All 4 nodes and 3 edges should exist
-    assert_eq!(db.get_nodes_by_type(1).unwrap().len(), 4);
+    assert_eq!(db.get_nodes_by_labels("Person").unwrap().len(), 4);
     let nbrs = db
         .neighbors(
             a,
@@ -9313,19 +10076,19 @@ fn test_write_dedup_across_multiple_immutables() {
 
     // Freeze 1: alice + edge a->b in oldest immutable
     let id_alice = db
-        .upsert_node(1, "alice", UpsertNodeOptions::default())
+        .upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
     let id_bob = db
-        .upsert_node(1, "bob", UpsertNodeOptions::default())
+        .upsert_node("Person", "bob", UpsertNodeOptions::default())
         .unwrap();
     let e1 = db
-        .upsert_edge(id_alice, id_bob, 10, UpsertEdgeOptions::default())
+        .upsert_edge(id_alice, id_bob, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
 
     // Freeze 2: charlie in newer immutable
     let id_charlie = db
-        .upsert_node(1, "charlie", UpsertNodeOptions::default())
+        .upsert_node("Person", "charlie", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
 
@@ -9333,7 +10096,7 @@ fn test_write_dedup_across_multiple_immutables() {
     // charlie in immutable[0], and bob in immutable[1]. No new IDs allocated.
     let inputs = vec![
         NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: "alice".to_string(),
             props: BTreeMap::new(),
             weight: 0.8,
@@ -9341,7 +10104,7 @@ fn test_write_dedup_across_multiple_immutables() {
             sparse_vector: None,
         },
         NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: "bob".to_string(),
             props: BTreeMap::new(),
             weight: 0.9,
@@ -9349,7 +10112,7 @@ fn test_write_dedup_across_multiple_immutables() {
             sparse_vector: None,
         },
         NodeInput {
-            type_id: 1,
+            labels: vec!["Person".to_string()],
             key: "charlie".to_string(),
             props: BTreeMap::new(),
             weight: 0.7,
@@ -9357,7 +10120,7 @@ fn test_write_dedup_across_multiple_immutables() {
             sparse_vector: None,
         },
     ];
-    let ids = db.batch_upsert_nodes(&inputs).unwrap();
+    let ids = db.batch_upsert_nodes(inputs).unwrap();
     assert_eq!(
         ids[0], id_alice,
         "alice should reuse ID from older immutable"
@@ -9370,12 +10133,12 @@ fn test_write_dedup_across_multiple_immutables() {
 
     // Re-upsert edge a->b; should find it in older immutable.
     let e2 = db
-        .upsert_edge(id_alice, id_bob, 10, UpsertEdgeOptions::default())
+        .upsert_edge(id_alice, id_bob, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     assert_eq!(e1, e2, "edge should reuse ID from older immutable");
 
     // Total should still be 3 nodes
-    assert_eq!(db.get_nodes_by_type(1).unwrap().len(), 3);
+    assert_eq!(db.get_nodes_by_labels("Person").unwrap().len(), 3);
 
     db.close().unwrap();
 }
@@ -9390,21 +10153,21 @@ fn test_degrees_batch_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: edge a→b moves to immutable
     db.freeze_memtable().unwrap();
 
-    db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Batch degrees should count edges from both active and immutable
@@ -9435,15 +10198,15 @@ fn test_sum_edge_weights_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     db.upsert_edge(
         a,
         b,
-        10,
+        "KNOWS",
         UpsertEdgeOptions {
             weight: 0.5,
             ..Default::default()
@@ -9455,12 +10218,12 @@ fn test_sum_edge_weights_sees_immutable() {
     db.freeze_memtable().unwrap();
 
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     db.upsert_edge(
         a,
         c,
-        10,
+        "KNOWS",
         UpsertEdgeOptions {
             weight: 1.5,
             ..Default::default()
@@ -9509,21 +10272,21 @@ fn test_neighbors_paged_sees_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze
     db.freeze_memtable().unwrap();
 
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     let page = db
@@ -9565,7 +10328,7 @@ fn test_dense_search_tombstone_in_immutable_hides_result() {
     // Insert two nodes with dense vectors, flush to segments
     let id_a = db
         .upsert_node(
-            1,
+            "Person",
             "vec_a",
             UpsertNodeOptions {
                 dense_vector: Some(vec![1.0, 0.0, 0.0]),
@@ -9575,7 +10338,7 @@ fn test_dense_search_tombstone_in_immutable_hides_result() {
         .unwrap();
     let id_b = db
         .upsert_node(
-            1,
+            "Person",
             "vec_b",
             UpsertNodeOptions {
                 dense_vector: Some(vec![0.9, 0.1, 0.0]),
@@ -9596,7 +10359,7 @@ fn test_dense_search_tombstone_in_immutable_hides_result() {
             dense_query: Some(vec![1.0, 0.0, 0.0]),
             sparse_query: None,
             k: 10,
-            type_filter: None,
+            label_filter: None,
             ef_search: None,
             scope: None,
             dense_weight: None,
@@ -9628,7 +10391,7 @@ fn test_sparse_search_tombstone_in_immutable_hides_result() {
 
     let id_a = db
         .upsert_node(
-            1,
+            "Person",
             "sp_a",
             UpsertNodeOptions {
                 sparse_vector: Some(vec![(0, 1.0), (1, 0.5)]),
@@ -9638,7 +10401,7 @@ fn test_sparse_search_tombstone_in_immutable_hides_result() {
         .unwrap();
     let id_b = db
         .upsert_node(
-            1,
+            "Person",
             "sp_b",
             UpsertNodeOptions {
                 sparse_vector: Some(vec![(0, 0.8), (2, 1.0)]),
@@ -9658,7 +10421,7 @@ fn test_sparse_search_tombstone_in_immutable_hides_result() {
             dense_query: None,
             sparse_query: Some(vec![(0, 1.0)]),
             k: 10,
-            type_filter: None,
+            label_filter: None,
             ef_search: None,
             scope: None,
             dense_weight: None,
@@ -9701,7 +10464,7 @@ fn test_dense_scoped_search_sees_immutable() {
     // Hub node (scope start)
     let hub = db
         .upsert_node(
-            1,
+            "Person",
             "hub",
             UpsertNodeOptions {
                 dense_vector: Some(vec![0.5, 0.5, 0.0]),
@@ -9712,7 +10475,7 @@ fn test_dense_scoped_search_sees_immutable() {
 
     let id_a = db
         .upsert_node(
-            1,
+            "Person",
             "vec_a",
             UpsertNodeOptions {
                 dense_vector: Some(vec![1.0, 0.0, 0.0]),
@@ -9720,7 +10483,7 @@ fn test_dense_scoped_search_sees_immutable() {
             },
         )
         .unwrap();
-    db.upsert_edge(hub, id_a, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(hub, id_a, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze: node A + edge hub→A move to immutable
@@ -9728,7 +10491,7 @@ fn test_dense_scoped_search_sees_immutable() {
 
     let id_b = db
         .upsert_node(
-            1,
+            "Person",
             "vec_b",
             UpsertNodeOptions {
                 dense_vector: Some(vec![0.0, 1.0, 0.0]),
@@ -9736,7 +10499,7 @@ fn test_dense_scoped_search_sees_immutable() {
             },
         )
         .unwrap();
-    db.upsert_edge(hub, id_b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(hub, id_b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Scoped search from hub: traversal discovers A (immutable) and B (active).
@@ -9746,13 +10509,13 @@ fn test_dense_scoped_search_sees_immutable() {
             dense_query: Some(vec![1.0, 0.0, 0.0]),
             sparse_query: None,
             k: 10,
-            type_filter: None,
+            label_filter: None,
             ef_search: None,
             scope: Some(VectorSearchScope {
                 start_node_id: hub,
                 max_depth: 1,
                 direction: Direction::Outgoing,
-                edge_type_filter: None,
+                edge_label_filter: None,
                 at_epoch: None,
             }),
             dense_weight: None,
@@ -9782,15 +10545,15 @@ fn test_dijkstra_shortest_path_through_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     db.upsert_edge(
         a,
         b,
-        10,
+        "KNOWS",
         UpsertEdgeOptions {
             weight: 1.0,
             ..Default::default()
@@ -9802,12 +10565,12 @@ fn test_dijkstra_shortest_path_through_immutable() {
     db.freeze_memtable().unwrap();
 
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     db.upsert_edge(
         b,
         c,
-        10,
+        "KNOWS",
         UpsertEdgeOptions {
             weight: 2.0,
             ..Default::default()
@@ -9847,21 +10610,21 @@ fn test_all_shortest_paths_through_immutable() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // Freeze
     db.freeze_memtable().unwrap();
 
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
-    db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+    db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
 
     // BFS variant (no weight_field)
@@ -9909,9 +10672,9 @@ fn test_crash_after_freeze_before_flush() {
 
         // Write data to gen 0
         let id_a = db
-            .upsert_node(1, "alice", UpsertNodeOptions::default())
+            .upsert_node("Person", "alice", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_edge(id_a, id_a, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(id_a, id_a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // Freeze: gen 0 becomes frozen, gen 1 becomes active
@@ -9921,7 +10684,7 @@ fn test_crash_after_freeze_before_flush() {
 
         // Write data to gen 1 (active)
         let id_b = db
-            .upsert_node(1, "bob", UpsertNodeOptions::default())
+            .upsert_node("Person", "bob", UpsertNodeOptions::default())
             .unwrap();
         assert_ne!(id_a, id_b);
 
@@ -9948,13 +10711,13 @@ fn test_crash_after_freeze_before_flush() {
     // Reopen and verify ALL data recovered
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let alice = db.get_node_by_key(1, "alice").unwrap();
+        let alice = db.get_node_by_key("Person", "alice").unwrap();
         assert!(alice.is_some(), "alice from gen 0 should be recovered");
-        let bob = db.get_node_by_key(1, "bob").unwrap();
+        let bob = db.get_node_by_key("Person", "bob").unwrap();
         assert!(bob.is_some(), "bob from gen 1 should be recovered");
 
         // Edge from gen 0 should also be recovered
-        let all_nodes = db.get_nodes_by_type(1).unwrap();
+        let all_nodes = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all_nodes.len(), 2, "both nodes should be present");
 
         db.close().unwrap();
@@ -9972,9 +10735,9 @@ fn test_crash_with_flushed_segment_and_unflushed_wal() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write and flush -- segment is created and manifest is updated
-        db.upsert_node(1, "flushed_1", UpsertNodeOptions::default())
+        db.upsert_node("Person", "flushed_1", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_node(1, "flushed_2", UpsertNodeOptions::default())
+        db.upsert_node("Person", "flushed_2", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
@@ -9982,9 +10745,9 @@ fn test_crash_with_flushed_segment_and_unflushed_wal() {
         assert!(db.segment_count().unwrap() >= 1);
 
         // Write more data (unflushed)
-        db.upsert_node(1, "unflushed_1", UpsertNodeOptions::default())
+        db.upsert_node("Person", "unflushed_1", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_node(1, "unflushed_2", UpsertNodeOptions::default())
+        db.upsert_node("Person", "unflushed_2", UpsertNodeOptions::default())
             .unwrap();
 
         // Simulate crash after writes but before another flush
@@ -9996,18 +10759,18 @@ fn test_crash_with_flushed_segment_and_unflushed_wal() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Flushed data should be in segments
-        let f1 = db.get_node_by_key(1, "flushed_1").unwrap();
+        let f1 = db.get_node_by_key("Person", "flushed_1").unwrap();
         assert!(f1.is_some(), "flushed_1 from segment should be present");
-        let f2 = db.get_node_by_key(1, "flushed_2").unwrap();
+        let f2 = db.get_node_by_key("Person", "flushed_2").unwrap();
         assert!(f2.is_some(), "flushed_2 from segment should be present");
 
         // Unflushed data should be recovered from WAL replay
-        let u1 = db.get_node_by_key(1, "unflushed_1").unwrap();
+        let u1 = db.get_node_by_key("Person", "unflushed_1").unwrap();
         assert!(u1.is_some(), "unflushed_1 should be recovered from WAL");
-        let u2 = db.get_node_by_key(1, "unflushed_2").unwrap();
+        let u2 = db.get_node_by_key("Person", "unflushed_2").unwrap();
         assert!(u2.is_some(), "unflushed_2 should be recovered from WAL");
 
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 4, "all 4 nodes should be present");
 
         db.close().unwrap();
@@ -10024,9 +10787,9 @@ fn test_crash_after_segment_write_before_manifest_publish() {
 
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "alice", UpsertNodeOptions::default())
+        db.upsert_node("Person", "alice", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_node(1, "bob", UpsertNodeOptions::default())
+        db.upsert_node("Person", "bob", UpsertNodeOptions::default())
             .unwrap();
 
         // Freeze: data goes to immutable, epoch recorded as FrozenPendingFlush
@@ -10040,7 +10803,11 @@ fn test_crash_after_segment_write_before_manifest_publish() {
     // wrote the segment but crash happened before manifest publish).
     let orphan_seg = segment_dir(&db_path, 9999);
     std::fs::create_dir_all(&orphan_seg).unwrap();
-    std::fs::write(orphan_seg.join("nodes.dat"), b"dummy").unwrap();
+    std::fs::write(
+        orphan_seg.join(crate::segment_components::PACKED_CORE_FILENAME),
+        b"dummy",
+    )
+    .unwrap();
 
     // Verify: manifest has FrozenPendingFlush, orphan segment exists
     let manifest = load_manifest(&db_path).unwrap().unwrap();
@@ -10060,14 +10827,14 @@ fn test_crash_after_segment_write_before_manifest_publish() {
 
         // Data recovered from WAL replay
         assert!(
-            db.get_node_by_key(1, "alice").unwrap().is_some(),
+            db.get_node_by_key("Person", "alice").unwrap().is_some(),
             "alice recovered from WAL"
         );
         assert!(
-            db.get_node_by_key(1, "bob").unwrap().is_some(),
+            db.get_node_by_key("Person", "bob").unwrap().is_some(),
             "bob recovered from WAL"
         );
-        assert_eq!(db.get_nodes_by_type(1).unwrap().len(), 2);
+        assert_eq!(db.get_nodes_by_labels("Person").unwrap().len(), 2);
 
         // Orphan segment cleaned up
         assert!(
@@ -10091,17 +10858,17 @@ fn test_crash_with_multiple_frozen_generations() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Gen 0: write and freeze
-        db.upsert_node(1, "gen0_node", UpsertNodeOptions::default())
+        db.upsert_node("Person", "gen0_node", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
 
         // Gen 1: write and freeze
-        db.upsert_node(1, "gen1_node", UpsertNodeOptions::default())
+        db.upsert_node("Person", "gen1_node", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
 
         // Gen 2 (active): write
-        db.upsert_node(1, "gen2_node", UpsertNodeOptions::default())
+        db.upsert_node("Person", "gen2_node", UpsertNodeOptions::default())
             .unwrap();
 
         assert_eq!(db.immutable_memtable_count(), 2);
@@ -10129,19 +10896,19 @@ fn test_crash_with_multiple_frozen_generations() {
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         assert!(
-            db.get_node_by_key(1, "gen0_node").unwrap().is_some(),
+            db.get_node_by_key("Person", "gen0_node").unwrap().is_some(),
             "gen0 data recovered"
         );
         assert!(
-            db.get_node_by_key(1, "gen1_node").unwrap().is_some(),
+            db.get_node_by_key("Person", "gen1_node").unwrap().is_some(),
             "gen1 data recovered"
         );
         assert!(
-            db.get_node_by_key(1, "gen2_node").unwrap().is_some(),
+            db.get_node_by_key("Person", "gen2_node").unwrap().is_some(),
             "gen2 data recovered"
         );
 
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 3, "all 3 generations of data should be present");
 
         db.close().unwrap();
@@ -10165,7 +10932,7 @@ fn test_crash_after_publish_before_wal_retire() {
 
         // Write data and flush -- creates segment and retires WAL
         node_id = db
-            .upsert_node(1, "published_node", UpsertNodeOptions::default())
+            .upsert_node("Person", "published_node", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
@@ -10192,7 +10959,7 @@ fn test_crash_after_publish_before_wal_retire() {
         let mut writer = WalWriter::open_generation(&db_path, 0).unwrap();
         let node = NodeRecord {
             id: node_id,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: "published_node".to_string(),
             props: BTreeMap::new(),
             created_at: 1000,
@@ -10222,7 +10989,7 @@ fn test_crash_after_publish_before_wal_retire() {
         assert_eq!(node.unwrap().key, "published_node");
 
         // No duplicate data -- still just 1 node
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(
             all.len(),
             1,
@@ -10259,7 +11026,7 @@ fn test_reopen_fails_if_published_pending_retire_segment_is_missing() {
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         node_id = db
-            .upsert_node(1, "published_node", UpsertNodeOptions::default())
+            .upsert_node("Person", "published_node", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
         seg_id = db.manifest().unwrap().segments[0].id;
@@ -10279,7 +11046,7 @@ fn test_reopen_fails_if_published_pending_retire_segment_is_missing() {
         let mut writer = WalWriter::open_generation(&db_path, 0).unwrap();
         let node = NodeRecord {
             id: node_id,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: "published_node".to_string(),
             props: BTreeMap::new(),
             created_at: 1000,
@@ -10339,7 +11106,7 @@ fn test_crash_after_wal_delete_before_epoch_removal() {
     let seg_id;
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "survivor", UpsertNodeOptions::default())
+        db.upsert_node("Person", "survivor", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
         seg_id = db.manifest().unwrap().segments[0].id;
@@ -10370,7 +11137,7 @@ fn test_crash_after_wal_delete_before_epoch_removal() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Data should be intact from segment
-        let node = db.get_node_by_key(1, "survivor").unwrap();
+        let node = db.get_node_by_key("Person", "survivor").unwrap();
         assert!(node.is_some(), "node should be readable from segment");
 
         // Stale epoch should be cleaned from manifest
@@ -10393,7 +11160,7 @@ fn test_orphan_segment_ignored_on_reopen_cp8() {
 
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "real_node", UpsertNodeOptions::default())
+        db.upsert_node("Person", "real_node", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
         assert_eq!(db.segment_count().unwrap(), 1);
@@ -10418,7 +11185,7 @@ fn test_orphan_segment_ignored_on_reopen_cp8() {
 
         // Real segment data should be intact
         assert_eq!(db.segment_count().unwrap(), 1);
-        let node = db.get_node_by_key(1, "real_node").unwrap();
+        let node = db.get_node_by_key("Person", "real_node").unwrap();
         assert!(node.is_some(), "real node should still be readable");
 
         db.close().unwrap();
@@ -10434,7 +11201,7 @@ fn test_orphan_wal_generation_ignored() {
 
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "real_node", UpsertNodeOptions::default())
+        db.upsert_node("Person", "real_node", UpsertNodeOptions::default())
             .unwrap();
         db.close_fast().unwrap();
     }
@@ -10444,7 +11211,7 @@ fn test_orphan_wal_generation_ignored() {
         let mut writer = WalWriter::open_generation(&db_path, 99).unwrap();
         let orphan_node = NodeRecord {
             id: 999,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: "orphan_ghost".to_string(),
             props: BTreeMap::new(),
             created_at: 5000,
@@ -10468,7 +11235,7 @@ fn test_orphan_wal_generation_ignored() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Real data should be present
-        let real = db.get_node_by_key(1, "real_node").unwrap();
+        let real = db.get_node_by_key("Person", "real_node").unwrap();
         assert!(real.is_some(), "real_node should be recovered");
 
         // Orphan data should NOT be present
@@ -10478,7 +11245,7 @@ fn test_orphan_wal_generation_ignored() {
             "orphan ghost node from unreferenced WAL gen 99 should NOT be replayed"
         );
 
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 1, "only real_node should exist");
 
         // Orphan WAL file should be cleaned up
@@ -10504,7 +11271,7 @@ fn test_reopen_replays_frozen_epochs_oldest_first() {
 
         // Gen 0: create node with initial value
         db.upsert_node(
-            1,
+            "Person",
             "shared",
             UpsertNodeOptions {
                 weight: 1.0,
@@ -10516,7 +11283,7 @@ fn test_reopen_replays_frozen_epochs_oldest_first() {
 
         // Gen 1: update the same node (different weight to distinguish)
         db.upsert_node(
-            1,
+            "Person",
             "shared",
             UpsertNodeOptions {
                 weight: 2.0,
@@ -10528,7 +11295,7 @@ fn test_reopen_replays_frozen_epochs_oldest_first() {
 
         // Gen 2: update again
         db.upsert_node(
-            1,
+            "Person",
             "shared",
             UpsertNodeOptions {
                 weight: 3.0,
@@ -10543,7 +11310,7 @@ fn test_reopen_replays_frozen_epochs_oldest_first() {
     // Reopen -- newest value should win
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        let node = db.get_node_by_key(1, "shared").unwrap();
+        let node = db.get_node_by_key("Person", "shared").unwrap();
         assert!(node.is_some(), "shared node should be recovered");
         let node = node.unwrap();
         assert!(
@@ -10553,7 +11320,7 @@ fn test_reopen_replays_frozen_epochs_oldest_first() {
         );
 
         // Should be exactly 1 node (not 3 copies)
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 1, "upsert dedup should produce exactly 1 node");
 
         db.close().unwrap();
@@ -10574,18 +11341,18 @@ fn test_published_pending_retire_not_replayed() {
         // Write 5 nodes and an edge, flush to segment
         let ids: Vec<u64> = (0..5)
             .map(|i| {
-                db.upsert_node(1, &format!("node_{}", i), UpsertNodeOptions::default())
+                db.upsert_node("Person", &format!("node_{}", i), UpsertNodeOptions::default())
                     .unwrap()
             })
             .collect();
         let _edge_id = db
-            .upsert_edge(ids[0], ids[1], 10, UpsertEdgeOptions::default())
+            .upsert_edge(ids[0], ids[1], "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
         assert!(db.segment_count().unwrap() >= 1);
 
         // Write more data after flush (this goes to the new active WAL gen)
-        db.upsert_node(1, "post_flush_node", UpsertNodeOptions::default())
+        db.upsert_node("Person", "post_flush_node", UpsertNodeOptions::default())
             .unwrap();
 
         db.close().unwrap();
@@ -10609,7 +11376,7 @@ fn test_published_pending_retire_not_replayed() {
         for i in 0..5 {
             let node = NodeRecord {
                 id: i + 1,
-                type_id: 1,
+                label_ids: NodeLabelSet::single(1).unwrap(),
                 key: format!("node_{}", i),
                 props: BTreeMap::new(),
                 created_at: 1000,
@@ -10629,7 +11396,7 @@ fn test_published_pending_retire_not_replayed() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Should have exactly 6 nodes: 5 from segment + 1 post-flush
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(
             all.len(),
             6,
@@ -10664,24 +11431,24 @@ fn test_reopen_after_flush_then_more_writes() {
 
         // Write and flush
         for i in 0..10 {
-            db.upsert_node(1, &format!("flushed_{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("flushed_{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
         db.flush().unwrap();
 
         // Write more (not flushed)
         for i in 0..10 {
-            db.upsert_node(1, &format!("unflushed_{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("unflushed_{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
 
         // Add edge spanning flushed and unflushed nodes
-        let flushed_node = db.get_node_by_key(1, "flushed_0").unwrap().unwrap();
-        let unflushed_node = db.get_node_by_key(1, "unflushed_0").unwrap().unwrap();
+        let flushed_node = db.get_node_by_key("Person", "flushed_0").unwrap().unwrap();
+        let unflushed_node = db.get_node_by_key("Person", "unflushed_0").unwrap().unwrap();
         db.upsert_edge(
             flushed_node.id,
             unflushed_node.id,
-            10,
+            "KNOWS",
             UpsertEdgeOptions::default(),
         )
         .unwrap();
@@ -10697,7 +11464,7 @@ fn test_reopen_after_flush_then_more_writes() {
         for i in 0..10 {
             let key = format!("flushed_{}", i);
             assert!(
-                db.get_node_by_key(1, &key).unwrap().is_some(),
+                db.get_node_by_key("Person", &key).unwrap().is_some(),
                 "{} should be present from segment",
                 key
             );
@@ -10707,13 +11474,13 @@ fn test_reopen_after_flush_then_more_writes() {
         for i in 0..10 {
             let key = format!("unflushed_{}", i);
             assert!(
-                db.get_node_by_key(1, &key).unwrap().is_some(),
+                db.get_node_by_key("Person", &key).unwrap().is_some(),
                 "{} should be present from WAL replay",
                 key
             );
         }
 
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 20, "all 20 nodes should be present");
 
         db.close().unwrap();
@@ -10731,21 +11498,21 @@ fn test_multiple_flush_reopen_cycles() {
 
         // Cycle 1: write + flush
         for i in 0..5 {
-            db.upsert_node(1, &format!("cycle1_{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("cycle1_{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
         db.flush().unwrap();
 
         // Cycle 2: write + flush
         for i in 0..5 {
-            db.upsert_node(1, &format!("cycle2_{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("cycle2_{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
         db.flush().unwrap();
 
         // Cycle 3: write (no flush -- stays in WAL)
         for i in 0..5 {
-            db.upsert_node(1, &format!("cycle3_{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("cycle3_{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
 
@@ -10760,14 +11527,14 @@ fn test_multiple_flush_reopen_cycles() {
             for i in 0..5 {
                 let key = format!("cycle{}_{}", cycle, i);
                 assert!(
-                    db.get_node_by_key(1, &key).unwrap().is_some(),
+                    db.get_node_by_key("Person", &key).unwrap().is_some(),
                     "{} should be present",
                     key
                 );
             }
         }
 
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(
             all.len(),
             15,
@@ -10786,38 +11553,38 @@ fn test_close_fast_then_close_normally() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("fast_then_normal");
 
-    // Phase 1: Write, freeze, close_fast (simulate crash)
+    // Step 1: Write, freeze, close_fast (simulate crash)
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "surviving_node", UpsertNodeOptions::default())
+        db.upsert_node("Person", "surviving_node", UpsertNodeOptions::default())
             .unwrap();
         let a = db
-            .upsert_node(1, "node_a", UpsertNodeOptions::default())
+            .upsert_node("Person", "node_a", UpsertNodeOptions::default())
             .unwrap();
         let b = db
-            .upsert_node(1, "node_b", UpsertNodeOptions::default())
+            .upsert_node("Person", "node_b", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
 
         // Write more to active
-        db.upsert_node(1, "active_node", UpsertNodeOptions::default())
+        db.upsert_node("Person", "active_node", UpsertNodeOptions::default())
             .unwrap();
 
         db.close_fast().unwrap();
     }
 
-    // Phase 2: Reopen, verify data, flush, close normally
+    // Step 2: Reopen, verify data, flush, close normally
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // All data should be present via WAL replay
-        assert!(db.get_node_by_key(1, "surviving_node").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "node_a").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "node_b").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "active_node").unwrap().is_some());
-        let all = db.get_nodes_by_type(1).unwrap();
+        assert!(db.get_node_by_key("Person", "surviving_node").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "node_a").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "node_b").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "active_node").unwrap().is_some());
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 4, "all 4 nodes should be present after recovery");
 
         // Now flush and close normally
@@ -10828,15 +11595,15 @@ fn test_close_fast_then_close_normally() {
         db.close().unwrap();
     }
 
-    // Phase 3: Reopen again, verify everything is clean
+    // Step 3: Reopen again, verify everything is clean
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        assert!(db.get_node_by_key(1, "surviving_node").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "node_a").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "node_b").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "active_node").unwrap().is_some());
-        let all = db.get_nodes_by_type(1).unwrap();
+        assert!(db.get_node_by_key("Person", "surviving_node").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "node_a").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "node_b").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "active_node").unwrap().is_some());
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 4);
 
         // Manifest should be clean -- no pending flush epochs
@@ -10865,13 +11632,13 @@ fn test_crash_recovery_preserves_edges() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         node_a = db
-            .upsert_node(1, "a", UpsertNodeOptions::default())
+            .upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
         node_b = db
-            .upsert_node(1, "b", UpsertNodeOptions::default())
+            .upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
         edge_ab = db
-            .upsert_edge(node_a, node_b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(node_a, node_b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // Freeze: nodes a,b and edge_ab move to immutable
@@ -10879,10 +11646,10 @@ fn test_crash_recovery_preserves_edges() {
 
         // Write more in active gen
         node_c = db
-            .upsert_node(1, "c", UpsertNodeOptions::default())
+            .upsert_node("Person", "c", UpsertNodeOptions::default())
             .unwrap();
         edge_bc = db
-            .upsert_edge(node_b, node_c, 20, UpsertEdgeOptions::default())
+            .upsert_edge(node_b, node_c, "REPORTS_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         // Simulate crash
@@ -10935,13 +11702,13 @@ fn test_crash_recovery_preserves_deletes() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let node_a = db
-            .upsert_node(1, "a", UpsertNodeOptions::default())
+            .upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
         let node_b = db
-            .upsert_node(1, "b", UpsertNodeOptions::default())
+            .upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
         let _edge = db
-            .upsert_edge(node_a, node_b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(node_a, node_b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         db.freeze_memtable().unwrap();
@@ -10959,18 +11726,18 @@ fn test_crash_recovery_preserves_deletes() {
 
         // node_a should be deleted
         assert!(
-            db.get_node_by_key(1, "a").unwrap().is_none(),
+            db.get_node_by_key("Person", "a").unwrap().is_none(),
             "deleted node_a should not be visible after recovery"
         );
 
         // node_b should still exist
         assert!(
-            db.get_node_by_key(1, "b").unwrap().is_some(),
+            db.get_node_by_key("Person", "b").unwrap().is_some(),
             "non-deleted node_b should survive recovery"
         );
 
         // Only 1 node should be visible
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 1, "only node_b should be visible");
 
         db.close().unwrap();
@@ -10988,16 +11755,16 @@ fn test_reopen_engine_seq_continuity() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write several items
-        db.upsert_node(1, "a", UpsertNodeOptions::default())
+        db.upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_node(1, "b", UpsertNodeOptions::default())
+        db.upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_node(1, "c", UpsertNodeOptions::default())
+        db.upsert_node("Person", "c", UpsertNodeOptions::default())
             .unwrap();
 
         db.freeze_memtable().unwrap();
 
-        db.upsert_node(1, "d", UpsertNodeOptions::default())
+        db.upsert_node("Person", "d", UpsertNodeOptions::default())
             .unwrap();
 
         db.close_fast().unwrap();
@@ -11008,17 +11775,17 @@ fn test_reopen_engine_seq_continuity() {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         // Write a new node -- its seq should be > pre-crash values
-        db.upsert_node(1, "post_crash", UpsertNodeOptions::default())
+        db.upsert_node("Person", "post_crash", UpsertNodeOptions::default())
             .unwrap();
 
         // The node should exist
-        assert!(db.get_node_by_key(1, "post_crash").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "post_crash").unwrap().is_some());
 
         // All pre-crash data should be present
-        assert!(db.get_node_by_key(1, "a").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "b").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "c").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "d").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "a").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "b").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "c").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "d").unwrap().is_some());
 
         db.close().unwrap();
     }
@@ -11033,7 +11800,7 @@ fn test_repeated_crash_reopen_cycles() {
     // Crash cycle 1
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "cycle1_node", UpsertNodeOptions::default())
+        db.upsert_node("Person", "cycle1_node", UpsertNodeOptions::default())
             .unwrap();
         db.close_fast().unwrap();
     }
@@ -11042,11 +11809,11 @@ fn test_repeated_crash_reopen_cycles() {
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         // Verify cycle 1 data
-        assert!(db.get_node_by_key(1, "cycle1_node").unwrap().is_some());
-        db.upsert_node(1, "cycle2_node", UpsertNodeOptions::default())
+        assert!(db.get_node_by_key("Person", "cycle1_node").unwrap().is_some());
+        db.upsert_node("Person", "cycle2_node", UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
-        db.upsert_node(1, "cycle2_active", UpsertNodeOptions::default())
+        db.upsert_node("Person", "cycle2_active", UpsertNodeOptions::default())
             .unwrap();
         db.close_fast().unwrap();
     }
@@ -11055,13 +11822,13 @@ fn test_repeated_crash_reopen_cycles() {
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         // Verify cycle 1 + 2 data
-        assert!(db.get_node_by_key(1, "cycle1_node").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "cycle2_node").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "cycle2_active").unwrap().is_some());
-        db.upsert_node(1, "cycle3_node", UpsertNodeOptions::default())
+        assert!(db.get_node_by_key("Person", "cycle1_node").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "cycle2_node").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "cycle2_active").unwrap().is_some());
+        db.upsert_node("Person", "cycle3_node", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_node(1, "cycle3_unflushed", UpsertNodeOptions::default())
+        db.upsert_node("Person", "cycle3_unflushed", UpsertNodeOptions::default())
             .unwrap();
         db.close_fast().unwrap();
     }
@@ -11069,13 +11836,13 @@ fn test_repeated_crash_reopen_cycles() {
     // Final verification
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        assert!(db.get_node_by_key(1, "cycle1_node").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "cycle2_node").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "cycle2_active").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "cycle3_node").unwrap().is_some());
-        assert!(db.get_node_by_key(1, "cycle3_unflushed").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "cycle1_node").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "cycle2_node").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "cycle2_active").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "cycle3_node").unwrap().is_some());
+        assert!(db.get_node_by_key("Person", "cycle3_unflushed").unwrap().is_some());
 
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(
             all.len(),
             5,
@@ -11096,7 +11863,7 @@ fn test_backpressure_triggers_on_total_bytes() {
     // just the active memtable.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("bp_total");
-    // Each node is ~190 bytes (120 base + key + type/time index overhead).
+    // Each node is ~190 bytes (120 base + key + label/time index overhead).
     // Threshold at 350 bytes: 1 node won't trigger, but 2 nodes will.
     let opts = DbOptions {
         memtable_flush_threshold: 350, // triggers when total > 350 bytes
@@ -11109,7 +11876,7 @@ fn test_backpressure_triggers_on_total_bytes() {
     let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
     // Write 1 node (under threshold) and freeze.
-    db.upsert_node(1, "frozen", UpsertNodeOptions::default())
+    db.upsert_node("Person", "frozen", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_memtable_count(), 1);
@@ -11117,7 +11884,7 @@ fn test_backpressure_triggers_on_total_bytes() {
 
     // Now write 1 more node. Active ~190 + immutable ~190 = ~380, exceeding
     // the 350-byte threshold. auto-flush should fire (async).
-    db.upsert_node(1, "active", UpsertNodeOptions::default())
+    db.upsert_node("Person", "active", UpsertNodeOptions::default())
         .unwrap();
 
     // Auto-flush is now async, so drain pending flushes before asserting.
@@ -11154,7 +11921,7 @@ fn test_max_immutable_memtables_blocks() {
 
     // Write and freeze twice to reach max_immutable_memtables=2
     for i in 0..5 {
-        db.upsert_node(1, &format!("g1:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("g1:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.freeze_memtable().unwrap();
@@ -11162,7 +11929,7 @@ fn test_max_immutable_memtables_blocks() {
     assert_eq!(db.segment_count().unwrap(), 0);
 
     for i in 0..5 {
-        db.upsert_node(1, &format!("g2:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("g2:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.freeze_memtable().unwrap();
@@ -11172,7 +11939,7 @@ fn test_max_immutable_memtables_blocks() {
     // Now write to the active memtable. The next write triggers
     // backpressure because immutable count == max_immutable_memtables.
     for i in 0..5 {
-        db.upsert_node(1, &format!("g3:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("g3:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
 
@@ -11183,7 +11950,7 @@ fn test_max_immutable_memtables_blocks() {
     );
 
     // All data should be readable
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all.len(), 15, "all 15 nodes should be visible");
 
     db.close().unwrap();
@@ -11208,7 +11975,7 @@ fn test_max_immutable_memtables_disabled_when_zero() {
     for batch in 0..5 {
         for i in 0..3 {
             db.upsert_node(
-                1,
+                "Person",
                 &format!("b{}:{}", batch, i),
                 UpsertNodeOptions::default(),
             )
@@ -11250,7 +12017,7 @@ fn test_close_drains_all_immutables() {
         for batch in 0..3 {
             for i in 0..5 {
                 db.upsert_node(
-                    1,
+                    "Person",
                     &format!("b{}:{}", batch, i),
                     UpsertNodeOptions::default(),
                 )
@@ -11261,7 +12028,7 @@ fn test_close_drains_all_immutables() {
 
         // Write more to active memtable
         for i in 0..5 {
-            db.upsert_node(1, &format!("active:{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("active:{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
 
@@ -11275,7 +12042,7 @@ fn test_close_drains_all_immutables() {
     // Reopen and verify all data is in segments
     {
         let db = DatabaseEngine::open(&db_path, &opts).unwrap();
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(all.len(), 20, "all 20 nodes should survive close + reopen");
 
         // Data should be in segments, not memtable (WAL was retired)
@@ -11316,7 +12083,7 @@ fn test_close_fast_preserves_wal_for_recovery() {
         for batch in 0..3 {
             for i in 0..5 {
                 db.upsert_node(
-                    1,
+                    "Person",
                     &format!("b{}:{}", batch, i),
                     UpsertNodeOptions::default(),
                 )
@@ -11327,7 +12094,7 @@ fn test_close_fast_preserves_wal_for_recovery() {
 
         // Write to active memtable
         for i in 0..5 {
-            db.upsert_node(1, &format!("active:{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("active:{}", i), UpsertNodeOptions::default())
                 .unwrap();
         }
 
@@ -11341,7 +12108,7 @@ fn test_close_fast_preserves_wal_for_recovery() {
     // Reopen: WAL replay recovers everything.
     {
         let db = DatabaseEngine::open(&db_path, &opts).unwrap();
-        let all = db.get_nodes_by_type(1).unwrap();
+        let all = db.get_nodes_by_labels("Person").unwrap();
         assert_eq!(
             all.len(),
             20,
@@ -11378,14 +12145,14 @@ fn test_compaction_respects_flush_published_segments() {
 
     // Create first segment
     for i in 0..10 {
-        db.upsert_node(1, &format!("seg1:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("seg1:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.flush().unwrap();
 
     // Create second segment
     for i in 0..10 {
-        db.upsert_node(1, &format!("seg2:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("seg2:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.flush().unwrap();
@@ -11400,7 +12167,7 @@ fn test_compaction_respects_flush_published_segments() {
 
     // Create a third segment (published after compaction)
     for i in 0..10 {
-        db.upsert_node(1, &format!("seg3:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("seg3:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.flush().unwrap();
@@ -11409,13 +12176,13 @@ fn test_compaction_respects_flush_published_segments() {
     assert_eq!(db.segment_count().unwrap(), 2);
 
     // All 30 nodes should be readable
-    let all = db.get_nodes_by_type(1).unwrap();
+    let all = db.get_nodes_by_labels("Person").unwrap();
     assert_eq!(all.len(), 30);
 
     // Compact again to verify new segments coexist properly
     db.compact().unwrap();
     assert_eq!(db.segment_count().unwrap(), 1);
-    assert_eq!(db.get_nodes_by_type(1).unwrap().len(), 30);
+    assert_eq!(db.get_nodes_by_labels("Person").unwrap().len(), 30);
 
     db.close().unwrap();
 }
@@ -11442,14 +12209,14 @@ fn test_close_with_active_and_immutable_data() {
 
         // Write to active, then freeze
         let id = db
-            .upsert_node(1, "frozen_a", UpsertNodeOptions::default())
+            .upsert_node("Person", "frozen_a", UpsertNodeOptions::default())
             .unwrap();
         node_ids.push(id);
         db.freeze_memtable().unwrap();
 
         // Write more to new active
         let id = db
-            .upsert_node(1, "active_b", UpsertNodeOptions::default())
+            .upsert_node("Person", "active_b", UpsertNodeOptions::default())
             .unwrap();
         node_ids.push(id);
 
@@ -11462,7 +12229,7 @@ fn test_close_with_active_and_immutable_data() {
         for &id in &node_ids {
             assert!(db.get_node(id).unwrap().is_some());
         }
-        assert_eq!(db.get_nodes_by_type(1).unwrap().len(), 2);
+        assert_eq!(db.get_nodes_by_labels("Person").unwrap().len(), 2);
         assert!(db.segment_count().unwrap() >= 1, "close() should have flushed");
         db.close().unwrap();
     }
@@ -11504,14 +12271,14 @@ fn test_backpressure_bytes_and_count_combined() {
 
     // Freeze once to reach max_immutable_memtables=1
     for i in 0..3 {
-        db.upsert_node(1, &format!("x:{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("x:{}", i), UpsertNodeOptions::default())
             .unwrap();
     }
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_memtable_count(), 1);
 
     // Next write should trigger count-based backpressure
-    db.upsert_node(1, "trigger", UpsertNodeOptions::default())
+    db.upsert_node("Person", "trigger", UpsertNodeOptions::default())
         .unwrap();
 
     // Flush should have happened
@@ -11539,7 +12306,7 @@ fn test_data_visible_while_in_flight() {
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let id = db
-        .upsert_node(1, "visible", UpsertNodeOptions::default())
+        .upsert_node("Person", "visible", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_epoch_count(), 1);
@@ -11555,7 +12322,7 @@ fn test_data_visible_while_in_flight() {
 
     // All read paths must see the frozen data
     assert!(db.get_node(id).unwrap().is_some());
-    assert!(db.get_node_by_key(1, "visible").unwrap().is_some());
+    assert!(db.get_node_by_key("Person", "visible").unwrap().is_some());
 
     // Release worker, wait for completion
     release_tx.send(()).unwrap();
@@ -11586,7 +12353,7 @@ fn test_multiple_epochs_all_visible_during_flush() {
     // Gen 1: oldest frozen
     let id1 = db
         .upsert_node(
-            1,
+            "Person",
             "gen1_key",
             UpsertNodeOptions {
                 weight: 1.0,
@@ -11599,7 +12366,7 @@ fn test_multiple_epochs_all_visible_during_flush() {
     // Gen 2: newest frozen
     let id2 = db
         .upsert_node(
-            1,
+            "Person",
             "gen2_key",
             UpsertNodeOptions {
                 weight: 2.0,
@@ -11612,7 +12379,7 @@ fn test_multiple_epochs_all_visible_during_flush() {
     // Gen 3: active memtable
     let id3 = db
         .upsert_node(
-            1,
+            "Person",
             "gen3_key",
             UpsertNodeOptions {
                 weight: 3.0,
@@ -11637,9 +12404,9 @@ fn test_multiple_epochs_all_visible_during_flush() {
 
     // Precedence: if same key existed across generations, active wins
     // (we used different keys, so just check all exist)
-    assert!(db.get_node_by_key(1, "gen1_key").unwrap().is_some());
-    assert!(db.get_node_by_key(1, "gen2_key").unwrap().is_some());
-    assert!(db.get_node_by_key(1, "gen3_key").unwrap().is_some());
+    assert!(db.get_node_by_key("Person", "gen1_key").unwrap().is_some());
+    assert!(db.get_node_by_key("Person", "gen2_key").unwrap().is_some());
+    assert!(db.get_node_by_key("Person", "gen3_key").unwrap().is_some());
 
     // Release, drain
     release_tx.send(()).unwrap();
@@ -11672,7 +12439,7 @@ fn test_auto_flush_is_async_not_blocking() {
     let mut ids = Vec::new();
     for i in 0..5 {
         let id = db
-            .upsert_node(1, &format!("af_{}", i), UpsertNodeOptions::default())
+            .upsert_node("Person", &format!("af_{}", i), UpsertNodeOptions::default())
             .unwrap();
         ids.push(id);
     }
@@ -11711,7 +12478,7 @@ fn test_apply_removes_epoch_after_publish() {
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let id = db
-        .upsert_node(1, "apply_test", UpsertNodeOptions::default())
+        .upsert_node("Person", "apply_test", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_epoch_count(), 1);
@@ -11741,7 +12508,7 @@ fn test_worker_failure_keeps_epoch_visible() {
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let id = db
-        .upsert_node(1, "fail_test", UpsertNodeOptions::default())
+        .upsert_node("Person", "fail_test", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
 
@@ -11759,7 +12526,7 @@ fn test_worker_failure_keeps_epoch_visible() {
 
     // Data still readable
     assert!(db.get_node(id).unwrap().is_some());
-    assert!(db.get_node_by_key(1, "fail_test").unwrap().is_some());
+    assert!(db.get_node_by_key("Person", "fail_test").unwrap().is_some());
 
     db.close().unwrap();
 }
@@ -11779,10 +12546,10 @@ fn test_backpressure_counts_all_epochs_including_in_flight() {
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     // Freeze twice to reach max
-    db.upsert_node(1, "bp1", UpsertNodeOptions::default())
+    db.upsert_node("Person", "bp1", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
-    db.upsert_node(1, "bp2", UpsertNodeOptions::default())
+    db.upsert_node("Person", "bp2", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
     assert_eq!(db.immutable_epoch_count(), 2);
@@ -11819,7 +12586,7 @@ fn test_flush_sync_barrier_drains_all_epochs() {
 
     // Create 3 frozen memtables
     for i in 0..3 {
-        db.upsert_node(1, &format!("sync_{}", i), UpsertNodeOptions::default())
+        db.upsert_node("Person", &format!("sync_{}", i), UpsertNodeOptions::default())
             .unwrap();
         db.freeze_memtable().unwrap();
     }
@@ -11833,7 +12600,7 @@ fn test_flush_sync_barrier_drains_all_epochs() {
     // All data readable from segments
     for i in 0..3 {
         assert!(db
-            .get_node_by_key(1, &format!("sync_{}", i))
+            .get_node_by_key("Person", &format!("sync_{}", i))
             .unwrap()
             .is_some());
     }
@@ -11886,7 +12653,7 @@ fn test_async_flush_latency_profile() {
 
         for i in 0..WRITE_COUNT {
             let start = Instant::now();
-            db.upsert_node(1, &format!("n{}", i), write_opts(i))
+            db.upsert_node("Person", &format!("n{}", i), write_opts(i))
                 .unwrap();
             if (i + 1) % SYNC_FLUSH_INTERVAL == 0 {
                 db.flush().unwrap();
@@ -11912,7 +12679,7 @@ fn test_async_flush_latency_profile() {
 
         for i in 0..WRITE_COUNT {
             let start = Instant::now();
-            db.upsert_node(1, &format!("n{}", i), write_opts(i))
+            db.upsert_node("Person", &format!("n{}", i), write_opts(i))
                 .unwrap();
             latencies.push(start.elapsed().as_micros());
         }
@@ -11982,7 +12749,7 @@ fn test_property_index_manifest_reopens_and_reseeds_active_memtable() {
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         index_id = db
-            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
             .unwrap()
             .index_id;
         db.close().unwrap();
@@ -12003,7 +12770,7 @@ fn test_property_index_manifest_reopens_and_reseeds_active_memtable() {
         props.insert("color".to_string(), PropValue::String("red".to_string()));
         let node_id = db
             .upsert_node(
-                1,
+                "Person",
                 "a",
                 UpsertNodeOptions {
                     props,
@@ -12043,7 +12810,7 @@ fn test_ensure_property_index_while_flush_in_flight_preserves_manifest_and_seedi
     );
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "frozen",
             UpsertNodeOptions {
                 props,
@@ -12058,7 +12825,7 @@ fn test_ensure_property_index_while_flush_in_flight_preserves_manifest_and_seedi
     ready_rx.recv().unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
     let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
@@ -12080,7 +12847,7 @@ fn test_ensure_property_index_while_flush_in_flight_preserves_manifest_and_seedi
     assert!(crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id).exists());
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+        db.find_nodes("Person", "status", &PropValue::String("active".to_string()))
             .unwrap(),
         vec![node_id]
     );
@@ -12113,7 +12880,7 @@ fn test_ready_property_index_downgrades_when_flush_publish_missed_declaration_sn
     );
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "frozen",
             UpsertNodeOptions {
                 props,
@@ -12128,7 +12895,7 @@ fn test_ready_property_index_downgrades_when_flush_publish_missed_declaration_sn
     publish_ready_rx.recv().unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -12150,7 +12917,7 @@ fn test_ready_property_index_downgrades_when_flush_publish_missed_declaration_sn
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+        db.find_nodes("Person", "status", &PropValue::String("active".to_string()))
             .unwrap(),
         vec![node_id]
     );
@@ -12160,11 +12927,13 @@ fn test_ready_property_index_downgrades_when_flush_publish_missed_declaration_sn
 
     repair_release_tx.send(()).unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path =
+        crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(repaired_sidecar_path.exists());
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+        db.find_nodes("Person", "status", &PropValue::String("active".to_string()))
             .unwrap(),
         vec![node_id]
     );
@@ -12187,7 +12956,7 @@ fn test_published_property_query_route_stays_snapshot_stable_across_build_comple
     );
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "snapshot-stable",
             UpsertNodeOptions {
                 props,
@@ -12198,7 +12967,7 @@ fn test_published_property_query_route_stays_snapshot_stable_across_build_comple
 
     let (build_ready_rx, build_release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
         .unwrap();
     build_ready_rx.recv().unwrap();
 
@@ -12230,7 +12999,7 @@ fn test_published_property_query_route_stays_snapshot_stable_across_build_comple
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+        db.find_nodes("Person", "status", &PropValue::String("active".to_string()))
             .unwrap(),
         vec![node_id]
     );
@@ -12258,7 +13027,7 @@ fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_sn
     first_props.insert("status".to_string(), active.clone());
     let node_a = db
         .upsert_node(
-            1,
+            "Person",
             "seg_a",
             UpsertNodeOptions {
                 props: first_props,
@@ -12272,7 +13041,7 @@ fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_sn
     second_props.insert("status".to_string(), active.clone());
     let node_b = db
         .upsert_node(
-            1,
+            "Person",
             "seg_b",
             UpsertNodeOptions {
                 props: second_props,
@@ -12287,7 +13056,7 @@ fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_sn
     let expected_ids = vec![node_a, node_b];
 
     let info = db
-        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -12310,7 +13079,7 @@ fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_sn
 
     db.reset_property_query_routes();
     let mut results = db
-        .find_nodes(1, "status", &PropValue::String("active".to_string()))
+        .find_nodes("Person", "status", &PropValue::String("active".to_string()))
         .unwrap();
     results.sort_unstable();
     assert_eq!(results, expected_ids);
@@ -12320,11 +13089,13 @@ fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_sn
 
     repair_release_tx.send(()).unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path =
+        crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(repaired_sidecar_path.exists());
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes(1, "status", &PropValue::String("active".to_string()))
+        db.find_nodes("Person", "status", &PropValue::String("active".to_string()))
             .unwrap(),
         expected_ids
     );
@@ -12346,7 +13117,7 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
         color_props.insert("color".to_string(), PropValue::String("red".to_string()));
         let color_id = db
             .upsert_node(
-                1,
+                "Person",
                 "color",
                 UpsertNodeOptions {
                     props: color_props,
@@ -12358,7 +13129,7 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
         score_props.insert("score".to_string(), PropValue::Int(10));
         let score_id = db
             .upsert_node(
-                1,
+                "Person",
                 "score",
                 UpsertNodeOptions {
                     props: score_props,
@@ -12368,11 +13139,10 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
             .unwrap();
 
         let eq = db
-            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
             .unwrap();
         let range = db
-            .ensure_node_property_index(
-                1,
+            .ensure_node_property_index("Person",
                 "score",
                 SecondaryIndexKind::Range {
                     domain: SecondaryIndexRangeDomain::Int,
@@ -12395,13 +13165,12 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
         db.rebuild_secondary_index_catalog().unwrap();
 
         assert_eq!(
-            db.find_nodes(1, "color", &PropValue::String("red".to_string()))
+            db.find_nodes("Person", "color", &PropValue::String("red".to_string()))
                 .unwrap(),
             vec![color_id]
         );
         assert_eq!(
-            db.find_nodes_range(
-                1,
+            db.find_nodes_range("Person",
                 "score",
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -12432,14 +13201,13 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
 
         db.reset_property_query_routes();
         assert_eq!(
-            db.find_nodes(1, "color", &PropValue::String("red".to_string()))
+            db.find_nodes("Person", "color", &PropValue::String("red".to_string()))
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            db.find_nodes_range(
-                1,
+            db.find_nodes_range("Person",
                 "score",
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -12468,7 +13236,7 @@ fn test_zero_declaration_flush_and_compaction_skip_equality_artifacts() {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
         db.upsert_node(
-            1,
+            "Person",
             key,
             UpsertNodeOptions {
                 props,
@@ -12479,8 +13247,7 @@ fn test_zero_declaration_flush_and_compaction_skip_equality_artifacts() {
     }
     db.flush().unwrap();
     let first_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
-    assert!(!first_seg_dir.join("prop_index.dat").exists());
-    assert!(!first_seg_dir.join("node_prop_hashes.dat").exists());
+    assert_no_legacy_property_components(&first_seg_dir);
     assert!(!first_seg_dir
         .join(crate::segment_writer::SECONDARY_INDEX_DIRNAME)
         .exists());
@@ -12489,7 +13256,7 @@ fn test_zero_declaration_flush_and_compaction_skip_equality_artifacts() {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("blue".to_string()));
         db.upsert_node(
-            1,
+            "Person",
             key,
             UpsertNodeOptions {
                 props,
@@ -12502,8 +13269,7 @@ fn test_zero_declaration_flush_and_compaction_skip_equality_artifacts() {
     let stats = db.compact().unwrap().unwrap();
     assert_eq!(stats.segments_merged, 2);
     let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
-    assert!(!compacted_seg_dir.join("prop_index.dat").exists());
-    assert!(!compacted_seg_dir.join("node_prop_hashes.dat").exists());
+    assert_no_legacy_property_components(&compacted_seg_dir);
     assert!(!compacted_seg_dir
         .join(crate::segment_writer::SECONDARY_INDEX_DIRNAME)
         .exists());
@@ -12522,7 +13288,7 @@ fn test_equality_index_backfills_existing_segments_and_compaction_preserves_side
     props.insert("color".to_string(), red.clone());
     let first_id = db
         .upsert_node(
-            1,
+            "Person",
             "first",
             UpsertNodeOptions {
                 props: props.clone(),
@@ -12533,7 +13299,7 @@ fn test_equality_index_backfills_existing_segments_and_compaction_preserves_side
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -12544,7 +13310,7 @@ fn test_equality_index_backfills_existing_segments_and_compaction_preserves_side
 
     let second_id = db
         .upsert_node(
-            1,
+            "Person",
             "second",
             UpsertNodeOptions {
                 props,
@@ -12566,11 +13332,10 @@ fn test_equality_index_backfills_existing_segments_and_compaction_preserves_side
     let compacted_sidecar =
         crate::segment_writer::node_prop_eq_sidecar_path(&compacted_seg_dir, info.index_id);
     assert!(compacted_sidecar.exists());
-    assert!(!compacted_seg_dir.join("prop_index.dat").exists());
-    assert!(!compacted_seg_dir.join("node_prop_hashes.dat").exists());
+    assert_no_legacy_property_components(&compacted_seg_dir);
 
     db.reset_property_query_routes();
-    let mut ids = db.find_nodes(1, "color", &red).unwrap();
+    let mut ids = db.find_nodes("Person", "color", &red).unwrap();
     ids.sort_unstable();
     assert_eq!(ids, vec![first_id, second_id]);
     let routes = db.property_query_route_snapshot();
@@ -12593,7 +13358,7 @@ fn test_missing_equality_sidecar_reopens_and_repairs_to_ready() {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), red.clone());
         db.upsert_node(
-            1,
+            "Person",
             "repair-me",
             UpsertNodeOptions {
                 props,
@@ -12604,7 +13369,7 @@ fn test_missing_equality_sidecar_reopens_and_repairs_to_ready() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -12619,10 +13384,11 @@ fn test_missing_equality_sidecar_reopens_and_repairs_to_ready() {
 
     let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, index_id);
+    assert!(repaired_sidecar_path.exists());
     assert_eq!(
         reopened
-            .find_nodes(1, "color", &PropValue::String("red".to_string()))
+            .find_nodes("Person", "color", &PropValue::String("red".to_string()))
             .unwrap()
             .len(),
         1
@@ -12644,7 +13410,7 @@ fn test_corrupt_equality_sidecar_reopens_failed_and_queries_fallback() {
         props.insert("color".to_string(), red.clone());
         let node_id = db
             .upsert_node(
-                1,
+                "Person",
                 "broken",
                 UpsertNodeOptions {
                     props,
@@ -12655,12 +13421,12 @@ fn test_corrupt_equality_sidecar_reopens_failed_and_queries_fallback() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
         seg_id = db.segments_for_test()[0].segment_id;
-        assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+        assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
         db.close().unwrap();
     }
 
@@ -12678,10 +13444,81 @@ fn test_corrupt_equality_sidecar_reopens_failed_and_queries_fallback() {
     assert!(info.last_error.is_some());
 
     reopened.reset_property_query_routes();
-    assert_eq!(reopened.find_nodes(1, "color", &red).unwrap().len(), 1);
+    assert_eq!(reopened.find_nodes("Person", "color", &red).unwrap().len(), 1);
     let routes = reopened.property_query_route_snapshot();
     assert_eq!(routes.equality_scan_fallback, 1);
     assert_eq!(routes.equality_index_lookup, 0);
+
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_ready_equality_sidecar_tail_corruption_does_not_full_scan_on_open() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let blue = PropValue::String("blue".to_string());
+    let index_id;
+    let seg_id;
+    let red_id;
+
+    {
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let mut red_props = BTreeMap::new();
+        red_props.insert("color".to_string(), red.clone());
+        red_id = db
+            .upsert_node(
+                "Person",
+                "red",
+                UpsertNodeOptions {
+                    props: red_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for key in ["blue-a", "blue-b"] {
+            let mut blue_props = BTreeMap::new();
+            blue_props.insert("color".to_string(), blue.clone());
+            db.upsert_node(
+                "Person",
+                key,
+                UpsertNodeOptions {
+                    props: blue_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        db.flush().unwrap();
+
+        let info = db
+            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+        index_id = info.index_id;
+        seg_id = db.segments_for_test()[0].segment_id;
+        db.close().unwrap();
+    }
+
+    let seg_dir = segment_dir(&db_path, seg_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, index_id);
+    corrupt_equality_sidecar_tail_group_order_in_place(&sidecar_path, hash_prop_value(&blue));
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let info = reopened
+        .list_node_property_indexes()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.index_id == index_id)
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Ready);
+    assert!(info.last_error.is_none());
+
+    reopened.reset_property_query_routes();
+    assert_eq!(reopened.find_nodes("Person", "color", &red).unwrap(), vec![red_id]);
+    let routes = reopened.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
 
     reopened.close().unwrap();
 }
@@ -12698,7 +13535,7 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
     props.insert("color".to_string(), red.clone());
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "repair-live",
             UpsertNodeOptions {
                 props,
@@ -12709,20 +13546,23 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
-    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let segment_id = db.segments_for_test()[0].segment_id;
+    let seg_dir = segment_dir(&db_path, segment_id);
     let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
     std::fs::remove_file(&sidecar_path).unwrap();
     assert!(!sidecar_path.exists());
+    db.reopen_segment_reader_and_rebuild_sources_for_test(segment_id)
+        .unwrap();
 
     let mut unrelated_props = BTreeMap::new();
     unrelated_props.insert("color".to_string(), blue.clone());
     let unrelated_id = db
         .upsert_node(
-            1,
+            "Person",
             "live-counter-node",
             UpsertNodeOptions {
                 props: unrelated_props,
@@ -12733,7 +13573,7 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
     db.upsert_edge(
         node_id,
         unrelated_id,
-        7,
+        "FRIENDS_WITH",
         UpsertEdgeOptions {
             ..Default::default()
         },
@@ -12747,7 +13587,7 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
 
     let (repair_ready_rx, repair_release_tx) = db.set_secondary_index_build_pause();
     db.reset_property_query_routes();
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     repair_ready_rx.recv().unwrap();
     let routes = db.property_query_route_snapshot();
     assert_eq!(routes.equality_scan_fallback, 1);
@@ -12773,7 +13613,7 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
     later_props.insert("color".to_string(), blue);
     let later_id = db
         .upsert_node(
-            1,
+            "Person",
             "repair-counter-node",
             UpsertNodeOptions {
                 props: later_props,
@@ -12784,7 +13624,7 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
     db.upsert_edge(
         node_id,
         later_id,
-        8,
+        "COLLABORATES_WITH",
         UpsertEdgeOptions {
             ..Default::default()
         },
@@ -12798,7 +13638,9 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
 
     repair_release_tx.send(()).unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path =
+        crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(repaired_sidecar_path.exists());
 
     let manifest_after_repair = crate::manifest::load_manifest_readonly(&db_path)
         .unwrap()
@@ -12824,7 +13666,7 @@ fn test_corrupt_equality_sidecar_while_open_queries_fallback_and_marks_failed() 
     props.insert("color".to_string(), red.clone());
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "fail-live",
             UpsertNodeOptions {
                 props,
@@ -12835,7 +13677,7 @@ fn test_corrupt_equality_sidecar_while_open_queries_fallback_and_marks_failed() 
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -12844,7 +13686,7 @@ fn test_corrupt_equality_sidecar_while_open_queries_fallback_and_marks_failed() 
     corrupt_sidecar_header_in_place(&sidecar_path);
 
     db.reset_property_query_routes();
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     let routes = db.property_query_route_snapshot();
     assert_eq!(routes.equality_scan_fallback, 1);
     assert_eq!(routes.equality_index_lookup, 0);
@@ -12867,7 +13709,7 @@ fn test_compaction_with_corrupt_ready_sidecar_succeeds_and_marks_failed() {
     props.insert("color".to_string(), red.clone());
     let first_id = db
         .upsert_node(
-            1,
+            "Person",
             "first",
             UpsertNodeOptions {
                 props: props.clone(),
@@ -12878,13 +13720,13 @@ fn test_compaction_with_corrupt_ready_sidecar_succeeds_and_marks_failed() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
     let second_id = db
         .upsert_node(
-            1,
+            "Person",
             "second",
             UpsertNodeOptions {
                 props,
@@ -12911,7 +13753,7 @@ fn test_compaction_with_corrupt_ready_sidecar_succeeds_and_marks_failed() {
     assert!(compacted_sidecar.exists());
 
     db.reset_property_query_routes();
-    let mut ids = db.find_nodes(1, "color", &red).unwrap();
+    let mut ids = db.find_nodes("Person", "color", &red).unwrap();
     ids.sort_unstable();
     assert_eq!(ids, vec![first_id, second_id]);
     let routes = db.property_query_route_snapshot();
@@ -12932,7 +13774,7 @@ fn test_compaction_with_missing_ready_sidecar_rebuilds_equality_index_via_target
     props.insert("color".to_string(), red.clone());
     let first_id = db
         .upsert_node(
-            1,
+            "Person",
             "first-missing-sidecar",
             UpsertNodeOptions {
                 props: props.clone(),
@@ -12943,13 +13785,13 @@ fn test_compaction_with_missing_ready_sidecar_rebuilds_equality_index_via_target
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
     let second_id = db
         .upsert_node(
-            1,
+            "Person",
             "second-missing-sidecar",
             UpsertNodeOptions {
                 props,
@@ -12982,7 +13824,7 @@ fn test_compaction_with_missing_ready_sidecar_rebuilds_equality_index_via_target
     assert!(compacted_sidecar.exists());
 
     db.reset_property_query_routes();
-    let mut ids = db.find_nodes(1, "color", &red).unwrap();
+    let mut ids = db.find_nodes("Person", "color", &red).unwrap();
     ids.sort_unstable();
     assert_eq!(ids, vec![first_id, second_id]);
     let routes = db.property_query_route_snapshot();
@@ -13001,7 +13843,7 @@ fn test_compaction_with_missing_ready_sidecar_rebuilds_equality_index_via_target
     assert!(reopened_info.last_error.is_none());
 
     reopened.reset_property_query_routes();
-    let mut reopened_ids = reopened.find_nodes(1, "color", &red).unwrap();
+    let mut reopened_ids = reopened.find_nodes("Person", "color", &red).unwrap();
     reopened_ids.sort_unstable();
     assert_eq!(reopened_ids, vec![first_id, second_id]);
     let reopened_routes = reopened.property_query_route_snapshot();
@@ -13022,7 +13864,7 @@ fn test_drop_equality_index_routes_to_fallback_and_cleans_sidecar() {
     props.insert("color".to_string(), red.clone());
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "drop-equality",
             UpsertNodeOptions {
                 props,
@@ -13033,12 +13875,12 @@ fn test_drop_equality_index_routes_to_fallback_and_cleans_sidecar() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
     db.reset_property_query_routes();
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     let indexed_routes = db.property_query_route_snapshot();
     assert_eq!(indexed_routes.equality_scan_fallback, 0);
     assert_eq!(indexed_routes.equality_index_lookup, 1);
@@ -13048,7 +13890,7 @@ fn test_drop_equality_index_routes_to_fallback_and_cleans_sidecar() {
     assert!(sidecar_path.exists());
 
     assert!(db
-        .drop_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .drop_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap());
     assert!(
         db.list_node_property_indexes().unwrap()
@@ -13062,95 +13904,32 @@ fn test_drop_equality_index_routes_to_fallback_and_cleans_sidecar() {
     );
 
     db.reset_property_query_routes();
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     let fallback_routes = db.property_query_route_snapshot();
     assert_eq!(fallback_routes.equality_scan_fallback, 1);
     assert_eq!(fallback_routes.equality_index_lookup, 0);
 
     wait_for_path_absent(&sidecar_path);
+    let manifest = read_component_manifest_for_test(&seg_dir);
+    assert!(manifest.components.iter().all(|record| {
+        !matches!(
+            &record.kind,
+            crate::segment_components::SegmentComponentKind::NodePropertyEqualityIndex {
+                index_id
+            } if *index_id == info.index_id
+        )
+    }));
 
     db.close().unwrap();
 
     let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     assert!(reopened.list_node_property_indexes().unwrap().is_empty());
     reopened.reset_property_query_routes();
-    assert_eq!(reopened.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(reopened.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     let reopened_routes = reopened.property_query_route_snapshot();
     assert_eq!(reopened_routes.equality_scan_fallback, 1);
     assert_eq!(reopened_routes.equality_index_lookup, 0);
     reopened.close().unwrap();
-}
-
-#[test]
-fn test_legacy_property_hash_backfill_and_compaction_parity() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("testdb");
-    let red = PropValue::String("red".to_string());
-    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-
-    let mut props = BTreeMap::new();
-    props.insert("color".to_string(), red.clone());
-    let first_id = db
-        .upsert_node(
-            1,
-            "legacy-first",
-            UpsertNodeOptions {
-                props: props.clone(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    db.flush().unwrap();
-
-    let first_seg_id = db.segments_for_test()[0].segment_id;
-    db.close().unwrap();
-    drop(db);
-
-    let first_seg_dir = segment_dir(&db_path, first_seg_id);
-    install_legacy_property_hash_sidecars(
-        &first_seg_dir,
-        &[(first_id, 1, vec![("color".to_string(), red.clone())])],
-    );
-    assert!(first_seg_dir.join("prop_index.dat").exists());
-    assert!(first_seg_dir.join("node_prop_hashes.dat").exists());
-
-    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-    let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
-        .unwrap();
-    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
-    let first_sidecar =
-        crate::segment_writer::node_prop_eq_sidecar_path(&first_seg_dir, info.index_id);
-    assert!(first_sidecar.exists());
-
-    let second_id = db
-        .upsert_node(
-            1,
-            "legacy-second",
-            UpsertNodeOptions {
-                props,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    db.flush().unwrap();
-
-    let stats = db.compact().unwrap().unwrap();
-    assert_eq!(stats.segments_merged, 2);
-    let compacted_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
-    let compacted_sidecar =
-        crate::segment_writer::node_prop_eq_sidecar_path(&compacted_seg_dir, info.index_id);
-    assert!(compacted_sidecar.exists());
-
-    db.reset_property_query_routes();
-    let mut ids = db.find_nodes(1, "color", &red).unwrap();
-    ids.sort_unstable();
-    assert_eq!(ids, vec![first_id, second_id]);
-    let routes = db.property_query_route_snapshot();
-    assert_eq!(routes.equality_scan_fallback, 0);
-    assert_eq!(routes.equality_index_lookup, 1);
-
-    db.close().unwrap();
 }
 
 #[test]
@@ -13164,7 +13943,7 @@ fn test_equality_backfill_survives_compaction_during_build() {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), red.clone());
         db.upsert_node(
-            1,
+            "Person",
             key,
             UpsertNodeOptions {
                 props,
@@ -13177,7 +13956,7 @@ fn test_equality_backfill_survives_compaction_during_build() {
 
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -13191,7 +13970,7 @@ fn test_equality_backfill_survives_compaction_during_build() {
     wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
     db.reset_property_query_routes();
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap().len(), 2);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap().len(), 2);
     let routes = db.property_query_route_snapshot();
     assert_eq!(routes.equality_scan_fallback, 0);
     assert_eq!(routes.equality_index_lookup, 1);
@@ -13214,7 +13993,7 @@ fn test_equality_index_close_while_build_paused_reopens_and_resumes() {
     props.insert("color".to_string(), red.clone());
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "close-paused-eq",
             UpsertNodeOptions {
                 props,
@@ -13227,7 +14006,7 @@ fn test_equality_index_close_while_build_paused_reopens_and_resumes() {
     let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -13262,10 +14041,12 @@ fn test_equality_index_close_while_build_paused_reopens_and_resumes() {
 
     let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
     wait_for_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path =
+        crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(repaired_sidecar_path.exists());
 
     reopened.reset_property_query_routes();
-    assert_eq!(reopened.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(reopened.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     let routes = reopened.property_query_route_snapshot();
     assert_eq!(routes.equality_scan_fallback, 0);
     assert_eq!(routes.equality_index_lookup, 1);
@@ -13287,7 +14068,7 @@ fn test_drop_equality_index_while_build_paused_stale_sidecar_does_not_resurrect(
     props.insert("color".to_string(), red.clone());
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "drop-paused-eq",
             UpsertNodeOptions {
                 props,
@@ -13300,14 +14081,14 @@ fn test_drop_equality_index_while_build_paused_stale_sidecar_does_not_resurrect(
     let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
 
     assert!(db
-        .drop_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .drop_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap());
     assert!(db.list_node_property_indexes().unwrap().is_empty());
     let manifest_after_drop = crate::manifest::load_manifest_readonly(&db_path)
@@ -13330,7 +14111,7 @@ fn test_drop_equality_index_while_build_paused_stale_sidecar_does_not_resurrect(
     let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
     assert!(reopened.list_node_property_indexes().unwrap().is_empty());
     reopened.reset_property_query_routes();
-    assert_eq!(reopened.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(reopened.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     let routes = reopened.property_query_route_snapshot();
     assert_eq!(routes.equality_scan_fallback, 1);
     assert_eq!(routes.equality_index_lookup, 0);
@@ -13352,7 +14133,7 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
     props.insert("score".to_string(), PropValue::Int(10));
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "frozen-range",
             UpsertNodeOptions {
                 props,
@@ -13367,8 +14148,7 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
     ready_rx.recv().unwrap();
 
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -13391,8 +14171,7 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
     assert!(crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id).exists());
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes_range(
-            1,
+        db.find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -13426,7 +14205,7 @@ fn test_ready_property_range_index_downgrades_when_flush_publish_missed_declarat
     props.insert("score".to_string(), PropValue::Int(10));
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "frozen-range",
             UpsertNodeOptions {
                 props,
@@ -13441,8 +14220,7 @@ fn test_ready_property_range_index_downgrades_when_flush_publish_missed_declarat
     publish_ready_rx.recv().unwrap();
 
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -13470,8 +14248,7 @@ fn test_ready_property_range_index_downgrades_when_flush_publish_missed_declarat
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes_range(
-            1,
+        db.find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -13485,12 +14262,13 @@ fn test_ready_property_range_index_downgrades_when_flush_publish_missed_declarat
 
     repair_release_tx.send(()).unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path =
+        crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
+    assert!(repaired_sidecar_path.exists());
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes_range(
-            1,
+        db.find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -13517,7 +14295,7 @@ fn test_missing_range_sidecar_reopens_and_repairs_to_ready() {
         let mut props = BTreeMap::new();
         props.insert("score".to_string(), PropValue::Int(10));
         db.upsert_node(
-            1,
+            "Person",
             "repair-me-range",
             UpsertNodeOptions {
                 props,
@@ -13528,8 +14306,7 @@ fn test_missing_range_sidecar_reopens_and_repairs_to_ready() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index(
-                1,
+            .ensure_node_property_index("Person",
                 "score",
                 SecondaryIndexKind::Range {
                     domain: SecondaryIndexRangeDomain::Int,
@@ -13549,11 +14326,12 @@ fn test_missing_range_sidecar_reopens_and_repairs_to_ready() {
 
     let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path =
+        crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, index_id);
+    assert!(repaired_sidecar_path.exists());
     assert_eq!(
         reopened
-            .find_nodes_range(
-                1,
+            .find_nodes_range("Person",
                 "score",
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -13578,7 +14356,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
         props.insert("score".to_string(), PropValue::Int(10));
         let node_id = db
             .upsert_node(
-                1,
+                "Person",
                 "broken-range",
                 UpsertNodeOptions {
                     props,
@@ -13589,8 +14367,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index(
-                1,
+            .ensure_node_property_index("Person",
                 "score",
                 SecondaryIndexKind::Range {
                     domain: SecondaryIndexRangeDomain::Int,
@@ -13601,8 +14378,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
         index_id = info.index_id;
         seg_id = db.segments_for_test()[0].segment_id;
         assert_eq!(
-            db.find_nodes_range(
-                1,
+            db.find_nodes_range("Person",
                 "score",
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -13629,8 +14405,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
     reopened.reset_property_query_routes();
     assert_eq!(
         reopened
-            .find_nodes_range(
-                1,
+            .find_nodes_range("Person",
                 "score",
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -13647,6 +14422,83 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
 }
 
 #[test]
+fn test_ready_range_sidecar_tail_corruption_does_not_full_scan_on_open() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let index_id;
+    let seg_id;
+    let first_id;
+
+    {
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let mut first_id_for_setup = None;
+        for (key, score) in [("score-10", 10), ("score-20", 20), ("score-30", 30)] {
+            let mut props = BTreeMap::new();
+            props.insert("score".to_string(), PropValue::Int(score));
+            let id = db
+                .upsert_node(
+                    "Person",
+                    key,
+                    UpsertNodeOptions {
+                        props,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            if score == 10 {
+                first_id_for_setup = Some(id);
+            }
+        }
+        first_id = first_id_for_setup.unwrap();
+        db.flush().unwrap();
+
+        let info = db
+            .ensure_node_property_index("Person",
+                "score",
+                SecondaryIndexKind::Range {
+                    domain: SecondaryIndexRangeDomain::Int,
+                },
+            )
+            .unwrap();
+        wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+        index_id = info.index_id;
+        seg_id = db.segments_for_test()[0].segment_id;
+        db.close().unwrap();
+    }
+
+    let seg_dir = segment_dir(&db_path, seg_id);
+    let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, index_id);
+    corrupt_range_sidecar_tail_sort_order_in_place(&sidecar_path);
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let info = reopened
+        .list_node_property_indexes()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.index_id == index_id)
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Ready);
+    assert!(info.last_error.is_none());
+
+    reopened.reset_property_query_routes();
+    assert_eq!(
+        reopened
+            .find_nodes_range("Person",
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(10))),
+            )
+            .unwrap(),
+        vec![first_id]
+    );
+    let routes = reopened.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 1);
+
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
@@ -13656,7 +14508,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     props.insert("score".to_string(), PropValue::Int(10));
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "repair-live-range",
             UpsertNodeOptions {
                 props,
@@ -13667,8 +14519,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -13677,14 +14528,17 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
-    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let segment_id = db.segments_for_test()[0].segment_id;
+    let seg_dir = segment_dir(&db_path, segment_id);
     let sidecar_path = crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
     std::fs::remove_file(&sidecar_path).unwrap();
     assert!(!sidecar_path.exists());
+    db.reopen_segment_reader_and_rebuild_sources_for_test(segment_id)
+        .unwrap();
 
     let unrelated_id = db
         .upsert_node(
-            1,
+            "Person",
             "live-counter-range",
             UpsertNodeOptions {
                 ..Default::default()
@@ -13694,7 +14548,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     db.upsert_edge(
         node_id,
         unrelated_id,
-        7,
+        "FRIENDS_WITH",
         UpsertEdgeOptions {
             ..Default::default()
         },
@@ -13709,8 +14563,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     let (repair_ready_rx, repair_release_tx) = db.set_secondary_index_build_pause();
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes_range(
-            1,
+        db.find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -13732,7 +14585,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
 
     let later_id = db
         .upsert_node(
-            1,
+            "Person",
             "repair-counter-range",
             UpsertNodeOptions {
                 ..Default::default()
@@ -13742,7 +14595,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     db.upsert_edge(
         node_id,
         later_id,
-        8,
+        "COLLABORATES_WITH",
         UpsertEdgeOptions {
             ..Default::default()
         },
@@ -13756,7 +14609,9 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
 
     repair_release_tx.send(()).unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path =
+        crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
+    assert!(repaired_sidecar_path.exists());
 
     let manifest_after_repair = crate::manifest::load_manifest_readonly(&db_path)
         .unwrap()
@@ -13778,7 +14633,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
     props.insert("score".to_string(), PropValue::Int(10));
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "corrupt-live-range",
             UpsertNodeOptions {
                 props,
@@ -13789,8 +14644,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -13805,7 +14659,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
 
     let unrelated_id = db
         .upsert_node(
-            1,
+            "Person",
             "failed-counter-range",
             UpsertNodeOptions {
                 ..Default::default()
@@ -13815,7 +14669,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
     db.upsert_edge(
         node_id,
         unrelated_id,
-        9,
+        "RELATED_TO",
         UpsertEdgeOptions {
             ..Default::default()
         },
@@ -13829,8 +14683,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes_range(
-            1,
+        db.find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -13866,7 +14719,7 @@ fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() 
     props.insert("score".to_string(), PropValue::Int(10));
     let first_id = db
         .upsert_node(
-            1,
+            "Person",
             "first-range",
             UpsertNodeOptions {
                 props: props.clone(),
@@ -13877,8 +14730,7 @@ fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() 
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -13889,7 +14741,7 @@ fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() 
 
     let second_id = db
         .upsert_node(
-            1,
+            "Person",
             "second-range",
             UpsertNodeOptions {
                 props,
@@ -13921,8 +14773,7 @@ fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() 
 
     db.reset_property_query_routes();
     let mut ids = db
-        .find_nodes_range(
-            1,
+        .find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -13947,7 +14798,7 @@ fn test_compaction_with_missing_ready_range_sidecar_rebuilds_index_via_targeted_
     props.insert("score".to_string(), PropValue::Int(10));
     let first_id = db
         .upsert_node(
-            1,
+            "Person",
             "first-missing-range-sidecar",
             UpsertNodeOptions {
                 props: props.clone(),
@@ -13958,8 +14809,7 @@ fn test_compaction_with_missing_ready_range_sidecar_rebuilds_index_via_targeted_
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -13970,7 +14820,7 @@ fn test_compaction_with_missing_ready_range_sidecar_rebuilds_index_via_targeted_
 
     let second_id = db
         .upsert_node(
-            1,
+            "Person",
             "second-missing-range-sidecar",
             UpsertNodeOptions {
                 props,
@@ -14004,8 +14854,7 @@ fn test_compaction_with_missing_ready_range_sidecar_rebuilds_index_via_targeted_
 
     db.reset_property_query_routes();
     let mut ids = db
-        .find_nodes_range(
-            1,
+        .find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -14030,8 +14879,7 @@ fn test_compaction_with_missing_ready_range_sidecar_rebuilds_index_via_targeted_
 
     reopened.reset_property_query_routes();
     let mut reopened_ids = reopened
-        .find_nodes_range(
-            1,
+        .find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -14056,7 +14904,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
     props.insert("score".to_string(), PropValue::Int(10));
     let first_id = db
         .upsert_node(
-            1,
+            "Person",
             "drop-range-first",
             UpsertNodeOptions {
                 props: props.clone(),
@@ -14067,8 +14915,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -14079,8 +14926,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes_range(
-            1,
+        db.find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -14096,10 +14942,10 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
     let first_sidecar_path =
         crate::segment_writer::node_prop_range_sidecar_path(&first_seg_dir, info.index_id);
     assert!(first_sidecar_path.exists());
+    let packed_core_before_drop = packed_core_snapshot_for_test(&first_seg_dir);
 
     assert!(db
-        .drop_node_property_index(
-            1,
+        .drop_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -14119,8 +14965,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes_range(
-            1,
+        db.find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -14133,10 +14978,24 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
     assert_eq!(fallback_routes.range_index_lookup, 0);
 
     wait_for_path_absent(&first_sidecar_path);
+    assert_packed_core_unchanged_for_test(
+        &first_seg_dir,
+        &packed_core_before_drop,
+        "declared range index drop cleanup",
+    );
+    let first_manifest = read_component_manifest_for_test(&first_seg_dir);
+    assert!(first_manifest.components.iter().all(|record| {
+        !matches!(
+            &record.kind,
+            crate::segment_components::SegmentComponentKind::NodePropertyRangeIndex {
+                index_id
+            } if *index_id == info.index_id
+        )
+    }));
 
     let second_id = db
         .upsert_node(
-            1,
+            "Person",
             "drop-range-second",
             UpsertNodeOptions {
                 props,
@@ -14160,8 +15019,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
 
     db.reset_property_query_routes();
     let mut ids = db
-        .find_nodes_range(
-            1,
+        .find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -14179,8 +15037,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
     assert!(reopened.list_node_property_indexes().unwrap().is_empty());
     reopened.reset_property_query_routes();
     let mut reopened_ids = reopened
-        .find_nodes_range(
-            1,
+        .find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -14204,7 +15061,7 @@ fn test_range_backfill_survives_compaction_during_build() {
         let mut props = BTreeMap::new();
         props.insert("score".to_string(), PropValue::Int(10));
         db.upsert_node(
-            1,
+            "Person",
             key,
             UpsertNodeOptions {
                 props,
@@ -14217,8 +15074,7 @@ fn test_range_backfill_survives_compaction_during_build() {
 
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -14238,8 +15094,7 @@ fn test_range_backfill_survives_compaction_during_build() {
 
     db.reset_property_query_routes();
     assert_eq!(
-        db.find_nodes_range(
-            1,
+        db.find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
             Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -14269,7 +15124,7 @@ fn test_range_index_close_fast_while_build_paused_reopens_and_resumes() {
     props.insert("score".to_string(), PropValue::Int(10));
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "close-fast-paused-range",
             UpsertNodeOptions {
                 props,
@@ -14282,8 +15137,7 @@ fn test_range_index_close_fast_while_build_paused_reopens_and_resumes() {
     let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -14324,13 +15178,14 @@ fn test_range_index_close_fast_while_build_paused_reopens_and_resumes() {
 
     let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
     wait_for_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path =
+        crate::segment_writer::node_prop_range_sidecar_path(&seg_dir, info.index_id);
+    assert!(repaired_sidecar_path.exists());
 
     reopened.reset_property_query_routes();
     assert_eq!(
         reopened
-            .find_nodes_range(
-                1,
+            .find_nodes_range("Person",
                 "score",
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
                 Some(&PropertyRangeBound::Included(PropValue::Int(10))),
@@ -14355,7 +15210,7 @@ fn test_open_rejects_conflicting_range_declarations_for_same_property() {
         SecondaryIndexManifestEntry {
             index_id: 1,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "score".to_string(),
             },
             kind: SecondaryIndexKind::Range {
@@ -14367,7 +15222,7 @@ fn test_open_rejects_conflicting_range_declarations_for_same_property() {
         SecondaryIndexManifestEntry {
             index_id: 2,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "score".to_string(),
             },
             kind: SecondaryIndexKind::Range {
@@ -14398,7 +15253,7 @@ fn test_open_rejects_duplicate_secondary_index_ids_in_manifest() {
         SecondaryIndexManifestEntry {
             index_id: 1,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "score".to_string(),
             },
             kind: SecondaryIndexKind::Equality,
@@ -14408,7 +15263,7 @@ fn test_open_rejects_duplicate_secondary_index_ids_in_manifest() {
         SecondaryIndexManifestEntry {
             index_id: 1,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "color".to_string(),
             },
             kind: SecondaryIndexKind::Equality,
@@ -14439,7 +15294,7 @@ fn test_open_rejects_duplicate_equality_declarations_for_same_property() {
         SecondaryIndexManifestEntry {
             index_id: 1,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "score".to_string(),
             },
             kind: SecondaryIndexKind::Equality,
@@ -14449,7 +15304,7 @@ fn test_open_rejects_duplicate_equality_declarations_for_same_property() {
         SecondaryIndexManifestEntry {
             index_id: 2,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "score".to_string(),
             },
             kind: SecondaryIndexKind::Equality,
@@ -14476,7 +15331,7 @@ fn test_shared_handle_clone_observes_state_and_close_is_family_wide() {
     let clone = db.clone();
 
     let id = db
-        .upsert_node(1, "shared", UpsertNodeOptions::default())
+        .upsert_node("Person", "shared", UpsertNodeOptions::default())
         .unwrap();
     assert_eq!(clone.get_node(id).unwrap().unwrap().key, "shared");
 
@@ -14484,7 +15339,7 @@ fn test_shared_handle_clone_observes_state_and_close_is_family_wide() {
 
     assert!(matches!(db.get_node(id), Err(EngineError::DatabaseClosed)));
     assert!(matches!(
-        db.upsert_node(1, "after-close", UpsertNodeOptions::default()),
+        db.upsert_node("Person", "after-close", UpsertNodeOptions::default()),
         Err(EngineError::DatabaseClosed)
     ));
     assert!(matches!(db.list_prune_policies(), Err(EngineError::DatabaseClosed)));
@@ -14526,18 +15381,20 @@ fn test_shared_handle_reads_hold_old_published_snapshot_until_republish() {
     let (write_done_tx, write_done_rx) = std::sync::mpsc::sync_channel(1);
 
     std::thread::spawn(move || {
-        let result = writer.upsert_node(1, "during-publish", UpsertNodeOptions::default());
+        let result = writer.upsert_node("Person", "during-publish", UpsertNodeOptions::default());
         let _ = write_done_tx.send(result);
     });
 
     ready_rx.recv().unwrap();
 
     assert!(reader.get_node(1).unwrap().is_none());
-    assert!(reader.get_node_by_key(1, "during-publish").unwrap().is_none());
+    assert!(reader.get_node_by_key("Person", "during-publish").unwrap().is_none());
     assert!(reader.find_existing_node(1, "during-publish").unwrap().is_none());
     let batch_nodes = reader.get_nodes(&[1]).unwrap();
     assert!(batch_nodes[0].is_none());
-    let batch_keys = reader.get_nodes_by_keys(&[(1, "during-publish")]).unwrap();
+    let batch_keys = reader
+        .get_nodes_by_keys(&[NodeKeyQuery { label: "Person".to_string(), key: "during-publish".to_string() }])
+        .unwrap();
     assert!(batch_keys[0].is_none());
 
     release_tx.send(()).unwrap();
@@ -14549,7 +15406,7 @@ fn test_shared_handle_reads_hold_old_published_snapshot_until_republish() {
     assert_eq!(id, 1);
     assert_eq!(reader.get_node(id).unwrap().unwrap().key, "during-publish");
     assert_eq!(
-        reader.get_node_by_key(1, "during-publish").unwrap().unwrap().id,
+        reader.get_node_by_key("Person", "during-publish").unwrap().unwrap().id,
         id
     );
     assert_eq!(
@@ -14562,21 +15419,23 @@ fn test_shared_handle_reads_hold_old_published_snapshot_until_republish() {
 
     let batch_nodes = reader.get_nodes(&[id]).unwrap();
     assert_eq!(batch_nodes[0].as_ref().unwrap().key, "during-publish");
-    let batch_keys = reader.get_nodes_by_keys(&[(1, "during-publish")]).unwrap();
+    let batch_keys = reader
+        .get_nodes_by_keys(&[NodeKeyQuery { label: "Person".to_string(), key: "during-publish".to_string() }])
+        .unwrap();
     assert_eq!(batch_keys[0].as_ref().unwrap().id, id);
 
     db.close().unwrap();
 }
 
 #[test]
-fn test_shared_handle_snapshot_queries_keep_visible_type_enumeration_until_republish() {
+fn test_shared_handle_snapshot_queries_keep_visible_label_enumeration_until_republish() {
     let dir = TempDir::new().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     let reader = db.clone();
     let writer = db.clone();
 
     let id = db
-        .upsert_node(1, "snapshot-type", UpsertNodeOptions::default())
+        .upsert_node("Person", "snapshot-label", UpsertNodeOptions::default())
         .unwrap();
 
     let initial_export = reader.export_adjacency(&ExportOptions::default()).unwrap();
@@ -14600,7 +15459,7 @@ fn test_shared_handle_snapshot_queries_keep_visible_type_enumeration_until_repub
     assert_eq!(
         pinned_export.node_ids,
         vec![id],
-        "old published snapshot must keep the pre-delete node type visible"
+        "old published snapshot must keep the pre-delete node label visible"
     );
     let pinned_components = reader
         .connected_components(&ComponentOptions::default())
@@ -14608,7 +15467,7 @@ fn test_shared_handle_snapshot_queries_keep_visible_type_enumeration_until_repub
     assert_eq!(
         pinned_components.get(&id),
         Some(&id),
-        "connected_components must enumerate node types from snapshot-visible membership"
+        "connected_components must enumerate node labels from snapshot-visible membership"
     );
 
     release_tx.send(()).unwrap();
@@ -14628,11 +15487,69 @@ fn test_shared_handle_snapshot_queries_keep_visible_type_enumeration_until_repub
 }
 
 #[test]
+fn test_transaction_pinned_snapshot_label_history() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+
+    let id = db
+        .upsert_node("Person", "snapshot-label-history", UpsertNodeOptions::default())
+        .unwrap();
+    let pinned = db.published_read_view_for_test();
+    let pinned_person_id = pinned
+        .label_catalog
+        .resolve_node_label_for_read("Person")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pinned.get_node(id).unwrap().unwrap().label_ids.as_slice(),
+        &[pinned_person_id]
+    );
+
+    let mut txn = db.begin_write_txn().unwrap();
+    assert!(txn.add_node_label(TxnNodeRef::Id(id), "Employee").unwrap());
+    assert!(txn.remove_node_label(TxnNodeRef::Id(id), "Person").unwrap());
+    txn.commit().unwrap();
+
+    assert_eq!(
+        pinned.get_node(id).unwrap().unwrap().label_ids.as_slice(),
+        &[pinned_person_id],
+        "pinned reader must keep the old node labels after committed label changes"
+    );
+    assert_eq!(
+        pinned
+            .get_node_by_label_key(pinned_person_id, "snapshot-label-history")
+            .unwrap()
+            .map(|node| node.id),
+        Some(id)
+    );
+    assert!(pinned
+        .label_catalog
+        .resolve_node_label_for_read("Employee")
+        .unwrap()
+        .is_none());
+
+    let latest = db.get_node(id).unwrap().unwrap();
+    assert_eq!(latest.labels, vec!["Employee".to_string()]);
+    assert!(db
+        .get_node_by_key("Person", "snapshot-label-history")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.get_node_by_key("Employee", "snapshot-label-history")
+            .unwrap()
+            .map(|node| node.id),
+        Some(id)
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
 fn test_shared_handle_close_waits_for_admitted_read_and_rejects_later_reads() {
     let dir = TempDir::new().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     let id = db
-        .upsert_node(1, "close-read", UpsertNodeOptions::default())
+        .upsert_node("Person", "close-read", UpsertNodeOptions::default())
         .unwrap();
 
     let reader = db.clone();
@@ -14691,7 +15608,7 @@ fn test_shared_handle_close_waits_for_admitted_write_to_finish() {
     let (close_done_tx, close_done_rx) = std::sync::mpsc::sync_channel(1);
 
     std::thread::spawn(move || {
-        let result = writer.upsert_node(1, "close-barrier", UpsertNodeOptions::default());
+        let result = writer.upsert_node("Person", "close-barrier", UpsertNodeOptions::default());
         let _ = write_done_tx.send(result);
     });
 
@@ -14739,18 +15656,20 @@ fn test_shared_handle_single_object_allows_point_read_during_paused_write() {
     let (write_done_tx, write_done_rx) = std::sync::mpsc::sync_channel(1);
 
     std::thread::spawn(move || {
-        let result = writer.upsert_node(1, "single-object", UpsertNodeOptions::default());
+        let result = writer.upsert_node("Person", "single-object", UpsertNodeOptions::default());
         let _ = write_done_tx.send(result);
     });
 
     ready_rx.recv().unwrap();
 
     assert!(reader.get_node(1).unwrap().is_none());
-    assert!(reader.get_node_by_key(1, "single-object").unwrap().is_none());
+    assert!(reader.get_node_by_key("Person", "single-object").unwrap().is_none());
     assert!(reader.find_existing_node(1, "single-object").unwrap().is_none());
     let batch_nodes = reader.get_nodes(&[1]).unwrap();
     assert!(batch_nodes[0].is_none());
-    let batch_keys = reader.get_nodes_by_keys(&[(1, "single-object")]).unwrap();
+    let batch_keys = reader
+        .get_nodes_by_keys(&[NodeKeyQuery { label: "Person".to_string(), key: "single-object".to_string() }])
+        .unwrap();
     assert!(batch_keys[0].is_none());
 
     release_tx.send(()).unwrap();
@@ -14762,7 +15681,7 @@ fn test_shared_handle_single_object_allows_point_read_during_paused_write() {
     assert_eq!(id, 1);
     assert_eq!(reader.get_node(id).unwrap().unwrap().key, "single-object");
     assert_eq!(
-        reader.get_node_by_key(1, "single-object").unwrap().unwrap().id,
+        reader.get_node_by_key("Person", "single-object").unwrap().unwrap().id,
         id
     );
     assert_eq!(
@@ -14786,14 +15705,14 @@ fn test_coordinator_sequences_same_key_upserts_to_one_id() {
     let barrier_a = std::sync::Arc::clone(&barrier);
     let handle_a = std::thread::spawn(move || {
         barrier_a.wait();
-        writer_a.upsert_node(1, "same-key", UpsertNodeOptions::default())
+        writer_a.upsert_node("Person", "same-key", UpsertNodeOptions::default())
     });
 
     let writer_b = std::sync::Arc::clone(&db);
     let barrier_b = std::sync::Arc::clone(&barrier);
     let handle_b = std::thread::spawn(move || {
         barrier_b.wait();
-        writer_b.upsert_node(1, "same-key", UpsertNodeOptions::default())
+        writer_b.upsert_node("Person", "same-key", UpsertNodeOptions::default())
     });
 
     barrier.wait();
@@ -14802,7 +15721,7 @@ fn test_coordinator_sequences_same_key_upserts_to_one_id() {
     let id_b = handle_b.join().unwrap().unwrap();
     assert_eq!(id_a, 1);
     assert_eq!(id_b, 1);
-    assert_eq!(db.get_node_by_key(1, "same-key").unwrap().unwrap().id, 1);
+    assert_eq!(db.get_node_by_key("Person", "same-key").unwrap().unwrap().id, 1);
 
     db.close().unwrap();
 }
@@ -14816,10 +15735,10 @@ fn test_coordinator_sequences_unique_edge_upserts_to_one_id() {
     };
     let db = std::sync::Arc::new(DatabaseEngine::open(dir.path(), &opts).unwrap());
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
 
@@ -14827,14 +15746,14 @@ fn test_coordinator_sequences_unique_edge_upserts_to_one_id() {
     let barrier_a = std::sync::Arc::clone(&barrier);
     let handle_a = std::thread::spawn(move || {
         barrier_a.wait();
-        writer_a.upsert_edge(a, b, 9, UpsertEdgeOptions::default())
+        writer_a.upsert_edge(a, b, "RELATED_TO", UpsertEdgeOptions::default())
     });
 
     let writer_b = std::sync::Arc::clone(&db);
     let barrier_b = std::sync::Arc::clone(&barrier);
     let handle_b = std::thread::spawn(move || {
         barrier_b.wait();
-        writer_b.upsert_edge(a, b, 9, UpsertEdgeOptions::default())
+        writer_b.upsert_edge(a, b, "RELATED_TO", UpsertEdgeOptions::default())
     });
 
     barrier.wait();
@@ -14843,7 +15762,7 @@ fn test_coordinator_sequences_unique_edge_upserts_to_one_id() {
     let id_b = handle_b.join().unwrap().unwrap();
     assert_eq!(id_a, 1);
     assert_eq!(id_b, 1);
-    assert_eq!(db.get_edge_by_triple(a, b, 9).unwrap().unwrap().id, 1);
+    assert_eq!(db.get_edge_by_triple(a, b, "RELATED_TO").unwrap().unwrap().id, 1);
 
     db.close().unwrap();
 }
@@ -14861,12 +15780,12 @@ fn test_core_write_queue_capacity_blocks_pre_admission_until_slot_frees() {
     let (done_b_tx, done_b_rx) = std::sync::mpsc::sync_channel(1);
 
     std::thread::spawn(move || {
-        let _ = done_a_tx.send(writer_a.upsert_node(1, "queued-a", UpsertNodeOptions::default()));
+        let _ = done_a_tx.send(writer_a.upsert_node("Person", "queued-a", UpsertNodeOptions::default()));
     });
     ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
 
     std::thread::spawn(move || {
-        let _ = done_b_tx.send(writer_b.upsert_node(1, "queued-b", UpsertNodeOptions::default()));
+        let _ = done_b_tx.send(writer_b.upsert_node("Person", "queued-b", UpsertNodeOptions::default()));
     });
 
     assert!(
@@ -14911,12 +15830,12 @@ fn test_core_write_queue_close_rejects_pre_admission_submitter() {
     let (close_done_tx, close_done_rx) = std::sync::mpsc::sync_channel(1);
 
     std::thread::spawn(move || {
-        let _ = done_a_tx.send(writer_a.upsert_node(1, "close-head", UpsertNodeOptions::default()));
+        let _ = done_a_tx.send(writer_a.upsert_node("Person", "close-head", UpsertNodeOptions::default()));
     });
     ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
 
     std::thread::spawn(move || {
-        let _ = done_b_tx.send(writer_b.upsert_node(1, "close-blocked", UpsertNodeOptions::default()));
+        let _ = done_b_tx.send(writer_b.upsert_node("Person", "close-blocked", UpsertNodeOptions::default()));
     });
     assert!(
         done_b_rx
@@ -14957,7 +15876,7 @@ fn test_core_write_queue_close_rejects_pre_admission_submitter() {
 
     let reopened = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
     assert_eq!(reopened.get_node(1).unwrap().unwrap().key, "close-head");
-    assert!(reopened.get_node_by_key(1, "close-blocked").unwrap().is_none());
+    assert!(reopened.get_node_by_key("Person", "close-blocked").unwrap().is_none());
     reopened.close().unwrap();
 }
 
@@ -14975,7 +15894,7 @@ fn test_coordinator_head_of_line_backpressure_retry_preserves_order() {
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     assert_eq!(
-        db.upsert_node(1, "seed", UpsertNodeOptions::default()).unwrap(),
+        db.upsert_node("Person", "seed", UpsertNodeOptions::default()).unwrap(),
         1
     );
     db.freeze_memtable().unwrap();
@@ -14987,12 +15906,12 @@ fn test_coordinator_head_of_line_backpressure_retry_preserves_order() {
     let (done_b_tx, done_b_rx) = std::sync::mpsc::sync_channel(1);
 
     std::thread::spawn(move || {
-        let _ = done_a_tx.send(writer_a.upsert_node(1, "head-a", UpsertNodeOptions::default()));
+        let _ = done_a_tx.send(writer_a.upsert_node("Person", "head-a", UpsertNodeOptions::default()));
     });
     ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
 
     std::thread::spawn(move || {
-        let _ = done_b_tx.send(writer_b.upsert_node(1, "queued-b", UpsertNodeOptions::default()));
+        let _ = done_b_tx.send(writer_b.upsert_node("Person", "queued-b", UpsertNodeOptions::default()));
     });
 
     assert!(
@@ -15018,8 +15937,8 @@ fn test_coordinator_head_of_line_backpressure_retry_preserves_order() {
             .unwrap(),
         3
     );
-    assert_eq!(db.get_node_by_key(1, "head-a").unwrap().unwrap().id, 2);
-    assert_eq!(db.get_node_by_key(1, "queued-b").unwrap().unwrap().id, 3);
+    assert_eq!(db.get_node_by_key("Person", "head-a").unwrap().unwrap().id, 2);
+    assert_eq!(db.get_node_by_key("Person", "queued-b").unwrap().unwrap().id, 3);
 
     db.close().unwrap();
 }
@@ -15029,7 +15948,7 @@ fn test_coordinator_flush_barrier_stays_head_of_line() {
     let dir = TempDir::new().unwrap();
     let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
 
-    db.upsert_node(1, "flush-head", UpsertNodeOptions::default())
+    db.upsert_node("Person", "flush-head", UpsertNodeOptions::default())
         .unwrap();
     db.freeze_memtable().unwrap();
 
@@ -15045,7 +15964,7 @@ fn test_coordinator_flush_barrier_stays_head_of_line() {
     ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
 
     std::thread::spawn(move || {
-        let _ = write_done_tx.send(writer.upsert_node(1, "queued-after-flush", UpsertNodeOptions::default()));
+        let _ = write_done_tx.send(writer.upsert_node("Person", "queued-after-flush", UpsertNodeOptions::default()));
     });
 
     assert!(
@@ -15083,11 +16002,11 @@ fn test_compact_with_progress_waits_for_admitted_work_and_blocks_later_mutations
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
     let seg_a = db
-        .upsert_node(1, "seg-a", UpsertNodeOptions::default())
+        .upsert_node("Person", "seg-a", UpsertNodeOptions::default())
         .unwrap();
     db.flush().unwrap();
     let seg_b = db
-        .upsert_node(1, "seg-b", UpsertNodeOptions::default())
+        .upsert_node("Person", "seg-b", UpsertNodeOptions::default())
         .unwrap();
     db.flush().unwrap();
 
@@ -15104,7 +16023,7 @@ fn test_compact_with_progress_waits_for_admitted_work_and_blocks_later_mutations
 
     std::thread::spawn(move || {
         let _ = write_a_done_tx.send(writer_a.upsert_node(
-            1,
+            "Person",
             "ahead-of-compact",
             UpsertNodeOptions::default(),
         ));
@@ -15128,7 +16047,7 @@ fn test_compact_with_progress_waits_for_admitted_work_and_blocks_later_mutations
 
     std::thread::spawn(move || {
         let _ = write_b_done_tx.send(writer_b.upsert_node(
-            1,
+            "Person",
             "behind-compact",
             UpsertNodeOptions::default(),
         ));
@@ -15192,7 +16111,7 @@ fn test_publish_counters_use_snapshot_only_for_normal_write() {
     let before = db.published_state();
     db.reset_publish_counters_for_test();
     let node_id = db
-        .upsert_node(1, "snapshot-only", UpsertNodeOptions::default())
+        .upsert_node("Person", "snapshot-only", UpsertNodeOptions::default())
         .unwrap();
 
     let after = db.published_state();
@@ -15217,7 +16136,7 @@ fn test_publish_counters_rebuild_sources_for_flush() {
     };
     let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
 
-    db.upsert_node(1, "flush-me", UpsertNodeOptions::default())
+    db.upsert_node("Person", "flush-me", UpsertNodeOptions::default())
         .unwrap();
     db.reset_publish_counters_for_test();
 
@@ -15238,7 +16157,7 @@ fn test_publish_counters_rebuild_sources_for_prune_policy_change_and_skip_noop()
     let policy = PrunePolicy {
         max_age_ms: Some(60_000),
         max_weight: Some(0.5),
-        type_id: Some(1),
+        label: Some("Person".to_string()),
     };
 
     db.reset_publish_counters_for_test();
@@ -15273,7 +16192,7 @@ fn test_publish_counters_rebuild_sources_for_property_index_change_and_skip_exis
         PropValue::String("active".to_string()),
     );
     db.upsert_node(
-        1,
+        "Person",
         "indexed",
         UpsertNodeOptions {
             props,
@@ -15285,7 +16204,7 @@ fn test_publish_counters_rebuild_sources_for_property_index_change_and_skip_exis
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     db.reset_publish_counters_for_test();
     let info = db
-        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
         .unwrap();
 
     let counters = db.publish_counter_snapshot_for_test();
@@ -15303,7 +16222,7 @@ fn test_publish_counters_rebuild_sources_for_property_index_change_and_skip_exis
 
     db.reset_publish_counters_for_test();
     let existing = db
-        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
         .unwrap();
     assert_eq!(existing.index_id, info.index_id);
 
@@ -15344,7 +16263,7 @@ fn test_property_index_followups_coalesce_while_first_followup_is_in_flight() {
     props.insert("color".to_string(), red.clone());
     let node_id = db
         .upsert_node(
-            1,
+            "Person",
             "coalesce",
             UpsertNodeOptions {
                 props,
@@ -15355,25 +16274,28 @@ fn test_property_index_followups_coalesce_while_first_followup_is_in_flight() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
-    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let segment_id = db.segments_for_test()[0].segment_id;
+    let seg_dir = segment_dir(&db_path, segment_id);
     let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
     std::fs::remove_file(&sidecar_path).unwrap();
     assert!(!sidecar_path.exists());
+    db.reopen_segment_reader_and_rebuild_sources_for_test(segment_id)
+        .unwrap();
 
     let (repair_ready_rx, repair_release_tx) = db.set_secondary_index_build_pause();
     let (followup_ready_rx, followup_release_tx) = db.set_runtime_publish_pause();
 
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     followup_ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
     assert_eq!(db.pending_secondary_index_followup_count_for_test(), 1);
 
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     assert_eq!(db.pending_secondary_index_followup_count_for_test(), 1);
 
     followup_release_tx.send(()).unwrap();
@@ -15391,7 +16313,9 @@ fn test_property_index_followups_coalesce_while_first_followup_is_in_flight() {
 
     repair_release_tx.send(()).unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
-    assert!(sidecar_path.exists());
+    let repaired_sidecar_path =
+        crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(repaired_sidecar_path.exists());
 
     db.close().unwrap();
 }
@@ -15409,27 +16333,99 @@ fn test_targeted_equality_stats_refresh_replaces_reader_after_ready_transition()
     )
     .unwrap();
 
+    let mut node_ids = Vec::new();
     for (key, color) in [("red-a", "red"), ("blue-a", "blue"), ("red-b", "red")] {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String(color.to_string()));
-        db.upsert_node(1, key, UpsertNodeOptions { props, ..Default::default() })
+        let node_id = db
+            .upsert_node(
+                "Person",
+                key,
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
             .unwrap();
+        node_ids.push(node_id);
     }
     db.flush().unwrap();
 
     let old_reader = db.segments_for_test()[0].clone();
+    let segment_id = old_reader.segment_id;
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let old_component_manifest = read_component_manifest_for_test(&seg_dir);
+    let packed_core_before = packed_core_snapshot_for_test(&seg_dir);
+    let base_stats_path = seg_dir.join(crate::planner_stats::PLANNER_STATS_FILENAME);
+    let base_stats_payload_before = read_external_component_payload_for_test(&base_stats_path);
     let old_read_view = db.published_read_view_for_test();
     let old_stats_view = Arc::clone(&old_read_view.planner_stats);
     assert!(old_reader.planner_stats().unwrap().equality_index_stats.is_empty());
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
     let new_reader = db.segments_for_test()[0].clone();
     assert!(!Arc::ptr_eq(&old_reader, &new_reader));
+    assert!(new_reader.component_manifest_generation() > old_reader.component_manifest_generation());
+    let new_component_manifest = read_component_manifest_for_test(&seg_dir);
+    assert!(new_component_manifest.generation > old_component_manifest.generation);
+    assert_packed_core_unchanged_for_test(
+        &seg_dir,
+        &packed_core_before,
+        "equality/planner-stats optional refresh",
+    );
+    assert_eq!(
+        new_component_manifest.segment_data_id,
+        old_component_manifest.segment_data_id
+    );
+    assert_eq!(
+        read_external_component_payload_for_test(&base_stats_path),
+        base_stats_payload_before,
+        "optional refresh must not overwrite the base planner_stats.dat path"
+    );
+    let stats_record = new_component_manifest
+        .components
+        .iter()
+        .find(|record| record.kind == crate::segment_components::SegmentComponentKind::PlannerStats)
+        .expect("planner stats record should exist");
+    let crate::segment_components::ComponentHandleV1::ExternalFile {
+        relative_path: stats_relative_path,
+        ..
+    } = &stats_record.handle
+    else {
+        panic!("planner stats refresh should use an external file handle");
+    };
+    assert!(stats_relative_path.starts_with("planner_stats.g"));
+    assert_ne!(stats_relative_path, crate::planner_stats::PLANNER_STATS_FILENAME);
+    assert!(seg_dir.join(stats_relative_path).exists());
+    let eq_record = new_component_manifest
+        .components
+        .iter()
+        .find(|record| {
+            record.kind
+                == crate::segment_components::SegmentComponentKind::NodePropertyEqualityIndex {
+                    index_id: info.index_id,
+                }
+        })
+        .expect("equality sidecar record should exist");
+    let crate::segment_components::ComponentHandleV1::ExternalFile {
+        relative_path: eq_relative_path,
+        ..
+    } = &eq_record.handle
+    else {
+        panic!("equality sidecar refresh should use an external file handle");
+    };
+    assert!(eq_relative_path.starts_with(&format!(
+        "secondary_indexes/node_prop_eq_{}.g",
+        info.index_id
+    )));
+    assert!(!seg_dir
+        .join(format!("secondary_indexes/node_prop_eq_{}.dat", info.index_id))
+        .exists());
     let stats = new_reader.planner_stats().expect("targeted stats should be available");
     assert_eq!(
         stats.build_kind,
@@ -15449,6 +16445,11 @@ fn test_targeted_equality_stats_refresh_replaces_reader_after_ready_transition()
         .equality_index_stats
         .iter()
         .all(|stats| stats.index_id != info.index_id));
+    let old_reader_node = old_reader
+        .get_node(node_ids[0])
+        .unwrap()
+        .expect("old reader should keep packed core mapped after refresh");
+    assert_eq!(old_reader_node.key, "red-a");
     assert!(!old_stats_view.equality_index_rollups.contains_key(&info.index_id));
     assert!(!old_read_view
         .planner_stats
@@ -15460,6 +16461,304 @@ fn test_targeted_equality_stats_refresh_replaces_reader_after_ready_transition()
     assert!(new_stats_view.equality_index_rollups.contains_key(&info.index_id));
 
     db.close().unwrap();
+}
+
+#[test]
+fn test_ready_index_adopts_refreshed_sidecar_when_stats_refresh_fails() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let red = PropValue::String("red".to_string());
+    let db = DatabaseEngine::open(
+        &db_path,
+        &DbOptions {
+            compact_after_n_flushes: 0,
+            ..DbOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), red.clone());
+    let node_id = db
+        .upsert_node("Person", "stats-fails-adopt", UpsertNodeOptions { props, ..Default::default() })
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    let ready_entry =
+        wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let segment_id = db.segments_for_test()[0].segment_id;
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    db.reopen_segment_reader_and_rebuild_sources_for_test(segment_id)
+        .unwrap();
+    let missing_reader = db.segments_for_test()[0].clone();
+
+    let groups = build_secondary_eq_groups_for_segment(&missing_reader, 1, "color").unwrap();
+    install_secondary_eq_sidecar(&seg_dir, &ready_entry, &groups).unwrap();
+    let manifest_after_sidecar = read_component_manifest_for_test(&seg_dir);
+    assert!(manifest_after_sidecar.generation > missing_reader.component_manifest_generation());
+
+    let blocked_stats_path = seg_dir.join(format!(
+        "planner_stats.g{:016}.dat",
+        manifest_after_sidecar.generation + 1
+    ));
+    std::fs::create_dir(&blocked_stats_path).unwrap();
+
+    let ready = SecondaryIndexReadyApplied::from_ready_entry(&ready_entry, vec![segment_id]).unwrap();
+    let manifest_write_lock = {
+        let core_guard = db.runtime.core.lock().unwrap();
+        Arc::clone(&core_guard.as_ref().unwrap().manifest_write_lock)
+    };
+    let refreshed = refresh_ready_secondary_index_planner_stats(
+        &db_path,
+        &manifest_write_lock,
+        &ready,
+        &AtomicBool::new(false),
+    );
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(
+        read_component_manifest_for_test(&seg_dir).generation,
+        manifest_after_sidecar.generation,
+        "the forced stats failure must not be required for sidecar adoption"
+    );
+
+    db.runtime
+        .republish_secondary_index_state_and_refreshed_stats_if_open(&ready, refreshed);
+    let adopted_reader = db.segments_for_test()[0].clone();
+    assert!(adopted_reader.component_manifest_generation() > missing_reader.component_manifest_generation());
+
+    db.reset_property_query_routes();
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
+    let routes = db.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_optional_refresh_preserves_root_manifest_and_republishes_once() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let db = DatabaseEngine::open(
+        &db_path,
+        &DbOptions {
+            compact_after_n_flushes: 0,
+            ..DbOptions::default()
+        },
+    )
+    .unwrap();
+
+    for (key, color) in [("refresh-a", "red"), ("refresh-b", "blue")] {
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String(color.to_string()));
+        db.upsert_node("Person", key, UpsertNodeOptions { props, ..Default::default() })
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    let ready_entry =
+        wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    let before_reader = db.segments_for_test()[0].clone();
+    let seg_dir = segment_dir(&db_path, before_reader.segment_id);
+    let before_component_manifest = read_component_manifest_for_test(&seg_dir);
+    let packed_core_before = packed_core_snapshot_for_test(&seg_dir);
+    let root_manifest_before = std::fs::read(db_path.join("manifest.current")).unwrap();
+    let ready = SecondaryIndexReadyApplied::from_ready_entry(
+        &ready_entry,
+        vec![before_reader.segment_id],
+    )
+    .unwrap();
+    let manifest_write_lock = {
+        let core_guard = db.runtime.core.lock().unwrap();
+        Arc::clone(&core_guard.as_ref().unwrap().manifest_write_lock)
+    };
+
+    let refreshed = refresh_ready_secondary_index_planner_stats(
+        &db_path,
+        &manifest_write_lock,
+        &ready,
+        &AtomicBool::new(false),
+    );
+    assert_eq!(refreshed.len(), 1);
+    let after_component_manifest = read_component_manifest_for_test(&seg_dir);
+    assert!(after_component_manifest.generation > before_component_manifest.generation);
+    assert_packed_core_unchanged_for_test(
+        &seg_dir,
+        &packed_core_before,
+        "targeted planner-stats optional refresh",
+    );
+    assert_eq!(
+        after_component_manifest.segment_data_id,
+        before_component_manifest.segment_data_id
+    );
+    assert_eq!(
+        std::fs::read(db_path.join("manifest.current")).unwrap(),
+        root_manifest_before,
+        "optional refresh must not rewrite the root DB manifest"
+    );
+
+    db.reset_publish_counters_for_test();
+    db.runtime
+        .republish_secondary_index_state_and_refreshed_stats_if_open(&ready, refreshed);
+    let counters = db.publish_counter_snapshot_for_test();
+    assert_eq!(counters.rebuild_sources, 1);
+    assert_eq!(counters.source_rebuilds, 1);
+    let after_reader = db.segments_for_test()[0].clone();
+    assert!(after_reader.component_manifest_generation() > before_reader.component_manifest_generation());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_optional_refresh_adoption_rejects_older_reader_generation() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let db = DatabaseEngine::open(
+        &db_path,
+        &DbOptions {
+            compact_after_n_flushes: 0,
+            ..DbOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert("color".to_string(), PropValue::String("red".to_string()));
+    db.upsert_node("Person", "stale-adopt", UpsertNodeOptions { props, ..Default::default() })
+        .unwrap();
+    db.flush().unwrap();
+
+    let info = db
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .unwrap();
+    let ready_entry =
+        wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    let stale_reader = db.segments_for_test()[0].clone();
+    let ready = SecondaryIndexReadyApplied::from_ready_entry(
+        &ready_entry,
+        vec![stale_reader.segment_id],
+    )
+    .unwrap();
+    let manifest_write_lock = {
+        let core_guard = db.runtime.core.lock().unwrap();
+        Arc::clone(&core_guard.as_ref().unwrap().manifest_write_lock)
+    };
+    let refreshed = refresh_ready_secondary_index_planner_stats(
+        &db_path,
+        &manifest_write_lock,
+        &ready,
+        &AtomicBool::new(false),
+    );
+    assert_eq!(refreshed.len(), 1);
+    db.runtime
+        .republish_secondary_index_state_and_refreshed_stats_if_open(&ready, refreshed);
+    let newer_reader = db.segments_for_test()[0].clone();
+    assert!(newer_reader.component_manifest_generation() > stale_reader.component_manifest_generation());
+
+    db.runtime
+        .republish_secondary_index_state_and_refreshed_stats_if_open(
+            &ready,
+            vec![(stale_reader.segment_id, stale_reader)],
+        );
+    assert!(Arc::ptr_eq(&newer_reader, &db.segments_for_test()[0]));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_optional_refresh_orphan_files_are_cleaned_on_reopen() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let (segment_id, index_id, referenced_eq_path, referenced_stats_path);
+    let temp_path;
+    let orphan_stats_path;
+    let orphan_eq_path;
+    let packed_core_before;
+
+    {
+        let db = DatabaseEngine::open(
+            &db_path,
+            &DbOptions {
+                compact_after_n_flushes: 0,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
+
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String("red".to_string()));
+        db.upsert_node("Person", "cleanup", UpsertNodeOptions { props, ..Default::default() })
+            .unwrap();
+        db.flush().unwrap();
+
+        let info = db
+            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .unwrap();
+        wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+        index_id = info.index_id;
+        segment_id = db.segments_for_test()[0].segment_id;
+        let seg_dir = segment_dir(&db_path, segment_id);
+        packed_core_before = packed_core_snapshot_for_test(&seg_dir);
+        referenced_eq_path =
+            crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
+        let manifest = read_component_manifest_for_test(&seg_dir);
+        let stats_record = manifest
+            .components
+            .iter()
+            .find(|record| {
+                record.kind == crate::segment_components::SegmentComponentKind::PlannerStats
+            })
+            .unwrap();
+        let crate::segment_components::ComponentHandleV1::ExternalFile {
+            relative_path,
+            ..
+        } = &stats_record.handle
+        else {
+            panic!("planner stats should use external file");
+        };
+        referenced_stats_path = seg_dir.join(relative_path);
+        temp_path = seg_dir.join(".planner_stats.refresh_tmp.test.g0000000000009999.dat");
+        orphan_stats_path = seg_dir.join("planner_stats.g0000000000009999.dat");
+        orphan_eq_path = seg_dir
+            .join(format!("secondary_indexes/node_prop_eq_{index_id}.g0000000000009999.dat"));
+        std::fs::write(&temp_path, b"temp").unwrap();
+        std::fs::write(&orphan_stats_path, b"orphan stats").unwrap();
+        std::fs::write(&orphan_eq_path, b"orphan eq").unwrap();
+
+        db.close().unwrap();
+    }
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    assert!(!temp_path.exists());
+    assert!(!orphan_stats_path.exists());
+    assert!(!orphan_eq_path.exists());
+    assert!(referenced_eq_path.exists());
+    assert!(referenced_stats_path.exists());
+    let seg_dir = segment_dir(&db_path, segment_id);
+    assert_packed_core_unchanged_for_test(
+        &seg_dir,
+        &packed_core_before,
+        "optional orphan cleanup",
+    );
+    assert_eq!(reopened.segments_for_test()[0].segment_id, segment_id);
+    let ready = reopened
+        .list_node_property_indexes()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.index_id == index_id)
+        .unwrap();
+    assert_eq!(ready.state, SecondaryIndexState::Ready);
+
+    reopened.close().unwrap();
 }
 
 #[test]
@@ -15479,7 +16778,7 @@ fn test_public_index_list_waits_for_ready_publish_after_targeted_stats_refresh()
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), red.clone());
     let node_id = db
-        .upsert_node(1, "publish-boundary", UpsertNodeOptions { props, ..Default::default() })
+        .upsert_node("Person", "publish-boundary", UpsertNodeOptions { props, ..Default::default() })
         .unwrap();
     db.flush().unwrap();
 
@@ -15488,7 +16787,7 @@ fn test_public_index_list_waits_for_ready_publish_after_targeted_stats_refresh()
 
     let (build_ready_rx, build_release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     build_ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -15509,7 +16808,7 @@ fn test_public_index_list_waits_for_ready_publish_after_targeted_stats_refresh()
     assert_ne!(listed_while_publish_paused[0].state, SecondaryIndexState::Ready);
 
     db.reset_property_query_routes();
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     let routes_before_publish = db.property_query_route_snapshot();
     assert_eq!(routes_before_publish.equality_scan_fallback, 1);
     assert_eq!(routes_before_publish.equality_index_lookup, 0);
@@ -15520,7 +16819,7 @@ fn test_public_index_list_waits_for_ready_publish_after_targeted_stats_refresh()
     assert!(old_read_view.secondary_index_entries.is_empty());
 
     db.reset_property_query_routes();
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     let routes_after_publish = db.property_query_route_snapshot();
     assert_eq!(routes_after_publish.equality_scan_fallback, 0);
     assert_eq!(routes_after_publish.equality_index_lookup, 1);
@@ -15530,7 +16829,7 @@ fn test_public_index_list_waits_for_ready_publish_after_targeted_stats_refresh()
 
 #[test]
 #[cfg(unix)]
-fn test_targeted_stats_refresh_failure_still_publishes_ready_index() {
+fn test_targeted_stats_refresh_ignores_stale_legacy_tmp_and_publishes_ready_index() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = TempDir::new().unwrap();
@@ -15548,7 +16847,7 @@ fn test_targeted_stats_refresh_failure_still_publishes_ready_index() {
     let mut props = BTreeMap::new();
     props.insert("color".to_string(), red.clone());
     let node_id = db
-        .upsert_node(1, "stats-failure-ready", UpsertNodeOptions { props, ..Default::default() })
+        .upsert_node("Person", "stats-failure-ready", UpsertNodeOptions { props, ..Default::default() })
         .unwrap();
     db.flush().unwrap();
 
@@ -15561,15 +16860,15 @@ fn test_targeted_stats_refresh_failure_still_publishes_ready_index() {
     std::fs::set_permissions(&tmp_path, perms).unwrap();
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     let ready = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.state, SecondaryIndexState::Ready);
     assert!(ready.last_error.is_none());
-    assert!(!tmp_path.exists());
+    assert!(tmp_path.exists());
 
     db.reset_property_query_routes();
-    assert_eq!(db.find_nodes(1, "color", &red).unwrap(), vec![node_id]);
+    assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
     let routes = db.property_query_route_snapshot();
     assert_eq!(routes.equality_scan_fallback, 0);
     assert_eq!(routes.equality_index_lookup, 1);
@@ -15579,7 +16878,7 @@ fn test_targeted_stats_refresh_failure_still_publishes_ready_index() {
     assert!(stats
         .equality_index_stats
         .iter()
-        .all(|stats| stats.index_id != info.index_id));
+        .any(|stats| stats.index_id == info.index_id && stats.sidecar_present_at_build));
 
     db.close().unwrap();
 }
@@ -15600,18 +16899,19 @@ fn test_targeted_range_stats_refresh_writes_minimal_stats_when_missing() {
     for (key, score) in [("score-a", 10), ("score-b", 20), ("score-c", 30)] {
         let mut props = BTreeMap::new();
         props.insert("score".to_string(), PropValue::Int(score));
-        db.upsert_node(1, key, UpsertNodeOptions { props, ..Default::default() })
+        db.upsert_node("Person", key, UpsertNodeOptions { props, ..Default::default() })
             .unwrap();
     }
     db.flush().unwrap();
 
     let segment_id = db.segments_for_test()[0].segment_id;
-    let stats_path = segment_dir(&db_path, segment_id).join(crate::planner_stats::PLANNER_STATS_FILENAME);
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let stats_path = seg_dir.join(crate::planner_stats::PLANNER_STATS_FILENAME);
     std::fs::remove_file(&stats_path).unwrap();
+    let packed_core_before = packed_core_snapshot_for_test(&seg_dir);
 
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -15620,6 +16920,29 @@ fn test_targeted_range_stats_refresh_writes_minimal_stats_when_missing() {
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert_packed_core_unchanged_for_test(
+        &seg_dir,
+        &packed_core_before,
+        "range/planner-stats optional refresh",
+    );
+    let manifest = read_component_manifest_for_test(&seg_dir);
+    let range_record = manifest
+        .components
+        .iter()
+        .find(|record| {
+            record.kind
+                == crate::segment_components::SegmentComponentKind::NodePropertyRangeIndex {
+                    index_id: info.index_id,
+                }
+        })
+        .expect("range sidecar record should exist");
+    assert!(
+        matches!(
+            &range_record.handle,
+            crate::segment_components::ComponentHandleV1::ExternalFile { .. }
+        ),
+        "range optional refresh should publish an external sidecar"
+    );
 
     let reader = db.segments_for_test()[0].clone();
     let stats = reader.planner_stats().expect("minimal targeted stats should load");
@@ -15631,7 +16954,7 @@ fn test_targeted_range_stats_refresh_writes_minimal_stats_when_missing() {
     assert_eq!(stats.general_property_sampled_node_count, 0);
     assert!(stats.property_stats.is_empty());
     assert_eq!(stats.node_count, 3);
-    assert_eq!(stats.type_stats.len(), 1);
+    assert_eq!(stats.node_label_stats.len(), 1);
     let range = stats
         .range_index_stats
         .iter()
@@ -15659,7 +16982,7 @@ fn test_targeted_range_stats_refresh_writes_minimal_stats_when_corrupt() {
     for (key, score) in [("corrupt-a", 10), ("corrupt-b", 20), ("corrupt-c", 30)] {
         let mut props = BTreeMap::new();
         props.insert("score".to_string(), PropValue::Int(score));
-        db.upsert_node(1, key, UpsertNodeOptions { props, ..Default::default() })
+        db.upsert_node("Person", key, UpsertNodeOptions { props, ..Default::default() })
             .unwrap();
     }
     db.flush().unwrap();
@@ -15670,8 +16993,7 @@ fn test_targeted_range_stats_refresh_writes_minimal_stats_when_corrupt() {
     std::fs::write(&stats_path, b"corrupt planner stats").unwrap();
 
     let info = db
-        .ensure_node_property_index(
-            1,
+        .ensure_node_property_index("Person",
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -15719,13 +17041,13 @@ fn test_targeted_stats_refresh_drops_stale_declared_index_blocks() {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String(color.to_string()));
         props.insert("tier".to_string(), PropValue::String(tier.to_string()));
-        db.upsert_node(1, key, UpsertNodeOptions { props, ..Default::default() })
+        db.upsert_node("Person", key, UpsertNodeOptions { props, ..Default::default() })
             .unwrap();
     }
     db.flush().unwrap();
 
     let color = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, color.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, color.index_id, SecondaryIndexState::Ready);
@@ -15737,10 +17059,10 @@ fn test_targeted_stats_refresh_drops_stale_declared_index_blocks() {
         .any(|stats| stats.index_id == color.index_id));
 
     assert!(db
-        .drop_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .drop_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap());
     let tier = db
-        .ensure_node_property_index(1, "tier", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "tier", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, tier.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, tier.index_id, SecondaryIndexState::Ready);
@@ -15779,7 +17101,7 @@ fn test_targeted_stats_refresh_skips_obsolete_segments_before_write_and_swap() {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
         db.upsert_node(
-            1,
+            "Person",
             &format!("race-{segment}"),
             UpsertNodeOptions { props, ..Default::default() },
         )
@@ -15789,7 +17111,7 @@ fn test_targeted_stats_refresh_skips_obsolete_segments_before_write_and_swap() {
     let old_segments = db.segments_for_test();
 
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     let ready_entry =
@@ -15832,7 +17154,7 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
         let entry = SecondaryIndexManifestEntry {
             index_id: 991,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "color".to_string(),
             },
             kind: SecondaryIndexKind::Equality,
@@ -15848,9 +17170,12 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
 
         let snapshot = SecondaryEqBuildSnapshot {
             dense_config: None,
-            type_id: 1,
+            target: SecondaryIndexTargetDiscriminant::Node,
+            target_label_id: 1,
             prop_key: "color".to_string(),
             segment_ids: Vec::new(),
+            segment_infos: Vec::new(),
+            secondary_indexes: vec![entry.clone()],
         };
         let outcome = {
             let core_guard = db.runtime.core.lock().unwrap();
@@ -15863,6 +17188,7 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
                 &core.next_node_id_seen,
                 &core.next_edge_id_seen,
                 &core.engine_seq_seen,
+                &core.label_catalog,
                 entry.index_id,
                 &snapshot,
                 &status,
@@ -15892,7 +17218,7 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
         let entry = SecondaryIndexManifestEntry {
             index_id: 992,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id: 1,
+                label_id: 1,
                 prop_key: "score".to_string(),
             },
             kind: SecondaryIndexKind::Range {
@@ -15910,10 +17236,13 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
 
         let snapshot = SecondaryRangeBuildSnapshot {
             dense_config: None,
-            type_id: 1,
+            target: SecondaryIndexTargetDiscriminant::Node,
+            target_label_id: 1,
             prop_key: "score".to_string(),
             domain: SecondaryIndexRangeDomain::Int,
             segment_ids: Vec::new(),
+            segment_infos: Vec::new(),
+            secondary_indexes: vec![entry.clone()],
         };
         let outcome = {
             let core_guard = db.runtime.core.lock().unwrap();
@@ -15926,6 +17255,7 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
                 &core.next_node_id_seen,
                 &core.next_edge_id_seen,
                 &core.engine_seq_seen,
+                &core.label_catalog,
                 entry.index_id,
                 &snapshot,
                 &status,
@@ -15965,7 +17295,7 @@ fn test_targeted_stats_refresh_swaps_only_affected_reader_arcs() {
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
         db.upsert_node(
-            1,
+            "Person",
             &format!("affected-{segment}"),
             UpsertNodeOptions { props, ..Default::default() },
         )
@@ -15973,7 +17303,7 @@ fn test_targeted_stats_refresh_swaps_only_affected_reader_arcs() {
         db.flush().unwrap();
     }
     let info = db
-        .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     let ready_entry =
@@ -15986,11 +17316,20 @@ fn test_targeted_stats_refresh_swaps_only_affected_reader_arcs() {
     .unwrap();
 
     let refreshed_segment_id = before[0].segment_id;
+    let manifest = crate::manifest::load_manifest_readonly(&db_path)
+        .unwrap()
+        .unwrap();
+    let refreshed_info = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == refreshed_segment_id)
+        .unwrap();
     let refreshed_reader = Arc::new(
-        SegmentReader::open(
+        SegmentReader::open_with_info(
             &segment_dir(&db_path, refreshed_segment_id),
-            refreshed_segment_id,
-            None,
+            refreshed_info,
+            manifest.dense_vector.as_ref(),
+            &manifest.secondary_indexes,
         )
         .unwrap(),
     );
@@ -16013,7 +17352,7 @@ fn test_open_does_not_backfill_missing_planner_stats() {
     let db_path = dir.path().join("testdb");
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
-        db.upsert_node(1, "missing-stats", UpsertNodeOptions::default())
+        db.upsert_node("Person", "missing-stats", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
         let segment_id = db.segments_for_test()[0].segment_id;

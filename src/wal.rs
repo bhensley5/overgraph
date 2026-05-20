@@ -2,12 +2,13 @@
 use crate::encoding::encode_wal_op;
 use crate::encoding::{decode_wal_op, encode_wal_op_into};
 use crate::error::EngineError;
-use crate::types::WalOp;
+use crate::types::{OpTag, WalOp};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-const WAL_FILENAME: &str = "data.wal";
+#[cfg(test)]
+const WAL_FILENAME: &str = "wal_0.wal";
 const WAL_MAGIC: [u8; 4] = *b"OVGR";
 const WAL_VERSION: u32 = 3;
 const WAL_HEADER_SIZE: usize = 8; // WAL_MAGIC (4) + WAL_VERSION (4)
@@ -18,6 +19,44 @@ const MAX_WAL_RECORD_SIZE: usize = 64 * 1024 * 1024;
 /// - len: byte length of payload (not including len or crc fields)
 /// - crc32: CRC-32 of payload bytes
 /// - payload: encoded WalOp
+#[derive(Clone, Copy)]
+struct WalReadAtomicBatch {
+    first_seq: u64,
+    op_count: u32,
+    ops_read: u32,
+}
+
+impl WalReadAtomicBatch {
+    fn new(first_seq: u64, op_count: u32) -> Option<Self> {
+        if first_seq == 0 || op_count < 2 {
+            return None;
+        }
+        Some(Self {
+            first_seq,
+            op_count,
+            ops_read: 0,
+        })
+    }
+
+    fn push_normal_op(&mut self, seq: u64) -> bool {
+        if self.ops_read >= self.op_count {
+            return false;
+        }
+        let Some(expected_seq) = self.first_seq.checked_add(self.ops_read as u64) else {
+            return false;
+        };
+        if seq != expected_seq {
+            return false;
+        }
+        self.ops_read += 1;
+        true
+    }
+
+    fn matches_commit(&self, first_seq: u64, op_count: u32) -> bool {
+        self.first_seq == first_seq && self.op_count == op_count && self.ops_read == op_count
+    }
+}
+
 fn write_wal_header(writer: &mut impl Write) -> Result<(), EngineError> {
     writer.write_all(&WAL_MAGIC)?;
     writer.write_all(&WAL_VERSION.to_le_bytes())?;
@@ -44,61 +83,12 @@ fn validate_wal_header(header: &[u8; WAL_HEADER_SIZE]) -> Result<(), EngineError
 
 /// Write-ahead log writer. Appends framed records to the WAL file.
 pub struct WalWriter {
-    path: PathBuf,
     writer: BufWriter<File>,
     encode_buf: Vec<u8>,
 }
 
 impl WalWriter {
-    /// Open or create a WAL file for appending.
-    ///
-    /// If the file is new or empty, writes the WAL header (magic + version).
-    /// If the file already has data, validates the existing header.
-    pub fn open(db_dir: &Path) -> Result<Self, EngineError> {
-        let path = db_dir.join(WAL_FILENAME);
-
-        // Open a single file handle for both validation and append writes.
-        // read+create+append avoids a TOCTOU race between check and open.
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)?;
-
-        let file_len = file.metadata()?.len();
-        let needs_header = if file_len == 0 {
-            true
-        } else if file_len < WAL_HEADER_SIZE as u64 {
-            return Err(EngineError::CorruptWal(
-                "WAL file too small for header".into(),
-            ));
-        } else {
-            // Validate existing header using the same file handle
-            let mut header = [0u8; WAL_HEADER_SIZE];
-            (&file).read_exact(&mut header)?;
-            validate_wal_header(&header)?;
-            false
-        };
-
-        let mut writer = BufWriter::new(file);
-
-        if needs_header {
-            write_wal_header(&mut writer)?;
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-        }
-
-        Ok(WalWriter {
-            path,
-            writer,
-            encode_buf: Vec::new(),
-        })
-    }
-
     /// Open or create a WAL generation file for appending.
-    ///
-    /// Same as `open()` but uses `wal_generation_path(db_dir, gen_id)` instead
-    /// of the legacy `data.wal` filename.
     pub fn open_generation(db_dir: &Path, gen_id: u64) -> Result<Self, EngineError> {
         let path = wal_generation_path(db_dir, gen_id);
 
@@ -131,7 +121,6 @@ impl WalWriter {
         }
 
         Ok(WalWriter {
-            path,
             writer,
             encode_buf: Vec::new(),
         })
@@ -161,28 +150,77 @@ impl WalWriter {
         Ok(8 + total_payload)
     }
 
+    fn encode_frame_into(
+        &mut self,
+        seq: u64,
+        op: &WalOp,
+        batch_buf: &mut Vec<u8>,
+    ) -> Result<(), EngineError> {
+        encode_wal_op_into(op, &mut self.encode_buf)?;
+        let seq_bytes = seq.to_le_bytes();
+        let total_payload = 8 + self.encode_buf.len();
+        let len = total_payload as u32;
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&seq_bytes);
+        hasher.update(&self.encode_buf);
+        let crc = hasher.finalize();
+
+        batch_buf.extend_from_slice(&len.to_le_bytes());
+        batch_buf.extend_from_slice(&crc.to_le_bytes());
+        batch_buf.extend_from_slice(&seq_bytes);
+        batch_buf.extend_from_slice(&self.encode_buf);
+        Ok(())
+    }
+
     /// Append multiple (engine_seq, WalOp) pairs as a single atomic buffer write.
+    /// Multi-op batches are wrapped in begin/commit control frames.
     /// All ops are pre-encoded before any I/O, so encoding failures
     /// don't leave partial data in the write buffer.
     /// Returns total bytes written (framing + payload).
     pub(crate) fn append_batch(&mut self, ops: &[(u64, WalOp)]) -> Result<usize, EngineError> {
-        // Pre-encode all ops into a single contiguous buffer
         let mut batch_buf = Vec::new();
-        for (seq, op) in ops {
-            encode_wal_op_into(op, &mut self.encode_buf)?;
-            let seq_bytes = seq.to_le_bytes();
-            let total_payload = 8 + self.encode_buf.len();
-            let len = total_payload as u32;
-
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&seq_bytes);
-            hasher.update(&self.encode_buf);
-            let crc = hasher.finalize();
-
-            batch_buf.extend_from_slice(&len.to_le_bytes());
-            batch_buf.extend_from_slice(&crc.to_le_bytes());
-            batch_buf.extend_from_slice(&seq_bytes);
-            batch_buf.extend_from_slice(&self.encode_buf);
+        match ops {
+            [] => {}
+            [(seq, op)] => self.encode_frame_into(*seq, op, &mut batch_buf)?,
+            _ => {
+                let first_seq = ops[0].0;
+                let op_count = u32::try_from(ops.len()).map_err(|_| {
+                    EngineError::InvalidOperation(
+                        "atomic WAL batch op_count exceeds u32::MAX".to_string(),
+                    )
+                })?;
+                if first_seq == 0 {
+                    return Err(EngineError::InvalidOperation(
+                        "atomic WAL batch first sequence must be nonzero".to_string(),
+                    ));
+                }
+                for (idx, (seq, _)) in ops.iter().enumerate() {
+                    let expected_seq = first_seq.checked_add(idx as u64).ok_or_else(|| {
+                        EngineError::InvalidOperation(
+                            "atomic WAL batch sequence range overflows u64".to_string(),
+                        )
+                    })?;
+                    if *seq != expected_seq {
+                        return Err(EngineError::InvalidOperation(
+                            "atomic WAL batch sequences must be contiguous".to_string(),
+                        ));
+                    }
+                }
+                let begin = WalOp::BeginAtomicBatch {
+                    first_seq,
+                    op_count,
+                };
+                self.encode_frame_into(first_seq, &begin, &mut batch_buf)?;
+                for (seq, op) in ops {
+                    self.encode_frame_into(*seq, op, &mut batch_buf)?;
+                }
+                let commit = WalOp::CommitAtomicBatch {
+                    first_seq,
+                    op_count,
+                };
+                self.encode_frame_into(first_seq, &commit, &mut batch_buf)?;
+            }
         }
 
         let total = batch_buf.len();
@@ -191,8 +229,8 @@ impl WalWriter {
         Ok(total)
     }
 
-    /// Flush the WAL to disk.
-    pub fn flush(&mut self) -> Result<(), EngineError> {
+    #[cfg(test)]
+    pub(crate) fn flush(&mut self) -> Result<(), EngineError> {
         self.writer.flush()?;
         Ok(())
     }
@@ -203,168 +241,65 @@ impl WalWriter {
         self.writer.get_ref().sync_all()?;
         Ok(())
     }
-
-    /// Truncate the WAL file and re-write the header.
-    /// Re-opens the append writer after truncation.
-    pub fn truncate_and_reset(&mut self) -> Result<(), EngineError> {
-        self.writer.flush()?;
-        {
-            // Use a dedicated truncate handle so Windows does not rely on
-            // set_len() against an append-mode descriptor.
-            let file = OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&self.path)?;
-            let mut writer = BufWriter::new(file);
-            write_wal_header(&mut writer)?;
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-        }
-
-        // Re-open append writer for subsequent WAL appends.
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        self.writer = BufWriter::new(file);
-        Ok(())
-    }
-
-    /// Return the WAL file path.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 /// Write-ahead log reader. Reads framed records with CRC validation.
 pub struct WalReader {
+    #[cfg(test)]
     path: PathBuf,
 }
 
+pub(crate) struct WalReadResult {
+    pub(crate) records: Vec<(u64, WalOp)>,
+    pub(crate) durable_len: u64,
+}
+
 impl WalReader {
-    pub fn new(db_dir: &Path) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(db_dir: &Path) -> Self {
         WalReader {
-            path: db_dir.join(WAL_FILENAME),
+            path: wal_generation_path(db_dir, 0),
         }
     }
 
-    /// Read all valid records from the WAL. Stops at EOF or first corrupt/truncated
-    /// record (which is treated as a crash boundary; the partial record is ignored).
-    ///
-    /// Validates the WAL header (magic + version) before reading records.
-    /// Returns `(engine_seq, WalOp)` pairs. Returns an error if the file is
-    /// not a valid OverGraph WAL.
     #[cfg(test)]
     pub(crate) fn read_all(&self) -> Result<Vec<(u64, WalOp)>, EngineError> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let file = File::open(&self.path)?;
-        let file_len = file.metadata()?.len();
-        if file_len == 0 {
-            return Ok(Vec::new());
-        }
-
-        if file_len < WAL_HEADER_SIZE as u64 {
-            return Err(EngineError::CorruptWal(
-                "WAL file too small for header".into(),
-            ));
-        }
-
-        let mut reader = BufReader::new(file);
-
-        // Validate header
-        let mut header = [0u8; WAL_HEADER_SIZE];
-        reader
-            .read_exact(&mut header)
-            .map_err(EngineError::IoError)?;
-        validate_wal_header(&header)?;
-
-        let mut ops = Vec::new();
-
-        loop {
-            // Read length
-            let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(EngineError::IoError(e)),
-            }
-            let payload_len = u32::from_le_bytes(len_buf) as usize;
-
-            // Sanity check: reject zero-length or impossibly large records
-            if payload_len == 0 || payload_len > MAX_WAL_RECORD_SIZE {
-                break;
-            }
-
-            // Read CRC
-            let mut crc_buf = [0u8; 4];
-            match reader.read_exact(&mut crc_buf) {
-                Ok(()) => {}
-                Err(_) => break, // truncated
-            }
-            let stored_crc = u32::from_le_bytes(crc_buf);
-
-            // Read payload
-            let mut payload = vec![0u8; payload_len];
-            match reader.read_exact(&mut payload) {
-                Ok(()) => {}
-                Err(_) => break, // truncated
-            }
-
-            // Validate CRC
-            if crc32fast::hash(&payload) != stored_crc {
-                // Corrupt record. Stop here (crash boundary)
-                break;
-            }
-
-            // V3 frame: first 8 bytes are engine_seq, rest is WalOp
-            if payload.len() < 8 {
-                break; // truncated seq prefix
-            }
-            let engine_seq = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes for seq"));
-            let walop_bytes = &payload[8..];
-
-            let recognized_tag = walop_bytes
-                .first()
-                .and_then(|tag| crate::types::OpTag::from_u8(*tag))
-                .is_some();
-
-            // Decode the operation. Unknown op tags remain a crash boundary for
-            // garbage tail recovery, but recognized malformed records are hard
-            // corruption and must fail reopen.
-            match decode_wal_op(walop_bytes) {
-                Ok(op) => ops.push((engine_seq, op)),
-                Err(err) if recognized_tag => {
-                    return Err(EngineError::CorruptWal(format!(
-                        "failed to decode WAL record: {}",
-                        err
-                    )));
-                }
-                Err(_) => break,
-            }
-        }
-
-        Ok(ops)
+        Self::read_path(&self.path).map(|result| result.records)
     }
 
     /// Read all valid records from a WAL generation file.
-    /// Same as `read_all()` but reads from `wal_generation_path(db_dir, gen_id)`.
+    #[cfg(test)]
     pub(crate) fn read_generation(
         db_dir: &Path,
         gen_id: u64,
     ) -> Result<Vec<(u64, WalOp)>, EngineError> {
+        Self::read_generation_recoverable(db_dir, gen_id).map(|result| result.records)
+    }
+
+    /// Read all recoverable records plus the byte offset of the durable prefix.
+    pub(crate) fn read_generation_recoverable(
+        db_dir: &Path,
+        gen_id: u64,
+    ) -> Result<WalReadResult, EngineError> {
         let path = wal_generation_path(db_dir, gen_id);
+        Self::read_path(&path)
+    }
+
+    fn read_path(path: &Path) -> Result<WalReadResult, EngineError> {
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(WalReadResult {
+                records: Vec::new(),
+                durable_len: 0,
+            });
         }
 
-        let file = File::open(&path)?;
+        let file = File::open(path)?;
         let file_len = file.metadata()?.len();
         if file_len == 0 {
-            return Ok(Vec::new());
+            return Ok(WalReadResult {
+                records: Vec::new(),
+                durable_len: 0,
+            });
         }
 
         if file_len < WAL_HEADER_SIZE as u64 {
@@ -383,8 +318,12 @@ impl WalReader {
         validate_wal_header(&header)?;
 
         let mut ops = Vec::new();
+        let mut open_batch: Option<WalReadAtomicBatch> = None;
+        let mut pos = WAL_HEADER_SIZE as u64;
+        let mut durable_len = pos;
 
         loop {
+            let frame_start = pos;
             // Read length
             let mut len_buf = [0u8; 4];
             match reader.read_exact(&mut len_buf) {
@@ -397,6 +336,7 @@ impl WalReader {
             if payload_len == 0 || payload_len > MAX_WAL_RECORD_SIZE {
                 break;
             }
+            let frame_end = frame_start + 8 + payload_len as u64;
 
             // Read CRC
             let mut crc_buf = [0u8; 4];
@@ -425,14 +365,63 @@ impl WalReader {
             let engine_seq = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes for seq"));
             let walop_bytes = &payload[8..];
 
-            let recognized_tag = walop_bytes
-                .first()
-                .and_then(|tag| crate::types::OpTag::from_u8(*tag))
-                .is_some();
+            let recognized_tag = walop_bytes.first().and_then(|tag| OpTag::from_u8(*tag));
 
             match decode_wal_op(walop_bytes) {
-                Ok(op) => ops.push((engine_seq, op)),
-                Err(err) if recognized_tag => {
+                Ok(op) => match &op {
+                    WalOp::BeginAtomicBatch {
+                        first_seq,
+                        op_count,
+                    } => {
+                        if open_batch.is_some() {
+                            break;
+                        }
+                        let Some(batch) = WalReadAtomicBatch::new(*first_seq, *op_count) else {
+                            break;
+                        };
+                        open_batch = Some(batch);
+                        ops.push((engine_seq, op));
+                        pos = frame_end;
+                    }
+                    WalOp::CommitAtomicBatch {
+                        first_seq,
+                        op_count,
+                    } => {
+                        let Some(batch) = open_batch else {
+                            break;
+                        };
+                        if !batch.matches_commit(*first_seq, *op_count) {
+                            break;
+                        }
+                        open_batch = None;
+                        ops.push((engine_seq, op));
+                        durable_len = frame_end;
+                        pos = frame_end;
+                    }
+                    _ => {
+                        if let Some(batch) = open_batch.as_mut() {
+                            if !batch.push_normal_op(engine_seq) {
+                                break;
+                            }
+                        } else {
+                            durable_len = frame_end;
+                        }
+                        ops.push((engine_seq, op));
+                        pos = frame_end;
+                    }
+                },
+                Err(_)
+                    if matches!(
+                        recognized_tag,
+                        Some(OpTag::BeginAtomicBatch | OpTag::CommitAtomicBatch)
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) if open_batch.is_some() && recognized_tag.is_some() => {
+                    break;
+                }
+                Err(err) if recognized_tag.is_some() => {
                     return Err(EngineError::CorruptWal(format!(
                         "failed to decode WAL record: {}",
                         err
@@ -442,27 +431,11 @@ impl WalReader {
             }
         }
 
-        Ok(ops)
+        Ok(WalReadResult {
+            records: ops,
+            durable_len,
+        })
     }
-
-    /// Returns true if the WAL file exists.
-    pub fn exists(&self) -> bool {
-        self.path.exists()
-    }
-
-    /// Return the WAL file path.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Delete the WAL file (used after successful flush/checkpoint).
-pub fn remove_wal(db_dir: &Path) -> Result<(), EngineError> {
-    let path = db_dir.join(WAL_FILENAME);
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
-    Ok(())
 }
 
 /// WAL generation file path: `wal_<generation_id>.wal`
@@ -479,14 +452,18 @@ pub fn remove_wal_generation(db_dir: &Path, gen_id: u64) -> Result<(), EngineErr
     Ok(())
 }
 
-/// Truncate the WAL file and re-write the header (alternative to remove for reuse).
-pub fn truncate_wal(db_dir: &Path) -> Result<(), EngineError> {
-    let path = db_dir.join(WAL_FILENAME);
-    if path.exists() {
-        let file = OpenOptions::new().write(true).truncate(true).open(&path)?;
-        let mut writer = BufWriter::new(&file);
-        write_wal_header(&mut writer)?;
-        writer.flush()?;
+pub(crate) fn truncate_wal_generation_to(
+    db_dir: &Path,
+    gen_id: u64,
+    durable_len: u64,
+) -> Result<(), EngineError> {
+    let path = wal_generation_path(db_dir, gen_id);
+    if !path.exists() {
+        return Ok(());
+    }
+    let file = OpenOptions::new().write(true).open(&path)?;
+    if file.metadata()?.len() > durable_len {
+        file.set_len(durable_len)?;
         file.sync_all()?;
     }
     Ok(())
@@ -504,7 +481,7 @@ mod tests {
         props.insert("name".to_string(), PropValue::String(key.to_string()));
         WalOp::UpsertNode(NodeRecord {
             id,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: key.to_string(),
             props,
             created_at: 1000 * id as i64,
@@ -521,7 +498,7 @@ mod tests {
             id,
             from,
             to,
-            type_id: 10,
+            label_id: 10,
             props: BTreeMap::new(),
             created_at: 2000 * id as i64,
             updated_at: 2000 * id as i64 + 1,
@@ -535,7 +512,7 @@ mod tests {
     #[test]
     fn test_wal_write_and_read_single() {
         let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         let op = make_test_node(1, "user:alice");
         writer.append(&op, 1).unwrap();
@@ -560,7 +537,7 @@ mod tests {
     #[test]
     fn test_wal_write_and_read_many() {
         let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         for i in 0..1000 {
             let op = make_test_node(i, &format!("node:{}", i));
@@ -613,7 +590,7 @@ mod tests {
     #[test]
     fn test_wal_mixed_operations() {
         let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         writer.append(&make_test_node(1, "alice"), 1).unwrap();
         writer.append(&make_test_node(2, "bob"), 2).unwrap();
@@ -672,7 +649,7 @@ mod tests {
     #[test]
     fn test_wal_corrupt_tail_recovery() {
         let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         // Write 5 valid records
         for i in 0..5 {
@@ -700,7 +677,7 @@ mod tests {
     #[test]
     fn test_wal_corrupt_crc_detection() {
         let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         // Write 3 valid records
         for i in 0..3 {
@@ -732,58 +709,9 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_truncate() {
-        let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
-        writer.append(&make_test_node(1, "test"), 1).unwrap();
-        writer.flush().unwrap();
-        drop(writer);
-
-        // Verify data exists
-        let reader = WalReader::new(dir.path());
-        assert_eq!(reader.read_all().unwrap().len(), 1);
-
-        // Truncate (re-writes header)
-        truncate_wal(dir.path()).unwrap();
-
-        // Verify empty records but valid WAL
-        let reader = WalReader::new(dir.path());
-        assert!(reader.read_all().unwrap().is_empty());
-
-        // Verify we can reopen a writer on the truncated file
-        let mut writer = WalWriter::open(dir.path()).unwrap();
-        writer
-            .append(&make_test_node(2, "after_truncate"), 2)
-            .unwrap();
-        writer.flush().unwrap();
-        drop(writer);
-
-        let reader = WalReader::new(dir.path());
-        let records = reader.read_all().unwrap();
-        assert_eq!(records.len(), 1);
-        match &records[0] {
-            (_, WalOp::UpsertNode(node)) => assert_eq!(node.key, "after_truncate"),
-            _ => panic!("expected UpsertNode"),
-        }
-    }
-
-    #[test]
-    fn test_wal_remove() {
-        let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
-        writer.append(&make_test_node(1, "test"), 1).unwrap();
-        writer.flush().unwrap();
-        drop(writer);
-
-        assert!(dir.path().join(WAL_FILENAME).exists());
-        remove_wal(dir.path()).unwrap();
-        assert!(!dir.path().join(WAL_FILENAME).exists());
-    }
-
-    #[test]
     fn test_wal_append_returns_size() {
         let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         let delete_op = WalOp::DeleteNode {
             id: 1,
@@ -797,12 +725,26 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_append_batch_rejects_non_contiguous_sequences() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        let err = writer
+            .append_batch(&[(1, make_test_node(1, "a")), (3, make_test_node(2, "b"))])
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidOperation(_)));
+        writer.flush().unwrap();
+
+        let reader = WalReader::new(dir.path());
+        assert!(reader.read_all().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_wal_reopen_writer_and_append() {
         let dir = TempDir::new().unwrap();
 
         // First session: write 3 records
         {
-            let mut writer = WalWriter::open(dir.path()).unwrap();
+            let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
             for i in 0..3 {
                 writer
                     .append(&make_test_node(i, &format!("s1:{}", i)), i + 1)
@@ -813,7 +755,7 @@ mod tests {
 
         // Second session: reopen and append 2 more
         {
-            let mut writer = WalWriter::open(dir.path()).unwrap();
+            let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
             for i in 10..12 {
                 writer
                     .append(&make_test_node(i, &format!("s2:{}", i)), i + 1)
@@ -873,7 +815,7 @@ mod tests {
         std::fs::write(&wal_path, b"BADMAGIC").unwrap();
 
         // Writer should refuse to open
-        let result = WalWriter::open(dir.path());
+        let result = WalWriter::open_generation(dir.path(), 0);
         assert!(result.is_err());
     }
 
@@ -883,7 +825,7 @@ mod tests {
         let wal_path = dir.path().join(WAL_FILENAME);
 
         // Create a WAL via writer
-        let writer = WalWriter::open(dir.path()).unwrap();
+        let writer = WalWriter::open_generation(dir.path(), 0).unwrap();
         drop(writer);
 
         // Verify the file starts with the header
@@ -902,7 +844,7 @@ mod tests {
         let wal_path = dir.path().join(WAL_FILENAME);
 
         // Write 3 valid records via writer (header auto-added)
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
         for i in 0..3 {
             writer
                 .append(&make_test_node(i, &format!("n:{}", i)), i + 1)
@@ -937,7 +879,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let wal_path = dir.path().join(WAL_FILENAME);
 
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
         writer.append(&make_test_node(1, "valid"), 1).unwrap();
         writer.flush().unwrap();
         drop(writer);
@@ -972,7 +914,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let wal_path = dir.path().join(WAL_FILENAME);
 
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
         writer.append(&make_test_node(1, "valid"), 1).unwrap();
         writer.flush().unwrap();
         drop(writer);
@@ -1031,7 +973,7 @@ mod tests {
         let wal_path = dir.path().join(WAL_FILENAME);
 
         // Write 2 valid records via writer (header auto-added)
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
         writer.append(&make_test_node(1, "first"), 1).unwrap();
         writer.append(&make_test_node(2, "second"), 2).unwrap();
         writer.flush().unwrap();

@@ -1,6 +1,6 @@
 use overgraph::*;
 
-/// Build a small graph (20 nodes, 50 edges, mixed types),
+/// Build a small graph (20 nodes, 50 edges, mixed labels and relationships),
 /// verify all query patterns: get, neighbors, deletes.
 #[test]
 fn test_full_graph_query_patterns() {
@@ -9,13 +9,17 @@ fn test_full_graph_query_patterns() {
 
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-    // Create 20 nodes across 3 types
+    // Create 20 nodes across 3 labels
     let mut node_ids = Vec::new();
     for i in 0..20 {
-        let type_id = (i % 3) as u32 + 1; // types 1, 2, 3
+        let label = match i % 3 {
+            0 => "Person",
+            1 => "Company",
+            _ => "Article",
+        };
         let id = engine
             .upsert_node(
-                type_id,
+                label,
                 &format!("node:{}", i),
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -27,16 +31,16 @@ fn test_full_graph_query_patterns() {
     }
     assert_eq!(engine.node_count().unwrap(), 20);
 
-    // Create 50 edges across 2 types
-    // Type 10: "knows" edges, chain pattern (0->1->2->...->19)
-    // Type 20: "references" edges, skip pattern (i->i+3)
+    // Create 50 edges across two relationships.
+    // KNOWS edges use a chain pattern (0->1->2->...->19).
+    // REFERENCES edges use skip and hub patterns.
     let mut edge_ids = Vec::new();
     for i in 0..19 {
         let eid = engine
             .upsert_edge(
                 node_ids[i],
                 node_ids[i + 1],
-                10,
+                "KNOWS",
                 UpsertEdgeOptions::default(),
             )
             .unwrap();
@@ -47,7 +51,7 @@ fn test_full_graph_query_patterns() {
             .upsert_edge(
                 node_ids[i],
                 node_ids[i + 3],
-                20,
+                "REFERENCES",
                 UpsertEdgeOptions {
                     weight: 0.8,
                     ..Default::default()
@@ -62,7 +66,7 @@ fn test_full_graph_query_patterns() {
             .upsert_edge(
                 node_ids[0],
                 node_ids[i],
-                20,
+                "REFERENCES",
                 UpsertEdgeOptions {
                     weight: 0.5,
                     ..Default::default()
@@ -88,12 +92,12 @@ fn test_full_graph_query_patterns() {
         .unwrap();
     assert_eq!(out_0.len(), 16);
 
-    // Filter by type 10 ("knows"), node 0 has exactly 1 (->1)
+    // Filter by KNOWS, node 0 has exactly 1 (->1)
     let knows_0 = engine
         .neighbors(
             node_ids[0],
             &NeighborOptions {
-                type_filter: Some(vec![10]),
+                edge_label_filter: Some(vec!["KNOWS".to_string()]),
                 ..Default::default()
             },
         )
@@ -106,7 +110,7 @@ fn test_full_graph_query_patterns() {
         .neighbors(
             node_ids[5],
             &NeighborOptions {
-                type_filter: Some(vec![10]),
+                edge_label_filter: Some(vec!["KNOWS".to_string()]),
                 ..Default::default()
             },
         )
@@ -169,7 +173,7 @@ fn test_full_graph_query_patterns() {
         .neighbors(
             node_ids[0],
             &NeighborOptions {
-                type_filter: Some(vec![10]),
+                edge_label_filter: Some(vec!["KNOWS".to_string()]),
                 ..Default::default()
             },
         )
@@ -200,7 +204,7 @@ fn test_graph_state_survives_restart() {
 
         node_a = engine
             .upsert_node(
-                1,
+                "Person",
                 "a",
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -210,7 +214,7 @@ fn test_graph_state_survives_restart() {
             .unwrap();
         node_b = engine
             .upsert_node(
-                1,
+                "Person",
                 "b",
                 UpsertNodeOptions {
                     weight: 0.6,
@@ -220,7 +224,7 @@ fn test_graph_state_survives_restart() {
             .unwrap();
         node_c = engine
             .upsert_node(
-                2,
+                "Company",
                 "c",
                 UpsertNodeOptions {
                     weight: 0.7,
@@ -230,7 +234,7 @@ fn test_graph_state_survives_restart() {
             .unwrap();
         node_d = engine
             .upsert_node(
-                2,
+                "Company",
                 "d",
                 UpsertNodeOptions {
                     weight: 0.8,
@@ -240,13 +244,13 @@ fn test_graph_state_survives_restart() {
             .unwrap();
 
         edge_ab = engine
-            .upsert_edge(node_a, node_b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(node_a, node_b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         edge_ac = engine
             .upsert_edge(
                 node_a,
                 node_c,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 0.9,
                     ..Default::default()
@@ -257,7 +261,7 @@ fn test_graph_state_survives_restart() {
             .upsert_edge(
                 node_b,
                 node_c,
-                20,
+                "REFERENCES",
                 UpsertEdgeOptions {
                     weight: 0.8,
                     ..Default::default()
@@ -268,7 +272,7 @@ fn test_graph_state_survives_restart() {
             .upsert_edge(
                 node_c,
                 node_d,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 0.7,
                     ..Default::default()
@@ -334,23 +338,23 @@ fn test_graph_state_survives_restart() {
         assert_eq!(inc_c.len(), 1);
         assert_eq!(inc_c[0].node_id, node_a);
 
-        // Type filter works after replay
-        let typed = engine
+        // Edge label filter works after replay
+        let label_filtered = engine
             .neighbors(
                 node_a,
                 &NeighborOptions {
-                    type_filter: Some(vec![10]),
+                    edge_label_filter: Some(vec!["KNOWS".to_string()]),
                     ..Default::default()
                 },
             )
             .unwrap();
-        assert_eq!(typed.len(), 2); // both ab and ac are type 10
+        assert_eq!(label_filtered.len(), 2); // both ab and ac are KNOWS
 
         // Upsert dedup still works after replay
         let engine = engine; // need mut for upsert
         let a_again = engine
             .upsert_node(
-                1,
+                "Person",
                 "a",
                 UpsertNodeOptions {
                     weight: 0.99,
@@ -364,7 +368,7 @@ fn test_graph_state_survives_restart() {
         // New allocation doesn't collide
         let node_e = engine
             .upsert_node(
-                1,
+                "Person",
                 "e",
                 UpsertNodeOptions {
                     weight: 0.5,

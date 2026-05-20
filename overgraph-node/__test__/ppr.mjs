@@ -22,7 +22,7 @@ describe('personalizedPagerank (sync)', () => {
   });
 
   it('single seed no edges returns seed with rank 1.0', () => {
-    const id = db.upsertNode(1, 'lonely');
+    const id = db.upsertNode('Person', 'lonely');
     const r = db.personalizedPagerank([id]);
     assert.equal(r.nodeIds.length, 1);
     assert.equal(r.nodeIds[0], id);
@@ -31,7 +31,7 @@ describe('personalizedPagerank (sync)', () => {
   });
 
   it('approx mode returns algorithm metadata', () => {
-    const id = db.upsertNode(1, 'approx-seed');
+    const id = db.upsertNode('Person', 'approx-seed');
     const r = db.personalizedPagerank([id], {
       algorithm: 'approx',
       approxResidualTolerance: 1e-6,
@@ -48,12 +48,12 @@ describe('personalizedPagerank, graph queries', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-ppr-graph-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 1, { weight: 1.0 });
-    db.upsertEdge(b, c, 1, { weight: 1.0 });
-    db.upsertEdge(c, a, 1, { weight: 1.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'LINKS_TO', { weight: 1.0 });
+    db.upsertEdge(b, c, 'LINKS_TO', { weight: 1.0 });
+    db.upsertEdge(c, a, 'LINKS_TO', { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -73,10 +73,10 @@ describe('personalizedPagerank, graph queries', () => {
     assert.ok(r.nodeIds.length <= 2);
   });
 
-  it('edge type filter restricts walk', () => {
+  it('edge label filter restricts walk', () => {
     // Only type-1 edges exist, filter to type-99 should give no neighbors
     const r = db.personalizedPagerank([a], {
-      edgeTypeFilter: [99],
+      edgeLabelFilter: ['MISSING_EDGE_TYPE'],
       maxIterations: 100,
     });
     // Only seed should have rank (no edges to walk)
@@ -90,11 +90,11 @@ describe('personalizedPagerank, weighted edges', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-ppr-weight-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 1, { weight: 1.0 });
-    db.upsertEdge(a, c, 1, { weight: 9.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'LINKS_TO', { weight: 1.0 });
+    db.upsertEdge(a, c, 'LINKS_TO', { weight: 9.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -112,12 +112,12 @@ describe('personalizedPagerank across flush', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-ppr-flush-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 1, { weight: 1.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    db.upsertEdge(a, b, 'LINKS_TO', { weight: 1.0 });
     db.flush();
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(b, c, 1, { weight: 1.0 });
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(b, c, 'LINKS_TO', { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -132,9 +132,9 @@ describe('personalizedPagerankAsync', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-ppr-async-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 1, { weight: 1.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    db.upsertEdge(a, b, 'LINKS_TO', { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 

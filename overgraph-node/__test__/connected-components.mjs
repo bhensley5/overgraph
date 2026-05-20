@@ -19,11 +19,11 @@ describe('connectedComponents (sync)', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('finds single component', () => {
-    const a = db.upsertNode(1, 'a');
-    const b = db.upsertNode(1, 'b');
-    const c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10);
-    db.upsertEdge(b, c, 10);
+    const a = db.upsertNode('Person', 'a');
+    const b = db.upsertNode('Person', 'b');
+    const c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'WORKS_AT');
+    db.upsertEdge(b, c, 'WORKS_AT');
 
     const comps = db.connectedComponents();
     assert.equal(comps.length, 3);
@@ -34,9 +34,9 @@ describe('connectedComponents (sync)', () => {
   });
 
   it('finds multiple components', () => {
-    const d = db.upsertNode(1, 'd');
-    const e = db.upsertNode(1, 'e');
-    db.upsertEdge(d, e, 10);
+    const d = db.upsertNode('Person', 'd');
+    const e = db.upsertNode('Person', 'e');
+    db.upsertEdge(d, e, 'WORKS_AT');
 
     const comps = db.connectedComponents();
     const map = Object.fromEntries(comps.map(e => [e.nodeId, e.componentId]));
@@ -48,20 +48,20 @@ describe('connectedComponents (sync)', () => {
   });
 
   it('handles self-loops', () => {
-    const s = db.upsertNode(1, 'selfloop');
-    db.upsertEdge(s, s, 10);
+    const s = db.upsertNode('Person', 'selfloop');
+    db.upsertEdge(s, s, 'WORKS_AT');
     const comps = db.connectedComponents();
     const map = Object.fromEntries(comps.map(e => [e.nodeId, e.componentId]));
     assert.equal(map[s], s); // self-loop doesn't change membership
   });
 
   it('handles parallel edges', () => {
-    const p1 = db.upsertNode(1, 'par1');
-    const p2 = db.upsertNode(1, 'par2');
-    const p3 = db.upsertNode(1, 'par3');
-    db.upsertEdge(p1, p2, 10);
-    db.upsertEdge(p1, p2, 20); // parallel
-    db.upsertEdge(p2, p1, 10); // reverse parallel
+    const p1 = db.upsertNode('Person', 'par1');
+    const p2 = db.upsertNode('Person', 'par2');
+    const p3 = db.upsertNode('Person', 'par3');
+    db.upsertEdge(p1, p2, 'WORKS_AT');
+    db.upsertEdge(p1, p2, 'MENTIONS'); // parallel
+    db.upsertEdge(p2, p1, 'WORKS_AT'); // reverse parallel
     const comps = db.connectedComponents();
     const map = Object.fromEntries(comps.map(e => [e.nodeId, e.componentId]));
     assert.equal(map[p1], map[p2]);
@@ -69,37 +69,37 @@ describe('connectedComponents (sync)', () => {
   });
 
   it('isolated nodes are singletons', () => {
-    const f = db.upsertNode(1, 'f_isolated');
+    const f = db.upsertNode('Person', 'f_isolated');
     const comps = db.connectedComponents();
     const map = Object.fromEntries(comps.map(e => [e.nodeId, e.componentId]));
     assert.equal(map[f], f);
   });
 
-  it('respects edge type filter', () => {
-    const g = db.upsertNode(1, 'g');
-    const h = db.upsertNode(1, 'h');
-    const i = db.upsertNode(1, 'i');
-    db.upsertEdge(g, h, 10);
-    db.upsertEdge(h, i, 20);
+  it('respects edge label filter', () => {
+    const g = db.upsertNode('Person', 'g');
+    const h = db.upsertNode('Person', 'h');
+    const i = db.upsertNode('Person', 'i');
+    db.upsertEdge(g, h, 'WORKS_AT');
+    db.upsertEdge(h, i, 'MENTIONS');
 
-    const comps = db.connectedComponents({ edgeTypeFilter: [10] });
+    const comps = db.connectedComponents({ edgeLabelFilter: ['WORKS_AT'] });
     const map = Object.fromEntries(comps.map(e => [e.nodeId, e.componentId]));
-    assert.equal(map[g], map[h]); // connected via type 10
-    assert.notEqual(map[h], map[i]); // type 20 excluded
+    assert.equal(map[g], map[h]); // connected via WORKS_AT
+    assert.notEqual(map[h], map[i]); // MENTIONS excluded
   });
 
-  it('respects node type filter', () => {
-    const j = db.upsertNode(1, 'j');
-    const k = db.upsertNode(2, 'k');
-    const l = db.upsertNode(1, 'l');
-    db.upsertEdge(j, k, 10);
-    db.upsertEdge(k, l, 10);
+  it('respects node label filter', () => {
+    const j = db.upsertNode('Person', 'j');
+    const k = db.upsertNode('Company', 'k');
+    const l = db.upsertNode('Person', 'l');
+    db.upsertEdge(j, k, 'WORKS_AT');
+    db.upsertEdge(k, l, 'WORKS_AT');
 
-    const comps = db.connectedComponents({ nodeTypeFilter: [1] });
+    const comps = db.connectedComponents({ nodeLabelFilter: { labels: ['Person'], mode: 'all' } });
     const map = Object.fromEntries(comps.map(e => [e.nodeId, e.componentId]));
     assert.ok(map[j] !== undefined);
     assert.ok(map[l] !== undefined);
-    assert.equal(map[k], undefined); // type 2 filtered out
+    assert.equal(map[k], undefined); // Company filtered out
   });
 
   it('returns sorted by nodeId', () => {
@@ -124,12 +124,12 @@ describe('componentOf (sync)', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-comp-'));
     db = freshDb(tmpDir, 'comp');
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    d = db.upsertNode(1, 'd');
-    db.upsertEdge(a, b, 10);
-    db.upsertEdge(b, c, 10);
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    d = db.upsertNode('Person', 'd');
+    db.upsertEdge(a, b, 'WORKS_AT');
+    db.upsertEdge(b, c, 'WORKS_AT');
     // d is isolated
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
@@ -157,34 +157,34 @@ describe('componentOf (sync)', () => {
     assert.equal(members.length, 0);
   });
 
-  it('respects edge type filter', () => {
-    const e = db.upsertNode(1, 'e');
-    const f = db.upsertNode(1, 'f');
-    db.upsertEdge(e, f, 20);
+  it('respects edge label filter', () => {
+    const e = db.upsertNode('Person', 'e');
+    const f = db.upsertNode('Person', 'f');
+    db.upsertEdge(e, f, 'MENTIONS');
 
-    const members = Array.from(db.componentOf(e, { edgeTypeFilter: [10] }));
-    // Edge type 20 excluded, so e is isolated.
+    const members = Array.from(db.componentOf(e, { edgeLabelFilter: ['WORKS_AT'] }));
+    // MENTIONS excluded, so e is isolated.
     assert.deepEqual(members, [e]);
   });
 
-  it('respects node type filter', () => {
-    const g = db.upsertNode(1, 'g');
-    const h = db.upsertNode(2, 'h');
-    db.upsertEdge(g, h, 10);
+  it('respects node label filter', () => {
+    const g = db.upsertNode('Person', 'g');
+    const h = db.upsertNode('Company', 'h');
+    db.upsertEdge(g, h, 'WORKS_AT');
 
-    const members = Array.from(db.componentOf(g, { nodeTypeFilter: [1] }));
-    // h is type 2, filtered out
+    const members = Array.from(db.componentOf(g, { nodeLabelFilter: { labels: ['Person'], mode: 'all' } }));
+    // h is Company, filtered out
     assert.deepEqual(members, [g]);
   });
 
-  it('returns empty for start node excluded by type filter', () => {
-    const members = Array.from(db.componentOf(a, { nodeTypeFilter: [99] }));
+  it('returns empty for start node excluded by label filter', () => {
+    const members = Array.from(db.componentOf(a, { nodeLabelFilter: { labels: ['MissingLabel'], mode: 'all' } }));
     assert.equal(members.length, 0);
   });
 
   it('handles self-loop', () => {
-    const s = db.upsertNode(1, 'selfloop_comp');
-    db.upsertEdge(s, s, 10);
+    const s = db.upsertNode('Person', 'selfloop_comp');
+    db.upsertEdge(s, s, 'WORKS_AT');
     const members = Array.from(db.componentOf(s));
     assert.deepEqual(members, [s]);
   });
@@ -200,10 +200,10 @@ describe('connectedComponents (async)', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('finds components async', async () => {
-    const a = db.upsertNode(1, 'a');
-    const b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 10);
-    const c = db.upsertNode(1, 'c'); // isolated
+    const a = db.upsertNode('Person', 'a');
+    const b = db.upsertNode('Person', 'b');
+    db.upsertEdge(a, b, 'WORKS_AT');
+    const c = db.upsertNode('Person', 'c'); // isolated
 
     const comps = await db.connectedComponentsAsync();
     const map = Object.fromEntries(comps.map(e => [e.nodeId, e.componentId]));
@@ -223,9 +223,9 @@ describe('componentOf (async)', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('finds component members async', async () => {
-    const a = db.upsertNode(1, 'a');
-    const b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 10);
+    const a = db.upsertNode('Person', 'a');
+    const b = db.upsertNode('Person', 'b');
+    db.upsertEdge(a, b, 'WORKS_AT');
 
     const members = await db.componentOfAsync(a);
     assert.deepEqual(Array.from(members).sort((x, y) => x - y), [a, b].sort((x, y) => x - y));

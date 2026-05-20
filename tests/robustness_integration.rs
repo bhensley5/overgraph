@@ -5,6 +5,8 @@ use overgraph::{
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
+const LARGE_SCALE_LABELS: [&str; 5] = ["Person", "Company", "Article", "Topic", "Project"];
+
 fn make_props(key: &str, val: &str) -> BTreeMap<String, PropValue> {
     let mut m = BTreeMap::new();
     m.insert(key.to_string(), PropValue::String(val.to_string()));
@@ -30,12 +32,12 @@ fn test_crash_recovery_wal_replay() {
     let node_b;
     let edge_ab;
 
-    // Phase 1: write data, flush some to segment, leave some in WAL only
+    // Step 1: write data, flush some to segment, leave some in WAL only
     {
         let db = DatabaseEngine::open(&db_path, &opts).unwrap();
         node_a = db
             .upsert_node(
-                1,
+                "Person",
                 "alice",
                 UpsertNodeOptions {
                     props: make_props("role", "admin"),
@@ -45,7 +47,7 @@ fn test_crash_recovery_wal_replay() {
             .unwrap();
         node_b = db
             .upsert_node(
-                1,
+                "Person",
                 "bob",
                 UpsertNodeOptions {
                     props: make_props("role", "user"),
@@ -55,7 +57,7 @@ fn test_crash_recovery_wal_replay() {
             )
             .unwrap();
         edge_ab = db
-            .upsert_edge(node_a, node_b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(node_a, node_b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // Flush to segment
@@ -63,7 +65,7 @@ fn test_crash_recovery_wal_replay() {
 
         // Write more data that stays in WAL only
         db.upsert_node(
-            2,
+            "Company",
             "charlie",
             UpsertNodeOptions {
                 props: make_props("role", "viewer"),
@@ -73,7 +75,7 @@ fn test_crash_recovery_wal_replay() {
         )
         .unwrap();
         db.upsert_node(
-            2,
+            "Company",
             "diana",
             UpsertNodeOptions {
                 props: make_props("role", "editor"),
@@ -87,7 +89,7 @@ fn test_crash_recovery_wal_replay() {
         // (The Drop impl will attempt cleanup but WAL data should be durable)
     }
 
-    // Phase 2: reopen and verify everything
+    // Step 2: reopen and verify everything
     {
         let db = DatabaseEngine::open(&db_path, &opts).unwrap();
 
@@ -107,13 +109,13 @@ fn test_crash_recovery_wal_replay() {
         assert_eq!(edge.to, node_b);
 
         // WAL-only data should be recovered
-        let charlie = db.get_node_by_key(2, "charlie").unwrap();
+        let charlie = db.get_node_by_key("Company", "charlie").unwrap();
         assert!(
             charlie.is_some(),
             "WAL-only node 'charlie' should be recovered"
         );
 
-        let diana = db.get_node_by_key(2, "diana").unwrap();
+        let diana = db.get_node_by_key("Company", "diana").unwrap();
         assert!(diana.is_some(), "WAL-only node 'diana' should be recovered");
 
         // Neighbors should work across recovered data
@@ -143,12 +145,12 @@ fn test_crash_recovery_with_deletes() {
     {
         let db = DatabaseEngine::open(&db_path, &opts).unwrap();
         node_a = db
-            .upsert_node(1, "a", UpsertNodeOptions::default())
+            .upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
         node_b = db
-            .upsert_node(1, "b", UpsertNodeOptions::default())
+            .upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
-        db.upsert_edge(node_a, node_b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(node_a, node_b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
@@ -208,7 +210,7 @@ fn test_large_scale_100k_nodes() {
         let chunk_end = (chunk_start + chunk_size).min(total_nodes);
         let batch: Vec<NodeInput> = (chunk_start..chunk_end)
             .map(|i| NodeInput {
-                type_id: (i % 5 + 1) as u32,
+                labels: vec![LARGE_SCALE_LABELS[i % LARGE_SCALE_LABELS.len()].to_string()],
                 key: format!("node-{}", i),
                 props: {
                     let mut m = BTreeMap::new();
@@ -221,7 +223,7 @@ fn test_large_scale_100k_nodes() {
             })
             .collect();
 
-        let ids = db.batch_upsert_nodes(&batch).unwrap();
+        let ids = db.batch_upsert_nodes(batch.clone()).unwrap();
         all_ids.extend_from_slice(&ids);
 
         // Flush every other chunk to create segments
@@ -238,7 +240,7 @@ fn test_large_scale_100k_nodes() {
         .map(|i| overgraph::EdgeInput {
             from: all_ids[i],
             to: all_ids[i + 1],
-            type_id: 10,
+            label: "KNOWS".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
@@ -246,7 +248,7 @@ fn test_large_scale_100k_nodes() {
         })
         .collect();
 
-    db.batch_upsert_edges(&edge_batch).unwrap();
+    db.batch_upsert_edges(edge_batch.clone()).unwrap();
     db.flush().unwrap();
 
     // Compact all segments
@@ -259,13 +261,15 @@ fn test_large_scale_100k_nodes() {
     let spot = db.get_node(all_ids[50_000]).unwrap().unwrap();
     assert_eq!(spot.key, "node-50000");
 
-    // Type query
-    let type_1_count = db.count_nodes_by_type(1).unwrap();
-    assert_eq!(type_1_count, 20_000); // 100k / 5 types
+    // Label query
+    let person_count = db.count_nodes_by_labels("Person").unwrap();
+    assert_eq!(person_count, 20_000); // 100k / 5 labels
 
     // Find nodes
-    let found = db.find_nodes(3, "idx", &PropValue::Int(42)).unwrap();
-    assert!(!found.is_empty() || 42 % 5 + 1 != 3); // only found if type matches
+    let found = db
+        .find_nodes("Article", "idx", &PropValue::Int(42))
+        .unwrap();
+    assert!(!found.is_empty()); // node 42 uses the Article label
 
     // Bulk read
     let sample_ids = &all_ids[0..100];
@@ -306,11 +310,11 @@ fn test_engine_manifest_corruption_recovery() {
     // Write data and flush to create a manifest
     {
         let db = DatabaseEngine::open(&db_path, &opts).unwrap();
-        db.upsert_node(1, "a", UpsertNodeOptions::default())
+        db.upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
         // Write a second manifest version so manifest.prev exists
-        db.upsert_node(1, "b", UpsertNodeOptions::default())
+        db.upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
         db.close().unwrap();
@@ -327,7 +331,7 @@ fn test_engine_manifest_corruption_recovery() {
         // The engine should open successfully (recovered from prev)
         // We may lose the second flush's manifest entry, but the WAL
         // should replay and recover the data
-        let node_a = db.get_node_by_key(1, "a").unwrap();
+        let node_a = db.get_node_by_key("Person", "a").unwrap();
         assert!(node_a.is_some(), "node 'a' should be recoverable");
         db.close().unwrap();
     }
@@ -355,7 +359,7 @@ fn test_engine_wal_truncated_record_recovery() {
         let db = DatabaseEngine::open(&db_path, &opts).unwrap();
         node_a = db
             .upsert_node(
-                1,
+                "Person",
                 "valid_node",
                 UpsertNodeOptions {
                     props: make_props("k", "v"),
@@ -410,23 +414,23 @@ fn test_temporal_edges_cross_source() {
 
     let db = DatabaseEngine::open(&db_path, &opts).unwrap();
     let a = db
-        .upsert_node(1, "a", UpsertNodeOptions::default())
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();
     let b = db
-        .upsert_node(1, "b", UpsertNodeOptions::default())
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
         .unwrap();
     let c = db
-        .upsert_node(1, "c", UpsertNodeOptions::default())
+        .upsert_node("Person", "c", UpsertNodeOptions::default())
         .unwrap();
     let d = db
-        .upsert_node(1, "d", UpsertNodeOptions::default())
+        .upsert_node("Person", "d", UpsertNodeOptions::default())
         .unwrap();
 
     // Edge in segment: A->B valid [1000, 5000)
     db.upsert_edge(
         a,
         b,
-        10,
+        "KNOWS",
         UpsertEdgeOptions {
             valid_from: Some(1000),
             valid_to: Some(5000),
@@ -440,7 +444,7 @@ fn test_temporal_edges_cross_source() {
     db.upsert_edge(
         a,
         c,
-        10,
+        "KNOWS",
         UpsertEdgeOptions {
             valid_from: Some(3000),
             valid_to: Some(9000),
@@ -453,7 +457,7 @@ fn test_temporal_edges_cross_source() {
     db.upsert_edge(
         a,
         d,
-        10,
+        "KNOWS",
         UpsertEdgeOptions {
             valid_from: Some(0),
             ..Default::default()
@@ -504,7 +508,7 @@ fn test_temporal_edges_cross_source() {
     assert!(ids.contains(&d), "D (always-valid) should be visible");
 
     // Compact and re-verify
-    db.upsert_node(1, "filler", UpsertNodeOptions::default())
+    db.upsert_node("Person", "filler", UpsertNodeOptions::default())
         .unwrap();
     db.flush().unwrap();
     db.compact().unwrap();

@@ -1,6 +1,6 @@
 {
   "name": "overgraph",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "An absurdly fast embedded graph database for Node.js. Sub-microsecond reads, pure Rust core.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -16,11 +16,14 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
+    "typecheck": "tsc --noEmit -p tsconfig.types.json",
     "test": "node --test __test__/*.mjs",
     "bench": "node __test__/benchmark-v2.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.0.0"
+    "@napi-rs/cli": "^3.0.0",
+    "@types/node": "^25.8.0",
+    "typescript": "^6.0.3"
   },
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -30,12 +33,20 @@
   },
   "homepage": "https://overgraph.io",
   "docs": "https://overgraph.io/docs/api-reference",
-  "keywords": ["graph-database", "embedded", "performance", "typescript", "napi-rs", "rust"],
+  "keywords": [
+    "graph-database",
+    "embedded",
+    "performance",
+    "typescript",
+    "napi-rs",
+    "rust"
+  ],
   "author": "Brandon Hensley",
   "files": [
     "index.js",
     "index.d.ts",
     "query-types.d.ts",
+    "helpers/pack-binary.mjs",
     "*.node",
     "README.md"
   ]

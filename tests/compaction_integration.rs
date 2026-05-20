@@ -4,6 +4,8 @@ use overgraph::{
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
+const COMPACTION_LABELS: [&str; 3] = ["Person", "Company", "Article"];
+
 /// Insert 5k nodes + 10k edges, flush, delete 30%, flush, compact,
 /// verify disk shrinks and queries return correct results.
 #[test]
@@ -17,7 +19,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
     let mut node_ids = Vec::with_capacity(5_000);
     let batch: Vec<overgraph::NodeInput> = (0..5_000)
         .map(|i| overgraph::NodeInput {
-            type_id: (i % 3) as u32 + 1, // types 1..3
+            labels: vec![COMPACTION_LABELS[i % COMPACTION_LABELS.len()].to_string()],
             key: format!("n:{}", i),
             props: {
                 let mut p = BTreeMap::new();
@@ -29,7 +31,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
             sparse_vector: None,
         })
         .collect();
-    node_ids.extend(engine.batch_upsert_nodes(&batch).unwrap());
+    node_ids.extend(engine.batch_upsert_nodes(batch.clone()).unwrap());
     assert_eq!(node_ids.len(), 5_000);
 
     // --- Step 1b: Insert 10k edges (chain + cross-links) ---
@@ -39,28 +41,28 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
         .map(|i| overgraph::EdgeInput {
             from: node_ids[i],
             to: node_ids[i + 1],
-            type_id: 10,
+            label: "KNOWS".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         })
         .collect();
-    edge_ids.extend(engine.batch_upsert_edges(&chain).unwrap());
+    edge_ids.extend(engine.batch_upsert_edges(chain.clone()).unwrap());
 
     // Cross-links: 5001 more edges
     let cross: Vec<overgraph::EdgeInput> = (0..5_001)
         .map(|i| overgraph::EdgeInput {
             from: node_ids[i % 5_000],
             to: node_ids[(i + 500) % 5_000],
-            type_id: 20,
+            label: "REFERENCES".to_string(),
             props: BTreeMap::new(),
             weight: 0.7,
             valid_from: None,
             valid_to: None,
         })
         .collect();
-    edge_ids.extend(engine.batch_upsert_edges(&cross).unwrap());
+    edge_ids.extend(engine.batch_upsert_edges(cross.clone()).unwrap());
     assert_eq!(edge_ids.len(), 10_000);
 
     // --- Flush to segment 1 ---
@@ -192,18 +194,18 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
         );
     }
 
-    // Type-filtered neighbors should still work
+    // Relationship-filtered neighbors should still work
     let chain_only = engine
         .neighbors(
             mid,
             &NeighborOptions {
-                type_filter: Some(vec![10]),
+                edge_label_filter: Some(vec!["KNOWS".to_string()]),
                 ..Default::default()
             },
         )
         .unwrap();
     for entry in &chain_only {
-        assert_eq!(entry.edge_type_id, 10);
+        assert_eq!(entry.label, "KNOWS");
     }
 
     engine.close().unwrap();
@@ -240,7 +242,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
     // Segment 1: nodes A, B, C with edges A->B, B->C
     let a = engine
         .upsert_node(
-            1,
+            "Person",
             "alpha",
             UpsertNodeOptions {
                 props: props(&[("v", 1)]),
@@ -251,7 +253,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         .unwrap();
     let b = engine
         .upsert_node(
-            1,
+            "Person",
             "beta",
             UpsertNodeOptions {
                 props: props(&[("v", 2)]),
@@ -262,7 +264,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         .unwrap();
     let c = engine
         .upsert_node(
-            2,
+            "Company",
             "gamma",
             UpsertNodeOptions {
                 props: props(&[("v", 3)]),
@@ -272,13 +274,13 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         )
         .unwrap();
     let e_ab = engine
-        .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     let e_bc = engine
         .upsert_edge(
             b,
             c,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 0.9,
                 ..Default::default()
@@ -290,7 +292,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
     // Segment 2: update B's props, add node D, edge C->D, delete edge A->B
     let _ = engine
         .upsert_node(
-            1,
+            "Person",
             "beta",
             UpsertNodeOptions {
                 props: props(&[("v", 20)]),
@@ -301,7 +303,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         .unwrap(); // update B
     let d = engine
         .upsert_node(
-            3,
+            "Article",
             "delta",
             UpsertNodeOptions {
                 props: props(&[("v", 4)]),
@@ -314,7 +316,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         .upsert_edge(
             c,
             d,
-            20,
+            "REFERENCES",
             UpsertEdgeOptions {
                 weight: 0.8,
                 ..Default::default()
@@ -328,7 +330,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
     engine.delete_node(c).unwrap();
     let e = engine
         .upsert_node(
-            1,
+            "Person",
             "epsilon",
             UpsertNodeOptions {
                 props: props(&[("v", 5)]),
@@ -341,7 +343,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         .upsert_edge(
             d,
             e,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 0.7,
                 ..Default::default()

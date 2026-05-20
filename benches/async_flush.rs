@@ -35,7 +35,23 @@ const SYNC_FLUSH_INTERVAL: u64 = 3300;
 fn temp_db_with_opts(opts: DbOptions) -> (tempfile::TempDir, DatabaseEngine) {
     let dir = tempfile::tempdir().unwrap();
     let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    seed_bench_label_tokens(&engine);
     (dir, engine)
+}
+
+fn seed_bench_label_tokens(engine: &DatabaseEngine) {
+    for label_token_id in 1..=8 {
+        assert_eq!(
+            engine
+                .ensure_node_label(&bench_node_label(label_token_id))
+                .unwrap(),
+            label_token_id
+        );
+    }
+}
+
+fn bench_node_label(label_token_id: u32) -> String {
+    format!("BenchNode{label_token_id}")
 }
 
 fn sync_opts() -> DbOptions {
@@ -106,7 +122,7 @@ fn simple_sparse_vector(index: usize, nnz: usize) -> Vec<(u32, f32)> {
 fn pre_populate_plain(engine: &mut DatabaseEngine, count: usize) -> Vec<u64> {
     let inputs: Vec<NodeInput> = (0..count)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("seed_{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -114,7 +130,7 @@ fn pre_populate_plain(engine: &mut DatabaseEngine, count: usize) -> Vec<u64> {
             sparse_vector: None,
         })
         .collect();
-    let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+    let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
     engine.flush().unwrap();
     ids
 }
@@ -122,7 +138,7 @@ fn pre_populate_plain(engine: &mut DatabaseEngine, count: usize) -> Vec<u64> {
 fn pre_populate_dense(engine: &mut DatabaseEngine, count: usize, dim: usize) {
     let inputs: Vec<NodeInput> = (0..count)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("vec_{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -130,14 +146,14 @@ fn pre_populate_dense(engine: &mut DatabaseEngine, count: usize, dim: usize) {
             sparse_vector: None,
         })
         .collect();
-    engine.batch_upsert_nodes(&inputs).unwrap();
+    engine.batch_upsert_nodes(inputs.clone()).unwrap();
     engine.flush().unwrap();
 }
 
 fn pre_populate_sparse(engine: &mut DatabaseEngine, count: usize, nnz: usize) {
     let inputs: Vec<NodeInput> = (0..count)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("svec_{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -145,7 +161,7 @@ fn pre_populate_sparse(engine: &mut DatabaseEngine, count: usize, nnz: usize) {
             sparse_vector: Some(simple_sparse_vector(i, nnz)),
         })
         .collect();
-    engine.batch_upsert_nodes(&inputs).unwrap();
+    engine.batch_upsert_nodes(inputs.clone()).unwrap();
     engine.flush().unwrap();
 }
 
@@ -165,7 +181,7 @@ fn bench_sustained_writes_threshold(c: &mut Criterion) {
             |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
-                        .upsert_node(1, &format!("n{}", i), write_opts(i))
+                        .upsert_node("BenchNode", &format!("n{}", i), write_opts(i))
                         .unwrap();
                     if (i + 1) % SYNC_FLUSH_INTERVAL == 0 {
                         engine.flush().unwrap();
@@ -182,7 +198,7 @@ fn bench_sustained_writes_threshold(c: &mut Criterion) {
             |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
-                        .upsert_node(1, &format!("n{}", i), write_opts(i))
+                        .upsert_node("BenchNode", &format!("n{}", i), write_opts(i))
                         .unwrap();
                 }
             },
@@ -208,7 +224,7 @@ fn bench_writes_with_queued_epochs(c: &mut Criterion) {
                 let (_dir, engine) = temp_db_with_opts(sync_opts());
                 for j in 0..2000u64 {
                     engine
-                        .upsert_node(1, &format!("pre_{}", j), write_opts(j))
+                        .upsert_node("BenchNode", &format!("pre_{}", j), write_opts(j))
                         .unwrap();
                     if (j + 1) % SYNC_FLUSH_INTERVAL == 0 {
                         engine.flush().unwrap();
@@ -220,7 +236,7 @@ fn bench_writes_with_queued_epochs(c: &mut Criterion) {
                 for i in 0..BURST_SIZE {
                     let k = 2000 + i;
                     engine
-                        .upsert_node(1, &format!("n{}", k), write_opts(k))
+                        .upsert_node("BenchNode", &format!("n{}", k), write_opts(k))
                         .unwrap();
                     if (i + 1) % SYNC_FLUSH_INTERVAL == 0 {
                         engine.flush().unwrap();
@@ -237,7 +253,7 @@ fn bench_writes_with_queued_epochs(c: &mut Criterion) {
                 let (_dir, engine) = temp_db_with_opts(async_opts());
                 for j in 0..2000u64 {
                     engine
-                        .upsert_node(1, &format!("pre_{}", j), write_opts(j))
+                        .upsert_node("BenchNode", &format!("pre_{}", j), write_opts(j))
                         .unwrap();
                 }
                 (_dir, engine)
@@ -246,7 +262,7 @@ fn bench_writes_with_queued_epochs(c: &mut Criterion) {
                 for i in 0..BURST_SIZE {
                     let k = 2000 + i;
                     engine
-                        .upsert_node(1, &format!("n{}", k), write_opts(k))
+                        .upsert_node("BenchNode", &format!("n{}", k), write_opts(k))
                         .unwrap();
                 }
             },
@@ -276,7 +292,7 @@ fn bench_mixed_writes_reads(c: &mut Criterion) {
             |(_dir, engine, ids)| {
                 for i in 0..BURST_SIZE {
                     engine
-                        .upsert_node(1, &format!("w{}", i), write_opts(i))
+                        .upsert_node("BenchNode", &format!("w{}", i), write_opts(i))
                         .unwrap();
                     if (i + 1) % SYNC_FLUSH_INTERVAL == 0 {
                         engine.flush().unwrap();
@@ -298,7 +314,7 @@ fn bench_mixed_writes_reads(c: &mut Criterion) {
             |(_dir, engine, ids)| {
                 for i in 0..BURST_SIZE {
                     engine
-                        .upsert_node(1, &format!("w{}", i), write_opts(i))
+                        .upsert_node("BenchNode", &format!("w{}", i), write_opts(i))
                         .unwrap();
                     black_box(engine.get_node(ids[(i as usize) % ids.len()]).unwrap());
                 }
@@ -330,7 +346,7 @@ fn bench_mixed_writes_dense_vector(c: &mut Criterion) {
         dense_query: Some(simple_dense_vector(dim, 999)),
         sparse_query: None,
         k: 10,
-        type_filter: None,
+        label_filter: None,
         ef_search: None,
         scope: None,
         dense_weight: None,
@@ -350,7 +366,7 @@ fn bench_mixed_writes_dense_vector(c: &mut Criterion) {
             |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
-                        .upsert_node(1, &format!("w{}", i), write_opts(i))
+                        .upsert_node("BenchNode", &format!("w{}", i), write_opts(i))
                         .unwrap();
                     if (i + 1) % SYNC_FLUSH_INTERVAL == 0 {
                         engine.flush().unwrap();
@@ -374,7 +390,7 @@ fn bench_mixed_writes_dense_vector(c: &mut Criterion) {
             |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
-                        .upsert_node(1, &format!("w{}", i), write_opts(i))
+                        .upsert_node("BenchNode", &format!("w{}", i), write_opts(i))
                         .unwrap();
                     black_box(engine.vector_search(&request).unwrap());
                 }
@@ -400,7 +416,7 @@ fn bench_mixed_writes_sparse_vector(c: &mut Criterion) {
         dense_query: None,
         sparse_query: Some(simple_sparse_vector(999, 8)),
         k: 10,
-        type_filter: None,
+        label_filter: None,
         ef_search: None,
         scope: None,
         dense_weight: None,
@@ -418,7 +434,7 @@ fn bench_mixed_writes_sparse_vector(c: &mut Criterion) {
             |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
-                        .upsert_node(1, &format!("w{}", i), write_opts(i))
+                        .upsert_node("BenchNode", &format!("w{}", i), write_opts(i))
                         .unwrap();
                     if (i + 1) % SYNC_FLUSH_INTERVAL == 0 {
                         engine.flush().unwrap();
@@ -440,7 +456,7 @@ fn bench_mixed_writes_sparse_vector(c: &mut Criterion) {
             |(_dir, engine)| {
                 for i in 0..BURST_SIZE {
                     engine
-                        .upsert_node(1, &format!("w{}", i), write_opts(i))
+                        .upsert_node("BenchNode", &format!("w{}", i), write_opts(i))
                         .unwrap();
                     black_box(engine.vector_search(&request).unwrap());
                 }

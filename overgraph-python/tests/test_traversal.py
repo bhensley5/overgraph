@@ -23,13 +23,13 @@ class TestNeighbors:
         nbrs = db.neighbors(nodes[1], direction="both")
         assert len(nbrs) == 2
 
-    def test_type_filter(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n1, n3, 20)
-        nbrs = db.neighbors(n1, direction="outgoing", type_filter=[10])
+    def test_edge_label_filter(self, db):
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n1, n3, "WORKS_AT")
+        nbrs = db.neighbors(n1, direction="outgoing", edge_label_filter=["RELATES_TO"])
         assert len(nbrs) == 1
         assert nbrs[0].node_id == n2
 
@@ -39,38 +39,38 @@ class TestNeighbors:
         assert len(nbrs) == 3
 
     def test_empty(self, db):
-        nid = db.upsert_node(1, "lonely")
+        nid = db.upsert_node("Person", "lonely")
         nbrs = db.neighbors(nid, direction="outgoing")
         assert nbrs == []
 
     def test_invalid_direction(self, db):
-        nid = db.upsert_node(1, "a")
+        nid = db.upsert_node("Person", "a")
         with pytest.raises(ValueError, match="Invalid direction"):
             db.neighbors(nid, direction="sideways")
 
     def test_neighbor_entry_fields(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        eid = db.upsert_edge(n1, n2, 10, weight=2.5)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        eid = db.upsert_edge(n1, n2, "RELATES_TO", weight=2.5)
         nbrs = db.neighbors(n1, direction="outgoing")
         assert len(nbrs) == 1
         entry = nbrs[0]
         assert entry.node_id == n2
         assert entry.edge_id == eid
-        assert entry.edge_type_id == 10
+        assert entry.label == "RELATES_TO"
         assert abs(entry.weight - 2.5) < 0.01
         assert "NeighborEntry" in repr(entry)
 
 
 class TestTraverse:
     def test_basic_depth_and_order(self, db):
-        start = db.upsert_node(1, "start")
-        depth1_b = db.upsert_node(1, "depth1-b")
-        depth1_a = db.upsert_node(1, "depth1-a")
-        depth2 = db.upsert_node(1, "depth2")
-        db.upsert_edge(start, depth1_b, 10)
-        db.upsert_edge(start, depth1_a, 10)
-        db.upsert_edge(depth1_a, depth2, 10)
+        start = db.upsert_node("Person", "start")
+        depth1_b = db.upsert_node("Person", "depth1-b")
+        depth1_a = db.upsert_node("Person", "depth1-a")
+        depth2 = db.upsert_node("Person", "depth2")
+        db.upsert_edge(start, depth1_b, "RELATES_TO")
+        db.upsert_edge(start, depth1_a, "RELATES_TO")
+        db.upsert_edge(depth1_a, depth2, "RELATES_TO")
 
         page = db.traverse(start, 2, min_depth=0, direction="outgoing")
 
@@ -94,11 +94,11 @@ class TestTraverse:
         assert [(hit.node_id, hit.depth) for hit in page.items] == [(nodes[2], 2)]
 
     def test_cursor_constructor(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n2, n3, 10)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n2, n3, "RELATES_TO")
         page = db.traverse(n1, 2, direction="outgoing", limit=1)
         assert len(page.items) == 1
         assert page.next_cursor is not None
@@ -113,39 +113,39 @@ class TestTraverse:
         assert not hasattr(db, "neighbors_2hop_constrained_paged")
 
     def test_rejects_raw_id_cursor(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n2, n3, 10)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n2, n3, "RELATES_TO")
         with pytest.raises(TypeError):
             db.traverse(n1, 2, min_depth=2, direction="outgoing", cursor=123)
 
 
 class TestTraverseFilters:
-    def test_node_type_filter_is_emission_only(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(2, "b")  # type 2
-        n3 = db.upsert_node(3, "c")  # type 3
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n2, n3, 10)
+    def test_node_label_filter_is_emission_only(self, db):
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Company", "b")
+        n3 = db.upsert_node("Document", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n2, n3, "RELATES_TO")
         page = db.traverse(
             n1,
             2,
             min_depth=2,
             direction="outgoing",
-            edge_type_filter=[10],
-            node_type_filter=[3],
+            edge_label_filter=["RELATES_TO"],
+            emit_node_label_filter={"labels": ["Document"], "mode": "all"},
         )
         assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
 
 
 class TestTopKNeighbors:
     def test_top_k_by_weight(self, db):
-        center = db.upsert_node(1, "center")
+        center = db.upsert_node("Person", "center")
         for i in range(10):
-            spoke = db.upsert_node(1, f"s{i}")
-            db.upsert_edge(center, spoke, 10, weight=float(i))
+            spoke = db.upsert_node("Person", f"s{i}")
+            db.upsert_edge(center, spoke, "RELATES_TO", weight=float(i))
         top3 = db.top_k_neighbors(center, 3, direction="outgoing", scoring="weight")
         assert len(top3) == 3
         # Highest weights first
@@ -153,45 +153,45 @@ class TestTopKNeighbors:
         assert weights == sorted(weights, reverse=True)
 
     def test_top_k_by_recency(self, db):
-        center = db.upsert_node(1, "center")
+        center = db.upsert_node("Person", "center")
         for i in range(5):
-            spoke = db.upsert_node(1, f"s{i}")
-            db.upsert_edge(center, spoke, 10)
+            spoke = db.upsert_node("Person", f"s{i}")
+            db.upsert_edge(center, spoke, "RELATES_TO")
         top2 = db.top_k_neighbors(center, 2, direction="outgoing", scoring="recency")
         assert len(top2) == 2
 
     def test_invalid_scoring(self, db):
-        nid = db.upsert_node(1, "a")
+        nid = db.upsert_node("Person", "a")
         with pytest.raises(ValueError, match="Invalid scoring"):
             db.top_k_neighbors(nid, 3, direction="outgoing", scoring="magic")
 
     def test_decay_requires_lambda(self, db):
-        nid = db.upsert_node(1, "a")
+        nid = db.upsert_node("Person", "a")
         with pytest.raises(ValueError, match="decay_lambda"):
             db.top_k_neighbors(nid, 3, direction="outgoing", scoring="decay")
 
     def test_decay_with_lambda(self, db):
-        center = db.upsert_node(1, "center")
+        center = db.upsert_node("Person", "center")
         for i in range(5):
-            spoke = db.upsert_node(1, f"s{i}")
-            db.upsert_edge(center, spoke, 10, weight=float(i))
+            spoke = db.upsert_node("Person", f"s{i}")
+            db.upsert_edge(center, spoke, "RELATES_TO", weight=float(i))
         top2 = db.top_k_neighbors(
             center, 2, direction="outgoing", scoring="decay", decay_lambda=0.01
         )
         assert len(top2) == 2
 
     def test_decay_negative_lambda_rejected(self, db):
-        nid = db.upsert_node(1, "a")
+        nid = db.upsert_node("Person", "a")
         with pytest.raises(ValueError, match="decay_lambda"):
             db.top_k_neighbors(
                 nid, 3, direction="outgoing", scoring="decay", decay_lambda=-0.5
             )
 
     def test_top_k_at_epoch(self, db):
-        center = db.upsert_node(1, "center")
+        center = db.upsert_node("Person", "center")
         for i in range(5):
-            spoke = db.upsert_node(1, f"s{i}")
-            db.upsert_edge(center, spoke, 10, weight=float(i))
+            spoke = db.upsert_node("Person", f"s{i}")
+            db.upsert_edge(center, spoke, "RELATES_TO", weight=float(i))
         # at_epoch in the far future should still return results
         import time
         future_ms = int(time.time() * 1000) + 60_000
@@ -203,11 +203,11 @@ class TestTopKNeighbors:
 
 class TestNeighborsBatch:
     def test_basic(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n1, n3, 20)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n1, n3, "WORKS_AT")
         result = db.neighbors_batch([n1])
         assert isinstance(result, dict)
         assert n1 in result
@@ -216,11 +216,11 @@ class TestNeighborsBatch:
         assert node_ids == {n2, n3}
 
     def test_multiple_nodes(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n2, n3, 10)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n2, n3, "RELATES_TO")
         result = db.neighbors_batch([n1, n2])
         assert n1 in result
         assert n2 in result
@@ -230,20 +230,20 @@ class TestNeighborsBatch:
         assert result[n2][0].node_id == n3
 
     def test_direction(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        db.upsert_edge(n1, n2, 10)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        db.upsert_edge(n1, n2, "RELATES_TO")
         result = db.neighbors_batch([n2], direction="incoming")
         assert n2 in result
         assert result[n2][0].node_id == n1
 
-    def test_type_filter(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n1, n3, 20)
-        result = db.neighbors_batch([n1], type_filter=[10])
+    def test_edge_label_filter(self, db):
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n1, n3, "WORKS_AT")
+        result = db.neighbors_batch([n1], edge_label_filter=["RELATES_TO"])
         assert len(result[n1]) == 1
         assert result[n1][0].node_id == n2
 
@@ -252,18 +252,18 @@ class TestNeighborsBatch:
         assert result == {}
 
     def test_no_neighbors(self, db):
-        lonely = db.upsert_node(1, "lonely")
+        lonely = db.upsert_node("Person", "lonely")
         result = db.neighbors_batch([lonely])
         # Engine filters empty entries
         assert lonely not in result
 
     def test_matches_individual(self, db):
         """Batch results match individual neighbors calls."""
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n1, n3, 10)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n1, n3, "RELATES_TO")
 
         individual = db.neighbors(n1, direction="outgoing")
         batch = db.neighbors_batch([n1])
@@ -292,13 +292,13 @@ class TestExtractSubgraph:
         r = repr(sg)
         assert "Subgraph" in r
 
-    def test_subgraph_edge_type_filter(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n1, n3, 20)
-        sg = db.extract_subgraph(n1, 1, edge_type_filter=[10])
+    def test_subgraph_edge_label_filter(self, db):
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n1, n3, "WORKS_AT")
+        sg = db.extract_subgraph(n1, 1, edge_label_filter=["RELATES_TO"])
         assert len(sg.edges) == 1
         sg_ids = {n.id for n in sg.nodes}
         assert n2 in sg_ids

@@ -25,12 +25,12 @@ from conftest import make_chain, make_star
 class TestTemporalFiltering:
     def test_neighbors_at_epoch_filters_by_validity(self, db):
         """Edges with non-overlapping validity windows are filtered by epoch."""
-        a = db.upsert_node(1, "a")
-        b = db.upsert_node(1, "b")
-        c = db.upsert_node(1, "c")
+        a = db.upsert_node("Person", "a")
+        b = db.upsert_node("Person", "b")
+        c = db.upsert_node("Person", "c")
         # A->B valid [1000, 5000), A->C valid [3000, 9000)
-        db.upsert_edge(a, b, 10, valid_from=1000, valid_to=5000)
-        db.upsert_edge(a, c, 10, valid_from=3000, valid_to=9000)
+        db.upsert_edge(a, b, "RELATES_TO", valid_from=1000, valid_to=5000)
+        db.upsert_edge(a, c, "RELATES_TO", valid_from=3000, valid_to=9000)
 
         # epoch 2000: only A->B is valid
         nbrs = db.neighbors(a, direction="outgoing", at_epoch=2000)
@@ -53,13 +53,13 @@ class TestTemporalFiltering:
 
     def test_neighbors_at_epoch_without_filter_uses_current_time(self, db):
         """Without at_epoch, defaults to current time -- expired edges excluded."""
-        a = db.upsert_node(1, "a")
-        b = db.upsert_node(1, "b")
-        c = db.upsert_node(1, "c")
+        a = db.upsert_node("Person", "a")
+        b = db.upsert_node("Person", "b")
+        c = db.upsert_node("Person", "c")
         now = int(time.time() * 1000)
         # One edge valid now, one expired
-        db.upsert_edge(a, b, 10, valid_from=0, valid_to=now + 60000)  # valid
-        db.upsert_edge(a, c, 10, valid_from=1000, valid_to=5000)  # expired
+        db.upsert_edge(a, b, "RELATES_TO", valid_from=0, valid_to=now + 60000)  # valid
+        db.upsert_edge(a, c, "RELATES_TO", valid_from=1000, valid_to=5000)  # expired
 
         nbrs = db.neighbors(a, direction="outgoing")
         ids = {n.node_id for n in nbrs}
@@ -68,12 +68,12 @@ class TestTemporalFiltering:
 
     def test_traverse_two_hop_at_epoch(self, db):
         """Traversal respects at_epoch across both hops."""
-        a = db.upsert_node(1, "a")
-        b = db.upsert_node(1, "b")
-        c = db.upsert_node(1, "c")
+        a = db.upsert_node("Person", "a")
+        b = db.upsert_node("Person", "b")
+        c = db.upsert_node("Person", "c")
         # A->B valid [1000, 5000), B->C valid [2000, 6000)
-        db.upsert_edge(a, b, 10, valid_from=1000, valid_to=5000)
-        db.upsert_edge(b, c, 10, valid_from=2000, valid_to=6000)
+        db.upsert_edge(a, b, "RELATES_TO", valid_from=1000, valid_to=5000)
+        db.upsert_edge(b, c, "RELATES_TO", valid_from=2000, valid_to=6000)
 
         # epoch 3000: both hops valid, C reachable
         page = db.traverse(a, 2, min_depth=2, direction="outgoing", at_epoch=3000)
@@ -93,11 +93,11 @@ class TestTemporalFiltering:
 
     def test_neighbors_batch_at_epoch(self, db):
         """Batch neighbor queries respect at_epoch."""
-        a = db.upsert_node(1, "a")
-        b = db.upsert_node(1, "b")
-        c = db.upsert_node(1, "c")
-        db.upsert_edge(a, b, 10, valid_from=1000, valid_to=5000)
-        db.upsert_edge(a, c, 10, valid_from=3000, valid_to=9000)
+        a = db.upsert_node("Person", "a")
+        b = db.upsert_node("Person", "b")
+        c = db.upsert_node("Person", "c")
+        db.upsert_edge(a, b, "RELATES_TO", valid_from=1000, valid_to=5000)
+        db.upsert_edge(a, c, "RELATES_TO", valid_from=3000, valid_to=9000)
 
         # epoch 2000: only A->B valid
         result = db.neighbors_batch([a], at_epoch=2000)
@@ -114,13 +114,13 @@ class TestTemporalFiltering:
 
     def test_top_k_at_epoch(self, db):
         """top_k_neighbors with at_epoch filters correctly."""
-        center = db.upsert_node(1, "center")
-        s1 = db.upsert_node(1, "s1")
-        s2 = db.upsert_node(1, "s2")
-        s3 = db.upsert_node(1, "s3")
-        db.upsert_edge(center, s1, 10, weight=3.0, valid_from=1000, valid_to=5000)
-        db.upsert_edge(center, s2, 10, weight=2.0, valid_from=3000, valid_to=9000)
-        db.upsert_edge(center, s3, 10, weight=1.0, valid_from=3000, valid_to=9000)
+        center = db.upsert_node("Person", "center")
+        s1 = db.upsert_node("Person", "s1")
+        s2 = db.upsert_node("Person", "s2")
+        s3 = db.upsert_node("Person", "s3")
+        db.upsert_edge(center, s1, "RELATES_TO", weight=3.0, valid_from=1000, valid_to=5000)
+        db.upsert_edge(center, s2, "RELATES_TO", weight=2.0, valid_from=3000, valid_to=9000)
+        db.upsert_edge(center, s3, "RELATES_TO", weight=1.0, valid_from=3000, valid_to=9000)
 
         # epoch 2000: only s1 valid
         top = db.top_k_neighbors(center, 3, direction="outgoing", scoring="weight", at_epoch=2000)
@@ -140,11 +140,11 @@ class TestTemporalFiltering:
 
     def test_extract_subgraph_at_epoch(self, db):
         """Subgraph extraction respects at_epoch."""
-        a = db.upsert_node(1, "a")
-        b = db.upsert_node(1, "b")
-        c = db.upsert_node(1, "c")
-        db.upsert_edge(a, b, 10, valid_from=1000, valid_to=5000)
-        db.upsert_edge(b, c, 10, valid_from=2000, valid_to=6000)
+        a = db.upsert_node("Person", "a")
+        b = db.upsert_node("Person", "b")
+        c = db.upsert_node("Person", "c")
+        db.upsert_edge(a, b, "RELATES_TO", valid_from=1000, valid_to=5000)
+        db.upsert_edge(b, c, "RELATES_TO", valid_from=2000, valid_to=6000)
 
         # epoch 3000: both edges valid
         sg = db.extract_subgraph(a, 2, at_epoch=3000)
@@ -213,27 +213,27 @@ class TestPaginationEdgeCases:
     def test_cursor_past_all_ids_returns_empty(self, db):
         """A cursor beyond all existing IDs should return empty results."""
         for i in range(5):
-            db.upsert_node(1, f"n{i}")
-        page = db.nodes_by_type_paged(1, limit=50, after=999999999)
+            db.upsert_node("Person", f"n{i}")
+        page = db.nodes_by_labels_paged("Person", limit=50, after=999999999)
         assert len(page.items) == 0
         assert page.next_cursor is None
 
     def test_cursor_zero_returns_first_page(self, db):
         """after=0 should behave like the first page (all IDs are > 0)."""
         for i in range(5):
-            db.upsert_node(1, f"n{i}")
-        page_no_cursor = db.nodes_by_type_paged(1, limit=50)
-        page_zero = db.nodes_by_type_paged(1, limit=50, after=0)
+            db.upsert_node("Person", f"n{i}")
+        page_no_cursor = db.nodes_by_labels_paged("Person", limit=50)
+        page_zero = db.nodes_by_labels_paged("Person", limit=50, after=0)
         assert page_no_cursor.items == page_zero.items
 
     def test_find_nodes_paged_cursor_traversal(self, db):
         """Exhaustive cursor traversal via find_nodes_paged."""
         for i in range(7):
-            db.upsert_node(1, f"n{i}", props={"tag": "x"})
+            db.upsert_node("Person", f"n{i}", props={"tag": "x"})
         all_ids = []
         cursor = None
         while True:
-            page = db.find_nodes_paged(1, "tag", "x", limit=3, after=cursor)
+            page = db.find_nodes_paged("Person", "tag", "x", limit=3, after=cursor)
             all_ids.extend(page.items)
             if page.next_cursor is None:
                 break
@@ -245,7 +245,7 @@ class TestPaginationEdgeCases:
     def test_edges_paged_cursor_past_all_returns_empty(self, db):
         """Edge pagination with cursor past all IDs returns empty."""
         nodes, edges = make_chain(db, 4)
-        page = db.edges_by_type_paged(10, limit=50, after=999999999)
+        page = db.edges_by_label_paged("RELATES_TO", limit=50, after=999999999)
         assert len(page.items) == 0
 
 
@@ -257,24 +257,24 @@ class TestPaginationEdgeCases:
 class TestSelfLoops:
     def test_self_loop_in_neighbors_outgoing(self, db):
         """A self-loop should appear in outgoing neighbors."""
-        a = db.upsert_node(1, "a")
-        db.upsert_edge(a, a, 10)
+        a = db.upsert_node("Person", "a")
+        db.upsert_edge(a, a, "RELATES_TO")
         nbrs = db.neighbors(a, direction="outgoing")
         assert len(nbrs) == 1
         assert nbrs[0].node_id == a
 
     def test_self_loop_in_neighbors_incoming(self, db):
         """A self-loop should appear in incoming neighbors."""
-        a = db.upsert_node(1, "a")
-        db.upsert_edge(a, a, 10)
+        a = db.upsert_node("Person", "a")
+        db.upsert_edge(a, a, "RELATES_TO")
         nbrs = db.neighbors(a, direction="incoming")
         assert len(nbrs) == 1
         assert nbrs[0].node_id == a
 
     def test_self_loop_both_direction_no_duplicate(self, db):
         """A self-loop queried with 'both' should not produce duplicates."""
-        a = db.upsert_node(1, "a")
-        db.upsert_edge(a, a, 10)
+        a = db.upsert_node("Person", "a")
+        db.upsert_edge(a, a, "RELATES_TO")
         nbrs = db.neighbors(a, direction="both")
         # Self-loop should appear exactly once (deduplicated)
         assert len(nbrs) == 1
@@ -282,26 +282,26 @@ class TestSelfLoops:
 
     def test_self_loop_in_subgraph(self, db):
         """Subgraph extraction handles self-loops without infinite recursion."""
-        a = db.upsert_node(1, "a")
-        db.upsert_edge(a, a, 10)
+        a = db.upsert_node("Person", "a")
+        db.upsert_edge(a, a, "RELATES_TO")
         sg = db.extract_subgraph(a, 2)
         assert len(sg.nodes) == 1
         assert len(sg.edges) == 1
 
     def test_self_loop_with_regular_edges(self, db):
         """Self-loop combined with regular edges should all appear."""
-        a = db.upsert_node(1, "a")
-        b = db.upsert_node(1, "b")
-        db.upsert_edge(a, a, 10)
-        db.upsert_edge(a, b, 10)
+        a = db.upsert_node("Person", "a")
+        b = db.upsert_node("Person", "b")
+        db.upsert_edge(a, a, "RELATES_TO")
+        db.upsert_edge(a, b, "RELATES_TO")
         nbrs = db.neighbors(a, direction="outgoing")
         ids = {n.node_id for n in nbrs}
         assert ids == {a, b}
 
     def test_self_loop_in_batch_neighbors(self, db):
         """Batch neighbor query includes self-loops."""
-        a = db.upsert_node(1, "a")
-        db.upsert_edge(a, a, 10)
+        a = db.upsert_node("Person", "a")
+        db.upsert_edge(a, a, "RELATES_TO")
         result = db.neighbors_batch([a])
         assert a in result
         ids = {n.node_id for n in result[a]}
@@ -319,7 +319,7 @@ class TestCompactWithProgressDepth:
         # Create data and flush multiple times to guarantee segments to compact
         for batch in range(3):
             for i in range(20):
-                db.upsert_node(1, f"b{batch}_n{i}")
+                db.upsert_node("Person", f"b{batch}_n{i}")
             db.flush()
 
         progress_events = []
@@ -345,7 +345,7 @@ class TestCompactWithProgressDepth:
         """Returning False from callback cancels compaction without data loss."""
         for batch in range(3):
             for i in range(20):
-                db.upsert_node(1, f"b{batch}_n{i}")
+                db.upsert_node("Person", f"b{batch}_n{i}")
             db.flush()
 
         def cancel_first_call(_p):
@@ -359,14 +359,14 @@ class TestCompactWithProgressDepth:
         # Data should still be intact after cancelled compaction
         # We inserted 60 unique nodes total (3 batches x 20)
         # Each batch re-upserts the same keys within its group, but keys are unique
-        page = db.nodes_by_type_paged(1, limit=100)
+        page = db.nodes_by_labels_paged("Person", limit=100)
         assert len(page.items) == 60
 
     def test_callback_exception_propagates(self, db):
         """A RuntimeError raised in the callback should propagate."""
         for batch in range(2):
             for i in range(20):
-                db.upsert_node(1, f"b{batch}_n{i}")
+                db.upsert_node("Person", f"b{batch}_n{i}")
             db.flush()
 
         def raise_error(_p):
@@ -379,7 +379,7 @@ class TestCompactWithProgressDepth:
         """records_processed should be monotonically non-decreasing within a phase."""
         for batch in range(3):
             for i in range(20):
-                db.upsert_node(1, f"b{batch}_n{i}")
+                db.upsert_node("Person", f"b{batch}_n{i}")
             db.flush()
 
         events_by_phase = {}
@@ -416,7 +416,7 @@ class TestAsyncStress:
         db_path = os.path.join(tmp_dir, "stress_db")
         db = await AsyncOverGraph.open(db_path)
         try:
-            tasks = [db.upsert_node(1, f"node-{i}") for i in range(50)]
+            tasks = [db.upsert_node("Person", f"node-{i}") for i in range(50)]
             ids = await asyncio.gather(*tasks)
             assert len(ids) == 50
             assert len(set(ids)) == 50  # all unique
@@ -440,11 +440,11 @@ class TestAsyncStress:
             # Pre-create some nodes
             pre_ids = []
             for i in range(10):
-                nid = await db.upsert_node(1, f"pre-{i}")
+                nid = await db.upsert_node("Person", f"pre-{i}")
                 pre_ids.append(nid)
 
             # Mix upserts and reads concurrently
-            upsert_tasks = [db.upsert_node(1, f"new-{i}") for i in range(20)]
+            upsert_tasks = [db.upsert_node("Person", f"new-{i}") for i in range(20)]
             read_tasks = [db.get_node(nid) for nid in pre_ids]
             all_results = await asyncio.gather(*upsert_tasks, *read_tasks)
 
@@ -468,12 +468,12 @@ class TestAsyncStress:
             # Create nodes first
             nodes = []
             for i in range(10):
-                nid = await db.upsert_node(1, f"n{i}")
+                nid = await db.upsert_node("Person", f"n{i}")
                 nodes.append(nid)
 
             # Create edges concurrently (each from nodes[i] to nodes[i+1])
             edge_tasks = [
-                db.upsert_edge(nodes[i], nodes[(i + 1) % 10], 10)
+                db.upsert_edge(nodes[i], nodes[(i + 1) % 10], "RELATES_TO")
                 for i in range(10)
             ]
             edge_ids = await asyncio.gather(*edge_tasks)
@@ -492,7 +492,7 @@ class TestPruneByAge:
     def test_prune_max_age_removes_old_nodes(self, db):
         """Pruning with max_age_ms=1 should remove everything after a short sleep."""
         for i in range(5):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         # Wait just enough so all nodes are older than 1ms
         time.sleep(0.05)
         result = db.prune(max_age_ms=1)
@@ -501,38 +501,38 @@ class TestPruneByAge:
     def test_prune_max_age_keeps_recent(self, db):
         """Pruning with a very large max_age_ms should keep everything."""
         for i in range(5):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         result = db.prune(max_age_ms=999_999_999)
         assert result.nodes_pruned == 0
 
     def test_prune_max_age_selective(self, db):
         """Only nodes older than threshold are pruned."""
-        db.upsert_node(1, "old")
+        db.upsert_node("Person", "old")
         time.sleep(0.05)  # 50ms
-        db.upsert_node(1, "new")
+        db.upsert_node("Person", "new")
         # Prune anything older than 10ms
         result = db.prune(max_age_ms=10)
         assert result.nodes_pruned >= 1
         # "new" should survive
-        assert db.get_node_by_key(1, "new") is not None
+        assert db.get_node_by_key("Person", "new") is not None
 
     def test_prune_max_age_cascades_edges(self, db):
         """Pruning a node by age should also remove its edges."""
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        eid = db.upsert_edge(n1, n2, 10)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        eid = db.upsert_edge(n1, n2, "RELATES_TO")
         time.sleep(0.05)
         result = db.prune(max_age_ms=1)
         assert result.nodes_pruned >= 1
         assert result.edges_pruned >= 1
         assert db.get_edge(eid) is None
 
-    def test_prune_max_age_with_type_filter(self, db):
-        """max_age_ms combined with type_id only prunes matching type."""
-        db.upsert_node(1, "t1")
-        db.upsert_node(2, "t2")
+    def test_prune_max_age_with_label_filter(self, db):
+        """max_age_ms combined with node label only prunes matching label."""
+        db.upsert_node("Person", "t1")
+        db.upsert_node("Company", "t2")
         time.sleep(0.05)
-        result = db.prune(max_age_ms=1, type_id=1)
+        result = db.prune(max_age_ms=1, label="Person")
         assert result.nodes_pruned == 1
         # Type 2 should survive
-        assert db.get_node_by_key(2, "t2") is not None
+        assert db.get_node_by_key("Company", "t2") is not None

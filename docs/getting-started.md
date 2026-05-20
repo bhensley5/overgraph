@@ -29,7 +29,7 @@ A database is a directory on disk. Pass a vector dimension if you want to use de
 ```python
 from overgraph import OverGraph
 
-db = OverGraph.open("./my-graph", dense_vector_dimension=384)
+db = OverGraph.open("./my-graph", dense_vector_dimension=3)
 ```
 
 **Node.js**
@@ -37,18 +37,18 @@ db = OverGraph.open("./my-graph", dense_vector_dimension=384)
 import { OverGraph } from 'overgraph';
 
 const db = OverGraph.open('./my-graph', {
-  denseVector: { dimension: 384 },
+  denseVector: { dimension: 3 },
 });
 ```
 
 **Rust**
 ```rust
 use overgraph::*;
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 let opts = DbOptions {
     dense_vector: Some(DenseVectorConfig {
-        dimension: 384,
+        dimension: 3,
         metric: DenseMetric::Cosine,
         hnsw: HnswConfig::default(),
     }),
@@ -57,97 +57,91 @@ let opts = DbOptions {
 let mut db = DatabaseEngine::open(Path::new("./my-graph"), &opts)?;
 ```
 
-## Define type IDs
+## Choose labels and edge labels
 
-OverGraph uses integers to classify nodes and edges. Define them as constants:
-
-**Python**
-```python
-USER = 1
-PROJECT = 2
-WORKS_ON = 10
-```
-
-**Node.js**
-```javascript
-const USER = 1;
-const PROJECT = 2;
-const WORKS_ON = 10;
-```
-
-**Rust**
-```rust
-const USER: u32 = 1;
-const PROJECT: u32 = 2;
-const WORKS_ON: u32 = 10;
-```
+OverGraph uses labels to classify nodes and edge labels to classify edges. They are
+ordinary strings at the public API boundary.
 
 ## Create nodes and edges
 
 **Python**
 ```python
-alice = db.upsert_node(USER, "alice", props={"role": "engineer"})
-bob = db.upsert_node(USER, "bob")
-project = db.upsert_node(PROJECT, "atlas",
-    dense_vector=project_embedding,        # from your embedding model
-    sparse_vector=project_sparse)          # from SPLADE, BGE-M3, etc.
+project_dense = [0.18, 0.71, 0.39]
+project_sparse = [(101, 0.6), (407, 0.8)]
 
-db.upsert_edge(alice, project, WORKS_ON)
-db.upsert_edge(bob, project, WORKS_ON, weight=0.5)
+# Also accepts multiple labels: ["User", "Engineer"]
+alice = db.upsert_node("User", "alice", props={"role": "engineer"})
+bob = db.upsert_node("User", "bob")
+project = db.upsert_node("Project", "atlas",
+    dense_vector=project_dense,
+    sparse_vector=project_sparse)
+
+db.upsert_edge(alice, project, "WORKS_ON")
+db.upsert_edge(bob, project, "WORKS_ON", weight=0.5)
 ```
 
 **Node.js**
 ```javascript
-const alice = db.upsertNode(USER, 'alice', { props: { role: 'engineer' } });
-const bob = db.upsertNode(USER, 'bob');
-const project = db.upsertNode(PROJECT, 'atlas', {
-  denseVector: projectEmbedding,        // from your embedding model
-  sparseVector: projectSparse,          // from SPLADE, BGE-M3, etc.
+const projectDense = [0.18, 0.71, 0.39];
+const projectSparse = [{ dimension: 101, value: 0.6 }, { dimension: 407, value: 0.8 }];
+
+// Also accepts multiple labels: ['User', 'Engineer']
+const alice = db.upsertNode('User', 'alice', { props: { role: 'engineer' } });
+const bob = db.upsertNode('User', 'bob');
+const project = db.upsertNode('Project', 'atlas', {
+  denseVector: projectDense,
+  sparseVector: projectSparse,
 });
 
-db.upsertEdge(alice, project, WORKS_ON);
-db.upsertEdge(bob, project, WORKS_ON, { weight: 0.5 });
+db.upsertEdge(alice, project, 'WORKS_ON');
+db.upsertEdge(bob, project, 'WORKS_ON', { weight: 0.5 });
 ```
 
 **Rust**
 ```rust
-let alice = db.upsert_node(USER, "alice", UpsertNodeOptions {
+let project_dense = vec![0.18_f32, 0.71, 0.39];
+let project_sparse = vec![(101, 0.6_f32), (407, 0.8)];
+
+// Also accepts multiple labels: &["User", "Engineer"]
+let alice = db.upsert_node("User", "alice", UpsertNodeOptions {
     props: BTreeMap::from([("role".into(), PropValue::String("engineer".into()))]),
     ..Default::default()
 })?;
-let bob = db.upsert_node(USER, "bob", UpsertNodeOptions::default())?;
-let project = db.upsert_node(PROJECT, "atlas", UpsertNodeOptions {
-    dense_vector: Some(project_embedding),  // from your embedding model
-    sparse_vector: Some(project_sparse),    // from SPLADE, BGE-M3, etc.
+let bob = db.upsert_node("User", "bob", UpsertNodeOptions::default())?;
+let project = db.upsert_node("Project", "atlas", UpsertNodeOptions {
+    dense_vector: Some(project_dense),
+    sparse_vector: Some(project_sparse),
     ..Default::default()
 })?;
 
-db.upsert_edge(alice, project, WORKS_ON, UpsertEdgeOptions::default())?;
-db.upsert_edge(bob, project, WORKS_ON, UpsertEdgeOptions { weight: 0.5, ..Default::default() })?;
+db.upsert_edge(alice, project, "WORKS_ON", UpsertEdgeOptions::default())?;
+db.upsert_edge(bob, project, "WORKS_ON", UpsertEdgeOptions { weight: 0.5, ..Default::default() })?;
 ```
 
-Upserting the same `(type_id, key)` pair updates the existing node instead of creating a duplicate.
+Upsert APIs accept either a single label string or a label collection. Each live
+`(label, key)` membership points at one node; if every supplied label/key membership
+resolves to the same node, the upsert updates that node instead of creating a duplicate.
 
 ## Read data back
 
 **Python**
 ```python
 node = db.get_node(alice)
-node = db.get_node_by_key(USER, "alice")
+node = db.get_node_by_key("User", "alice")
 nodes = db.get_nodes([alice, bob])       # batch read
 ```
 
 **Node.js**
 ```javascript
 const node = db.getNode(alice);
-const node2 = db.getNodeByKey(USER, 'alice');
+const node2 = db.getNodeByKey('User', 'alice');
 const nodes = db.getNodes([alice, bob]);
 ```
 
 **Rust**
 ```rust
 let node = db.get_node(alice)?;
-let node = db.get_node_by_key(USER, "alice")?;
+let node = db.get_node_by_key("User", "alice")?;
 let nodes = db.get_nodes(&[alice, bob])?;
 ```
 
@@ -180,8 +174,11 @@ for n in &neighbors {
 
 **Python**
 ```python
+query_dense = [0.14, 0.74, 0.36]
+query_sparse = [(101, 1.0)]
+
 hits = db.vector_search("hybrid", k=10,
-    dense_query=query_embedding,
+    dense_query=query_dense,
     sparse_query=query_sparse,
     scope_start_node_id=alice,
     scope_max_depth=3)
@@ -192,9 +189,12 @@ for hit in hits:
 
 **Node.js**
 ```javascript
+const queryDense = [0.14, 0.74, 0.36];
+const querySparse = [{ dimension: 101, value: 1.0 }];
+
 const hits = db.vectorSearch('hybrid', {
   k: 10,
-  denseQuery: queryEmbedding,
+  denseQuery: queryDense,
   sparseQuery: querySparse,
   scope: { startNodeId: alice, maxDepth: 3 },
 });
@@ -204,19 +204,26 @@ hits.forEach(h => console.log(h.nodeId, h.score));
 
 **Rust**
 ```rust
+let query_dense = vec![0.14_f32, 0.74, 0.36];
+let query_sparse = vec![(101, 1.0_f32)];
+
 let hits = db.vector_search(&VectorSearchRequest {
     mode: VectorSearchMode::Hybrid,
-    dense_query: Some(query_embedding),
+    dense_query: Some(query_dense),
     sparse_query: Some(query_sparse),
     k: 10,
+    label_filter: None,
+    ef_search: None,
     scope: Some(VectorSearchScope {
         start_node_id: alice,
         max_depth: 3,
         direction: Direction::Outgoing,
-        edge_type_filter: None,
+        edge_label_filter: None,
         at_epoch: None,
     }),
-    ..Default::default()
+    dense_weight: None,
+    sparse_weight: None,
+    fusion_mode: None,
 })?;
 
 for hit in &hits {
@@ -230,39 +237,53 @@ Property queries work without any extra setup. If a property is hot in your work
 
 **Python**
 ```python
-db.ensure_node_property_index(USER, "role", "equality")
-db.ensure_node_property_index(PROJECT, "priority", "range", domain="int")
+from overgraph import PropertyRangeBound
 
-user_ids = db.find_nodes(USER, "role", "engineer")
-priority_ids = db.find_nodes_range(PROJECT, "priority", lower=1, upper=5)
+db.ensure_node_property_index("User", "role", "equality")
+db.ensure_node_property_index("Project", "priority", "range", domain="int")
+
+user_ids = db.find_nodes("User", "role", "engineer")
+priority_ids = db.find_nodes_range(
+    "Project",
+    "priority",
+    PropertyRangeBound(1, domain="int"),
+    PropertyRangeBound(5, domain="int"),
+)
 ```
 
 **Node.js**
 ```javascript
-db.ensureNodePropertyIndex(USER, 'role', 'equality');
-db.ensureNodePropertyIndex(PROJECT, 'priority', 'range', { domain: 'int' });
+db.ensureNodePropertyIndex('User', 'role', { kind: 'equality' });
+db.ensureNodePropertyIndex('Project', 'priority', { kind: 'range', domain: 'int' });
 
-const userIds = db.findNodes(USER, 'role', 'engineer');
-const priorityIds = db.findNodesRange(PROJECT, 'priority', { lower: 1, upper: 5 });
+const userIds = db.findNodes('User', 'role', 'engineer');
+const priorityIds = db.findNodesRange(
+  'Project',
+  'priority',
+  { value: 1, inclusive: true, domain: 'int' },
+  { value: 5, inclusive: true, domain: 'int' },
+);
 ```
 
 **Rust**
 ```rust
-db.ensure_node_property_index(USER, "role", SecondaryIndexKind::Equality)?;
+db.ensure_node_property_index("User", "role", SecondaryIndexKind::Equality)?;
 db.ensure_node_property_index(
-    PROJECT,
+    "Project",
     "priority",
-    SecondaryIndexKind::Range(SecondaryIndexRangeDomain::Int),
+    SecondaryIndexKind::Range {
+        domain: SecondaryIndexRangeDomain::Int,
+    },
 )?;
 
-let user_ids = db.find_nodes(USER, "role", &PropValue::String("engineer".into()))?;
+let user_ids = db.find_nodes("User", "role", &PropValue::String("engineer".into()))?;
+let lower = PropertyRangeBound::Included(PropValue::Int(1));
+let upper = PropertyRangeBound::Included(PropValue::Int(5));
 let priority_ids = db.find_nodes_range(
-    PROJECT,
+    "Project",
     "priority",
-    Some(PropValue::Int(1)),
-    Some(PropValue::Int(5)),
-    true,
-    true,
+    Some(&lower),
+    Some(&upper),
 )?;
 ```
 
@@ -274,7 +295,7 @@ db.close()
 
 # Or use a context manager:
 with OverGraph.open("./my-graph") as db:
-    db.upsert_node(USER, "alice")
+    db.upsert_node("User", "alice")
 ```
 
 **Node.js**
@@ -294,7 +315,7 @@ db.close()?;
 from overgraph import AsyncOverGraph
 
 async with await AsyncOverGraph.open("./my-graph") as db:
-    alice = await db.upsert_node(USER, "alice")
+    alice = await db.upsert_node("User", "alice")
     neighbors = await db.neighbors(alice)
 ```
 

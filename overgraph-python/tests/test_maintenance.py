@@ -3,7 +3,7 @@ from overgraph import OverGraph, OverGraphError
 
 class TestSync:
     def test_sync(self, db):
-        db.upsert_node(1, "a")
+        db.upsert_node("Person", "a")
         db.sync()  # Should not raise
 
 
@@ -14,7 +14,7 @@ class TestFlush:
 
     def test_flush_with_data(self, db):
         for i in range(10):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         result = db.flush()
         assert result is not None
         assert result.node_count == 10
@@ -30,10 +30,10 @@ class TestCompact:
     def test_compact_with_segments(self, db):
         # Create enough data to flush at least twice
         for i in range(50):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         db.flush()
         for i in range(50, 100):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         db.flush()
         result = db.compact()
         assert result is not None
@@ -47,10 +47,10 @@ class TestCompactWithProgress:
     def test_progress_callback(self, db):
         # Create enough data to flush at least twice
         for i in range(50):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         db.flush()
         for i in range(50, 100):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         db.flush()
 
         progress_calls = []
@@ -70,10 +70,10 @@ class TestCompactWithProgress:
 
     def test_cancel_via_callback(self, db):
         for i in range(50):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         db.flush()
         for i in range(50, 100):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         db.flush()
 
         def cancel_immediately(_p):
@@ -91,10 +91,10 @@ class TestCompactWithProgress:
         import pytest
 
         for i in range(50):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         db.flush()
         for i in range(50, 100):
-            db.upsert_node(1, f"n{i}")
+            db.upsert_node("Person", f"n{i}")
         db.flush()
 
         def buggy_callback(_p):

@@ -20,30 +20,30 @@ class TestPersonalizedPagerank:
 
     def test_ppr_multiple_seeds(self, db):
         # Two disconnected stars
-        c1 = db.upsert_node(1, "c1")
+        c1 = db.upsert_node("Person", "c1")
         for i in range(3):
-            s = db.upsert_node(1, f"s1_{i}")
-            db.upsert_edge(c1, s, 10)
-        c2 = db.upsert_node(1, "c2")
+            s = db.upsert_node("Person", f"s1_{i}")
+            db.upsert_edge(c1, s, "RELATES_TO")
+        c2 = db.upsert_node("Person", "c2")
         for i in range(3):
-            s = db.upsert_node(1, f"s2_{i}")
-            db.upsert_edge(c2, s, 10)
+            s = db.upsert_node("Person", f"s2_{i}")
+            db.upsert_edge(c2, s, "RELATES_TO")
         result = db.personalized_pagerank([c1, c2])
         assert len(result.node_ids) > 0
         # Both seeds should appear
         assert c1 in result.node_ids
         assert c2 in result.node_ids
 
-    def test_ppr_edge_type_filter(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n1, n3, 20)
-        # Only follow type 10 edges
-        result = db.personalized_pagerank([n1], edge_type_filter=[10])
+    def test_ppr_edge_label_filter(self, db):
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n1, n3, "WORKS_AT")
+        # Only follow RELATES_TO edges.
+        result = db.personalized_pagerank([n1], edge_label_filter=["RELATES_TO"])
         assert n2 in result.node_ids
-        # n3 should not be reachable via type 10
+        # n3 should not be reachable through the filtered edge label.
         assert n3 not in result.node_ids
 
     def test_ppr_max_results(self, db):
@@ -77,7 +77,7 @@ class TestPersonalizedPagerank:
         assert len(result.node_ids) > 0
 
     def test_ppr_isolated_node(self, db):
-        nid = db.upsert_node(1, "lonely")
+        nid = db.upsert_node("Person", "lonely")
         result = db.personalized_pagerank([nid])
         assert len(result.node_ids) == 1
         assert result.node_ids[0] == nid
@@ -98,7 +98,7 @@ class TestPersonalizedPagerank:
             assert result.scores[prev_idx] >= result.scores[curr_idx]
 
     def test_ppr_empty_seeds(self, db):
-        db.upsert_node(1, "a")
+        db.upsert_node("Person", "a")
         result = db.personalized_pagerank([])
         assert len(result.node_ids) == 0
         assert len(result.scores) == 0
@@ -117,49 +117,48 @@ class TestExportAdjacency:
         assert e.from_id in export.node_ids
         assert e.to_id in export.node_ids
 
-    def test_export_node_type_filter(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(2, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n1, n3, 10)
-        # Only type 1 nodes
-        export = db.export_adjacency(node_type_filter=[1])
+    def test_export_node_label_filter(self, db):
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Company", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n1, n3, "RELATES_TO")
+        # Only Person nodes.
+        export = db.export_adjacency(node_label_filter={"labels": ["Person"], "mode": "all"})
         assert n1 in export.node_ids
         assert n3 in export.node_ids
         assert n2 not in export.node_ids
+        assert "Person" in export.node_labels
         # Edge n1->n2 should be excluded (n2 not in subgraph)
         for e in export.edges:
             assert e.to_id != n2
 
-    def test_export_edge_type_filter(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        n3 = db.upsert_node(1, "c")
-        db.upsert_edge(n1, n2, 10)
-        db.upsert_edge(n1, n3, 20)
-        export = db.export_adjacency(edge_type_filter=[10])
+    def test_export_edge_label_filter(self, db):
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        n3 = db.upsert_node("Person", "c")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        db.upsert_edge(n1, n3, "WORKS_AT")
+        export = db.export_adjacency(edge_label_filter=["RELATES_TO"])
         # All nodes should be present (node filter is separate)
         assert len(export.node_ids) == 3
-        # Only type 10 edges
-        assert all(e.type_id == 10 for e in export.edges)
+        assert all(export.edge_labels[e.edge_label_index] == "RELATES_TO" for e in export.edges)
 
     def test_export_include_weights(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        db.upsert_edge(n1, n2, 10, weight=3.5)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        db.upsert_edge(n1, n2, "RELATES_TO", weight=3.5)
         export = db.export_adjacency(include_weights=True)
         assert len(export.edges) == 1
         assert abs(export.edges[0].weight - 3.5) < 0.01
 
     def test_export_without_weights(self, db):
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(1, "b")
-        db.upsert_edge(n1, n2, 10, weight=3.5)
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        db.upsert_edge(n1, n2, "RELATES_TO", weight=3.5)
         export = db.export_adjacency(include_weights=False)
         assert len(export.edges) == 1
-        # Without weights, weight should be 0
-        assert export.edges[0].weight == 0.0
+        assert export.edges[0].weight is None
 
     def test_export_empty(self, db):
         export = db.export_adjacency()
@@ -168,11 +167,11 @@ class TestExportAdjacency:
 
     def test_export_consistent_subgraph(self, db):
         """Edges should only appear if both endpoints are in the node set."""
-        n1 = db.upsert_node(1, "a")
-        n2 = db.upsert_node(2, "b")
-        db.upsert_edge(n1, n2, 10)
-        # Filter to only type 1 (n2 excluded)
-        export = db.export_adjacency(node_type_filter=[1])
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Company", "b")
+        db.upsert_edge(n1, n2, "RELATES_TO")
+        # Filter to only Person nodes (n2 excluded).
+        export = db.export_adjacency(node_label_filter={"labels": ["Person"], "mode": "all"})
         assert n1 in export.node_ids
         assert n2 not in export.node_ids
         # No edges should be present since n2 is not in node set
