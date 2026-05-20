@@ -562,7 +562,7 @@ fn test_label_resolution_plan_caches_distinct_node_labels_per_request() {
 
     let label_ids = plan
         .resolve_node_label_ids_for_request(
-            ["Person", "Person", "Company", "Company", "Person"].into_iter(),
+            ["Person", "Person", "Company", "Company", "Person"],
         )
         .unwrap();
 
@@ -737,7 +737,7 @@ fn test_label_resolution_plan_caches_distinct_edge_labels_per_request() {
 
     let label_ids = plan
         .resolve_edge_label_ids_for_request(
-            ["KNOWS", "KNOWS", "WORKS_AT", "WORKS_AT", "KNOWS"].into_iter(),
+            ["KNOWS", "KNOWS", "WORKS_AT", "WORKS_AT", "KNOWS"],
         )
         .unwrap();
 

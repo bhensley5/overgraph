@@ -154,7 +154,7 @@ fn edge_op(id: u64, from: u64, to: u64, label_id: u32) -> WalOp {
         id,
         from,
         to,
-        label_id: label_id,
+        label_id,
         props: BTreeMap::new(),
         created_at: id as i64,
         updated_at: id as i64,

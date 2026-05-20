@@ -3537,7 +3537,7 @@ mod tests {
             id,
             from,
             to,
-            label_id: label_id,
+            label_id,
             props: BTreeMap::new(),
             created_at: 2000,
             updated_at: 2001,

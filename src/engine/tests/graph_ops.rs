@@ -5369,7 +5369,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         assert_eq!(node_ids, NodeIdSet::from_iter([a, b, d]));
         assert_eq!(sg.edges.len(), 2);
         // All edges should be label 1
-        assert!(sg.edges.iter().all(|e| e.label == "RELATES_TO".to_string()));
+        assert!(sg.edges.iter().all(|e| e.label == "RELATES_TO"));
 
         engine.close().unwrap();
     }
@@ -6947,7 +6947,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         txn.upsert_edge(
             TxnNodeRef::Id(a),
             TxnNodeRef::Id(b),
-            &"KNOWS".to_string(),
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 2.5,
                 ..Default::default()
@@ -6989,7 +6989,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             .upsert_edge(
                 TxnNodeRef::Id(a),
                 TxnNodeRef::Id(b),
-                &"KNOWS".to_string(),
+                "KNOWS",
                 UpsertEdgeOptions::default(),
             )
             .unwrap();
@@ -7005,7 +7005,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             .upsert_edge(
                 TxnNodeRef::Id(a),
                 TxnNodeRef::Id(b),
-                &"KNOWS".to_string(),
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 2.0,
                     ..Default::default()

@@ -2076,7 +2076,7 @@ impl EngineCore {
                         id,
                         from: from_id,
                         to: to_id,
-                        label_id: label_id,
+                        label_id,
                         props: options.props.clone(),
                         created_at,
                         updated_at: now,

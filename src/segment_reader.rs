@@ -5132,7 +5132,7 @@ impl SegmentReader {
                 edge_id,
                 from,
                 to,
-                label_id: label_id,
+                label_id,
                 updated_at,
                 weight,
                 valid_from,
@@ -8934,7 +8934,7 @@ fn decode_edge_at(data: &[u8], offset: usize, id: u64) -> Result<EdgeRecord, Eng
         id,
         from,
         to,
-        label_id: label_id,
+        label_id,
         props,
         created_at,
         updated_at,
@@ -9060,7 +9060,9 @@ pub(crate) mod tests {
     }
 
     fn rewrite_payload_file(path: &std::path::Path, rewrite: impl FnOnce(&mut [u8])) {
-        let mut data = std::fs::read(path).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+
+        let data = std::fs::read(path).unwrap();
         let range = if data.len() >= crate::segment_components::COMPONENT_IDENTITY_HEADER_LEN
             && data[0..crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC.len()]
                 == crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC
@@ -9072,15 +9074,23 @@ pub(crate) mod tests {
         } else {
             0..data.len()
         };
-        rewrite(&mut data[range]);
-        std::fs::write(path, data).unwrap();
+        let mut payload = data[range.clone()].to_vec();
+        rewrite(&mut payload);
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(range.start as u64)).unwrap();
+        file.write_all(&payload).unwrap();
+        file.sync_all().unwrap();
     }
 
     fn tamper_envelope_format_version(seg_dir: &std::path::Path, version: u32) {
+        use std::io::{Seek, SeekFrom, Write};
+
         let path = seg_dir.join(SEGMENT_COMPONENT_MANIFEST_FILENAME);
-        let mut data = std::fs::read(&path).unwrap();
-        data[12..16].copy_from_slice(&version.to_le_bytes());
-        std::fs::write(&path, data).unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(12)).unwrap();
+        file.write_all(&version.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
     }
 
     fn read_segment_manifest_for_test(seg_dir: &std::path::Path) -> SegmentComponentManifestV1 {
@@ -9119,6 +9129,8 @@ pub(crate) mod tests {
         kind: SegmentComponentKind,
         rewrite: impl FnOnce(&mut [u8]),
     ) {
+        use std::io::{Seek, SeekFrom, Write};
+
         let manifest = read_segment_manifest_for_test(seg_dir);
         let record = manifest
             .components
@@ -9128,21 +9140,31 @@ pub(crate) mod tests {
         match &record.handle {
             ComponentHandleV1::ExternalFile { relative_path, .. } => {
                 let path = seg_dir.join(relative_path);
-                let mut data = std::fs::read(&path).unwrap();
+                let data = std::fs::read(&path).unwrap();
                 let header = crate::segment_components::decode_identity_header(&data).unwrap();
                 let start = header.payload_offset as usize;
                 let end = start + header.payload_len as usize;
-                rewrite(&mut data[start..end]);
-                std::fs::write(path, data).unwrap();
+                let mut payload = data[start..end].to_vec();
+                rewrite(&mut payload);
+
+                let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.seek(SeekFrom::Start(start as u64)).unwrap();
+                file.write_all(&payload).unwrap();
+                file.sync_all().unwrap();
             }
             ComponentHandleV1::PackedRange { offset, len, .. } => {
                 let path = seg_dir.join(crate::segment_components::PACKED_CORE_FILENAME);
-                let mut data = std::fs::read(&path).unwrap();
+                let data = std::fs::read(&path).unwrap();
                 let header = crate::segment_components::decode_identity_header(&data).unwrap();
                 let start = header.payload_offset as usize + *offset as usize;
                 let end = start + *len as usize;
-                rewrite(&mut data[start..end]);
-                std::fs::write(path, data).unwrap();
+                let mut payload = data[start..end].to_vec();
+                rewrite(&mut payload);
+
+                let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.seek(SeekFrom::Start(start as u64)).unwrap();
+                file.write_all(&payload).unwrap();
+                file.sync_all().unwrap();
             }
         }
     }
@@ -9298,7 +9320,7 @@ pub(crate) mod tests {
             id,
             from,
             to,
-            label_id: label_id,
+            label_id,
             props: BTreeMap::new(),
             created_at: 2000,
             updated_at: 2001,
@@ -11587,7 +11609,9 @@ pub(crate) mod tests {
 
         let err = expect_engine_error(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None));
         assert!(
-            err.contains("No such file") || err.contains("segment.core"),
+            err.contains("No such file")
+                || err.contains("cannot find the file")
+                || err.contains("segment.core"),
             "got: {err}"
         );
     }

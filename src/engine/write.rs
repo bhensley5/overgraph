@@ -464,7 +464,7 @@ impl EngineCore {
         let ops = if should_create {
             vec![WalOp::EnsureEdgeLabel {
                 label: label.to_string(),
-                label_id: label_id,
+                label_id,
             }]
         } else {
             Vec::new()
@@ -813,7 +813,7 @@ impl EngineCore {
             id,
             from,
             to,
-            label_id: label_id,
+            label_id,
             props: options.props.clone(),
             created_at,
             updated_at: now,
@@ -827,7 +827,7 @@ impl EngineCore {
         if should_create_token {
             ops.push(WalOp::EnsureEdgeLabel {
                 label: label.to_string(),
-                label_id: label_id,
+                label_id,
             });
         }
         ops.push(WalOp::UpsertEdge(edge));
@@ -952,7 +952,7 @@ impl EngineCore {
                 id,
                 from: input.from,
                 to: input.to,
-                label_id: label_id,
+                label_id,
                 props: input.props.clone(),
                 created_at,
                 updated_at: now,
@@ -1178,7 +1178,7 @@ impl EngineCore {
                 id,
                 from: input.from,
                 to: input.to,
-                label_id: label_id,
+                label_id,
                 props: input.props.clone(),
                 created_at,
                 updated_at: now,
@@ -1783,7 +1783,7 @@ impl EngineCore {
             if let Some(existing) = manifest.secondary_indexes.iter_mut().find(|entry| {
                 entry.target
                     == SecondaryIndexTarget::EdgeProperty {
-                        label_id: label_id,
+                        label_id,
                         prop_key: prop_key.clone(),
                     }
                     && entry.kind == kind
@@ -1799,7 +1799,7 @@ impl EngineCore {
             let entry = SecondaryIndexManifestEntry {
                 index_id: manifest.next_secondary_index_id,
                 target: SecondaryIndexTarget::EdgeProperty {
-                    label_id: label_id,
+                    label_id,
                     prop_key: prop_key.clone(),
                 },
                 kind: kind.clone(),
@@ -1858,7 +1858,7 @@ impl EngineCore {
             let idx = manifest.secondary_indexes.iter().position(|entry| {
                 entry.target
                     == SecondaryIndexTarget::EdgeProperty {
-                        label_id: label_id,
+                        label_id,
                         prop_key: prop_key.clone(),
                     }
                     && entry.kind == kind

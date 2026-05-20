@@ -5731,7 +5731,7 @@ mod tests {
             id,
             from,
             to,
-            label_id: label_id,
+            label_id,
             props: BTreeMap::new(),
             created_at: 2000,
             updated_at: 2001,
@@ -6105,7 +6105,7 @@ mod tests {
                 data_len,
                 from,
                 to,
-                label_id: label_id,
+                label_id,
                 updated_at,
                 weight,
                 valid_from,
@@ -6288,7 +6288,7 @@ mod tests {
     fn make_adj(edge_id: u64, label_id: u32, neighbor_id: u64, weight: f32) -> AdjEntry {
         AdjEntry {
             edge_id,
-            label_id: label_id,
+            label_id,
             neighbor_id,
             weight,
             valid_from: 1000,

@@ -4894,7 +4894,7 @@ mod tests {
         SecondaryIndexManifestEntry {
             index_id,
             target: SecondaryIndexTarget::EdgeProperty {
-                label_id: label_id,
+                label_id,
                 prop_key: prop_key.to_string(),
             },
             kind: SecondaryIndexKind::Equality,

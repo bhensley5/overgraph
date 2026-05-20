@@ -3063,7 +3063,7 @@ fn build_clean_compaction_fixture(engine: &mut DatabaseEngine) -> (Vec<u64>, Vec
             let id = next_node_id;
             next_node_id += 1;
             let created_at = 1_000 + (seg as i64 * 100) + (i as i64 * 2);
-            write_internal_wal_op(&engine, &WalOp::UpsertNode(NodeRecord {
+            write_internal_wal_op(engine, &WalOp::UpsertNode(NodeRecord {
                     id,
                     label_ids: NodeLabelSet::single(1).unwrap(),
                     key: format!("s{}_n{}", seg, i),
@@ -3084,7 +3084,7 @@ fn build_clean_compaction_fixture(engine: &mut DatabaseEngine) -> (Vec<u64>, Vec
             let eid = next_edge_id;
             next_edge_id += 1;
             let created_at = 5_000 + (seg as i64 * 100) + (i as i64 * 2);
-            write_internal_wal_op(&engine, &WalOp::UpsertEdge(EdgeRecord {
+            write_internal_wal_op(engine, &WalOp::UpsertEdge(EdgeRecord {
                     id: eid,
                     from: seg_node_ids[i],
                     to: seg_node_ids[i + 1],
@@ -3156,10 +3156,8 @@ fn build_vector_compaction_and_flush_fixture(
                 ..compact_node.clone()
             };
 
-            write_internal_wal_op(&compact_engine, &WalOp::UpsertNode(compact_node))
-                .unwrap();
-            write_internal_wal_op(&flush_engine, &WalOp::UpsertNode(flush_node))
-                .unwrap();
+            write_internal_wal_op(compact_engine, &WalOp::UpsertNode(compact_node)).unwrap();
+            write_internal_wal_op(flush_engine, &WalOp::UpsertNode(flush_node)).unwrap();
 
             compact_seg_ids.push(node_id);
             flush_seg_ids.push(node_id);
@@ -3189,10 +3187,8 @@ fn build_vector_compaction_and_flush_fixture(
                 ..compact_edge.clone()
             };
 
-            write_internal_wal_op(&compact_engine, &WalOp::UpsertEdge(compact_edge))
-                .unwrap();
-            write_internal_wal_op(&flush_engine, &WalOp::UpsertEdge(flush_edge))
-                .unwrap();
+            write_internal_wal_op(compact_engine, &WalOp::UpsertEdge(compact_edge)).unwrap();
+            write_internal_wal_op(flush_engine, &WalOp::UpsertEdge(flush_edge)).unwrap();
 
             compact_edge_ids.push(edge_id);
             flush_edge_ids.push(edge_id);
@@ -6838,12 +6834,12 @@ fn test_backpressure_invalidate_edge() {
         "EDGE_LABEL_19",
         "REPORTS_TO",
     ];
-    for i in 0..20 {
+    for label in edge_labels {
         let eid = engine
             .upsert_edge(
                 n1,
                 n2,
-                edge_labels[i],
+                label,
                 UpsertEdgeOptions {
                     weight: 0.5,
                     ..Default::default()

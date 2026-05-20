@@ -1378,6 +1378,13 @@ mod tests {
         std::fs::write(seg_dir.join(SEGMENT_COMPONENT_MANIFEST_FILENAME), data).unwrap();
     }
 
+    fn write_test_bytes_at(path: &Path, offset: usize, bytes: &[u8]) {
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
     fn any_finding(report: &ScrubReport, finding_type: ScrubFindingType) -> bool {
         report
             .segments
@@ -1595,11 +1602,10 @@ mod tests {
         let manifest = read_segment_manifest(&seg_dir);
         let node_records_payload_start = packed_node_records_payload_start(&manifest);
         let core_path = seg_dir.join(PACKED_CORE_FILENAME);
-        let mut core = std::fs::read(&core_path).unwrap();
+        let core = std::fs::read(&core_path).unwrap();
         let first_record_offset = read_test_u64(&core, node_records_payload_start + 8 + 8) as usize;
         let first_label_id_offset = node_records_payload_start + first_record_offset + 1;
-        core[first_label_id_offset..first_label_id_offset + 4].copy_from_slice(&0u32.to_le_bytes());
-        std::fs::write(&core_path, core).unwrap();
+        write_test_bytes_at(&core_path, first_label_id_offset, &0u32.to_le_bytes());
 
         let report = db.scrub().unwrap();
         assert!(
@@ -1616,13 +1622,15 @@ mod tests {
         let manifest = read_segment_manifest(&seg_dir);
         let node_records_payload_start = packed_node_records_payload_start(&manifest);
         let core_path = seg_dir.join(PACKED_CORE_FILENAME);
-        let mut core = std::fs::read(&core_path).unwrap();
+        let core = std::fs::read(&core_path).unwrap();
         let first_offset_pos = node_records_payload_start + 8 + 8;
         let second_offset_pos = node_records_payload_start + 8 + 16 + 8;
         let second_record_offset = read_test_u64(&core, second_offset_pos);
-        core[first_offset_pos..first_offset_pos + 8]
-            .copy_from_slice(&second_record_offset.to_le_bytes());
-        std::fs::write(&core_path, core).unwrap();
+        write_test_bytes_at(
+            &core_path,
+            first_offset_pos,
+            &second_record_offset.to_le_bytes(),
+        );
 
         let report = db.scrub().unwrap();
         assert!(
@@ -1659,7 +1667,7 @@ mod tests {
         let node_label_index_start =
             packed_component_payload_start(&manifest, SegmentComponentKind::NodeLabelIndex);
         let core_path = seg_dir.join(PACKED_CORE_FILENAME);
-        let mut core = std::fs::read(&core_path).unwrap();
+        let core = std::fs::read(&core_path).unwrap();
         let label_count = read_test_u64(&core, node_label_index_start);
         assert!(
             label_count >= 2,
@@ -1667,9 +1675,11 @@ mod tests {
         );
         let first_posting_offset = read_test_u64(&core, node_label_index_start + 8 + 4);
         let second_posting_offset_pos = node_label_index_start + 8 + 16 + 4;
-        core[second_posting_offset_pos..second_posting_offset_pos + 8]
-            .copy_from_slice(&first_posting_offset.to_le_bytes());
-        std::fs::write(&core_path, core).unwrap();
+        write_test_bytes_at(
+            &core_path,
+            second_posting_offset_pos,
+            &first_posting_offset.to_le_bytes(),
+        );
 
         let report = db.scrub().unwrap();
         assert!(
@@ -1691,10 +1701,11 @@ mod tests {
         let node_records_payload_start =
             packed_component_payload_start(&manifest, SegmentComponentKind::NodeRecords);
         let core_path = seg_dir.join(PACKED_CORE_FILENAME);
-        let mut core = std::fs::read(&core_path).unwrap();
-        core[node_records_payload_start..node_records_payload_start + 8]
-            .copy_from_slice(&u64::MAX.to_le_bytes());
-        std::fs::write(&core_path, core).unwrap();
+        write_test_bytes_at(
+            &core_path,
+            node_records_payload_start,
+            &u64::MAX.to_le_bytes(),
+        );
 
         let report = db.scrub().unwrap();
         assert!(
@@ -1716,10 +1727,11 @@ mod tests {
         let node_metadata_payload_start =
             packed_component_payload_start(&manifest, SegmentComponentKind::NodeMetadata);
         let core_path = seg_dir.join(PACKED_CORE_FILENAME);
-        let mut core = std::fs::read(&core_path).unwrap();
-        core[node_metadata_payload_start..node_metadata_payload_start + 8]
-            .copy_from_slice(&u64::MAX.to_le_bytes());
-        std::fs::write(&core_path, core).unwrap();
+        write_test_bytes_at(
+            &core_path,
+            node_metadata_payload_start,
+            &u64::MAX.to_le_bytes(),
+        );
 
         let report = db.scrub().unwrap();
         assert!(
@@ -1800,11 +1812,13 @@ mod tests {
         let sidecar_path = seg_dir
             .join("secondary_indexes")
             .join(format!("node_prop_eq_{eq_index_id}.dat"));
-        let mut sidecar = std::fs::read(&sidecar_path).unwrap();
+        let sidecar = std::fs::read(&sidecar_path).unwrap();
         let group_payload_offset = read_test_u64(&sidecar, payload_offset + 16) as usize;
-        sidecar[payload_offset + group_payload_offset..payload_offset + group_payload_offset + 8]
-            .copy_from_slice(&999_999u64.to_le_bytes());
-        std::fs::write(&sidecar_path, sidecar).unwrap();
+        write_test_bytes_at(
+            &sidecar_path,
+            payload_offset + group_payload_offset,
+            &999_999u64.to_le_bytes(),
+        );
 
         let report = db.scrub().unwrap();
         assert!(
@@ -1833,7 +1847,7 @@ mod tests {
         let sidecar_path = seg_dir
             .join("secondary_indexes")
             .join(format!("node_prop_eq_{eq_index_id}.dat"));
-        let mut sidecar = std::fs::read(&sidecar_path).unwrap();
+        let sidecar = std::fs::read(&sidecar_path).unwrap();
         let id_count_offset = payload_offset + 24;
         let id_count = u32::from_le_bytes(
             sidecar[id_count_offset..id_count_offset + 4]
@@ -1844,9 +1858,11 @@ mod tests {
             id_count > 1,
             "test precondition: expected at least two node IDs in the first equality group"
         );
-        sidecar[id_count_offset..id_count_offset + 4]
-            .copy_from_slice(&(id_count - 1).to_le_bytes());
-        std::fs::write(&sidecar_path, sidecar).unwrap();
+        write_test_bytes_at(
+            &sidecar_path,
+            id_count_offset,
+            &(id_count - 1).to_le_bytes(),
+        );
 
         let report = db.scrub().unwrap();
         assert!(
@@ -1875,10 +1891,11 @@ mod tests {
         let sidecar_path = seg_dir
             .join("secondary_indexes")
             .join(format!("node_prop_range_{range_index_id}.dat"));
-        let mut sidecar = std::fs::read(&sidecar_path).unwrap();
-        sidecar[payload_offset + 16..payload_offset + 24]
-            .copy_from_slice(&999_999u64.to_le_bytes());
-        std::fs::write(&sidecar_path, sidecar).unwrap();
+        write_test_bytes_at(
+            &sidecar_path,
+            payload_offset + 16,
+            &999_999u64.to_le_bytes(),
+        );
 
         let report = db.scrub().unwrap();
         assert!(

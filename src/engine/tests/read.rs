@@ -12791,19 +12791,30 @@ fn assert_vector_hits_match(actual: &[VectorHit], expected: &[VectorHit]) {
 }
 
 fn rewrite_segment_component_payload_for_test(path: &Path, rewrite: impl FnOnce(&mut [u8])) {
-    let mut data = std::fs::read(path).unwrap();
-    if data.len() >= crate::segment_components::COMPONENT_IDENTITY_HEADER_LEN
+    use std::io::{Seek, SeekFrom, Write};
+
+    let data = std::fs::read(path).unwrap();
+    let range = if data.len() >= crate::segment_components::COMPONENT_IDENTITY_HEADER_LEN
         && data[0..crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC.len()]
             == crate::segment_components::COMPONENT_IDENTITY_HEADER_MAGIC
     {
         let header = crate::segment_components::decode_identity_header(&data).unwrap();
         let start = header.payload_offset as usize;
         let end = start + header.payload_len as usize;
-        rewrite(&mut data[start..end]);
+        start..end
     } else {
-        rewrite(&mut data);
-    }
-    std::fs::write(path, data).unwrap();
+        0..data.len()
+    };
+    let mut payload = data[range.clone()].to_vec();
+    rewrite(&mut payload);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.seek(SeekFrom::Start(range.start as u64)).unwrap();
+    file.write_all(&payload).unwrap();
+    file.sync_all().unwrap();
 }
 
 #[test]

@@ -75,6 +75,18 @@ fn corrupt_planner_stats_for_segment(db_path: &std::path::Path, segment_id: u64)
     std::fs::write(stats_path, b"corrupt planner stats").unwrap();
 }
 
+fn write_test_bytes_at(path: &std::path::Path, offset: u64, bytes: &[u8]) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+}
+
 fn insert_query_node(
     engine: &DatabaseEngine,
     label: &str,
@@ -732,17 +744,19 @@ fn edge_query_metadata_sidecar_unavailable_falls_back_at_engine_level() {
                     crate::segment_components::ComponentHandleV1::ExternalFile {
                         relative_path,
                         ..
-                    } => std::fs::write(seg_dir.join(relative_path), b"corrupt metadata sidecar")
-                        .unwrap(),
+                    } => write_test_bytes_at(
+                        &seg_dir.join(relative_path),
+                        0,
+                        b"corrupt metadata sidecar",
+                    ),
                     crate::segment_components::ComponentHandleV1::PackedRange { offset, .. } => {
                         let core_path =
                             seg_dir.join(crate::segment_components::PACKED_CORE_FILENAME);
-                        let mut core = std::fs::read(&core_path).unwrap();
+                        let core = std::fs::read(&core_path).unwrap();
                         let header =
                             crate::segment_components::decode_identity_header(&core).unwrap();
                         let start = header.payload_offset as usize + *offset as usize;
-                        core[start..start + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-                        std::fs::write(core_path, core).unwrap();
+                        write_test_bytes_at(&core_path, start as u64, &u64::MAX.to_le_bytes());
                     }
                 }
             }
@@ -3797,7 +3811,7 @@ fn oracle_query_ids(
 
 fn set_query_node_updated_at(engine: &DatabaseEngine, node_id: u64, updated_at: i64) {
     let node = internal_node_record(engine, node_id).unwrap().unwrap();
-    write_internal_wal_op(&engine, &WalOp::UpsertNode(NodeRecord {
+    write_internal_wal_op(engine, &WalOp::UpsertNode(NodeRecord {
             created_at: updated_at,
             updated_at,
             ..node
@@ -3807,7 +3821,7 @@ fn set_query_node_updated_at(engine: &DatabaseEngine, node_id: u64, updated_at: 
 
 fn set_query_edge_props(engine: &DatabaseEngine, edge_id: u64, props: BTreeMap<String, PropValue>) {
     let edge = internal_edge_record(engine, edge_id).unwrap().unwrap();
-    write_internal_wal_op(&engine, &WalOp::UpsertEdge(EdgeRecord { props, ..edge }))
+    write_internal_wal_op(engine, &WalOp::UpsertEdge(EdgeRecord { props, ..edge }))
         .unwrap();
 }
 
@@ -3938,7 +3952,7 @@ fn planned_pattern_anchor_and_edge_aliases(
     let (_guard, published) = engine.runtime.published_snapshot().unwrap();
     let normalized = published
         .view
-        .normalize_pattern_query(&query)
+        .normalize_pattern_query(query)
         .unwrap();
     let planned = published
         .view
@@ -3971,7 +3985,7 @@ fn planned_pattern_anchor_sort_and_edge_aliases(
     let (_guard, published) = engine.runtime.published_snapshot().unwrap();
     let normalized = published
         .view
-        .normalize_pattern_query(&query)
+        .normalize_pattern_query(query)
         .unwrap();
     let planned = published
         .view
@@ -4657,7 +4671,7 @@ fn test_node_query_any_dedupes_before_pagination_and_hydrates_final_page() {
     let employee = insert_query_node(&engine, "Employee", "employee", &[], 1.0);
     let both_b =
         insert_query_node_with_labels(&engine, &["Person", "Employee"], "both-b", &[], 1.0);
-    let expected = vec![both_a, person, employee, both_b];
+    let expected = [both_a, person, employee, both_b];
 
     let mut query = query_label_filter(&["Person", "Employee"], LabelMatchMode::Any);
     query.page = PageRequest {

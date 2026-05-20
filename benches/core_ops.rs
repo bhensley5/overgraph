@@ -2997,7 +2997,7 @@ fn bench_batch_get_by_keys(c: &mut Criterion) {
     let keys: Vec<(u32, String)> = (0..1000).map(|i| (1u32, format!("key_{:04}", i))).collect();
     for (tid, k) in &keys {
         engine
-            .upsert_node(&bench_node_label(*tid), k, UpsertNodeOptions::default())
+            .upsert_node(bench_node_label(*tid), k, UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();

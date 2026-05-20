@@ -298,17 +298,17 @@ mod public_api_boundary_tests {
         }
 
         for required in [
-            concat!("Edge", "LabelInfo"),
-            concat!("pub label: String"),
-            concat!("pub edge_label_filter: Option<Vec<String>>"),
-            concat!("pub edge_label_index: u32"),
-            concat!("pub fn ensure_edge_label"),
-            concat!("pub fn get_edge_label_id"),
-            concat!("pub fn get_edge_label("),
-            concat!("pub fn list_edge_labels"),
-            concat!("pub fn edges_by_label"),
-            concat!("pub fn get_edges_by_label"),
-            concat!("pub fn count_edges_by_label"),
+            "EdgeLabelInfo",
+            "pub label: String",
+            "pub edge_label_filter: Option<Vec<String>>",
+            "pub edge_label_index: u32",
+            "pub fn ensure_edge_label",
+            "pub fn get_edge_label_id",
+            "pub fn get_edge_label(",
+            "pub fn list_edge_labels",
+            "pub fn edges_by_label",
+            "pub fn get_edges_by_label",
+            "pub fn count_edges_by_label",
         ] {
             assert!(
                 lib.contains(required) || types.contains(required) || engine.contains(required),

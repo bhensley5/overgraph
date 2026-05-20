@@ -7,8 +7,7 @@ fn open_test_db(dir: &std::path::Path) -> DatabaseEngine {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir, &opts).unwrap();
-    db
+    DatabaseEngine::open(dir, &opts).unwrap()
 }
 
 fn populate_and_flush(db: &DatabaseEngine) {
