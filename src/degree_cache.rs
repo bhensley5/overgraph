@@ -1,12 +1,17 @@
 use crate::engine::DegreeEntry;
 use crate::error::EngineError;
+use crate::segment_components::{
+    decode_identity_header, COMPONENT_IDENTITY_HEADER_LEN, COMPONENT_IDENTITY_HEADER_MAGIC,
+};
 #[cfg(test)]
 use crate::types::NodeIdBuildHasher;
 use crate::types::NodeIdMap;
 use memmap2::Mmap;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+#[cfg(test)]
+use std::io::BufWriter;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -318,6 +323,8 @@ fn degree_overlay_shard_index(node_id: u64) -> usize {
 
 pub(crate) struct DegreeSidecar {
     data: Mmap,
+    payload_offset: usize,
+    payload_len: usize,
     entry_count: usize,
     block_count: usize,
 }
@@ -332,16 +339,19 @@ impl DegreeSidecar {
             )));
         }
         let data = unsafe { Mmap::map(&file)? };
-        validate_degree_sidecar(&data)?;
-        let entry_count = read_u64_at(&data, 16)? as usize;
-        let block_count = read_u64_at(&data, 24)? as usize;
+        let (payload_offset, payload_len) = degree_payload_range(path, &data)?;
+        let payload = &data[payload_offset..payload_offset + payload_len];
+        let shape = validate_degree_sidecar_shape(payload)?;
         Ok(Self {
             data,
-            entry_count,
-            block_count,
+            payload_offset,
+            payload_len,
+            entry_count: shape.entry_count,
+            block_count: shape.block_count,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn open_optional(path: &Path) -> Option<Self> {
         Self::open(path).ok()
     }
@@ -355,6 +365,7 @@ impl DegreeSidecar {
         if self.entry_count == 0 || self.block_count == 0 {
             return DegreeDelta::ZERO;
         }
+        let data = self.payload();
 
         let mut lo = 0usize;
         let mut hi = self.block_count;
@@ -371,23 +382,20 @@ impl DegreeSidecar {
             return DegreeDelta::ZERO;
         }
         let block_index = lo - 1;
-        let start = self.block_entry_start(block_index);
-        let end = if block_index + 1 < self.block_count {
-            self.block_entry_start(block_index + 1)
-        } else {
-            self.entry_count
-        };
+        let block_size = DEGREE_DELTA_BLOCK_SIZE as usize;
+        let start = block_index * block_size;
+        let end = start.saturating_add(block_size).min(self.entry_count);
 
         let mut entry_lo = start;
         let mut entry_hi = end;
         while entry_lo < entry_hi {
             let mid = entry_lo + (entry_hi - entry_lo) / 2;
-            let mid_node = read_sidecar_entry_node_id(&self.data, self.block_count, mid);
+            let mid_node = read_sidecar_entry_node_id(data, self.block_count, mid);
             match mid_node.cmp(&node_id) {
                 std::cmp::Ordering::Less => entry_lo = mid + 1,
                 std::cmp::Ordering::Greater => entry_hi = mid,
                 std::cmp::Ordering::Equal => {
-                    return read_sidecar_entry_delta(&self.data, self.block_count, mid);
+                    return read_sidecar_entry_delta(data, self.block_count, mid);
                 }
             }
         }
@@ -410,22 +418,49 @@ impl DegreeSidecar {
             return None;
         }
         Some((
-            read_sidecar_entry_node_id(&self.data, self.block_count, index),
-            read_sidecar_entry_delta(&self.data, self.block_count, index),
+            read_sidecar_entry_node_id(self.payload(), self.block_count, index),
+            read_sidecar_entry_delta(self.payload(), self.block_count, index),
         ))
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.data[self.payload_offset..self.payload_offset + self.payload_len]
     }
 
     #[inline]
     fn block_first_node_id(&self, block_index: usize) -> u64 {
         let offset = HEADER_SIZE + block_index * BLOCK_INDEX_ENTRY_SIZE;
-        u64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap())
+        let data = self.payload();
+        u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
     }
+}
 
-    #[inline]
-    fn block_entry_start(&self, block_index: usize) -> usize {
-        let offset = HEADER_SIZE + block_index * BLOCK_INDEX_ENTRY_SIZE + 8;
-        u64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap()) as usize
+fn degree_payload_range(path: &Path, data: &[u8]) -> Result<(usize, usize), EngineError> {
+    if data.len() >= COMPONENT_IDENTITY_HEADER_LEN
+        && data[0..COMPONENT_IDENTITY_HEADER_MAGIC.len()] == COMPONENT_IDENTITY_HEADER_MAGIC
+    {
+        let header = decode_identity_header(data)?;
+        let end = header
+            .payload_offset
+            .checked_add(header.payload_len)
+            .ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "degree sidecar payload range overflows for {}",
+                    path.display()
+                ))
+            })?;
+        if end > data.len() as u64 {
+            return Err(EngineError::CorruptRecord(format!(
+                "degree sidecar payload range [{}, {}) exceeds file length {} for {}",
+                header.payload_offset,
+                end,
+                data.len(),
+                path.display()
+            )));
+        }
+        return Ok((header.payload_offset as usize, header.payload_len as usize));
     }
+    Ok((0, data.len()))
 }
 
 #[cfg(test)]
@@ -455,12 +490,26 @@ pub(crate) fn write_degree_delta_sidecar(
     write_sorted_degree_delta_sidecar_unchecked(path, &coalesced)
 }
 
+#[cfg(test)]
 pub(crate) fn write_sorted_degree_delta_sidecar(
     path: &Path,
     entries: &[(u64, DegreeDelta)],
 ) -> Result<(), EngineError> {
     validate_sorted_degree_delta_entries(entries)?;
-    write_sorted_degree_delta_sidecar_unchecked(path, entries)
+    let mut file = File::create(path)?;
+    write_sorted_degree_delta_sidecar_payload(&mut file, entries)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn write_sorted_degree_delta_sidecar_payload(
+    writer: &mut impl Write,
+    entries: &[(u64, DegreeDelta)],
+) -> Result<(), EngineError> {
+    validate_sorted_degree_delta_entries(entries)?;
+    let bytes = encode_sorted_degree_delta_sidecar_unchecked(entries);
+    writer.write_all(&bytes)?;
+    Ok(())
 }
 
 fn validate_sorted_degree_delta_entries(entries: &[(u64, DegreeDelta)]) -> Result<(), EngineError> {
@@ -481,10 +530,19 @@ fn validate_sorted_degree_delta_entries(entries: &[(u64, DegreeDelta)]) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
 fn write_sorted_degree_delta_sidecar_unchecked(
     path: &Path,
     entries: &[(u64, DegreeDelta)],
 ) -> Result<(), EngineError> {
+    let bytes = encode_sorted_degree_delta_sidecar_unchecked(entries);
+    let mut file = File::create(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn encode_sorted_degree_delta_sidecar_unchecked(entries: &[(u64, DegreeDelta)]) -> Vec<u8> {
     let entry_count = entries.len();
     let block_size = DEGREE_DELTA_BLOCK_SIZE as usize;
     let block_count = if entry_count == 0 {
@@ -524,17 +582,29 @@ fn write_sorted_degree_delta_sidecar_unchecked(
 
     let crc = crc32fast::hash(&bytes);
     bytes.extend_from_slice(&crc.to_le_bytes());
-
-    let mut file = File::create(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    Ok(())
+    bytes
 }
 
+#[cfg(test)]
 pub(crate) fn write_folded_degree_delta_sidecar_from_sidecars(
     path: &Path,
     sidecars: &[&DegreeSidecar],
 ) -> Result<(), EngineError> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    write_folded_degree_delta_sidecar_payload_from_sidecars(&mut writer, sidecars)?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn write_folded_degree_delta_sidecar_payload_from_sidecars(
+    writer: &mut impl Write,
+    sidecars: &[&DegreeSidecar],
+) -> Result<(), EngineError> {
+    for sidecar in sidecars {
+        validate_degree_sidecar(sidecar.payload())?;
+    }
+
     let mut entry_count = 0usize;
     let mut block_index = Vec::new();
     let block_size = DEGREE_DELTA_BLOCK_SIZE as usize;
@@ -546,33 +616,24 @@ pub(crate) fn write_folded_degree_delta_sidecar_from_sidecars(
         Ok(())
     })?;
 
-    let mut writer = BufWriter::new(File::create(path)?);
     let mut hasher = crc32fast::Hasher::new();
-    write_hashed(&mut writer, &mut hasher, &DEGREE_DELTA_MAGIC)?;
+    write_hashed(writer, &mut hasher, &DEGREE_DELTA_MAGIC)?;
     write_hashed(
-        &mut writer,
+        writer,
         &mut hasher,
         &DEGREE_DELTA_FORMAT_VERSION.to_le_bytes(),
     )?;
+    write_hashed(writer, &mut hasher, &DEGREE_DELTA_BLOCK_SIZE.to_le_bytes())?;
+    write_hashed(writer, &mut hasher, &(entry_count as u64).to_le_bytes())?;
     write_hashed(
-        &mut writer,
-        &mut hasher,
-        &DEGREE_DELTA_BLOCK_SIZE.to_le_bytes(),
-    )?;
-    write_hashed(
-        &mut writer,
-        &mut hasher,
-        &(entry_count as u64).to_le_bytes(),
-    )?;
-    write_hashed(
-        &mut writer,
+        writer,
         &mut hasher,
         &(block_index.len() as u64).to_le_bytes(),
     )?;
 
     for &(first_node_id, entry_start) in &block_index {
-        write_hashed(&mut writer, &mut hasher, &first_node_id.to_le_bytes())?;
-        write_hashed(&mut writer, &mut hasher, &entry_start.to_le_bytes())?;
+        write_hashed(writer, &mut hasher, &first_node_id.to_le_bytes())?;
+        write_hashed(writer, &mut hasher, &entry_start.to_le_bytes())?;
     }
 
     let mut emitted = 0usize;
@@ -583,7 +644,7 @@ pub(crate) fn write_folded_degree_delta_sidecar_from_sidecars(
                 Some(&(node_id, emitted as u64))
             );
         }
-        write_degree_delta_entry_hashed(&mut writer, &mut hasher, node_id, delta)?;
+        write_degree_delta_entry_hashed(writer, &mut hasher, node_id, delta)?;
         emitted += 1;
         Ok(())
     })?;
@@ -591,8 +652,6 @@ pub(crate) fn write_folded_degree_delta_sidecar_from_sidecars(
 
     let crc = hasher.finalize();
     writer.write_all(&crc.to_le_bytes())?;
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -725,7 +784,12 @@ impl PartialOrd for DegreeSidecarHeapEntry {
     }
 }
 
-fn validate_degree_sidecar(data: &[u8]) -> Result<(), EngineError> {
+struct DegreeSidecarShape {
+    entry_count: usize,
+    block_count: usize,
+}
+
+fn validate_degree_sidecar_shape(data: &[u8]) -> Result<DegreeSidecarShape, EngineError> {
     if data.len() < HEADER_SIZE + CRC_SIZE {
         return Err(EngineError::CorruptRecord(format!(
             "degree sidecar length {} is smaller than header",
@@ -789,6 +853,17 @@ fn validate_degree_sidecar(data: &[u8]) -> Result<(), EngineError> {
             expected_len
         )));
     }
+
+    Ok(DegreeSidecarShape {
+        entry_count,
+        block_count,
+    })
+}
+
+fn validate_degree_sidecar(data: &[u8]) -> Result<(), EngineError> {
+    let shape = validate_degree_sidecar_shape(data)?;
+    let entry_count = shape.entry_count;
+    let block_count = shape.block_count;
 
     let stored_crc = read_u32_at(data, data.len() - CRC_SIZE)?;
     let actual_crc = crc32fast::hash(&data[..data.len() - CRC_SIZE]);
@@ -1126,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_crc_validation_disables_optional_open() {
+    fn sidecar_crc_validation_moves_to_compaction_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DEGREE_DELTA_FILENAME);
         write_degree_delta_sidecar(&path, &[(1, DegreeDelta::add_valid_edge(1, 2, 1.0))]).unwrap();
@@ -1134,7 +1209,57 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         std::fs::write(&path, bytes).unwrap();
-        assert!(DegreeSidecar::open(&path).is_err());
-        assert!(DegreeSidecar::open_optional(&path).is_none());
+
+        let sidecar = DegreeSidecar::open(&path).unwrap();
+        assert!(DegreeSidecar::open_optional(&path).is_some());
+        assert_eq!(sidecar.lookup(1).out_degree, 1);
+
+        let output_path = dir.path().join("folded_degree_delta.dat");
+        let err =
+            write_folded_degree_delta_sidecar_from_sidecars(&output_path, &[&sidecar]).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::CorruptRecord(message) if message.contains("CRC mismatch")
+        ));
+    }
+
+    #[test]
+    fn sidecar_lookup_derives_block_ranges_after_cheap_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DEGREE_DELTA_FILENAME);
+        let mut entries = Vec::new();
+        for node_id in 1..=600u64 {
+            entries.push((
+                node_id * 2,
+                DegreeDelta {
+                    out_degree: node_id as i64,
+                    out_weight_sum: node_id as f64,
+                    ..DegreeDelta::ZERO
+                },
+            ));
+        }
+        write_degree_delta_sidecar(&path, &entries).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let second_block_start_offset = HEADER_SIZE + BLOCK_INDEX_ENTRY_SIZE + 8;
+        bytes[second_block_start_offset..second_block_start_offset + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        let crc_offset = bytes.len() - CRC_SIZE;
+        let crc = crc32fast::hash(&bytes[..crc_offset]);
+        bytes[crc_offset..crc_offset + CRC_SIZE].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let sidecar = DegreeSidecar::open(&path).unwrap();
+        assert_eq!(sidecar.lookup(600).out_degree, 300);
+        assert_eq!(sidecar.lookup(1200).out_degree, 600);
+
+        let output_path = dir.path().join("folded_degree_delta.dat");
+        let err =
+            write_folded_degree_delta_sidecar_from_sidecars(&output_path, &[&sidecar]).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::CorruptRecord(message)
+                if message.contains("block 1 starts")
+        ));
     }
 }

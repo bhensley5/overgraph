@@ -1,31 +1,41 @@
 use crate::degree_cache::{DegreeDelta, DegreeOverlayEdit, DegreeOverlaySnapshot};
 use crate::dense_hnsw::exact_dense_search_above_cutoff;
+use crate::edge_metadata::EdgeMetadataCandidate;
 use crate::error::EngineError;
 use crate::manifest::{default_manifest, load_manifest, load_manifest_readonly, write_manifest};
 use crate::memtable::{encode_range_prop_value, Memtable};
 use crate::planner_stats::{
     planner_stats_declaration_fingerprint_for_entry,
     write_targeted_secondary_index_planner_stats_sidecar, DeclaredIndexRuntimeCoverage,
-    EstimateConfidence, PlannerEstimateKind, PlannerStatsDirection, PlannerStatsView,
-    PlannerStatsWriteOutcome, StalePostingRisk,
+    EstimateConfidence, PlannerEstimateKind, PlannerStatsDeclaredIndexTarget,
+    PlannerStatsDirection, PlannerStatsView, StalePostingRisk,
 };
-use crate::segment_reader::{SegmentReader, SegmentTypePosting};
+use crate::segment_components::{ComponentAvailability, SegmentComponentKind};
+use crate::segment_reader::{SegmentAdjPostingCursor, SegmentLabelPosting, SegmentReader};
 use crate::segment_writer::{
-    node_prop_eq_sidecar_path, node_prop_range_sidecar_path, segment_dir, segment_tmp_dir,
-    write_indexes_from_metadata_with_secondary_indexes, write_merged_edges_dat,
-    write_merged_nodes_dat, write_node_prop_eq_sidecar_to_path,
-    write_node_prop_range_sidecar_to_path, write_segment_with_degree_overlay_and_secondary_indexes,
-    write_v3_edges_dat, write_v3_nodes_dat, CompactEdgeMeta, CompactNodeMeta, FastMergeCopyInfo,
+    cleanup_orphan_optional_component_files, create_compaction_core_writer,
+    finalize_compaction_segment, finish_compaction_core_writer,
+    is_optional_component_publication_conflict,
+    maintained_secondary_index_ids_from_segment_manifest, publish_edge_prop_eq_sidecar_component,
+    publish_edge_prop_range_sidecar_component, publish_node_prop_eq_sidecar_component,
+    publish_node_prop_range_sidecar_component, remove_secondary_index_component_records,
+    secondary_index_sidecar_paths_for_entry, segment_dir, segment_tmp_dir,
+    write_compaction_source_components, write_indexes_from_metadata_with_secondary_indexes,
+    write_merged_edges_dat, write_merged_nodes_dat,
+    write_segment_with_degree_overlay_and_secondary_indexes, write_v3_edges_dat,
+    write_v3_nodes_dat, CompactEdgeMeta, CompactNodeMeta, FastMergeCopyInfo,
     SecondaryIndexMaintenanceReport,
 };
 use crate::source_list::SourceList;
-use crate::sparse_postings::{accumulate_sparse_posting_scores, sparse_dot_score};
+use crate::sparse_postings::sparse_dot_score;
 use crate::types::*;
-use crate::wal::{remove_wal_generation, wal_generation_path, WalReader, WalWriter};
+#[cfg(test)]
+use crate::wal::wal_generation_path;
+use crate::wal::{remove_wal_generation, truncate_wal_generation_to, WalReader, WalWriter};
 use crate::wal_sync::{shutdown_sync_thread, sync_thread_loop, WalSyncState};
 use arc_swap::ArcSwap;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -34,8 +44,54 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
-type SecondaryIndexCatalog =
-    HashMap<u32, HashMap<String, HashMap<SecondaryIndexKind, SecondaryIndexManifestEntry>>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SecondaryIndexTargetDiscriminant {
+    Node,
+    Edge,
+}
+
+fn secondary_index_target_discriminant(
+    target: &SecondaryIndexTarget,
+) -> SecondaryIndexTargetDiscriminant {
+    match target {
+        SecondaryIndexTarget::NodeProperty { .. } => SecondaryIndexTargetDiscriminant::Node,
+        SecondaryIndexTarget::EdgeProperty { .. } => SecondaryIndexTargetDiscriminant::Edge,
+    }
+}
+
+fn secondary_index_target_label_id(target: &SecondaryIndexTarget) -> u32 {
+    match target {
+        SecondaryIndexTarget::NodeProperty { label_id, .. } => *label_id,
+        SecondaryIndexTarget::EdgeProperty { label_id, .. } => *label_id,
+    }
+}
+
+fn secondary_index_target_prop_key(target: &SecondaryIndexTarget) -> &str {
+    match target {
+        SecondaryIndexTarget::NodeProperty { prop_key, .. }
+        | SecondaryIndexTarget::EdgeProperty { prop_key, .. } => prop_key,
+    }
+}
+
+fn secondary_index_range_domain_rank(domain: SecondaryIndexRangeDomain) -> u8 {
+    match domain {
+        SecondaryIndexRangeDomain::Int => 0,
+        SecondaryIndexRangeDomain::UInt => 1,
+        SecondaryIndexRangeDomain::Float => 2,
+    }
+}
+
+fn secondary_index_kind_rank(kind: &SecondaryIndexKind) -> (u8, u8) {
+    match kind {
+        SecondaryIndexKind::Equality => (0, 0),
+        SecondaryIndexKind::Range { domain } => (1, secondary_index_range_domain_rank(*domain)),
+    }
+}
+
+type SecondaryIndexCatalog = HashMap<
+    (SecondaryIndexTargetDiscriminant, u32),
+    HashMap<String, HashMap<SecondaryIndexKind, SecondaryIndexManifestEntry>>,
+>;
 type SecondaryIndexEntries = Vec<SecondaryIndexManifestEntry>;
 
 /// Generic K-way merge across already-sorted sources with early termination
@@ -145,7 +201,7 @@ fn merge_sorted_paged<T: Clone>(
 
 /// K-way merge for u64 ID lists. Thin wrapper around `merge_sorted_paged`
 /// with identity key and deleted-set skip function.
-fn merge_type_ids_paged(
+fn merge_record_ids_paged(
     memtable_ids: Vec<u64>,
     segment_sorted_ids: Vec<Vec<u64>>,
     deleted: &NodeIdSet,
@@ -194,12 +250,11 @@ fn reconcile_dense_vector_manifest(
 }
 
 fn secondary_index_lookup_key(entry: &SecondaryIndexManifestEntry) -> SecondaryIndexLookupKey {
-    match &entry.target {
-        SecondaryIndexTarget::NodeProperty { type_id, prop_key } => SecondaryIndexLookupKey {
-            type_id: *type_id,
-            prop_key: prop_key.clone(),
-            kind: entry.kind.clone(),
-        },
+    SecondaryIndexLookupKey {
+        discriminant: secondary_index_target_discriminant(&entry.target),
+        target_label_id: secondary_index_target_label_id(&entry.target),
+        prop_key: secondary_index_target_prop_key(&entry.target).to_string(),
+        kind: entry.kind.clone(),
     }
 }
 
@@ -224,11 +279,17 @@ fn normalize_secondary_index_manifest(manifest: &mut ManifestState) -> Result<bo
             )));
         }
         if matches!(entry.kind, SecondaryIndexKind::Range { .. }) {
-            let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
-            if !seen_range_targets.insert((*type_id, prop_key.clone())) {
+            let disc = secondary_index_target_discriminant(&entry.target);
+            let target_label_id = secondary_index_target_label_id(&entry.target);
+            let prop_key = secondary_index_target_prop_key(&entry.target);
+            if !seen_range_targets.insert((disc, target_label_id, prop_key.to_string())) {
+                let target_label = match disc {
+                    SecondaryIndexTargetDiscriminant::Node => "node",
+                    SecondaryIndexTargetDiscriminant::Edge => "edge",
+                };
                 return Err(EngineError::ManifestError(format!(
-                    "duplicate range declaration for node property ({}, {})",
-                    type_id, prop_key
+                    "duplicate range declaration for {} property ({}, {})",
+                    target_label, target_label_id, prop_key
                 )));
             }
         }
@@ -256,28 +317,31 @@ fn build_secondary_index_catalog(
     let mut catalog: SecondaryIndexCatalog = HashMap::with_capacity(entries.len());
     let mut seen_range_targets = HashSet::new();
     for entry in entries {
-        match &entry.target {
-            SecondaryIndexTarget::NodeProperty { type_id, prop_key } => {
-                if matches!(entry.kind, SecondaryIndexKind::Range { .. })
-                    && !seen_range_targets.insert((*type_id, prop_key.clone()))
-                {
-                    return Err(EngineError::ManifestError(format!(
-                        "duplicate range declaration loaded from manifest for node property ({}, {})",
-                        type_id, prop_key
-                    )));
-                }
-                let kind_map = catalog
-                    .entry(*type_id)
-                    .or_default()
-                    .entry(prop_key.clone())
-                    .or_default();
-                if kind_map.insert(entry.kind.clone(), entry.clone()).is_some() {
-                    return Err(EngineError::ManifestError(format!(
-                        "duplicate secondary index declaration loaded from manifest: {:?}",
-                        entry.target
-                    )));
-                }
-            }
+        let disc = secondary_index_target_discriminant(&entry.target);
+        let target_label_id = secondary_index_target_label_id(&entry.target);
+        let prop_key = secondary_index_target_prop_key(&entry.target);
+        if matches!(entry.kind, SecondaryIndexKind::Range { .. })
+            && !seen_range_targets.insert((disc, target_label_id, prop_key.to_string()))
+        {
+            let target_label = match disc {
+                SecondaryIndexTargetDiscriminant::Node => "node",
+                SecondaryIndexTargetDiscriminant::Edge => "edge",
+            };
+            return Err(EngineError::ManifestError(format!(
+                "duplicate range declaration loaded from manifest for {} property ({}, {})",
+                target_label, target_label_id, prop_key
+            )));
+        }
+        let kind_map = catalog
+            .entry((disc, target_label_id))
+            .or_default()
+            .entry(prop_key.to_string())
+            .or_default();
+        if kind_map.insert(entry.kind.clone(), entry.clone()).is_some() {
+            return Err(EngineError::ManifestError(format!(
+                "duplicate secondary index declaration loaded from manifest: {:?}",
+                entry.target
+            )));
         }
     }
     Ok(catalog)
@@ -311,6 +375,587 @@ fn merge_runtime_manifest_counters_from_shared(
         .max(engine_seq_seen.load(Ordering::Acquire));
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeLabelCatalog {
+    pub node_label_to_id: BTreeMap<String, u32>,
+    pub node_id_to_label: BTreeMap<u32, String>,
+    node_label_wal_generation: BTreeMap<String, u64>,
+    pub edge_label_to_id: BTreeMap<String, u32>,
+    pub edge_id_to_label: BTreeMap<u32, String>,
+    edge_label_wal_generation: BTreeMap<String, u64>,
+    pub next_node_label_id: u32,
+    pub next_edge_label_id: u32,
+}
+
+impl RuntimeLabelCatalog {
+    fn from_manifest(manifest: &ManifestState) -> Result<Self, EngineError> {
+        let mut catalog = Self {
+            node_label_to_id: manifest.node_label_tokens.clone(),
+            node_id_to_label: BTreeMap::new(),
+            node_label_wal_generation: BTreeMap::new(),
+            edge_label_to_id: manifest.edge_label_tokens.clone(),
+            edge_id_to_label: BTreeMap::new(),
+            edge_label_wal_generation: BTreeMap::new(),
+            next_node_label_id: manifest.next_node_label_id,
+            next_edge_label_id: manifest.next_edge_label_id,
+        };
+        catalog.rebuild_reverse_maps()?;
+        Ok(catalog)
+    }
+
+    fn rebuild_reverse_maps(&mut self) -> Result<(), EngineError> {
+        self.node_id_to_label.clear();
+        for (label, &label_id) in &self.node_label_to_id {
+            if let Some(existing) = self.node_id_to_label.insert(label_id, label.clone()) {
+                return Err(EngineError::ManifestError(format!(
+                    "node label token conflict: label_id {label_id} is assigned to both '{existing}' and '{label}'"
+                )));
+            }
+        }
+        self.edge_id_to_label.clear();
+        for (label, &label_id) in &self.edge_label_to_id {
+            if let Some(existing) = self.edge_id_to_label.insert(label_id, label.clone()) {
+                return Err(EngineError::ManifestError(format!(
+                    "edge-label token conflict: label_id {label_id} is assigned to both '{existing}' and '{label}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_to_manifest(&self, manifest: &mut ManifestState) {
+        manifest.label_token_schema_version = LABEL_TOKEN_SCHEMA_VERSION;
+        manifest.node_label_tokens = self.node_label_to_id.clone();
+        manifest.edge_label_tokens = self.edge_label_to_id.clone();
+        manifest.next_node_label_id = self.next_node_label_id;
+        manifest.next_edge_label_id = self.next_edge_label_id;
+    }
+
+    fn apply_checkpointed_to_manifest(
+        &self,
+        manifest: &mut ManifestState,
+        max_wal_generation: Option<u64>,
+    ) {
+        manifest.label_token_schema_version = LABEL_TOKEN_SCHEMA_VERSION;
+        for (label, &label_id) in &self.node_label_to_id {
+            if manifest.node_label_tokens.get(label) == Some(&label_id)
+                || self
+                    .node_label_wal_generation
+                    .get(label)
+                    .is_some_and(|generation| {
+                        max_wal_generation
+                            .is_some_and(|max_generation| *generation <= max_generation)
+                    })
+            {
+                manifest.node_label_tokens.insert(label.clone(), label_id);
+            }
+        }
+        for (label, &label_id) in &self.edge_label_to_id {
+            if manifest.edge_label_tokens.get(label) == Some(&label_id)
+                || self
+                    .edge_label_wal_generation
+                    .get(label)
+                    .is_some_and(|generation| {
+                        max_wal_generation
+                            .is_some_and(|max_generation| *generation <= max_generation)
+                    })
+            {
+                manifest.edge_label_tokens.insert(label.clone(), label_id);
+            }
+        }
+        manifest.next_node_label_id = manifest.next_node_label_id.max(
+            manifest
+                .node_label_tokens
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        manifest.next_edge_label_id = manifest.next_edge_label_id.max(
+            manifest
+                .edge_label_tokens
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+    }
+
+    fn reserve_node_label(&self, label: &str) -> Result<(u32, bool), EngineError> {
+        if let Some(&label_id) = self.node_label_to_id.get(label) {
+            return Ok((label_id, false));
+        }
+        validate_label_token_name(label)?;
+        if self.next_node_label_id == u32::MAX {
+            return Err(EngineError::InvalidOperation(
+                "node label token ID space exhausted".to_string(),
+            ));
+        }
+        Ok((self.next_node_label_id, true))
+    }
+
+    fn reserve_edge_label(&self, label: &str) -> Result<(u32, bool), EngineError> {
+        if let Some(&label_id) = self.edge_label_to_id.get(label) {
+            return Ok((label_id, false));
+        }
+        validate_label_token_name(label)?;
+        if self.next_edge_label_id == u32::MAX {
+            return Err(EngineError::InvalidOperation(
+                "edge-label token ID space exhausted".to_string(),
+            ));
+        }
+        Ok((self.next_edge_label_id, true))
+    }
+
+    fn apply_node_label(
+        &mut self,
+        label: String,
+        label_id: u32,
+        wal_generation: Option<u64>,
+    ) -> Result<(), EngineError> {
+        validate_label_token_name(&label)?;
+        if label_id == 0 {
+            return Err(EngineError::InvalidOperation(
+                "node label token ID 0 is reserved".to_string(),
+            ));
+        }
+        if let Some(existing_id) = self.node_label_to_id.get(&label) {
+            if *existing_id == label_id {
+                if let Some(wal_generation) = wal_generation {
+                    self.node_label_wal_generation
+                        .entry(label)
+                        .and_modify(|existing| *existing = (*existing).min(wal_generation))
+                        .or_insert(wal_generation);
+                }
+                return Ok(());
+            }
+            return Err(EngineError::CorruptWal(format!(
+                "node label token conflict: label '{label}' is assigned to both label_id {existing_id} and {label_id}"
+            )));
+        }
+        if let Some(existing_label) = self.node_id_to_label.get(&label_id) {
+            return Err(EngineError::CorruptWal(format!(
+                "node label token conflict: label_id {label_id} is assigned to both '{existing_label}' and '{label}'"
+            )));
+        }
+        self.node_label_to_id.insert(label.clone(), label_id);
+        self.node_id_to_label.insert(label_id, label);
+        if let Some(wal_generation) = wal_generation {
+            let stored_label = self
+                .node_id_to_label
+                .get(&label_id)
+                .expect("node label reverse map was just inserted")
+                .clone();
+            self.node_label_wal_generation
+                .insert(stored_label, wal_generation);
+        }
+        self.next_node_label_id = self.next_node_label_id.max(label_id.saturating_add(1));
+        Ok(())
+    }
+
+    fn apply_edge_label(
+        &mut self,
+        label: String,
+        label_id: u32,
+        wal_generation: Option<u64>,
+    ) -> Result<(), EngineError> {
+        validate_label_token_name(&label)?;
+        if label_id == 0 {
+            return Err(EngineError::InvalidOperation(
+                "edge-label token ID 0 is reserved".to_string(),
+            ));
+        }
+        if let Some(existing_id) = self.edge_label_to_id.get(&label) {
+            if *existing_id == label_id {
+                if let Some(wal_generation) = wal_generation {
+                    self.edge_label_wal_generation
+                        .entry(label)
+                        .and_modify(|existing| *existing = (*existing).min(wal_generation))
+                        .or_insert(wal_generation);
+                }
+                return Ok(());
+            }
+            return Err(EngineError::CorruptWal(format!(
+                "edge-label token conflict: edge label '{label}' is assigned to both label_id {existing_id} and {label_id}"
+            )));
+        }
+        if let Some(existing_label) = self.edge_id_to_label.get(&label_id) {
+            return Err(EngineError::CorruptWal(format!(
+                "edge-label token conflict: label_id {label_id} is assigned to both '{existing_label}' and '{label}'"
+            )));
+        }
+        self.edge_label_to_id.insert(label.clone(), label_id);
+        self.edge_id_to_label.insert(label_id, label);
+        if let Some(wal_generation) = wal_generation {
+            let stored_label = self
+                .edge_id_to_label
+                .get(&label_id)
+                .expect("edge-label reverse map was just inserted")
+                .clone();
+            self.edge_label_wal_generation
+                .insert(stored_label, wal_generation);
+        }
+        self.next_edge_label_id = self.next_edge_label_id.max(label_id.saturating_add(1));
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReadLabelCatalogSnapshot {
+    node_label_to_id: HashMap<String, u32>,
+    node_id_to_label: ReadLabelNameLookup,
+    edge_label_to_id: HashMap<String, u32>,
+    edge_id_to_label: ReadLabelNameLookup,
+}
+
+#[derive(Debug, Clone)]
+enum ReadLabelNameLookup {
+    Dense(Box<[Option<Arc<str>>]>),
+    Sparse(HashMap<u32, Arc<str>>),
+}
+
+impl ReadLabelNameLookup {
+    const MAX_DENSE_LEN: usize = 1_000_000;
+
+    fn from_runtime_map(names: &BTreeMap<u32, String>) -> Self {
+        let Some(max_label_id) = names.keys().next_back().copied() else {
+            return Self::Dense(Vec::new().into_boxed_slice());
+        };
+        let dense_len = usize::try_from(max_label_id)
+            .ok()
+            .and_then(|max| max.checked_add(1));
+        let dense_threshold = names.len().saturating_mul(8).saturating_add(64);
+
+        if let Some(len) =
+            dense_len.filter(|&len| len <= Self::MAX_DENSE_LEN && len <= dense_threshold)
+        {
+            let mut dense = vec![None; len];
+            for (&label_id, name) in names {
+                dense[label_id as usize] = Some(Arc::<str>::from(name.as_str()));
+            }
+            return Self::Dense(dense.into_boxed_slice());
+        }
+
+        Self::Sparse(
+            names
+                .iter()
+                .map(|(&label_id, name)| (label_id, Arc::<str>::from(name.as_str())))
+                .collect(),
+        )
+    }
+
+    fn get(&self, label_id: u32) -> Option<&str> {
+        match self {
+            Self::Dense(names) => usize::try_from(label_id)
+                .ok()
+                .and_then(|idx| names.get(idx))
+                .and_then(Option::as_deref),
+            Self::Sparse(names) => names.get(&label_id).map(AsRef::as_ref),
+        }
+    }
+}
+
+trait LabelCatalogLookup {
+    fn node_label(&self, label_id: u32) -> Option<&str>;
+    fn edge_label(&self, label_id: u32) -> Option<&str>;
+}
+
+impl LabelCatalogLookup for RuntimeLabelCatalog {
+    fn node_label(&self, label_id: u32) -> Option<&str> {
+        self.node_id_to_label.get(&label_id).map(String::as_str)
+    }
+
+    fn edge_label(&self, label_id: u32) -> Option<&str> {
+        self.edge_id_to_label.get(&label_id).map(String::as_str)
+    }
+}
+
+impl LabelCatalogLookup for ReadLabelCatalogSnapshot {
+    fn node_label(&self, label_id: u32) -> Option<&str> {
+        self.node_id_to_label.get(label_id)
+    }
+
+    fn edge_label(&self, label_id: u32) -> Option<&str> {
+        self.edge_id_to_label.get(label_id)
+    }
+}
+
+impl ReadLabelCatalogSnapshot {
+    fn from_runtime(catalog: &RuntimeLabelCatalog) -> Self {
+        Self {
+            node_label_to_id: catalog.node_label_to_id.clone().into_iter().collect(),
+            node_id_to_label: ReadLabelNameLookup::from_runtime_map(&catalog.node_id_to_label),
+            edge_label_to_id: catalog.edge_label_to_id.clone().into_iter().collect(),
+            edge_id_to_label: ReadLabelNameLookup::from_runtime_map(&catalog.edge_id_to_label),
+        }
+    }
+
+    fn resolve_node_label_for_read(&self, label: &str) -> Result<Option<u32>, EngineError> {
+        validate_label_token_name(label)?;
+        Ok(self.node_label_to_id.get(label).copied())
+    }
+
+    fn resolve_edge_label_for_read(&self, label: &str) -> Result<Option<u32>, EngineError> {
+        validate_label_token_name(label)?;
+        Ok(self.edge_label_to_id.get(label).copied())
+    }
+
+    fn resolve_edge_label_filter(
+        &self,
+        edge_labels: Option<&[String]>,
+    ) -> Result<(LabelFilterResolution, Vec<QueryPlanWarning>), EngineError> {
+        let Some(edge_labels) = edge_labels else {
+            return Ok((LabelFilterResolution::Unconstrained, Vec::new()));
+        };
+        if edge_labels.is_empty() {
+            return Ok((LabelFilterResolution::Unconstrained, Vec::new()));
+        }
+
+        let mut known = Vec::new();
+        let mut warnings = Vec::new();
+        for label in edge_labels {
+            match self.resolve_edge_label_for_read(label)? {
+                Some(label_id) => known.push(label_id),
+                None => push_query_warning(&mut warnings, QueryPlanWarning::UnknownEdgeLabel),
+            }
+        }
+
+        if known.is_empty() {
+            return Ok((LabelFilterResolution::EmptyConstraint, warnings));
+        }
+        known.sort_unstable();
+        known.dedup();
+        Ok((LabelFilterResolution::Known(known), warnings))
+    }
+
+    fn resolve_edge_label_filter_for_read(
+        &self,
+        edge_labels: Option<&[String]>,
+    ) -> Result<LabelFilterResolution, EngineError> {
+        Ok(self.resolve_edge_label_filter(edge_labels)?.0)
+    }
+
+    #[allow(dead_code)]
+    fn resolve_node_label_filter_request(
+        &self,
+        filter: Option<&NodeLabelFilter>,
+    ) -> Result<ResolvedNodeLabelFilter, EngineError> {
+        let Some(filter) = filter else {
+            return Ok(ResolvedNodeLabelFilter::Unconstrained);
+        };
+        validate_node_label_filter(filter)?;
+
+        let mut known = Vec::with_capacity(filter.labels.len());
+        let mut unknown_label_count = 0usize;
+        for label in &filter.labels {
+            match self.resolve_node_label_for_read(label)? {
+                Some(label_id) => known.push(label_id),
+                None => unknown_label_count += 1,
+            }
+        }
+
+        if known.is_empty() {
+            return Ok(ResolvedNodeLabelFilter::empty(
+                filter.mode,
+                unknown_label_count,
+            ));
+        }
+        if filter.mode == LabelMatchMode::All && unknown_label_count > 0 {
+            return Ok(ResolvedNodeLabelFilter::empty(
+                filter.mode,
+                unknown_label_count,
+            ));
+        }
+        Ok(ResolvedNodeLabelFilter::known(
+            filter.mode,
+            NodeLabelSet::from_label_ids(known)?,
+            unknown_label_count,
+        ))
+    }
+}
+
+fn node_view_from_record(
+    record: NodeRecord,
+    catalog: &ReadLabelCatalogSnapshot,
+) -> Result<NodeView, EngineError> {
+    let labels = match record.label_ids.as_slice() {
+        &[label_id] => vec![catalog
+            .node_label(label_id)
+            .ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "node record {} references missing node label_id {}",
+                    record.id, label_id
+                ))
+            })?
+            .to_string()],
+        label_ids => {
+            let mut labels = Vec::with_capacity(label_ids.len());
+            for &label_id in label_ids {
+                labels.push(
+                    catalog
+                        .node_label(label_id)
+                        .ok_or_else(|| {
+                            EngineError::InvalidOperation(format!(
+                                "node record {} references missing node label_id {}",
+                                record.id, label_id
+                            ))
+                        })?
+                        .to_string(),
+                );
+            }
+            labels
+        }
+    };
+
+    Ok(NodeView {
+        id: record.id,
+        labels,
+        key: record.key,
+        props: record.props,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        weight: record.weight,
+        dense_vector: record.dense_vector,
+        sparse_vector: record.sparse_vector,
+    })
+}
+
+fn node_view_from_record_with_resolved_label(
+    record: NodeRecord,
+    expected_label_id: u32,
+    catalog: &ReadLabelCatalogSnapshot,
+) -> Result<NodeView, EngineError> {
+    if !record.label_ids.contains(expected_label_id) {
+        return Err(EngineError::InvalidOperation(format!(
+            "node record {} resolved by label_id {} but found {:?}",
+            record.id, expected_label_id, record.label_ids
+        )));
+    }
+
+    node_view_from_record(record, catalog)
+}
+
+fn edge_view_from_record(
+    record: EdgeRecord,
+    catalog: &ReadLabelCatalogSnapshot,
+) -> Result<EdgeView, EngineError> {
+    let label = catalog
+        .edge_label(record.label_id)
+        .ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "edge record {} references missing edge-label label_id {}",
+                record.id, record.label_id
+            ))
+        })?
+        .to_string();
+
+    Ok(EdgeView {
+        id: record.id,
+        from: record.from,
+        to: record.to,
+        label,
+        props: record.props,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        weight: record.weight,
+        valid_from: record.valid_from,
+        valid_to: record.valid_to,
+    })
+}
+
+fn edge_view_from_record_with_resolved_label(
+    record: EdgeRecord,
+    expected_label_id: u32,
+    label: String,
+) -> Result<EdgeView, EngineError> {
+    if record.label_id != expected_label_id {
+        return Err(EngineError::InvalidOperation(format!(
+            "edge record {} resolved by edge label '{}' expected label_id {} but found {}",
+            record.id, label, expected_label_id, record.label_id
+        )));
+    }
+
+    Ok(EdgeView {
+        id: record.id,
+        from: record.from,
+        to: record.to,
+        label,
+        props: record.props,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        weight: record.weight,
+        valid_from: record.valid_from,
+        valid_to: record.valid_to,
+    })
+}
+
+fn neighbor_entry_from_record(
+    record: NeighborRecord,
+    catalog: &ReadLabelCatalogSnapshot,
+) -> Result<NeighborEntry, EngineError> {
+    let label = catalog
+        .edge_label(record.edge_label_id)
+        .ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "neighbor edge {} references missing edge-label label_id {}",
+                record.edge_id, record.edge_label_id
+            ))
+        })?
+        .to_string();
+
+    Ok(NeighborEntry {
+        node_id: record.node_id,
+        edge_id: record.edge_id,
+        label,
+        weight: record.weight,
+        valid_from: record.valid_from,
+        valid_to: record.valid_to,
+    })
+}
+
+fn resolve_node_label_for_read(
+    catalog: &RuntimeLabelCatalog,
+    label: &str,
+) -> Result<Option<u32>, EngineError> {
+    validate_label_token_name(label)?;
+    Ok(catalog.node_label_to_id.get(label).copied())
+}
+
+fn resolve_edge_label_for_read(
+    catalog: &RuntimeLabelCatalog,
+    label: &str,
+) -> Result<Option<u32>, EngineError> {
+    validate_label_token_name(label)?;
+    Ok(catalog.edge_label_to_id.get(label).copied())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LabelFilterResolution {
+    Unconstrained,
+    Known(Vec<u32>),
+    EmptyConstraint,
+}
+
+fn merge_runtime_label_catalog_into_manifest(
+    manifest: &mut ManifestState,
+    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+) {
+    label_catalog.read().unwrap().apply_to_manifest(manifest);
+}
+
+fn merge_checkpointed_label_catalog_into_manifest(
+    manifest: &mut ManifestState,
+    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+    max_wal_generation: Option<u64>,
+) {
+    label_catalog
+        .read()
+        .unwrap()
+        .apply_checkpointed_to_manifest(manifest, max_wal_generation);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_secondary_index_manifest_runtime(
     db_dir: &Path,
@@ -320,6 +965,8 @@ fn update_secondary_index_manifest_runtime(
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
+    label_catalog: Option<&Arc<RwLock<RuntimeLabelCatalog>>>,
+    max_token_checkpoint_wal_generation: Option<u64>,
     mutate: impl FnOnce(&mut ManifestState) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
     let _guard = manifest_write_lock.lock().unwrap();
@@ -332,6 +979,13 @@ fn update_secondary_index_manifest_runtime(
         next_edge_id_seen,
         engine_seq_seen,
     );
+    if let Some(label_catalog) = label_catalog {
+        merge_checkpointed_label_catalog_into_manifest(
+            &mut manifest,
+            label_catalog,
+            max_token_checkpoint_wal_generation,
+        );
+    }
     write_manifest(db_dir, &manifest)?;
     sync_secondary_index_runtime_state(catalog_lock, entries_lock, &manifest.secondary_indexes)?;
     Ok(())
@@ -342,6 +996,29 @@ fn is_not_found_io_error(error: &EngineError) -> bool {
         error,
         EngineError::IoError(io_error) if io_error.kind() == std::io::ErrorKind::NotFound
     )
+}
+
+fn manifestless_database_artifacts(path: &Path) -> Result<Vec<String>, EngineError> {
+    let mut artifacts = Vec::new();
+    if path.join("data.wal").exists() {
+        artifacts.push("data.wal".to_string());
+    }
+    if path.join("segments").exists() {
+        artifacts.push("segments/".to_string());
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with("wal_") && name.ends_with(".wal") {
+            artifacts.push(name.to_string());
+        }
+    }
+    artifacts.sort();
+    artifacts.dedup();
+    Ok(artifacts)
 }
 
 fn apply_secondary_index_failure_report(
@@ -372,22 +1049,6 @@ fn apply_secondary_index_failure_report(
             }
         }
     }
-}
-
-fn equality_index_ids_snapshot(entries: &[SecondaryIndexManifestEntry]) -> NodeIdSet {
-    entries
-        .iter()
-        .filter(|entry| matches!(entry.kind, SecondaryIndexKind::Equality))
-        .map(|entry| entry.index_id)
-        .collect()
-}
-
-fn range_index_ids_snapshot(entries: &[SecondaryIndexManifestEntry]) -> NodeIdSet {
-    entries
-        .iter()
-        .filter(|entry| matches!(entry.kind, SecondaryIndexKind::Range { .. }))
-        .map(|entry| entry.index_id)
-        .collect()
 }
 
 fn reconcile_background_output_equality_declarations(
@@ -459,6 +1120,7 @@ fn mark_secondary_index_failed(
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
+    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
     index_id: u64,
     error: &EngineError,
 ) {
@@ -471,6 +1133,8 @@ fn mark_secondary_index_failed(
         next_node_id_seen,
         next_edge_id_seen,
         engine_seq_seen,
+        Some(label_catalog),
+        None,
         |manifest| {
             if let Some(entry) = manifest
                 .secondary_indexes
@@ -487,66 +1151,22 @@ fn mark_secondary_index_failed(
 
 fn build_secondary_eq_groups_for_segment(
     segment: &SegmentReader,
-    type_id: u32,
+    target_label_id: u32,
     prop_key: &str,
 ) -> Result<BTreeMap<u64, Vec<u64>>, EngineError> {
-    let target_key_hash = hash_prop_key(prop_key);
-    let legacy_hashes = segment.raw_node_prop_hashes_mmap();
     let mut groups: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
 
     for index in 0..segment.node_meta_count() as usize {
-        let (
-            node_id,
-            data_offset,
-            _data_len,
-            node_type_id,
-            _updated_at,
-            _weight,
-            _key_len,
-            prop_hash_offset,
-            prop_hash_count,
-            _last_write_seq,
-        ) = segment.node_meta_at(index)?;
-        if node_type_id != type_id {
+        let meta = segment.node_meta_at(index)?;
+        if !meta.label_ids.contains(target_label_id) {
             continue;
         }
 
-        let mut value_hash = None;
-        if !legacy_hashes.is_empty() && prop_hash_count > 0 {
-            let base = prop_hash_offset as usize;
-            for pair_index in 0..prop_hash_count as usize {
-                let pair_off = base + pair_index * 16;
-                let pair_end = pair_off + 16;
-                if pair_end > legacy_hashes.len() {
-                    return Err(EngineError::CorruptRecord(format!(
-                        "node {} prop hash pair at offset {} exceeds source length {}",
-                        node_id,
-                        pair_off,
-                        legacy_hashes.len()
-                    )));
-                }
-                let key_hash =
-                    u64::from_le_bytes(legacy_hashes[pair_off..pair_off + 8].try_into().unwrap());
-                if key_hash != target_key_hash {
-                    continue;
-                }
-                value_hash = Some(u64::from_le_bytes(
-                    legacy_hashes[pair_off + 8..pair_off + 16]
-                        .try_into()
-                        .unwrap(),
-                ));
-                break;
-            }
-        }
-
-        if value_hash.is_none() {
-            value_hash = segment
-                .node_property_value_at_offset(node_id, data_offset, prop_key)?
-                .map(|value| hash_prop_value(&value));
-        }
-
-        if let Some(value_hash) = value_hash {
-            groups.entry(value_hash).or_default().push(node_id);
+        if let Some(value_hash) = segment
+            .node_property_value_at_offset(meta.node_id, meta.data_offset, prop_key)?
+            .map(|value| hash_prop_value(&value))
+        {
+            groups.entry(value_hash).or_default().push(meta.node_id);
         }
     }
 
@@ -559,37 +1179,110 @@ fn build_secondary_eq_groups_for_segment(
 
 fn build_secondary_range_entries_for_segment(
     segment: &SegmentReader,
-    type_id: u32,
+    target_label_id: u32,
     prop_key: &str,
     domain: SecondaryIndexRangeDomain,
 ) -> Result<Vec<(u64, u64)>, EngineError> {
     let mut entries = Vec::new();
 
     for index in 0..segment.node_meta_count() as usize {
-        let (
-            node_id,
-            data_offset,
-            _data_len,
-            node_type_id,
-            _updated_at,
-            _weight,
-            _key_len,
-            _prop_hash_offset,
-            _prop_hash_count,
-            _last_write_seq,
-        ) = segment.node_meta_at(index)?;
-        if node_type_id != type_id {
+        let meta = segment.node_meta_at(index)?;
+        if !meta.label_ids.contains(target_label_id) {
             continue;
         }
 
-        let Some(value) = segment.node_property_value_at_offset(node_id, data_offset, prop_key)?
+        let Some(value) =
+            segment.node_property_value_at_offset(meta.node_id, meta.data_offset, prop_key)?
         else {
             continue;
         };
         let Some(encoded_value) = encode_range_prop_value(domain, &value) else {
             continue;
         };
-        entries.push((encoded_value, node_id));
+        entries.push((encoded_value, meta.node_id));
+    }
+
+    entries.sort_unstable();
+    entries.dedup();
+    Ok(entries)
+}
+
+fn build_edge_secondary_eq_groups_for_segment(
+    segment: &SegmentReader,
+    label_id: u32,
+    prop_key: &str,
+) -> Result<BTreeMap<u64, Vec<u64>>, EngineError> {
+    let mut groups: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+
+    for index in 0..segment.edge_meta_count() as usize {
+        let (
+            edge_id,
+            data_offset,
+            _data_len,
+            _from,
+            _to,
+            edge_label_id,
+            _updated_at,
+            _weight,
+            _valid_from,
+            _valid_to,
+            _last_write_seq,
+        ) = segment.edge_meta_at(index)?;
+        if edge_label_id != label_id {
+            continue;
+        }
+
+        if let Some(value) =
+            segment.edge_property_value_at_offset(edge_id, data_offset, prop_key)?
+        {
+            groups
+                .entry(hash_prop_value(&value))
+                .or_default()
+                .push(edge_id);
+        }
+    }
+
+    for ids in groups.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    Ok(groups)
+}
+
+fn build_edge_secondary_range_entries_for_segment(
+    segment: &SegmentReader,
+    label_id: u32,
+    prop_key: &str,
+    domain: SecondaryIndexRangeDomain,
+) -> Result<Vec<(u64, u64)>, EngineError> {
+    let mut entries = Vec::new();
+
+    for index in 0..segment.edge_meta_count() as usize {
+        let (
+            edge_id,
+            data_offset,
+            _data_len,
+            _from,
+            _to,
+            edge_label_id,
+            _updated_at,
+            _weight,
+            _valid_from,
+            _valid_to,
+            _last_write_seq,
+        ) = segment.edge_meta_at(index)?;
+        if edge_label_id != label_id {
+            continue;
+        }
+
+        let Some(value) = segment.edge_property_value_at_offset(edge_id, data_offset, prop_key)?
+        else {
+            continue;
+        };
+        let Some(encoded_value) = encode_range_prop_value(domain, &value) else {
+            continue;
+        };
+        entries.push((encoded_value, edge_id));
     }
 
     entries.sort_unstable();
@@ -599,48 +1292,45 @@ fn build_secondary_range_entries_for_segment(
 
 fn install_secondary_eq_sidecar(
     seg_dir: &Path,
-    index_id: u64,
+    entry: &SecondaryIndexManifestEntry,
     groups: &BTreeMap<u64, Vec<u64>>,
 ) -> Result<(), EngineError> {
-    let index_dir = seg_dir.join("secondary_indexes");
-    match std::fs::create_dir(&index_dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    let final_path = node_prop_eq_sidecar_path(seg_dir, index_id);
-    let tmp_path = index_dir.join(format!(".node_prop_eq_{}.tmp", index_id));
-    write_node_prop_eq_sidecar_to_path(&tmp_path, groups)?;
-    std::fs::rename(&tmp_path, &final_path)?;
-    fsync_dir(&index_dir)?;
-    Ok(())
+    publish_node_prop_eq_sidecar_component(seg_dir, entry, groups)
 }
 
 fn install_secondary_range_sidecar(
     seg_dir: &Path,
-    index_id: u64,
+    entry: &SecondaryIndexManifestEntry,
     entries: &[(u64, u64)],
 ) -> Result<(), EngineError> {
-    let index_dir = seg_dir.join("secondary_indexes");
-    match std::fs::create_dir(&index_dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    let final_path = node_prop_range_sidecar_path(seg_dir, index_id);
-    let tmp_path = index_dir.join(format!(".node_prop_range_{}.tmp", index_id));
-    write_node_prop_range_sidecar_to_path(&tmp_path, entries)?;
-    std::fs::rename(&tmp_path, &final_path)?;
-    fsync_dir(&index_dir)?;
-    Ok(())
+    publish_node_prop_range_sidecar_component(seg_dir, entry, entries)
+}
+
+fn install_edge_secondary_eq_sidecar(
+    seg_dir: &Path,
+    entry: &SecondaryIndexManifestEntry,
+    groups: &BTreeMap<u64, Vec<u64>>,
+) -> Result<(), EngineError> {
+    publish_edge_prop_eq_sidecar_component(seg_dir, entry, groups)
+}
+
+fn install_edge_secondary_range_sidecar(
+    seg_dir: &Path,
+    entry: &SecondaryIndexManifestEntry,
+    entries: &[(u64, u64)],
+) -> Result<(), EngineError> {
+    publish_edge_prop_range_sidecar_component(seg_dir, entry, entries)
 }
 
 #[derive(Clone)]
 struct SecondaryEqBuildSnapshot {
     dense_config: Option<DenseVectorConfig>,
-    type_id: u32,
+    target: SecondaryIndexTargetDiscriminant,
+    target_label_id: u32,
     prop_key: String,
     segment_ids: Vec<u64>,
+    segment_infos: Vec<SegmentInfo>,
+    secondary_indexes: Vec<SecondaryIndexManifestEntry>,
 }
 
 enum SecondaryEqCoverageStatus {
@@ -660,10 +1350,13 @@ enum SecondaryEqFinalizeOutcome {
 #[derive(Clone)]
 struct SecondaryRangeBuildSnapshot {
     dense_config: Option<DenseVectorConfig>,
-    type_id: u32,
+    target: SecondaryIndexTargetDiscriminant,
+    target_label_id: u32,
     prop_key: String,
     domain: SecondaryIndexRangeDomain,
     segment_ids: Vec<u64>,
+    segment_infos: Vec<SegmentInfo>,
+    secondary_indexes: Vec<SecondaryIndexManifestEntry>,
 }
 
 enum SecondaryRangeCoverageStatus {
@@ -680,11 +1373,27 @@ enum SecondaryRangeFinalizeOutcome {
     Inactive,
 }
 
+fn segment_info_for_id(segment_infos: &[SegmentInfo], segment_id: u64) -> Option<&SegmentInfo> {
+    segment_infos
+        .iter()
+        .find(|segment| segment.id == segment_id)
+}
+
+fn planner_stats_target_from_discriminant(
+    target: SecondaryIndexTargetDiscriminant,
+) -> PlannerStatsDeclaredIndexTarget {
+    match target {
+        SecondaryIndexTargetDiscriminant::Node => PlannerStatsDeclaredIndexTarget::NodeProperty,
+        SecondaryIndexTargetDiscriminant::Edge => PlannerStatsDeclaredIndexTarget::EdgeProperty,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SecondaryIndexReadyApplied {
     index_id: u64,
+    target: SecondaryIndexTarget,
     kind: SecondaryIndexKind,
-    type_id: u32,
+    target_label_id: u32,
     prop_key: String,
     declaration_fingerprint: u64,
     snapshot_segment_ids: Vec<u64>,
@@ -698,12 +1407,14 @@ impl SecondaryIndexReadyApplied {
         if entry.state != SecondaryIndexState::Ready {
             return None;
         }
-        let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
+        let target_label_id = secondary_index_target_label_id(&entry.target);
+        let prop_key = secondary_index_target_prop_key(&entry.target);
         Some(Self {
             index_id: entry.index_id,
+            target: entry.target.clone(),
             kind: entry.kind.clone(),
-            type_id: *type_id,
-            prop_key: prop_key.clone(),
+            target_label_id,
+            prop_key: prop_key.to_string(),
             declaration_fingerprint: planner_stats_declaration_fingerprint_for_entry(entry),
             snapshot_segment_ids,
         })
@@ -712,13 +1423,15 @@ impl SecondaryIndexReadyApplied {
     fn matches_entry(&self, entry: &SecondaryIndexManifestEntry) -> bool {
         if entry.state != SecondaryIndexState::Ready
             || entry.index_id != self.index_id
+            || entry.target != self.target
             || entry.kind != self.kind
         {
             return false;
         }
-        let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
-        *type_id == self.type_id
-            && prop_key == &self.prop_key
+        let target_label_id = secondary_index_target_label_id(&entry.target);
+        let prop_key = secondary_index_target_prop_key(&entry.target);
+        target_label_id == self.target_label_id
+            && prop_key == self.prop_key
             && planner_stats_declaration_fingerprint_for_entry(entry)
                 == self.declaration_fingerprint
     }
@@ -746,14 +1459,21 @@ fn load_secondary_eq_build_snapshot(
         return Ok(None);
     }
 
-    let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = entry.target;
+    let target = secondary_index_target_discriminant(&entry.target);
+    let target_label_id = secondary_index_target_label_id(&entry.target);
+    let prop_key = secondary_index_target_prop_key(&entry.target).to_string();
     let mut segment_ids: Vec<u64> = manifest.segments.iter().map(|segment| segment.id).collect();
     segment_ids.sort_unstable();
+    let mut segment_infos = manifest.segments.clone();
+    segment_infos.sort_by_key(|segment| segment.id);
     Ok(Some(SecondaryEqBuildSnapshot {
         dense_config: manifest.dense_vector.clone(),
-        type_id,
+        target,
+        target_label_id,
         prop_key,
         segment_ids,
+        segment_infos,
+        secondary_indexes: manifest.secondary_indexes.clone(),
     }))
 }
 
@@ -772,23 +1492,89 @@ fn build_secondary_eq_sidecars_for_snapshot(
         if !seg_path.exists() {
             continue;
         }
+        let Some(seg_info) = segment_info_for_id(&snapshot.segment_infos, segment_id) else {
+            continue;
+        };
 
-        let segment =
-            match SegmentReader::open(&seg_path, segment_id, snapshot.dense_config.as_ref()) {
-                Ok(segment) => segment,
-                Err(error) if is_not_found_io_error(&error) => continue,
-                Err(error) => return Err(error),
-            };
+        let segment = match SegmentReader::open_with_info(
+            &seg_path,
+            seg_info,
+            snapshot.dense_config.as_ref(),
+            &snapshot.secondary_indexes,
+        ) {
+            Ok(segment) => segment,
+            Err(error) if is_not_found_io_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
 
-        match segment.validate_secondary_eq_sidecar(index_id) {
+        if snapshot.target == SecondaryIndexTargetDiscriminant::Edge {
+            match segment.validate_secondary_eq_sidecar_for_target(
+                index_id,
+                PlannerStatsDeclaredIndexTarget::EdgeProperty,
+            ) {
+                Ok(true) => continue,
+                Ok(false) => {
+                    let Some(entry) = snapshot
+                        .secondary_indexes
+                        .iter()
+                        .find(|entry| entry.index_id == index_id)
+                    else {
+                        continue;
+                    };
+                    let groups = build_edge_secondary_eq_groups_for_segment(
+                        &segment,
+                        snapshot.target_label_id,
+                        &snapshot.prop_key,
+                    )?;
+                    match install_edge_secondary_eq_sidecar(&seg_path, entry, &groups) {
+                        Ok(()) => {}
+                        Err(error) if is_not_found_io_error(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if is_not_found_io_error(&error) => {}
+                Err(_) => {
+                    let Some(entry) = snapshot
+                        .secondary_indexes
+                        .iter()
+                        .find(|entry| entry.index_id == index_id)
+                    else {
+                        continue;
+                    };
+                    let groups = build_edge_secondary_eq_groups_for_segment(
+                        &segment,
+                        snapshot.target_label_id,
+                        &snapshot.prop_key,
+                    )?;
+                    match install_edge_secondary_eq_sidecar(&seg_path, entry, &groups) {
+                        Ok(()) => {}
+                        Err(error) if is_not_found_io_error(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            continue;
+        }
+
+        match segment.validate_secondary_eq_sidecar_for_target(
+            index_id,
+            planner_stats_target_from_discriminant(snapshot.target),
+        ) {
             Ok(true) => continue,
             Ok(false) => {
+                let Some(entry) = snapshot
+                    .secondary_indexes
+                    .iter()
+                    .find(|entry| entry.index_id == index_id)
+                else {
+                    continue;
+                };
                 let groups = build_secondary_eq_groups_for_segment(
                     &segment,
-                    snapshot.type_id,
+                    snapshot.target_label_id,
                     &snapshot.prop_key,
                 )?;
-                match install_secondary_eq_sidecar(&seg_path, index_id, &groups) {
+                match install_secondary_eq_sidecar(&seg_path, entry, &groups) {
                     Ok(()) => {}
                     Err(error) if is_not_found_io_error(&error) => {}
                     Err(error) => return Err(error),
@@ -796,12 +1582,19 @@ fn build_secondary_eq_sidecars_for_snapshot(
             }
             Err(error) if is_not_found_io_error(&error) => {}
             Err(_) => {
+                let Some(entry) = snapshot
+                    .secondary_indexes
+                    .iter()
+                    .find(|entry| entry.index_id == index_id)
+                else {
+                    continue;
+                };
                 let groups = build_secondary_eq_groups_for_segment(
                     &segment,
-                    snapshot.type_id,
+                    snapshot.target_label_id,
                     &snapshot.prop_key,
                 )?;
-                match install_secondary_eq_sidecar(&seg_path, index_id, &groups) {
+                match install_secondary_eq_sidecar(&seg_path, entry, &groups) {
                     Ok(()) => {}
                     Err(error) if is_not_found_io_error(&error) => {}
                     Err(error) => return Err(error),
@@ -831,18 +1624,29 @@ fn validate_secondary_eq_snapshot_coverage(
             all_present = false;
             continue;
         }
+        let Some(seg_info) = segment_info_for_id(&snapshot.segment_infos, segment_id) else {
+            all_present = false;
+            continue;
+        };
 
-        let segment =
-            match SegmentReader::open(&seg_path, segment_id, snapshot.dense_config.as_ref()) {
-                Ok(segment) => segment,
-                Err(error) if is_not_found_io_error(&error) => {
-                    all_present = false;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+        let segment = match SegmentReader::open_with_info(
+            &seg_path,
+            seg_info,
+            snapshot.dense_config.as_ref(),
+            &snapshot.secondary_indexes,
+        ) {
+            Ok(segment) => segment,
+            Err(error) if is_not_found_io_error(&error) => {
+                all_present = false;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
-        match segment.validate_secondary_eq_sidecar(index_id) {
+        match segment.validate_secondary_eq_sidecar_for_target(
+            index_id,
+            planner_stats_target_from_discriminant(snapshot.target),
+        ) {
             Ok(true) => {}
             Ok(false) => {
                 all_present = false;
@@ -869,6 +1673,7 @@ fn finalize_secondary_eq_build_snapshot(
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
+    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
     index_id: u64,
     snapshot: &SecondaryEqBuildSnapshot,
     coverage: &SecondaryEqCoverageStatus,
@@ -882,6 +1687,8 @@ fn finalize_secondary_eq_build_snapshot(
         next_node_id_seen,
         next_edge_id_seen,
         engine_seq_seen,
+        Some(label_catalog),
+        None,
         |manifest| {
             let Some(entry_pos) = manifest
                 .secondary_indexes
@@ -961,15 +1768,22 @@ fn load_secondary_range_build_snapshot(
     let SecondaryIndexKind::Range { domain } = entry.kind else {
         return Ok(None);
     };
-    let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = entry.target;
+    let target = secondary_index_target_discriminant(&entry.target);
+    let target_label_id = secondary_index_target_label_id(&entry.target);
+    let prop_key = secondary_index_target_prop_key(&entry.target).to_string();
     let mut segment_ids: Vec<u64> = manifest.segments.iter().map(|segment| segment.id).collect();
     segment_ids.sort_unstable();
+    let mut segment_infos = manifest.segments.clone();
+    segment_infos.sort_by_key(|segment| segment.id);
     Ok(Some(SecondaryRangeBuildSnapshot {
         dense_config: manifest.dense_vector.clone(),
-        type_id,
+        target,
+        target_label_id,
         prop_key,
         domain,
         segment_ids,
+        segment_infos,
+        secondary_indexes: manifest.secondary_indexes.clone(),
     }))
 }
 
@@ -988,24 +1802,92 @@ fn build_secondary_range_sidecars_for_snapshot(
         if !seg_path.exists() {
             continue;
         }
+        let Some(seg_info) = segment_info_for_id(&snapshot.segment_infos, segment_id) else {
+            continue;
+        };
 
-        let segment =
-            match SegmentReader::open(&seg_path, segment_id, snapshot.dense_config.as_ref()) {
-                Ok(segment) => segment,
-                Err(error) if is_not_found_io_error(&error) => continue,
-                Err(error) => return Err(error),
-            };
+        let segment = match SegmentReader::open_with_info(
+            &seg_path,
+            seg_info,
+            snapshot.dense_config.as_ref(),
+            &snapshot.secondary_indexes,
+        ) {
+            Ok(segment) => segment,
+            Err(error) if is_not_found_io_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
 
-        match segment.validate_secondary_range_sidecar(index_id) {
+        if snapshot.target == SecondaryIndexTargetDiscriminant::Edge {
+            match segment.validate_secondary_range_sidecar_for_target(
+                index_id,
+                PlannerStatsDeclaredIndexTarget::EdgeProperty,
+            ) {
+                Ok(true) => continue,
+                Ok(false) => {
+                    let Some(entry) = snapshot
+                        .secondary_indexes
+                        .iter()
+                        .find(|entry| entry.index_id == index_id)
+                    else {
+                        continue;
+                    };
+                    let entries = build_edge_secondary_range_entries_for_segment(
+                        &segment,
+                        snapshot.target_label_id,
+                        &snapshot.prop_key,
+                        snapshot.domain,
+                    )?;
+                    match install_edge_secondary_range_sidecar(&seg_path, entry, &entries) {
+                        Ok(()) => {}
+                        Err(error) if is_not_found_io_error(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if is_not_found_io_error(&error) => {}
+                Err(_) => {
+                    let Some(entry) = snapshot
+                        .secondary_indexes
+                        .iter()
+                        .find(|entry| entry.index_id == index_id)
+                    else {
+                        continue;
+                    };
+                    let entries = build_edge_secondary_range_entries_for_segment(
+                        &segment,
+                        snapshot.target_label_id,
+                        &snapshot.prop_key,
+                        snapshot.domain,
+                    )?;
+                    match install_edge_secondary_range_sidecar(&seg_path, entry, &entries) {
+                        Ok(()) => {}
+                        Err(error) if is_not_found_io_error(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            continue;
+        }
+
+        match segment.validate_secondary_range_sidecar_for_target(
+            index_id,
+            planner_stats_target_from_discriminant(snapshot.target),
+        ) {
             Ok(true) => continue,
             Ok(false) => {
+                let Some(entry) = snapshot
+                    .secondary_indexes
+                    .iter()
+                    .find(|entry| entry.index_id == index_id)
+                else {
+                    continue;
+                };
                 let entries = build_secondary_range_entries_for_segment(
                     &segment,
-                    snapshot.type_id,
+                    snapshot.target_label_id,
                     &snapshot.prop_key,
                     snapshot.domain,
                 )?;
-                match install_secondary_range_sidecar(&seg_path, index_id, &entries) {
+                match install_secondary_range_sidecar(&seg_path, entry, &entries) {
                     Ok(()) => {}
                     Err(error) if is_not_found_io_error(&error) => {}
                     Err(error) => return Err(error),
@@ -1013,13 +1895,20 @@ fn build_secondary_range_sidecars_for_snapshot(
             }
             Err(error) if is_not_found_io_error(&error) => {}
             Err(_) => {
+                let Some(entry) = snapshot
+                    .secondary_indexes
+                    .iter()
+                    .find(|entry| entry.index_id == index_id)
+                else {
+                    continue;
+                };
                 let entries = build_secondary_range_entries_for_segment(
                     &segment,
-                    snapshot.type_id,
+                    snapshot.target_label_id,
                     &snapshot.prop_key,
                     snapshot.domain,
                 )?;
-                match install_secondary_range_sidecar(&seg_path, index_id, &entries) {
+                match install_secondary_range_sidecar(&seg_path, entry, &entries) {
                     Ok(()) => {}
                     Err(error) if is_not_found_io_error(&error) => {}
                     Err(error) => return Err(error),
@@ -1049,18 +1938,29 @@ fn validate_secondary_range_snapshot_coverage(
             all_present = false;
             continue;
         }
+        let Some(seg_info) = segment_info_for_id(&snapshot.segment_infos, segment_id) else {
+            all_present = false;
+            continue;
+        };
 
-        let segment =
-            match SegmentReader::open(&seg_path, segment_id, snapshot.dense_config.as_ref()) {
-                Ok(segment) => segment,
-                Err(error) if is_not_found_io_error(&error) => {
-                    all_present = false;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+        let segment = match SegmentReader::open_with_info(
+            &seg_path,
+            seg_info,
+            snapshot.dense_config.as_ref(),
+            &snapshot.secondary_indexes,
+        ) {
+            Ok(segment) => segment,
+            Err(error) if is_not_found_io_error(&error) => {
+                all_present = false;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
-        match segment.validate_secondary_range_sidecar(index_id) {
+        match segment.validate_secondary_range_sidecar_for_target(
+            index_id,
+            planner_stats_target_from_discriminant(snapshot.target),
+        ) {
             Ok(true) => {}
             Ok(false) => {
                 all_present = false;
@@ -1087,6 +1987,7 @@ fn finalize_secondary_range_build_snapshot(
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
+    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
     index_id: u64,
     snapshot: &SecondaryRangeBuildSnapshot,
     coverage: &SecondaryRangeCoverageStatus,
@@ -1100,6 +2001,8 @@ fn finalize_secondary_range_build_snapshot(
         next_node_id_seen,
         next_edge_id_seen,
         engine_seq_seen,
+        Some(label_catalog),
+        None,
         |manifest| {
             let Some(entry_pos) = manifest
                 .secondary_indexes
@@ -1165,6 +2068,7 @@ fn process_secondary_index_build(
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
+    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
     #[cfg(test)] build_pause: &Arc<Mutex<Option<SecondaryIndexBuildPauseHook>>>,
     index_id: u64,
     cancel: &AtomicBool,
@@ -1204,6 +2108,7 @@ fn process_secondary_index_build(
                 next_node_id_seen,
                 next_edge_id_seen,
                 engine_seq_seen,
+                label_catalog,
                 index_id,
                 &snapshot,
                 &coverage,
@@ -1232,6 +2137,7 @@ fn process_secondary_index_build(
                 next_node_id_seen,
                 next_edge_id_seen,
                 engine_seq_seen,
+                label_catalog,
                 index_id,
                 &snapshot,
                 &coverage,
@@ -1253,6 +2159,8 @@ struct TargetedStatsRefreshSnapshot {
     target_entry: SecondaryIndexManifestEntry,
     ready_indexes: Vec<SecondaryIndexManifestEntry>,
     segment_ids: Vec<u64>,
+    segment_infos: Vec<SegmentInfo>,
+    secondary_indexes: Vec<SecondaryIndexManifestEntry>,
 }
 
 fn load_targeted_stats_refresh_snapshot(
@@ -1286,6 +2194,13 @@ fn load_targeted_stats_refresh_snapshot(
     if segment_ids.is_empty() {
         return Ok(None);
     }
+    let mut segment_infos: Vec<_> = manifest
+        .segments
+        .iter()
+        .filter(|segment| snapshot_segment_ids.contains(&segment.id))
+        .cloned()
+        .collect();
+    segment_infos.sort_by_key(|segment| segment.id);
 
     let mut ready_indexes: Vec<_> = manifest
         .secondary_indexes
@@ -1299,6 +2214,8 @@ fn load_targeted_stats_refresh_snapshot(
         target_entry,
         ready_indexes,
         segment_ids,
+        segment_infos,
+        secondary_indexes: manifest.secondary_indexes.clone(),
     }))
 }
 
@@ -1323,10 +2240,16 @@ fn target_secondary_sidecar_is_valid(
     segment: &SegmentReader,
     ready: &SecondaryIndexReadyApplied,
 ) -> Result<bool, EngineError> {
+    let target = match &ready.target {
+        SecondaryIndexTarget::NodeProperty { .. } => PlannerStatsDeclaredIndexTarget::NodeProperty,
+        SecondaryIndexTarget::EdgeProperty { .. } => PlannerStatsDeclaredIndexTarget::EdgeProperty,
+    };
     match ready.kind {
-        SecondaryIndexKind::Equality => segment.validate_secondary_eq_sidecar(ready.index_id),
+        SecondaryIndexKind::Equality => {
+            segment.validate_secondary_eq_sidecar_for_target(ready.index_id, target)
+        }
         SecondaryIndexKind::Range { .. } => {
-            segment.validate_secondary_range_sidecar(ready.index_id)
+            segment.validate_secondary_range_sidecar_for_target(ready.index_id, target)
         }
     }
 }
@@ -1337,6 +2260,8 @@ fn refresh_ready_secondary_index_planner_stats(
     ready: &SecondaryIndexReadyApplied,
     cancel: &AtomicBool,
 ) -> Vec<(u64, Arc<SegmentReader>)> {
+    const TARGETED_STATS_REFRESH_MAX_ATTEMPTS: usize = 4;
+
     let Some(initial_snapshot) =
         load_targeted_stats_refresh_snapshot(db_dir, manifest_write_lock, ready)
             .ok()
@@ -1351,46 +2276,106 @@ fn refresh_ready_secondary_index_planner_stats(
             break;
         }
         let seg_dir = segment_dir(db_dir, segment_id);
-        let segment =
-            match SegmentReader::open(&seg_dir, segment_id, initial_snapshot.dense_config.as_ref())
-            {
-                Ok(segment) => segment,
-                Err(error) if is_not_found_io_error(&error) => continue,
-                Err(_) => continue,
-            };
+        let Some(initial_seg_info) =
+            segment_info_for_id(&initial_snapshot.segment_infos, segment_id)
+        else {
+            continue;
+        };
+        let segment = match SegmentReader::open_with_info(
+            &seg_dir,
+            initial_seg_info,
+            initial_snapshot.dense_config.as_ref(),
+            &initial_snapshot.secondary_indexes,
+        ) {
+            Ok(segment) => segment,
+            Err(error) if is_not_found_io_error(&error) => continue,
+            Err(_) => continue,
+        };
         match target_secondary_sidecar_is_valid(&segment, ready) {
             Ok(true) => {}
             Ok(false) | Err(_) => continue,
         }
 
-        let Some(snapshot) = targeted_refresh_snapshot_contains_segment(
-            db_dir,
-            manifest_write_lock,
-            ready,
-            segment_id,
-        )
-        .ok()
-        .flatten() else {
+        let mut latest_snapshot = None;
+        for _ in 0..TARGETED_STATS_REFRESH_MAX_ATTEMPTS {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(snapshot) = targeted_refresh_snapshot_contains_segment(
+                db_dir,
+                manifest_write_lock,
+                ready,
+                segment_id,
+            )
+            .ok()
+            .flatten() else {
+                latest_snapshot = None;
+                break;
+            };
+            let Some(seg_info) = segment_info_for_id(&snapshot.segment_infos, segment_id) else {
+                latest_snapshot = None;
+                break;
+            };
+            let latest_segment = match SegmentReader::open_with_info(
+                &seg_dir,
+                seg_info,
+                snapshot.dense_config.as_ref(),
+                &snapshot.secondary_indexes,
+            ) {
+                Ok(segment) => segment,
+                Err(error) if is_not_found_io_error(&error) => {
+                    latest_snapshot = None;
+                    break;
+                }
+                Err(_) => {
+                    latest_snapshot = None;
+                    break;
+                }
+            };
+            match target_secondary_sidecar_is_valid(&latest_segment, ready) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    latest_snapshot = None;
+                    break;
+                }
+            }
+            match write_targeted_secondary_index_planner_stats_sidecar(
+                &seg_dir,
+                &latest_segment,
+                &snapshot.target_entry,
+                &snapshot.ready_indexes,
+            ) {
+                Ok(_) => {
+                    latest_snapshot = Some(snapshot);
+                    break;
+                }
+                Err(error) if is_optional_component_publication_conflict(&error) => {
+                    latest_snapshot = Some(snapshot);
+                    continue;
+                }
+                Err(_) => {
+                    latest_snapshot = Some(snapshot);
+                    break;
+                }
+            }
+        }
+        let Some(snapshot) = latest_snapshot else {
             continue;
         };
-        match write_targeted_secondary_index_planner_stats_sidecar(
-            &seg_dir,
-            &segment,
-            &snapshot.target_entry,
-            &snapshot.ready_indexes,
-        ) {
-            Ok(PlannerStatsWriteOutcome::Written) => {}
-            Ok(PlannerStatsWriteOutcome::SkippedOversize)
-            | Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable)
-            | Err(_) => continue,
-        }
+        let Some(seg_info) = segment_info_for_id(&snapshot.segment_infos, segment_id) else {
+            continue;
+        };
 
-        let refreshed_reader =
-            match SegmentReader::open(&seg_dir, segment_id, snapshot.dense_config.as_ref()) {
-                Ok(reader) => reader,
-                Err(error) if is_not_found_io_error(&error) => continue,
-                Err(_) => continue,
-            };
+        let refreshed_reader = match SegmentReader::open_with_info(
+            &seg_dir,
+            seg_info,
+            snapshot.dense_config.as_ref(),
+            &snapshot.secondary_indexes,
+        ) {
+            Ok(reader) => reader,
+            Err(error) if is_not_found_io_error(&error) => continue,
+            Err(_) => continue,
+        };
         for entry in &snapshot.ready_indexes {
             refreshed_reader.warm_declared_index_runtime_coverage(entry);
         }
@@ -1404,7 +2389,7 @@ fn refresh_ready_secondary_index_planner_stats(
 
 fn process_secondary_index_drop_cleanup(
     db_dir: &Path,
-    index_id: u64,
+    entry: &SecondaryIndexManifestEntry,
     cancel: &AtomicBool,
 ) -> Result<(), EngineError> {
     let manifest = load_manifest_readonly(db_dir)?
@@ -1415,10 +2400,18 @@ fn process_secondary_index_drop_cleanup(
         }
 
         let seg_dir = segment_dir(db_dir, segment_info.id);
-        for sidecar_path in [
-            node_prop_eq_sidecar_path(&seg_dir, index_id),
-            node_prop_range_sidecar_path(&seg_dir, index_id),
-        ] {
+        let mut sidecar_paths = match remove_secondary_index_component_records(&seg_dir, entry) {
+            Ok(paths) => paths,
+            Err(error) if is_not_found_io_error(&error) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        sidecar_paths.extend(secondary_index_sidecar_paths_for_entry(&seg_dir, entry));
+
+        let mut seen_paths = HashSet::new();
+        for sidecar_path in sidecar_paths {
+            if !seen_paths.insert(sidecar_path.clone()) {
+                continue;
+            }
             if sidecar_path.exists() {
                 let _ = std::fs::remove_file(&sidecar_path);
                 if let Some(parent) = sidecar_path.parent() {
@@ -1426,6 +2419,7 @@ fn process_secondary_index_drop_cleanup(
                 }
             }
         }
+        cleanup_orphan_optional_component_files(&seg_dir);
     }
     Ok(())
 }
@@ -1442,6 +2436,7 @@ fn bg_secondary_index_worker(
     next_node_id_seen: Arc<AtomicU64>,
     next_edge_id_seen: Arc<AtomicU64>,
     engine_seq_seen: Arc<AtomicU64>,
+    label_catalog: Arc<RwLock<RuntimeLabelCatalog>>,
     #[cfg(test)] build_pause: Arc<Mutex<Option<SecondaryIndexBuildPauseHook>>>,
 ) {
     while let Ok(job) = rx.recv() {
@@ -1458,6 +2453,7 @@ fn bg_secondary_index_worker(
                     next_node_id_seen.as_ref(),
                     next_edge_id_seen.as_ref(),
                     engine_seq_seen.as_ref(),
+                    &label_catalog,
                     #[cfg(test)]
                     &build_pause,
                     index_id,
@@ -1473,6 +2469,7 @@ fn bg_secondary_index_worker(
                             next_node_id_seen.as_ref(),
                             next_edge_id_seen.as_ref(),
                             engine_seq_seen.as_ref(),
+                            &label_catalog,
                             index_id,
                             &error,
                         );
@@ -1498,8 +2495,8 @@ fn bg_secondary_index_worker(
                     }
                 }
             }
-            SecondaryIndexJob::DropCleanup { index_id } => {
-                let _ = process_secondary_index_drop_cleanup(&db_dir, index_id, &cancel);
+            SecondaryIndexJob::DropCleanup { entry } => {
+                let _ = process_secondary_index_drop_cleanup(&db_dir, &entry, &cancel);
             }
             SecondaryIndexJob::Shutdown => break,
         }
@@ -1548,6 +2545,11 @@ fn normalize_wal_op_for_write(
             normalized.sparse_vector = sparse_vector;
             Ok(WalOp::UpsertNode(normalized))
         }
+        WalOp::BeginAtomicBatch { .. } | WalOp::CommitAtomicBatch { .. } => {
+            Err(EngineError::InvalidOperation(
+                "WAL atomic batch markers are not write operations".into(),
+            ))
+        }
         _ => Ok(op.clone()),
     }
 }
@@ -1567,6 +2569,46 @@ fn normalize_wal_op_for_replay(
     })
 }
 
+fn validate_or_apply_replayed_label_token_op(
+    catalog: &mut RuntimeLabelCatalog,
+    op: &WalOp,
+    wal_generation_id: u64,
+) -> Result<(), EngineError> {
+    match op {
+        WalOp::EnsureNodeLabel { label, label_id } => {
+            catalog.apply_node_label(label.clone(), *label_id, Some(wal_generation_id))
+        }
+        WalOp::EnsureEdgeLabel { label, label_id } => {
+            catalog.apply_edge_label(label.clone(), *label_id, Some(wal_generation_id))
+        }
+        WalOp::UpsertNode(node) => {
+            for &label_id in node.label_ids.as_slice() {
+                if !catalog.node_id_to_label.contains_key(&label_id) {
+                    return Err(EngineError::CorruptWal(format!(
+                        "node record {} references missing node label label_id {}",
+                        node.id, label_id
+                    )));
+                }
+            }
+            Ok(())
+        }
+        WalOp::UpsertEdge(edge) => {
+            if catalog.edge_id_to_label.contains_key(&edge.label_id) {
+                Ok(())
+            } else {
+                Err(EngineError::CorruptWal(format!(
+                    "edge record {} references missing edge-label label_id {}",
+                    edge.id, edge.label_id
+                )))
+            }
+        }
+        WalOp::DeleteNode { .. } | WalOp::DeleteEdge { .. } => Ok(()),
+        WalOp::BeginAtomicBatch { .. } | WalOp::CommitAtomicBatch { .. } => Err(
+            EngineError::CorruptWal("WAL atomic batch marker reached normal replay apply".into()),
+        ),
+    }
+}
+
 /// Returns true if an edge is valid (not expired, not future) at the given reference time.
 /// Same predicate used by `neighbors()`. Extracted to prevent drift.
 #[inline]
@@ -1580,15 +2622,15 @@ fn is_edge_valid_at(valid_from: i64, valid_to: i64, reference_time: i64) -> bool
 /// Core prune-policy match: does a single (precomputed) policy match the given fields?
 /// AND within policy: all set criteria must match.
 fn matches_prune_cutoff(
-    type_id: u32,
+    label_ids: &NodeLabelSet,
     updated_at: i64,
     weight: f32,
     policy_age_cutoff: Option<i64>,
     policy_max_weight: Option<f32>,
-    policy_type_id: Option<u32>,
+    policy_label_id: Option<u32>,
 ) -> bool {
-    if let Some(tid) = policy_type_id {
-        if type_id != tid {
+    if let Some(label_id) = policy_label_id {
+        if !label_ids.contains(label_id) {
             return false;
         }
     }
@@ -1605,18 +2647,73 @@ fn matches_prune_cutoff(
     true
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedPrunePolicy {
+    max_age_ms: Option<i64>,
+    max_weight: Option<f32>,
+    label_id: Option<u32>,
+}
+
+fn public_prune_policy_from_resolved(
+    policy: &ResolvedPrunePolicy,
+    catalog: &RuntimeLabelCatalog,
+) -> Result<PrunePolicy, EngineError> {
+    let label = policy
+        .label_id
+        .map(|label_id| {
+            catalog
+                .node_id_to_label
+                .get(&label_id)
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::ManifestError(format!(
+                        "prune policy references missing node label_id {label_id}"
+                    ))
+                })
+        })
+        .transpose()?;
+    Ok(PrunePolicy {
+        max_age_ms: policy.max_age_ms,
+        max_weight: policy.max_weight,
+        label,
+    })
+}
+
+fn resolve_manifest_prune_policy(
+    policy: &PrunePolicy,
+    catalog: &RuntimeLabelCatalog,
+) -> Result<ResolvedPrunePolicy, EngineError> {
+    let label_id = policy
+        .label
+        .as_deref()
+        .map(|label| {
+            validate_label_token_name(label)?;
+            catalog.node_label_to_id.get(label).copied().ok_or_else(|| {
+                EngineError::ManifestError(format!(
+                    "prune policy references missing node label '{label}'"
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(ResolvedPrunePolicy {
+        max_age_ms: policy.max_age_ms,
+        max_weight: policy.max_weight,
+        label_id,
+    })
+}
+
 struct PrecomputedPruneCutoffs {
-    /// (age_cutoff, max_weight, type_id) per policy.
+    /// (age_cutoff, max_weight, label_id) per policy.
     policies: Vec<(Option<i64>, Option<f32>, Option<u32>)>,
 }
 
 impl PrecomputedPruneCutoffs {
-    fn from_policies(policies: &BTreeMap<String, PrunePolicy>, now: i64) -> Self {
+    fn from_policies(policies: &BTreeMap<String, ResolvedPrunePolicy>, now: i64) -> Self {
         let policies = policies
             .values()
             .map(|p| {
                 let age_cutoff = p.max_age_ms.map(|age| now - age);
-                (age_cutoff, p.max_weight, p.type_id)
+                (age_cutoff, p.max_weight, p.label_id)
             })
             .collect();
         Self { policies }
@@ -1624,18 +2721,18 @@ impl PrecomputedPruneCutoffs {
 
     /// Returns true if the node matches ANY registered policy (should be excluded).
     fn excludes(&self, node: &NodeRecord) -> bool {
-        self.excludes_fields(node.type_id, node.updated_at, node.weight)
+        self.excludes_fields(&node.label_ids, node.updated_at, node.weight)
     }
 
-    fn excludes_fields(&self, node_type_id: u32, updated_at: i64, weight: f32) -> bool {
-        for &(age_cutoff, max_weight, policy_type_id) in &self.policies {
+    fn excludes_fields(&self, label_ids: &NodeLabelSet, updated_at: i64, weight: f32) -> bool {
+        for &(age_cutoff, max_weight, policy_label_id) in &self.policies {
             if matches_prune_cutoff(
-                node_type_id,
+                label_ids,
                 updated_at,
                 weight,
                 age_cutoff,
                 max_weight,
-                policy_type_id,
+                policy_label_id,
             ) {
                 return true;
             }
@@ -1690,7 +2787,7 @@ fn is_cache_bypass_edge(valid_from: i64, valid_to: i64, created_at: i64) -> bool
 
 #[derive(Clone)]
 struct ReadManifestState {
-    prune_policies: BTreeMap<String, PrunePolicy>,
+    prune_policies: BTreeMap<String, ResolvedPrunePolicy>,
     dense_vector: Option<DenseVectorConfig>,
 }
 
@@ -1726,15 +2823,31 @@ pub(crate) struct QueryPlanningProbeSnapshot {
 #[cfg(test)]
 #[derive(Default)]
 struct QueryExecutionCounters {
+    node_record_hydration_reads: AtomicUsize,
+    node_visibility_meta_reads: AtomicUsize,
+    edge_record_hydration_reads: AtomicUsize,
+    edge_record_hydration_calls: AtomicUsize,
     equality_materialization_record_reads: AtomicUsize,
     final_verifier_record_reads: AtomicUsize,
+    edge_full_scan_pages: AtomicUsize,
+    endpoint_adjacency_candidates: AtomicUsize,
+    pattern_edge_pending_entries: AtomicUsize,
+    public_edge_query_calls: AtomicUsize,
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct QueryExecutionCounterSnapshot {
+    pub node_record_hydration_reads: usize,
+    pub node_visibility_meta_reads: usize,
+    pub edge_record_hydration_reads: usize,
+    pub edge_record_hydration_calls: usize,
     pub equality_materialization_record_reads: usize,
     pub final_verifier_record_reads: usize,
+    pub edge_full_scan_pages: usize,
+    pub endpoint_adjacency_candidates: usize,
+    pub pattern_edge_pending_entries: usize,
+    pub public_edge_query_calls: usize,
 }
 
 /// Published read-visible snapshot for CP1 point/dedup reads.
@@ -1743,12 +2856,14 @@ pub(crate) struct ReadView {
     sources: Arc<PublishedReadSources>,
     snapshot_seq: u64,
     active_degree_overlay: Arc<DegreeOverlaySnapshot>,
+    label_catalog: Arc<ReadLabelCatalogSnapshot>,
 }
 
 pub(crate) type ReadViewImmutableEpoch = ImmutableEpoch;
 
 struct PublishedReadState {
     view: Arc<ReadView>,
+    label_catalog: Arc<ReadLabelCatalogSnapshot>,
     edge_uniqueness: bool,
     #[cfg(test)]
     engine_seq: u64,
@@ -1760,6 +2875,7 @@ struct PublishedReadState {
 enum PublishImpact {
     NoPublish,
     SnapshotOnly,
+    SnapshotWithLabelCatalog,
     RebuildSources,
 }
 
@@ -1997,15 +3113,29 @@ pub(crate) struct DegreeQueryOutcome<T> {
 }
 
 enum CoreWriteRequest {
+    EnsureNodeLabel {
+        label: String,
+    },
+    EnsureEdgeLabel {
+        label: String,
+    },
     UpsertNode {
-        type_id: u32,
+        labels: Vec<String>,
         key: String,
         options: UpsertNodeOptions,
+    },
+    AddNodeLabel {
+        id: u64,
+        label: String,
+    },
+    RemoveNodeLabel {
+        id: u64,
+        label: String,
     },
     UpsertEdge {
         from: u64,
         to: u64,
-        type_id: u32,
+        label: String,
         options: UpsertEdgeOptions,
     },
     BatchUpsertNodes {
@@ -2049,12 +3179,22 @@ enum CoreWriteRequest {
         name: String,
     },
     EnsureNodePropertyIndex {
-        type_id: u32,
+        label: String,
         prop_key: String,
         kind: SecondaryIndexKind,
     },
     DropNodePropertyIndex {
-        type_id: u32,
+        label: String,
+        prop_key: String,
+        kind: SecondaryIndexKind,
+    },
+    EnsureEdgePropertyIndex {
+        label: String,
+        prop_key: String,
+        kind: SecondaryIndexKind,
+    },
+    DropEdgePropertyIndex {
+        label: String,
         prop_key: String,
         kind: SecondaryIndexKind,
     },
@@ -2069,6 +3209,7 @@ enum CoreWriteRequest {
 }
 
 enum CoreWriteReply {
+    U32(u32),
     U64(u64),
     VecU64(Vec<u64>),
     Unit,
@@ -2078,6 +3219,7 @@ enum CoreWriteReply {
     PruneResult(PruneResult),
     Bool(bool),
     NodePropertyIndexInfo(NodePropertyIndexInfo),
+    EdgePropertyIndexInfo(EdgePropertyIndexInfo),
     OptionSegmentInfo(Option<SegmentInfo>),
     OptionCompactionStats(Option<CompactionStats>),
 }
@@ -2087,6 +3229,7 @@ struct CoreWritePlan {
     reply: CoreWriteReply,
     auto_flush: bool,
     track_ids: bool,
+    label_catalog_changed: bool,
 }
 
 struct QueuedCoreWrite {
@@ -2423,7 +3566,7 @@ impl DbRuntime {
         core: &mut EngineCore,
         impact: PublishImpact,
         _apply_test_pause: bool,
-    ) {
+    ) -> Result<(), EngineError> {
         #[cfg(test)]
         match impact {
             PublishImpact::NoPublish => {
@@ -2431,7 +3574,7 @@ impl DbRuntime {
                     .skipped
                     .fetch_add(1, Ordering::Relaxed);
             }
-            PublishImpact::SnapshotOnly => {
+            PublishImpact::SnapshotOnly | PublishImpact::SnapshotWithLabelCatalog => {
                 self.publish_counters
                     .snapshot_only
                     .fetch_add(1, Ordering::Relaxed);
@@ -2448,7 +3591,7 @@ impl DbRuntime {
 
         if impact == PublishImpact::NoPublish {
             core.retry_deferred_segment_cleanup();
-            return;
+            return Ok(());
         }
 
         #[cfg(test)]
@@ -2460,14 +3603,22 @@ impl DbRuntime {
         }
 
         if impact == PublishImpact::RebuildSources {
-            core.rebuild_published_read_sources();
+            core.rebuild_published_read_sources()?;
         }
 
-        let published = Arc::new(core.published_read_state());
+        let label_catalog = match impact {
+            PublishImpact::SnapshotOnly => Arc::clone(&self.published.load_full().label_catalog),
+            PublishImpact::SnapshotWithLabelCatalog | PublishImpact::RebuildSources => {
+                core.read_label_catalog_snapshot()
+            }
+            PublishImpact::NoPublish => unreachable!("NoPublish returned before publish rebuild"),
+        };
+        let published = Arc::new(core.published_read_state_with_catalog(label_catalog));
         // Publish before releasing the core mutex so later writers cannot overtake
         // this committed snapshot and install an older view afterward.
         self.published.store(published);
         core.retry_deferred_segment_cleanup();
+        Ok(())
     }
 
     fn with_core_ref<T>(
@@ -2491,8 +3642,9 @@ impl DbRuntime {
 
         let result = f(core);
 
-        self.publish_locked(core, PublishImpact::RebuildSources, true);
+        let publish_result = self.publish_locked(core, PublishImpact::RebuildSources, true);
         drop(core_guard);
+        publish_result?;
         result
     }
 
@@ -2502,7 +3654,7 @@ impl DbRuntime {
             return;
         };
         core.manifest.secondary_indexes = core.secondary_index_entries_snapshot();
-        self.publish_locked(core, PublishImpact::RebuildSources, true);
+        let _ = self.publish_locked(core, PublishImpact::RebuildSources, true);
     }
 
     fn republish_secondary_index_state_and_refreshed_stats_if_open(
@@ -2523,11 +3675,19 @@ impl DbRuntime {
             .any(|entry| ready.matches_entry(entry));
         if ready_still_current {
             for (segment_id, reader) in refreshed_readers {
-                if !core
+                let Some(root_segment) = core
                     .manifest
                     .segments
                     .iter()
-                    .any(|segment| segment.id == segment_id)
+                    .find(|segment| segment.id == segment_id)
+                else {
+                    continue;
+                };
+                if root_segment.segment_data_id != reader.segment_data_id() {
+                    continue;
+                }
+                if root_segment.node_count != reader.node_count()
+                    || root_segment.edge_count != reader.edge_count()
                 {
                     continue;
                 }
@@ -2543,13 +3703,16 @@ impl DbRuntime {
                 };
                 if core.segments[position].node_count() == reader.node_count()
                     && core.segments[position].edge_count() == reader.edge_count()
+                    && core.segments[position].segment_data_id() == reader.segment_data_id()
+                    && core.segments[position].component_manifest_generation()
+                        <= reader.component_manifest_generation()
                 {
                     core.segments[position] = reader;
                 }
             }
         }
 
-        self.publish_locked(core, PublishImpact::RebuildSources, true);
+        let _ = self.publish_locked(core, PublishImpact::RebuildSources, true);
     }
 
     fn start_coordinator(self: &Arc<Self>) {
@@ -2713,6 +3876,8 @@ impl DbRuntime {
         let uses_write_backpressure = matches!(
             &command.request,
             CoreWriteRequest::UpsertNode { .. }
+                | CoreWriteRequest::AddNodeLabel { .. }
+                | CoreWriteRequest::RemoveNodeLabel { .. }
                 | CoreWriteRequest::UpsertEdge { .. }
                 | CoreWriteRequest::BatchUpsertNodes { .. }
                 | CoreWriteRequest::BatchUpsertEdges { .. }
@@ -2731,12 +3896,18 @@ impl DbRuntime {
             match backpressure_result {
                 Ok(BackpressureFlushAction::Ready) => {}
                 Ok(BackpressureFlushAction::Wait) => {
-                    self.publish_locked(core, publish_impact, true);
+                    if let Err(err) = self.publish_locked(core, publish_impact, true) {
+                        drop(core_guard);
+                        return QueuedWriteProgress::Complete {
+                            command,
+                            result: Err(err),
+                        };
+                    }
                     drop(core_guard);
                     return QueuedWriteProgress::WaitForLifecycle { command };
                 }
                 Err(err) => {
-                    self.publish_locked(core, publish_impact, true);
+                    let _ = self.publish_locked(core, publish_impact, true);
                     drop(core_guard);
                     return QueuedWriteProgress::Complete {
                         command,
@@ -2758,18 +3929,34 @@ impl DbRuntime {
                 Err(err) => (Err(err), PublishImpact::NoPublish),
             },
             CoreWriteRequest::EnsureNodePropertyIndex {
-                type_id,
+                label,
                 prop_key,
                 kind,
-            } => match core.ensure_node_property_index(*type_id, prop_key, kind.clone()) {
+            } => match core.ensure_node_property_index(label, prop_key, kind.clone()) {
                 Ok((info, impact)) => (Ok(CoreWriteReply::NodePropertyIndexInfo(info)), impact),
                 Err(err) => (Err(err), PublishImpact::NoPublish),
             },
             CoreWriteRequest::DropNodePropertyIndex {
-                type_id,
+                label,
                 prop_key,
                 kind,
-            } => match core.drop_node_property_index(*type_id, prop_key, kind.clone()) {
+            } => match core.drop_node_property_index(label, prop_key, kind.clone()) {
+                Ok((removed, impact)) => (Ok(CoreWriteReply::Bool(removed)), impact),
+                Err(err) => (Err(err), PublishImpact::NoPublish),
+            },
+            CoreWriteRequest::EnsureEdgePropertyIndex {
+                label,
+                prop_key,
+                kind,
+            } => match core.ensure_edge_property_index(label, prop_key, kind.clone()) {
+                Ok((info, impact)) => (Ok(CoreWriteReply::EdgePropertyIndexInfo(info)), impact),
+                Err(err) => (Err(err), PublishImpact::NoPublish),
+            },
+            CoreWriteRequest::DropEdgePropertyIndex {
+                label,
+                prop_key,
+                kind,
+            } => match core.drop_edge_property_index(label, prop_key, kind.clone()) {
                 Ok((removed, impact)) => (Ok(CoreWriteReply::Bool(removed)), impact),
                 Err(err) => (Err(err), PublishImpact::NoPublish),
             },
@@ -2792,8 +3979,13 @@ impl DbRuntime {
                 .unwrap_or_else(|err| (Err(err), PublishImpact::NoPublish)),
         };
         publish_impact = publish_impact.combine(request_publish_impact);
-        self.publish_locked(core, publish_impact, true);
+        let publish_result = self.publish_locked(core, publish_impact, true);
         drop(core_guard);
+        let result = match (result, publish_result) {
+            (Err(err), _) => Err(err),
+            (Ok(reply), Ok(())) => Ok(reply),
+            (Ok(_), Err(err)) => Err(err),
+        };
         QueuedWriteProgress::Complete { command, result }
     }
 
@@ -2827,7 +4019,7 @@ impl DbRuntime {
 
                 if core.immutable_epochs.is_empty() {
                     if mutated {
-                        self.publish_locked(core, PublishImpact::RebuildSources, true);
+                        self.publish_locked(core, PublishImpact::RebuildSources, true)?;
                     }
                     let result = core.current_flush_pipeline_error().map_or(Ok(None), Err);
                     drop(core_guard);
@@ -2837,14 +4029,14 @@ impl DbRuntime {
                 core.ensure_bg_flush_worker();
                 if let Err(error) = core.enqueue_all_non_in_flight() {
                     if mutated {
-                        self.publish_locked(core, PublishImpact::RebuildSources, true);
+                        self.publish_locked(core, PublishImpact::RebuildSources, true)?;
                     }
                     drop(core_guard);
                     return Err(error);
                 }
                 target_epoch = core.immutable_epochs.first().map(|epoch| epoch.epoch_id);
                 if mutated {
-                    self.publish_locked(core, PublishImpact::RebuildSources, true);
+                    self.publish_locked(core, PublishImpact::RebuildSources, true)?;
                 }
             } else if !core
                 .immutable_epochs
@@ -2875,7 +4067,7 @@ impl DbRuntime {
         if let Some(previous) = core.ingest_saved_compact_after_n_flushes.take() {
             core.compact_after_n_flushes = previous;
         }
-        self.publish_locked(core, PublishImpact::NoPublish, true);
+        self.publish_locked(core, PublishImpact::NoPublish, true)?;
         drop(core_guard);
         Ok(())
     }
@@ -2913,7 +4105,7 @@ impl DbRuntime {
             } else {
                 PublishImpact::NoPublish
             };
-            self.publish_locked(core, publish_impact, true);
+            self.publish_locked(core, publish_impact, true)?;
             drop(core_guard);
             return result;
         }
@@ -2943,7 +4135,7 @@ impl DbRuntime {
             } else {
                 PublishImpact::NoPublish
             });
-        self.publish_locked(core, publish_impact, false);
+        let _ = self.publish_locked(core, publish_impact, false);
         drop(core_guard);
 
         if progressed {
@@ -3058,7 +4250,7 @@ impl DbRuntime {
                 let err = core
                     .current_flush_pipeline_error()
                     .expect("flush pipeline error must be present");
-                self.publish_locked(core, PublishImpact::NoPublish, true);
+                self.publish_locked(core, PublishImpact::NoPublish, true)?;
                 drop(core_guard);
                 return Err(err);
             }
@@ -3190,6 +4382,7 @@ impl ReadView {
         sources: Arc<PublishedReadSources>,
         snapshot_seq: u64,
         active_degree_overlay: Arc<DegreeOverlaySnapshot>,
+        label_catalog: Arc<ReadLabelCatalogSnapshot>,
     ) -> Self {
         debug_assert!(
             sources.declared_index_runtime_coverage.entry_count()
@@ -3202,6 +4395,7 @@ impl ReadView {
             sources,
             snapshot_seq,
             active_degree_overlay,
+            label_catalog,
         }
     }
 
@@ -3229,6 +4423,30 @@ impl ReadView {
     }
 
     #[cfg(test)]
+    fn note_node_record_hydration_reads(&self, count: usize) {
+        self.query_execution_counters
+            .node_record_hydration_reads
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_node_visibility_meta_reads(&self, count: usize) {
+        self.query_execution_counters
+            .node_visibility_meta_reads
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_edge_record_hydration_reads(&self, count: usize) {
+        self.query_execution_counters
+            .edge_record_hydration_reads
+            .fetch_add(count, Ordering::Relaxed);
+        self.query_execution_counters
+            .edge_record_hydration_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     fn note_equality_materialization_record_reads(&self, count: usize) {
         self.query_execution_counters
             .equality_materialization_record_reads
@@ -3242,14 +4460,48 @@ impl ReadView {
             .fetch_add(count, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    fn note_edge_full_scan_page(&self) {
+        self.query_execution_counters
+            .edge_full_scan_pages
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_endpoint_adjacency_candidates(&self, count: usize) {
+        self.query_execution_counters
+            .endpoint_adjacency_candidates
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_pattern_edge_pending_entry(&self) {
+        self.query_execution_counters
+            .pattern_edge_pending_entries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn node_property_index_entry(
         &self,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         kind: &SecondaryIndexKind,
     ) -> Option<SecondaryIndexManifestEntry> {
         self.secondary_index_catalog
-            .get(&type_id)?
+            .get(&(SecondaryIndexTargetDiscriminant::Node, label_id))?
+            .get(prop_key)?
+            .get(kind)
+            .cloned()
+    }
+
+    fn edge_property_index_entry(
+        &self,
+        label_id: u32,
+        prop_key: &str,
+        kind: &SecondaryIndexKind,
+    ) -> Option<SecondaryIndexManifestEntry> {
+        self.secondary_index_catalog
+            .get(&(SecondaryIndexTargetDiscriminant::Edge, label_id))?
             .get(prop_key)?
             .get(kind)
             .cloned()
@@ -3274,16 +4526,20 @@ impl ReadView {
         self.sources().find_edge(id)
     }
 
-    fn get_node_by_key_raw(
+    fn get_node_by_label_key_raw(
         &self,
-        type_id: u32,
+        label_id: u32,
         key: &str,
     ) -> Result<Option<NodeRecord>, EngineError> {
-        self.sources().find_node_by_key(type_id, key)
+        self.sources().find_node_by_label_key(label_id, key)
     }
 
-    fn get_node_by_key(&self, type_id: u32, key: &str) -> Result<Option<NodeRecord>, EngineError> {
-        let node = match self.get_node_by_key_raw(type_id, key)? {
+    fn get_node_by_label_key(
+        &self,
+        label_id: u32,
+        key: &str,
+    ) -> Result<Option<NodeRecord>, EngineError> {
+        let node = match self.get_node_by_label_key_raw(label_id, key)? {
             Some(node) => node,
             None => return Ok(None),
         };
@@ -3297,12 +4553,14 @@ impl ReadView {
         &self,
         from: u64,
         to: u64,
-        type_id: u32,
+        label_id: u32,
     ) -> Result<Option<EdgeRecord>, EngineError> {
-        self.sources().find_edge_by_triple(from, to, type_id)
+        self.sources().find_edge_by_triple(from, to, label_id)
     }
 
     fn get_nodes_raw(&self, ids: &[u64]) -> Result<Vec<Option<NodeRecord>>, EngineError> {
+        #[cfg(test)]
+        self.note_node_record_hydration_reads(ids.len());
         self.sources().find_nodes(ids)
     }
 
@@ -3322,18 +4580,18 @@ impl ReadView {
         Ok(results)
     }
 
-    fn get_nodes_by_keys_raw(
+    fn get_nodes_by_label_keys_raw(
         &self,
         keys: &[(u32, &str)],
     ) -> Result<Vec<Option<NodeRecord>>, EngineError> {
-        self.sources().find_nodes_by_keys(keys)
+        self.sources().find_nodes_by_label_keys(keys)
     }
 
-    fn get_nodes_by_keys(
+    fn get_nodes_by_label_keys(
         &self,
         keys: &[(u32, &str)],
     ) -> Result<Vec<Option<NodeRecord>>, EngineError> {
-        let mut results = self.get_nodes_by_keys_raw(keys)?;
+        let mut results = self.get_nodes_by_label_keys_raw(keys)?;
         if !self.manifest.prune_policies.is_empty() {
             let cutoffs =
                 PrecomputedPruneCutoffs::from_policies(&self.manifest.prune_policies, now_millis());
@@ -3349,6 +4607,8 @@ impl ReadView {
     }
 
     fn get_edges(&self, ids: &[u64]) -> Result<Vec<Option<EdgeRecord>>, EngineError> {
+        #[cfg(test)]
+        self.note_edge_record_hydration_reads(ids.len());
         self.sources().find_edges(ids)
     }
 }
@@ -3367,28 +4627,28 @@ impl EngineCore {
         self.sources().find_edge(id)
     }
 
-    fn get_node_by_key_raw(
+    fn get_node_by_label_key_raw(
         &self,
-        type_id: u32,
+        label_id: u32,
         key: &str,
     ) -> Result<Option<NodeRecord>, EngineError> {
-        self.sources().find_node_by_key(type_id, key)
+        self.sources().find_node_by_label_key(label_id, key)
     }
 
-    fn get_nodes_by_keys_raw(
+    fn get_nodes_by_label_keys_raw(
         &self,
         keys: &[(u32, &str)],
     ) -> Result<Vec<Option<NodeRecord>>, EngineError> {
-        self.sources().find_nodes_by_keys(keys)
+        self.sources().find_nodes_by_label_keys(keys)
     }
 
     fn get_edge_by_triple(
         &self,
         from: u64,
         to: u64,
-        type_id: u32,
+        label_id: u32,
     ) -> Result<Option<EdgeRecord>, EngineError> {
-        self.sources().find_edge_by_triple(from, to, type_id)
+        self.sources().find_edge_by_triple(from, to, label_id)
     }
 
     fn get_nodes_raw(&self, ids: &[u64]) -> Result<Vec<Option<NodeRecord>>, EngineError> {
@@ -3399,8 +4659,8 @@ impl EngineCore {
         self.read_view().get_edges(ids)
     }
 
-    fn nodes_by_type_raw(&self, type_id: u32) -> Result<Vec<u64>, EngineError> {
-        self.read_view().nodes_by_type_raw(type_id)
+    fn nodes_by_label_id_raw(&self, label_id: u32) -> Result<Vec<u64>, EngineError> {
+        self.read_view().nodes_by_label_id_raw(label_id)
     }
 
     fn collect_tombstones(
@@ -3417,7 +4677,7 @@ impl EngineCore {
         &self,
         node_id: u64,
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         limit: usize,
         at_epoch: Option<i64>,
         decay_lambda: Option<f32>,
@@ -3425,11 +4685,11 @@ impl EngineCore {
             &HashSet<u64, NodeIdBuildHasher>,
             &HashSet<u64, NodeIdBuildHasher>,
         )>,
-    ) -> Result<Vec<NeighborEntry>, EngineError> {
+    ) -> Result<Vec<NeighborRecord>, EngineError> {
         self.read_view().neighbors_raw(
             node_id,
             direction,
-            type_filter,
+            label_filter_ids,
             limit,
             at_epoch,
             decay_lambda,
@@ -3477,6 +4737,8 @@ impl EngineCore {
             &self.next_node_id_seen,
             &self.next_edge_id_seen,
             &self.engine_seq_seen,
+            Some(&self.label_catalog),
+            self.checkpointable_wal_generation(),
             |manifest| {
                 if let Some(entry) = manifest
                     .secondary_indexes
@@ -3541,6 +4803,8 @@ impl EngineCore {
             &self.next_node_id_seen,
             &self.next_edge_id_seen,
             &self.engine_seq_seen,
+            Some(&self.label_catalog),
+            self.checkpointable_wal_generation(),
             |manifest| {
                 if let Some(entry) = manifest
                     .secondary_indexes
@@ -3595,16 +4859,135 @@ impl DatabaseEngine {
         self.runtime.close(true)
     }
 
-    pub fn upsert_node(
+    pub fn ensure_node_label(&self, label: &str) -> Result<u32, EngineError> {
+        match self
+            .runtime
+            .submit_core_write(CoreWriteRequest::EnsureNodeLabel {
+                label: label.to_string(),
+            })? {
+            CoreWriteReply::U32(label_id) => Ok(label_id),
+            _ => unreachable!("ensure_node_label must return a label id"),
+        }
+    }
+
+    pub fn ensure_edge_label(&self, label: &str) -> Result<u32, EngineError> {
+        match self
+            .runtime
+            .submit_core_write(CoreWriteRequest::EnsureEdgeLabel {
+                label: label.to_string(),
+            })? {
+            CoreWriteReply::U32(label_id) => Ok(label_id),
+            _ => unreachable!("ensure_edge_label must return a label id"),
+        }
+    }
+
+    pub fn get_node_label_id(&self, label: &str) -> Result<Option<u32>, EngineError> {
+        validate_label_token_name(label)?;
+        self.with_core_ref(|core| {
+            Ok(core
+                .label_catalog
+                .read()
+                .unwrap()
+                .node_label_to_id
+                .get(label)
+                .copied())
+        })
+    }
+
+    pub fn get_edge_label_id(&self, label: &str) -> Result<Option<u32>, EngineError> {
+        validate_label_token_name(label)?;
+        self.with_core_ref(|core| {
+            Ok(core
+                .label_catalog
+                .read()
+                .unwrap()
+                .edge_label_to_id
+                .get(label)
+                .copied())
+        })
+    }
+
+    pub fn get_node_label(&self, label_id: u32) -> Result<Option<String>, EngineError> {
+        self.with_core_ref(|core| {
+            Ok(core
+                .label_catalog
+                .read()
+                .unwrap()
+                .node_id_to_label
+                .get(&label_id)
+                .cloned())
+        })
+    }
+
+    pub fn get_edge_label(&self, label_id: u32) -> Result<Option<String>, EngineError> {
+        self.with_core_ref(|core| {
+            Ok(core
+                .label_catalog
+                .read()
+                .unwrap()
+                .edge_id_to_label
+                .get(&label_id)
+                .cloned())
+        })
+    }
+
+    pub fn list_node_labels(&self) -> Result<Vec<NodeLabelInfo>, EngineError> {
+        self.with_core_ref(|core| {
+            let mut labels: Vec<NodeLabelInfo> = core
+                .label_catalog
+                .read()
+                .unwrap()
+                .node_label_to_id
+                .iter()
+                .map(|(label, &label_id)| NodeLabelInfo {
+                    label: label.clone(),
+                    label_id,
+                })
+                .collect();
+            labels.sort_by(|a, b| {
+                a.label_id
+                    .cmp(&b.label_id)
+                    .then_with(|| a.label.cmp(&b.label))
+            });
+            Ok(labels)
+        })
+    }
+
+    pub fn list_edge_labels(&self) -> Result<Vec<EdgeLabelInfo>, EngineError> {
+        self.with_core_ref(|core| {
+            let mut edge_labels: Vec<EdgeLabelInfo> = core
+                .label_catalog
+                .read()
+                .unwrap()
+                .edge_label_to_id
+                .iter()
+                .map(|(label, &label_id)| EdgeLabelInfo {
+                    label: label.clone(),
+                    label_id,
+                })
+                .collect();
+            edge_labels.sort_by(|a, b| {
+                a.label_id
+                    .cmp(&b.label_id)
+                    .then_with(|| a.label.cmp(&b.label))
+            });
+            Ok(edge_labels)
+        })
+    }
+
+    pub fn upsert_node<L>(
         &self,
-        type_id: u32,
+        labels: L,
         key: &str,
         options: UpsertNodeOptions,
-    ) -> Result<u64, EngineError> {
+    ) -> Result<u64, EngineError>
+    where
+        L: IntoNodeLabels,
+    {
         match self
             .runtime
             .submit_core_write(CoreWriteRequest::UpsertNode {
-                type_id,
+                labels: labels.into_node_labels(),
                 key: key.to_string(),
                 options,
             })? {
@@ -3617,7 +5000,7 @@ impl DatabaseEngine {
         &self,
         from: u64,
         to: u64,
-        type_id: u32,
+        label: &str,
         options: UpsertEdgeOptions,
     ) -> Result<u64, EngineError> {
         match self
@@ -3625,7 +5008,7 @@ impl DatabaseEngine {
             .submit_core_write(CoreWriteRequest::UpsertEdge {
                 from,
                 to,
-                type_id,
+                label: label.to_string(),
                 options,
             })? {
             CoreWriteReply::U64(id) => Ok(id),
@@ -3633,23 +5016,45 @@ impl DatabaseEngine {
         }
     }
 
-    pub fn batch_upsert_nodes(&self, inputs: &[NodeInput]) -> Result<Vec<u64>, EngineError> {
+    pub fn add_node_label(&self, id: u64, label: &str) -> Result<bool, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::BatchUpsertNodes {
-                inputs: inputs.to_vec(),
+            .submit_core_write(CoreWriteRequest::AddNodeLabel {
+                id,
+                label: label.to_string(),
             })? {
+            CoreWriteReply::Bool(changed) => Ok(changed),
+            _ => unreachable!("add_node_label must return changed bool"),
+        }
+    }
+
+    pub fn remove_node_label(&self, id: u64, label: &str) -> Result<bool, EngineError> {
+        match self
+            .runtime
+            .submit_core_write(CoreWriteRequest::RemoveNodeLabel {
+                id,
+                label: label.to_string(),
+            })? {
+            CoreWriteReply::Bool(changed) => Ok(changed),
+            _ => unreachable!("remove_node_label must return changed bool"),
+        }
+    }
+
+    pub fn batch_upsert_nodes(&self, inputs: Vec<NodeInput>) -> Result<Vec<u64>, EngineError> {
+        match self
+            .runtime
+            .submit_core_write(CoreWriteRequest::BatchUpsertNodes { inputs })?
+        {
             CoreWriteReply::VecU64(ids) => Ok(ids),
             _ => unreachable!("batch_upsert_nodes must return node ids"),
         }
     }
 
-    pub fn batch_upsert_edges(&self, inputs: &[EdgeInput]) -> Result<Vec<u64>, EngineError> {
+    pub fn batch_upsert_edges(&self, inputs: Vec<EdgeInput>) -> Result<Vec<u64>, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::BatchUpsertEdges {
-                inputs: inputs.to_vec(),
-            })? {
+            .submit_core_write(CoreWriteRequest::BatchUpsertEdges { inputs })?
+        {
             CoreWriteReply::VecU64(ids) => Ok(ids),
             _ => unreachable!("batch_upsert_edges must return edge ids"),
         }
@@ -3675,26 +5080,24 @@ impl DatabaseEngine {
         }
     }
 
-    pub fn invalidate_edge(
-        &self,
-        id: u64,
-        valid_to: i64,
-    ) -> Result<Option<EdgeRecord>, EngineError> {
-        match self
+    pub fn invalidate_edge(&self, id: u64, valid_to: i64) -> Result<Option<EdgeView>, EngineError> {
+        let edge = match self
             .runtime
             .submit_core_write(CoreWriteRequest::InvalidateEdge { id, valid_to })?
         {
-            CoreWriteReply::OptionEdge(edge) => Ok(edge),
+            CoreWriteReply::OptionEdge(edge) => edge,
             _ => unreachable!("invalidate_edge must return an optional edge"),
-        }
+        };
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        edge.map(|edge| edge_view_from_record(edge, published.label_catalog.as_ref()))
+            .transpose()
     }
 
-    pub fn graph_patch(&self, patch: &GraphPatch) -> Result<PatchResult, EngineError> {
+    pub fn graph_patch(&self, patch: GraphPatch) -> Result<PatchResult, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::GraphPatch {
-                patch: patch.clone(),
-            })? {
+            .submit_core_write(CoreWriteRequest::GraphPatch { patch })?
+        {
             CoreWriteReply::PatchResult(result) => Ok(result),
             _ => unreachable!("graph_patch must return patch results"),
         }
@@ -3732,20 +5135,20 @@ impl DatabaseEngine {
         }
     }
 
-    pub fn list_prune_policies(&self) -> Result<Vec<(String, PrunePolicy)>, EngineError> {
-        self.with_core_ref(|core| Ok(core.list_prune_policies()))
+    pub fn list_prune_policies(&self) -> Result<Vec<PrunePolicyInfo>, EngineError> {
+        self.with_core_ref(|core| core.list_prune_policies())
     }
 
     pub fn ensure_node_property_index(
         &self,
-        type_id: u32,
+        label: &str,
         prop_key: &str,
         kind: SecondaryIndexKind,
     ) -> Result<NodePropertyIndexInfo, EngineError> {
         match self
             .runtime
             .submit_core_write(CoreWriteRequest::EnsureNodePropertyIndex {
-                type_id,
+                label: label.to_string(),
                 prop_key: prop_key.to_string(),
                 kind,
             })? {
@@ -3756,14 +5159,14 @@ impl DatabaseEngine {
 
     pub fn drop_node_property_index(
         &self,
-        type_id: u32,
+        label: &str,
         prop_key: &str,
         kind: SecondaryIndexKind,
     ) -> Result<bool, EngineError> {
         match self
             .runtime
             .submit_core_write(CoreWriteRequest::DropNodePropertyIndex {
-                type_id,
+                label: label.to_string(),
                 prop_key: prop_key.to_string(),
                 kind,
             })? {
@@ -3774,67 +5177,213 @@ impl DatabaseEngine {
 
     pub fn list_node_property_indexes(&self) -> Result<Vec<NodePropertyIndexInfo>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        let mut indexes: Vec<NodePropertyIndexInfo> = published
+        let catalog = published.label_catalog.as_ref();
+        let mut entries: Vec<&SecondaryIndexManifestEntry> = published
             .view
             .secondary_index_entries
             .iter()
-            .map(EngineCore::node_property_index_info)
+            .filter(|e| matches!(&e.target, SecondaryIndexTarget::NodeProperty { .. }))
             .collect();
-        indexes.sort_unstable_by(|left, right| {
-            left.type_id
-                .cmp(&right.type_id)
-                .then_with(|| left.prop_key.cmp(&right.prop_key))
-                .then_with(|| format!("{:?}", left.kind).cmp(&format!("{:?}", right.kind)))
+        entries.sort_unstable_by(|left, right| {
+            secondary_index_target_label_id(&left.target)
+                .cmp(&secondary_index_target_label_id(&right.target))
+                .then_with(|| {
+                    secondary_index_target_prop_key(&left.target)
+                        .cmp(secondary_index_target_prop_key(&right.target))
+                })
+                .then_with(|| {
+                    secondary_index_kind_rank(&left.kind)
+                        .cmp(&secondary_index_kind_rank(&right.kind))
+                })
                 .then_with(|| left.index_id.cmp(&right.index_id))
         });
-        Ok(indexes)
+        entries
+            .into_iter()
+            .map(|entry| EngineCore::node_property_index_info(entry, catalog))
+            .collect()
     }
 
-    pub fn get_node(&self, id: u64) -> Result<Option<NodeRecord>, EngineError> {
-        let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_node(id)
-    }
-
-    pub fn get_edge(&self, id: u64) -> Result<Option<EdgeRecord>, EngineError> {
-        let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_edge(id)
-    }
-
-    pub fn get_node_by_key(
+    pub fn ensure_edge_property_index(
         &self,
-        type_id: u32,
-        key: &str,
-    ) -> Result<Option<NodeRecord>, EngineError> {
+        label: &str,
+        prop_key: &str,
+        kind: SecondaryIndexKind,
+    ) -> Result<EdgePropertyIndexInfo, EngineError> {
+        match self
+            .runtime
+            .submit_core_write(CoreWriteRequest::EnsureEdgePropertyIndex {
+                label: label.to_string(),
+                prop_key: prop_key.to_string(),
+                kind,
+            })? {
+            CoreWriteReply::EdgePropertyIndexInfo(info) => Ok(info),
+            _ => unreachable!("ensure_edge_property_index must return index info"),
+        }
+    }
+
+    pub fn drop_edge_property_index(
+        &self,
+        label: &str,
+        prop_key: &str,
+        kind: SecondaryIndexKind,
+    ) -> Result<bool, EngineError> {
+        match self
+            .runtime
+            .submit_core_write(CoreWriteRequest::DropEdgePropertyIndex {
+                label: label.to_string(),
+                prop_key: prop_key.to_string(),
+                kind,
+            })? {
+            CoreWriteReply::Bool(dropped) => Ok(dropped),
+            _ => unreachable!("drop_edge_property_index must return bool"),
+        }
+    }
+
+    pub fn list_edge_property_indexes(&self) -> Result<Vec<EdgePropertyIndexInfo>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_node_by_key(type_id, key)
+        let catalog = published.label_catalog.as_ref();
+        let mut entries: Vec<&SecondaryIndexManifestEntry> = published
+            .view
+            .secondary_index_entries
+            .iter()
+            .filter(|e| matches!(&e.target, SecondaryIndexTarget::EdgeProperty { .. }))
+            .collect();
+        entries.sort_unstable_by(|left, right| {
+            secondary_index_target_label_id(&left.target)
+                .cmp(&secondary_index_target_label_id(&right.target))
+                .then_with(|| {
+                    secondary_index_target_prop_key(&left.target)
+                        .cmp(secondary_index_target_prop_key(&right.target))
+                })
+                .then_with(|| {
+                    secondary_index_kind_rank(&left.kind)
+                        .cmp(&secondary_index_kind_rank(&right.kind))
+                })
+                .then_with(|| left.index_id.cmp(&right.index_id))
+        });
+        entries
+            .into_iter()
+            .map(|entry| EngineCore::edge_property_index_info(entry, catalog))
+            .collect()
+    }
+
+    pub fn get_node(&self, id: u64) -> Result<Option<NodeView>, EngineError> {
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        let node = published.view.get_node(id)?;
+        node.map(|node| node_view_from_record(node, published.label_catalog.as_ref()))
+            .transpose()
+    }
+
+    pub fn get_edge(&self, id: u64) -> Result<Option<EdgeView>, EngineError> {
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        let edge = published.view.get_edge(id)?;
+        edge.map(|edge| edge_view_from_record(edge, published.label_catalog.as_ref()))
+            .transpose()
+    }
+
+    pub fn get_node_by_key(&self, label: &str, key: &str) -> Result<Option<NodeView>, EngineError> {
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        validate_label_token_name(label)?;
+        let Some(label_id) = published.label_catalog.resolve_node_label_for_read(label)? else {
+            return Ok(None);
+        };
+        let node = published.view.get_node_by_label_key(label_id, key)?;
+        node.map(|node| {
+            node_view_from_record_with_resolved_label(
+                node,
+                label_id,
+                published.label_catalog.as_ref(),
+            )
+        })
+        .transpose()
     }
 
     pub fn get_edge_by_triple(
         &self,
         from: u64,
         to: u64,
-        type_id: u32,
-    ) -> Result<Option<EdgeRecord>, EngineError> {
+        label: &str,
+    ) -> Result<Option<EdgeView>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_edge_by_triple(from, to, type_id)
+        validate_label_token_name(label)?;
+        let Some(label_id) = published.label_catalog.resolve_edge_label_for_read(label)? else {
+            return Ok(None);
+        };
+        let edge = published.view.get_edge_by_triple(from, to, label_id)?;
+        edge.map(|edge| {
+            edge_view_from_record_with_resolved_label(edge, label_id, label.to_string())
+        })
+        .transpose()
     }
 
-    pub fn get_nodes(&self, ids: &[u64]) -> Result<Vec<Option<NodeRecord>>, EngineError> {
+    pub fn get_nodes(&self, ids: &[u64]) -> Result<Vec<Option<NodeView>>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_nodes(ids)
+        let nodes = published.view.get_nodes(ids)?;
+        nodes
+            .into_iter()
+            .map(|node| {
+                node.map(|node| node_view_from_record(node, published.label_catalog.as_ref()))
+                    .transpose()
+            })
+            .collect()
     }
 
     pub fn get_nodes_by_keys(
         &self,
-        keys: &[(u32, &str)],
-    ) -> Result<Vec<Option<NodeRecord>>, EngineError> {
+        keys: &[NodeKeyQuery],
+    ) -> Result<Vec<Option<NodeView>>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_nodes_by_keys(keys)
+        let mut label_ids: BTreeMap<&str, Option<u32>> = BTreeMap::new();
+        for query in keys {
+            validate_label_token_name(&query.label)?;
+            let label = query.label.as_str();
+            if !label_ids.contains_key(label) {
+                let label_id = published.label_catalog.resolve_node_label_for_read(label)?;
+                label_ids.insert(label, label_id);
+            }
+        }
+
+        let mut resolved = Vec::new();
+        let mut positions = Vec::new();
+        for (idx, query) in keys.iter().enumerate() {
+            if let Some(label_id) = label_ids
+                .get(query.label.as_str())
+                .copied()
+                .expect("label was validated and resolved in first pass")
+            {
+                positions.push((idx, label_id));
+                resolved.push((label_id, query.key.as_str()));
+            }
+        }
+        let mut output = vec![None; keys.len()];
+        if resolved.is_empty() {
+            return Ok(output);
+        }
+        let nodes = published.view.get_nodes_by_label_keys(&resolved)?;
+        for ((idx, label_id), node) in positions.into_iter().zip(nodes) {
+            output[idx] = node
+                .map(|node| {
+                    node_view_from_record_with_resolved_label(
+                        node,
+                        label_id,
+                        published.label_catalog.as_ref(),
+                    )
+                })
+                .transpose()?;
+        }
+        Ok(output)
     }
 
-    pub fn get_edges(&self, ids: &[u64]) -> Result<Vec<Option<EdgeRecord>>, EngineError> {
+    pub fn get_edges(&self, ids: &[u64]) -> Result<Vec<Option<EdgeView>>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_edges(ids)
+        let edges = published.view.get_edges(ids)?;
+        edges
+            .into_iter()
+            .map(|edge| {
+                edge.map(|edge| edge_view_from_record(edge, published.label_catalog.as_ref()))
+                    .transpose()
+            })
+            .collect()
     }
 
     pub fn vector_search(
@@ -3845,82 +5394,255 @@ impl DatabaseEngine {
         published.view.vector_search(request)
     }
 
-    pub fn nodes_by_type(&self, type_id: u32) -> Result<Vec<u64>, EngineError> {
+    pub fn edges_by_label(&self, label: &str) -> Result<Vec<u64>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.nodes_by_type(type_id)
+        let label_id = published.label_catalog.resolve_edge_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            return Ok(Vec::new());
+        };
+        published.view.edges_by_label_id(label_id)
     }
 
-    pub fn edges_by_type(&self, type_id: u32) -> Result<Vec<u64>, EngineError> {
+    pub fn get_edges_by_label(&self, label: &str) -> Result<Vec<EdgeView>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.edges_by_type(type_id)
+        let label_id = published.label_catalog.resolve_edge_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            return Ok(Vec::new());
+        };
+        let label = label.to_string();
+        published
+            .view
+            .get_edges_by_label_id(label_id)?
+            .into_iter()
+            .map(|edge| edge_view_from_record_with_resolved_label(edge, label_id, label.clone()))
+            .collect()
     }
 
-    pub fn get_nodes_by_type(&self, type_id: u32) -> Result<Vec<NodeRecord>, EngineError> {
-        let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_nodes_by_type(type_id)
+    pub fn nodes_by_labels<L>(&self, labels: L) -> Result<Vec<u64>, EngineError>
+    where
+        L: IntoNodeLabels,
+    {
+        let labels = labels.into_node_labels();
+        validate_public_node_label_list(labels.iter().map(String::as_str))?;
+        if let [label] = labels.as_slice() {
+            let (_guard, published) = self.runtime.published_snapshot()?;
+            let Some(label_id) = published.label_catalog.resolve_node_label_for_read(label)? else {
+                return Ok(Vec::new());
+            };
+            return published.view.nodes_by_label_id(label_id);
+        }
+        Ok(self
+            .query_node_ids(&NodeQuery {
+                label_filter: Some(NodeLabelFilter {
+                    labels,
+                    mode: LabelMatchMode::All,
+                }),
+                ..Default::default()
+            })?
+            .items)
     }
 
-    pub fn get_edges_by_type(&self, type_id: u32) -> Result<Vec<EdgeRecord>, EngineError> {
-        let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_edges_by_type(type_id)
+    pub fn get_nodes_by_labels<L>(&self, labels: L) -> Result<Vec<NodeView>, EngineError>
+    where
+        L: IntoNodeLabels,
+    {
+        let labels = labels.into_node_labels();
+        validate_public_node_label_list(labels.iter().map(String::as_str))?;
+        if let [label] = labels.as_slice() {
+            let (_guard, published) = self.runtime.published_snapshot()?;
+            let Some(label_id) = published.label_catalog.resolve_node_label_for_read(label)? else {
+                return Ok(Vec::new());
+            };
+            return published
+                .view
+                .get_nodes_by_label_id(label_id)?
+                .into_iter()
+                .map(|node| {
+                    node_view_from_record_with_resolved_label(
+                        node,
+                        label_id,
+                        published.label_catalog.as_ref(),
+                    )
+                })
+                .collect();
+        }
+        Ok(self
+            .query_nodes(&NodeQuery {
+                label_filter: Some(NodeLabelFilter {
+                    labels,
+                    mode: LabelMatchMode::All,
+                }),
+                ..Default::default()
+            })?
+            .items)
     }
 
-    pub fn count_nodes_by_type(&self, type_id: u32) -> Result<u64, EngineError> {
+    pub fn count_nodes_by_labels<L>(&self, labels: L) -> Result<u64, EngineError>
+    where
+        L: IntoNodeLabels,
+    {
+        let labels = labels.into_node_labels();
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.count_nodes_by_type(type_id)
+        let filter = NodeLabelFilter {
+            labels,
+            mode: LabelMatchMode::All,
+        };
+        let resolved = published
+            .label_catalog
+            .resolve_node_label_filter_request(Some(&filter))?;
+        published
+            .view
+            .count_nodes_by_resolved_label_filter(&resolved)
     }
 
-    pub fn count_edges_by_type(&self, type_id: u32) -> Result<u64, EngineError> {
+    pub fn count_edges_by_label(&self, label: &str) -> Result<u64, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.count_edges_by_type(type_id)
+        let label_id = published.label_catalog.resolve_edge_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            return Ok(0);
+        };
+        published.view.count_edges_by_label_id(label_id)
     }
 
-    pub fn nodes_by_type_paged(
+    pub fn nodes_by_labels_paged<L>(
         &self,
-        type_id: u32,
+        labels: L,
+        page: &PageRequest,
+    ) -> Result<PageResult<u64>, EngineError>
+    where
+        L: IntoNodeLabels,
+    {
+        let labels = labels.into_node_labels();
+        validate_public_node_label_list(labels.iter().map(String::as_str))?;
+        if let [label] = labels.as_slice() {
+            let (_guard, published) = self.runtime.published_snapshot()?;
+            let Some(label_id) = published.label_catalog.resolve_node_label_for_read(label)? else {
+                return Ok(PageResult {
+                    items: Vec::new(),
+                    next_cursor: None,
+                });
+            };
+            return published.view.nodes_by_label_id_paged(label_id, page);
+        }
+        let result = self.query_node_ids(&NodeQuery {
+            label_filter: Some(NodeLabelFilter {
+                labels,
+                mode: LabelMatchMode::All,
+            }),
+            page: page.clone(),
+            ..Default::default()
+        })?;
+        Ok(PageResult {
+            items: result.items,
+            next_cursor: result.next_cursor,
+        })
+    }
+
+    pub fn get_nodes_by_labels_paged<L>(
+        &self,
+        labels: L,
+        page: &PageRequest,
+    ) -> Result<PageResult<NodeView>, EngineError>
+    where
+        L: IntoNodeLabels,
+    {
+        let labels = labels.into_node_labels();
+        validate_public_node_label_list(labels.iter().map(String::as_str))?;
+        if let [label] = labels.as_slice() {
+            let (_guard, published) = self.runtime.published_snapshot()?;
+            let Some(label_id) = published.label_catalog.resolve_node_label_for_read(label)? else {
+                return Ok(PageResult {
+                    items: Vec::new(),
+                    next_cursor: None,
+                });
+            };
+            let page = published.view.get_nodes_by_label_id_paged(label_id, page)?;
+            let items = page
+                .items
+                .into_iter()
+                .map(|node| {
+                    node_view_from_record_with_resolved_label(
+                        node,
+                        label_id,
+                        published.label_catalog.as_ref(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(PageResult {
+                items,
+                next_cursor: page.next_cursor,
+            });
+        }
+        let result = self.query_nodes(&NodeQuery {
+            label_filter: Some(NodeLabelFilter {
+                labels,
+                mode: LabelMatchMode::All,
+            }),
+            page: page.clone(),
+            ..Default::default()
+        })?;
+        Ok(PageResult {
+            items: result.items,
+            next_cursor: result.next_cursor,
+        })
+    }
+
+    pub fn edges_by_label_paged(
+        &self,
+        label: &str,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.nodes_by_type_paged(type_id, page)
+        let label_id = published.label_catalog.resolve_edge_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            return Ok(PageResult {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        };
+        published.view.edges_by_label_id_paged(label_id, page)
     }
 
-    pub fn edges_by_type_paged(
+    pub fn get_edges_by_label_paged(
         &self,
-        type_id: u32,
+        label: &str,
         page: &PageRequest,
-    ) -> Result<PageResult<u64>, EngineError> {
+    ) -> Result<PageResult<EdgeView>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.edges_by_type_paged(type_id, page)
-    }
-
-    pub fn get_nodes_by_type_paged(
-        &self,
-        type_id: u32,
-        page: &PageRequest,
-    ) -> Result<PageResult<NodeRecord>, EngineError> {
-        let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_nodes_by_type_paged(type_id, page)
-    }
-
-    pub fn get_edges_by_type_paged(
-        &self,
-        type_id: u32,
-        page: &PageRequest,
-    ) -> Result<PageResult<EdgeRecord>, EngineError> {
-        let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.get_edges_by_type_paged(type_id, page)
+        let label_id = published.label_catalog.resolve_edge_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            return Ok(PageResult {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        };
+        let label = label.to_string();
+        let page = published.view.get_edges_by_label_id_paged(label_id, page)?;
+        let items = page
+            .items
+            .into_iter()
+            .map(|edge| edge_view_from_record_with_resolved_label(edge, label_id, label.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PageResult {
+            items,
+            next_cursor: page.next_cursor,
+        })
     }
 
     pub fn find_nodes(
         &self,
-        type_id: u32,
+        label: &str,
         prop_key: &str,
         prop_value: &PropValue,
     ) -> Result<Vec<u64>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
+        let label_id = published.label_catalog.resolve_node_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            return Ok(Vec::new());
+        };
         let outcome = published
             .view
-            .find_nodes_outcome(type_id, prop_key, prop_value)?;
+            .find_nodes_outcome(label_id, prop_key, prop_value)?;
         self.runtime.record_property_query_route(outcome.route);
         if let Some(followup) = outcome.followup {
             self.runtime.enqueue_secondary_index_read_followup(followup);
@@ -3930,15 +5652,22 @@ impl DatabaseEngine {
 
     pub fn find_nodes_paged(
         &self,
-        type_id: u32,
+        label: &str,
         prop_key: &str,
         prop_value: &PropValue,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
+        let label_id = published.label_catalog.resolve_node_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            return Ok(PageResult {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        };
         let outcome = published
             .view
-            .find_nodes_paged_outcome(type_id, prop_key, prop_value, page)?;
+            .find_nodes_paged_outcome(label_id, prop_key, prop_value, page)?;
         self.runtime.record_property_query_route(outcome.route);
         if let Some(followup) = outcome.followup {
             self.runtime.enqueue_secondary_index_read_followup(followup);
@@ -3948,14 +5677,19 @@ impl DatabaseEngine {
 
     pub fn find_nodes_range(
         &self,
-        type_id: u32,
+        label: &str,
         prop_key: &str,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
     ) -> Result<Vec<u64>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
+        let label_id = published.label_catalog.resolve_node_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            ReadView::validate_property_range_bounds(lower, upper, None)?;
+            return Ok(Vec::new());
+        };
         let outcome = published.view.find_nodes_range_paged_outcome(
-            type_id,
+            label_id,
             prop_key,
             lower,
             upper,
@@ -3970,16 +5704,24 @@ impl DatabaseEngine {
 
     pub fn find_nodes_range_paged(
         &self,
-        type_id: u32,
+        label: &str,
         prop_key: &str,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         page: &PropertyRangePageRequest,
     ) -> Result<PropertyRangePageResult<u64>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
+        let label_id = published.label_catalog.resolve_node_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            ReadView::validate_property_range_bounds(lower, upper, page.after.as_ref())?;
+            return Ok(PropertyRangePageResult {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        };
         let outcome = published
             .view
-            .find_nodes_range_paged_outcome(type_id, prop_key, lower, upper, page)?;
+            .find_nodes_range_paged_outcome(label_id, prop_key, lower, upper, page)?;
         self.runtime.record_property_query_route(outcome.route);
         if let Some(followup) = outcome.followup {
             self.runtime.enqueue_secondary_index_read_followup(followup);
@@ -3989,27 +5731,38 @@ impl DatabaseEngine {
 
     pub fn find_nodes_by_time_range(
         &self,
-        type_id: u32,
+        label: &str,
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Vec<u64>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
+        let label_id = published.label_catalog.resolve_node_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            return Ok(Vec::new());
+        };
         published
             .view
-            .find_nodes_by_time_range(type_id, from_ms, to_ms)
+            .find_nodes_by_time_range(label_id, from_ms, to_ms)
     }
 
     pub fn find_nodes_by_time_range_paged(
         &self,
-        type_id: u32,
+        label: &str,
         from_ms: i64,
         to_ms: i64,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
+        let label_id = published.label_catalog.resolve_node_label_for_read(label)?;
+        let Some(label_id) = label_id else {
+            return Ok(PageResult {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        };
         published
             .view
-            .find_nodes_by_time_range_paged(type_id, from_ms, to_ms, page)
+            .find_nodes_by_time_range_paged(label_id, from_ms, to_ms, page)
     }
 
     pub fn personalized_pagerank(
@@ -4115,7 +5868,11 @@ impl DatabaseEngine {
         options: &NeighborOptions,
     ) -> Result<Vec<NeighborEntry>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.neighbors(node_id, options)
+        let entries = published.view.neighbors(node_id, options)?;
+        entries
+            .into_iter()
+            .map(|entry| neighbor_entry_from_record(entry, published.label_catalog.as_ref()))
+            .collect()
     }
 
     pub fn neighbors_batch(
@@ -4124,7 +5881,17 @@ impl DatabaseEngine {
         options: &NeighborOptions,
     ) -> Result<NodeIdMap<Vec<NeighborEntry>>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.neighbors_batch(node_ids, options)
+        let batch = published.view.neighbors_batch(node_ids, options)?;
+        let mut output =
+            NodeIdMap::with_capacity_and_hasher(batch.len(), NodeIdBuildHasher::default());
+        for (node_id, entries) in batch {
+            let entries = entries
+                .into_iter()
+                .map(|entry| neighbor_entry_from_record(entry, published.label_catalog.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?;
+            output.insert(node_id, entries);
+        }
+        Ok(output)
     }
 
     pub fn neighbors_paged(
@@ -4134,7 +5901,16 @@ impl DatabaseEngine {
         page: &PageRequest,
     ) -> Result<PageResult<NeighborEntry>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.neighbors_paged(node_id, options, page)
+        let page = published.view.neighbors_paged(node_id, options, page)?;
+        let items = page
+            .items
+            .into_iter()
+            .map(|entry| neighbor_entry_from_record(entry, published.label_catalog.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PageResult {
+            items,
+            next_cursor: page.next_cursor,
+        })
     }
 
     pub fn top_k_neighbors(
@@ -4144,7 +5920,11 @@ impl DatabaseEngine {
         options: &TopKOptions,
     ) -> Result<Vec<NeighborEntry>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
-        published.view.top_k_neighbors(node_id, k, options)
+        let entries = published.view.top_k_neighbors(node_id, k, options)?;
+        entries
+            .into_iter()
+            .map(|entry| neighbor_entry_from_record(entry, published.label_catalog.as_ref()))
+            .collect()
     }
 
     pub fn extract_subgraph(
@@ -4230,6 +6010,11 @@ impl DatabaseEngine {
         self.with_core_ref(|core| Ok(core.stats()))
     }
 
+    pub fn scrub(&self) -> Result<ScrubReport, EngineError> {
+        let manifest = self.manifest()?;
+        crate::scrub::scrub_database(self.path(), &manifest)
+    }
+
     #[cfg(test)]
     pub(crate) fn write_op(&self, op: &WalOp) -> Result<(), EngineError> {
         match self
@@ -4256,6 +6041,11 @@ impl DatabaseEngine {
         self.runtime.path()
     }
 
+    /// Return a raw manifest snapshot for diagnostics.
+    ///
+    /// This is an explicit introspection exception: the returned manifest may
+    /// contain internal numeric token IDs and storage metadata. Ordinary public
+    /// graph APIs use node labels and edge-label names instead.
     pub fn manifest(&self) -> Result<ManifestState, EngineError> {
         self.with_core_ref(|core| {
             let mut manifest = core.manifest.clone();
@@ -4265,6 +6055,7 @@ impl DatabaseEngine {
                 &core.next_edge_id_seen,
                 &core.engine_seq_seen,
             );
+            merge_runtime_label_catalog_into_manifest(&mut manifest, &core.label_catalog);
             Ok(manifest)
         })
     }
@@ -4325,13 +6116,13 @@ impl DatabaseEngine {
 
     pub(crate) fn find_existing_node(
         &self,
-        type_id: u32,
+        label_id: u32,
         key: &str,
     ) -> Result<Option<(u64, i64)>, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
         Ok(published
             .view
-            .get_node_by_key_raw(type_id, key)?
+            .get_node_by_label_key_raw(label_id, key)?
             .map(|node| (node.id, node.created_at)))
     }
 
@@ -4392,6 +6183,11 @@ impl DatabaseEngine {
         Arc::clone(&self.published_state().view)
     }
 
+    #[cfg(test)]
+    fn published_label_catalog_snapshot_for_test(&self) -> Arc<ReadLabelCatalogSnapshot> {
+        Arc::clone(&self.published_state().label_catalog)
+    }
+
     pub(crate) fn planner_stats_view_for_test(&self) -> Arc<PlannerStatsView> {
         Arc::clone(&self.published_state().view.planner_stats)
     }
@@ -4414,8 +6210,23 @@ impl DatabaseEngine {
             .as_mut()
             .ok_or_else(|| EngineError::InvalidOperation("database is closed".into()))?;
         let seg_path = segment_dir(&core.db_dir, segment_id);
-        let reader =
-            SegmentReader::open(&seg_path, segment_id, core.manifest.dense_vector.as_ref())?;
+        let seg_info = core
+            .manifest
+            .segments
+            .iter()
+            .find(|segment| segment.id == segment_id)
+            .ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "segment {} is not present in the root manifest",
+                    segment_id
+                ))
+            })?;
+        let reader = SegmentReader::open_with_info(
+            &seg_path,
+            seg_info,
+            core.manifest.dense_vector.as_ref(),
+            &core.manifest.secondary_indexes,
+        )?;
         core.warm_declared_index_runtime_coverage_for_reader(&reader);
         let Some(position) = core
             .segments
@@ -4429,7 +6240,7 @@ impl DatabaseEngine {
         };
         core.segments[position] = Arc::new(reader);
         self.runtime
-            .publish_locked(core, PublishImpact::RebuildSources, false);
+            .publish_locked(core, PublishImpact::RebuildSources, false)?;
         Ok(())
     }
 
@@ -4535,6 +6346,26 @@ impl DatabaseEngine {
     ) -> QueryExecutionCounterSnapshot {
         let published = self.published_state();
         QueryExecutionCounterSnapshot {
+            node_record_hydration_reads: published
+                .view
+                .query_execution_counters
+                .node_record_hydration_reads
+                .load(Ordering::Relaxed),
+            node_visibility_meta_reads: published
+                .view
+                .query_execution_counters
+                .node_visibility_meta_reads
+                .load(Ordering::Relaxed),
+            edge_record_hydration_reads: published
+                .view
+                .query_execution_counters
+                .edge_record_hydration_reads
+                .load(Ordering::Relaxed),
+            edge_record_hydration_calls: published
+                .view
+                .query_execution_counters
+                .edge_record_hydration_calls
+                .load(Ordering::Relaxed),
             equality_materialization_record_reads: published
                 .view
                 .query_execution_counters
@@ -4545,6 +6376,26 @@ impl DatabaseEngine {
                 .query_execution_counters
                 .final_verifier_record_reads
                 .load(Ordering::Relaxed),
+            edge_full_scan_pages: published
+                .view
+                .query_execution_counters
+                .edge_full_scan_pages
+                .load(Ordering::Relaxed),
+            endpoint_adjacency_candidates: published
+                .view
+                .query_execution_counters
+                .endpoint_adjacency_candidates
+                .load(Ordering::Relaxed),
+            pattern_edge_pending_entries: published
+                .view
+                .query_execution_counters
+                .pattern_edge_pending_entries
+                .load(Ordering::Relaxed),
+            public_edge_query_calls: published
+                .view
+                .query_execution_counters
+                .public_edge_query_calls
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -4554,12 +6405,52 @@ impl DatabaseEngine {
         published
             .view
             .query_execution_counters
+            .node_record_hydration_reads
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .node_visibility_meta_reads
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .edge_record_hydration_reads
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .edge_record_hydration_calls
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
             .equality_materialization_record_reads
             .store(0, Ordering::Relaxed);
         published
             .view
             .query_execution_counters
             .final_verifier_record_reads
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .edge_full_scan_pages
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .endpoint_adjacency_candidates
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .pattern_edge_pending_entries
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .public_edge_query_calls
             .store(0, Ordering::Relaxed);
     }
 
@@ -4796,7 +6687,7 @@ struct EngineCore {
     next_node_id: u64,
     /// Running edge ID counter. Monotonically increasing.
     next_edge_id: u64,
-    /// Whether to enforce edge uniqueness on (from, to, type_id).
+    /// Whether to enforce edge uniqueness on (from, to, label_id).
     edge_uniqueness: bool,
     /// Memtable size threshold for auto-flush (bytes). 0 = manual only.
     flush_threshold: usize,
@@ -4832,6 +6723,9 @@ struct EngineCore {
     next_edge_id_seen: Arc<AtomicU64>,
     /// Monotonic shared view of the latest durable engine_seq.
     engine_seq_seen: Arc<AtomicU64>,
+    /// Shared runtime node-label/edge-label catalog. Manifest writers merge this
+    /// before checkpointing so token WAL generations are not retired early.
+    label_catalog: Arc<RwLock<RuntimeLabelCatalog>>,
     /// Serialize all manifest writes across engine, flush publisher, and compaction.
     manifest_write_lock: Arc<Mutex<()>>,
     /// Frozen memtable epochs awaiting or undergoing flush, newest-first.
@@ -4846,7 +6740,7 @@ struct EngineCore {
     active_wal_generation_id: u64,
     /// Handle for the persistent background flush worker thread.
     bg_flush: Option<BgFlushHandle>,
-    /// Runtime declaration catalog keyed by `(type_id, prop_key, kind)`.
+    /// Runtime declaration catalog keyed by `(target_label_id, prop_key, kind)`.
     secondary_index_catalog: Arc<RwLock<SecondaryIndexCatalog>>,
     /// Runtime declaration entries kept in sync with background state changes.
     secondary_index_entries: Arc<RwLock<SecondaryIndexEntries>>,
@@ -4951,7 +6845,7 @@ struct BgCompactResult {
     reader: SegmentReader,
     old_seg_dirs: Vec<PathBuf>,
     stats: CompactionStats,
-    input_segment_ids: NodeIdSet,
+    input_segment_snapshots: Vec<SegmentInfo>,
     maintained_equality_index_ids: NodeIdSet,
     maintained_range_index_ids: NodeIdSet,
     secondary_index_report: SecondaryIndexMaintenanceReport,
@@ -4977,14 +6871,15 @@ struct BgFlushHandle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SecondaryIndexLookupKey {
-    type_id: u32,
+    discriminant: SecondaryIndexTargetDiscriminant,
+    target_label_id: u32,
     prop_key: String,
     kind: SecondaryIndexKind,
 }
 
 enum SecondaryIndexJob {
     Build { index_id: u64 },
-    DropCleanup { index_id: u64 },
+    DropCleanup { entry: SecondaryIndexManifestEntry },
     Shutdown,
 }
 
@@ -5070,6 +6965,7 @@ struct BuiltFlushResult {
     dense_config: Option<DenseVectorConfig>,
     maintained_equality_index_ids: NodeIdSet,
     maintained_range_index_ids: NodeIdSet,
+    secondary_indexes: Vec<SecondaryIndexManifestEntry>,
 }
 
 /// Cheap foreground-only adoption payload. No disk I/O remains at this stage.
@@ -5199,6 +7095,15 @@ impl EngineCore {
         // Load or create manifest
         let loaded_manifest = load_manifest(path)?;
         let created_manifest = loaded_manifest.is_none();
+        if created_manifest {
+            let artifacts = manifestless_database_artifacts(path)?;
+            if !artifacts.is_empty() {
+                return Err(EngineError::ManifestError(format!(
+                    "database artifacts exist without a manifest label-token schema: {}; old numeric-only databases are not migrated",
+                    artifacts.join(", ")
+                )));
+            }
+        }
         let mut manifest = match loaded_manifest {
             Some(m) => m,
             None => default_manifest(),
@@ -5208,20 +7113,6 @@ impl EngineCore {
         if created_manifest || manifest_dirty {
             write_manifest(path, &manifest)?;
         };
-
-        // --- WAL generation migration ---
-        // If this is an old manifest (next_wal_generation_id == 0) and data.wal
-        // exists, migrate to WAL generation format by renaming data.wal → wal_0.wal.
-        let legacy_wal_path = path.join("data.wal");
-        let gen0_path = wal_generation_path(path, 0);
-        if manifest.next_wal_generation_id == 0
-            && manifest.active_wal_generation_id == 0
-            && manifest.pending_flush_epochs.is_empty()
-            && legacy_wal_path.exists()
-            && !gen0_path.exists()
-        {
-            std::fs::rename(&legacy_wal_path, &gen0_path)?;
-        }
 
         // Ensure next_wal_generation_id is at least active + 1 and above any
         // pending epoch generation IDs.
@@ -5244,8 +7135,12 @@ impl EngineCore {
         for seg_info in manifest.segments.iter().rev() {
             let seg_path = segment_dir(path, seg_info.id);
             if seg_path.exists() {
-                let reader =
-                    SegmentReader::open(&seg_path, seg_info.id, manifest.dense_vector.as_ref())?;
+                let reader = SegmentReader::open_with_info(
+                    &seg_path,
+                    seg_info,
+                    manifest.dense_vector.as_ref(),
+                    &manifest.secondary_indexes,
+                )?;
                 segments.push(Arc::new(reader));
             } else if manifest.pending_flush_epochs.iter().any(|e| {
                 e.state == FlushEpochState::PublishedPendingRetire
@@ -5292,6 +7187,8 @@ impl EngineCore {
             write_manifest(path, &manifest)?;
         }
 
+        let mut runtime_label_catalog = RuntimeLabelCatalog::from_manifest(&manifest)?;
+
         // --- Replay WAL generations ---
         // Frozen epochs are replayed into separate immutable memtables so their
         // WAL files and manifest entries are preserved. Published degree overlays
@@ -5310,10 +7207,11 @@ impl EngineCore {
         let mut immutable_bytes_on_open: usize = 0;
 
         for &(epoch_id, wal_gen_id) in &frozen_epochs {
-            let (frozen_mt, degree_overlay) = replay_wal_generation_to_memtable_and_overlay(
+            let (frozen_mt, degree_overlay, _) = replay_wal_generation_to_memtable_and_overlay(
                 path,
                 wal_gen_id,
                 manifest.dense_vector.as_ref(),
+                &mut runtime_label_catalog,
                 &mut engine_seq,
                 &immutable_epochs_on_open,
                 &segments,
@@ -5334,14 +7232,22 @@ impl EngineCore {
 
         // Replay active WAL generation into the active memtable and overlay.
         // Use the persisted engine_seq from each WAL record (V3 format).
-        let (memtable, active_degree_overlay) = replay_wal_generation_to_memtable_and_overlay(
+        let (memtable, active_degree_overlay, active_wal_durable_len) =
+            replay_wal_generation_to_memtable_and_overlay(
+                path,
+                manifest.active_wal_generation_id,
+                manifest.dense_vector.as_ref(),
+                &mut runtime_label_catalog,
+                &mut engine_seq,
+                &immutable_epochs_on_open,
+                &segments,
+            )?;
+        truncate_wal_generation_to(
             path,
             manifest.active_wal_generation_id,
-            manifest.dense_vector.as_ref(),
-            &mut engine_seq,
-            &immutable_epochs_on_open,
-            &segments,
+            active_wal_durable_len,
         )?;
+        runtime_label_catalog.apply_to_manifest(&mut manifest);
 
         // Compute next IDs from active memtable + immutable epochs + manifest.
         let mut max_node_id = manifest
@@ -5369,6 +7275,7 @@ impl EngineCore {
         // write and manifest update, or between bg compact output and apply).
         // Safe to delete. The manifest is the source of truth.
         cleanup_orphan_segments(path, &manifest);
+        cleanup_orphan_optional_refresh_files(path, &manifest);
         cleanup_orphan_wal_files(path, &manifest);
 
         // Open WAL writer for the active generation
@@ -5430,6 +7337,7 @@ impl EngineCore {
         let next_node_id_seen = Arc::new(AtomicU64::new(next_node_id));
         let next_edge_id_seen = Arc::new(AtomicU64::new(next_edge_id));
         let engine_seq_seen = Arc::new(AtomicU64::new(engine_seq));
+        let label_catalog = Arc::new(RwLock::new(runtime_label_catalog));
         let manifest_write_lock = Arc::new(Mutex::new(()));
         let mut engine = EngineCore {
             db_dir: path.to_path_buf(),
@@ -5458,6 +7366,7 @@ impl EngineCore {
             next_node_id_seen,
             next_edge_id_seen,
             engine_seq_seen,
+            label_catalog,
             manifest_write_lock,
             immutable_epochs: immutable_epochs_on_open,
             immutable_bytes_total: immutable_bytes_on_open,
@@ -5490,7 +7399,7 @@ impl EngineCore {
         engine.rebuild_secondary_index_catalog()?;
         engine.seed_secondary_indexes_from_manifest()?;
         engine.warm_declared_index_runtime_coverage_for_current_readers();
-        engine.rebuild_published_read_sources();
+        engine.rebuild_published_read_sources()?;
 
         Ok(engine)
     }
@@ -5556,7 +7465,7 @@ impl EngineCore {
             }
         }
         let active_wal_generation_id = self.active_wal_generation_id;
-        self.with_runtime_manifest_write(|manifest| {
+        self.with_synced_runtime_manifest_write(|manifest| {
             manifest.active_wal_generation_id = active_wal_generation_id;
             Ok(())
         })
@@ -5566,11 +7475,29 @@ impl EngineCore {
         &self.memtable
     }
 
-    fn build_read_manifest_state(&self) -> ReadManifestState {
-        ReadManifestState {
-            prune_policies: self.manifest.prune_policies.clone(),
+    fn build_read_manifest_state(&self) -> Result<ReadManifestState, EngineError> {
+        let catalog = self.label_catalog.read().unwrap();
+        let prune_policies = self
+            .manifest
+            .prune_policies
+            .iter()
+            .map(|(name, policy)| {
+                resolve_manifest_prune_policy(policy, &catalog).map(|policy| (name.clone(), policy))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(ReadManifestState {
+            prune_policies,
             dense_vector: self.manifest.dense_vector.clone(),
-        }
+        })
+    }
+
+    fn resolved_manifest_prune_policies(&self) -> Result<Vec<ResolvedPrunePolicy>, EngineError> {
+        let catalog = self.label_catalog.read().unwrap();
+        self.manifest
+            .prune_policies
+            .values()
+            .map(|policy| resolve_manifest_prune_policy(policy, &catalog))
+            .collect()
     }
 
     fn warm_declared_index_runtime_coverage_for_reader(&self, reader: &SegmentReader) {
@@ -5589,7 +7516,10 @@ impl EngineCore {
         }
     }
 
-    fn build_published_read_sources(&self) -> Arc<PublishedReadSources> {
+    fn build_published_read_sources(
+        &self,
+        generation: u64,
+    ) -> Result<Arc<PublishedReadSources>, EngineError> {
         #[cfg(test)]
         self.published_read_source_builds
             .fetch_add(1, Ordering::Relaxed);
@@ -5602,13 +7532,13 @@ impl EngineCore {
             &secondary_index_entries,
         ));
         let planner_stats = Arc::new(PlannerStatsView::build_from_readers(
-            self.published_read_sources_generation,
+            generation,
             &self.segments,
             &secondary_index_entries,
             declared_index_runtime_coverage.as_ref(),
         ));
-        Arc::new(PublishedReadSources {
-            manifest: self.build_read_manifest_state(),
+        Ok(Arc::new(PublishedReadSources {
+            manifest: self.build_read_manifest_state()?,
             memtable: Arc::clone(&self.memtable),
             immutable_epochs: self.immutable_epochs.clone(),
             segments: self.segments.iter().map(Arc::clone).collect(),
@@ -5620,13 +7550,15 @@ impl EngineCore {
             planning_probe_counters: QueryPlanningProbeCounters::default(),
             #[cfg(test)]
             query_execution_counters: QueryExecutionCounters::default(),
-        })
+        }))
     }
 
-    fn rebuild_published_read_sources(&mut self) {
-        self.published_read_sources_generation =
-            self.published_read_sources_generation.saturating_add(1);
-        self.published_read_sources = Some(self.build_published_read_sources());
+    fn rebuild_published_read_sources(&mut self) -> Result<(), EngineError> {
+        let generation = self.published_read_sources_generation.saturating_add(1);
+        let sources = self.build_published_read_sources(generation)?;
+        self.published_read_sources_generation = generation;
+        self.published_read_sources = Some(sources);
+        Ok(())
     }
 
     fn current_published_read_sources(&self) -> Arc<PublishedReadSources> {
@@ -5660,22 +7592,37 @@ impl EngineCore {
             self.current_published_read_sources(),
             self.engine_seq,
             Arc::clone(&self.active_degree_overlay),
+            self.read_label_catalog_snapshot(),
         )
     }
 
     fn published_read_state(&self) -> PublishedReadState {
+        self.published_read_state_with_catalog(self.read_label_catalog_snapshot())
+    }
+
+    fn published_read_state_with_catalog(
+        &self,
+        label_catalog: Arc<ReadLabelCatalogSnapshot>,
+    ) -> PublishedReadState {
         PublishedReadState {
             view: Arc::new(ReadView::from_published_sources(
                 self.current_published_read_sources(),
                 self.engine_seq,
                 Arc::clone(&self.active_degree_overlay),
+                Arc::clone(&label_catalog),
             )),
+            label_catalog,
             edge_uniqueness: self.edge_uniqueness,
             #[cfg(test)]
             engine_seq: self.engine_seq,
             #[cfg(test)]
             active_wal_generation_id: self.active_wal_generation_id,
         }
+    }
+
+    fn read_label_catalog_snapshot(&self) -> Arc<ReadLabelCatalogSnapshot> {
+        let catalog = self.label_catalog.read().unwrap();
+        Arc::new(ReadLabelCatalogSnapshot::from_runtime(&catalog))
     }
 
     fn secondary_index_entries_snapshot(&self) -> SecondaryIndexEntries {
@@ -5699,18 +7646,70 @@ impl EngineCore {
 
             for segment in &self.segments {
                 let validation = match entry.kind {
-                    SecondaryIndexKind::Equality => {
-                        segment.validate_secondary_eq_sidecar(entry.index_id)
-                    }
-                    SecondaryIndexKind::Range { .. } => {
-                        segment.validate_secondary_range_sidecar(entry.index_id)
-                    }
+                    SecondaryIndexKind::Equality => segment
+                        .secondary_eq_sidecar_lightweight_available_for_target(
+                            entry.index_id,
+                            match &entry.target {
+                                SecondaryIndexTarget::NodeProperty { .. } => {
+                                    PlannerStatsDeclaredIndexTarget::NodeProperty
+                                }
+                                SecondaryIndexTarget::EdgeProperty { .. } => {
+                                    PlannerStatsDeclaredIndexTarget::EdgeProperty
+                                }
+                            },
+                        ),
+                    SecondaryIndexKind::Range { .. } => segment
+                        .secondary_range_sidecar_lightweight_available_for_target(
+                            entry.index_id,
+                            match &entry.target {
+                                SecondaryIndexTarget::NodeProperty { .. } => {
+                                    PlannerStatsDeclaredIndexTarget::NodeProperty
+                                }
+                                SecondaryIndexTarget::EdgeProperty { .. } => {
+                                    PlannerStatsDeclaredIndexTarget::EdgeProperty
+                                }
+                            },
+                        ),
                 };
                 match validation {
                     Ok(true) => continue,
                     Ok(false) => {
-                        entry.state = SecondaryIndexState::Building;
-                        entry.last_error = None;
+                        let is_edge =
+                            matches!(&entry.target, SecondaryIndexTarget::EdgeProperty { .. });
+                        let kind = match (&entry.kind, is_edge) {
+                            (SecondaryIndexKind::Equality, false) => {
+                                SegmentComponentKind::NodePropertyEqualityIndex {
+                                    index_id: entry.index_id,
+                                }
+                            }
+                            (SecondaryIndexKind::Range { .. }, false) => {
+                                SegmentComponentKind::NodePropertyRangeIndex {
+                                    index_id: entry.index_id,
+                                }
+                            }
+                            (SecondaryIndexKind::Equality, true) => {
+                                SegmentComponentKind::EdgePropertyEqualityIndex {
+                                    index_id: entry.index_id,
+                                }
+                            }
+                            (SecondaryIndexKind::Range { .. }, true) => {
+                                SegmentComponentKind::EdgePropertyRangeIndex {
+                                    index_id: entry.index_id,
+                                }
+                            }
+                        };
+                        match segment.optional_component_availability(kind) {
+                            ComponentAvailability::Missing | ComponentAvailability::Available => {
+                                entry.state = SecondaryIndexState::Building;
+                                entry.last_error = None;
+                            }
+                            ComponentAvailability::Incompatible { reason }
+                            | ComponentAvailability::CorruptIdentity { reason }
+                            | ComponentAvailability::Unsupported { reason } => {
+                                entry.state = SecondaryIndexState::Failed;
+                                entry.last_error = Some(reason);
+                            }
+                        }
                         dirty = true;
                         break;
                     }
@@ -5725,7 +7724,15 @@ impl EngineCore {
         }
 
         if dirty {
-            write_manifest(&self.db_dir, &self.manifest)?;
+            let new_manifest = {
+                let _guard = self.manifest_write_lock.lock().unwrap();
+                let mut manifest = self.load_current_manifest_for_write()?;
+                manifest.secondary_indexes = self.manifest.secondary_indexes.clone();
+                self.merge_checkpointed_runtime_manifest_state(&mut manifest);
+                write_manifest(&self.db_dir, &manifest)?;
+                manifest
+            };
+            self.manifest = new_manifest;
         }
         Ok(())
     }
@@ -5786,6 +7793,7 @@ impl EngineCore {
         let next_node_id_seen = Arc::clone(&self.next_node_id_seen);
         let next_edge_id_seen = Arc::clone(&self.next_edge_id_seen);
         let engine_seq_seen = Arc::clone(&self.engine_seq_seen);
+        let label_catalog = Arc::clone(&self.label_catalog);
         #[cfg(test)]
         let build_pause = Arc::clone(&self.secondary_index_build_pause);
         let handle = std::thread::spawn(move || {
@@ -5800,6 +7808,7 @@ impl EngineCore {
                 next_node_id_seen,
                 next_edge_id_seen,
                 engine_seq_seen,
+                label_catalog,
                 #[cfg(test)]
                 build_pause,
             )
@@ -5874,6 +7883,10 @@ impl EngineCore {
             .fetch_max(self.engine_seq, Ordering::Release);
     }
 
+    fn checkpointable_wal_generation(&self) -> Option<u64> {
+        self.active_wal_generation_id.checked_sub(1)
+    }
+
     fn merge_runtime_manifest_counters(&self, manifest: &mut ManifestState) {
         merge_runtime_manifest_counters_from_shared(
             manifest,
@@ -5881,6 +7894,20 @@ impl EngineCore {
             &self.next_edge_id_seen,
             &self.engine_seq_seen,
         );
+    }
+
+    fn merge_checkpointed_runtime_manifest_state(&self, manifest: &mut ManifestState) {
+        self.merge_runtime_manifest_counters(manifest);
+        merge_checkpointed_label_catalog_into_manifest(
+            manifest,
+            &self.label_catalog,
+            self.checkpointable_wal_generation(),
+        );
+    }
+
+    fn merge_synced_runtime_manifest_state(&self, manifest: &mut ManifestState) {
+        self.merge_runtime_manifest_counters(manifest);
+        merge_runtime_label_catalog_into_manifest(manifest, &self.label_catalog);
     }
 
     fn load_current_manifest_for_write(&self) -> Result<ManifestState, EngineError> {
@@ -5892,6 +7919,24 @@ impl EngineCore {
         manifest.active_wal_generation_id = manifest
             .active_wal_generation_id
             .max(self.manifest.active_wal_generation_id);
+        merge_checkpointed_label_catalog_into_manifest(
+            &mut manifest,
+            &self.label_catalog,
+            self.checkpointable_wal_generation(),
+        );
+        Ok(manifest)
+    }
+
+    fn load_current_manifest_for_synced_write(&self) -> Result<ManifestState, EngineError> {
+        let mut manifest = load_manifest_readonly(&self.db_dir)?
+            .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
+        manifest.next_wal_generation_id = manifest
+            .next_wal_generation_id
+            .max(self.manifest.next_wal_generation_id);
+        manifest.active_wal_generation_id = manifest
+            .active_wal_generation_id
+            .max(self.manifest.active_wal_generation_id);
+        merge_runtime_label_catalog_into_manifest(&mut manifest, &self.label_catalog);
         Ok(manifest)
     }
 
@@ -5902,13 +7947,89 @@ impl EngineCore {
         let _guard = self.manifest_write_lock.lock().unwrap();
         let mut manifest = self.load_current_manifest_for_write()?;
         let result = mutate(&mut manifest)?;
-        self.merge_runtime_manifest_counters(&mut manifest);
+        self.merge_checkpointed_runtime_manifest_state(&mut manifest);
+        write_manifest(&self.db_dir, &manifest)?;
+        self.manifest = manifest;
+        Ok(result)
+    }
+
+    fn with_synced_runtime_manifest_write<T>(
+        &mut self,
+        mutate: impl FnOnce(&mut ManifestState) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let _guard = self.manifest_write_lock.lock().unwrap();
+        let mut manifest = self.load_current_manifest_for_synced_write()?;
+        let result = mutate(&mut manifest)?;
+        self.merge_synced_runtime_manifest_state(&mut manifest);
         write_manifest(&self.db_dir, &manifest)?;
         self.manifest = manifest;
         Ok(result)
     }
 
     // --- Write path helpers ---
+
+    fn apply_label_token_op_after_wal_append(&mut self, op: &WalOp) -> Result<(), EngineError> {
+        match op {
+            WalOp::EnsureNodeLabel { label, label_id } => {
+                {
+                    let mut catalog = self.label_catalog.write().unwrap();
+                    catalog.apply_node_label(
+                        label.clone(),
+                        *label_id,
+                        Some(self.active_wal_generation_id),
+                    )?;
+                    catalog.apply_to_manifest(&mut self.manifest);
+                }
+                Ok(())
+            }
+            WalOp::EnsureEdgeLabel { label, label_id } => {
+                {
+                    let mut catalog = self.label_catalog.write().unwrap();
+                    catalog.apply_edge_label(
+                        label.clone(),
+                        *label_id,
+                        Some(self.active_wal_generation_id),
+                    )?;
+                    catalog.apply_to_manifest(&mut self.manifest);
+                }
+                Ok(())
+            }
+            WalOp::UpsertNode(node) => {
+                let catalog = self.label_catalog.read().unwrap();
+                for &label_id in node.label_ids.as_slice() {
+                    if !catalog.node_id_to_label.contains_key(&label_id) {
+                        return Err(EngineError::InvalidOperation(format!(
+                            "node label_id {} does not exist in the node label catalog",
+                            label_id
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            WalOp::UpsertEdge(edge) => {
+                if self
+                    .label_catalog
+                    .read()
+                    .unwrap()
+                    .edge_id_to_label
+                    .contains_key(&edge.label_id)
+                {
+                    Ok(())
+                } else {
+                    Err(EngineError::InvalidOperation(format!(
+                        "edge-label label_id {} does not exist in the edge-label catalog",
+                        edge.label_id
+                    )))
+                }
+            }
+            WalOp::DeleteNode { .. } | WalOp::DeleteEdge { .. } => Ok(()),
+            WalOp::BeginAtomicBatch { .. } | WalOp::CommitAtomicBatch { .. } => {
+                Err(EngineError::InvalidOperation(
+                    "WAL atomic batch markers cannot be applied as normal write ops".into(),
+                ))
+            }
+        }
+    }
 
     /// Metadata-only logical edge lookup for degree-cache maintenance.
     /// Checks memtable first, then segments newest-to-oldest, respecting
@@ -5998,7 +8119,12 @@ impl EngineCore {
                     Self::collect_degree_delta_for_old_edge(deltas, old);
                 }
             }
-            WalOp::DeleteNode { .. } | WalOp::UpsertNode(_) => {}
+            WalOp::DeleteNode { .. }
+            | WalOp::UpsertNode(_)
+            | WalOp::EnsureNodeLabel { .. }
+            | WalOp::EnsureEdgeLabel { .. }
+            | WalOp::BeginAtomicBatch { .. }
+            | WalOp::CommitAtomicBatch { .. } => {}
         }
     }
 
@@ -6017,7 +8143,12 @@ impl EngineCore {
         match op {
             WalOp::UpsertEdge(edge) => Some(edge.id),
             WalOp::DeleteEdge { id, .. } => Some(*id),
-            WalOp::UpsertNode(_) | WalOp::DeleteNode { .. } => None,
+            WalOp::UpsertNode(_)
+            | WalOp::DeleteNode { .. }
+            | WalOp::EnsureNodeLabel { .. }
+            | WalOp::EnsureEdgeLabel { .. }
+            | WalOp::BeginAtomicBatch { .. }
+            | WalOp::CommitAtomicBatch { .. } => None,
         }
     }
 
@@ -6032,7 +8163,13 @@ impl EngineCore {
                 valid_from: edge.valid_from,
                 valid_to: edge.valid_to,
             }),
-            WalOp::DeleteEdge { .. } | WalOp::DeleteNode { .. } | WalOp::UpsertNode(_) => None,
+            WalOp::DeleteEdge { .. }
+            | WalOp::DeleteNode { .. }
+            | WalOp::UpsertNode(_)
+            | WalOp::EnsureNodeLabel { .. }
+            | WalOp::EnsureEdgeLabel { .. }
+            | WalOp::BeginAtomicBatch { .. }
+            | WalOp::CommitAtomicBatch { .. } => None,
         }
     }
 
@@ -6071,6 +8208,7 @@ impl EngineCore {
             let old_edge = edge_id
                 .and_then(|id| edge_states.get(&id).copied().flatten())
                 .map(OldEdgeInfo::from_core);
+            self.apply_label_token_op_after_wal_append(op)?;
             self.active_memtable().apply_op(op, *seq);
             Self::collect_degree_delta_for_op(op, old_edge, &mut degree_deltas);
             if let Some(edge_id) = edge_id {
@@ -6092,6 +8230,7 @@ impl EngineCore {
             .map(OldEdgeInfo::from_core);
         self.wal_append(|w| w.append(op, seq))?;
         self.engine_seq = seq;
+        self.apply_label_token_op_after_wal_append(op)?;
         self.active_memtable().apply_op(op, seq);
         let mut degree_deltas: NodeIdMap<DegreeDelta> = NodeIdMap::default();
         Self::collect_degree_delta_for_op(op, old_edge, &mut degree_deltas);
@@ -6217,7 +8356,7 @@ impl EngineCore {
         // 2. Allocate new WAL generation
         let old_wal_gen = self.active_wal_generation_id;
         let epoch_id = old_wal_gen;
-        let new_wal_gen = self.with_runtime_manifest_write(|manifest| {
+        let new_wal_gen = self.with_synced_runtime_manifest_write(|manifest| {
             let new_wal_gen = manifest.next_wal_generation_id;
             manifest.next_wal_generation_id = new_wal_gen + 1;
             manifest.pending_flush_epochs.push(FlushEpochMeta {
@@ -6429,6 +8568,7 @@ impl EngineCore {
         let next_node_id_seen = Arc::clone(&self.next_node_id_seen);
         let next_edge_id_seen = Arc::clone(&self.next_edge_id_seen);
         let engine_seq_seen = Arc::clone(&self.engine_seq_seen);
+        let label_catalog = Arc::clone(&self.label_catalog);
         let publish_runtime = self.runtime.clone();
         #[cfg(test)]
         let publish_pause = Arc::clone(&self.flush_publish_pause);
@@ -6443,6 +8583,7 @@ impl EngineCore {
                 next_node_id_seen,
                 next_edge_id_seen,
                 engine_seq_seen,
+                label_catalog,
                 publish_cancel,
                 publish_events_ready,
                 publish_runtime,
@@ -6840,12 +8981,21 @@ impl EngineCore {
             return Ok(());
         }
 
-        // Snapshot current segment IDs and paths for the background thread.
-        let input_segments: Vec<(u64, PathBuf)> = self
+        // Snapshot current root SegmentInfo and paths for the background thread.
+        let input_segments: Vec<(SegmentInfo, PathBuf)> = self
             .segments
             .iter()
-            .map(|s| (s.segment_id, segment_dir(&self.db_dir, s.segment_id)))
+            .filter_map(|s| {
+                segment_info_for_id(&self.manifest.segments, s.segment_id)
+                    .cloned()
+                    .map(|info| (info, segment_dir(&self.db_dir, s.segment_id)))
+            })
             .collect();
+        if input_segments.len() != self.segments.len() {
+            return Err(EngineError::ManifestError(
+                "background compaction snapshot missing root segment info".into(),
+            ));
+        }
         // Allocate the output segment ID on the main thread.
         let seg_id = self.next_segment_id;
         self.next_segment_id += 1;
@@ -6854,8 +9004,7 @@ impl EngineCore {
         self.flush_count_since_last_compact = 0;
 
         let db_dir = self.db_dir.clone();
-        let prune_policies: Vec<PrunePolicy> =
-            self.manifest.prune_policies.values().cloned().collect();
+        let prune_policies = self.resolved_manifest_prune_policies()?;
         let dense_vector = self.manifest.dense_vector.clone();
         let secondary_indexes = self.secondary_index_entries_snapshot();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -6953,18 +9102,27 @@ impl EngineCore {
                 }
             };
 
-            let live_seg_ids: NodeIdSet = manifest.segments.iter().map(|s| s.id).collect();
-            for input_id in &result.input_segment_ids {
-                if !live_seg_ids.contains(input_id) {
+            for input_info in &result.input_segment_snapshots {
+                let Some(live_info) = segment_info_for_id(&manifest.segments, input_info.id) else {
+                    let output_dir = segment_dir(&self.db_dir, result.stats.output_segment_id);
+                    let _ = std::fs::remove_dir_all(output_dir);
+                    return None;
+                };
+                if live_info.segment_data_id != input_info.segment_data_id {
                     let output_dir = segment_dir(&self.db_dir, result.stats.output_segment_id);
                     let _ = std::fs::remove_dir_all(output_dir);
                     return None;
                 }
             }
+            let input_segment_ids: NodeIdSet = result
+                .input_segment_snapshots
+                .iter()
+                .map(|segment| segment.id)
+                .collect();
 
             manifest
                 .segments
-                .retain(|s| !result.input_segment_ids.contains(&s.id));
+                .retain(|s| !input_segment_ids.contains(&s.id));
             manifest.segments.push(result.seg_info.clone());
             apply_secondary_index_failure_report(&mut manifest, &result.secondary_index_report);
             let rebuild_equality_index_ids = reconcile_background_output_equality_declarations(
@@ -6975,7 +9133,7 @@ impl EngineCore {
                 &mut manifest,
                 &result.maintained_range_index_ids,
             );
-            self.merge_runtime_manifest_counters(&mut manifest);
+            self.merge_checkpointed_runtime_manifest_state(&mut manifest);
 
             if let Err(e) = write_manifest(&self.db_dir, &manifest) {
                 eprintln!("Background compaction: manifest write failed: {}", e);
@@ -6999,8 +9157,13 @@ impl EngineCore {
         }
         // Remove input segments, keep any new segments added by flushes during
         // background compaction (they have different IDs).
+        let input_segment_ids: NodeIdSet = result
+            .input_segment_snapshots
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
         self.segments
-            .retain(|s| !result.input_segment_ids.contains(&s.segment_id));
+            .retain(|s| !input_segment_ids.contains(&s.segment_id));
         // Compacted segment is oldest; push to end (segments are newest-first).
         self.warm_declared_index_runtime_coverage_for_reader(&result.reader);
         self.segments.push(Arc::new(result.reader));
@@ -7073,7 +9236,6 @@ impl EngineCore {
         if self.segments.len() < 2 {
             return Ok(None);
         }
-
         self.compacting = true;
         let result = self.compact_with_progress_inner(&mut callback);
         self.compacting = false;
@@ -7105,7 +9267,7 @@ impl EngineCore {
         let total_input_edges: u64 = self.segments.iter().map(|s| s.edge_count()).sum();
 
         let has_tombstones = self.segments.iter().any(|s| s.has_tombstones());
-        let policies: Vec<PrunePolicy> = self.manifest.prune_policies.values().cloned().collect();
+        let policies = self.resolved_manifest_prune_policies()?;
         let secondary_indexes = self.secondary_index_entries_snapshot();
         let degree_sidecar_expected =
             policies.is_empty() && self.segments.iter().all(|s| s.degree_delta_available());
@@ -7165,19 +9327,30 @@ impl EngineCore {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(e.into());
         }
+        if let Some(parent) = final_dir.parent() {
+            if let Err(e) = fsync_dir(parent) {
+                self.next_segment_id -= 1;
+                let _ = std::fs::remove_dir_all(&final_dir);
+                return Err(e);
+            }
+        }
 
         // Open new segment reader BEFORE modifying any state (M3 fix)
-        let new_reader =
-            match SegmentReader::open(&final_dir, seg_id, self.manifest.dense_vector.as_ref()) {
-                Ok(r) => r,
-                Err(e) => {
-                    // Output segment exists on disk but we can't read it.
-                    // Clean up orphan directory and release the segment ID.
-                    self.next_segment_id -= 1;
-                    let _ = std::fs::remove_dir_all(&final_dir);
-                    return Err(e);
-                }
-            };
+        let new_reader = match SegmentReader::open_with_info(
+            &final_dir,
+            &seg_info,
+            self.manifest.dense_vector.as_ref(),
+            &secondary_indexes,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                // Output segment exists on disk but we can't read it.
+                // Clean up orphan directory and release the segment ID.
+                self.next_segment_id -= 1;
+                let _ = std::fs::remove_dir_all(&final_dir);
+                return Err(e);
+            }
+        };
         if degree_sidecar_expected && !new_reader.degree_delta_available() {
             self.next_segment_id -= 1;
             let _ = std::fs::remove_dir_all(&final_dir);
@@ -7200,7 +9373,7 @@ impl EngineCore {
             manifest.segments.retain(|s| !old_seg_ids.contains(&s.id));
             manifest.segments.push(seg_info.clone());
             apply_secondary_index_failure_report(&mut manifest, &secondary_index_report);
-            self.merge_runtime_manifest_counters(&mut manifest);
+            self.merge_checkpointed_runtime_manifest_state(&mut manifest);
             write_manifest(&self.db_dir, &manifest)?;
             manifest
         };
@@ -7329,7 +9502,7 @@ impl EngineCore {
         seg_id: u64,
         callback: &mut F,
         has_tombstones: bool,
-        prune_policies: &[PrunePolicy],
+        prune_policies: &[ResolvedPrunePolicy],
         secondary_indexes: &[SecondaryIndexManifestEntry],
         input_segment_count: usize,
         total_input_nodes: u64,
@@ -7506,6 +9679,7 @@ impl EngineCore {
                     self.update_next_edge_id_seen();
                 }
             }
+            WalOp::EnsureNodeLabel { .. } | WalOp::EnsureEdgeLabel { .. } => {}
             _ => {}
         }
     }
@@ -7606,30 +9780,209 @@ fn get_edge_core_from_sources(
     Ok(None)
 }
 
+struct ReplayAtomicBatch {
+    first_seq: u64,
+    op_count: u32,
+    ops: Vec<(u64, WalOp)>,
+}
+
+impl ReplayAtomicBatch {
+    fn new(first_seq: u64, op_count: u32) -> Option<Self> {
+        if first_seq == 0 || op_count < 2 {
+            return None;
+        }
+        Some(Self {
+            first_seq,
+            op_count,
+            ops: Vec::new(),
+        })
+    }
+
+    fn push(&mut self, seq: u64, op: WalOp) -> bool {
+        let Ok(op_count) = usize::try_from(self.op_count) else {
+            return false;
+        };
+        if self.ops.len() >= op_count {
+            return false;
+        }
+        self.ops.push((seq, op));
+        true
+    }
+
+    fn matches_commit(&self, first_seq: u64, op_count: u32) -> bool {
+        if self.first_seq != first_seq || self.op_count != op_count {
+            return false;
+        }
+        if self.ops.len() != op_count as usize {
+            return false;
+        }
+        self.ops.iter().enumerate().all(|(idx, (seq, _))| {
+            self.first_seq
+                .checked_add(idx as u64)
+                .is_some_and(|expected| *seq == expected)
+        })
+    }
+}
+
+fn replay_apply_normalized_op(
+    memtable: &Memtable,
+    degree_deltas: &mut NodeIdMap<DegreeDelta>,
+    engine_seq: &mut u64,
+    seq: u64,
+    op: &WalOp,
+    old_edge: Option<OldEdgeInfo>,
+) {
+    *engine_seq = (*engine_seq).max(seq);
+    memtable.apply_op(op, seq);
+    EngineCore::collect_degree_delta_for_op(op, old_edge, degree_deltas);
+}
+
+fn capture_replay_batch_edge_states(
+    memtable: &Memtable,
+    immutable_epochs: &[ImmutableEpoch],
+    segments: &[Arc<SegmentReader>],
+    ops: &[(u64, WalOp)],
+) -> Result<NodeIdMap<Option<EdgeCore>>, EngineError> {
+    let mut states: NodeIdMap<Option<EdgeCore>> = NodeIdMap::default();
+    for (_, op) in ops {
+        let Some(edge_id) = EngineCore::edge_id_for_degree_op(op) else {
+            continue;
+        };
+        if states.contains_key(&edge_id) {
+            continue;
+        }
+        states.insert(
+            edge_id,
+            get_edge_core_from_sources(memtable, immutable_epochs, segments, edge_id)?,
+        );
+    }
+    Ok(states)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_apply_committed_atomic_batch(
+    batch: ReplayAtomicBatch,
+    memtable: &Memtable,
+    degree_deltas: &mut NodeIdMap<DegreeDelta>,
+    dense_config: Option<&DenseVectorConfig>,
+    label_catalog: &mut RuntimeLabelCatalog,
+    engine_seq: &mut u64,
+    wal_generation_id: u64,
+    immutable_epochs: &[ImmutableEpoch],
+    segments: &[Arc<SegmentReader>],
+) -> Result<(), EngineError> {
+    let normalized_ops: Vec<(u64, WalOp)> = batch
+        .ops
+        .into_iter()
+        .map(|(seq, op)| normalize_wal_op_for_replay(dense_config, op).map(|op| (seq, op)))
+        .collect::<Result<_, _>>()?;
+
+    let mut staged_catalog = label_catalog.clone();
+    for (_, op) in &normalized_ops {
+        validate_or_apply_replayed_label_token_op(&mut staged_catalog, op, wal_generation_id)?;
+    }
+
+    let mut edge_states =
+        capture_replay_batch_edge_states(memtable, immutable_epochs, segments, &normalized_ops)?;
+    *label_catalog = staged_catalog;
+
+    for (seq, op) in normalized_ops {
+        let edge_id = EngineCore::edge_id_for_degree_op(&op);
+        let old_edge = edge_id
+            .and_then(|id| edge_states.get(&id).copied().flatten())
+            .map(OldEdgeInfo::from_core);
+        replay_apply_normalized_op(memtable, degree_deltas, engine_seq, seq, &op, old_edge);
+        if let Some(edge_id) = edge_id {
+            edge_states.insert(edge_id, EngineCore::edge_core_after_op(&op));
+        }
+    }
+
+    Ok(())
+}
+
 fn replay_wal_generation_to_memtable_and_overlay(
     db_dir: &Path,
     wal_generation_id: u64,
     dense_config: Option<&DenseVectorConfig>,
+    label_catalog: &mut RuntimeLabelCatalog,
     engine_seq: &mut u64,
     immutable_epochs: &[ImmutableEpoch],
     segments: &[Arc<SegmentReader>],
-) -> Result<(Memtable, Arc<DegreeOverlaySnapshot>), EngineError> {
+) -> Result<(Memtable, Arc<DegreeOverlaySnapshot>, u64), EngineError> {
     let memtable = Memtable::new();
     let mut degree_deltas: NodeIdMap<DegreeDelta> = NodeIdMap::default();
+    let mut open_batch: Option<ReplayAtomicBatch> = None;
+    let read_result = WalReader::read_generation_recoverable(db_dir, wal_generation_id)?;
+    let durable_len = read_result.durable_len;
 
-    for (seq, op) in WalReader::read_generation(db_dir, wal_generation_id)? {
-        let op = normalize_wal_op_for_replay(dense_config, op)?;
-        let old_edge = EngineCore::edge_id_for_degree_op(&op)
-            .map(|id| get_edge_core_from_sources(&memtable, immutable_epochs, segments, id))
-            .transpose()?
-            .flatten()
-            .map(OldEdgeInfo::from_core);
-        *engine_seq = (*engine_seq).max(seq);
-        memtable.apply_op(&op, seq);
-        EngineCore::collect_degree_delta_for_op(&op, old_edge, &mut degree_deltas);
+    for (seq, op) in read_result.records {
+        match op {
+            WalOp::BeginAtomicBatch {
+                first_seq,
+                op_count,
+            } => {
+                if open_batch.is_some() {
+                    break;
+                }
+                let Some(batch) = ReplayAtomicBatch::new(first_seq, op_count) else {
+                    break;
+                };
+                open_batch = Some(batch);
+            }
+            WalOp::CommitAtomicBatch {
+                first_seq,
+                op_count,
+            } => {
+                let Some(batch) = open_batch.take() else {
+                    break;
+                };
+                if !batch.matches_commit(first_seq, op_count) {
+                    break;
+                }
+                replay_apply_committed_atomic_batch(
+                    batch,
+                    &memtable,
+                    &mut degree_deltas,
+                    dense_config,
+                    label_catalog,
+                    engine_seq,
+                    wal_generation_id,
+                    immutable_epochs,
+                    segments,
+                )?;
+            }
+            op => {
+                if let Some(batch) = open_batch.as_mut() {
+                    if !batch.push(seq, op) {
+                        break;
+                    }
+                    continue;
+                }
+
+                let op = normalize_wal_op_for_replay(dense_config, op)?;
+                validate_or_apply_replayed_label_token_op(label_catalog, &op, wal_generation_id)?;
+                let old_edge = EngineCore::edge_id_for_degree_op(&op)
+                    .map(|id| get_edge_core_from_sources(&memtable, immutable_epochs, segments, id))
+                    .transpose()?
+                    .flatten()
+                    .map(OldEdgeInfo::from_core);
+                replay_apply_normalized_op(
+                    &memtable,
+                    &mut degree_deltas,
+                    engine_seq,
+                    seq,
+                    &op,
+                    old_edge,
+                );
+            }
+        }
     }
 
-    Ok((memtable, DegreeOverlaySnapshot::from_flat(degree_deltas)))
+    Ok((
+        memtable,
+        DegreeOverlaySnapshot::from_flat(degree_deltas),
+        durable_len,
+    ))
 }
 
 impl Drop for EngineCore {
@@ -7727,6 +10080,12 @@ fn cleanup_orphan_segments(db_dir: &Path, manifest: &ManifestState) {
                 }
             }
         }
+    }
+}
+
+fn cleanup_orphan_optional_refresh_files(db_dir: &Path, manifest: &ManifestState) {
+    for segment in &manifest.segments {
+        cleanup_orphan_optional_component_files(&segment_dir(db_dir, segment.id));
     }
 }
 
@@ -7969,8 +10328,6 @@ fn bg_flush_build_worker(
         }
 
         let current_secondary_indexes = secondary_index_entries.read().unwrap().clone();
-        let maintained_equality_index_ids = equality_index_ids_snapshot(&current_secondary_indexes);
-        let maintained_range_index_ids = range_index_ids_snapshot(&current_secondary_indexes);
         let needs_reseed = current_secondary_indexes.iter().any(|entry| {
             !work
                 .frozen
@@ -8017,6 +10374,32 @@ fn bg_flush_build_worker(
                             cancel.store(true, Ordering::Relaxed);
                             break;
                         } else {
+                            let maintained_index_ids =
+                                match maintained_secondary_index_ids_from_segment_manifest(
+                                    &work.final_dir,
+                                    &current_secondary_indexes,
+                                ) {
+                                    Ok(ids) => ids,
+                                    Err(e) => {
+                                        let _ = std::fs::remove_dir_all(&work.final_dir);
+                                        send_bg_flush_event(
+                                            &event_tx,
+                                            &events_ready,
+                                            &runtime,
+                                            BgFlushEvent::Failed(FlushPipelineError {
+                                                epoch_id: work.epoch_id,
+                                                wal_generation_id: work.wal_gen_id,
+                                                stage: FlushPipelineStage::Build,
+                                                message: format!(
+                                                    "segment maintained index scan failed: {}",
+                                                    e
+                                                ),
+                                            }),
+                                        );
+                                        cancel.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                };
                             BuiltFlushResult {
                                 epoch_id: work.epoch_id,
                                 wal_gen_to_retire: work.wal_gen_id,
@@ -8024,8 +10407,10 @@ fn bg_flush_build_worker(
                                 seg_id: work.seg_id,
                                 final_dir: work.final_dir,
                                 dense_config: work.dense_config,
-                                maintained_equality_index_ids,
-                                maintained_range_index_ids,
+                                maintained_equality_index_ids: maintained_index_ids
+                                    .equality_index_ids,
+                                maintained_range_index_ids: maintained_index_ids.range_index_ids,
+                                secondary_indexes: current_secondary_indexes,
                             }
                         }
                     } else {
@@ -8099,6 +10484,7 @@ fn bg_flush_publish_worker(
     next_node_id_seen: Arc<AtomicU64>,
     next_edge_id_seen: Arc<AtomicU64>,
     engine_seq_seen: Arc<AtomicU64>,
+    label_catalog: Arc<RwLock<RuntimeLabelCatalog>>,
     cancel: Arc<AtomicBool>,
     events_ready: Arc<AtomicUsize>,
     runtime: Option<std::sync::Weak<DbRuntime>>,
@@ -8109,10 +10495,11 @@ fn bg_flush_publish_worker(
             break;
         }
 
-        let reader = match SegmentReader::open(
+        let reader = match SegmentReader::open_with_info(
             &result.final_dir,
-            result.seg_id,
+            &result.seg_info,
             result.dense_config.as_ref(),
+            &result.secondary_indexes,
         ) {
             Ok(reader) => reader,
             Err(e) => {
@@ -8191,6 +10578,11 @@ fn bg_flush_publish_worker(
             manifest.next_engine_seq = manifest
                 .next_engine_seq
                 .max(engine_seq_seen.load(Ordering::Acquire));
+            merge_checkpointed_label_catalog_into_manifest(
+                &mut manifest,
+                &label_catalog,
+                Some(result.wal_gen_to_retire),
+            );
             let rebuild_equality_index_ids = reconcile_background_output_equality_declarations(
                 &mut manifest,
                 &result.maintained_equality_index_ids,
@@ -8257,16 +10649,14 @@ fn bg_flush_publish_worker(
 fn bg_compact_worker(
     db_dir: PathBuf,
     seg_id: u64,
-    input_segments: Vec<(u64, PathBuf)>,
-    prune_policies: Vec<PrunePolicy>,
+    input_segments: Vec<(SegmentInfo, PathBuf)>,
+    prune_policies: Vec<ResolvedPrunePolicy>,
     dense_vector: Option<DenseVectorConfig>,
     secondary_indexes: SecondaryIndexEntries,
     cancel: &AtomicBool,
     #[cfg(test)] compact_pause: &Arc<Mutex<Option<BgCompactPauseHook>>>,
 ) -> Result<BgCompactResult, EngineError> {
     let compact_start = std::time::Instant::now();
-    let maintained_equality_index_ids = equality_index_ids_snapshot(&secondary_indexes);
-    let maintained_range_index_ids = range_index_ids_snapshot(&secondary_indexes);
 
     #[cfg(test)]
     if let Some(hook) = compact_pause.lock().unwrap().take() {
@@ -8277,11 +10667,12 @@ fn bg_compact_worker(
     // Re-open input segments (independent mmap handles, safe to use concurrently
     // with the main thread's readers of the same files).
     let mut segments = Vec::with_capacity(input_segments.len());
-    for (id, path) in &input_segments {
-        segments.push(Arc::new(SegmentReader::open(
+    for (info, path) in &input_segments {
+        segments.push(Arc::new(SegmentReader::open_with_info(
             path,
-            *id,
+            info,
             dense_vector.as_ref(),
+            &secondary_indexes,
         )?));
     }
 
@@ -8341,9 +10732,30 @@ fn bg_compact_worker(
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(e.into());
     }
+    if let Some(parent) = final_dir.parent() {
+        if let Err(e) = fsync_dir(parent) {
+            let _ = std::fs::remove_dir_all(&final_dir);
+            return Err(e);
+        }
+    }
+    let maintained_index_ids = match maintained_secondary_index_ids_from_segment_manifest(
+        &final_dir,
+        &secondary_indexes,
+    ) {
+        Ok(ids) => ids,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&final_dir);
+            return Err(error);
+        }
+    };
 
     // Open the output segment reader (will be sent back to the main thread).
-    let reader = match SegmentReader::open(&final_dir, seg_id, dense_vector.as_ref()) {
+    let reader = match SegmentReader::open_with_info(
+        &final_dir,
+        &seg_info,
+        dense_vector.as_ref(),
+        &secondary_indexes,
+    ) {
         Ok(r) => r,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&final_dir);
@@ -8361,10 +10773,13 @@ fn bg_compact_worker(
         reader.warm_declared_index_runtime_coverage(entry);
     }
 
-    let input_segment_ids: NodeIdSet = input_segments.iter().map(|(id, _)| *id).collect();
+    let input_segment_snapshots: Vec<SegmentInfo> = input_segments
+        .iter()
+        .map(|(info, _)| info.clone())
+        .collect();
     let old_seg_dirs: Vec<PathBuf> = input_segments
         .iter()
-        .map(|(id, _)| segment_dir(&db_dir, *id))
+        .map(|(info, _)| segment_dir(&db_dir, info.id))
         .collect();
 
     let stats = CompactionStats {
@@ -8384,9 +10799,9 @@ fn bg_compact_worker(
         reader,
         old_seg_dirs,
         stats,
-        input_segment_ids,
-        maintained_equality_index_ids,
-        maintained_range_index_ids,
+        input_segment_snapshots,
+        maintained_equality_index_ids: maintained_index_ids.equality_index_ids,
+        maintained_range_index_ids: maintained_index_ids.range_index_ids,
         secondary_index_report,
     })
 }
@@ -8400,7 +10815,7 @@ struct NodeWinner {
     seg_idx: usize,
     data_offset: u64,
     data_len: u32,
-    type_id: u32,
+    label_ids: NodeLabelSet,
     updated_at: i64,
     weight: f32,
     key_len: u16,
@@ -8418,7 +10833,7 @@ struct EdgeWinner {
     data_len: u32,
     from: u64,
     to: u64,
-    type_id: u32,
+    label_id: u32,
     updated_at: i64,
     weight: f32,
     valid_from: i64,
@@ -8438,21 +10853,21 @@ struct V3Plan {
 /// OR across policies (any match → pruned), AND within each policy.
 /// Uses the shared `matches_prune_cutoff` helper (same logic as read-time filtering).
 fn matches_any_prune_policy_meta(
-    type_id: u32,
+    label_ids: &NodeLabelSet,
     updated_at: i64,
     weight: f32,
-    policies: &[PrunePolicy],
+    policies: &[ResolvedPrunePolicy],
     now: i64,
 ) -> bool {
     for policy in policies {
         let age_cutoff = policy.max_age_ms.map(|age| now - age);
         if matches_prune_cutoff(
-            type_id,
+            label_ids,
             updated_at,
             weight,
             age_cutoff,
             policy.max_weight,
-            policy.type_id,
+            policy.label_id,
         ) {
             return true;
         }
@@ -8467,7 +10882,7 @@ fn matches_any_prune_policy_meta(
 /// fields without decoding full records.
 fn v3_plan_winners(
     segments: &[Arc<SegmentReader>],
-    prune_policies: &[PrunePolicy],
+    prune_policies: &[ResolvedPrunePolicy],
     deleted_nodes: &NodeIdSet,
     deleted_edges: &NodeIdSet,
 ) -> Result<V3Plan, EngineError> {
@@ -8482,52 +10897,47 @@ fn v3_plan_winners(
     for (seg_idx, seg) in segments.iter().enumerate() {
         let count = seg.node_meta_count() as usize;
         for i in 0..count {
-            let (
-                node_id,
-                data_offset,
-                data_len,
-                type_id,
-                updated_at,
-                weight,
-                key_len,
-                _prop_hash_offset,
-                _prop_hash_count,
-                last_write_seq,
-            ) = seg.node_meta_at(i)?;
+            let meta = seg.node_meta_at(i)?;
             let (dense_vector_offset, dense_vector_len, sparse_vector_offset, sparse_vector_len) =
                 seg.node_vector_meta_at(i)?;
 
-            if seen_nodes.contains(&node_id) {
+            if seen_nodes.contains(&meta.node_id) {
                 continue; // Already have a newer version
             }
-            seen_nodes.insert(node_id);
+            seen_nodes.insert(meta.node_id);
 
-            if deleted_nodes.contains(&node_id) {
+            if deleted_nodes.contains(&meta.node_id) {
                 continue; // Tombstoned
             }
 
             if has_policies
-                && matches_any_prune_policy_meta(type_id, updated_at, weight, prune_policies, now)
+                && matches_any_prune_policy_meta(
+                    &meta.label_ids,
+                    meta.updated_at,
+                    meta.weight,
+                    prune_policies,
+                    now,
+                )
             {
-                pruned_node_ids.insert(node_id);
+                pruned_node_ids.insert(meta.node_id);
                 continue;
             }
 
             node_winners.insert(
-                node_id,
+                meta.node_id,
                 NodeWinner {
                     seg_idx,
-                    data_offset,
-                    data_len,
-                    type_id,
-                    updated_at,
-                    weight,
-                    key_len,
+                    data_offset: meta.data_offset,
+                    data_len: meta.data_len,
+                    label_ids: meta.label_ids,
+                    updated_at: meta.updated_at,
+                    weight: meta.weight,
+                    key_len: meta.key_len,
                     dense_vector_offset,
                     dense_vector_len,
                     sparse_vector_offset,
                     sparse_vector_len,
-                    last_write_seq,
+                    last_write_seq: meta.last_write_seq,
                 },
             );
         }
@@ -8549,7 +10959,7 @@ fn v3_plan_winners(
                 data_len,
                 from,
                 to,
-                type_id,
+                label_id,
                 updated_at,
                 weight,
                 valid_from,
@@ -8586,7 +10996,7 @@ fn v3_plan_winners(
                     data_len,
                     from,
                     to,
-                    type_id,
+                    label_id,
                     updated_at,
                     weight,
                     valid_from,
@@ -8630,9 +11040,13 @@ fn v3_build_output(
         .map(|(&id, w)| (id, w.seg_idx, w.data_offset, w.data_len))
         .collect();
 
+    let mut core_writer = create_compaction_core_writer(tmp_dir, seg_id)?;
+
     // Raw-copy winning records to output data files
-    let node_data = write_v3_nodes_dat(tmp_dir, segments, &node_winner_list)?;
-    let edge_data = write_v3_edges_dat(tmp_dir, segments, &edge_winner_list)?;
+    let (node_record, node_data) =
+        write_v3_nodes_dat(&mut core_writer, segments, &node_winner_list)?;
+    let (edge_record, edge_data) =
+        write_v3_edges_dat(&mut core_writer, segments, &edge_winner_list)?;
 
     // Build CompactNodeMeta/CompactEdgeMeta by zipping planner winners with output offsets.
     // Both are sorted by ID (BTreeMap iteration + write order), so a linear zip replaces
@@ -8666,7 +11080,7 @@ fn v3_build_output(
             node_id,
             new_data_offset,
             data_len,
-            type_id: w.type_id,
+            label_ids: w.label_ids,
             updated_at: w.updated_at,
             weight: w.weight,
             key_len: w.key_len,
@@ -8696,38 +11110,49 @@ fn v3_build_output(
             data_len,
             from: w.from,
             to: w.to,
-            type_id: w.type_id,
+            label_id: w.label_id,
             updated_at: w.updated_at,
             weight: w.weight,
             valid_from: w.valid_from,
             valid_to: w.valid_to,
+            src_seg_idx: w.seg_idx,
+            src_data_offset: w.data_offset,
             last_write_seq: w.last_write_seq,
         });
     }
 
+    let (source_groups, dense_points) = write_compaction_source_components(
+        seg_id,
+        &mut core_writer,
+        segments,
+        node_record,
+        edge_record,
+        &node_metas,
+        &edge_metas,
+    )?;
+
     // Build all secondary indexes and sidecars from metadata
-    let secondary_index_report = write_indexes_from_metadata_with_secondary_indexes(
+    let component_output = write_indexes_from_metadata_with_secondary_indexes(
         seg_id,
         tmp_dir,
+        &mut core_writer,
         segments,
         &node_metas,
         &edge_metas,
         dense_config,
+        dense_points,
         write_degree_sidecar,
         secondary_indexes,
+        source_groups,
     )?;
+    let mut records = component_output.records;
+    records.extend(finish_compaction_core_writer(core_writer)?);
 
     let node_count = plan.node_winners.len() as u64;
     let edge_count = plan.edge_winners.len() as u64;
+    let seg_info = finalize_compaction_segment(tmp_dir, seg_id, node_count, edge_count, records)?;
 
-    Ok((
-        SegmentInfo {
-            id: seg_id,
-            node_count,
-            edge_count,
-        },
-        secondary_index_report,
-    ))
+    Ok((seg_info, component_output.report))
 }
 
 fn collect_fast_merge_node_metas(
@@ -8738,51 +11163,45 @@ fn collect_fast_merge_node_metas(
     for (seg_idx, seg) in segments.iter().enumerate() {
         let info = &copy_info[seg_idx];
         for i in 0..seg.node_meta_count() as usize {
-            let (
-                node_id,
-                data_offset,
-                data_len,
-                type_id,
-                updated_at,
-                weight,
-                key_len,
-                _prop_hash_offset,
-                _prop_hash_count,
-                last_write_seq,
-            ) = seg.node_meta_at(i)?;
+            let meta = seg.node_meta_at(i)?;
             let (dense_vector_offset, dense_vector_len, sparse_vector_offset, sparse_vector_len) =
                 seg.node_vector_meta_at(i)?;
-            let rebased_offset =
-                info.new_data_base
-                    .checked_add(data_offset.checked_sub(info.orig_data_start).ok_or_else(
-                        || {
+            let rebased_offset = info
+                .new_data_base
+                .checked_add(
+                    meta.data_offset
+                        .checked_sub(info.orig_data_start)
+                        .ok_or_else(|| {
                             EngineError::CorruptRecord(format!(
                                 "segment {} node {} data offset {} precedes data section {}",
-                                seg.segment_id, node_id, data_offset, info.orig_data_start
+                                seg.segment_id,
+                                meta.node_id,
+                                meta.data_offset,
+                                info.orig_data_start
                             ))
-                        },
-                    )?)
-                    .ok_or_else(|| {
-                        EngineError::CorruptRecord(format!(
-                            "segment {} node {} merged offset overflow",
-                            seg.segment_id, node_id
-                        ))
-                    })?;
+                        })?,
+                )
+                .ok_or_else(|| {
+                    EngineError::CorruptRecord(format!(
+                        "segment {} node {} merged offset overflow",
+                        seg.segment_id, meta.node_id
+                    ))
+                })?;
             metas.push(CompactNodeMeta {
-                node_id,
+                node_id: meta.node_id,
                 new_data_offset: rebased_offset,
-                data_len,
-                type_id,
-                updated_at,
-                weight,
-                key_len,
+                data_len: meta.data_len,
+                label_ids: meta.label_ids,
+                updated_at: meta.updated_at,
+                weight: meta.weight,
+                key_len: meta.key_len,
                 dense_vector_offset,
                 dense_vector_len,
                 sparse_vector_offset,
                 sparse_vector_len,
                 src_seg_idx: seg_idx,
-                src_data_offset: data_offset,
-                last_write_seq,
+                src_data_offset: meta.data_offset,
+                last_write_seq: meta.last_write_seq,
             });
         }
     }
@@ -8812,7 +11231,7 @@ fn collect_fast_merge_edge_metas(
                 data_len,
                 from,
                 to,
-                type_id,
+                label_id,
                 updated_at,
                 weight,
                 valid_from,
@@ -8841,11 +11260,13 @@ fn collect_fast_merge_edge_metas(
                 data_len,
                 from,
                 to,
-                type_id,
+                label_id,
                 updated_at,
                 weight,
                 valid_from,
                 valid_to,
+                src_seg_idx: seg_idx,
+                src_data_offset: data_offset,
                 last_write_seq,
             });
         }
@@ -8871,30 +11292,46 @@ fn build_fast_merge_output(
 ) -> Result<(SegmentInfo, SecondaryIndexMaintenanceReport), EngineError> {
     std::fs::create_dir_all(tmp_dir)?;
 
-    let node_copy_info = write_merged_nodes_dat(tmp_dir, segments)?;
-    let edge_copy_info = write_merged_edges_dat(tmp_dir, segments)?;
+    let mut core_writer = create_compaction_core_writer(tmp_dir, seg_id)?;
+    let (node_record, node_copy_info) = write_merged_nodes_dat(&mut core_writer, segments)?;
+    let (edge_record, edge_copy_info) = write_merged_edges_dat(&mut core_writer, segments)?;
     let node_metas = collect_fast_merge_node_metas(segments, &node_copy_info)?;
     let edge_metas = collect_fast_merge_edge_metas(segments, &edge_copy_info)?;
 
-    let secondary_index_report = write_indexes_from_metadata_with_secondary_indexes(
+    let (source_groups, dense_points) = write_compaction_source_components(
+        seg_id,
+        &mut core_writer,
+        segments,
+        node_record,
+        edge_record,
+        &node_metas,
+        &edge_metas,
+    )?;
+
+    let component_output = write_indexes_from_metadata_with_secondary_indexes(
         seg_id,
         tmp_dir,
+        &mut core_writer,
         segments,
         &node_metas,
         &edge_metas,
         dense_config,
+        dense_points,
         true,
         secondary_indexes,
+        source_groups,
+    )?;
+    let mut records = component_output.records;
+    records.extend(finish_compaction_core_writer(core_writer)?);
+    let seg_info = finalize_compaction_segment(
+        tmp_dir,
+        seg_id,
+        node_metas.len() as u64,
+        edge_metas.len() as u64,
+        records,
     )?;
 
-    Ok((
-        SegmentInfo {
-            id: seg_id,
-            node_count: node_metas.len() as u64,
-            edge_count: edge_metas.len() as u64,
-        },
-        secondary_index_report,
-    ))
+    Ok((seg_info, component_output.report))
 }
 
 /// V3 background merge: metadata-only planning + raw binary copy.
@@ -8931,7 +11368,7 @@ fn bg_standard_merge(
     tmp_dir: &Path,
     seg_id: u64,
     has_tombstones: bool,
-    prune_policies: &[PrunePolicy],
+    prune_policies: &[ResolvedPrunePolicy],
     dense_config: Option<&DenseVectorConfig>,
     secondary_indexes: &[SecondaryIndexManifestEntry],
     cancel: &AtomicBool,
@@ -8993,12 +11430,193 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn internal_node_record(
+        engine: &DatabaseEngine,
+        id: u64,
+    ) -> Result<Option<NodeRecord>, EngineError> {
+        let (_guard, published) = engine.runtime.published_snapshot()?;
+        published.view.get_node(id)
+    }
+
+    fn internal_edge_record(
+        engine: &DatabaseEngine,
+        id: u64,
+    ) -> Result<Option<EdgeRecord>, EngineError> {
+        let (_guard, published) = engine.runtime.published_snapshot()?;
+        published.view.get_edge(id)
+    }
+
+    fn internal_edge_records(
+        engine: &DatabaseEngine,
+        ids: &[u64],
+    ) -> Result<Vec<Option<EdgeRecord>>, EngineError> {
+        let (_guard, published) = engine.runtime.published_snapshot()?;
+        published.view.get_edges(ids)
+    }
+
+    fn seed_internal_wal_op_tokens(
+        engine: &DatabaseEngine,
+        ops: &[WalOp],
+    ) -> Result<(), EngineError> {
+        let node_label_for_label_id = |label_id| match label_id {
+            1 => "Person".to_string(),
+            2 => "Company".to_string(),
+            3 => "Article".to_string(),
+            4 => "Topic".to_string(),
+            5 => "City".to_string(),
+            6 => "Project".to_string(),
+            7 => "Account".to_string(),
+            8 => "Team".to_string(),
+            9 => "User".to_string(),
+            10 => "Document".to_string(),
+            20 => "Group".to_string(),
+            90 => "Metric".to_string(),
+            99 => "MissingLabel".to_string(),
+            110 => "SearchNode110".to_string(),
+            117 => "SearchNode117".to_string(),
+            120 => "SearchNode120".to_string(),
+            831 => "SpecialNode831".to_string(),
+            999 => "SpecialNode999".to_string(),
+            1024 => "SpecialNode1024".to_string(),
+            _ => format!("NodeLabel{label_id}"),
+        };
+        let edge_label_for_label_id = |label_id| match label_id {
+            1 => "RELATES_TO".to_string(),
+            2 => "WORKS_AT".to_string(),
+            3 => "LIKES".to_string(),
+            4 => "MENTIONS".to_string(),
+            5 => "OWNS".to_string(),
+            6 => "FOLLOWS".to_string(),
+            7 => "FRIENDS_WITH".to_string(),
+            8 => "COLLABORATES_WITH".to_string(),
+            9 => "RELATED_TO".to_string(),
+            10 => "KNOWS".to_string(),
+            11 => "BLOCKS".to_string(),
+            12 => "DEPENDS_ON".to_string(),
+            13 => "ASSIGNED_TO".to_string(),
+            14 => "REVIEWED_BY".to_string(),
+            15 => "PUBLISHED_BY".to_string(),
+            16 => "TAGGED_WITH".to_string(),
+            20 => "REPORTS_TO".to_string(),
+            30 => "RATES".to_string(),
+            40 => "REFERENCES".to_string(),
+            99 => "MISSING_EDGE_LABEL".to_string(),
+            831 => "SPECIAL_EDGE_831".to_string(),
+            999 => "SPECIAL_EDGE_999".to_string(),
+            1024 => "SPECIAL_EDGE_1024".to_string(),
+            _ => format!("EDGE_LABEL_{label_id}"),
+        };
+        engine.with_core_mut(|core| {
+            let mut dirty = false;
+            {
+                let mut catalog = core.label_catalog.write().unwrap();
+                for op in ops {
+                    match op {
+                        WalOp::UpsertNode(node) => {
+                            for &label_id in node.label_ids.as_slice() {
+                                let label = node_label_for_label_id(label_id);
+                                if !catalog.node_id_to_label.contains_key(&label_id) {
+                                    catalog.apply_node_label(label, label_id, None)?;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        WalOp::UpsertEdge(edge) => {
+                            let label = edge_label_for_label_id(edge.label_id);
+                            if !catalog.edge_id_to_label.contains_key(&edge.label_id) {
+                                catalog.apply_edge_label(label, edge.label_id, None)?;
+                                dirty = true;
+                            }
+                        }
+                        WalOp::EnsureNodeLabel { .. }
+                        | WalOp::EnsureEdgeLabel { .. }
+                        | WalOp::DeleteNode { .. }
+                        | WalOp::DeleteEdge { .. }
+                        | WalOp::BeginAtomicBatch { .. }
+                        | WalOp::CommitAtomicBatch { .. } => {}
+                    }
+                }
+                if dirty {
+                    catalog.apply_to_manifest(&mut core.manifest);
+                }
+            }
+            if dirty {
+                write_manifest(&core.db_dir, &core.manifest)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn seed_internal_node_labels(
+        engine: &DatabaseEngine,
+        label_ids: &[u32],
+    ) -> Result<(), EngineError> {
+        let node_label_for_label_id = |label_id| match label_id {
+            1 => "Person".to_string(),
+            2 => "Company".to_string(),
+            3 => "Article".to_string(),
+            4 => "Topic".to_string(),
+            5 => "City".to_string(),
+            6 => "Project".to_string(),
+            7 => "Account".to_string(),
+            8 => "Team".to_string(),
+            9 => "User".to_string(),
+            10 => "Document".to_string(),
+            20 => "Group".to_string(),
+            90 => "Metric".to_string(),
+            99 => "MissingLabel".to_string(),
+            110 => "SearchNode110".to_string(),
+            117 => "SearchNode117".to_string(),
+            120 => "SearchNode120".to_string(),
+            831 => "SpecialNode831".to_string(),
+            999 => "SpecialNode999".to_string(),
+            1024 => "SpecialNode1024".to_string(),
+            _ => format!("NodeLabel{label_id}"),
+        };
+        engine.with_core_mut(|core| {
+            let mut dirty = false;
+            {
+                let mut catalog = core.label_catalog.write().unwrap();
+                for &label_id in label_ids {
+                    if !catalog.node_id_to_label.contains_key(&label_id) {
+                        catalog.apply_node_label(
+                            node_label_for_label_id(label_id),
+                            label_id,
+                            None,
+                        )?;
+                        dirty = true;
+                    }
+                }
+                if dirty {
+                    catalog.apply_to_manifest(&mut core.manifest);
+                }
+            }
+            if dirty {
+                write_manifest(&core.db_dir, &core.manifest)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn write_internal_wal_op(engine: &DatabaseEngine, op: &WalOp) -> Result<(), EngineError> {
+        seed_internal_wal_op_tokens(engine, std::slice::from_ref(op))?;
+        engine.write_op(op)
+    }
+
+    fn write_internal_wal_op_batch(
+        engine: &DatabaseEngine,
+        ops: &[WalOp],
+    ) -> Result<(), EngineError> {
+        seed_internal_wal_op_tokens(engine, ops)?;
+        engine.write_op_batch(ops)
+    }
+
     fn make_node(id: u64, key: &str) -> NodeRecord {
         let mut props = BTreeMap::new();
         props.insert("name".to_string(), PropValue::String(key.to_string()));
         NodeRecord {
             id,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: key.to_string(),
             props,
             created_at: 1000 * id as i64,
@@ -9015,7 +11633,7 @@ mod tests {
             id,
             from,
             to,
-            type_id: 10,
+            label_id: 10,
             props: BTreeMap::new(),
             created_at: 2000 * id as i64,
             updated_at: 2000 * id as i64 + 1,
@@ -9026,6 +11644,233 @@ mod tests {
         }
     }
 
+    fn is_atomic_batch_marker(op: &WalOp) -> bool {
+        matches!(
+            op,
+            WalOp::BeginAtomicBatch { .. } | WalOp::CommitAtomicBatch { .. }
+        )
+    }
+
+    fn marker_free_wal_records(records: &[(u64, WalOp)]) -> Vec<(u64, WalOp)> {
+        records
+            .iter()
+            .filter(|(_, op)| !is_atomic_batch_marker(op))
+            .cloned()
+            .collect()
+    }
+
+    fn assert_no_atomic_batch_markers(records: &[(u64, WalOp)]) {
+        assert!(
+            records.iter().all(|(_, op)| !is_atomic_batch_marker(op)),
+            "expected marker-free WAL records, got {records:?}"
+        );
+    }
+
+    fn split_top_level_args(call_args: &str) -> Vec<&str> {
+        let mut args = Vec::new();
+        let mut start = 0usize;
+        let mut paren_depth = 0i32;
+        let mut bracket_depth = 0i32;
+        let mut brace_depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for (idx, ch) in call_args.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '(' => paren_depth += 1,
+                ')' => paren_depth -= 1,
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth -= 1,
+                '{' => brace_depth += 1,
+                '}' => brace_depth -= 1,
+                ',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                    args.push(call_args[start..idx].trim());
+                    start = idx + ch.len_utf8();
+                }
+                _ => {}
+            }
+        }
+        args.push(call_args[start..].trim());
+        args
+    }
+
+    fn call_args_after<'a>(source: &'a str, needle: &str) -> Vec<&'a str> {
+        let mut calls = Vec::new();
+        let mut offset = 0usize;
+        while let Some(pos) = source[offset..].find(needle) {
+            let needle_start = offset + pos;
+            let after_needle = needle_start + needle.len();
+            let Some(open_rel) = source[after_needle..].find('(') else {
+                break;
+            };
+            let open = after_needle + open_rel;
+            if !source[after_needle..open].trim().is_empty() {
+                offset = after_needle;
+                continue;
+            }
+
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escaped = false;
+            for (rel, ch) in source[open..].char_indices() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+
+                match ch {
+                    '"' => in_string = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let close = open + rel;
+                            calls.push(&source[open + 1..close]);
+                            offset = close + ch.len_utf8();
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if offset <= needle_start {
+                offset = after_needle;
+            }
+        }
+        calls
+    }
+
+    fn arg_starts_with_number(arg: &str) -> bool {
+        arg.trim_start()
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit())
+    }
+
+    #[test]
+    fn engine_tests_do_not_use_legacy_numeric_public_adapter_patterns() {
+        let adapter_forbidden = [
+            concat!("struct DatabaseEngine", "(super::DatabaseEngine)"),
+            concat!("legacy", "_node_label"),
+            concat!("legacy", "_edge", "_", "type"),
+            concat!("seed", "_legacy_numeric_test_label_tokens"),
+            concat!("test_node", "_label("),
+            concat!("test_edge", "_", "type("),
+            concat!("test_node", "_label_names("),
+            concat!("test_edge", "_", "type_names("),
+            concat!("test_node", "_label_option("),
+            concat!("test_node", "_key_query("),
+            concat!("test_node", "_key_queries("),
+        ];
+        let included_test_forbidden = [
+            adapter_forbidden.as_slice(),
+            &[
+                concat!("node_type", "_filter:"),
+                concat!("get_nodes_by_keys", "(&[("),
+            ],
+        ]
+        .concat();
+
+        let engine_mod_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/mod.rs");
+        let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/tests");
+        let files = std::fs::read_dir(&test_dir).unwrap();
+        let mut violations = Vec::new();
+
+        let engine_mod_source = std::fs::read_to_string(&engine_mod_path).unwrap();
+        let engine_mod_display = engine_mod_path
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(&engine_mod_path);
+        for forbidden in adapter_forbidden {
+            if engine_mod_source.contains(forbidden) {
+                violations.push(format!(
+                    "{} contains `{}`",
+                    engine_mod_display.display(),
+                    forbidden
+                ));
+            }
+        }
+
+        for file in files {
+            let path = file.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let display = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(&path);
+
+            for forbidden in &included_test_forbidden {
+                if source.contains(*forbidden) {
+                    violations.push(format!("{} contains `{}`", display.display(), forbidden));
+                }
+            }
+
+            for (method, arg_index) in [
+                ("upsert_node", 0usize),
+                ("ensure_node_property_index", 0),
+                ("ensure_edge_property_index", 0),
+                ("get_node_by_key", 0),
+                ("upsert_edge", 2),
+                ("get_edge_by_triple", 2),
+            ] {
+                for call_args in call_args_after(&source, method) {
+                    let args = split_top_level_args(call_args);
+                    if args
+                        .get(arg_index)
+                        .is_some_and(|arg| arg_starts_with_number(arg))
+                    {
+                        violations.push(format!(
+                            "{} has numeric public `{}` argument in `{}`",
+                            display.display(),
+                            method,
+                            call_args.lines().next().unwrap_or(call_args).trim()
+                        ));
+                    }
+                }
+            }
+
+            for (line_no, line) in source.lines().enumerate() {
+                if line.contains("label_filter_ids:") && !line.contains("edge_label_filter:") {
+                    violations.push(format!(
+                        "{}:{} contains legacy `{}`",
+                        display.display(),
+                        line_no + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "legacy numeric public API patterns remain:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    include!("tests/label_catalog.rs");
+    include!("tests/wal_atomic.rs");
     include!("tests/lifecycle.rs");
     include!("tests/txn.rs");
     include!("tests/write.rs");

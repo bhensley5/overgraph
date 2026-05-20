@@ -83,7 +83,7 @@ def _request_list(value: Sequence[Any], field: str) -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class NodeQueryRequest:
-    type_id: int | None = None
+    label_filter: Mapping[str, Any] | None = None
     ids: Sequence[int] | None = None
     keys: Sequence[str] | None = None
     filter: Mapping[str, Any] | None = None
@@ -94,7 +94,7 @@ class NodeQueryRequest:
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
-        _set_if_not_none(data, "type_id", self.type_id)
+        _set_if_not_none(data, "label_filter", _optional_dict(self.label_filter))
         _set_if_not_none(data, "ids", _optional_int_list(self.ids, "ids"))
         _set_if_not_none(data, "keys", _optional_str_list(self.keys, "keys"))
         _set_if_not_none(data, "filter", _optional_dict(self.filter))
@@ -110,16 +110,46 @@ QueryNodeRequest = NodeQueryRequest
 
 
 @dataclass(frozen=True)
+class EdgeQueryRequest:
+    label: str | None = None
+    ids: Sequence[int] | None = None
+    from_ids: Sequence[int] | None = None
+    to_ids: Sequence[int] | None = None
+    endpoint_ids: Sequence[int] | None = None
+    filter: Mapping[str, Any] | None = None
+    limit: int | None = None
+    after: int | None = None
+    allow_full_scan: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        _set_if_not_none(data, "label", self.label)
+        _set_if_not_none(data, "ids", _optional_int_list(self.ids, "ids"))
+        _set_if_not_none(data, "from_ids", _optional_int_list(self.from_ids, "from_ids"))
+        _set_if_not_none(data, "to_ids", _optional_int_list(self.to_ids, "to_ids"))
+        _set_if_not_none(data, "endpoint_ids", _optional_int_list(self.endpoint_ids, "endpoint_ids"))
+        _set_if_not_none(data, "filter", _optional_dict(self.filter))
+        _set_if_not_none(data, "limit", self.limit)
+        _set_if_not_none(data, "after", self.after)
+        if self.allow_full_scan:
+            data["allow_full_scan"] = True
+        return data
+
+
+QueryEdgeRequest = EdgeQueryRequest
+
+
+@dataclass(frozen=True)
 class GraphNodePattern:
     alias: str
-    type_id: int | None = None
+    label_filter: Mapping[str, Any] | None = None
     ids: Sequence[int] | None = None
     keys: Sequence[str] | None = None
     filter: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"alias": self.alias}
-        _set_if_not_none(data, "type_id", self.type_id)
+        _set_if_not_none(data, "label_filter", _optional_dict(self.label_filter))
         _set_if_not_none(data, "ids", _optional_int_list(self.ids, "ids"))
         _set_if_not_none(data, "keys", _optional_str_list(self.keys, "keys"))
         _set_if_not_none(data, "filter", _optional_dict(self.filter))
@@ -132,9 +162,8 @@ class GraphEdgePattern:
     to_alias: str
     alias: str | None = None
     direction: str | None = None
-    type_filter: Sequence[int] | None = None
-    where: Mapping[str, Any] | None = None
-    predicates: Sequence[Mapping[str, Any]] | None = None
+    label_filter: Sequence[str] | None = None
+    filter: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -143,13 +172,12 @@ class GraphEdgePattern:
         }
         _set_if_not_none(data, "alias", self.alias)
         _set_if_not_none(data, "direction", self.direction)
-        _set_if_not_none(data, "type_filter", _optional_int_list(self.type_filter, "type_filter"))
-        _set_if_not_none(data, "where", _optional_dict(self.where))
         _set_if_not_none(
             data,
-            "predicates",
-            _optional_mapping_list(self.predicates, "predicates"),
+            "label_filter",
+            _optional_str_list(self.label_filter, "label_filter"),
         )
+        _set_if_not_none(data, "filter", _optional_dict(self.filter))
         return data
 
 

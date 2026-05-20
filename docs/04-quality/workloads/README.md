@@ -8,8 +8,8 @@ This directory defines the cross-language benchmark profile contract for Phase 1
 
 ## Determinism Rules
 - Seed: `1729`
-- Node key format: `node:{i}`
-- Type IDs cycle through `[1, 2, 3, 4, 5]`
+- Node key format: `node-{i}`
+- Node labels cycle through `Person`, `Company`, `Document`, `Project`, and `Observation`
 - Weight formula: `0.5 + ((i mod 500) / 1000.0)`
 - Temporal edge fields use:
   - `valid_from = 1700000000000 + i`
@@ -48,11 +48,16 @@ All benchmark harnesses (Rust, Node.js, Python) must load these fields consisten
 - percentile computation method declaration
 
 ## Query Scenario Set
-Phase 23 adds a query-only scenario set for native planner parity:
+Phase 23 adds a query-only scenario set for native planner parity. Phase 26 extends it with
+planner-backed direct edge query scenarios:
 
 - `S-QUERY-001`: `query_node_ids_intersected_predicates`
 - `S-QUERY-002`: `query_nodes_intersected_predicates_hydrated`
+- `S-QUERY-003`: `query_edge_ids_endpoint_metadata`
+- `S-QUERY-004`: `query_edges_endpoint_property_hydrated`
 
-These scenarios benchmark planner intersection over existing single-source property indexes. They
-must not be described as compound-index benchmarks; maintained compound/composite indexes remain a
-separate follow-up.
+The node scenarios benchmark planner intersection over existing single-source property indexes.
+They must not be described as compound-index benchmarks; maintained compound/composite indexes
+remain a separate follow-up. The edge scenarios benchmark endpoint-bounded direct edge queries with
+metadata-only verification and bounded property-filter hydration; Phase 26 does not include
+maintained edge-property indexes.

@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 import pytest_asyncio
-from overgraph import AsyncOverGraph
+from overgraph import AsyncOverGraph, OverGraphError
 
 
 @pytest_asyncio.fixture
@@ -42,7 +42,7 @@ class TestAsyncLifecycle:
         path = os.path.join(d, "testdb")
         try:
             async with await AsyncOverGraph.open(path) as db:
-                nid = await db.upsert_node(1, "test")
+                nid = await db.upsert_node("Person", "test")
                 assert nid > 0
         finally:
             shutil.rmtree(d, ignore_errors=True)
@@ -50,18 +50,82 @@ class TestAsyncLifecycle:
 
 class TestAsyncCrud:
     @pytest.mark.asyncio
+    async def test_catalog_apis(self, async_db):
+        person_id = await async_db.ensure_node_label("Person")
+        company_id = await async_db.ensure_node_label("Company")
+        relates_to_id = await async_db.ensure_edge_label("RELATES_TO")
+        works_at_id = await async_db.ensure_edge_label("WORKS_AT")
+
+        assert await async_db.ensure_node_label("Person") == person_id
+        assert await async_db.ensure_edge_label("RELATES_TO") == relates_to_id
+        assert await async_db.get_node_label_id("Person") == person_id
+        assert await async_db.get_node_label_id("Company") == company_id
+        assert await async_db.get_edge_label_id("RELATES_TO") == relates_to_id
+        assert await async_db.get_edge_label_id("WORKS_AT") == works_at_id
+        assert await async_db.get_node_label(person_id) == "Person"
+        assert await async_db.get_node_label(company_id) == "Company"
+        assert await async_db.get_edge_label(relates_to_id) == "RELATES_TO"
+        assert await async_db.get_edge_label(works_at_id) == "WORKS_AT"
+        assert await async_db.get_edge_label(label_id=relates_to_id) == "RELATES_TO"
+        assert await async_db.get_node_label_id("Document") is None
+        assert await async_db.get_edge_label_id("LIKES") is None
+        assert await async_db.get_node_label(999999) is None
+        assert await async_db.get_edge_label(999999) is None
+
+        old_field_name = "type" + "_id"
+        with pytest.raises(TypeError):
+            await async_db.get_edge_label(**{old_field_name: relates_to_id})
+
+        node_labels = {
+            entry.label: entry.label_id
+            for entry in await async_db.list_node_labels()
+        }
+        edge_label_entries = await async_db.list_edge_labels()
+        edge_labels = {
+            entry.label: entry.label_id
+            for entry in edge_label_entries
+        }
+        assert node_labels["Person"] == person_id
+        assert node_labels["Company"] == company_id
+        assert edge_labels["RELATES_TO"] == relates_to_id
+        assert edge_labels["WORKS_AT"] == works_at_id
+        for entry in edge_label_entries:
+            assert not hasattr(entry, old_field_name)
+        assert "label_id=" in repr(edge_label_entries[0])
+
+    @pytest.mark.asyncio
     async def test_upsert_get_node(self, async_db):
-        nid = await async_db.upsert_node(1, "hello", props={"x": 42})
+        nid = await async_db.upsert_node("Person", "hello", props={"x": 42})
         node = await async_db.get_node(nid)
         assert node is not None
         assert node.key == "hello"
-        assert node.type_id == 1
+        assert node.labels == ["Person"]
+        assert await async_db.add_node_label(nid, "Admin") is True
+        assert await async_db.add_node_label(nid, "Admin") is False
+        assert (await async_db.get_node(nid)).labels == ["Person", "Admin"]
+        assert await async_db.remove_node_label(nid, "Admin") is True
+        assert await async_db.remove_node_label(nid, "Admin") is False
+
+    @pytest.mark.asyncio
+    async def test_node_label_failure_paths(self, async_db):
+        solo = await async_db.upsert_node("Person", "solo")
+        with pytest.raises(OverGraphError, match="last node label"):
+            await async_db.remove_node_label(solo, "Person")
+        assert (await async_db.get_node(solo)).labels == ["Person"]
+
+        alice = await async_db.upsert_node("Person", "shared")
+        other = await async_db.upsert_node("Admin", "shared")
+        with pytest.raises(OverGraphError, match="node key conflict"):
+            await async_db.add_node_label(alice, "Admin")
+
+        assert (await async_db.get_node(alice)).labels == ["Person"]
+        assert (await async_db.get_node(other)).labels == ["Admin"]
 
     @pytest.mark.asyncio
     async def test_upsert_get_edge(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        eid = await async_db.upsert_edge(n1, n2, 10, weight=2.5)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        eid = await async_db.upsert_edge(n1, n2, "RELATES_TO", weight=2.5)
         edge = await async_db.get_edge(eid)
         assert edge is not None
         assert edge.from_id == n1
@@ -69,74 +133,74 @@ class TestAsyncCrud:
 
     @pytest.mark.asyncio
     async def test_delete_node(self, async_db):
-        nid = await async_db.upsert_node(1, "bye")
+        nid = await async_db.upsert_node("Person", "bye")
         await async_db.delete_node(nid)
         assert await async_db.get_node(nid) is None
 
     @pytest.mark.asyncio
     async def test_delete_edge(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        eid = await async_db.upsert_edge(n1, n2, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        eid = await async_db.upsert_edge(n1, n2, "RELATES_TO")
         await async_db.delete_edge(eid)
         assert await async_db.get_edge(eid) is None
 
     @pytest.mark.asyncio
     async def test_get_node_by_key(self, async_db):
-        nid = await async_db.upsert_node(1, "mykey")
-        node = await async_db.get_node_by_key(1, "mykey")
+        nid = await async_db.upsert_node("Person", "mykey")
+        node = await async_db.get_node_by_key("Person", "mykey")
         assert node is not None
         assert node.id == nid
 
     @pytest.mark.asyncio
     async def test_get_edge_by_triple(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        eid = await async_db.upsert_edge(n1, n2, 10)
-        edge = await async_db.get_edge_by_triple(n1, n2, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        eid = await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        edge = await async_db.get_edge_by_triple(n1, n2, "RELATES_TO")
         assert edge is not None
         assert edge.id == eid
 
     @pytest.mark.asyncio
     async def test_invalidate_edge(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        eid = await async_db.upsert_edge(n1, n2, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        eid = await async_db.upsert_edge(n1, n2, "RELATES_TO")
         result = await async_db.invalidate_edge(eid, 1000)
-        assert result is not None  # returns updated EdgeRecord
+        assert result is not None  # returns updated EdgeView
 
 
 class TestAsyncBatch:
     @pytest.mark.asyncio
     async def test_batch_upsert_nodes(self, async_db):
-        nodes = [{"type_id": 1, "key": f"n{i}"} for i in range(5)]
+        nodes = [{"labels": ["Person"], "key": f"n{i}"} for i in range(5)]
         ids = await async_db.batch_upsert_nodes(nodes)
         assert len(ids) == 5
 
     @pytest.mark.asyncio
     async def test_batch_upsert_edges(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        n3 = await async_db.upsert_node(1, "c")
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        n3 = await async_db.upsert_node("Person", "c")
         edges = [
-            {"from_id": n1, "to_id": n2, "type_id": 10},
-            {"from_id": n2, "to_id": n3, "type_id": 10},
+            {"from_id": n1, "to_id": n2, "label": "RELATES_TO"},
+            {"from_id": n2, "to_id": n3, "label": "RELATES_TO"},
         ]
         ids = await async_db.batch_upsert_edges(edges)
         assert len(ids) == 2
 
     @pytest.mark.asyncio
     async def test_get_nodes(self, async_db):
-        nids = [await async_db.upsert_node(1, f"n{i}") for i in range(3)]
+        nids = [await async_db.upsert_node("Person", f"n{i}") for i in range(3)]
         nodes = await async_db.get_nodes(nids)
         assert len(nodes) == 3
         assert all(n is not None for n in nodes)
 
     @pytest.mark.asyncio
     async def test_get_edges(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        eid = await async_db.upsert_edge(n1, n2, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        eid = await async_db.upsert_edge(n1, n2, "RELATES_TO")
         edges = await async_db.get_edges([eid])
         assert len(edges) == 1
         assert edges[0] is not None
@@ -144,9 +208,13 @@ class TestAsyncBatch:
 
     @pytest.mark.asyncio
     async def test_get_nodes_by_keys(self, async_db):
-        await async_db.upsert_node(1, "alice")
-        await async_db.upsert_node(1, "bob")
-        results = await async_db.get_nodes_by_keys([(1, "alice"), (1, "bob"), (1, "missing")])
+        await async_db.upsert_node("Person", "alice")
+        await async_db.upsert_node("Person", "bob")
+        results = await async_db.get_nodes_by_keys([
+            {"labels": ["Person"], "key": "alice"},
+            {"labels": ["Person"], "key": "bob"},
+            {"labels": ["Person"], "key": "missing"},
+        ])
         assert len(results) == 3
         assert results[0].key == "alice"
         assert results[1].key == "bob"
@@ -156,8 +224,8 @@ class TestAsyncBatch:
     async def test_graph_patch(self, async_db):
         result = await async_db.graph_patch({
             "upsert_nodes": [
-                {"type_id": 1, "key": "a"},
-                {"type_id": 1, "key": "b"},
+                {"labels": ["Person"], "key": "a"},
+                {"labels": ["Person"], "key": "b"},
             ],
         })
         assert len(result.node_ids) == 2
@@ -172,17 +240,17 @@ class TestAsyncTransactions:
                 {
                     "op": "upsert_node",
                     "alias": "alice",
-                    "type_id": 1,
+                    "labels": ["Person"],
                     "key": "alice",
                     "props": {"name": "Alice"},
                 },
-                {"op": "upsert_node", "alias": "bob", "type_id": 1, "key": "bob"},
+                {"op": "upsert_node", "alias": "bob", "labels": ["Person"], "key": "bob"},
                 {
                     "op": "upsert_edge",
                     "alias": "knows",
                     "from": {"local": "alice"},
                     "to": {"local": "bob"},
-                    "type_id": 7,
+                    "label": "KNOWS",
                 },
             ]
         )
@@ -190,6 +258,7 @@ class TestAsyncTransactions:
         staged = await txn.get_node({"local": "alice"})
         assert staged is not None
         assert staged["id"] is None
+        assert staged["labels"] == ["Person"]
         assert staged["props"]["name"] == "Alice"
 
         result = await txn.commit()
@@ -201,16 +270,48 @@ class TestAsyncTransactions:
     @pytest.mark.asyncio
     async def test_async_builders_and_rollback(self, async_db):
         txn = await async_db.begin_write_txn()
-        alice = await txn.upsert_node_as("alice", 1, "alice", props={"mood": "staged"})
-        bob = await txn.upsert_node_as("bob", 1, "bob")
-        await txn.upsert_edge_as("knows", alice, bob, 9)
+        alice = await txn.upsert_node_as("alice", "Person", "alice", props={"mood": "staged"})
+        bob = await txn.upsert_node_as("bob", "Person", "bob")
+        await txn.upsert_edge_as("knows", alice, bob, "KNOWS")
 
-        staged = await txn.get_node_by_key(1, "alice")
+        staged = await txn.get_node_by_key("Person", "alice")
         assert staged is not None
         assert staged["props"]["mood"] == "staged"
 
         await txn.rollback()
-        assert await async_db.get_node_by_key(1, "alice") is None
+        assert await async_db.get_node_by_key("Person", "alice") is None
+
+    @pytest.mark.asyncio
+    async def test_async_transaction_add_remove_node_label(self, async_db):
+        node_id = await async_db.upsert_node("Person", "alice")
+
+        txn = await async_db.begin_write_txn()
+        assert await txn.add_node_label({"id": node_id}, "Admin") is True
+        assert await txn.add_node_label({"id": node_id}, "Admin") is False
+        assert (await txn.get_node({"id": node_id}))["labels"] == ["Person", "Admin"]
+        assert await txn.remove_node_label({"id": node_id}, "Admin") is True
+        assert await txn.remove_node_label({"id": node_id}, "Admin") is False
+        await txn.commit()
+
+        assert (await async_db.get_node(node_id)).labels == ["Person"]
+
+    @pytest.mark.asyncio
+    async def test_async_transaction_node_label_failure_paths(self, async_db):
+        solo = await async_db.upsert_node("Person", "solo")
+        txn = await async_db.begin_write_txn()
+        with pytest.raises(OverGraphError, match="last node label"):
+            await txn.remove_node_label({"id": solo}, "Person")
+        await txn.rollback()
+
+        alice = await async_db.upsert_node("Person", "shared")
+        other = await async_db.upsert_node("Admin", "shared")
+        conflict_txn = await async_db.begin_write_txn()
+        with pytest.raises(OverGraphError, match="node key conflict"):
+            await conflict_txn.add_node_label({"id": alice}, "Admin")
+        await conflict_txn.rollback()
+
+        assert (await async_db.get_node(alice)).labels == ["Person"]
+        assert (await async_db.get_node(other)).labels == ["Admin"]
 
     @pytest.mark.asyncio
     async def test_async_transaction_operations_preserve_call_order(self, async_db):
@@ -221,7 +322,7 @@ class TestAsyncTransactions:
                     {
                         "op": "upsert_node",
                         "alias": "queued",
-                        "type_id": 1,
+                        "labels": ["Person"],
                         "key": "queued",
                     }
                 ]
@@ -242,42 +343,42 @@ class TestAsyncTransactions:
 class TestAsyncQueries:
     @pytest.mark.asyncio
     async def test_find_nodes(self, async_db):
-        await async_db.upsert_node(1, "x", props={"color": "red"})
-        ids = await async_db.find_nodes(1, "color", "red")
+        await async_db.upsert_node("Person", "x", props={"color": "red"})
+        ids = await async_db.find_nodes("Person", "color", "red")
         assert len(ids) == 1
 
     @pytest.mark.asyncio
     async def test_count_by_type(self, async_db):
         for i in range(3):
-            await async_db.upsert_node(1, f"n{i}")
-        count = await async_db.count_nodes_by_type(1)
+            await async_db.upsert_node("Person", f"n{i}")
+        count = await async_db.count_nodes_by_labels("Person")
         assert count == 3
 
 
 class TestAsyncTraversal:
     @pytest.mark.asyncio
     async def test_neighbors(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(n1, n2, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
         nbrs = await async_db.neighbors(n1, direction="outgoing")
         assert len(nbrs) == 1
         assert nbrs[0].node_id == n2
 
     @pytest.mark.asyncio
     async def test_top_k_neighbors(self, async_db):
-        center = await async_db.upsert_node(1, "center")
+        center = await async_db.upsert_node("Person", "center")
         for i in range(3):
-            s = await async_db.upsert_node(1, f"s{i}")
-            await async_db.upsert_edge(center, s, 10, weight=float(i + 1))
+            s = await async_db.upsert_node("Person", f"s{i}")
+            await async_db.upsert_edge(center, s, "RELATES_TO", weight=float(i + 1))
         top = await async_db.top_k_neighbors(center, k=2, scoring="weight")
         assert len(top) == 2
 
     @pytest.mark.asyncio
     async def test_extract_subgraph(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(n1, n2, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
         sg = await async_db.extract_subgraph(n1, 1)
         assert len(sg.nodes) == 2
         assert len(sg.edges) == 1
@@ -286,8 +387,8 @@ class TestAsyncTraversal:
 class TestAsyncRetention:
     @pytest.mark.asyncio
     async def test_prune(self, async_db):
-        await async_db.upsert_node(1, "low", weight=0.1)
-        await async_db.upsert_node(1, "high", weight=5.0)
+        await async_db.upsert_node("Person", "low", weight=0.1)
+        await async_db.upsert_node("Person", "high", weight=5.0)
         result = await async_db.prune(max_weight=0.5)
         assert result.nodes_pruned == 1
 
@@ -303,26 +404,26 @@ class TestAsyncRetention:
 class TestAsyncTimeRange:
     @pytest.mark.asyncio
     async def test_find_nodes_by_time_range(self, async_db):
-        await async_db.upsert_node(1, "a")
-        await async_db.upsert_node(1, "b")
+        await async_db.upsert_node("Person", "a")
+        await async_db.upsert_node("Person", "b")
         # Use a wide range to catch all nodes
-        ids = await async_db.find_nodes_by_time_range(1, 0, 2**53)
+        ids = await async_db.find_nodes_by_time_range("Person", 0, 2**53)
         assert len(ids) == 2
 
 
 class TestAsyncMaintenance:
     @pytest.mark.asyncio
     async def test_sync_flush(self, async_db):
-        await async_db.upsert_node(1, "a")
+        await async_db.upsert_node("Person", "a")
         await async_db.sync()
         result = await async_db.flush()
         assert result is not None
 
     @pytest.mark.asyncio
     async def test_compact(self, async_db):
-        await async_db.upsert_node(1, "a")
+        await async_db.upsert_node("Person", "a")
         await async_db.flush()
-        await async_db.upsert_node(1, "b")
+        await async_db.upsert_node("Person", "b")
         await async_db.flush()
         result = await async_db.compact()
         assert result is not None
@@ -330,19 +431,19 @@ class TestAsyncMaintenance:
 
 class TestAsyncPagination:
     @pytest.mark.asyncio
-    async def test_nodes_by_type_paged(self, async_db):
+    async def test_nodes_by_labels_paged(self, async_db):
         for i in range(5):
-            await async_db.upsert_node(1, f"n{i}")
-        page = await async_db.nodes_by_type_paged(1, limit=3)
+            await async_db.upsert_node("Person", f"n{i}")
+        page = await async_db.nodes_by_labels_paged("Person", limit=3)
         assert len(page.items) == 3
         assert page.next_cursor is not None
 
     @pytest.mark.asyncio
     async def test_neighbors_paged(self, async_db):
-        center = await async_db.upsert_node(1, "center")
+        center = await async_db.upsert_node("Person", "center")
         for i in range(5):
-            s = await async_db.upsert_node(1, f"s{i}")
-            await async_db.upsert_edge(center, s, 10)
+            s = await async_db.upsert_node("Person", f"s{i}")
+            await async_db.upsert_edge(center, s, "RELATES_TO")
         page = await async_db.neighbors_paged(center, direction="outgoing", limit=3)
         assert len(page.items) == 3
 
@@ -350,28 +451,28 @@ class TestAsyncPagination:
 class TestAsyncTraversal2:
     @pytest.mark.asyncio
     async def test_traverse(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        n3 = await async_db.upsert_node(1, "c")
-        await async_db.upsert_edge(n1, n2, 10)
-        await async_db.upsert_edge(n2, n3, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        n3 = await async_db.upsert_node("Person", "c")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        await async_db.upsert_edge(n2, n3, "RELATES_TO")
         page = await async_db.traverse(n1, 2, min_depth=2, direction="outgoing")
         assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
 
     @pytest.mark.asyncio
-    async def test_traverse_node_type_filter(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(2, "b")
-        n3 = await async_db.upsert_node(3, "c")
-        await async_db.upsert_edge(n1, n2, 10)
-        await async_db.upsert_edge(n2, n3, 10)
+    async def test_traverse_node_label_filter(self, async_db):
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Company", "b")
+        n3 = await async_db.upsert_node("Document", "c")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        await async_db.upsert_edge(n2, n3, "RELATES_TO")
         page = await async_db.traverse(
             n1,
             2,
             min_depth=2,
             direction="outgoing",
-            edge_type_filter=[10],
-            node_type_filter=[3],
+            edge_label_filter=["RELATES_TO"],
+            emit_node_label_filter={"labels": ["Document"], "mode": "all"},
         )
         assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
 
@@ -384,11 +485,11 @@ class TestAsyncTraversal2:
 
     @pytest.mark.asyncio
     async def test_neighbors_batch(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        n3 = await async_db.upsert_node(1, "c")
-        await async_db.upsert_edge(n1, n2, 10)
-        await async_db.upsert_edge(n1, n3, 20)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        n3 = await async_db.upsert_node("Person", "c")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        await async_db.upsert_edge(n1, n3, "WORKS_AT")
         result = await async_db.neighbors_batch([n1])
         assert n1 in result
         assert len(result[n1]) == 2
@@ -396,113 +497,113 @@ class TestAsyncTraversal2:
 
 class TestAsyncQueries2:
     @pytest.mark.asyncio
-    async def test_count_edges_by_type(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(n1, n2, 10)
-        count = await async_db.count_edges_by_type(10)
+    async def test_count_edges_by_label(self, async_db):
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        count = await async_db.count_edges_by_label("RELATES_TO")
         assert count == 1
 
     @pytest.mark.asyncio
-    async def test_nodes_by_type(self, async_db):
-        await async_db.upsert_node(1, "a")
-        await async_db.upsert_node(1, "b")
-        ids = await async_db.nodes_by_type(1)
+    async def test_nodes_by_labels(self, async_db):
+        await async_db.upsert_node("Person", "a")
+        await async_db.upsert_node("Person", "b")
+        ids = await async_db.nodes_by_labels("Person")
         assert len(ids) == 2
 
     @pytest.mark.asyncio
-    async def test_edges_by_type(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(n1, n2, 10)
-        ids = await async_db.edges_by_type(10)
+    async def test_edges_by_label(self, async_db):
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        ids = await async_db.edges_by_label("RELATES_TO")
         assert len(ids) == 1
 
     @pytest.mark.asyncio
-    async def test_get_nodes_by_type(self, async_db):
-        await async_db.upsert_node(1, "a")
-        await async_db.upsert_node(1, "b")
-        nodes = await async_db.get_nodes_by_type(1)
+    async def test_get_nodes_by_labels(self, async_db):
+        await async_db.upsert_node("Person", "a")
+        await async_db.upsert_node("Person", "b")
+        nodes = await async_db.get_nodes_by_labels("Person")
         assert len(nodes) == 2
         keys = {n.key for n in nodes}
         assert keys == {"a", "b"}
 
     @pytest.mark.asyncio
-    async def test_get_edges_by_type(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(n1, n2, 10)
-        edges = await async_db.get_edges_by_type(10)
+    async def test_get_edges_by_label(self, async_db):
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        edges = await async_db.get_edges_by_label("RELATES_TO")
         assert len(edges) == 1
         assert edges[0].from_id == n1
 
 
 class TestAsyncPagination2:
     @pytest.mark.asyncio
-    async def test_edges_by_type_paged(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        n3 = await async_db.upsert_node(1, "c")
-        await async_db.upsert_edge(n1, n2, 10)
-        await async_db.upsert_edge(n1, n3, 10)
-        await async_db.upsert_edge(n2, n3, 10)
-        page = await async_db.edges_by_type_paged(10, limit=2)
+    async def test_edges_by_label_paged(self, async_db):
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        n3 = await async_db.upsert_node("Person", "c")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        await async_db.upsert_edge(n1, n3, "RELATES_TO")
+        await async_db.upsert_edge(n2, n3, "RELATES_TO")
+        page = await async_db.edges_by_label_paged("RELATES_TO", limit=2)
         assert len(page.items) == 2
         assert page.next_cursor is not None
 
     @pytest.mark.asyncio
-    async def test_get_nodes_by_type_paged(self, async_db):
+    async def test_get_nodes_by_labels_paged(self, async_db):
         for i in range(5):
-            await async_db.upsert_node(1, f"n{i}")
-        page = await async_db.get_nodes_by_type_paged(1, limit=3)
+            await async_db.upsert_node("Person", f"n{i}")
+        page = await async_db.get_nodes_by_labels_paged("Person", limit=3)
         assert len(page.items) == 3
         assert page.next_cursor is not None
 
     @pytest.mark.asyncio
-    async def test_get_edges_by_type_paged(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        n3 = await async_db.upsert_node(1, "c")
-        await async_db.upsert_edge(n1, n2, 10)
-        await async_db.upsert_edge(n2, n3, 10)
-        page = await async_db.get_edges_by_type_paged(10, limit=1)
+    async def test_get_edges_by_label_paged(self, async_db):
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        n3 = await async_db.upsert_node("Person", "c")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        await async_db.upsert_edge(n2, n3, "RELATES_TO")
+        page = await async_db.get_edges_by_label_paged("RELATES_TO", limit=1)
         assert len(page.items) == 1
         assert page.next_cursor is not None
 
     @pytest.mark.asyncio
     async def test_find_nodes_paged(self, async_db):
         for i in range(5):
-            await async_db.upsert_node(1, f"fp{i}", props={"color": "blue"})
-        page = await async_db.find_nodes_paged(1, "color", "blue", limit=3)
+            await async_db.upsert_node("Person", f"fp{i}", props={"color": "blue"})
+        page = await async_db.find_nodes_paged("Person", "color", "blue", limit=3)
         assert len(page.items) == 3
         assert page.next_cursor is not None
 
     @pytest.mark.asyncio
     async def test_find_nodes_by_time_range_paged(self, async_db):
         for i in range(5):
-            await async_db.upsert_node(1, f"tr{i}")
-        page = await async_db.find_nodes_by_time_range_paged(1, 0, 2**53, limit=3)
+            await async_db.upsert_node("Person", f"tr{i}")
+        page = await async_db.find_nodes_by_time_range_paged("Person", 0, 2**53, limit=3)
         assert len(page.items) == 3
 
     @pytest.mark.asyncio
     async def test_traverse_paged(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        n3 = await async_db.upsert_node(1, "c")
-        await async_db.upsert_edge(n1, n2, 10)
-        await async_db.upsert_edge(n2, n3, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        n3 = await async_db.upsert_node("Person", "c")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        await async_db.upsert_edge(n2, n3, "RELATES_TO")
         page = await async_db.traverse(n1, 2, min_depth=2, direction="outgoing")
         assert [(hit.node_id, hit.depth) for hit in page.items] == [(n3, 2)]
 
     @pytest.mark.asyncio
     async def test_traverse_cursor_roundtrip(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        n3 = await async_db.upsert_node(1, "c")
-        n4 = await async_db.upsert_node(1, "d")
-        await async_db.upsert_edge(n1, n2, 10)
-        await async_db.upsert_edge(n2, n3, 10)
-        await async_db.upsert_edge(n2, n4, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        n3 = await async_db.upsert_node("Person", "c")
+        n4 = await async_db.upsert_node("Person", "d")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
+        await async_db.upsert_edge(n2, n3, "RELATES_TO")
+        await async_db.upsert_edge(n2, n4, "RELATES_TO")
         p1 = await async_db.traverse(n1, 2, min_depth=2, direction="outgoing", limit=1)
         assert len(p1.items) == 1
         assert p1.next_cursor is not None
@@ -521,9 +622,9 @@ class TestAsyncPagination2:
 class TestAsyncMaintenance2:
     @pytest.mark.asyncio
     async def test_compact_with_progress(self, async_db):
-        await async_db.upsert_node(1, "a")
+        await async_db.upsert_node("Person", "a")
         await async_db.flush()
-        await async_db.upsert_node(1, "b")
+        await async_db.upsert_node("Person", "b")
         await async_db.flush()
         events = []
         result = await async_db.compact_with_progress(lambda p: (events.append(p) or True))
@@ -535,11 +636,14 @@ class TestAsyncBatch2:
     @pytest.mark.asyncio
     async def test_batch_upsert_nodes_binary(self, async_db):
         import struct
-        import json
-        buf = struct.pack("<I", 2)
+        buf = b"OGNB" + struct.pack("<HI", 2, 2)
         for key in ("a", "b"):
+            label = "Person".encode("utf-8")
             kb = key.encode("utf-8")
-            buf += struct.pack("<IfH", 1, 1.0, len(kb))
+            buf += struct.pack("<B", 1)
+            buf += struct.pack("<H", len(label))
+            buf += label
+            buf += struct.pack("<fH", 1.0, len(kb))
             buf += kb
             buf += struct.pack("<I", 0)
         ids = await async_db.batch_upsert_nodes_binary(buf)
@@ -548,12 +652,13 @@ class TestAsyncBatch2:
     @pytest.mark.asyncio
     async def test_batch_upsert_edges_binary(self, async_db):
         import struct
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
         buf = struct.pack("<I", 1)
-        buf += struct.pack("<QQIf", n1, n2, 10, 1.0)
-        buf += struct.pack("<qq", 0, 0)
-        buf += struct.pack("<I", 0)
+        label = "RELATES_TO".encode("utf-8")
+        buf += struct.pack("<QQH", n1, n2, len(label))
+        buf += label
+        buf += struct.pack("<fqqI", 1.0, 0, 0, 0)
         ids = await async_db.batch_upsert_edges_binary(buf)
         assert len(ids) == 1
 
@@ -561,18 +666,18 @@ class TestAsyncBatch2:
 class TestAsyncAnalytics:
     @pytest.mark.asyncio
     async def test_personalized_pagerank(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(n1, n2, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
         result = await async_db.personalized_pagerank([n1])
         assert len(result.node_ids) > 0
         assert n1 in result.node_ids
 
     @pytest.mark.asyncio
     async def test_personalized_pagerank_approx(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(n1, n2, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
         result = await async_db.personalized_pagerank(
             [n1],
             algorithm="approx",
@@ -584,9 +689,9 @@ class TestAsyncAnalytics:
 
     @pytest.mark.asyncio
     async def test_export_adjacency(self, async_db):
-        n1 = await async_db.upsert_node(1, "a")
-        n2 = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(n1, n2, 10)
+        n1 = await async_db.upsert_node("Person", "a")
+        n2 = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(n1, n2, "RELATES_TO")
         export = await async_db.export_adjacency()
         assert len(export.node_ids) == 2
         assert len(export.edges) == 1
@@ -595,25 +700,25 @@ class TestAsyncAnalytics:
 class TestAsyncDegree:
     @pytest.mark.asyncio
     async def test_degree(self, async_db):
-        a = await async_db.upsert_node(1, "a")
-        b = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(a, b, 10, weight=5.0)
+        a = await async_db.upsert_node("Person", "a")
+        b = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(a, b, "RELATES_TO", weight=5.0)
         assert await async_db.degree(a) == 1
         assert await async_db.degree(b) == 0
 
     @pytest.mark.asyncio
     async def test_sum_edge_weights(self, async_db):
-        a = await async_db.upsert_node(1, "a")
-        b = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(a, b, 10, weight=5.0)
+        a = await async_db.upsert_node("Person", "a")
+        b = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(a, b, "RELATES_TO", weight=5.0)
         s = await async_db.sum_edge_weights(a)
         assert abs(s - 5.0) < 1e-6
 
     @pytest.mark.asyncio
     async def test_avg_edge_weight(self, async_db):
-        a = await async_db.upsert_node(1, "a")
-        b = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(a, b, 10, weight=5.0)
+        a = await async_db.upsert_node("Person", "a")
+        b = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(a, b, "RELATES_TO", weight=5.0)
         avg = await async_db.avg_edge_weight(a)
         assert avg is not None
         assert abs(avg - 5.0) < 1e-6
@@ -621,9 +726,9 @@ class TestAsyncDegree:
 
     @pytest.mark.asyncio
     async def test_degrees_batch(self, async_db):
-        a = await async_db.upsert_node(1, "a")
-        b = await async_db.upsert_node(1, "b")
-        await async_db.upsert_edge(a, b, 10)
+        a = await async_db.upsert_node("Person", "a")
+        b = await async_db.upsert_node("Person", "b")
+        await async_db.upsert_edge(a, b, "RELATES_TO")
         result = await async_db.degrees([a, b])
         assert isinstance(result, dict)
         assert result[a] == 1

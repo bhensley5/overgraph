@@ -25,6 +25,44 @@ impl DatabaseEngine {
         published.view.explain_node_query(query)
     }
 
+    pub fn query_edge_ids(
+        &self,
+        query: &EdgeQuery,
+    ) -> Result<QueryEdgeIdsResult, EngineError> {
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        #[cfg(test)]
+        published
+            .view
+            .query_execution_counters
+            .public_edge_query_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let outcome = published.view.query_edge_ids_outcome(query)?;
+        for followup in outcome.followups {
+            self.runtime.enqueue_secondary_index_read_followup(followup);
+        }
+        Ok(outcome.value)
+    }
+
+    pub fn query_edges(&self, query: &EdgeQuery) -> Result<QueryEdgesResult, EngineError> {
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        #[cfg(test)]
+        published
+            .view
+            .query_execution_counters
+            .public_edge_query_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let outcome = published.view.query_edges_outcome(query)?;
+        for followup in outcome.followups {
+            self.runtime.enqueue_secondary_index_read_followup(followup);
+        }
+        Ok(outcome.value)
+    }
+
+    pub fn explain_edge_query(&self, query: &EdgeQuery) -> Result<QueryPlan, EngineError> {
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        published.view.explain_edge_query(query)
+    }
+
     pub fn query_pattern(
         &self,
         query: &GraphPatternQuery,

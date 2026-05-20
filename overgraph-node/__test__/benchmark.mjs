@@ -87,7 +87,7 @@ try {
 
   {
     const db = OverGraph.open(join(tmpDir, 'single-node'));
-    const s = bench((i) => db.upsertNode(1, `node-${i}`, { props: { idx: i }, weight: 1.0 }));
+    const s = bench((i) => db.upsertNode('Person', `node-${i}`, { props: { idx: i }, weight: 1.0 }));
     printRow('upsert_node', s);
     db.close();
   }
@@ -96,9 +96,9 @@ try {
     const db = OverGraph.open(join(tmpDir, 'single-edge'));
     const nodeIds = [];
     for (let i = 0; i < WARMUP_ITERS + BENCH_ITERS + 1; i++) {
-      nodeIds.push(db.upsertNode(1, `en-${i}`));
+      nodeIds.push(db.upsertNode('Person', `en-${i}`));
     }
-    const s = bench((i) => db.upsertEdge(nodeIds[i], nodeIds[i + 1], 1, { weight: 1.0 }));
+    const s = bench((i) => db.upsertEdge(nodeIds[i], nodeIds[i + 1], 'LINKS_TO', { weight: 1.0 }));
     printRow('upsert_edge', s);
     db.close();
   }
@@ -114,7 +114,7 @@ try {
   {
     const db = OverGraph.open(join(tmpDir, 'call-nodes-100'));
     const jsonArr = Array.from({ length: 100 }, (_, j) => ({
-      typeId: 1, key: `cn100-${j}`, props: { idx: j }, weight: 1.0,
+      labels: ['Person'], key: `cn100-${j}`, props: { idx: j }, weight: 1.0,
     }));
     const binBuf = packNodeBatch(jsonArr);
     const sJson = bench(() => db.batchUpsertNodes(jsonArr));
@@ -128,7 +128,7 @@ try {
   {
     const db = OverGraph.open(join(tmpDir, 'call-nodes-1000'));
     const jsonArr = Array.from({ length: 1000 }, (_, j) => ({
-      typeId: 1, key: `cn1k-${j}`, props: { idx: j }, weight: 1.0,
+      labels: ['Person'], key: `cn1k-${j}`, props: { idx: j }, weight: 1.0,
     }));
     const binBuf = packNodeBatch(jsonArr);
     const sJson = bench(() => db.batchUpsertNodes(jsonArr), { warmup: 10, iters: 50 });
@@ -142,10 +142,10 @@ try {
   {
     const db = OverGraph.open(join(tmpDir, 'call-edges-100'));
     const nids = db.batchUpsertNodes(
-      Array.from({ length: 200 }, (_, i) => ({ typeId: 1, key: `ce100-${i}` }))
+      Array.from({ length: 200 }, (_, i) => ({ labels: ['Person'], key: `ce100-${i}` }))
     );
     const jsonArr = Array.from({ length: 100 }, (_, j) => ({
-      from: nids[j], to: nids[j + 100], typeId: 1, weight: 1.0,
+      from: nids[j], to: nids[j + 100], label: 'LINKS_TO', weight: 1.0,
     }));
     const binBuf = packEdgeBatch(jsonArr);
     const sJson = bench(() => db.batchUpsertEdges(jsonArr));
@@ -159,10 +159,10 @@ try {
   {
     const db = OverGraph.open(join(tmpDir, 'call-edges-1000'));
     const nids = db.batchUpsertNodes(
-      Array.from({ length: 2000 }, (_, i) => ({ typeId: 1, key: `ce1k-${i}` }))
+      Array.from({ length: 2000 }, (_, i) => ({ labels: ['Person'], key: `ce1k-${i}` }))
     );
     const jsonArr = Array.from({ length: 1000 }, (_, j) => ({
-      from: nids[j], to: nids[j + 1000], typeId: 1, weight: 1.0,
+      from: nids[j], to: nids[j + 1000], label: 'LINKS_TO', weight: 1.0,
     }));
     const binBuf = packEdgeBatch(jsonArr);
     const sJson = bench(() => db.batchUpsertEdges(jsonArr), { warmup: 10, iters: 50 });
@@ -184,7 +184,7 @@ try {
       (i) => {
         const nodes = [];
         for (let j = 0; j < 1000; j++) {
-          nodes.push({ typeId: 1, key: `e2e-${i}-${j}`, props: { idx: j }, weight: 1.0 });
+          nodes.push({ labels: ['Person'], key: `e2e-${i}-${j}`, props: { idx: j }, weight: 1.0 });
         }
         db.batchUpsertNodes(nodes);
       },
@@ -201,7 +201,7 @@ try {
       (i) => {
         const nodes = [];
         for (let j = 0; j < 1000; j++) {
-          nodes.push({ typeId: 1, key: `e2e-${i}-${j}`, props: { idx: j }, weight: 1.0 });
+          nodes.push({ labels: ['Person'], key: `e2e-${i}-${j}`, props: { idx: j }, weight: 1.0 });
         }
         db.batchUpsertNodesBinary(packNodeBatch(nodes));
       },
@@ -220,7 +220,7 @@ try {
     const db = OverGraph.open(join(tmpDir, 'get-node'));
     const ids = db.batchUpsertNodes(
       Array.from({ length: 1000 }, (_, i) => ({
-        typeId: 1, key: `gn-${i}`, props: { idx: i, label: `node-${i}` },
+        labels: ['Person'], key: `gn-${i}`, props: { idx: i, label: `node-${i}` },
       }))
     );
     const s = bench((i) => db.getNode(ids[i % 1000]));
@@ -230,10 +230,10 @@ try {
 
   {
     const db = OverGraph.open(join(tmpDir, 'nbr-10'));
-    const hub = db.upsertNode(1, 'hub');
+    const hub = db.upsertNode('Person', 'hub');
     for (let i = 0; i < 10; i++) {
-      const n = db.upsertNode(1, `nbr10-${i}`);
-      db.upsertEdge(hub, n, 1, { weight: 1.0 });
+      const n = db.upsertNode('Person', `nbr10-${i}`);
+      db.upsertEdge(hub, n, 'LINKS_TO', { weight: 1.0 });
     }
     const s = bench(() => db.neighbors(hub, { direction: 'outgoing' }));
     printRow('neighbors (10 edges)', s);
@@ -242,10 +242,10 @@ try {
 
   {
     const db = OverGraph.open(join(tmpDir, 'nbr-100'));
-    const hub = db.upsertNode(1, 'hub');
+    const hub = db.upsertNode('Person', 'hub');
     for (let i = 0; i < 100; i++) {
-      const n = db.upsertNode(1, `nbr100-${i}`);
-      db.upsertEdge(hub, n, 1, { weight: 1.0 });
+      const n = db.upsertNode('Person', `nbr100-${i}`);
+      db.upsertEdge(hub, n, 'LINKS_TO', { weight: 1.0 });
     }
     const s = bench(() => db.neighbors(hub, { direction: 'outgoing' }));
     printRow('neighbors (100 edges)', s);
@@ -255,9 +255,9 @@ try {
   {
     const db = OverGraph.open(join(tmpDir, 'find'));
     for (let i = 0; i < 1000; i++) {
-      db.upsertNode(1, `fn-${i}`, { props: { bucket: i < 500 ? 'target' : 'other' } });
+      db.upsertNode('Person', `fn-${i}`, { props: { bucket: i < 500 ? 'target' : 'other' } });
     }
-    const s = bench(() => db.findNodes(1, 'bucket', 'target'));
+    const s = bench(() => db.findNodes('Person', 'bucket', 'target'));
     printRow('find_nodes (500/1000 match)', s);
     db.close();
   }
@@ -273,12 +273,12 @@ try {
       (i) => {
         const nodes = [];
         for (let j = 0; j < 100; j++) {
-          nodes.push({ typeId: 1, key: `fl-${i}-${j}` });
+          nodes.push({ labels: ['Person'], key: `fl-${i}-${j}` });
         }
         const ids = db.batchUpsertNodes(nodes);
         const edges = [];
         for (let j = 0; j < 20; j++) {
-          edges.push({ from: ids[j], to: ids[j + 1], typeId: 1 });
+          edges.push({ from: ids[j], to: ids[j + 1], label: 'LINKS_TO'});
         }
         db.batchUpsertEdges(edges);
         db.flush();

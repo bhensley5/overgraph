@@ -1,34 +1,47 @@
 use crate::error::EngineError;
 use crate::memtable::encode_range_prop_value;
+#[cfg(test)]
+use crate::segment_components::{
+    decode_identity_header, COMPONENT_IDENTITY_HEADER_LEN, COMPONENT_IDENTITY_HEADER_MAGIC,
+};
 use crate::segment_reader::SegmentReader;
-use crate::segment_writer::{CompactEdgeMeta, CompactNodeMeta};
+use crate::segment_writer::{
+    publish_planner_stats_component_payload_from_latest, CompactEdgeMeta, CompactNodeMeta,
+};
 use crate::types::{
     hash_prop_value, EdgeRecord, NodeIdMap, NodeRecord, PropValue, SecondaryIndexKind,
     SecondaryIndexManifestEntry, SecondaryIndexRangeDomain, SecondaryIndexState,
-    SecondaryIndexTarget,
+    SecondaryIndexTarget, MAX_NODE_LABELS_PER_NODE,
 };
 use crc32fast::Hasher as Crc32Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::{Read, Write};
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
+#[cfg(test)]
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) const PLANNER_STATS_FILENAME: &str = "planner_stats.dat";
+#[cfg(test)]
 const PLANNER_STATS_TMP_FILENAME: &str = "planner_stats.tmp";
 const PLANNER_STATS_MAGIC: [u8; 8] = *b"OGPST01\0";
 pub(crate) const PLANNER_STATS_FORMAT_VERSION: u32 = 1;
 const PLANNER_STATS_ENVELOPE_LEN: usize = 8 + 4 + 8 + 4 + 4;
 
-pub(crate) const PLANNER_STATS_MAX_PROPERTY_KEYS_PER_TYPE: usize = 256;
-const PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_TYPE: usize = 1024;
+pub(crate) const PLANNER_STATS_MAX_PROPERTY_KEYS_PER_LABEL: usize = 256;
+const PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_LABEL: usize = 1024;
 pub(crate) const PLANNER_STATS_MAX_HEAVY_HITTERS_PER_KEY: usize = 32;
 pub(crate) const PLANNER_STATS_MAX_DISTINCT_TRACKED_VALUES: usize = 4096;
 pub(crate) const PLANNER_STATS_RANGE_BUCKETS: usize = 64;
 pub(crate) const PLANNER_STATS_TIMESTAMP_BUCKETS: usize = 64;
 pub(crate) const PLANNER_STATS_NODE_ID_SAMPLE_SIZE: usize = 1024;
-pub(crate) const PLANNER_STATS_TOP_HUBS_PER_EDGE_TYPE: usize = 32;
+pub(crate) const PLANNER_STATS_TOP_HUBS_PER_EDGE_LABEL: usize = 32;
 pub(crate) const PLANNER_STATS_SOFT_SIDECAR_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const PLANNER_STATS_HARD_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const PLANNER_STATS_HARD_CANDIDATE_CAP: usize = 65_536;
@@ -125,6 +138,15 @@ pub(crate) enum PlannerStatsDeclaredIndexKind {
     Range,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub(crate) enum PlannerStatsDeclaredIndexTarget {
+    #[default]
+    NodeProperty,
+    EdgeProperty,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeclaredIndexRuntimeCoverageState {
     Available,
@@ -137,6 +159,7 @@ pub(crate) enum DeclaredIndexRuntimeCoverageState {
 pub(crate) struct DeclaredIndexRuntimeCoverageKey {
     pub segment_id: u64,
     pub index_id: u64,
+    pub target: PlannerStatsDeclaredIndexTarget,
     pub kind: PlannerStatsDeclaredIndexKind,
 }
 
@@ -155,9 +178,7 @@ impl DeclaredIndexRuntimeCoverage {
             if entry.state != SecondaryIndexState::Ready {
                 continue;
             }
-            if ready_node_property_target(entry).is_none() {
-                continue;
-            }
+            let target = planner_stats_declared_index_target(entry);
             let kind = match entry.kind {
                 SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
                 SecondaryIndexKind::Range { .. } => PlannerStatsDeclaredIndexKind::Range,
@@ -166,8 +187,13 @@ impl DeclaredIndexRuntimeCoverage {
                 coverage.insert(
                     segment.segment_id,
                     entry.index_id,
+                    target,
                     kind,
-                    segment.declared_index_runtime_coverage_state(entry.index_id, kind),
+                    segment.declared_index_runtime_coverage_state_for_target(
+                        entry.index_id,
+                        target,
+                        kind,
+                    ),
                 );
             }
         }
@@ -178,6 +204,7 @@ impl DeclaredIndexRuntimeCoverage {
         &mut self,
         segment_id: u64,
         index_id: u64,
+        target: PlannerStatsDeclaredIndexTarget,
         kind: PlannerStatsDeclaredIndexKind,
         state: DeclaredIndexRuntimeCoverageState,
     ) {
@@ -185,6 +212,7 @@ impl DeclaredIndexRuntimeCoverage {
             DeclaredIndexRuntimeCoverageKey {
                 segment_id,
                 index_id,
+                target,
                 kind,
             },
             state,
@@ -195,12 +223,14 @@ impl DeclaredIndexRuntimeCoverage {
         &self,
         segment_id: u64,
         index_id: u64,
+        target: PlannerStatsDeclaredIndexTarget,
         kind: PlannerStatsDeclaredIndexKind,
     ) -> DeclaredIndexRuntimeCoverageState {
         self.states
             .get(&DeclaredIndexRuntimeCoverageKey {
                 segment_id,
                 index_id,
+                target,
                 kind,
             })
             .copied()
@@ -211,9 +241,11 @@ impl DeclaredIndexRuntimeCoverage {
         &self,
         segment_id: u64,
         index_id: u64,
+        target: PlannerStatsDeclaredIndexTarget,
         kind: PlannerStatsDeclaredIndexKind,
     ) -> bool {
-        self.state(segment_id, index_id, kind) == DeclaredIndexRuntimeCoverageState::Available
+        self.state(segment_id, index_id, target, kind)
+            == DeclaredIndexRuntimeCoverageState::Available
     }
 
     pub(crate) fn entry_count(&self) -> usize {
@@ -224,8 +256,10 @@ impl DeclaredIndexRuntimeCoverage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DeclaredIndexStatsFingerprint {
     pub index_id: u64,
+    #[serde(default)]
+    pub target: PlannerStatsDeclaredIndexTarget,
     pub kind: PlannerStatsDeclaredIndexKind,
-    pub type_id: u32,
+    pub target_label_id: u32,
     pub prop_key: String,
     pub range_domain: Option<SecondaryIndexRangeDomain>,
 }
@@ -260,7 +294,7 @@ pub(crate) struct SegmentPlannerStatsV1 {
     pub general_property_sampled_node_count: u64,
     pub general_property_sampled_raw_bytes: u64,
     pub general_property_budget_exhausted: bool,
-    pub type_stats: Vec<TypePlannerStats>,
+    pub node_label_stats: Vec<NodeLabelPlannerStats>,
     pub timestamp_stats: Vec<TimestampPlannerStats>,
     pub property_stats: Vec<PropertyPlannerStats>,
     pub equality_index_stats: Vec<EqualityIndexPlannerStats>,
@@ -269,9 +303,46 @@ pub(crate) struct SegmentPlannerStatsV1 {
     pub node_id_sample: Vec<u64>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct StatsCorePartial {
+    pub node_count: u64,
+    pub edge_count: u64,
+    pub truncated: bool,
+    pub general_property_stats_complete: bool,
+    pub general_property_sampled_node_count: u64,
+    pub general_property_sampled_raw_bytes: u64,
+    pub general_property_budget_exhausted: bool,
+    pub node_label_stats: Vec<NodeLabelPlannerStats>,
+    pub timestamp_stats: Vec<TimestampPlannerStats>,
+    pub property_stats: Vec<PropertyPlannerStats>,
+    pub adjacency_stats: Vec<AdjacencyPlannerStats>,
+    pub node_id_sample: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct DeclaredIndexStatsEvidence {
+    pub equality_index_stats: Vec<EqualityIndexPlannerStats>,
+    pub range_index_stats: Vec<RangeIndexPlannerStats>,
+}
+
+impl DeclaredIndexStatsEvidence {
+    pub(crate) fn sort(&mut self) {
+        self.equality_index_stats
+            .sort_by_key(|stats| stats.index_id);
+        self.range_index_stats.sort_by_key(|stats| stats.index_id);
+    }
+
+    pub(crate) fn extend(&mut self, mut other: DeclaredIndexStatsEvidence) {
+        self.equality_index_stats
+            .append(&mut other.equality_index_stats);
+        self.range_index_stats.append(&mut other.range_index_stats);
+        self.sort();
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct TypePlannerStats {
-    pub type_id: u32,
+pub(crate) struct NodeLabelPlannerStats {
+    pub label_id: u32,
     pub node_count: u64,
     pub min_node_id: Option<u64>,
     pub max_node_id: Option<u64>,
@@ -281,7 +352,7 @@ pub(crate) struct TypePlannerStats {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TimestampPlannerStats {
-    pub type_id: u32,
+    pub label_id: u32,
     pub count: u64,
     pub min_ms: i64,
     pub max_ms: i64,
@@ -296,7 +367,7 @@ pub(crate) struct TimestampBucket {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PropertyPlannerStats {
-    pub type_id: u32,
+    pub label_id: u32,
     pub prop_key: String,
     pub tracked_reason: PropertyStatsTrackedReason,
     pub present_count: u64,
@@ -333,7 +404,7 @@ pub(crate) struct RangeValueSummary {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct EqualityIndexPlannerStats {
     pub index_id: u64,
-    pub type_id: u32,
+    pub target_label_id: u32,
     pub prop_key: String,
     pub total_postings: u64,
     pub value_group_count: u64,
@@ -345,7 +416,7 @@ pub(crate) struct EqualityIndexPlannerStats {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RangeIndexPlannerStats {
     pub index_id: u64,
-    pub type_id: u32,
+    pub target_label_id: u32,
     pub prop_key: String,
     pub domain: SecondaryIndexRangeDomain,
     pub total_entries: u64,
@@ -364,7 +435,7 @@ pub(crate) struct RangeBucket {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AdjacencyPlannerStats {
     pub direction: PlannerStatsDirection,
-    pub edge_type_id: Option<u32>,
+    pub edge_label_id: Option<u32>,
     pub source_node_count: u64,
     pub total_edges: u64,
     pub min_fanout: u32,
@@ -490,10 +561,10 @@ pub(crate) struct PlannerStatsView {
     pub missing_segment_stats: usize,
     pub unavailable_segment_stats: usize,
     pub full_rollup: FullRollupStats,
-    pub type_coverage: PlannerStatsFamilyCoverage,
+    pub node_label_coverage: PlannerStatsFamilyCoverage,
     pub timestamp_coverage: PlannerStatsFamilyCoverage,
     pub property_rollups: BTreeMap<(u32, String), PropertyRollupStats>,
-    pub type_rollups: BTreeMap<u32, TypeRollupStats>,
+    pub node_label_rollups: BTreeMap<u32, NodeLabelRollupStats>,
     pub timestamp_rollups: BTreeMap<u32, TimestampRollupStats>,
     pub equality_index_rollups: BTreeMap<u64, EqualityIndexRollupStats>,
     pub range_index_rollups: BTreeMap<u64, RangeIndexRollupStats>,
@@ -509,8 +580,8 @@ pub(crate) struct FullRollupStats {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct TypeRollupStats {
-    pub type_id: u32,
+pub(crate) struct NodeLabelRollupStats {
+    pub label_id: u32,
     pub node_count: u64,
     pub min_node_id: Option<u64>,
     pub max_node_id: Option<u64>,
@@ -520,7 +591,7 @@ pub(crate) struct TypeRollupStats {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TimestampRollupStats {
-    pub type_id: u32,
+    pub label_id: u32,
     pub count: u64,
     pub min_ms: Option<i64>,
     pub max_ms: Option<i64>,
@@ -538,7 +609,7 @@ struct TimestampSegmentRollupStats {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PropertyRollupStats {
-    pub type_id: u32,
+    pub label_id: u32,
     pub prop_key: String,
     pub present_count: u64,
     pub null_count: u64,
@@ -549,7 +620,7 @@ pub(crate) struct PropertyRollupStats {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EqualityIndexRollupStats {
     pub index_id: u64,
-    pub type_id: u32,
+    pub target_label_id: u32,
     pub prop_key: String,
     pub total_postings: u64,
     pub value_group_count: u64,
@@ -570,7 +641,7 @@ struct EqualitySegmentRollupStats {
 #[derive(Clone, Debug)]
 pub(crate) struct RangeIndexRollupStats {
     pub index_id: u64,
-    pub type_id: u32,
+    pub target_label_id: u32,
     pub prop_key: String,
     pub domain: SecondaryIndexRangeDomain,
     pub total_entries: u64,
@@ -592,7 +663,7 @@ impl Default for RangeIndexRollupStats {
     fn default() -> Self {
         Self {
             index_id: 0,
-            type_id: 0,
+            target_label_id: 0,
             prop_key: String::new(),
             domain: SecondaryIndexRangeDomain::Int,
             total_entries: 0,
@@ -607,7 +678,7 @@ impl Default for RangeIndexRollupStats {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AdjacencyRollupStats {
     pub direction: PlannerStatsDirection,
-    pub edge_type_id: Option<u32>,
+    pub edge_label_id: Option<u32>,
     pub source_node_count: u64,
     pub total_edges: u64,
     pub max_fanout: u32,
@@ -643,9 +714,9 @@ impl PlannerStatsView {
         view
     }
 
-    pub(crate) fn type_node_count(&self, type_id: u32) -> u64 {
-        self.type_rollups
-            .get(&type_id)
+    pub(crate) fn node_label_count(&self, label_id: u32) -> u64 {
+        self.node_label_rollups
+            .get(&label_id)
             .map_or(0, |rollup| rollup.node_count)
     }
 
@@ -692,15 +763,16 @@ impl PlannerStatsView {
 
     pub(crate) fn timestamp_estimate(
         &self,
-        type_id: u32,
+        label_id: u32,
         lower_ms: i64,
         upper_ms: i64,
     ) -> Option<PlannerStatsValueEstimate> {
-        let Some(rollup) = self.timestamp_rollups.get(&type_id) else {
-            if self.type_node_count(type_id) == 0 && self.type_coverage.covered_count() > 0 {
+        let Some(rollup) = self.timestamp_rollups.get(&label_id) else {
+            if self.node_label_count(label_id) == 0 && self.node_label_coverage.covered_count() > 0
+            {
                 return Some(PlannerStatsValueEstimate {
                     count: 0,
-                    exact: !self.type_coverage.has_uncovered(),
+                    exact: !self.node_label_coverage.has_uncovered(),
                 });
             }
             return None;
@@ -728,9 +800,9 @@ impl PlannerStatsView {
         Some(PlannerStatsValueEstimate { count, exact })
     }
 
-    pub(crate) fn timestamp_covers_segment(&self, type_id: u32, segment_id: u64) -> bool {
-        self.timestamp_rollups.get(&type_id).map_or_else(
-            || self.type_node_count(type_id) == 0 && self.type_coverage.covers(segment_id),
+    pub(crate) fn timestamp_covers_segment(&self, label_id: u32, segment_id: u64) -> bool {
+        self.timestamp_rollups.get(&label_id).map_or_else(
+            || self.node_label_count(label_id) == 0 && self.node_label_coverage.covers(segment_id),
             |rollup| rollup.coverage.covers(segment_id),
         )
     }
@@ -756,37 +828,37 @@ impl PlannerStatsView {
             "full stats coverage exceeds segment count"
         );
         debug_assert!(
-            self.type_coverage.covered_count() <= self.segment_count,
-            "type stats coverage exceeds segment count"
+            self.node_label_coverage.covered_count() <= self.segment_count,
+            "node label stats coverage exceeds segment count"
         );
         debug_assert!(
             self.timestamp_coverage.covered_count() <= self.segment_count,
             "timestamp stats coverage exceeds segment count"
         );
-        for (type_id, rollup) in &self.type_rollups {
-            debug_assert_eq!(*type_id, rollup.type_id);
+        for (label_id, rollup) in &self.node_label_rollups {
+            debug_assert_eq!(*label_id, rollup.label_id);
         }
-        for (type_id, rollup) in &self.timestamp_rollups {
-            debug_assert_eq!(*type_id, rollup.type_id);
+        for (label_id, rollup) in &self.timestamp_rollups {
+            debug_assert_eq!(*label_id, rollup.label_id);
         }
-        for ((type_id, prop_key), rollup) in &self.property_rollups {
-            debug_assert_eq!(*type_id, rollup.type_id);
+        for ((label_id, prop_key), rollup) in &self.property_rollups {
+            debug_assert_eq!(*label_id, rollup.label_id);
             debug_assert_eq!(prop_key, &rollup.prop_key);
         }
         for (index_id, rollup) in &self.equality_index_rollups {
             debug_assert_eq!(*index_id, rollup.index_id);
             debug_assert!(
                 !rollup.prop_key.is_empty(),
-                "equality rollup for type {} must have property key",
-                rollup.type_id
+                "equality rollup for target label {} must have property key",
+                rollup.target_label_id
             );
         }
         for (index_id, rollup) in &self.range_index_rollups {
             debug_assert_eq!(*index_id, rollup.index_id);
             debug_assert!(
                 !rollup.prop_key.is_empty(),
-                "range rollup for type {} must have property key",
-                rollup.type_id
+                "range rollup for target label {} must have property key",
+                rollup.target_label_id
             );
             match rollup.domain {
                 SecondaryIndexRangeDomain::Int
@@ -794,9 +866,9 @@ impl PlannerStatsView {
                 | SecondaryIndexRangeDomain::Float => {}
             }
         }
-        for ((direction, edge_type_id), rollup) in &self.adjacency_rollups {
+        for ((direction, edge_label_id), rollup) in &self.adjacency_rollups {
             debug_assert_eq!(*direction, rollup.direction);
-            debug_assert_eq!(*edge_type_id, rollup.edge_type_id);
+            debug_assert_eq!(*edge_label_id, rollup.edge_label_id);
         }
     }
 }
@@ -956,18 +1028,20 @@ struct AdjacencyRollupBuilder {
 
 #[derive(Clone)]
 struct EqualityIndexDeclaration {
-    type_id: u32,
+    target: PlannerStatsDeclaredIndexTarget,
+    target_label_id: u32,
     prop_key: String,
 }
 
 #[derive(Clone)]
 struct RangeIndexDeclaration {
-    type_id: u32,
+    target: PlannerStatsDeclaredIndexTarget,
+    target_label_id: u32,
     prop_key: String,
     domain: SecondaryIndexRangeDomain,
 }
 
-type DeclaredIndexFingerprintSet = BTreeSet<(u64, u8, u32, String, u8)>;
+type DeclaredIndexFingerprintSet = BTreeSet<(u64, u8, u8, u32, String, u8)>;
 
 #[cfg(test)]
 fn build_planner_stats_view_from_snapshots(
@@ -992,10 +1066,10 @@ fn all_available_runtime_coverage_for_snapshots(
 ) -> DeclaredIndexRuntimeCoverage {
     let mut coverage = DeclaredIndexRuntimeCoverage::default();
     for entry in secondary_indexes {
-        if entry.state != SecondaryIndexState::Ready || ready_node_property_target(entry).is_none()
-        {
+        if entry.state != SecondaryIndexState::Ready {
             continue;
         }
+        let target = planner_stats_declared_index_target(entry);
         let kind = match entry.kind {
             SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
             SecondaryIndexKind::Range { .. } => PlannerStatsDeclaredIndexKind::Range,
@@ -1004,6 +1078,7 @@ fn all_available_runtime_coverage_for_snapshots(
             coverage.insert(
                 segment.segment_id,
                 entry.index_id,
+                target,
                 kind,
                 DeclaredIndexRuntimeCoverageState::Available,
             );
@@ -1024,13 +1099,13 @@ fn build_planner_stats_view_from_snapshots_with_runtime_coverage(
         .collect::<Vec<_>>()
         .into();
     let mut full_coverage = CoverageBuilder::new(all_segment_ids.clone());
-    let mut type_coverage = CoverageBuilder::new(all_segment_ids.clone());
+    let mut node_label_coverage = CoverageBuilder::new(all_segment_ids.clone());
     let mut timestamp_coverage = CoverageBuilder::new(all_segment_ids.clone());
     let mut full_rollup = FullRollupStats::default();
-    let mut type_rollups: BTreeMap<u32, TypeRollupStats> = BTreeMap::new();
+    let mut node_label_rollups: BTreeMap<u32, NodeLabelRollupStats> = BTreeMap::new();
     let mut timestamp_rollups: BTreeMap<u32, TimestampRollupStats> = BTreeMap::new();
-    let mut segment_type_ids: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
-    let mut segment_timestamp_type_ids: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
+    let mut segment_label_ids: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
+    let mut segment_timestamp_label_ids: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
     let mut property_builders: BTreeMap<(u32, String), PropertyRollupBuilder> = BTreeMap::new();
     let equality_declarations = ready_equality_declarations(secondary_indexes);
     let range_declarations = ready_range_declarations(secondary_indexes);
@@ -1051,30 +1126,30 @@ fn build_planner_stats_view_from_snapshots_with_runtime_coverage(
             PlannerStatsAvailability::Available(stats) => {
                 available_segment_stats += 1;
                 full_coverage.mark_covered(segment.segment_id);
-                type_coverage.mark_covered(segment.segment_id);
+                node_label_coverage.mark_covered(segment.segment_id);
                 timestamp_coverage.mark_covered(segment.segment_id);
                 full_rollup.node_count = full_rollup.node_count.saturating_add(stats.node_count);
                 full_rollup.edge_count = full_rollup.edge_count.saturating_add(stats.edge_count);
                 if stats.general_property_stats_complete {
                     complete_property_segment_ids.insert(segment.segment_id);
                 }
-                segment_type_ids.insert(
+                segment_label_ids.insert(
                     segment.segment_id,
                     stats
-                        .type_stats
+                        .node_label_stats
                         .iter()
-                        .map(|type_stats| type_stats.type_id)
+                        .map(|node_label_stats| node_label_stats.label_id)
                         .collect(),
                 );
-                segment_timestamp_type_ids.insert(
+                segment_timestamp_label_ids.insert(
                     segment.segment_id,
                     stats
                         .timestamp_stats
                         .iter()
-                        .map(|timestamp| timestamp.type_id)
+                        .map(|timestamp| timestamp.label_id)
                         .collect(),
                 );
-                add_type_rollups(&mut type_rollups, stats);
+                add_node_label_rollups(&mut node_label_rollups, stats);
                 add_timestamp_rollups(&mut timestamp_rollups, segment.segment_id, stats);
                 add_property_rollups(
                     &mut property_builders,
@@ -1118,14 +1193,14 @@ fn build_planner_stats_view_from_snapshots_with_runtime_coverage(
     }
 
     full_rollup.coverage = full_coverage.finish();
-    let type_coverage = type_coverage.finish();
+    let node_label_coverage = node_label_coverage.finish();
     let timestamp_coverage = timestamp_coverage.finish();
     finalize_timestamp_rollup_coverage(
         &mut timestamp_rollups,
-        &type_rollups,
+        &node_label_rollups,
         all_segment_ids.clone(),
-        &segment_type_ids,
-        &segment_timestamp_type_ids,
+        &segment_label_ids,
+        &segment_timestamp_label_ids,
     );
 
     let property_rollups = property_builders
@@ -1170,10 +1245,10 @@ fn build_planner_stats_view_from_snapshots_with_runtime_coverage(
         missing_segment_stats,
         unavailable_segment_stats,
         full_rollup,
-        type_coverage,
+        node_label_coverage,
         timestamp_coverage,
         property_rollups,
-        type_rollups,
+        node_label_rollups,
         timestamp_rollups,
         equality_index_rollups,
         range_index_rollups,
@@ -1314,7 +1389,7 @@ fn ready_equality_declarations(
 ) -> BTreeMap<u64, EqualityIndexDeclaration> {
     let mut declarations = BTreeMap::new();
     for entry in secondary_indexes {
-        let Some((type_id, prop_key)) = ready_node_property_target(entry) else {
+        let Some((target, target_label_id, prop_key)) = ready_property_target(entry) else {
             continue;
         };
         if !matches!(entry.kind, SecondaryIndexKind::Equality) {
@@ -1322,7 +1397,11 @@ fn ready_equality_declarations(
         }
         declarations.insert(
             entry.index_id,
-            EqualityIndexDeclaration { type_id, prop_key },
+            EqualityIndexDeclaration {
+                target,
+                target_label_id,
+                prop_key,
+            },
         );
     }
     declarations
@@ -1333,7 +1412,7 @@ fn ready_range_declarations(
 ) -> BTreeMap<u64, RangeIndexDeclaration> {
     let mut declarations = BTreeMap::new();
     for entry in secondary_indexes {
-        let Some((type_id, prop_key)) = ready_node_property_target(entry) else {
+        let Some((target, target_label_id, prop_key)) = ready_property_target(entry) else {
             continue;
         };
         let SecondaryIndexKind::Range { domain } = entry.kind else {
@@ -1342,7 +1421,8 @@ fn ready_range_declarations(
         declarations.insert(
             entry.index_id,
             RangeIndexDeclaration {
-                type_id,
+                target,
+                target_label_id,
                 prop_key,
                 domain,
             },
@@ -1362,7 +1442,7 @@ fn equality_rollup_builders(
             EqualityRollupBuilder {
                 stats: EqualityIndexRollupStats {
                     index_id: *index_id,
-                    type_id: declaration.type_id,
+                    target_label_id: declaration.target_label_id,
                     prop_key: declaration.prop_key.clone(),
                     ..Default::default()
                 },
@@ -1384,7 +1464,7 @@ fn range_rollup_builders(
             RangeRollupBuilder {
                 stats: RangeIndexRollupStats {
                     index_id: *index_id,
-                    type_id: declaration.type_id,
+                    target_label_id: declaration.target_label_id,
                     prop_key: declaration.prop_key.clone(),
                     domain: declaration.domain,
                     ..Default::default()
@@ -1396,35 +1476,46 @@ fn range_rollup_builders(
     builders
 }
 
-fn ready_node_property_target(entry: &SecondaryIndexManifestEntry) -> Option<(u32, String)> {
+fn ready_property_target(
+    entry: &SecondaryIndexManifestEntry,
+) -> Option<(PlannerStatsDeclaredIndexTarget, u32, String)> {
     if entry.state != crate::types::SecondaryIndexState::Ready {
         return None;
     }
     match &entry.target {
-        SecondaryIndexTarget::NodeProperty { type_id, prop_key } => {
-            Some((*type_id, prop_key.clone()))
-        }
+        SecondaryIndexTarget::NodeProperty { label_id, prop_key } => Some((
+            PlannerStatsDeclaredIndexTarget::NodeProperty,
+            *label_id,
+            prop_key.clone(),
+        )),
+        SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => Some((
+            PlannerStatsDeclaredIndexTarget::EdgeProperty,
+            *label_id,
+            prop_key.clone(),
+        )),
     }
 }
 
-fn add_type_rollups(
-    type_rollups: &mut BTreeMap<u32, TypeRollupStats>,
+fn add_node_label_rollups(
+    node_label_rollups: &mut BTreeMap<u32, NodeLabelRollupStats>,
     stats: &SegmentPlannerStatsV1,
 ) {
-    for type_stats in &stats.type_stats {
-        let rollup = type_rollups
-            .entry(type_stats.type_id)
-            .or_insert_with(|| TypeRollupStats {
-                type_id: type_stats.type_id,
+    for node_label_stats in &stats.node_label_stats {
+        let rollup = node_label_rollups
+            .entry(node_label_stats.label_id)
+            .or_insert_with(|| NodeLabelRollupStats {
+                label_id: node_label_stats.label_id,
                 ..Default::default()
             });
-        rollup.node_count = rollup.node_count.saturating_add(type_stats.node_count);
-        rollup.min_node_id = min_option(rollup.min_node_id, type_stats.min_node_id);
-        rollup.max_node_id = max_option(rollup.max_node_id, type_stats.max_node_id);
+        rollup.node_count = rollup
+            .node_count
+            .saturating_add(node_label_stats.node_count);
+        rollup.min_node_id = min_option(rollup.min_node_id, node_label_stats.min_node_id);
+        rollup.max_node_id = max_option(rollup.max_node_id, node_label_stats.max_node_id);
         rollup.min_updated_at_ms =
-            min_option(rollup.min_updated_at_ms, type_stats.min_updated_at_ms);
+            min_option(rollup.min_updated_at_ms, node_label_stats.min_updated_at_ms);
         rollup.max_updated_at_ms =
-            max_option(rollup.max_updated_at_ms, type_stats.max_updated_at_ms);
+            max_option(rollup.max_updated_at_ms, node_label_stats.max_updated_at_ms);
     }
 }
 
@@ -1435,9 +1526,9 @@ fn add_timestamp_rollups(
 ) {
     for timestamp in &stats.timestamp_stats {
         let rollup = timestamp_rollups
-            .entry(timestamp.type_id)
+            .entry(timestamp.label_id)
             .or_insert_with(|| TimestampRollupStats {
-                type_id: timestamp.type_id,
+                label_id: timestamp.label_id,
                 ..Default::default()
             });
         rollup.count = rollup.count.saturating_add(timestamp.count);
@@ -1457,31 +1548,31 @@ fn add_timestamp_rollups(
 
 fn finalize_timestamp_rollup_coverage(
     timestamp_rollups: &mut BTreeMap<u32, TimestampRollupStats>,
-    type_rollups: &BTreeMap<u32, TypeRollupStats>,
+    node_label_rollups: &BTreeMap<u32, NodeLabelRollupStats>,
     all_segment_ids: Arc<[u64]>,
-    segment_type_ids: &BTreeMap<u64, BTreeSet<u32>>,
-    segment_timestamp_type_ids: &BTreeMap<u64, BTreeSet<u32>>,
+    segment_label_ids: &BTreeMap<u64, BTreeSet<u32>>,
+    segment_timestamp_label_ids: &BTreeMap<u64, BTreeSet<u32>>,
 ) {
-    let timestamp_type_ids: Vec<u32> = type_rollups
+    let timestamp_label_ids: Vec<u32> = node_label_rollups
         .keys()
         .chain(timestamp_rollups.keys())
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    for type_id in timestamp_type_ids {
+    for label_id in timestamp_label_ids {
         let mut coverage = CoverageBuilder::new(all_segment_ids.clone());
         for segment_id in all_segment_ids.iter().copied() {
-            let Some(segment_types) = segment_type_ids.get(&segment_id) else {
+            let Some(segment_labels) = segment_label_ids.get(&segment_id) else {
                 continue;
             };
-            if !segment_types.contains(&type_id) {
+            if !segment_labels.contains(&label_id) {
                 coverage.mark_covered(segment_id);
                 continue;
             }
-            if segment_timestamp_type_ids
+            if segment_timestamp_label_ids
                 .get(&segment_id)
-                .is_some_and(|timestamps| timestamps.contains(&type_id))
+                .is_some_and(|timestamps| timestamps.contains(&label_id))
             {
                 coverage.mark_covered(segment_id);
             } else {
@@ -1489,9 +1580,9 @@ fn finalize_timestamp_rollup_coverage(
             }
         }
         let rollup = timestamp_rollups
-            .entry(type_id)
+            .entry(label_id)
             .or_insert_with(|| TimestampRollupStats {
-                type_id,
+                label_id,
                 ..Default::default()
             });
         rollup.coverage = coverage.finish();
@@ -1505,12 +1596,12 @@ fn add_property_rollups(
     stats: &SegmentPlannerStatsV1,
 ) {
     for property in &stats.property_stats {
-        let key = (property.type_id, property.prop_key.clone());
+        let key = (property.label_id, property.prop_key.clone());
         let builder = property_builders
             .entry(key)
             .or_insert_with(|| PropertyRollupBuilder {
                 stats: PropertyRollupStats {
-                    type_id: property.type_id,
+                    label_id: property.label_id,
                     prop_key: property.prop_key.clone(),
                     ..Default::default()
                 },
@@ -1556,6 +1647,7 @@ fn add_equality_rollups(
             || !runtime_coverage.is_available(
                 segment_id,
                 index_stats.index_id,
+                declaration.target,
                 PlannerStatsDeclaredIndexKind::Equality,
             )
         {
@@ -1613,6 +1705,7 @@ fn add_range_rollups(
             || !runtime_coverage.is_available(
                 segment_id,
                 index_stats.index_id,
+                declaration.target,
                 PlannerStatsDeclaredIndexKind::Range,
             )
         {
@@ -1645,13 +1738,13 @@ fn add_adjacency_rollups(
     stats: &SegmentPlannerStatsV1,
 ) {
     for adjacency in &stats.adjacency_stats {
-        let key = (adjacency.direction, adjacency.edge_type_id);
+        let key = (adjacency.direction, adjacency.edge_label_id);
         let builder = adjacency_builders
             .entry(key)
             .or_insert_with(|| AdjacencyRollupBuilder {
                 stats: AdjacencyRollupStats {
                     direction: adjacency.direction,
-                    edge_type_id: adjacency.edge_type_id,
+                    edge_label_id: adjacency.edge_label_id,
                     ..Default::default()
                 },
                 coverage: CoverageBuilder::new(all_segment_ids.clone()),
@@ -1692,7 +1785,7 @@ fn merge_adjacency_top_hubs(
             .cmp(&a.count)
             .then_with(|| a.node_id.cmp(&b.node_id))
     });
-    merged.truncate(PLANNER_STATS_TOP_HUBS_PER_EDGE_TYPE);
+    merged.truncate(PLANNER_STATS_TOP_HUBS_PER_EDGE_LABEL);
     *current = merged;
 }
 
@@ -1701,13 +1794,16 @@ fn declared_equality_block_matches(
     declaration: &EqualityIndexDeclaration,
     declared_fingerprints: &DeclaredIndexFingerprintSet,
 ) -> bool {
-    if block.type_id != declaration.type_id || block.prop_key != declaration.prop_key {
+    if block.target_label_id != declaration.target_label_id
+        || block.prop_key != declaration.prop_key
+    {
         return false;
     }
     declared_fingerprints.contains(&declared_index_key(
         block.index_id,
+        declaration.target,
         PlannerStatsDeclaredIndexKind::Equality,
-        declaration.type_id,
+        declaration.target_label_id,
         &declaration.prop_key,
         None,
     ))
@@ -1718,7 +1814,7 @@ fn declared_range_block_matches(
     declaration: &RangeIndexDeclaration,
     declared_fingerprints: &DeclaredIndexFingerprintSet,
 ) -> bool {
-    if block.type_id != declaration.type_id
+    if block.target_label_id != declaration.target_label_id
         || block.prop_key != declaration.prop_key
         || block.domain != declaration.domain
     {
@@ -1726,8 +1822,9 @@ fn declared_range_block_matches(
     }
     declared_fingerprints.contains(&declared_index_key(
         block.index_id,
+        declaration.target,
         PlannerStatsDeclaredIndexKind::Range,
-        declaration.type_id,
+        declaration.target_label_id,
         &declaration.prop_key,
         Some(declaration.domain),
     ))
@@ -1740,8 +1837,9 @@ fn declared_index_fingerprint_set(stats: &SegmentPlannerStatsV1) -> DeclaredInde
         .map(|declared| {
             declared_index_key(
                 declared.index_id,
+                declared.target,
                 declared.kind,
-                declared.type_id,
+                declared.target_label_id,
                 &declared.prop_key,
                 declared.range_domain,
             )
@@ -1751,15 +1849,17 @@ fn declared_index_fingerprint_set(stats: &SegmentPlannerStatsV1) -> DeclaredInde
 
 fn declared_index_key(
     index_id: u64,
+    target: PlannerStatsDeclaredIndexTarget,
     kind: PlannerStatsDeclaredIndexKind,
-    type_id: u32,
+    target_label_id: u32,
     prop_key: &str,
     range_domain: Option<SecondaryIndexRangeDomain>,
-) -> (u64, u8, u32, String, u8) {
+) -> (u64, u8, u8, u32, String, u8) {
     (
         index_id,
+        declared_index_target_rank(target),
         declared_index_kind_rank(kind),
-        type_id,
+        target_label_id,
         prop_key.to_string(),
         range_domain_rank(range_domain),
     )
@@ -1964,7 +2064,7 @@ fn estimate_i64_histogram(
 }
 
 #[derive(Default)]
-struct TypeAccumulator {
+struct NodeLabelAccumulator {
     node_count: u64,
     min_node_id: Option<u64>,
     max_node_id: Option<u64>,
@@ -1975,7 +2075,7 @@ struct TypeAccumulator {
 
 #[derive(Clone)]
 struct PropertyAccumulator {
-    type_id: u32,
+    label_id: u32,
     prop_key: String,
     tracked_reason: PropertyStatsTrackedReason,
     present_count: u64,
@@ -1989,9 +2089,9 @@ struct PropertyAccumulator {
 }
 
 impl PropertyAccumulator {
-    fn new(type_id: u32, prop_key: String, tracked_reason: PropertyStatsTrackedReason) -> Self {
+    fn new(label_id: u32, prop_key: String, tracked_reason: PropertyStatsTrackedReason) -> Self {
         Self {
-            type_id,
+            label_id,
             prop_key,
             tracked_reason,
             present_count: 0,
@@ -2084,7 +2184,7 @@ impl PropertyAccumulator {
         let top_values =
             top_value_frequencies(self.value_counts, PLANNER_STATS_MAX_HEAVY_HITTERS_PER_KEY);
         PropertyPlannerStats {
-            type_id: self.type_id,
+            label_id: self.label_id,
             prop_key: self.prop_key,
             tracked_reason: self.tracked_reason,
             present_count: self.present_count,
@@ -2163,6 +2263,7 @@ impl ValueKindCounts {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_planner_stats_sidecar(
     seg_dir: &Path,
     expected_segment_id: u64,
@@ -2184,40 +2285,31 @@ pub(crate) fn read_planner_stats_sidecar(
     }
 }
 
-pub(crate) fn write_flush_planner_stats_sidecar_best_effort(
-    seg_dir: &Path,
-    segment_id: u64,
-    nodes: &NodeIdMap<NodeRecord>,
-    edges: &NodeIdMap<EdgeRecord>,
-    secondary_indexes: &[SecondaryIndexManifestEntry],
-) {
-    let result = build_flush_stats(segment_id, seg_dir, nodes, edges, secondary_indexes)
-        .and_then(|stats| write_planner_stats_sidecar_atomic(seg_dir, stats).map(|_| ()));
-    if result.is_err() {
-        cleanup_stats_tmp(seg_dir);
+pub(crate) fn read_planner_stats_payload(
+    data: &[u8],
+    expected_segment_id: u64,
+    expected_node_count: u64,
+    expected_edge_count: u64,
+) -> PlannerStatsAvailability {
+    if data.is_empty() {
+        return PlannerStatsAvailability::Missing;
     }
-}
-
-pub(crate) fn write_compaction_planner_stats_sidecar_best_effort(
-    seg_dir: &Path,
-    segment_id: u64,
-    segments: &[Arc<SegmentReader>],
-    node_metas: &[CompactNodeMeta],
-    edge_metas: &[CompactEdgeMeta],
-    secondary_indexes: &[SecondaryIndexManifestEntry],
-) {
-    let result = build_compaction_stats(
-        segment_id,
-        seg_dir,
-        segments,
-        node_metas,
-        edge_metas,
-        secondary_indexes,
-        PlannerStatsBuildPolicy::compaction(),
-    )
-    .and_then(|stats| write_planner_stats_sidecar_atomic(seg_dir, stats).map(|_| ()));
-    if result.is_err() {
-        cleanup_stats_tmp(seg_dir);
+    if data.len() > PLANNER_STATS_HARD_SIDECAR_BYTES {
+        return PlannerStatsAvailability::Unavailable {
+            reason: format!(
+                "planner stats sidecar exceeds hard cap: {} bytes",
+                data.len()
+            ),
+        };
+    }
+    match decode_planner_stats_envelope(
+        data,
+        expected_segment_id,
+        expected_node_count,
+        expected_edge_count,
+    ) {
+        Ok(stats) => PlannerStatsAvailability::Available(Box::new(stats)),
+        Err(reason) => PlannerStatsAvailability::Unavailable { reason },
     }
 }
 
@@ -2252,7 +2344,7 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
 
     let target_equality_stats = if matches!(target_index.kind, SecondaryIndexKind::Equality) {
         let mut stats =
-            build_equality_index_stats_from_sidecars(seg_dir, std::slice::from_ref(target_index))?;
+            build_equality_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
         let Some(stats) = stats.pop() else {
             return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
         };
@@ -2265,7 +2357,7 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
     };
     let target_range_stats = if matches!(target_index.kind, SecondaryIndexKind::Range { .. }) {
         let mut stats =
-            build_range_index_stats_from_sidecars(seg_dir, std::slice::from_ref(target_index))?;
+            build_range_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
         let Some(stats) = stats.pop() else {
             return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
         };
@@ -2277,44 +2369,34 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
         None
     };
 
-    let declared = declared_index_fingerprints(&ready_indexes);
-    let declaration_fingerprint = declaration_fingerprint(&declared);
-    let mut stats = match read_planner_stats_sidecar(
+    let written = publish_planner_stats_component_payload_from_latest(
         seg_dir,
-        segment.segment_id,
-        segment.node_count(),
-        segment.edge_count(),
-    ) {
-        PlannerStatsAvailability::Available(stats) => {
-            let mut stats = *stats;
-            retain_current_declared_index_stats(&mut stats, &ready_indexes, target_index.index_id);
-            stats
-        }
-        PlannerStatsAvailability::Missing | PlannerStatsAvailability::Unavailable { .. } => {
-            build_minimal_targeted_refresh_stats(segment)?
-        }
-    };
-
-    stats.build_kind = PlannerStatsBuildKind::SecondaryIndexRefresh;
-    stats.built_at_ms = 0;
-    stats.declared_indexes = declared;
-    stats.declaration_fingerprint = declaration_fingerprint;
-    stats.truncated |= !stats.general_property_stats_complete;
-
-    if let Some(equality) = target_equality_stats {
-        stats.equality_index_stats.push(equality);
-        stats
-            .equality_index_stats
-            .sort_by_key(|index_stats| index_stats.index_id);
+        &ready_indexes,
+        |current_payload, segment_id, node_count, edge_count| {
+            let base_stats = current_payload
+                .and_then(|payload| {
+                    match read_planner_stats_payload(payload, segment_id, node_count, edge_count) {
+                        PlannerStatsAvailability::Available(stats) => Some(stats.as_ref().clone()),
+                        PlannerStatsAvailability::Missing
+                        | PlannerStatsAvailability::Unavailable { .. } => None,
+                    }
+                })
+                .map(Ok)
+                .unwrap_or_else(|| build_minimal_targeted_refresh_stats(segment))?;
+            let stats = merge_targeted_declared_index_stats(
+                base_stats,
+                &ready_indexes,
+                target_index.index_id,
+                target_equality_stats,
+                target_range_stats,
+            );
+            planner_stats_sidecar_payload(stats)
+        },
+    )?;
+    if !written {
+        return Ok(PlannerStatsWriteOutcome::SkippedOversize);
     }
-    if let Some(range) = target_range_stats {
-        stats.range_index_stats.push(range);
-        stats
-            .range_index_stats
-            .sort_by_key(|index_stats| index_stats.index_id);
-    }
-
-    write_planner_stats_sidecar_atomic_cleanup_on_error(seg_dir, stats)
+    Ok(PlannerStatsWriteOutcome::Written)
 }
 
 pub(crate) fn planner_stats_declaration_fingerprint_for_entry(
@@ -2323,49 +2405,45 @@ pub(crate) fn planner_stats_declaration_fingerprint_for_entry(
     declaration_fingerprint(&declared_index_fingerprints(std::slice::from_ref(entry)))
 }
 
-pub(crate) fn build_flush_stats(
-    segment_id: u64,
-    seg_dir: &Path,
+pub(crate) fn build_flush_stats_core_partial(
     nodes: &NodeIdMap<NodeRecord>,
     edges: &NodeIdMap<EdgeRecord>,
     secondary_indexes: &[SecondaryIndexManifestEntry],
-) -> Result<SegmentPlannerStatsV1, EngineError> {
+) -> Result<StatsCorePartial, EngineError> {
     let policy = PlannerStatsBuildPolicy::flush();
-    let declared = declared_index_fingerprints(secondary_indexes);
     let declared_property_reasons = declared_property_reasons(secondary_indexes);
-    let mut type_accs = BTreeMap::new();
+    let mut label_accs = BTreeMap::new();
     let mut property_candidates = BTreeMap::new();
 
     let mut sorted_nodes: Vec<&NodeRecord> = nodes.values().collect();
     sorted_nodes.sort_unstable_by_key(|node| node.id);
     for node in &sorted_nodes {
-        observe_type(&mut type_accs, node.id, node.type_id, node.updated_at);
-        if policy.allow_general_property_decode {
-            observe_general_property_candidates(
-                &mut property_candidates,
-                &declared_property_reasons,
-                node.type_id,
-                &node.props,
-            );
+        for &label_id in node.label_ids.as_slice() {
+            observe_label(&mut label_accs, node.id, label_id, node.updated_at);
+            if policy.allow_general_property_decode {
+                observe_general_property_candidates(
+                    &mut property_candidates,
+                    &declared_property_reasons,
+                    label_id,
+                    &node.props,
+                );
+            }
         }
     }
     let mut property_accs =
-        seed_property_accumulators(&declared_property_reasons, property_candidates, &type_accs);
+        seed_property_accumulators(&declared_property_reasons, property_candidates, &label_accs);
     if policy.allow_general_property_decode {
         for node in &sorted_nodes {
-            observe_selected_node_properties(&mut property_accs, node.type_id, &node.props);
+            for &label_id in node.label_ids.as_slice() {
+                observe_selected_node_properties(&mut property_accs, label_id, &node.props);
+            }
         }
     }
 
     let mut sorted_edges: Vec<&EdgeRecord> = edges.values().collect();
     sorted_edges.sort_unstable_by_key(|edge| edge.id);
-    let stats = SegmentPlannerStatsV1 {
-        format_version: PLANNER_STATS_FORMAT_VERSION,
-        segment_id,
-        build_kind: PlannerStatsBuildKind::Flush,
-        built_at_ms: 0,
-        declaration_fingerprint: declaration_fingerprint(&declared),
-        declared_indexes: declared,
+    let timestamp_stats = finalize_timestamp_stats_from_label_accs(&label_accs);
+    Ok(StatsCorePartial {
         node_count: sorted_nodes.len() as u64,
         edge_count: sorted_edges.len() as u64,
         truncated: false,
@@ -2373,31 +2451,78 @@ pub(crate) fn build_flush_stats(
         general_property_sampled_node_count: sorted_nodes.len() as u64,
         general_property_sampled_raw_bytes: 0,
         general_property_budget_exhausted: false,
-        type_stats: finalize_type_stats(type_accs),
-        timestamp_stats: finalize_timestamp_stats(&sorted_nodes),
+        node_label_stats: finalize_node_label_stats(label_accs),
+        timestamp_stats,
         property_stats: finalize_property_stats(property_accs),
-        equality_index_stats: build_equality_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
-        range_index_stats: build_range_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
         adjacency_stats: build_adjacency_stats_from_edges(sorted_edges.iter().copied()),
         node_id_sample: node_id_sample(sorted_nodes.iter().map(|node| node.id)),
-    };
-    Ok(stats)
+    })
 }
 
-fn build_compaction_stats(
+pub(crate) fn assemble_flush_stats_from_partials(
+    segment_id: u64,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+    core: StatsCorePartial,
+    declared_evidence: DeclaredIndexStatsEvidence,
+) -> SegmentPlannerStatsV1 {
+    assemble_stats_from_partials(
+        segment_id,
+        PlannerStatsBuildKind::Flush,
+        secondary_indexes,
+        core,
+        declared_evidence,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn build_flush_stats(
     segment_id: u64,
     seg_dir: &Path,
+    nodes: &NodeIdMap<NodeRecord>,
+    edges: &NodeIdMap<EdgeRecord>,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<SegmentPlannerStatsV1, EngineError> {
+    let core = build_flush_stats_core_partial(nodes, edges, secondary_indexes)?;
+    let declared_evidence = DeclaredIndexStatsEvidence {
+        equality_index_stats: build_equality_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
+        range_index_stats: build_range_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
+    };
+    Ok(assemble_flush_stats_from_partials(
+        segment_id,
+        secondary_indexes,
+        core,
+        declared_evidence,
+    ))
+}
+
+pub(crate) fn build_compaction_stats_core_partial(
+    segments: &[Arc<SegmentReader>],
+    node_metas: &[CompactNodeMeta],
+    edge_metas: &[CompactEdgeMeta],
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<StatsCorePartial, EngineError> {
+    build_compaction_stats_core_partial_with_policy(
+        segments,
+        node_metas,
+        edge_metas,
+        secondary_indexes,
+        PlannerStatsBuildPolicy::compaction(),
+    )
+}
+
+fn build_compaction_stats_core_partial_with_policy(
     segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
     secondary_indexes: &[SecondaryIndexManifestEntry],
     policy: PlannerStatsBuildPolicy,
-) -> Result<SegmentPlannerStatsV1, EngineError> {
-    let declared = declared_index_fingerprints(secondary_indexes);
+) -> Result<StatsCorePartial, EngineError> {
     let declared_property_reasons = declared_property_reasons(secondary_indexes);
-    let mut type_accs = BTreeMap::new();
+    let mut label_accs = BTreeMap::new();
     for meta in node_metas {
-        observe_type(&mut type_accs, meta.node_id, meta.type_id, meta.updated_at);
+        for &label_id in meta.label_ids.as_slice() {
+            observe_label(&mut label_accs, meta.node_id, label_id, meta.updated_at);
+        }
     }
 
     let mut property_candidates = BTreeMap::new();
@@ -2421,33 +2546,32 @@ fn build_compaction_stats(
                 meta.src_data_offset,
                 meta.node_id,
             )?;
-            observe_general_property_candidates(
-                &mut property_candidates,
-                &declared_property_reasons,
-                meta.type_id,
-                &props,
-            );
-            sampled_props.push((meta.type_id, props));
+            for &label_id in meta.label_ids.as_slice() {
+                observe_general_property_candidates(
+                    &mut property_candidates,
+                    &declared_property_reasons,
+                    label_id,
+                    &props,
+                );
+            }
+            sampled_props.push((meta.label_ids, props));
             sampled_node_count += 1;
             sampled_raw_bytes = next_bytes;
         }
     }
     let mut property_accs =
-        seed_property_accumulators(&declared_property_reasons, property_candidates, &type_accs);
-    for (type_id, props) in &sampled_props {
-        observe_selected_node_properties(&mut property_accs, *type_id, props);
+        seed_property_accumulators(&declared_property_reasons, property_candidates, &label_accs);
+    for (label_ids, props) in &sampled_props {
+        for &label_id in label_ids.as_slice() {
+            observe_selected_node_properties(&mut property_accs, label_id, props);
+        }
     }
     let general_property_stats_complete =
         sampled_node_count == node_metas.len() as u64 && !budget_exhausted;
 
     let edge_refs = edge_metas.iter().map(EdgeMetaRef::from);
-    Ok(SegmentPlannerStatsV1 {
-        format_version: PLANNER_STATS_FORMAT_VERSION,
-        segment_id,
-        build_kind: PlannerStatsBuildKind::Compaction,
-        built_at_ms: 0,
-        declaration_fingerprint: declaration_fingerprint(&declared),
-        declared_indexes: declared,
+    let timestamp_stats = finalize_timestamp_stats_from_label_accs(&label_accs);
+    Ok(StatsCorePartial {
         node_count: node_metas.len() as u64,
         edge_count: edge_metas.len() as u64,
         truncated: !general_property_stats_complete,
@@ -2455,92 +2579,289 @@ fn build_compaction_stats(
         general_property_sampled_node_count: sampled_node_count,
         general_property_sampled_raw_bytes: sampled_raw_bytes,
         general_property_budget_exhausted: budget_exhausted,
-        type_stats: finalize_type_stats(type_accs),
-        timestamp_stats: finalize_timestamp_stats_from_meta(node_metas),
+        node_label_stats: finalize_node_label_stats(label_accs),
+        timestamp_stats,
         property_stats: finalize_property_stats(property_accs),
-        equality_index_stats: build_equality_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
-        range_index_stats: build_range_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
         adjacency_stats: build_adjacency_stats_from_edge_meta(edge_refs),
         node_id_sample: node_id_sample(node_metas.iter().map(|meta| meta.node_id)),
     })
 }
 
+pub(crate) fn assemble_compaction_stats_from_partials(
+    segment_id: u64,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+    core: StatsCorePartial,
+    declared_evidence: DeclaredIndexStatsEvidence,
+) -> SegmentPlannerStatsV1 {
+    assemble_stats_from_partials(
+        segment_id,
+        PlannerStatsBuildKind::Compaction,
+        secondary_indexes,
+        core,
+        declared_evidence,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn build_compaction_stats(
+    segment_id: u64,
+    seg_dir: &Path,
+    segments: &[Arc<SegmentReader>],
+    node_metas: &[CompactNodeMeta],
+    edge_metas: &[CompactEdgeMeta],
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<SegmentPlannerStatsV1, EngineError> {
+    let core =
+        build_compaction_stats_core_partial(segments, node_metas, edge_metas, secondary_indexes)?;
+    let declared_evidence = DeclaredIndexStatsEvidence {
+        equality_index_stats: build_equality_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
+        range_index_stats: build_range_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
+    };
+    Ok(assemble_compaction_stats_from_partials(
+        segment_id,
+        secondary_indexes,
+        core,
+        declared_evidence,
+    ))
+}
+
+fn assemble_stats_from_partials(
+    segment_id: u64,
+    build_kind: PlannerStatsBuildKind,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+    core: StatsCorePartial,
+    mut declared_evidence: DeclaredIndexStatsEvidence,
+) -> SegmentPlannerStatsV1 {
+    declared_evidence.sort();
+    let declared = declared_index_fingerprints(secondary_indexes);
+    SegmentPlannerStatsV1 {
+        format_version: PLANNER_STATS_FORMAT_VERSION,
+        segment_id,
+        build_kind,
+        built_at_ms: 0,
+        declaration_fingerprint: declaration_fingerprint(&declared),
+        declared_indexes: declared,
+        node_count: core.node_count,
+        edge_count: core.edge_count,
+        truncated: core.truncated,
+        general_property_stats_complete: core.general_property_stats_complete,
+        general_property_sampled_node_count: core.general_property_sampled_node_count,
+        general_property_sampled_raw_bytes: core.general_property_sampled_raw_bytes,
+        general_property_budget_exhausted: core.general_property_budget_exhausted,
+        node_label_stats: core.node_label_stats,
+        timestamp_stats: core.timestamp_stats,
+        property_stats: core.property_stats,
+        equality_index_stats: declared_evidence.equality_index_stats,
+        range_index_stats: declared_evidence.range_index_stats,
+        adjacency_stats: core.adjacency_stats,
+        node_id_sample: core.node_id_sample,
+    }
+}
+
+#[cfg(test)]
 fn build_equality_index_stats_from_sidecars(
     seg_dir: &Path,
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> Result<Vec<EqualityIndexPlannerStats>, EngineError> {
     let mut result = Vec::new();
     for entry in secondary_indexes {
-        if !matches!(entry.kind, SecondaryIndexKind::Equality) {
+        if entry.state != SecondaryIndexState::Ready
+            || !matches!(entry.kind, SecondaryIndexKind::Equality)
+        {
             continue;
         }
-        let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
-        let path = seg_dir
-            .join("secondary_indexes")
-            .join(format!("node_prop_eq_{}.dat", entry.index_id));
+        let file_name = match &entry.target {
+            SecondaryIndexTarget::NodeProperty { .. } => {
+                format!("node_prop_eq_{}.dat", entry.index_id)
+            }
+            SecondaryIndexTarget::EdgeProperty { .. } => {
+                format!("edge_prop_eq_{}.dat", entry.index_id)
+            }
+        };
+        let path = seg_dir.join("secondary_indexes").join(file_name);
         let groups = read_secondary_eq_group_counts(&path)?;
         let sidecar_present_at_build = groups.is_some();
         let groups = groups.unwrap_or_default();
-        let mut value_counts = BTreeMap::new();
-        let mut total_postings = 0u64;
-        let mut max_group_postings = 0u64;
-        for (&value_hash, &count) in &groups {
-            total_postings += count;
-            max_group_postings = max_group_postings.max(count);
-            value_counts.insert(value_hash, count);
-        }
-        result.push(EqualityIndexPlannerStats {
-            index_id: entry.index_id,
-            type_id: *type_id,
-            prop_key: prop_key.clone(),
-            total_postings,
-            value_group_count: groups.len() as u64,
-            max_group_postings,
-            top_value_hashes: top_value_frequencies(
-                value_counts,
-                PLANNER_STATS_MAX_HEAVY_HITTERS_PER_KEY,
-            ),
+        result.push(equality_index_stats_from_group_counts(
+            entry,
+            &groups,
             sidecar_present_at_build,
-        });
+        ));
     }
     result.sort_by_key(|stats| stats.index_id);
     Ok(result)
 }
 
+fn build_equality_index_stats_from_segment(
+    segment: &SegmentReader,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<Vec<EqualityIndexPlannerStats>, EngineError> {
+    let mut result = Vec::new();
+    for entry in secondary_indexes {
+        if entry.state != SecondaryIndexState::Ready
+            || !matches!(entry.kind, SecondaryIndexKind::Equality)
+        {
+            continue;
+        }
+        let mut groups = BTreeMap::new();
+        let sidecar_present_at_build =
+            segment.for_each_declared_secondary_eq_group(entry, |value_hash, ids| {
+                groups.insert(value_hash, ids.len() as u64);
+                Ok(())
+            })?;
+        result.push(equality_index_stats_from_group_counts(
+            entry,
+            &groups,
+            sidecar_present_at_build,
+        ));
+    }
+    result.sort_by_key(|stats| stats.index_id);
+    Ok(result)
+}
+
+pub(crate) fn equality_index_stats_from_written_groups(
+    entry: &SecondaryIndexManifestEntry,
+    groups: &BTreeMap<u64, Vec<u64>>,
+) -> EqualityIndexPlannerStats {
+    let group_counts: BTreeMap<u64, u64> = groups
+        .iter()
+        .map(|(&value_hash, ids)| (value_hash, ids.len() as u64))
+        .collect();
+    equality_index_stats_from_group_counts(entry, &group_counts, true)
+}
+
+pub(crate) fn equality_index_stats_from_group_counts(
+    entry: &SecondaryIndexManifestEntry,
+    groups: &BTreeMap<u64, u64>,
+    sidecar_present_at_build: bool,
+) -> EqualityIndexPlannerStats {
+    let (target_label_id, prop_key) = match &entry.target {
+        SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (*label_id, prop_key),
+        SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (*label_id, prop_key),
+    };
+    let mut value_counts = BTreeMap::new();
+    let mut total_postings = 0u64;
+    let mut max_group_postings = 0u64;
+    for (&value_hash, &count) in groups {
+        total_postings += count;
+        max_group_postings = max_group_postings.max(count);
+        value_counts.insert(value_hash, count);
+    }
+    EqualityIndexPlannerStats {
+        index_id: entry.index_id,
+        target_label_id,
+        prop_key: prop_key.clone(),
+        total_postings,
+        value_group_count: groups.len() as u64,
+        max_group_postings,
+        top_value_hashes: top_value_frequencies(
+            value_counts,
+            PLANNER_STATS_MAX_HEAVY_HITTERS_PER_KEY,
+        ),
+        sidecar_present_at_build,
+    }
+}
+
+#[cfg(test)]
 fn build_range_index_stats_from_sidecars(
     seg_dir: &Path,
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> Result<Vec<RangeIndexPlannerStats>, EngineError> {
     let mut result = Vec::new();
     for entry in secondary_indexes {
-        let SecondaryIndexKind::Range { domain } = entry.kind else {
+        if entry.state != SecondaryIndexState::Ready {
+            continue;
+        }
+        let SecondaryIndexKind::Range { .. } = entry.kind else {
             continue;
         };
-        let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
-        let path = seg_dir
-            .join("secondary_indexes")
-            .join(format!("node_prop_range_{}.dat", entry.index_id));
+        let file_name = match &entry.target {
+            SecondaryIndexTarget::NodeProperty { .. } => {
+                format!("node_prop_range_{}.dat", entry.index_id)
+            }
+            SecondaryIndexTarget::EdgeProperty { .. } => {
+                format!("edge_prop_range_{}.dat", entry.index_id)
+            }
+        };
+        let path = seg_dir.join("secondary_indexes").join(file_name);
         let encoded_values = read_secondary_range_encoded_values(&path)?;
         let sidecar_present_at_build = encoded_values.is_some();
-        let mut encoded_values = encoded_values.unwrap_or_default();
-        encoded_values.sort_unstable();
-        let min_encoded = encoded_values.first().copied();
-        let max_encoded = encoded_values.last().copied();
-        let buckets = range_buckets(&encoded_values, PLANNER_STATS_RANGE_BUCKETS);
-        result.push(RangeIndexPlannerStats {
-            index_id: entry.index_id,
-            type_id: *type_id,
-            prop_key: prop_key.clone(),
-            domain,
-            total_entries: encoded_values.len() as u64,
-            min_encoded,
-            max_encoded,
-            buckets,
+        result.push(range_index_stats_from_encoded_values(
+            entry,
+            &encoded_values.unwrap_or_default(),
             sidecar_present_at_build,
-        });
+        ));
     }
     result.sort_by_key(|stats| stats.index_id);
     Ok(result)
+}
+
+fn build_range_index_stats_from_segment(
+    segment: &SegmentReader,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<Vec<RangeIndexPlannerStats>, EngineError> {
+    let mut result = Vec::new();
+    for entry in secondary_indexes {
+        if entry.state != SecondaryIndexState::Ready {
+            continue;
+        }
+        let SecondaryIndexKind::Range { .. } = entry.kind else {
+            continue;
+        };
+        let mut encoded_values = Vec::new();
+        let sidecar_present_at_build = segment.for_each_declared_secondary_range_entry(
+            entry,
+            |encoded_value, _record_id| {
+                encoded_values.push(encoded_value);
+                Ok(())
+            },
+        )?;
+        result.push(range_index_stats_from_encoded_values(
+            entry,
+            &encoded_values,
+            sidecar_present_at_build,
+        ));
+    }
+    result.sort_by_key(|stats| stats.index_id);
+    Ok(result)
+}
+
+pub(crate) fn range_index_stats_from_written_entries(
+    entry: &SecondaryIndexManifestEntry,
+    entries: &[(u64, u64)],
+) -> RangeIndexPlannerStats {
+    let encoded_values: Vec<u64> = entries
+        .iter()
+        .map(|(encoded_value, _node_id)| *encoded_value)
+        .collect();
+    range_index_stats_from_encoded_values(entry, &encoded_values, true)
+}
+
+pub(crate) fn range_index_stats_from_encoded_values(
+    entry: &SecondaryIndexManifestEntry,
+    encoded_values: &[u64],
+    sidecar_present_at_build: bool,
+) -> RangeIndexPlannerStats {
+    let SecondaryIndexKind::Range { domain } = entry.kind else {
+        unreachable!("range stats require a range secondary index")
+    };
+    let (target_label_id, prop_key) = match &entry.target {
+        SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (*label_id, prop_key),
+        SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (*label_id, prop_key),
+    };
+    let mut encoded_values = encoded_values.to_vec();
+    encoded_values.sort_unstable();
+    RangeIndexPlannerStats {
+        index_id: entry.index_id,
+        target_label_id,
+        prop_key: prop_key.clone(),
+        domain,
+        total_entries: encoded_values.len() as u64,
+        min_encoded: encoded_values.first().copied(),
+        max_encoded: encoded_values.last().copied(),
+        buckets: range_buckets(&encoded_values, PLANNER_STATS_RANGE_BUCKETS),
+        sidecar_present_at_build,
+    }
 }
 
 fn ready_planner_stats_indexes(
@@ -2577,10 +2898,10 @@ fn retain_current_declared_index_stats(
             && ready_indexes.iter().any(|entry| {
                 matches!(entry.kind, SecondaryIndexKind::Equality)
                     && entry.index_id == block.index_id
-                    && matches!(
+                    && secondary_index_target_matches_stats(
                         &entry.target,
-                        SecondaryIndexTarget::NodeProperty { type_id, prop_key }
-                            if *type_id == block.type_id && prop_key == &block.prop_key
+                        block.target_label_id,
+                        &block.prop_key,
                     )
             })
     });
@@ -2590,40 +2911,75 @@ fn retain_current_declared_index_stats(
             && ready_indexes.iter().any(|entry| {
                 matches!(entry.kind, SecondaryIndexKind::Range { domain } if domain == block.domain)
                     && entry.index_id == block.index_id
-                    && matches!(
+                    && secondary_index_target_matches_stats(
                         &entry.target,
-                        SecondaryIndexTarget::NodeProperty { type_id, prop_key }
-                            if *type_id == block.type_id && prop_key == &block.prop_key
+                        block.target_label_id,
+                        &block.prop_key,
                     )
             })
     });
 }
 
+fn merge_targeted_declared_index_stats(
+    mut stats: SegmentPlannerStatsV1,
+    ready_indexes: &[SecondaryIndexManifestEntry],
+    target_index_id: u64,
+    target_equality_stats: Option<EqualityIndexPlannerStats>,
+    target_range_stats: Option<RangeIndexPlannerStats>,
+) -> SegmentPlannerStatsV1 {
+    let declared = declared_index_fingerprints(ready_indexes);
+    let declaration_fingerprint = declaration_fingerprint(&declared);
+    retain_current_declared_index_stats(&mut stats, ready_indexes, target_index_id);
+
+    stats.build_kind = PlannerStatsBuildKind::SecondaryIndexRefresh;
+    stats.built_at_ms = 0;
+    stats.declared_indexes = declared;
+    stats.declaration_fingerprint = declaration_fingerprint;
+    stats.truncated |= !stats.general_property_stats_complete;
+
+    if let Some(equality) = target_equality_stats {
+        stats.equality_index_stats.push(equality);
+    }
+    if let Some(range) = target_range_stats {
+        stats.range_index_stats.push(range);
+    }
+    stats
+        .equality_index_stats
+        .sort_by_key(|index_stats| index_stats.index_id);
+    stats
+        .range_index_stats
+        .sort_by_key(|index_stats| index_stats.index_id);
+    stats
+}
+
+fn secondary_index_target_matches_stats(
+    target: &SecondaryIndexTarget,
+    target_label_id: u32,
+    prop_key: &str,
+) -> bool {
+    match target {
+        SecondaryIndexTarget::NodeProperty {
+            label_id: expected_label_id,
+            prop_key: target_prop_key,
+        }
+        | SecondaryIndexTarget::EdgeProperty {
+            label_id: expected_label_id,
+            prop_key: target_prop_key,
+        } => *expected_label_id == target_label_id && target_prop_key == prop_key,
+    }
+}
+
 fn build_minimal_targeted_refresh_stats(
     segment: &SegmentReader,
 ) -> Result<SegmentPlannerStatsV1, EngineError> {
-    let mut type_accs = BTreeMap::new();
-    let mut timestamp_groups: BTreeMap<u32, Vec<i64>> = BTreeMap::new();
+    let mut label_accs = BTreeMap::new();
     let mut node_ids = Vec::with_capacity(segment.node_meta_count() as usize);
     for index in 0..segment.node_meta_count() as usize {
-        let (
-            node_id,
-            _data_offset,
-            _data_len,
-            type_id,
-            updated_at,
-            _weight,
-            _key_len,
-            _prop_hash_offset,
-            _prop_hash_count,
-            _last_write_seq,
-        ) = segment.node_meta_at(index)?;
-        observe_type(&mut type_accs, node_id, type_id, updated_at);
-        timestamp_groups
-            .entry(type_id)
-            .or_default()
-            .push(updated_at);
-        node_ids.push(node_id);
+        let meta = segment.node_meta_at(index)?;
+        for &label_id in meta.label_ids.as_slice() {
+            observe_label(&mut label_accs, meta.node_id, label_id, meta.updated_at);
+        }
+        node_ids.push(meta.node_id);
     }
 
     let mut edge_refs = Vec::with_capacity(segment.edge_meta_count() as usize);
@@ -2634,16 +2990,17 @@ fn build_minimal_targeted_refresh_stats(
             _data_len,
             from,
             to,
-            type_id,
+            label_id,
             _updated_at,
             _weight,
             _valid_from,
             _valid_to,
             _last_write_seq,
         ) = segment.edge_meta_at(index)?;
-        edge_refs.push(EdgeMetaRef { type_id, from, to });
+        edge_refs.push(EdgeMetaRef { label_id, from, to });
     }
 
+    let timestamp_stats = finalize_timestamp_stats_from_label_accs(&label_accs);
     Ok(SegmentPlannerStatsV1 {
         format_version: PLANNER_STATS_FORMAT_VERSION,
         segment_id: segment.segment_id,
@@ -2658,8 +3015,8 @@ fn build_minimal_targeted_refresh_stats(
         general_property_sampled_node_count: 0,
         general_property_sampled_raw_bytes: 0,
         general_property_budget_exhausted: segment.node_count() > 0,
-        type_stats: finalize_type_stats(type_accs),
-        timestamp_stats: finalize_timestamp_groups(timestamp_groups),
+        node_label_stats: finalize_node_label_stats(label_accs),
+        timestamp_stats,
         property_stats: Vec::new(),
         equality_index_stats: Vec::new(),
         range_index_stats: Vec::new(),
@@ -2668,16 +3025,12 @@ fn build_minimal_targeted_refresh_stats(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn write_planner_stats_sidecar_atomic(
     seg_dir: &Path,
     stats: SegmentPlannerStatsV1,
 ) -> Result<PlannerStatsWriteOutcome, EngineError> {
-    let Some(payload) = serialize_stats_with_limits(
-        stats,
-        PLANNER_STATS_SOFT_SIDECAR_BYTES,
-        PLANNER_STATS_HARD_SIDECAR_BYTES,
-    )?
-    else {
+    let Some(payload) = planner_stats_sidecar_payload(stats)? else {
         cleanup_stats_tmp(seg_dir);
         return Ok(PlannerStatsWriteOutcome::SkippedOversize);
     };
@@ -2693,6 +3046,7 @@ pub(crate) fn write_planner_stats_sidecar_atomic(
     Ok(PlannerStatsWriteOutcome::Written)
 }
 
+#[cfg(test)]
 fn write_planner_stats_sidecar_atomic_cleanup_on_error(
     seg_dir: &Path,
     stats: SegmentPlannerStatsV1,
@@ -2702,6 +3056,16 @@ fn write_planner_stats_sidecar_atomic_cleanup_on_error(
         cleanup_stats_tmp(seg_dir);
     }
     result
+}
+
+pub(crate) fn planner_stats_sidecar_payload(
+    stats: SegmentPlannerStatsV1,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    serialize_stats_with_limits(
+        stats,
+        PLANNER_STATS_SOFT_SIDECAR_BYTES,
+        PLANNER_STATS_HARD_SIDECAR_BYTES,
+    )
 }
 
 fn serialize_stats_with_limits(
@@ -2826,11 +3190,13 @@ fn encode_enveloped_stats(stats: &SegmentPlannerStatsV1) -> Result<Vec<u8>, Engi
     Ok(data)
 }
 
+#[cfg(test)]
 enum PlannerStatsReadFailure {
     Missing,
     Unavailable(String),
 }
 
+#[cfg(test)]
 fn read_planner_stats_file(
     path: &Path,
     expected_segment_id: u64,
@@ -2848,16 +3214,17 @@ fn read_planner_stats_file(
         .metadata()
         .map_err(|error| PlannerStatsReadFailure::Unavailable(error.to_string()))?
         .len();
-    if file_len > PLANNER_STATS_HARD_SIDECAR_BYTES as u64 {
+    if file_len > (PLANNER_STATS_HARD_SIDECAR_BYTES + COMPONENT_IDENTITY_HEADER_LEN) as u64 {
         return Err(PlannerStatsReadFailure::Unavailable(format!(
             "planner stats sidecar exceeds hard cap: {} bytes",
             file_len
         )));
     }
     let mut data = Vec::with_capacity(file_len as usize);
-    file.take((PLANNER_STATS_HARD_SIDECAR_BYTES + 1) as u64)
+    file.take(file_len.saturating_add(1))
         .read_to_end(&mut data)
         .map_err(|error| PlannerStatsReadFailure::Unavailable(error.to_string()))?;
+    let data = planner_stats_payload_slice(&data)?;
     if data.len() > PLANNER_STATS_HARD_SIDECAR_BYTES {
         return Err(PlannerStatsReadFailure::Unavailable(format!(
             "planner stats sidecar exceeds hard cap: {} bytes",
@@ -2865,12 +3232,40 @@ fn read_planner_stats_file(
         )));
     }
     decode_planner_stats_envelope(
-        &data,
+        data,
         expected_segment_id,
         expected_node_count,
         expected_edge_count,
     )
     .map_err(PlannerStatsReadFailure::Unavailable)
+}
+
+#[cfg(test)]
+fn planner_stats_payload_slice(data: &[u8]) -> Result<&[u8], PlannerStatsReadFailure> {
+    if data.len() >= COMPONENT_IDENTITY_HEADER_LEN
+        && data[0..COMPONENT_IDENTITY_HEADER_MAGIC.len()] == COMPONENT_IDENTITY_HEADER_MAGIC
+    {
+        let header = decode_identity_header(data)
+            .map_err(|error| PlannerStatsReadFailure::Unavailable(error.to_string()))?;
+        let end = header
+            .payload_offset
+            .checked_add(header.payload_len)
+            .ok_or_else(|| {
+                PlannerStatsReadFailure::Unavailable(
+                    "planner stats identity payload range overflow".into(),
+                )
+            })?;
+        if end > data.len() as u64 {
+            return Err(PlannerStatsReadFailure::Unavailable(format!(
+                "planner stats identity payload range [{}, {}) exceeds file length {}",
+                header.payload_offset,
+                end,
+                data.len()
+            )));
+        }
+        return Ok(&data[header.payload_offset as usize..end as usize]);
+    }
+    Ok(data)
 }
 
 fn decode_planner_stats_envelope(
@@ -2970,76 +3365,92 @@ fn validate_stats_payload(
     {
         return Err("planner stats node id sample is not sorted".to_string());
     }
-    let type_counts = validate_type_stats(stats)?;
-    validate_timestamp_stats(stats, &type_counts)?;
-    validate_property_stats(stats, &type_counts)?;
-    validate_declared_index_stats(stats, &type_counts)?;
+    let label_counts = validate_node_label_stats(stats)?;
+    validate_timestamp_stats(stats, &label_counts)?;
+    validate_property_stats(stats, &label_counts)?;
+    validate_declared_index_stats(stats, &label_counts)?;
     validate_adjacency_stats(stats)?;
     Ok(())
 }
 
-fn validate_type_stats(stats: &SegmentPlannerStatsV1) -> Result<BTreeMap<u32, u64>, String> {
-    let mut type_counts = BTreeMap::new();
+fn validate_node_label_stats(stats: &SegmentPlannerStatsV1) -> Result<BTreeMap<u32, u64>, String> {
+    let mut label_counts = BTreeMap::new();
     let mut total = 0u64;
-    for type_stat in &stats.type_stats {
-        if type_stat.node_count == 0 {
+    for label_stat in &stats.node_label_stats {
+        if label_stat.node_count == 0 {
             return Err(format!(
-                "planner stats type {} has zero node count",
-                type_stat.type_id
+                "planner stats label {} has zero node count",
+                label_stat.label_id
             ));
         }
-        if type_counts
-            .insert(type_stat.type_id, type_stat.node_count)
+        if label_stat.node_count > stats.node_count {
+            return Err(format!(
+                "planner stats label {} node count {} exceeds segment node count {}",
+                label_stat.label_id, label_stat.node_count, stats.node_count
+            ));
+        }
+        if label_counts
+            .insert(label_stat.label_id, label_stat.node_count)
             .is_some()
         {
             return Err(format!(
-                "planner stats type {} appears more than once",
-                type_stat.type_id
+                "planner stats label {} appears more than once",
+                label_stat.label_id
             ));
         }
-        total = checked_add_count(total, type_stat.node_count, "type node counts")?;
+        total = checked_add_count(total, label_stat.node_count, "node label counts")?;
         validate_ordered_option_pair(
-            type_stat.min_node_id,
-            type_stat.max_node_id,
-            "type node id bounds",
+            label_stat.min_node_id,
+            label_stat.max_node_id,
+            "node label id bounds",
         )?;
         validate_ordered_option_pair(
-            type_stat.min_updated_at_ms,
-            type_stat.max_updated_at_ms,
-            "type updated-at bounds",
+            label_stat.min_updated_at_ms,
+            label_stat.max_updated_at_ms,
+            "node label updated-at bounds",
         )?;
     }
-    if total != stats.node_count {
+    if stats.node_label_stats.len() <= 1 && total != stats.node_count {
         return Err(format!(
-            "planner stats type counts sum to {}, expected {}",
+            "planner stats label counts sum to {}, expected {} for single-label stats",
             total, stats.node_count
         ));
     }
-    Ok(type_counts)
+    let max_memberships = stats
+        .node_count
+        .checked_mul(MAX_NODE_LABELS_PER_NODE as u64)
+        .ok_or_else(|| "planner stats label count bound overflow".to_string())?;
+    if total < stats.node_count || total > max_memberships {
+        return Err(format!(
+            "planner stats label counts sum to {}, expected between {} and {}",
+            total, stats.node_count, max_memberships
+        ));
+    }
+    Ok(label_counts)
 }
 
 fn validate_timestamp_stats(
     stats: &SegmentPlannerStatsV1,
-    type_counts: &BTreeMap<u32, u64>,
+    label_counts: &BTreeMap<u32, u64>,
 ) -> Result<(), String> {
     let mut seen = BTreeMap::new();
     for timestamp in &stats.timestamp_stats {
-        let Some(type_count) = type_counts.get(&timestamp.type_id) else {
+        let Some(label_count) = label_counts.get(&timestamp.label_id) else {
             return Err(format!(
-                "planner stats timestamp section references unknown type {}",
-                timestamp.type_id
+                "planner stats timestamp section references unknown label {}",
+                timestamp.label_id
             ));
         };
-        if seen.insert(timestamp.type_id, ()).is_some() {
+        if seen.insert(timestamp.label_id, ()).is_some() {
             return Err(format!(
-                "planner stats timestamp section repeats type {}",
-                timestamp.type_id
+                "planner stats timestamp section repeats label {}",
+                timestamp.label_id
             ));
         }
-        if timestamp.count != *type_count {
+        if timestamp.count != *label_count {
             return Err(format!(
-                "planner stats timestamp count for type {} is {}, expected {}",
-                timestamp.type_id, timestamp.count, type_count
+                "planner stats timestamp count for label {} is {}, expected {}",
+                timestamp.label_id, timestamp.count, label_count
             ));
         }
         if timestamp.min_ms > timestamp.max_ms {
@@ -3052,26 +3463,26 @@ fn validate_timestamp_stats(
 
 fn validate_property_stats(
     stats: &SegmentPlannerStatsV1,
-    type_counts: &BTreeMap<u32, u64>,
+    label_counts: &BTreeMap<u32, u64>,
 ) -> Result<(), String> {
     let mut seen = BTreeMap::new();
     for prop in &stats.property_stats {
-        let Some(type_count) = type_counts.get(&prop.type_id) else {
+        let Some(label_count) = label_counts.get(&prop.label_id) else {
             return Err(format!(
-                "planner stats property {} references unknown type {}",
-                prop.prop_key, prop.type_id
+                "planner stats property {} references unknown label {}",
+                prop.prop_key, prop.label_id
             ));
         };
-        let key = (prop.type_id, prop.prop_key.as_str());
+        let key = (prop.label_id, prop.prop_key.as_str());
         if seen.insert(key, ()).is_some() {
             return Err(format!(
-                "planner stats property {} for type {} appears more than once",
-                prop.prop_key, prop.type_id
+                "planner stats property {} for label {} appears more than once",
+                prop.prop_key, prop.label_id
             ));
         }
-        if prop.present_count > *type_count {
+        if prop.present_count > *label_count {
             return Err(format!(
-                "planner stats property {} present count exceeds type count",
+                "planner stats property {} present count exceeds label count",
                 prop.prop_key
             ));
         }
@@ -3131,9 +3542,10 @@ fn validate_property_stats(
 
 fn validate_declared_index_stats(
     stats: &SegmentPlannerStatsV1,
-    type_counts: &BTreeMap<u32, u64>,
+    label_counts: &BTreeMap<u32, u64>,
 ) -> Result<(), String> {
     let declared = declared_index_map(stats)?;
+    let edge_label_counts = edge_label_counts_from_adjacency_stats(stats);
     let mut equality_seen = BTreeMap::new();
     for equality in &stats.equality_index_stats {
         let Some(declared_index) = declared.get(&equality.index_id) else {
@@ -3143,7 +3555,7 @@ fn validate_declared_index_stats(
             ));
         };
         if declared_index.kind != PlannerStatsDeclaredIndexKind::Equality
-            || declared_index.type_id != equality.type_id
+            || declared_index.target_label_id != equality.target_label_id
             || declared_index.prop_key != equality.prop_key
         {
             return Err(format!(
@@ -3157,10 +3569,11 @@ fn validate_declared_index_stats(
                 equality.index_id
             ));
         }
-        let type_count = *type_counts.get(&equality.type_id).unwrap_or(&0);
-        if equality.total_postings > type_count {
+        let target_count =
+            declared_index_target_count(declared_index, label_counts, &edge_label_counts);
+        if equality.total_postings > target_count {
             return Err(format!(
-                "planner stats equality index {} postings exceed type count",
+                "planner stats equality index {} postings exceed target count",
                 equality.index_id
             ));
         }
@@ -3192,7 +3605,7 @@ fn validate_declared_index_stats(
             ));
         };
         if declared_index.kind != PlannerStatsDeclaredIndexKind::Range
-            || declared_index.type_id != range.type_id
+            || declared_index.target_label_id != range.target_label_id
             || declared_index.prop_key != range.prop_key
             || declared_index.range_domain != Some(range.domain)
         {
@@ -3207,10 +3620,11 @@ fn validate_declared_index_stats(
                 range.index_id
             ));
         }
-        let type_count = *type_counts.get(&range.type_id).unwrap_or(&0);
-        if range.total_entries > type_count {
+        let target_count =
+            declared_index_target_count(declared_index, label_counts, &edge_label_counts);
+        if range.total_entries > target_count {
             return Err(format!(
-                "planner stats range index {} entries exceed type count",
+                "planner stats range index {} entries exceed target count",
                 range.index_id
             ));
         }
@@ -3218,6 +3632,35 @@ fn validate_declared_index_stats(
         validate_range_buckets(range.total_entries, &range.buckets)?;
     }
     Ok(())
+}
+
+fn edge_label_counts_from_adjacency_stats(stats: &SegmentPlannerStatsV1) -> BTreeMap<u32, u64> {
+    let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
+    for adjacency in &stats.adjacency_stats {
+        let Some(edge_label_id) = adjacency.edge_label_id else {
+            continue;
+        };
+        counts
+            .entry(edge_label_id)
+            .and_modify(|count| *count = (*count).max(adjacency.total_edges))
+            .or_insert(adjacency.total_edges);
+    }
+    counts
+}
+
+fn declared_index_target_count(
+    declared_index: &DeclaredIndexStatsFingerprint,
+    node_label_counts: &BTreeMap<u32, u64>,
+    edge_label_counts: &BTreeMap<u32, u64>,
+) -> u64 {
+    match declared_index.target {
+        PlannerStatsDeclaredIndexTarget::NodeProperty => *node_label_counts
+            .get(&declared_index.target_label_id)
+            .unwrap_or(&0),
+        PlannerStatsDeclaredIndexTarget::EdgeProperty => *edge_label_counts
+            .get(&declared_index.target_label_id)
+            .unwrap_or(&0),
+    }
 }
 
 fn declared_index_map(
@@ -3238,7 +3681,7 @@ fn declared_index_map(
 fn validate_adjacency_stats(stats: &SegmentPlannerStatsV1) -> Result<(), String> {
     let mut seen = BTreeMap::new();
     for adjacency in &stats.adjacency_stats {
-        let key = (adjacency.direction, adjacency.edge_type_id);
+        let key = (adjacency.direction, adjacency.edge_label_id);
         if seen.insert(key, ()).is_some() {
             return Err("planner stats adjacency section repeats a direction/type".to_string());
         }
@@ -3253,7 +3696,7 @@ fn validate_adjacency_stats(stats: &SegmentPlannerStatsV1) -> Result<(), String>
         if adjacency.total_edges > stats.edge_count {
             return Err("planner stats adjacency total exceeds segment edge count".to_string());
         }
-        if adjacency.edge_type_id.is_none() && adjacency.total_edges != stats.edge_count {
+        if adjacency.edge_label_id.is_none() && adjacency.total_edges != stats.edge_count {
             return Err(
                 "planner stats global adjacency total does not match edge count".to_string(),
             );
@@ -3409,13 +3852,13 @@ fn validate_ordered_option_pair<T: Ord>(
     }
 }
 
-fn observe_type(
-    type_accs: &mut BTreeMap<u32, TypeAccumulator>,
+fn observe_label(
+    label_accs: &mut BTreeMap<u32, NodeLabelAccumulator>,
     node_id: u64,
-    type_id: u32,
+    label_id: u32,
     updated_at_ms: i64,
 ) {
-    let acc = type_accs.entry(type_id).or_default();
+    let acc = label_accs.entry(label_id).or_default();
     acc.node_count += 1;
     acc.min_node_id = Some(acc.min_node_id.map_or(node_id, |value| value.min(node_id)));
     acc.max_node_id = Some(acc.max_node_id.map_or(node_id, |value| value.max(node_id)));
@@ -3430,11 +3873,13 @@ fn observe_type(
     acc.updated_values.push(updated_at_ms);
 }
 
-fn finalize_type_stats(type_accs: BTreeMap<u32, TypeAccumulator>) -> Vec<TypePlannerStats> {
-    type_accs
+fn finalize_node_label_stats(
+    label_accs: BTreeMap<u32, NodeLabelAccumulator>,
+) -> Vec<NodeLabelPlannerStats> {
+    label_accs
         .into_iter()
-        .map(|(type_id, acc)| TypePlannerStats {
-            type_id,
+        .map(|(label_id, acc)| NodeLabelPlannerStats {
+            label_id,
             node_count: acc.node_count,
             min_node_id: acc.min_node_id,
             max_node_id: acc.max_node_id,
@@ -3444,43 +3889,22 @@ fn finalize_type_stats(type_accs: BTreeMap<u32, TypeAccumulator>) -> Vec<TypePla
         .collect()
 }
 
-fn finalize_timestamp_stats(nodes: &[&NodeRecord]) -> Vec<TimestampPlannerStats> {
-    let mut by_type: BTreeMap<u32, Vec<i64>> = BTreeMap::new();
-    for node in nodes {
-        by_type
-            .entry(node.type_id)
-            .or_default()
-            .push(node.updated_at);
-    }
-    finalize_timestamp_groups(by_type)
-}
-
-fn finalize_timestamp_stats_from_meta(
-    node_metas: &[CompactNodeMeta],
+fn finalize_timestamp_stats_from_label_accs(
+    label_accs: &BTreeMap<u32, NodeLabelAccumulator>,
 ) -> Vec<TimestampPlannerStats> {
-    let mut by_type: BTreeMap<u32, Vec<i64>> = BTreeMap::new();
-    for meta in node_metas {
-        by_type
-            .entry(meta.type_id)
-            .or_default()
-            .push(meta.updated_at);
-    }
-    finalize_timestamp_groups(by_type)
-}
-
-fn finalize_timestamp_groups(by_type: BTreeMap<u32, Vec<i64>>) -> Vec<TimestampPlannerStats> {
-    by_type
-        .into_iter()
-        .filter_map(|(type_id, mut values)| {
-            if values.is_empty() {
+    label_accs
+        .iter()
+        .filter_map(|(&label_id, acc)| {
+            if acc.updated_values.is_empty() {
                 return None;
             }
+            let mut values = acc.updated_values.clone();
             values.sort_unstable();
             let min_ms = *values.first().unwrap();
             let max_ms = *values.last().unwrap();
             let buckets = timestamp_buckets(&values, PLANNER_STATS_TIMESTAMP_BUCKETS);
             Some(TimestampPlannerStats {
-                type_id,
+                label_id,
                 count: values.len() as u64,
                 min_ms,
                 max_ms,
@@ -3495,13 +3919,15 @@ fn declared_property_reasons(
 ) -> BTreeMap<(u32, String), PropertyStatsTrackedReason> {
     let mut reasons: BTreeMap<(u32, String), PropertyStatsTrackedReason> = BTreeMap::new();
     for entry in secondary_indexes {
-        let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
+        let SecondaryIndexTarget::NodeProperty { label_id, prop_key } = &entry.target else {
+            continue;
+        };
         let new_reason = match entry.kind {
             SecondaryIndexKind::Equality => PropertyStatsTrackedReason::DeclaredEquality,
             SecondaryIndexKind::Range { .. } => PropertyStatsTrackedReason::DeclaredRange,
         };
         reasons
-            .entry((*type_id, prop_key.clone()))
+            .entry((*label_id, prop_key.clone()))
             .and_modify(|reason| *reason = combine_property_reason(*reason, new_reason))
             .or_insert(new_reason);
     }
@@ -3511,23 +3937,23 @@ fn declared_property_reasons(
 fn seed_property_accumulators(
     declared_reasons: &BTreeMap<(u32, String), PropertyStatsTrackedReason>,
     property_candidates: BTreeMap<u32, PropertyKeyCandidateTracker>,
-    type_accs: &BTreeMap<u32, TypeAccumulator>,
+    label_accs: &BTreeMap<u32, NodeLabelAccumulator>,
 ) -> BTreeMap<(u32, String), PropertyAccumulator> {
     let mut accs = BTreeMap::new();
-    for ((type_id, prop_key), reason) in declared_reasons {
-        if !type_accs.contains_key(type_id) {
+    for ((label_id, prop_key), reason) in declared_reasons {
+        if !label_accs.contains_key(label_id) {
             continue;
         }
         accs.insert(
-            (*type_id, prop_key.clone()),
-            PropertyAccumulator::new(*type_id, prop_key.clone(), *reason),
+            (*label_id, prop_key.clone()),
+            PropertyAccumulator::new(*label_id, prop_key.clone(), *reason),
         );
     }
-    for (type_id, tracker) in property_candidates {
+    for (label_id, tracker) in property_candidates {
         for prop_key in tracker.into_keys() {
-            accs.entry((type_id, prop_key.clone())).or_insert_with(|| {
+            accs.entry((label_id, prop_key.clone())).or_insert_with(|| {
                 PropertyAccumulator::new(
-                    type_id,
+                    label_id,
                     prop_key,
                     PropertyStatsTrackedReason::GeneralTopProperty,
                 )
@@ -3561,14 +3987,14 @@ fn combine_property_reason(
 fn observe_general_property_candidates(
     candidates: &mut BTreeMap<u32, PropertyKeyCandidateTracker>,
     declared_reasons: &BTreeMap<(u32, String), PropertyStatsTrackedReason>,
-    type_id: u32,
+    label_id: u32,
     props: &BTreeMap<String, PropValue>,
 ) {
-    let tracker = candidates.entry(type_id).or_insert_with(|| {
-        PropertyKeyCandidateTracker::new(PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_TYPE)
+    let tracker = candidates.entry(label_id).or_insert_with(|| {
+        PropertyKeyCandidateTracker::new(PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_LABEL)
     });
     for key in props.keys() {
-        if declared_reasons.contains_key(&(type_id, key.clone())) {
+        if declared_reasons.contains_key(&(label_id, key.clone())) {
             continue;
         }
         tracker.observe(key);
@@ -3577,11 +4003,11 @@ fn observe_general_property_candidates(
 
 fn observe_selected_node_properties(
     accs: &mut BTreeMap<(u32, String), PropertyAccumulator>,
-    type_id: u32,
+    label_id: u32,
     props: &BTreeMap<String, PropValue>,
 ) {
     for (key, value) in props {
-        if let Some(acc) = accs.get_mut(&(type_id, key.clone())) {
+        if let Some(acc) = accs.get_mut(&(label_id, key.clone())) {
             acc.observe(value);
         }
     }
@@ -3590,13 +4016,13 @@ fn observe_selected_node_properties(
 fn finalize_property_stats(
     accs: BTreeMap<(u32, String), PropertyAccumulator>,
 ) -> Vec<PropertyPlannerStats> {
-    let mut by_type: BTreeMap<u32, Vec<PropertyAccumulator>> = BTreeMap::new();
+    let mut by_label: BTreeMap<u32, Vec<PropertyAccumulator>> = BTreeMap::new();
     for acc in accs.into_values() {
-        by_type.entry(acc.type_id).or_default().push(acc);
+        by_label.entry(acc.label_id).or_default().push(acc);
     }
 
     let mut stats = Vec::new();
-    for (_type_id, mut props) in by_type {
+    for (_label_id, mut props) in by_label {
         let mut declared = Vec::new();
         let mut general = Vec::new();
         for acc in props.drain(..) {
@@ -3620,13 +4046,13 @@ fn finalize_property_stats(
         stats.extend(
             general
                 .into_iter()
-                .take(PLANNER_STATS_MAX_PROPERTY_KEYS_PER_TYPE)
+                .take(PLANNER_STATS_MAX_PROPERTY_KEYS_PER_LABEL)
                 .map(PropertyAccumulator::into_stats),
         );
     }
     stats.sort_by(|a, b| {
-        a.type_id
-            .cmp(&b.type_id)
+        a.label_id
+            .cmp(&b.label_id)
             .then_with(|| a.tracked_reason.cmp(&b.tracked_reason))
             .then_with(|| a.prop_key.cmp(&b.prop_key))
     });
@@ -3638,8 +4064,13 @@ fn declared_index_fingerprints(
 ) -> Vec<DeclaredIndexStatsFingerprint> {
     let mut declared: Vec<_> = secondary_indexes
         .iter()
+        .filter(|entry| entry.state == SecondaryIndexState::Ready)
         .map(|entry| {
-            let SecondaryIndexTarget::NodeProperty { type_id, prop_key } = &entry.target;
+            let target = planner_stats_declared_index_target(entry);
+            let (target_label_id, prop_key) = match &entry.target {
+                SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (*label_id, prop_key),
+                SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (*label_id, prop_key),
+            };
             let (kind, range_domain) = match entry.kind {
                 SecondaryIndexKind::Equality => (PlannerStatsDeclaredIndexKind::Equality, None),
                 SecondaryIndexKind::Range { domain } => {
@@ -3648,8 +4079,9 @@ fn declared_index_fingerprints(
             };
             DeclaredIndexStatsFingerprint {
                 index_id: entry.index_id,
+                target,
                 kind,
-                type_id: *type_id,
+                target_label_id,
                 prop_key: prop_key.clone(),
                 range_domain,
             }
@@ -3658,18 +4090,31 @@ fn declared_index_fingerprints(
     declared.sort_by(|a, b| {
         a.index_id
             .cmp(&b.index_id)
+            .then_with(|| {
+                declared_index_target_rank(a.target).cmp(&declared_index_target_rank(b.target))
+            })
             .then_with(|| declared_index_kind_rank(a.kind).cmp(&declared_index_kind_rank(b.kind)))
-            .then_with(|| a.type_id.cmp(&b.type_id))
+            .then_with(|| a.target_label_id.cmp(&b.target_label_id))
             .then_with(|| a.prop_key.cmp(&b.prop_key))
             .then_with(|| range_domain_rank(a.range_domain).cmp(&range_domain_rank(b.range_domain)))
     });
     declared
 }
 
+pub(crate) fn planner_stats_declared_index_target(
+    entry: &SecondaryIndexManifestEntry,
+) -> PlannerStatsDeclaredIndexTarget {
+    match &entry.target {
+        SecondaryIndexTarget::NodeProperty { .. } => PlannerStatsDeclaredIndexTarget::NodeProperty,
+        SecondaryIndexTarget::EdgeProperty { .. } => PlannerStatsDeclaredIndexTarget::EdgeProperty,
+    }
+}
+
 fn declaration_fingerprint(declared: &[DeclaredIndexStatsFingerprint]) -> u64 {
     let mut hash = FNV_OFFSET;
     for entry in declared {
         hash = fnv_update_u64(hash, entry.index_id);
+        hash = fnv_update_u8(hash, declared_index_target_rank(entry.target));
         hash = fnv_update_u8(
             hash,
             match entry.kind {
@@ -3677,7 +4122,7 @@ fn declaration_fingerprint(declared: &[DeclaredIndexStatsFingerprint]) -> u64 {
                 PlannerStatsDeclaredIndexKind::Range => 2,
             },
         );
-        hash = fnv_update_u32(hash, entry.type_id);
+        hash = fnv_update_u32(hash, entry.target_label_id);
         hash = fnv_update_bytes(hash, entry.prop_key.as_bytes());
         hash = fnv_update_u8(
             hash,
@@ -3713,6 +4158,13 @@ fn fnv_update_u32(hash: u64, value: u32) -> u64 {
 
 fn fnv_update_u64(hash: u64, value: u64) -> u64 {
     fnv_update_bytes(hash, &value.to_le_bytes())
+}
+
+fn declared_index_target_rank(target: PlannerStatsDeclaredIndexTarget) -> u8 {
+    match target {
+        PlannerStatsDeclaredIndexTarget::NodeProperty => 0,
+        PlannerStatsDeclaredIndexTarget::EdgeProperty => 1,
+    }
 }
 
 fn declared_index_kind_rank(kind: PlannerStatsDeclaredIndexKind) -> u8 {
@@ -3820,14 +4272,14 @@ fn node_id_sample(ids: impl Iterator<Item = u64>) -> Vec<u64> {
 }
 
 trait EdgeLike {
-    fn edge_type_id(&self) -> u32;
+    fn edge_label_id(&self) -> u32;
     fn source_node_id(&self) -> u64;
     fn target_node_id(&self) -> u64;
 }
 
 impl EdgeLike for EdgeRecord {
-    fn edge_type_id(&self) -> u32 {
-        self.type_id
+    fn edge_label_id(&self) -> u32 {
+        self.label_id
     }
     fn source_node_id(&self) -> u64 {
         self.from
@@ -3838,8 +4290,8 @@ impl EdgeLike for EdgeRecord {
 }
 
 impl<T: EdgeLike + ?Sized> EdgeLike for &T {
-    fn edge_type_id(&self) -> u32 {
-        (*self).edge_type_id()
+    fn edge_label_id(&self) -> u32 {
+        (*self).edge_label_id()
     }
 
     fn source_node_id(&self) -> u64 {
@@ -3853,7 +4305,7 @@ impl<T: EdgeLike + ?Sized> EdgeLike for &T {
 
 #[derive(Clone, Copy)]
 struct EdgeMetaRef {
-    type_id: u32,
+    label_id: u32,
     from: u64,
     to: u64,
 }
@@ -3861,7 +4313,7 @@ struct EdgeMetaRef {
 impl From<&CompactEdgeMeta> for EdgeMetaRef {
     fn from(meta: &CompactEdgeMeta) -> Self {
         Self {
-            type_id: meta.type_id,
+            label_id: meta.label_id,
             from: meta.from,
             to: meta.to,
         }
@@ -3869,8 +4321,8 @@ impl From<&CompactEdgeMeta> for EdgeMetaRef {
 }
 
 impl EdgeLike for EdgeMetaRef {
-    fn edge_type_id(&self) -> u32 {
-        self.type_id
+    fn edge_label_id(&self) -> u32 {
+        self.label_id
     }
     fn source_node_id(&self) -> u64 {
         self.from
@@ -3898,15 +4350,15 @@ fn build_adjacency_stats<E: EdgeLike>(
     let mut groups: BTreeMap<(PlannerStatsDirection, Option<u32>), BTreeMap<u64, u32>> =
         BTreeMap::new();
     for edge in edges {
-        let type_id = edge.edge_type_id();
-        for edge_type_id in [None, Some(type_id)] {
+        let label_id = edge.edge_label_id();
+        for edge_label_id in [None, Some(label_id)] {
             *groups
-                .entry((PlannerStatsDirection::Outgoing, edge_type_id))
+                .entry((PlannerStatsDirection::Outgoing, edge_label_id))
                 .or_default()
                 .entry(edge.source_node_id())
                 .or_default() += 1;
             *groups
-                .entry((PlannerStatsDirection::Incoming, edge_type_id))
+                .entry((PlannerStatsDirection::Incoming, edge_label_id))
                 .or_default()
                 .entry(edge.target_node_id())
                 .or_default() += 1;
@@ -3915,13 +4367,13 @@ fn build_adjacency_stats<E: EdgeLike>(
 
     groups
         .into_iter()
-        .filter_map(|((direction, edge_type_id), fanouts)| {
+        .filter_map(|((direction, edge_label_id), fanouts)| {
             if fanouts.is_empty() {
                 return None;
             }
             Some(adjacency_stats_from_fanouts(
                 direction,
-                edge_type_id,
+                edge_label_id,
                 fanouts,
             ))
         })
@@ -3930,7 +4382,7 @@ fn build_adjacency_stats<E: EdgeLike>(
 
 fn adjacency_stats_from_fanouts(
     direction: PlannerStatsDirection,
-    edge_type_id: Option<u32>,
+    edge_label_id: Option<u32>,
     fanouts: BTreeMap<u64, u32>,
 ) -> AdjacencyPlannerStats {
     let mut counts: Vec<u32> = fanouts.values().copied().collect();
@@ -3950,10 +4402,10 @@ fn adjacency_stats_from_fanouts(
             .cmp(&a.count)
             .then_with(|| a.node_id.cmp(&b.node_id))
     });
-    top_hubs.truncate(PLANNER_STATS_TOP_HUBS_PER_EDGE_TYPE);
+    top_hubs.truncate(PLANNER_STATS_TOP_HUBS_PER_EDGE_LABEL);
     AdjacencyPlannerStats {
         direction,
-        edge_type_id,
+        edge_label_id,
         source_node_count: counts.len() as u64,
         total_edges,
         min_fanout,
@@ -3979,7 +4431,16 @@ fn decode_node_props_at(
     node_id: u64,
 ) -> Result<BTreeMap<String, PropValue>, EngineError> {
     let start = data_offset as usize;
-    let key_len_start = start.checked_add(4).ok_or_else(|| {
+    let label_count = *data.get(start).ok_or_else(|| {
+        EngineError::CorruptRecord(format!("node {} record too short for label count", node_id))
+    })? as usize;
+    if label_count == 0 || label_count > crate::types::MAX_NODE_LABELS_PER_NODE {
+        return Err(EngineError::CorruptRecord(format!(
+            "node {} record has invalid label count {}",
+            node_id, label_count
+        )));
+    }
+    let key_len_start = start.checked_add(1 + label_count * 4).ok_or_else(|| {
         EngineError::CorruptRecord(format!("node {} props offset overflow", node_id))
     })?;
     let key_len_end = key_len_start.checked_add(2).ok_or_else(|| {
@@ -4017,11 +4478,11 @@ fn decode_node_props_at(
     })
 }
 
+#[cfg(test)]
 fn read_secondary_eq_group_counts(path: &Path) -> Result<Option<BTreeMap<u64, u64>>, EngineError> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let data = match read_optional_component_payload(path)? {
+        Some(data) => data,
+        None => return Ok(None),
     };
     if data.len() < 8 {
         return Err(EngineError::CorruptRecord(format!(
@@ -4065,11 +4526,11 @@ fn read_secondary_eq_group_counts(path: &Path) -> Result<Option<BTreeMap<u64, u6
     Ok(Some(groups))
 }
 
+#[cfg(test)]
 fn read_secondary_range_encoded_values(path: &Path) -> Result<Option<Vec<u64>>, EngineError> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let data = match read_optional_component_payload(path)? {
+        Some(data) => data,
+        None => return Ok(None),
     };
     if data.len() < 8 {
         return Err(EngineError::CorruptRecord(format!(
@@ -4097,10 +4558,48 @@ fn read_secondary_range_encoded_values(path: &Path) -> Result<Option<Vec<u64>>, 
     Ok(Some(encoded_values))
 }
 
+#[cfg(test)]
+fn read_optional_component_payload(path: &Path) -> Result<Option<Vec<u8>>, EngineError> {
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if data.len() >= COMPONENT_IDENTITY_HEADER_LEN
+        && data[0..COMPONENT_IDENTITY_HEADER_MAGIC.len()] == COMPONENT_IDENTITY_HEADER_MAGIC
+    {
+        let header = decode_identity_header(&data)?;
+        let end = header
+            .payload_offset
+            .checked_add(header.payload_len)
+            .ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "component payload range overflows for {}",
+                    path.display()
+                ))
+            })?;
+        if end > data.len() as u64 {
+            return Err(EngineError::CorruptRecord(format!(
+                "component payload range [{}, {}) exceeds file length {} for {}",
+                header.payload_offset,
+                end,
+                data.len(),
+                path.display()
+            )));
+        }
+        return Ok(Some(
+            data[header.payload_offset as usize..end as usize].to_vec(),
+        ));
+    }
+    Ok(Some(data))
+}
+
+#[cfg(test)]
 fn cleanup_stats_tmp(seg_dir: &Path) {
     let _ = fs::remove_file(seg_dir.join(PLANNER_STATS_TMP_FILENAME));
 }
 
+#[cfg(test)]
 fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -4115,7 +4614,10 @@ fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SecondaryIndexState;
+    use crate::types::{
+        SecondaryIndexKind, SecondaryIndexManifestEntry, SecondaryIndexRangeDomain,
+        SecondaryIndexState, SecondaryIndexTarget,
+    };
 
     fn minimal_stats(segment_id: u64) -> SegmentPlannerStatsV1 {
         SegmentPlannerStatsV1 {
@@ -4132,8 +4634,8 @@ mod tests {
             general_property_sampled_node_count: 1,
             general_property_sampled_raw_bytes: 0,
             general_property_budget_exhausted: false,
-            type_stats: vec![TypePlannerStats {
-                type_id: 7,
+            node_label_stats: vec![NodeLabelPlannerStats {
+                label_id: 7,
                 node_count: 1,
                 min_node_id: Some(42),
                 max_node_id: Some(42),
@@ -4147,6 +4649,81 @@ mod tests {
             adjacency_stats: Vec::new(),
             node_id_sample: vec![42],
         }
+    }
+
+    fn equality_entry(index_id: u64) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 7,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        }
+    }
+
+    fn range_entry(index_id: u64) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 7,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn equality_stats_from_written_groups_match_sidecar_read_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::segment_writer::secondary_indexes_dir(dir.path())).unwrap();
+        let entry = equality_entry(41);
+        let mut groups = BTreeMap::new();
+        groups.insert(100, vec![1, 3, 5]);
+        groups.insert(200, vec![2]);
+        groups.insert(300, Vec::new());
+
+        crate::segment_writer::write_node_prop_eq_sidecar_to_path(
+            &crate::segment_writer::node_prop_eq_sidecar_path(dir.path(), entry.index_id),
+            &groups,
+        )
+        .unwrap();
+
+        let from_written = equality_index_stats_from_written_groups(&entry, &groups);
+        let from_sidecar =
+            build_equality_index_stats_from_sidecars(dir.path(), std::slice::from_ref(&entry))
+                .unwrap()
+                .pop()
+                .unwrap();
+        assert_eq!(from_written, from_sidecar);
+    }
+
+    #[test]
+    fn range_stats_from_written_entries_match_sidecar_read_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::segment_writer::secondary_indexes_dir(dir.path())).unwrap();
+        let entry = range_entry(42);
+        let entries = vec![(30, 3), (10, 1), (20, 2), (20, 4)];
+
+        crate::segment_writer::write_node_prop_range_sidecar_to_path(
+            &crate::segment_writer::node_prop_range_sidecar_path(dir.path(), entry.index_id),
+            &entries,
+        )
+        .unwrap();
+
+        let from_written = range_index_stats_from_written_entries(&entry, &entries);
+        let from_sidecar =
+            build_range_index_stats_from_sidecars(dir.path(), std::slice::from_ref(&entry))
+                .unwrap()
+                .pop()
+                .unwrap();
+        assert_eq!(from_written, from_sidecar);
     }
 
     #[test]
@@ -4183,7 +4760,7 @@ mod tests {
         stats.edge_count = 4;
         stats.adjacency_stats.push(AdjacencyPlannerStats {
             direction: PlannerStatsDirection::Outgoing,
-            edge_type_id: Some(10),
+            edge_label_id: Some(10),
             source_node_count: 2,
             total_edges: 4,
             min_fanout: 1,
@@ -4229,11 +4806,95 @@ mod tests {
         );
     }
 
-    fn ready_eq_entry(index_id: u64, type_id: u32, prop_key: &str) -> SecondaryIndexManifestEntry {
+    #[test]
+    fn validate_declared_index_stats_uses_edge_label_counts_for_edge_targets() {
+        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let mut stats = minimal_stats(1);
+        stats.node_count = 1;
+        stats.edge_count = 3;
+        stats.adjacency_stats.push(AdjacencyPlannerStats {
+            direction: PlannerStatsDirection::Outgoing,
+            edge_label_id: Some(7),
+            source_node_count: 1,
+            total_edges: 3,
+            min_fanout: 3,
+            max_fanout: 3,
+            p50_fanout: 3,
+            p90_fanout: 3,
+            p99_fanout: 3,
+            top_hubs: Vec::new(),
+        });
+        stats.declared_indexes.push(DeclaredIndexStatsFingerprint {
+            target: PlannerStatsDeclaredIndexTarget::EdgeProperty,
+            index_id: 31,
+            kind: PlannerStatsDeclaredIndexKind::Equality,
+            target_label_id: 7,
+            prop_key: "color".to_string(),
+            range_domain: None,
+        });
+        stats.equality_index_stats.push(EqualityIndexPlannerStats {
+            index_id: 31,
+            target_label_id: 7,
+            prop_key: "color".to_string(),
+            total_postings: 3,
+            value_group_count: 1,
+            max_group_postings: 3,
+            top_value_hashes: vec![ValueFrequency {
+                value_hash: red_hash,
+                count: 3,
+            }],
+            sidecar_present_at_build: true,
+        });
+        stats.declared_indexes.push(DeclaredIndexStatsFingerprint {
+            target: PlannerStatsDeclaredIndexTarget::EdgeProperty,
+            index_id: 32,
+            kind: PlannerStatsDeclaredIndexKind::Range,
+            target_label_id: 7,
+            prop_key: "score".to_string(),
+            range_domain: Some(SecondaryIndexRangeDomain::Float),
+        });
+        stats.range_index_stats.push(RangeIndexPlannerStats {
+            index_id: 32,
+            target_label_id: 7,
+            prop_key: "score".to_string(),
+            domain: SecondaryIndexRangeDomain::Float,
+            total_entries: 3,
+            min_encoded: Some(10),
+            max_encoded: Some(30),
+            buckets: vec![RangeBucket {
+                upper_encoded: 30,
+                count: 3,
+            }],
+            sidecar_present_at_build: true,
+        });
+        let mut node_label_counts = BTreeMap::new();
+        node_label_counts.insert(7, 1);
+
+        assert!(validate_declared_index_stats(&stats, &node_label_counts).is_ok());
+    }
+
+    fn ready_eq_entry(index_id: u64, label_id: u32, prop_key: &str) -> SecondaryIndexManifestEntry {
         SecondaryIndexManifestEntry {
             index_id,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id,
+                label_id,
+                prop_key: prop_key.to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        }
+    }
+
+    fn ready_edge_eq_entry(
+        index_id: u64,
+        label_id: u32,
+        prop_key: &str,
+    ) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::EdgeProperty {
+                label_id: label_id,
                 prop_key: prop_key.to_string(),
             },
             kind: SecondaryIndexKind::Equality,
@@ -4244,14 +4905,14 @@ mod tests {
 
     fn ready_range_entry(
         index_id: u64,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         domain: SecondaryIndexRangeDomain,
     ) -> SecondaryIndexManifestEntry {
         SecondaryIndexManifestEntry {
             index_id,
             target: SecondaryIndexTarget::NodeProperty {
-                type_id,
+                label_id,
                 prop_key: prop_key.to_string(),
             },
             kind: SecondaryIndexKind::Range { domain },
@@ -4263,22 +4924,23 @@ mod tests {
     fn add_eq_stats(
         stats: &mut SegmentPlannerStatsV1,
         index_id: u64,
-        type_id: u32,
+        target_label_id: u32,
         prop_key: &str,
         total_postings: u64,
         value_group_count: u64,
         top_value_hashes: Vec<ValueFrequency>,
     ) {
         stats.declared_indexes.push(DeclaredIndexStatsFingerprint {
+            target: PlannerStatsDeclaredIndexTarget::NodeProperty,
             index_id,
             kind: PlannerStatsDeclaredIndexKind::Equality,
-            type_id,
+            target_label_id,
             prop_key: prop_key.to_string(),
             range_domain: None,
         });
         stats.equality_index_stats.push(EqualityIndexPlannerStats {
             index_id,
-            type_id,
+            target_label_id,
             prop_key: prop_key.to_string(),
             total_postings,
             value_group_count,
@@ -4295,21 +4957,22 @@ mod tests {
     fn add_range_stats(
         stats: &mut SegmentPlannerStatsV1,
         index_id: u64,
-        type_id: u32,
+        target_label_id: u32,
         prop_key: &str,
         domain: SecondaryIndexRangeDomain,
         total_entries: u64,
     ) {
         stats.declared_indexes.push(DeclaredIndexStatsFingerprint {
+            target: PlannerStatsDeclaredIndexTarget::NodeProperty,
             index_id,
             kind: PlannerStatsDeclaredIndexKind::Range,
-            type_id,
+            target_label_id,
             prop_key: prop_key.to_string(),
             range_domain: Some(domain),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
             index_id,
-            type_id,
+            target_label_id,
             prop_key: prop_key.to_string(),
             domain,
             total_entries,
@@ -4323,9 +4986,86 @@ mod tests {
         });
     }
 
+    #[test]
+    fn targeted_stats_merge_replaces_only_target_block_and_keeps_siblings() {
+        let mut stats = minimal_stats(9);
+        add_eq_stats(
+            &mut stats,
+            11,
+            7,
+            "color",
+            3,
+            2,
+            vec![ValueFrequency {
+                value_hash: 111,
+                count: 2,
+            }],
+        );
+        add_range_stats(
+            &mut stats,
+            12,
+            7,
+            "score",
+            SecondaryIndexRangeDomain::Int,
+            1,
+        );
+        let ready_indexes = vec![
+            ready_range_entry(12, 7, "score", SecondaryIndexRangeDomain::Int),
+            ready_eq_entry(11, 7, "color"),
+        ];
+        let replacement_range = RangeIndexPlannerStats {
+            index_id: 12,
+            target_label_id: 7,
+            prop_key: "score".to_string(),
+            domain: SecondaryIndexRangeDomain::Int,
+            total_entries: 3,
+            min_encoded: Some(10),
+            max_encoded: Some(30),
+            buckets: vec![RangeBucket {
+                upper_encoded: 30,
+                count: 3,
+            }],
+            sidecar_present_at_build: true,
+        };
+
+        let merged = merge_targeted_declared_index_stats(
+            stats,
+            &ready_indexes,
+            12,
+            None,
+            Some(replacement_range),
+        );
+
+        assert_eq!(
+            merged.build_kind,
+            PlannerStatsBuildKind::SecondaryIndexRefresh
+        );
+        assert_eq!(merged.equality_index_stats.len(), 1);
+        assert_eq!(merged.equality_index_stats[0].index_id, 11);
+        assert_eq!(merged.range_index_stats.len(), 1);
+        assert_eq!(merged.range_index_stats[0].index_id, 12);
+        assert_eq!(merged.range_index_stats[0].total_entries, 3);
+        assert_eq!(
+            merged
+                .range_index_stats
+                .iter()
+                .filter(|stats| stats.index_id == 12)
+                .count(),
+            1
+        );
+        assert_eq!(
+            merged
+                .declared_indexes
+                .iter()
+                .map(|declared| declared.index_id)
+                .collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+    }
+
     fn stats_with_timestamp_histogram(
         segment_id: u64,
-        type_id: u32,
+        label_id: u32,
         count: u64,
         min_ms: i64,
         max_ms: i64,
@@ -4335,8 +5075,8 @@ mod tests {
         stats.general_property_sampled_node_count = stats
             .general_property_sampled_node_count
             .min(stats.node_count);
-        stats.type_stats = vec![TypePlannerStats {
-            type_id,
+        stats.node_label_stats = vec![NodeLabelPlannerStats {
+            label_id,
             node_count: count,
             min_node_id: Some(segment_id.saturating_mul(1_000)),
             max_node_id: Some(segment_id.saturating_mul(1_000).saturating_add(count)),
@@ -4344,7 +5084,7 @@ mod tests {
             max_updated_at_ms: Some(max_ms),
         }];
         stats.timestamp_stats = vec![TimestampPlannerStats {
-            type_id,
+            label_id,
             count,
             min_ms,
             max_ms,
@@ -4358,7 +5098,7 @@ mod tests {
 
     struct RangeHistogramInput {
         index_id: u64,
-        type_id: u32,
+        label_id: u32,
         prop_key: &'static str,
         domain: SecondaryIndexRangeDomain,
         count: u64,
@@ -4368,15 +5108,16 @@ mod tests {
 
     fn add_range_histogram_stats(stats: &mut SegmentPlannerStatsV1, input: RangeHistogramInput) {
         stats.declared_indexes.push(DeclaredIndexStatsFingerprint {
+            target: PlannerStatsDeclaredIndexTarget::NodeProperty,
             index_id: input.index_id,
             kind: PlannerStatsDeclaredIndexKind::Range,
-            type_id: input.type_id,
+            target_label_id: input.label_id,
             prop_key: input.prop_key.to_string(),
             range_domain: Some(input.domain),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
             index_id: input.index_id,
-            type_id: input.type_id,
+            target_label_id: input.label_id,
             prop_key: input.prop_key.to_string(),
             domain: input.domain,
             total_entries: input.count,
@@ -4494,16 +5235,158 @@ mod tests {
     }
 
     #[test]
+    fn envelope_allows_label_memberships_above_physical_node_count() {
+        let mut stats = minimal_stats(29);
+        stats.node_count = 2;
+        stats.general_property_sampled_node_count = 2;
+        stats.node_id_sample = vec![41, 42];
+        stats.node_label_stats = vec![
+            NodeLabelPlannerStats {
+                label_id: 7,
+                node_count: 2,
+                min_node_id: Some(41),
+                max_node_id: Some(42),
+                min_updated_at_ms: Some(1000),
+                max_updated_at_ms: Some(1001),
+            },
+            NodeLabelPlannerStats {
+                label_id: 9,
+                node_count: 1,
+                min_node_id: Some(42),
+                max_node_id: Some(42),
+                min_updated_at_ms: Some(1001),
+                max_updated_at_ms: Some(1001),
+            },
+        ];
+        stats.timestamp_stats = vec![
+            TimestampPlannerStats {
+                label_id: 7,
+                count: 2,
+                min_ms: 1000,
+                max_ms: 1001,
+                buckets: vec![TimestampBucket {
+                    upper_ms: 1001,
+                    count: 2,
+                }],
+            },
+            TimestampPlannerStats {
+                label_id: 9,
+                count: 1,
+                min_ms: 1001,
+                max_ms: 1001,
+                buckets: vec![TimestampBucket {
+                    upper_ms: 1001,
+                    count: 1,
+                }],
+            },
+        ];
+
+        let data = encode_enveloped_stats(&stats).unwrap();
+        let decoded = decode_planner_stats_envelope(&data, 29, 2, 0).unwrap();
+        assert_eq!(
+            decoded
+                .node_label_stats
+                .iter()
+                .map(|stat| stat.node_count)
+                .sum::<u64>(),
+            3
+        );
+        assert_eq!(decoded.node_count, 2);
+    }
+
+    #[test]
+    fn envelope_rejects_label_memberships_beyond_max_label_bound() {
+        let mut stats = minimal_stats(30);
+        stats.node_count = 1;
+        stats.node_label_stats = (1..=11)
+            .map(|label_id| NodeLabelPlannerStats {
+                label_id,
+                node_count: 1,
+                min_node_id: Some(42),
+                max_node_id: Some(42),
+                min_updated_at_ms: Some(1000),
+                max_updated_at_ms: Some(1000),
+            })
+            .collect();
+        stats.timestamp_stats = (1..=11)
+            .map(|label_id| TimestampPlannerStats {
+                label_id,
+                count: 1,
+                min_ms: 1000,
+                max_ms: 1000,
+                buckets: vec![TimestampBucket {
+                    upper_ms: 1000,
+                    count: 1,
+                }],
+            })
+            .collect();
+
+        assert_decode_err_contains(stats, 1, 0, "expected between 1 and 10");
+    }
+
+    #[test]
+    fn envelope_rejects_per_label_membership_count_above_node_count() {
+        let mut stats = minimal_stats(31);
+        stats.node_count = 2;
+        stats.general_property_sampled_node_count = 2;
+        stats.node_id_sample = vec![41, 42];
+        stats.node_label_stats = vec![
+            NodeLabelPlannerStats {
+                label_id: 7,
+                node_count: 3,
+                min_node_id: Some(41),
+                max_node_id: Some(42),
+                min_updated_at_ms: Some(1000),
+                max_updated_at_ms: Some(1001),
+            },
+            NodeLabelPlannerStats {
+                label_id: 9,
+                node_count: 1,
+                min_node_id: Some(42),
+                max_node_id: Some(42),
+                min_updated_at_ms: Some(1001),
+                max_updated_at_ms: Some(1001),
+            },
+        ];
+        stats.timestamp_stats = vec![
+            TimestampPlannerStats {
+                label_id: 7,
+                count: 3,
+                min_ms: 1000,
+                max_ms: 1001,
+                buckets: vec![TimestampBucket {
+                    upper_ms: 1001,
+                    count: 3,
+                }],
+            },
+            TimestampPlannerStats {
+                label_id: 9,
+                count: 1,
+                min_ms: 1001,
+                max_ms: 1001,
+                buckets: vec![TimestampBucket {
+                    upper_ms: 1001,
+                    count: 1,
+                }],
+            },
+        ];
+
+        assert_decode_err_contains(stats, 2, 0, "exceeds segment node count");
+    }
+
+    #[test]
     fn envelope_rejects_internal_count_sanity_failures() {
-        let mut bad_type_count = minimal_stats(9);
-        bad_type_count.type_stats[0].node_count = 2;
-        assert_decode_err_contains(bad_type_count, 1, 0, "type counts sum");
+        let mut bad_label_count = minimal_stats(9);
+        bad_label_count.node_count = 2;
+        bad_label_count.general_property_sampled_node_count = 2;
+        bad_label_count.node_id_sample = vec![42, 43];
+        assert_decode_err_contains(bad_label_count, 2, 0, "label counts sum");
 
         let mut bad_property_count = minimal_stats(9);
         bad_property_count
             .property_stats
             .push(PropertyPlannerStats {
-                type_id: 7,
+                label_id: 7,
                 prop_key: "score".to_string(),
                 tracked_reason: PropertyStatsTrackedReason::GeneralTopProperty,
                 present_count: 2,
@@ -4527,7 +5410,7 @@ mod tests {
             duplicate_property
                 .property_stats
                 .push(PropertyPlannerStats {
-                    type_id: 7,
+                    label_id: 7,
                     prop_key: "score".to_string(),
                     tracked_reason,
                     present_count: 1,
@@ -4548,7 +5431,7 @@ mod tests {
         bad_timestamp_bucket
             .timestamp_stats
             .push(TimestampPlannerStats {
-                type_id: 7,
+                label_id: 7,
                 count: 1,
                 min_ms: 1000,
                 max_ms: 1000,
@@ -4560,9 +5443,10 @@ mod tests {
         assert_decode_err_contains(bad_timestamp_bucket, 1, 0, "timestamp buckets sum");
 
         let declared_eq = DeclaredIndexStatsFingerprint {
+            target: PlannerStatsDeclaredIndexTarget::NodeProperty,
             index_id: 11,
             kind: PlannerStatsDeclaredIndexKind::Equality,
-            type_id: 7,
+            target_label_id: 7,
             prop_key: "color".to_string(),
             range_domain: None,
         };
@@ -4572,7 +5456,7 @@ mod tests {
             .equality_index_stats
             .push(EqualityIndexPlannerStats {
                 index_id: 11,
-                type_id: 7,
+                target_label_id: 7,
                 prop_key: "color".to_string(),
                 total_postings: 2,
                 value_group_count: 1,
@@ -4583,9 +5467,10 @@ mod tests {
         assert_decode_err_contains(bad_equality_count, 1, 0, "postings exceed");
 
         let declared_range = DeclaredIndexStatsFingerprint {
+            target: PlannerStatsDeclaredIndexTarget::NodeProperty,
             index_id: 12,
             kind: PlannerStatsDeclaredIndexKind::Range,
-            type_id: 7,
+            target_label_id: 7,
             prop_key: "score".to_string(),
             range_domain: Some(SecondaryIndexRangeDomain::Int),
         };
@@ -4595,7 +5480,7 @@ mod tests {
             .range_index_stats
             .push(RangeIndexPlannerStats {
                 index_id: 12,
-                type_id: 7,
+                target_label_id: 7,
                 prop_key: "score".to_string(),
                 domain: SecondaryIndexRangeDomain::Int,
                 total_entries: 1,
@@ -4613,7 +5498,7 @@ mod tests {
         bad_adjacency.edge_count = 1;
         bad_adjacency.adjacency_stats.push(AdjacencyPlannerStats {
             direction: PlannerStatsDirection::Outgoing,
-            edge_type_id: None,
+            edge_label_id: None,
             source_node_count: 1,
             total_edges: 2,
             min_fanout: 1,
@@ -4647,8 +5532,8 @@ mod tests {
     #[test]
     fn bounded_property_candidate_tracker_keeps_late_frequent_key() {
         let mut tracker =
-            PropertyKeyCandidateTracker::new(PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_TYPE);
-        for idx in 0..PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_TYPE {
+            PropertyKeyCandidateTracker::new(PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_LABEL);
+        for idx in 0..PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_LABEL {
             tracker.observe(&format!("one_off_{:04}", idx));
         }
         for _ in 0..32 {
@@ -4658,7 +5543,7 @@ mod tests {
         let keys: Vec<_> = tracker.into_keys().collect();
         assert_eq!(
             keys.len(),
-            PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_TYPE
+            PLANNER_STATS_PROPERTY_KEY_CANDIDATE_CAP_PER_LABEL
         );
         assert!(keys.iter().any(|key| key == "zz_late_hot"));
     }
@@ -4668,7 +5553,7 @@ mod tests {
         let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
         let mut stats = minimal_stats(1);
         stats.timestamp_stats.push(TimestampPlannerStats {
-            type_id: 7,
+            label_id: 7,
             count: 1,
             min_ms: 1000,
             max_ms: 1000,
@@ -4678,7 +5563,7 @@ mod tests {
             }],
         });
         stats.property_stats.push(PropertyPlannerStats {
-            type_id: 7,
+            label_id: 7,
             prop_key: "color".to_string(),
             tracked_reason: PropertyStatsTrackedReason::DeclaredEquality,
             present_count: 1,
@@ -4718,7 +5603,7 @@ mod tests {
         stats.edge_count = 1;
         stats.adjacency_stats.push(AdjacencyPlannerStats {
             direction: PlannerStatsDirection::Outgoing,
-            edge_type_id: Some(5),
+            edge_label_id: Some(5),
             source_node_count: 1,
             total_edges: 1,
             min_fanout: 1,
@@ -4771,19 +5656,19 @@ mod tests {
         assert_eq!(view.full_rollup.node_count, 1);
         assert_eq!(view.full_rollup.coverage.covered_segment_ids, vec![1]);
         assert_eq!(view.full_rollup.coverage.uncovered_segment_ids, vec![2, 3]);
-        assert_eq!(view.type_node_count(7), 1);
+        assert_eq!(view.node_label_count(7), 1);
         assert_eq!(view.timestamp_coverage.covered_segment_ids, vec![1]);
-        assert_eq!(view.type_rollups.get(&7).unwrap().type_id, 7);
-        assert_eq!(view.timestamp_rollups.get(&7).unwrap().type_id, 7);
+        assert_eq!(view.node_label_rollups.get(&7).unwrap().label_id, 7);
+        assert_eq!(view.timestamp_rollups.get(&7).unwrap().label_id, 7);
         let property = view
             .property_rollups
             .get(&(7, "color".to_string()))
             .unwrap();
-        assert_eq!(property.type_id, 7);
+        assert_eq!(property.label_id, 7);
         assert_eq!(property.prop_key, "color");
         assert_eq!(property.present_count, 1);
         let equality = view.equality_index_rollups.get(&11).unwrap();
-        assert_eq!(equality.type_id, 7);
+        assert_eq!(equality.target_label_id, 7);
         assert_eq!(equality.prop_key, "color");
         assert_eq!(equality.coverage.covered_segment_ids, vec![1]);
         assert_eq!(equality.coverage.uncovered_segment_ids, vec![2, 3]);
@@ -4795,7 +5680,7 @@ mod tests {
             })
         );
         let range = view.range_index_rollups.get(&12).unwrap();
-        assert_eq!(range.type_id, 7);
+        assert_eq!(range.target_label_id, 7);
         assert_eq!(range.prop_key, "score");
         assert_eq!(range.domain, SecondaryIndexRangeDomain::Int);
         assert_eq!(range.total_entries, 1);
@@ -4804,7 +5689,7 @@ mod tests {
             .get(&(PlannerStatsDirection::Outgoing, Some(5)))
             .unwrap();
         assert_eq!(adjacency.direction, PlannerStatsDirection::Outgoing);
-        assert_eq!(adjacency.edge_type_id, Some(5));
+        assert_eq!(adjacency.edge_label_id, Some(5));
         assert_eq!(adjacency.total_edges, 1);
     }
 
@@ -4839,7 +5724,7 @@ mod tests {
         );
 
         assert_eq!(view.full_rollup.coverage.covered_segment_ids, vec![1]);
-        assert_eq!(view.type_node_count(7), 1);
+        assert_eq!(view.node_label_count(7), 1);
         let equality = view.equality_index_rollups.get(&11).unwrap();
         assert_eq!(equality.coverage.mismatched_segment_ids, vec![1]);
         assert_eq!(view.equality_segment_estimate(11, 1, &[red_hash]), None);
@@ -4886,8 +5771,20 @@ mod tests {
                 ready_range_entry(12, 7, "score", SecondaryIndexRangeDomain::Int),
             ];
             let mut runtime_coverage = DeclaredIndexRuntimeCoverage::default();
-            runtime_coverage.insert(1, 11, PlannerStatsDeclaredIndexKind::Equality, state);
-            runtime_coverage.insert(1, 12, PlannerStatsDeclaredIndexKind::Range, state);
+            runtime_coverage.insert(
+                1,
+                11,
+                PlannerStatsDeclaredIndexTarget::NodeProperty,
+                PlannerStatsDeclaredIndexKind::Equality,
+                state,
+            );
+            runtime_coverage.insert(
+                1,
+                12,
+                PlannerStatsDeclaredIndexTarget::NodeProperty,
+                PlannerStatsDeclaredIndexKind::Range,
+                state,
+            );
 
             let view = build_planner_stats_view_from_snapshots_with_runtime_coverage(
                 1,
@@ -4955,7 +5852,87 @@ mod tests {
     }
 
     #[test]
-    fn rollup_declared_index_type_zero_is_valid_shape() {
+    fn rollup_declared_index_stats_require_matching_target_coverage() {
+        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let mut stats = minimal_stats(1);
+        stats.declared_indexes.push(DeclaredIndexStatsFingerprint {
+            target: PlannerStatsDeclaredIndexTarget::EdgeProperty,
+            index_id: 31,
+            kind: PlannerStatsDeclaredIndexKind::Equality,
+            target_label_id: 7,
+            prop_key: "color".to_string(),
+            range_domain: None,
+        });
+        stats.equality_index_stats.push(EqualityIndexPlannerStats {
+            index_id: 31,
+            target_label_id: 7,
+            prop_key: "color".to_string(),
+            total_postings: 1,
+            value_group_count: 1,
+            max_group_postings: 1,
+            top_value_hashes: vec![ValueFrequency {
+                value_hash: red_hash,
+                count: 1,
+            }],
+            sidecar_present_at_build: true,
+        });
+        let available = PlannerStatsAvailability::Available(Box::new(stats));
+        let segments = vec![PlannerStatsSegmentSnapshot {
+            segment_id: 1,
+            node_count: 0,
+            edge_count: 1,
+            availability: &available,
+        }];
+        let indexes = [ready_edge_eq_entry(31, 7, "color")];
+        let mut runtime_coverage = DeclaredIndexRuntimeCoverage::default();
+        runtime_coverage.insert(
+            1,
+            31,
+            PlannerStatsDeclaredIndexTarget::NodeProperty,
+            PlannerStatsDeclaredIndexKind::Equality,
+            DeclaredIndexRuntimeCoverageState::Available,
+        );
+
+        let view = build_planner_stats_view_from_snapshots_with_runtime_coverage(
+            1,
+            &segments,
+            &indexes,
+            &runtime_coverage,
+        );
+        assert_eq!(
+            view.equality_index_rollups
+                .get(&31)
+                .unwrap()
+                .coverage
+                .mismatched_segment_ids,
+            vec![1]
+        );
+
+        runtime_coverage.insert(
+            1,
+            31,
+            PlannerStatsDeclaredIndexTarget::EdgeProperty,
+            PlannerStatsDeclaredIndexKind::Equality,
+            DeclaredIndexRuntimeCoverageState::Available,
+        );
+        let view = build_planner_stats_view_from_snapshots_with_runtime_coverage(
+            1,
+            &segments,
+            &indexes,
+            &runtime_coverage,
+        );
+        assert_eq!(
+            view.equality_index_rollups
+                .get(&31)
+                .unwrap()
+                .coverage
+                .covered_segment_ids,
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn rollup_declared_index_label_zero_is_valid_shape() {
         let mut stats = minimal_stats(1);
         add_eq_stats(&mut stats, 11, 0, "color", 0, 0, Vec::new());
         add_range_stats(
@@ -4983,15 +5960,24 @@ mod tests {
             ],
         );
 
-        assert_eq!(view.equality_index_rollups.get(&11).unwrap().type_id, 0);
-        assert_eq!(view.range_index_rollups.get(&12).unwrap().type_id, 0);
+        assert_eq!(
+            view.equality_index_rollups
+                .get(&11)
+                .unwrap()
+                .target_label_id,
+            0
+        );
+        assert_eq!(
+            view.range_index_rollups.get(&12).unwrap().target_label_id,
+            0
+        );
     }
 
     #[test]
     fn rollup_range_and_timestamp_histograms_use_conservative_upper_estimates() {
         let mut stats = minimal_stats(1);
         stats.timestamp_stats = vec![TimestampPlannerStats {
-            type_id: 7,
+            label_id: 7,
             count: 6,
             min_ms: 10,
             max_ms: 60,
@@ -5011,15 +5997,16 @@ mod tests {
             ],
         }];
         stats.declared_indexes.push(DeclaredIndexStatsFingerprint {
+            target: PlannerStatsDeclaredIndexTarget::NodeProperty,
             index_id: 12,
             kind: PlannerStatsDeclaredIndexKind::Range,
-            type_id: 7,
+            target_label_id: 7,
             prop_key: "score".to_string(),
             range_domain: Some(SecondaryIndexRangeDomain::Int),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
             index_id: 12,
-            type_id: 7,
+            target_label_id: 7,
             prop_key: "score".to_string(),
             domain: SecondaryIndexRangeDomain::Int,
             total_entries: 6,
@@ -5097,7 +6084,7 @@ mod tests {
             &mut stats_a,
             RangeHistogramInput {
                 index_id: 12,
-                type_id: 7,
+                label_id: 7,
                 prop_key: "score",
                 domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
@@ -5110,7 +6097,7 @@ mod tests {
             &mut stats_b,
             RangeHistogramInput {
                 index_id: 12,
-                type_id: 7,
+                label_id: 7,
                 prop_key: "score",
                 domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
@@ -5194,7 +6181,7 @@ mod tests {
             &mut stats_a,
             RangeHistogramInput {
                 index_id: 12,
-                type_id: 7,
+                label_id: 7,
                 prop_key: "score",
                 domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
@@ -5207,7 +6194,7 @@ mod tests {
             &mut stats_b,
             RangeHistogramInput {
                 index_id: 12,
-                type_id: 7,
+                label_id: 7,
                 prop_key: "score",
                 domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
@@ -5291,7 +6278,7 @@ mod tests {
             &mut stats,
             RangeHistogramInput {
                 index_id: 12,
-                type_id: 7,
+                label_id: 7,
                 prop_key: "score",
                 domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
@@ -5376,7 +6363,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_absent_type_is_exact_zero_only_when_type_stats_cover_segments() {
+    fn timestamp_absent_label_is_exact_zero_only_when_node_label_stats_cover_segments() {
         let stats = stats_with_timestamp_histogram(1, 7, 100, 0, 100);
         let available = PlannerStatsAvailability::Available(Box::new(stats));
         let segments = vec![PlannerStatsSegmentSnapshot {
@@ -5516,7 +6503,7 @@ mod tests {
         assert_eq!(view.segment_count, 256);
         assert_eq!(view.available_segment_stats, 256);
         assert_eq!(view.full_rollup.node_count, 256);
-        assert_eq!(view.type_node_count(7), 256);
+        assert_eq!(view.node_label_count(7), 256);
         let equality = view.equality_index_rollups.get(&11).unwrap();
         assert_eq!(equality.coverage.covered_segment_ids.len(), 256);
         assert_eq!(equality.total_postings, 256);
@@ -5594,7 +6581,7 @@ mod tests {
     fn size_reduction_preserves_core_before_skip() {
         let mut stats = minimal_stats(1);
         stats.property_stats.push(PropertyPlannerStats {
-            type_id: 1,
+            label_id: 1,
             prop_key: "large_general".to_string(),
             tracked_reason: PropertyStatsTrackedReason::GeneralTopProperty,
             present_count: 1,
@@ -5616,7 +6603,7 @@ mod tests {
         let reduced = decode_planner_stats_envelope(&encoded, 1, 1, 0).unwrap();
         assert!(reduced.truncated);
         assert!(reduced.property_stats.is_empty());
-        assert_eq!(reduced.type_stats, stats.type_stats);
+        assert_eq!(reduced.node_label_stats, stats.node_label_stats);
 
         assert!(serialize_stats_with_limits(stats, 64, 64)
             .unwrap()
@@ -5629,23 +6616,25 @@ mod tests {
         stats.edge_count = 1;
         stats.declared_indexes = vec![
             DeclaredIndexStatsFingerprint {
+                target: PlannerStatsDeclaredIndexTarget::NodeProperty,
                 index_id: 11,
                 kind: PlannerStatsDeclaredIndexKind::Equality,
-                type_id: 7,
+                target_label_id: 7,
                 prop_key: "color".to_string(),
                 range_domain: None,
             },
             DeclaredIndexStatsFingerprint {
+                target: PlannerStatsDeclaredIndexTarget::NodeProperty,
                 index_id: 12,
                 kind: PlannerStatsDeclaredIndexKind::Range,
-                type_id: 7,
+                target_label_id: 7,
                 prop_key: "score".to_string(),
                 range_domain: Some(SecondaryIndexRangeDomain::Int),
             },
         ];
         stats.equality_index_stats.push(EqualityIndexPlannerStats {
             index_id: 11,
-            type_id: 7,
+            target_label_id: 7,
             prop_key: "color".to_string(),
             total_postings: 1,
             value_group_count: 1,
@@ -5658,7 +6647,7 @@ mod tests {
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
             index_id: 12,
-            type_id: 7,
+            target_label_id: 7,
             prop_key: "score".to_string(),
             domain: SecondaryIndexRangeDomain::Int,
             total_entries: 1,
@@ -5671,7 +6660,7 @@ mod tests {
             sidecar_present_at_build: true,
         });
         stats.property_stats.push(PropertyPlannerStats {
-            type_id: 7,
+            label_id: 7,
             prop_key: "general".to_string(),
             tracked_reason: PropertyStatsTrackedReason::GeneralTopProperty,
             present_count: 1,
@@ -5690,10 +6679,10 @@ mod tests {
                 .collect(),
             numeric_summaries: Vec::new(),
         });
-        for edge_type_id in 0..256 {
+        for edge_label_id in 0..256 {
             stats.adjacency_stats.push(AdjacencyPlannerStats {
                 direction: PlannerStatsDirection::Outgoing,
-                edge_type_id: Some(edge_type_id),
+                edge_label_id: Some(edge_label_id),
                 source_node_count: 1,
                 total_edges: 1,
                 min_fanout: 1,

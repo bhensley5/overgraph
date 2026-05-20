@@ -17,13 +17,13 @@ describe('neighborsBatch (sync)', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-nbatch-'));
     db = freshDb(tmpDir, 'nbatch');
     // Build a small graph: n1->n2 (type 10), n1->n3 (type 20), n2->n4 (type 10)
-    n1 = db.upsertNode(1, 'n1');
-    n2 = db.upsertNode(1, 'n2');
-    n3 = db.upsertNode(1, 'n3');
-    n4 = db.upsertNode(1, 'n4');
-    db.upsertEdge(n1, n2, 10);
-    db.upsertEdge(n1, n3, 20);
-    db.upsertEdge(n2, n4, 10);
+    n1 = db.upsertNode('Person', 'n1');
+    n2 = db.upsertNode('Person', 'n2');
+    n3 = db.upsertNode('Person', 'n3');
+    n4 = db.upsertNode('Person', 'n4');
+    db.upsertEdge(n1, n2, 'WORKS_AT');
+    db.upsertEdge(n1, n3, 'MENTIONS');
+    db.upsertEdge(n2, n4, 'WORKS_AT');
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -54,7 +54,7 @@ describe('neighborsBatch (sync)', () => {
   });
 
   it('respects type filter', () => {
-    const results = db.neighborsBatch([n1], { direction: 'outgoing', typeFilter: [10] });
+    const results = db.neighborsBatch([n1], { direction: 'outgoing', edgeLabelFilter: ['WORKS_AT'] });
     assert.equal(results.length, 1);
     // n1 has 1 outgoing edge of type 10 (to n2)
     assert.equal(results[0].neighbors.length, 1);
@@ -68,7 +68,7 @@ describe('neighborsBatch (sync)', () => {
   });
 
   it('handles node with no neighbors', () => {
-    const lonely = db.upsertNode(1, 'lonely');
+    const lonely = db.upsertNode('Person', 'lonely');
     const results = db.neighborsBatch([lonely]);
     // Engine filters empty entries: nodes with no neighbors are omitted
     assert.equal(results.length, 0);
@@ -100,10 +100,10 @@ describe('neighborsBatch, temporal (at_epoch)', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-nbatch-temp-'));
     db = freshDb(tmpDir, 'nbatch-temp');
-    n1 = db.upsertNode(1, 'a');
-    n2 = db.upsertNode(1, 'b');
+    n1 = db.upsertNode('Person', 'a');
+    n2 = db.upsertNode('Person', 'b');
     // Edge valid from 1000 to 2000
-    db.upsertEdge(n1, n2, 10, { weight: 1.0, validFrom: 1000, validTo: 2000 });
+    db.upsertEdge(n1, n2, 'WORKS_AT', { weight: 1.0, validFrom: 1000, validTo: 2000 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -126,11 +126,11 @@ describe('neighborsBatchAsync', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-nbatch-async-'));
     db = freshDb(tmpDir, 'nbatch-async');
-    n1 = db.upsertNode(1, 'x1');
-    n2 = db.upsertNode(1, 'x2');
-    n3 = db.upsertNode(1, 'x3');
-    db.upsertEdge(n1, n2, 10);
-    db.upsertEdge(n1, n3, 10);
+    n1 = db.upsertNode('Person', 'x1');
+    n2 = db.upsertNode('Person', 'x2');
+    n3 = db.upsertNode('Person', 'x3');
+    db.upsertEdge(n1, n2, 'WORKS_AT');
+    db.upsertEdge(n1, n3, 'WORKS_AT');
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 

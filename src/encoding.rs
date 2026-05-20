@@ -144,6 +144,33 @@ fn read_str(cursor: &mut Cursor<&[u8]>) -> Result<String, EngineError> {
     String::from_utf8(buf).map_err(|_| EngineError::CorruptRecord("invalid UTF-8 in string".into()))
 }
 
+fn read_node_label_set(cursor: &mut Cursor<&[u8]>) -> Result<NodeLabelSet, EngineError> {
+    let count = read_u8(cursor)? as usize;
+    if count == 0 {
+        return Err(EngineError::CorruptRecord(
+            "node WAL label_count must be at least 1".into(),
+        ));
+    }
+    if count > MAX_NODE_LABELS_PER_NODE {
+        return Err(EngineError::CorruptRecord(format!(
+            "node WAL label_count {} exceeds maximum {}",
+            count, MAX_NODE_LABELS_PER_NODE
+        )));
+    }
+
+    let mut ids = [0u32; MAX_NODE_LABELS_PER_NODE];
+    for index in 0..count {
+        ids[index] = read_u32(cursor)?;
+        if index > 0 && ids[index - 1] >= ids[index] {
+            return Err(EngineError::CorruptRecord(
+                "node WAL label IDs must be sorted ascending and unique".into(),
+            ));
+        }
+    }
+    NodeLabelSet::from_canonical_ids(&ids[..count])
+        .map_err(|err| EngineError::CorruptRecord(format!("invalid node WAL label set: {err}")))
+}
+
 // --- Public API ---
 
 /// Encode a WalOp into the provided buffer (clears first, reuses allocation).
@@ -154,7 +181,10 @@ pub(crate) fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), En
         WalOp::UpsertNode(node) => {
             write_u8(buf, OpTag::UpsertNode as u8);
             write_u64(buf, node.id);
-            write_u32(buf, node.type_id);
+            write_u8(buf, node.label_ids.len() as u8);
+            for &label_id in node.label_ids.as_slice() {
+                write_u32(buf, label_id);
+            }
             write_str(buf, &node.key)?;
             write_i64(buf, node.created_at);
             write_i64(buf, node.updated_at);
@@ -188,7 +218,7 @@ pub(crate) fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), En
             write_u64(buf, edge.id);
             write_u64(buf, edge.from);
             write_u64(buf, edge.to);
-            write_u32(buf, edge.type_id);
+            write_u32(buf, edge.label_id);
             write_i64(buf, edge.created_at);
             write_i64(buf, edge.updated_at);
             write_f32(buf, edge.weight);
@@ -208,6 +238,32 @@ pub(crate) fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), En
             write_u8(buf, OpTag::DeleteEdge as u8);
             write_u64(buf, *id);
             write_i64(buf, *deleted_at);
+        }
+        WalOp::EnsureNodeLabel { label, label_id } => {
+            write_u8(buf, OpTag::EnsureNodeLabel as u8);
+            write_str(buf, label)?;
+            write_u32(buf, *label_id);
+        }
+        WalOp::EnsureEdgeLabel { label, label_id } => {
+            write_u8(buf, OpTag::EnsureEdgeLabel as u8);
+            write_str(buf, label)?;
+            write_u32(buf, *label_id);
+        }
+        WalOp::BeginAtomicBatch {
+            first_seq,
+            op_count,
+        } => {
+            write_u8(buf, OpTag::BeginAtomicBatch as u8);
+            write_u64(buf, *first_seq);
+            write_u32(buf, *op_count);
+        }
+        WalOp::CommitAtomicBatch {
+            first_seq,
+            op_count,
+        } => {
+            write_u8(buf, OpTag::CommitAtomicBatch as u8);
+            write_u64(buf, *first_seq);
+            write_u32(buf, *op_count);
         }
     }
 
@@ -240,7 +296,7 @@ pub(crate) fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
     match OpTag::from_u8(op_tag) {
         Some(OpTag::UpsertNode) => {
             let id = read_u64(&mut cursor)?;
-            let type_id = read_u32(&mut cursor)?;
+            let label_ids = read_node_label_set(&mut cursor)?;
             let key = read_str(&mut cursor)?;
             let created_at = read_i64(&mut cursor)?;
             let updated_at = read_i64(&mut cursor)?;
@@ -290,7 +346,7 @@ pub(crate) fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
 
             Ok(WalOp::UpsertNode(NodeRecord {
                 id,
-                type_id,
+                label_ids,
                 key,
                 props,
                 created_at,
@@ -305,7 +361,7 @@ pub(crate) fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
             let id = read_u64(&mut cursor)?;
             let from = read_u64(&mut cursor)?;
             let to = read_u64(&mut cursor)?;
-            let type_id = read_u32(&mut cursor)?;
+            let label_id = read_u32(&mut cursor)?;
             let created_at = read_i64(&mut cursor)?;
             let updated_at = read_i64(&mut cursor)?;
             let weight = read_f32(&mut cursor)?;
@@ -321,7 +377,7 @@ pub(crate) fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
                 id,
                 from,
                 to,
-                type_id,
+                label_id,
                 props,
                 created_at,
                 updated_at,
@@ -343,6 +399,36 @@ pub(crate) fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
             reject_trailing_bytes(&cursor, "delete-edge WAL op")?;
             Ok(WalOp::DeleteEdge { id, deleted_at })
         }
+        Some(OpTag::EnsureNodeLabel) => {
+            let label = read_str(&mut cursor)?;
+            let label_id = read_u32(&mut cursor)?;
+            reject_trailing_bytes(&cursor, "ensure-node-label WAL op")?;
+            Ok(WalOp::EnsureNodeLabel { label, label_id })
+        }
+        Some(OpTag::EnsureEdgeLabel) => {
+            let label = read_str(&mut cursor)?;
+            let label_id = read_u32(&mut cursor)?;
+            reject_trailing_bytes(&cursor, "ensure-edge-label WAL op")?;
+            Ok(WalOp::EnsureEdgeLabel { label, label_id })
+        }
+        Some(OpTag::BeginAtomicBatch) => {
+            let first_seq = read_u64(&mut cursor)?;
+            let op_count = read_u32(&mut cursor)?;
+            reject_trailing_bytes(&cursor, "begin-atomic-batch WAL op")?;
+            Ok(WalOp::BeginAtomicBatch {
+                first_seq,
+                op_count,
+            })
+        }
+        Some(OpTag::CommitAtomicBatch) => {
+            let first_seq = read_u64(&mut cursor)?;
+            let op_count = read_u32(&mut cursor)?;
+            reject_trailing_bytes(&cursor, "commit-atomic-batch WAL op")?;
+            Ok(WalOp::CommitAtomicBatch {
+                first_seq,
+                op_count,
+            })
+        }
         None => Err(EngineError::CorruptRecord(format!(
             "unknown op tag: {}",
             op_tag
@@ -363,7 +449,7 @@ mod tests {
 
         let op = WalOp::UpsertNode(NodeRecord {
             id: 42,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: "user:alice".to_string(),
             props,
             created_at: 1000000,
@@ -375,12 +461,14 @@ mod tests {
         });
 
         let encoded = encode_wal_op(&op).unwrap();
+        assert_eq!(encoded[9], 1);
+        assert_eq!(u32::from_le_bytes(encoded[10..14].try_into().unwrap()), 1);
         let decoded = decode_wal_op(&encoded).unwrap();
 
         match decoded {
             WalOp::UpsertNode(node) => {
                 assert_eq!(node.id, 42);
-                assert_eq!(node.type_id, 1);
+                assert_eq!(node.label_ids.as_slice(), &[1]);
                 assert_eq!(node.key, "user:alice");
                 assert_eq!(node.created_at, 1000000);
                 assert_eq!(node.updated_at, 1000001);
@@ -399,7 +487,7 @@ mod tests {
     fn test_roundtrip_upsert_node_with_vectors() {
         let op = WalOp::UpsertNode(NodeRecord {
             id: 7,
-            type_id: 2,
+            label_ids: NodeLabelSet::single(2).unwrap(),
             key: "vector-node".to_string(),
             props: BTreeMap::new(),
             created_at: 10,
@@ -423,7 +511,39 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_legacy_upsert_node_without_vector_payload() {
+    fn test_roundtrip_upsert_node_with_multi_label_sets() {
+        let cases: &[&[u32]] = &[&[2, 5], &[10, 11, 12, 13, 14, 15, 16, 17, 18, 19]];
+
+        for &label_ids in cases {
+            let op = WalOp::UpsertNode(NodeRecord {
+                id: 100 + label_ids.len() as u64,
+                label_ids: NodeLabelSet::from_canonical_ids(label_ids).unwrap(),
+                key: format!("multi-label-{}", label_ids.len()),
+                props: BTreeMap::new(),
+                created_at: 10,
+                updated_at: 11,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            });
+
+            let encoded = encode_wal_op(&op).unwrap();
+            assert_eq!(encoded[9], label_ids.len() as u8);
+            let decoded = decode_wal_op(&encoded).unwrap();
+
+            match decoded {
+                WalOp::UpsertNode(node) => {
+                    assert_eq!(node.label_ids.as_slice(), label_ids);
+                    assert_eq!(node.key, format!("multi-label-{}", label_ids.len()));
+                }
+                _ => panic!("expected UpsertNode"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_legacy_upsert_node_without_vector_payload_is_rejected() {
         let mut props = BTreeMap::new();
         props.insert("name".to_string(), PropValue::String("legacy".to_string()));
 
@@ -438,14 +558,42 @@ mod tests {
         let props_bytes = rmp_serde::to_vec(&props).unwrap();
         write_bytes(&mut encoded, &props_bytes).unwrap();
 
-        let decoded = decode_wal_op(&encoded).unwrap();
-        match decoded {
-            WalOp::UpsertNode(node) => {
-                assert_eq!(node.key, "legacy");
-                assert!(node.dense_vector.is_none());
-                assert!(node.sparse_vector.is_none());
+        let err = decode_wal_op(&encoded).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::CorruptRecord(_) | EngineError::SerializationError(_)
+            ),
+            "unexpected legacy WAL error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_decode_upsert_node_rejects_invalid_label_sets() {
+        fn encode_with_labels(labels: &[u32]) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            write_u8(&mut encoded, OpTag::UpsertNode as u8);
+            write_u64(&mut encoded, 42);
+            write_u8(&mut encoded, labels.len() as u8);
+            for &label_id in labels {
+                write_u32(&mut encoded, label_id);
             }
-            _ => panic!("expected UpsertNode"),
+            write_str(&mut encoded, "bad").unwrap();
+            write_i64(&mut encoded, 1);
+            write_i64(&mut encoded, 2);
+            write_f32(&mut encoded, 1.0);
+            let props_bytes = rmp_serde::to_vec(&BTreeMap::<String, PropValue>::new()).unwrap();
+            write_bytes(&mut encoded, &props_bytes).unwrap();
+            write_u8(&mut encoded, 0);
+            encoded
+        }
+
+        for labels in [&[][..], &[2, 1][..], &[1, 1][..], &[0][..]] {
+            let err = decode_wal_op(&encode_with_labels(labels)).unwrap_err();
+            assert!(
+                err.to_string().contains("node WAL"),
+                "unexpected error for {labels:?}: {err}"
+            );
         }
     }
 
@@ -458,7 +606,7 @@ mod tests {
             id: 100,
             from: 1,
             to: 2,
-            type_id: 10,
+            label_id: 10,
             props,
             created_at: 2000000,
             updated_at: 2000001,
@@ -476,7 +624,7 @@ mod tests {
                 assert_eq!(edge.id, 100);
                 assert_eq!(edge.from, 1);
                 assert_eq!(edge.to, 2);
-                assert_eq!(edge.type_id, 10);
+                assert_eq!(edge.label_id, 10);
                 assert_eq!(edge.created_at, 2000000);
                 assert_eq!(edge.updated_at, 2000001);
                 assert!((edge.weight - 1.0).abs() < f32::EPSILON);
@@ -528,10 +676,83 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_ensure_node_label() {
+        let op = WalOp::EnsureNodeLabel {
+            label: "Person".to_string(),
+            label_id: 7,
+        };
+        let encoded = encode_wal_op(&op).unwrap();
+        let decoded = decode_wal_op(&encoded).unwrap();
+
+        match decoded {
+            WalOp::EnsureNodeLabel { label, label_id } => {
+                assert_eq!(label, "Person");
+                assert_eq!(label_id, 7);
+            }
+            _ => panic!("expected EnsureNodeLabel"),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_ensure_edge_label() {
+        let op = WalOp::EnsureEdgeLabel {
+            label: "KNOWS".to_string(),
+            label_id: 11,
+        };
+        let encoded = encode_wal_op(&op).unwrap();
+        let decoded = decode_wal_op(&encoded).unwrap();
+
+        match decoded {
+            WalOp::EnsureEdgeLabel { label, label_id } => {
+                assert_eq!(label, "KNOWS");
+                assert_eq!(label_id, 11);
+            }
+            _ => panic!("expected EnsureEdgeLabel"),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_atomic_batch_markers() {
+        let begin = WalOp::BeginAtomicBatch {
+            first_seq: 42,
+            op_count: 3,
+        };
+        let encoded = encode_wal_op(&begin).unwrap();
+        let decoded = decode_wal_op(&encoded).unwrap();
+        match decoded {
+            WalOp::BeginAtomicBatch {
+                first_seq,
+                op_count,
+            } => {
+                assert_eq!(first_seq, 42);
+                assert_eq!(op_count, 3);
+            }
+            _ => panic!("expected BeginAtomicBatch"),
+        }
+
+        let commit = WalOp::CommitAtomicBatch {
+            first_seq: 42,
+            op_count: 3,
+        };
+        let encoded = encode_wal_op(&commit).unwrap();
+        let decoded = decode_wal_op(&encoded).unwrap();
+        match decoded {
+            WalOp::CommitAtomicBatch {
+                first_seq,
+                op_count,
+            } => {
+                assert_eq!(first_seq, 42);
+                assert_eq!(op_count, 3);
+            }
+            _ => panic!("expected CommitAtomicBatch"),
+        }
+    }
+
+    #[test]
     fn test_roundtrip_empty_props() {
         let op = WalOp::UpsertNode(NodeRecord {
             id: 1,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: "test".to_string(),
             props: BTreeMap::new(),
             created_at: 0,
@@ -577,7 +798,7 @@ mod tests {
 
         let op = WalOp::UpsertNode(NodeRecord {
             id: 1,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: "test".to_string(),
             props,
             created_at: 0,
@@ -649,7 +870,7 @@ mod tests {
         let long_key = "x".repeat(65536);
         let op = WalOp::UpsertNode(NodeRecord {
             id: 1,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: long_key,
             props: BTreeMap::new(),
             created_at: 0,
@@ -671,7 +892,7 @@ mod tests {
         let max_key = "x".repeat(u16::MAX as usize);
         let op = WalOp::UpsertNode(NodeRecord {
             id: 1,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: max_key.clone(),
             props: BTreeMap::new(),
             created_at: 0,

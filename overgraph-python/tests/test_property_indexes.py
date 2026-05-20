@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from overgraph import OverGraphError, PyPropertyRangeBound, PyPropertyRangeCursor
+from overgraph import OverGraphError, PropertyRangeBound, PropertyRangeCursor
 
 
 def wait_for_index_state(db, predicate, expected_state="ready", timeout_s=5.0):
@@ -15,11 +15,31 @@ def wait_for_index_state(db, predicate, expected_state="ready", timeout_s=5.0):
     raise AssertionError(f"timed out waiting for secondary index state '{expected_state}'")
 
 
+def wait_for_edge_index_state(db, predicate, expected_state="ready", timeout_s=5.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        info = predicate(db.list_edge_property_indexes())
+        if info is not None and info.state == expected_state:
+            return info
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for edge secondary index state '{expected_state}'")
+
+
+def plan_has_kind(node, kind):
+    if not node:
+        return False
+    if node.get("kind") == kind:
+        return True
+    if "input" in node and plan_has_kind(node["input"], kind):
+        return True
+    return any(plan_has_kind(child, kind) for child in node.get("inputs", []))
+
+
 class TestPropertyIndexes:
     def test_ensure_list_drop(self, db):
         for i in range(6):
             db.upsert_node(
-                1,
+                "Person",
                 f"node-{i}",
                 props={
                     "color": "red" if i % 2 == 0 else "blue",
@@ -28,12 +48,12 @@ class TestPropertyIndexes:
                 },
             )
 
-        eq = db.ensure_node_property_index(1, "color", "equality")
+        eq = db.ensure_node_property_index("Person", "color", "equality")
         assert eq.kind == "equality"
         assert eq.domain is None
         assert eq.state == "building"
 
-        range_info = db.ensure_node_property_index(1, "score", "range", domain="int")
+        range_info = db.ensure_node_property_index("Person", "score", "range", domain="int")
         assert range_info.kind == "range"
         assert range_info.domain == "int"
         assert range_info.state == "building"
@@ -61,23 +81,23 @@ class TestPropertyIndexes:
         ]
 
         with pytest.raises(OverGraphError, match="different domain"):
-            db.ensure_node_property_index(1, "score", "range", domain="float")
+            db.ensure_node_property_index("Person", "score", "range", domain="float")
 
-        assert db.drop_node_property_index(1, "color", "equality") is True
-        assert db.drop_node_property_index(1, "color", "equality") is False
+        assert db.drop_node_property_index("Person", "color", "equality") is True
+        assert db.drop_node_property_index("Person", "color", "equality") is False
 
     def test_range_queries_and_paging(self, db):
         inserted = []
         for i in range(6):
             inserted.append(
                 db.upsert_node(
-                    1,
+                    "Person",
                     f"node-{i}",
                     props={"score": (i + 1) * 10, "temp": (i + 1) * 5},
                 )
             )
 
-        db.ensure_node_property_index(1, "score", "range", domain="int")
+        db.ensure_node_property_index("Person", "score", "range", domain="int")
         wait_for_index_state(
             db,
             lambda infos: next(
@@ -86,19 +106,19 @@ class TestPropertyIndexes:
             ),
         )
 
-        lower = PyPropertyRangeBound(20, domain="int")
-        upper = PyPropertyRangeBound(50, inclusive=False, domain="int")
-        all_ids = db.find_nodes_range(1, "score", lower, upper).to_list()
+        lower = PropertyRangeBound(20, domain="int")
+        upper = PropertyRangeBound(50, inclusive=False, domain="int")
+        all_ids = db.find_nodes_range("Person", "score", lower, upper).to_list()
         assert len(all_ids) == 3
 
-        first = db.find_nodes_range_paged(1, "score", lower, upper, limit=2)
+        first = db.find_nodes_range_paged("Person", "score", lower, upper, limit=2)
         assert first.items.to_list() == all_ids[:2]
         assert first.next_cursor is not None
         assert first.next_cursor.domain == "int"
         assert isinstance(first.next_cursor.node_id, int)
 
         second = db.find_nodes_range_paged(
-            1,
+            "Person",
             "score",
             lower,
             upper,
@@ -109,42 +129,42 @@ class TestPropertyIndexes:
         assert second.next_cursor is None
 
         fallback = db.find_nodes_range(
-            1,
+            "Person",
             "temp",
-            PyPropertyRangeBound(10, domain="int"),
-            PyPropertyRangeBound(25, domain="int"),
+            PropertyRangeBound(10, domain="int"),
+            PropertyRangeBound(25, domain="int"),
         )
         assert len(fallback) == 4
 
     def test_binding_validation_errors(self, db):
         with pytest.raises(ValueError, match="Invalid index kind"):
-            db.ensure_node_property_index(1, "score", "bogus")
+            db.ensure_node_property_index("Person", "score", "bogus")
 
         with pytest.raises(ValueError, match="require domain"):
-            db.ensure_node_property_index(1, "score", "range")
+            db.ensure_node_property_index("Person", "score", "range")
 
         with pytest.raises(ValueError, match="do not accept a range domain"):
-            db.ensure_node_property_index(1, "score", "equality", domain="int")
+            db.ensure_node_property_index("Person", "score", "equality", domain="int")
 
         with pytest.raises(ValueError, match="Invalid range domain"):
-            PyPropertyRangeBound(10, domain="bogus")
+            PropertyRangeBound(10, domain="bogus")
 
         with pytest.raises(OverGraphError, match="same PropValue variant"):
             db.find_nodes_range(
-                1,
+                "Person",
                 "score",
-                PyPropertyRangeBound(10, domain="int"),
-                PyPropertyRangeBound(20.0, domain="float"),
+                PropertyRangeBound(10, domain="int"),
+                PropertyRangeBound(20.0, domain="float"),
             )
 
         with pytest.raises(OverGraphError, match="cursor must use the same PropValue variant"):
             db.find_nodes_range_paged(
-                1,
+                "Person",
                 "score",
-                PyPropertyRangeBound(10, domain="int"),
-                PyPropertyRangeBound(20, domain="int"),
+                PropertyRangeBound(10, domain="int"),
+                PropertyRangeBound(20, domain="int"),
                 limit=2,
-                after=PyPropertyRangeCursor(15.0, 1, domain="float"),
+                after=PropertyRangeCursor(15.0, 1, domain="float"),
             )
 
 
@@ -153,12 +173,12 @@ class TestPropertyIndexesAsync:
     async def test_async_property_index_and_range_apis(self, async_db):
         for i in range(6):
             await async_db.upsert_node(
-                1,
+                "Person",
                 f"node-{i}",
                 props={"score": (i + 1) * 10, "temp": (i + 1) * 5},
             )
 
-        eq = await async_db.ensure_node_property_index(1, "temp", "equality")
+        eq = await async_db.ensure_node_property_index("Person", "temp", "equality")
         assert eq.kind == "equality"
 
         deadline = time.time() + 5.0
@@ -175,22 +195,196 @@ class TestPropertyIndexesAsync:
             raise AssertionError("timed out waiting for async equality index to become ready")
 
         ids = await async_db.find_nodes_range(
-            1,
+            "Person",
             "score",
-            PyPropertyRangeBound(20, domain="int"),
-            PyPropertyRangeBound(30, domain="int"),
+            PropertyRangeBound(20, domain="int"),
+            PropertyRangeBound(30, domain="int"),
         )
         assert ids.to_list() and len(ids) == 2
 
         page = await async_db.find_nodes_range_paged(
-            1,
+            "Person",
             "score",
-            PyPropertyRangeBound(20, domain="int"),
-            PyPropertyRangeBound(40, domain="int"),
+            PropertyRangeBound(20, domain="int"),
+            PropertyRangeBound(40, domain="int"),
             limit=2,
         )
         assert len(page.items) == 2
         assert page.next_cursor is not None
         assert page.next_cursor.domain == "int"
 
-        assert await async_db.drop_node_property_index(1, "temp", "equality") is True
+        assert await async_db.drop_node_property_index("Person", "temp", "equality") is True
+
+
+class TestEdgePropertyIndexes:
+    def test_ensure_list_validate_and_drop_edge_property_indexes(self, db):
+        eq = db.ensure_edge_property_index("RELATES_TO", "status", "equality")
+        assert eq.kind == "equality"
+        assert eq.domain is None
+        assert eq.state == "building"
+
+        range_info = db.ensure_edge_property_index("RELATES_TO", "score", "range", domain="int")
+        assert range_info.kind == "range"
+        assert range_info.domain == "int"
+        assert range_info.state == "building"
+
+        wait_for_edge_index_state(
+            db,
+            lambda infos: next(
+                (info for info in infos if info.prop_key == "status" and info.kind == "equality"),
+                None,
+            ),
+        )
+        wait_for_edge_index_state(
+            db,
+            lambda infos: next(
+                (info for info in infos if info.prop_key == "score" and info.kind == "range"),
+                None,
+            ),
+        )
+
+        listed = db.list_edge_property_indexes()
+        assert sorted((info.prop_key, info.kind, info.domain, info.state) for info in listed) == [
+            ("score", "range", "int", "ready"),
+            ("status", "equality", None, "ready"),
+        ]
+
+        with pytest.raises(OverGraphError, match="different domain"):
+            db.ensure_edge_property_index("RELATES_TO", "score", "range", domain="float")
+
+        with pytest.raises(ValueError, match="require domain"):
+            db.ensure_edge_property_index("RELATES_TO", "score", "range")
+
+        with pytest.raises(ValueError, match="do not accept a range domain"):
+            db.ensure_edge_property_index("RELATES_TO", "status", "equality", domain="int")
+
+        assert db.drop_edge_property_index("RELATES_TO", "missing", "equality") is False
+
+    def test_edge_property_index_queries_and_pattern_explain(self, db):
+        db.ensure_edge_property_index("RELATES_TO", "status", "equality")
+        db.ensure_edge_property_index("RELATES_TO", "score", "range", domain="int")
+        source = db.upsert_node("Person", "source")
+        hot_target = db.upsert_node("Company", "hot-target")
+        cold_target = db.upsert_node("Company", "cold-target")
+        hot_edge = db.upsert_edge(source, hot_target, "RELATES_TO", props={"status": "hot", "score": 90})
+        db.upsert_edge(source, cold_target, "RELATES_TO", props={"status": "cold", "score": 10})
+
+        wait_for_edge_index_state(
+            db,
+            lambda infos: next(
+                (info for info in infos if info.prop_key == "status" and info.kind == "equality"),
+                None,
+            ),
+        )
+        wait_for_edge_index_state(
+            db,
+            lambda infos: next(
+                (info for info in infos if info.prop_key == "score" and info.kind == "range"),
+                None,
+            ),
+        )
+
+        direct = db.query_edge_ids(
+            {
+                "label": "RELATES_TO",
+                "from_ids": [source],
+                "filter": {"property": "status", "eq": "hot"},
+                "limit": 10,
+            }
+        )
+        assert direct.items.to_list() == [hot_edge]
+
+        direct_plan = db.explain_edge_query(
+            {
+                "label": "RELATES_TO",
+                "from_ids": [source],
+                "filter": {"property": "status", "eq": "hot"},
+                "limit": 10,
+            }
+        )
+        assert plan_has_kind(direct_plan["root"], "edge_property_equality_index")
+
+        direct_range = db.query_edge_ids(
+            {
+                "label": "RELATES_TO",
+                "from_ids": [source],
+                "filter": {"property": "score", "gte": 80},
+                "limit": 10,
+            }
+        )
+        assert direct_range.items.to_list() == [hot_edge]
+
+        direct_range_plan = db.explain_edge_query(
+            {
+                "label": "RELATES_TO",
+                "from_ids": [source],
+                "filter": {"property": "score", "gte": 80},
+                "limit": 10,
+            }
+        )
+        assert plan_has_kind(direct_range_plan["root"], "edge_property_range_index")
+
+        pattern = {
+            "nodes": [
+                {"alias": "a", "label_filter": {"labels": ["Person"], "mode": "all"}},
+                {"alias": "b", "label_filter": {"labels": ["Company"], "mode": "all"}},
+            ],
+            "edges": [
+                {
+                    "alias": "e",
+                    "from_alias": "a",
+                    "to_alias": "b",
+                    "direction": "outgoing",
+                    "label_filter": ["RELATES_TO"],
+                    "filter": {"property": "status", "eq": "hot"},
+                }
+            ],
+            "limit": 10,
+        }
+        assert db.query_pattern(pattern)["matches"] == [
+            {"nodes": {"a": source, "b": hot_target}, "edges": {"e": hot_edge}}
+        ]
+        pattern_plan = db.explain_pattern_query(pattern)
+        assert plan_has_kind(pattern_plan["root"], "pattern_edge_anchor")
+        assert plan_has_kind(pattern_plan["root"], "edge_property_equality_index")
+
+        range_pattern = {
+            **pattern,
+            "edges": [
+                {
+                    **pattern["edges"][0],
+                    "filter": {"property": "score", "gte": 80},
+                }
+            ],
+        }
+        assert db.query_pattern(range_pattern)["matches"] == [
+            {"nodes": {"a": source, "b": hot_target}, "edges": {"e": hot_edge}}
+        ]
+        range_pattern_plan = db.explain_pattern_query(range_pattern)
+        assert plan_has_kind(range_pattern_plan["root"], "pattern_edge_anchor")
+        assert plan_has_kind(range_pattern_plan["root"], "edge_property_range_index")
+
+
+@pytest.mark.asyncio
+class TestEdgePropertyIndexesAsync:
+    async def test_async_edge_property_index_apis(self, async_db):
+        info = await async_db.ensure_edge_property_index("RELATES_TO", "temp", "equality")
+        assert info.kind == "equality"
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            infos = await async_db.list_edge_property_indexes()
+            ready = next(
+                (info for info in infos if info.prop_key == "temp" and info.kind == "equality"),
+                None,
+            )
+            if ready is not None and ready.state == "ready":
+                break
+            await __import__("asyncio").sleep(0.02)
+        else:
+            raise AssertionError("timed out waiting for async edge equality index to become ready")
+
+        listed = await async_db.list_edge_property_indexes()
+        assert any(info.prop_key == "temp" and info.kind == "equality" for info in listed)
+
+        assert await async_db.drop_edge_property_index("RELATES_TO", "temp", "equality") is True

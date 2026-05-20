@@ -1,7 +1,7 @@
 //! OverGraph Example: Knowledge Graph
 //!
 //! This example shows how to use OverGraph to build and query a
-//! knowledge graph of entities, facts, and relationships.
+//! knowledge graph of people, projects, facts, and relationships.
 //!
 //! Run: cargo run --example knowledge_graph
 
@@ -10,16 +10,12 @@ use overgraph::{
     UpsertNodeOptions,
 };
 use std::collections::BTreeMap;
+use std::env;
+use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-// Type IDs (you define these for your application)
-const ENTITY: u32 = 1;
-const FACT: u32 = 2;
-const CONVERSATION: u32 = 3;
-
-const RELATED_TO: u32 = 10;
-const MENTIONED_IN: u32 = 11;
-const SUPPORTS: u32 = 12;
+const RELATED_TO: &str = "RELATED_TO";
 
 fn props(pairs: &[(&str, &str)]) -> BTreeMap<String, PropValue> {
     pairs
@@ -29,52 +25,69 @@ fn props(pairs: &[(&str, &str)]) -> BTreeMap<String, PropValue> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = DatabaseEngine::open(Path::new("./example-graph"), &DbOptions::default())?;
+    let run_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let db_path = env::temp_dir().join(format!("overgraph-knowledge-rust-{run_id}"));
+
+    let result = run_example(&db_path);
+    let _ = fs::remove_dir_all(&db_path);
+    result
+}
+
+fn run_example(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let db = DatabaseEngine::open(db_path, &DbOptions::default())?;
+    db.ensure_node_label("Person")?;
+    db.ensure_node_label("Contributor")?;
+    db.ensure_node_label("Project")?;
+    db.ensure_node_label("Fact")?;
+    db.ensure_node_label("Conversation")?;
+    db.ensure_edge_label("RELATED_TO")?;
+    db.ensure_edge_label("MENTIONED_IN")?;
+    db.ensure_edge_label("SUPPORTS")?;
 
     // --- Build a knowledge graph ---
 
-    // Create some entities
-    let entity_ids = db.batch_upsert_nodes(&[
+    // Create people and a project
+    let node_ids = db.batch_upsert_nodes(vec![
         NodeInput {
-            type_id: ENTITY,
-            key: "person:alice".into(),
+            labels: vec!["Person".into(), "Contributor".into()],
+            key: "alice".into(),
             props: props(&[("name", "Alice"), ("role", "engineer")]),
             weight: 1.0,
             dense_vector: None,
             sparse_vector: None,
         },
         NodeInput {
-            type_id: ENTITY,
-            key: "person:bob".into(),
+            labels: vec!["Person".into(), "Contributor".into()],
+            key: "bob".into(),
             props: props(&[("name", "Bob"), ("role", "designer")]),
             weight: 0.9,
             dense_vector: None,
             sparse_vector: None,
         },
         NodeInput {
-            type_id: ENTITY,
-            key: "project:atlas".into(),
+            labels: vec!["Project".into()],
+            key: "atlas".into(),
             props: props(&[("name", "Atlas"), ("status", "active")]),
             weight: 0.95,
             dense_vector: None,
             sparse_vector: None,
         },
     ])?;
-    let (alice, bob, project) = (entity_ids[0], entity_ids[1], entity_ids[2]);
+    let (alice, bob, project) = (node_ids[0], node_ids[1], node_ids[2]);
 
     // Create some facts
-    let fact_ids = db.batch_upsert_nodes(&[
+    let fact_ids = db.batch_upsert_nodes(vec![
         NodeInput {
-            type_id: FACT,
-            key: "fact:alice-leads-atlas".into(),
+            labels: vec!["Fact".into()],
+            key: "alice-leads-atlas".into(),
             props: props(&[("text", "Alice leads the Atlas project")]),
             weight: 0.9,
             dense_vector: None,
             sparse_vector: None,
         },
         NodeInput {
-            type_id: FACT,
-            key: "fact:bob-designs-atlas".into(),
+            labels: vec!["Fact".into()],
+            key: "bob-designs-atlas".into(),
             props: props(&[("text", "Bob is the lead designer on Atlas")]),
             weight: 0.85,
             dense_vector: None,
@@ -85,8 +98,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a conversation node
     let convo = db.upsert_node(
-        CONVERSATION,
-        "convo:2024-01-15",
+        "Conversation",
+        "2024-01-15",
         UpsertNodeOptions {
             props: props(&[("summary", "Discussed Atlas project timeline")]),
             weight: 0.7,
@@ -94,12 +107,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    // Connect everything with typed edges
-    db.batch_upsert_edges(&[
+    // Connect everything with labeled edges
+    db.batch_upsert_edges(vec![
         EdgeInput {
             from: alice,
             to: project,
-            type_id: RELATED_TO,
+            label: RELATED_TO.into(),
             props: props(&[("role", "lead")]),
             weight: 1.0,
             valid_from: None,
@@ -108,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EdgeInput {
             from: bob,
             to: project,
-            type_id: RELATED_TO,
+            label: RELATED_TO.into(),
             props: props(&[("role", "designer")]),
             weight: 0.9,
             valid_from: None,
@@ -117,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EdgeInput {
             from: alice,
             to: bob,
-            type_id: RELATED_TO,
+            label: RELATED_TO.into(),
             props: props(&[("context", "teammates")]),
             weight: 0.8,
             valid_from: None,
@@ -126,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EdgeInput {
             from: fact1,
             to: convo,
-            type_id: MENTIONED_IN,
+            label: "MENTIONED_IN".into(),
             props: Default::default(),
             weight: 0.9,
             valid_from: None,
@@ -135,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EdgeInput {
             from: fact2,
             to: convo,
-            type_id: MENTIONED_IN,
+            label: "MENTIONED_IN".into(),
             props: Default::default(),
             weight: 0.85,
             valid_from: None,
@@ -144,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EdgeInput {
             from: fact1,
             to: alice,
-            type_id: SUPPORTS,
+            label: "SUPPORTS".into(),
             props: Default::default(),
             weight: 0.9,
             valid_from: None,
@@ -153,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EdgeInput {
             from: fact1,
             to: project,
-            type_id: SUPPORTS,
+            label: "SUPPORTS".into(),
             props: Default::default(),
             weight: 0.9,
             valid_from: None,
@@ -169,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let neighbors = db.neighbors(
         alice,
         &NeighborOptions {
-            type_filter: Some(vec![RELATED_TO]),
+            edge_label_filter: Some(vec![RELATED_TO.to_string()]),
             limit: Some(10),
             ..Default::default()
         },
@@ -183,20 +196,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 2. Find all entities
-    let entities = db.get_nodes_by_type(ENTITY)?;
-    println!("\nAll entities ({}):", entities.len());
-    for entity in &entities {
-        let name = match entity.props.get("name") {
+    // 2. Find all people
+    let people = db.get_nodes_by_labels("Person")?;
+    println!("\nAll people ({}):", people.len());
+    for person in &people {
+        let name = match person.props.get("name") {
             Some(PropValue::String(s)) => s.as_str(),
-            _ => &entity.key,
+            _ => &person.key,
         };
-        let detail = entity.props.get("role").or(entity.props.get("status"));
-        let detail_str = match detail {
+        let role = match person.props.get("role") {
             Some(PropValue::String(s)) => s.as_str(),
             _ => "unknown",
         };
-        println!("  {} ({})", name, detail_str);
+        println!("  {} ({})", name, role);
     }
 
     // 3. Personalized PageRank: what's most relevant to Alice?

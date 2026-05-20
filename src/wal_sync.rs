@@ -113,7 +113,7 @@ mod tests {
         props.insert("name".to_string(), PropValue::String(key.to_string()));
         WalOp::UpsertNode(NodeRecord {
             id,
-            type_id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
             key: key.to_string(),
             props,
             created_at: 1000 * id as i64,
@@ -126,44 +126,9 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_and_reset() {
-        let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
-
-        // Write some records
-        writer.append(&make_test_node(1, "a"), 1).unwrap();
-        writer.append(&make_test_node(2, "b"), 2).unwrap();
-        writer.sync().unwrap();
-
-        // Verify records exist
-        let reader = WalReader::new(dir.path());
-        assert_eq!(reader.read_all().unwrap().len(), 2);
-
-        // Truncate and reset
-        writer.truncate_and_reset().unwrap();
-
-        // Verify WAL is empty (just header)
-        let reader = WalReader::new(dir.path());
-        assert!(reader.read_all().unwrap().is_empty());
-
-        // Write new records after reset
-        writer.append(&make_test_node(3, "c"), 3).unwrap();
-        writer.sync().unwrap();
-        drop(writer);
-
-        let reader = WalReader::new(dir.path());
-        let ops = reader.read_all().unwrap();
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
-            (_, WalOp::UpsertNode(node)) => assert_eq!(node.key, "c"),
-            _ => panic!("expected UpsertNode"),
-        }
-    }
-
-    #[test]
     fn test_sync_thread_basic_operation() {
         let dir = TempDir::new().unwrap();
-        let writer = WalWriter::open(dir.path()).unwrap();
+        let writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         let state = WalSyncState {
             wal_writer: writer,
@@ -211,7 +176,7 @@ mod tests {
     #[test]
     fn test_append_batch_returns_size() {
         let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         let ops = vec![
             (1u64, make_test_node(1, "a")),
@@ -221,11 +186,11 @@ mod tests {
         // Each record has: 4 (len) + 4 (crc) + payload
         assert!(total > 0);
 
-        // Verify both records can be read back
+        // Verify both records and their atomic-batch markers can be read back
         writer.sync().unwrap();
         drop(writer);
         let reader = WalReader::new(dir.path());
-        assert_eq!(reader.read_all().unwrap().len(), 2);
+        assert_eq!(reader.read_all().unwrap().len(), 4);
     }
 
     #[test]
@@ -233,7 +198,7 @@ mod tests {
         // Verify that shutdown_sync_thread performs a final sync
         // even if the sync thread hasn't drained buffered_bytes yet.
         let dir = TempDir::new().unwrap();
-        let mut writer = WalWriter::open(dir.path()).unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         // Append data directly (not through sync thread)
         let bytes = writer.append(&make_test_node(1, "pending"), 1).unwrap();
@@ -278,7 +243,7 @@ mod tests {
     fn test_poisoned_state_is_visible() {
         // Verify that once poisoned is set, it persists in the shared state.
         let dir = TempDir::new().unwrap();
-        let writer = WalWriter::open(dir.path()).unwrap();
+        let writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         let state = WalSyncState {
             wal_writer: writer,
@@ -312,7 +277,7 @@ mod tests {
     fn test_multiple_sync_cycles_drain_all() {
         // Append data in three separate batches, verify all are synced.
         let dir = TempDir::new().unwrap();
-        let writer = WalWriter::open(dir.path()).unwrap();
+        let writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         let state = WalSyncState {
             wal_writer: writer,
@@ -362,7 +327,7 @@ mod tests {
     fn test_sync_thread_shutdown_with_zero_buffered() {
         // Shutdown when no data has been written should be clean and immediate.
         let dir = TempDir::new().unwrap();
-        let writer = WalWriter::open(dir.path()).unwrap();
+        let writer = WalWriter::open_generation(dir.path(), 0).unwrap();
 
         let state = WalSyncState {
             wal_writer: writer,

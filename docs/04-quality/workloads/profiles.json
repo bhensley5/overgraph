@@ -2,7 +2,7 @@
   "schema_version": 1,
   "determinism": {
     "seed": 1729,
-    "node_key_template": "node:{i}",
+    "node_key_template": "node-{i}",
     "edge_key_templates": {
       "chain": "edge:chain:{i}",
       "hub": "edge:hub:{i}",
@@ -10,7 +10,7 @@
       "temporal": "edge:temporal:{i}"
     },
     "generator_rules": {
-      "type_id_cycle": [1, 2, 3, 4, 5],
+      "label_cycle": ["Person", "Company", "Document", "Project", "Observation"],
       "weight_base": 0.5,
       "weight_modulus": 500,
       "weight_formula": "weight = weight_base + ((i mod weight_modulus) / 1000.0)",

@@ -5,6 +5,8 @@ use overgraph::{
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
+const LARGE_GRAPH_LABELS: [&str; 5] = ["Person", "Company", "Article", "Topic", "Project"];
+
 /// Large-scale insert, flush, more writes, cross-source queries.
 #[test]
 fn test_large_graph_with_flush_and_cross_source_queries() {
@@ -17,7 +19,7 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
     let mut node_ids = Vec::with_capacity(10_000);
     let batch: Vec<overgraph::NodeInput> = (0..10_000)
         .map(|i| overgraph::NodeInput {
-            type_id: (i % 5) as u32 + 1, // types 1..5
+            labels: vec![LARGE_GRAPH_LABELS[i % LARGE_GRAPH_LABELS.len()].to_string()],
             key: format!("node:{}", i),
             props: {
                 let mut p = BTreeMap::new();
@@ -29,7 +31,7 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
             sparse_vector: None,
         })
         .collect();
-    node_ids.extend(engine.batch_upsert_nodes(&batch).unwrap());
+    node_ids.extend(engine.batch_upsert_nodes(batch.clone()).unwrap());
     assert_eq!(node_ids.len(), 10_000);
 
     // --- Batch 1: 20k edges (chain + cross-links) ---
@@ -39,28 +41,28 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
         .map(|i| overgraph::EdgeInput {
             from: node_ids[i],
             to: node_ids[i + 1],
-            type_id: 10,
+            label: "KNOWS".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         })
         .collect();
-    edge_ids.extend(engine.batch_upsert_edges(&chain_edges).unwrap());
+    edge_ids.extend(engine.batch_upsert_edges(chain_edges.clone()).unwrap());
 
     // Cross-link edges: 10,001 wrapping edges (edge_uniqueness=off, one dup is fine)
     let cross_edges: Vec<overgraph::EdgeInput> = (0..10_001)
         .map(|i| overgraph::EdgeInput {
             from: node_ids[i % 10_000],
             to: node_ids[(i + 100) % 10_000],
-            type_id: 20,
+            label: "REFERENCES".to_string(),
             props: BTreeMap::new(),
             weight: 0.8,
             valid_from: None,
             valid_to: None,
         })
         .collect();
-    edge_ids.extend(engine.batch_upsert_edges(&cross_edges).unwrap());
+    edge_ids.extend(engine.batch_upsert_edges(cross_edges.clone()).unwrap());
     assert_eq!(edge_ids.len(), 20_000);
 
     // --- Force flush ---
@@ -71,7 +73,7 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
     // --- Batch 2: 500 more nodes + 1000 edges in memtable ---
     let batch2: Vec<overgraph::NodeInput> = (10_000..10_500)
         .map(|i| overgraph::NodeInput {
-            type_id: 6,
+            labels: vec!["Session".to_string()],
             key: format!("node:{}", i),
             props: BTreeMap::new(),
             weight: 0.7,
@@ -79,21 +81,21 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
             sparse_vector: None,
         })
         .collect();
-    let new_ids = engine.batch_upsert_nodes(&batch2).unwrap();
+    let new_ids = engine.batch_upsert_nodes(batch2.clone()).unwrap();
     assert_eq!(new_ids.len(), 500);
 
     let new_edges: Vec<overgraph::EdgeInput> = (0..1000)
         .map(|i| overgraph::EdgeInput {
             from: new_ids[i % 500],
             to: node_ids[i % 10_000], // link new -> old (cross-source)
-            type_id: 30,
+            label: "LINKS_TO".to_string(),
             props: BTreeMap::new(),
             weight: 0.6,
             valid_from: None,
             valid_to: None,
         })
         .collect();
-    engine.batch_upsert_edges(&new_edges).unwrap();
+    engine.batch_upsert_edges(new_edges.clone()).unwrap();
 
     // --- Cross-source queries ---
 
@@ -112,12 +114,12 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
         .unwrap();
     assert!(out_500.len() >= 2); // at least chain(->501) + cross-link(->600)
 
-    // 4. Type-filtered neighbors from segment
+    // 4. Relationship-filtered neighbors from segment
     let chain_only = engine
         .neighbors(
             node_ids[500],
             &NeighborOptions {
-                type_filter: Some(vec![10]),
+                edge_label_filter: Some(vec!["KNOWS".to_string()]),
                 ..Default::default()
             },
         )
@@ -176,7 +178,7 @@ fn test_flush_close_reopen_reads_from_segments() {
         // Build a small graph
         node_a = engine
             .upsert_node(
-                1,
+                "Person",
                 "alice",
                 UpsertNodeOptions {
                     props: {
@@ -192,7 +194,7 @@ fn test_flush_close_reopen_reads_from_segments() {
 
         node_b = engine
             .upsert_node(
-                1,
+                "Person",
                 "bob",
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -202,7 +204,7 @@ fn test_flush_close_reopen_reads_from_segments() {
             .unwrap();
         node_c = engine
             .upsert_node(
-                2,
+                "Company",
                 "charlie",
                 UpsertNodeOptions {
                     weight: 0.6,
@@ -212,13 +214,13 @@ fn test_flush_close_reopen_reads_from_segments() {
             .unwrap();
 
         edge_ab = engine
-            .upsert_edge(node_a, node_b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(node_a, node_b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         edge_bc = engine
             .upsert_edge(
                 node_b,
                 node_c,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 0.8,
                     ..Default::default()
@@ -236,7 +238,7 @@ fn test_flush_close_reopen_reads_from_segments() {
         // Add post-flush data (stays in WAL for replay on reopen)
         let _node_d = engine
             .upsert_node(
-                1,
+                "Person",
                 "dave",
                 UpsertNodeOptions {
                     weight: 0.4,
@@ -319,7 +321,7 @@ fn test_multi_segment_survives_reopen() {
         // Segment 1
         id_a = engine
             .upsert_node(
-                1,
+                "Person",
                 "alpha",
                 UpsertNodeOptions {
                     weight: 0.5,
@@ -328,14 +330,14 @@ fn test_multi_segment_survives_reopen() {
             )
             .unwrap();
         engine
-            .upsert_edge(id_a, id_a, 10, UpsertEdgeOptions::default())
+            .upsert_edge(id_a, id_a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap(); // self-loop
         engine.flush().unwrap();
 
         // Segment 2
         id_b = engine
             .upsert_node(
-                1,
+                "Person",
                 "beta",
                 UpsertNodeOptions {
                     weight: 0.6,
@@ -347,7 +349,7 @@ fn test_multi_segment_survives_reopen() {
             .upsert_edge(
                 id_a,
                 id_b,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 0.9,
                     ..Default::default()
@@ -359,7 +361,7 @@ fn test_multi_segment_survives_reopen() {
         // Memtable (will be WAL on reopen)
         id_c = engine
             .upsert_node(
-                1,
+                "Person",
                 "gamma",
                 UpsertNodeOptions {
                     weight: 0.7,
@@ -371,7 +373,7 @@ fn test_multi_segment_survives_reopen() {
             .upsert_edge(
                 id_b,
                 id_c,
-                20,
+                "REFERENCES",
                 UpsertEdgeOptions {
                     weight: 0.8,
                     ..Default::default()

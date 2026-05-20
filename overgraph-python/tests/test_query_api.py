@@ -1,7 +1,13 @@
 import pytest
 import time
 
-from overgraph import GraphEdgePattern, GraphNodePattern, GraphPatternRequest, NodeQueryRequest
+from overgraph import (
+    EdgeQueryRequest,
+    GraphEdgePattern,
+    GraphNodePattern,
+    GraphPatternRequest,
+    NodeQueryRequest,
+)
 
 
 def plan_has_kind(node, kind):
@@ -12,6 +18,10 @@ def plan_has_kind(node, kind):
     if "input" in node and plan_has_kind(node["input"], kind):
         return True
     return any(plan_has_kind(child, kind) for child in node.get("inputs", []))
+
+
+def node_lf(*labels, mode="all"):
+    return {"labels": list(labels), "mode": mode}
 
 
 def wait_for_index_state(db, predicate, expected_state="ready", timeout_s=5.0):
@@ -26,41 +36,41 @@ def wait_for_index_state(db, predicate, expected_state="ready", timeout_s=5.0):
 
 def seed_query_graph(db):
     active_high = db.upsert_node(
-        1, "active-high", props={"status": "active", "score": 90, "team": "core"}
+        "Person", "active-high", props={"status": "active", "score": 90, "team": "core"}
     )
     active_low = db.upsert_node(
-        1, "active-low", props={"status": "active", "score": 40, "team": "core"}
+        "Person", "active-low", props={"status": "active", "score": 40, "team": "core"}
     )
     inactive = db.upsert_node(
-        1, "inactive", props={"status": "inactive", "score": 95, "team": "core"}
+        "Person", "inactive", props={"status": "inactive", "score": 95, "team": "core"}
     )
     literal_updated_at = db.upsert_node(
-        1,
+        "Person",
         "literal-updated-at",
         props={"updated_at": "literal-property-value", "status": "active", "score": 70},
     )
     null_tag = db.upsert_node(
-        1,
+        "Person",
         "null-tag",
         props={"status": "nullish", "tag": None, "score": 10},
     )
     nested = db.upsert_node(
-        1,
+        "Person",
         "nested",
         props={"status": "nested", "payload": {"items": [1, "1", None]}, "score": 15},
     )
-    acme = db.upsert_node(2, "acme", props={"status": "customer"})
-    beta = db.upsert_node(2, "beta", props={"status": "prospect"})
+    acme = db.upsert_node("Company", "acme", props={"status": "customer"})
+    beta = db.upsert_node("Company", "beta", props={"status": "prospect"})
     works_at = db.upsert_edge(
         active_high,
         acme,
-        10,
+        "WORKS_AT",
         props={"role": "engineer", "since": 2020, "updated_at": "edge-literal"},
     )
     inactive_works_at = db.upsert_edge(
         inactive,
         beta,
-        10,
+        "WORKS_AT",
         props={"role": "engineer", "since": 2022, "updated_at": "edge-literal"},
     )
     return {
@@ -80,7 +90,7 @@ def seed_query_graph(db):
 def test_query_node_ids_and_hydrated_nodes(db):
     ids = seed_query_graph(db)
     request = {
-        "type_id": 1,
+        "label_filter": node_lf("Person"),
         "filter": {
             "and": [
                 {"property": "status", "eq": "active"},
@@ -104,7 +114,7 @@ def test_query_predicates_and_literal_builtin_name_collision(db):
 
     result = db.query_node_ids(
         {
-            "type_id": 1,
+            "label_filter": node_lf("Person"),
             "filter": {
                 "and": [
                     {"property": "status", "eq": "active"},
@@ -118,7 +128,7 @@ def test_query_predicates_and_literal_builtin_name_collision(db):
     updated_at = db.get_node(ids["active_high"]).updated_at
     timestamp_result = db.query_node_ids(
         {
-            "type_id": 1,
+            "label_filter": node_lf("Person"),
             "filter": {
                 "and": [
                     {"updated_at": {"gte": updated_at - 1000}},
@@ -128,6 +138,22 @@ def test_query_predicates_and_literal_builtin_name_collision(db):
         }
     )
     assert ids["active_high"] in timestamp_result.items.to_list()
+
+
+def test_query_node_label_filter_any_and_all_modes(db):
+    admin = db.upsert_node(["Person", "Admin"], "admin")
+    person = db.upsert_node("Person", "person")
+    company = db.upsert_node("Company", "company")
+
+    assert db.query_node_ids({"label_filter": node_lf("Person", "Admin")}).items.to_list() == [
+        admin
+    ]
+    assert sorted(
+        db.query_node_ids({"label_filter": node_lf("Admin", "Company", mode="any")}).items.to_list()
+    ) == [admin, company]
+    assert person not in db.query_node_ids(
+        {"label_filter": node_lf("Admin", "Company", mode="any")}
+    ).items.to_list()
 
 
 def test_query_updated_at_exclusive_boundaries(db):
@@ -196,10 +222,10 @@ def test_query_pattern_and_edge_literal_updated_at(db):
             "nodes": [
                 {
                     "alias": "person",
-                    "type_id": 1,
+                    "label_filter": node_lf("Person"),
                     "filter": {"property": "status", "eq": "active"},
                 },
-                {"alias": "company", "type_id": 2, "keys": ["acme"]},
+                {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
             ],
             "edges": [
                 {
@@ -207,14 +233,14 @@ def test_query_pattern_and_edge_literal_updated_at(db):
                     "from_alias": "person",
                     "to_alias": "company",
                     "direction": "outgoing",
-                    "type_filter": [10],
-                    "where": {
-                        "role": {"op": "eq", "value": "engineer"},
-                        "updated_at": {"op": "eq", "value": "edge-literal"},
+                    "label_filter": ["WORKS_AT"],
+                    "filter": {
+                        "and": [
+                            {"property": "role", "eq": "engineer"},
+                            {"property": "updated_at", "eq": "edge-literal"},
+                            {"property": "since", "lte": 2021},
+                        ]
                     },
-                    "predicates": [
-                        {"property": {"key": "since", "op": "range", "lte": 2021}}
-                    ],
                 }
             ],
             "limit": 10,
@@ -233,11 +259,70 @@ def test_query_pattern_and_edge_literal_updated_at(db):
     assert ids["inactive_works_at"] != ids["works_at"]
 
 
+def test_direct_edge_queries_and_canonical_pattern_filter(db):
+    ids = seed_query_graph(db)
+    edge = db.get_edge(ids["works_at"])
+    request = EdgeQueryRequest(
+        label="WORKS_AT",
+        from_ids=[ids["active_high"]],
+        filter={
+            "and": [
+                {"weight": {"gte": 1.0}},
+                {"valid_at": int(time.time() * 1000)},
+                {"updated_at": {"gte": edge.updated_at - 1000}},
+                {"property": "role", "eq": "engineer"},
+            ]
+        },
+        limit=0,
+    )
+
+    edge_ids = db.query_edge_ids(request)
+    assert edge_ids.items.to_list() == [ids["works_at"]]
+
+    edges = db.query_edges({**request.to_dict(), "limit": 1})
+    assert [edge.id for edge in edges.items] == [ids["works_at"]]
+    assert edges.next_cursor is None
+    assert edges.items[0].props["role"] == "engineer"
+
+    plan = db.explain_edge_query(request)
+    assert plan["kind"] == "edge_query"
+    assert plan_has_kind(plan["root"], "verify_edge_filter")
+    assert "edge_property_post_filter" in plan["warnings"]
+
+    pattern = GraphPatternRequest(
+        nodes=[
+            GraphNodePattern("person", ids=[ids["active_high"]]),
+            GraphNodePattern("company", label_filter=node_lf("Company"), keys=["acme"]),
+        ],
+        edges=[
+            GraphEdgePattern(
+                "person",
+                "company",
+                alias="employment",
+                label_filter=["WORKS_AT"],
+                filter={
+                    "and": [
+                        {"valid_at": int(time.time() * 1000)},
+                        {"property": "role", "eq": "engineer"},
+                    ]
+                },
+            )
+        ],
+        limit=10,
+    )
+    assert db.query_pattern(pattern)["matches"] == [
+        {
+            "nodes": {"company": ids["acme"], "person": ids["active_high"]},
+            "edges": {"employment": ids["works_at"]},
+        }
+    ]
+
+
 def test_query_request_helpers_are_directly_usable(db):
     ids = seed_query_graph(db)
 
     request = NodeQueryRequest(
-        type_id=1,
+        label_filter=node_lf("Person"),
         filter={
             "and": [
                 {"property": "status", "eq": "active"},
@@ -253,18 +338,18 @@ def test_query_request_helpers_are_directly_usable(db):
         nodes=[
             GraphNodePattern(
                 "person",
-                type_id=1,
+                label_filter=node_lf("Person"),
                 filter={"property": "status", "eq": "active"},
             ),
-            GraphNodePattern("company", type_id=2, keys=["acme"]),
+            GraphNodePattern("company", label_filter=node_lf("Company"), keys=["acme"]),
         ],
         edges=[
             GraphEdgePattern(
                 "person",
                 "company",
                 alias="employment",
-                type_filter=[10],
-                where={"role": {"eq": "engineer"}},
+                label_filter=["WORKS_AT"],
+                filter={"property": "role", "eq": "engineer"},
             )
         ],
         limit=10,
@@ -277,40 +362,53 @@ def test_query_request_helpers_are_directly_usable(db):
 
 def test_query_request_helpers_reject_string_list_fields(db):
     with pytest.raises(TypeError, match="keys"):
-        db.query_node_ids(NodeQueryRequest(type_id=1, keys="acme"))
+        db.query_node_ids(NodeQueryRequest(label_filter=node_lf("Person"), keys="acme"))
 
     with pytest.raises(TypeError, match="keys"):
-        GraphNodePattern("company", type_id=2, keys="acme").to_dict()
+        GraphNodePattern("company", label_filter=node_lf("Company"), keys="acme").to_dict()
 
 
 def test_query_explain_uses_lower_snake_recursive_strings(db):
-    seed_query_graph(db)
+    ids = seed_query_graph(db)
 
     node_plan = db.explain_node_query(
-        {"type_id": 1, "filter": {"property": "status", "eq": "active"}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "status", "eq": "active"}}
     )
     assert node_plan["kind"] == "node_query"
-    assert plan_has_kind(node_plan["root"], "fallback_type_scan")
+    assert plan_has_kind(node_plan["root"], "fallback_node_label_scan")
     assert all(warning.replace("_", "").islower() for warning in node_plan["warnings"])
     assert "using_fallback_scan" in node_plan["warnings"]
+    assert "stale_node_label_membership_verification" in node_plan["notes"]
+    assert node_plan["public_inputs"]["node_labels"] == [
+        {"alias": None, "name": "Person", "known": True, "mode": "all"}
+    ]
+    assert node_plan["public_inputs"]["edge_labels"] == []
+
+    db.upsert_node(["Person", "Admin"], "admin")
+    any_plan = db.explain_node_query({"label_filter": node_lf("Person", "Admin", mode="any")})
+    assert "node_label_any_final_verification" in any_plan["notes"]
+    assert any_plan["public_inputs"]["node_labels"] == [
+        {"alias": None, "name": "Person", "known": True, "mode": "any"},
+        {"alias": None, "name": "Admin", "known": True, "mode": "any"},
+    ]
 
     pattern_plan = db.explain_pattern_query(
         {
             "nodes": [
                 {
                     "alias": "person",
-                    "type_id": 1,
+                    "label_filter": node_lf("Person"),
                     "filter": {"property": "status", "eq": "active"},
                 },
-                {"alias": "company", "type_id": 2, "keys": ["acme"]},
+                {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
             ],
             "edges": [
                 {
                     "alias": "employment",
                     "from_alias": "person",
                     "to_alias": "company",
-                    "type_filter": [10],
-                    "where": {"role": {"op": "eq", "value": "engineer"}},
+                    "label_filter": ["WORKS_AT"],
+                    "filter": {"property": "role", "eq": "engineer"},
                 }
             ],
             "limit": 10,
@@ -321,21 +419,48 @@ def test_query_explain_uses_lower_snake_recursive_strings(db):
     assert plan_has_kind(pattern_plan["root"], "verify_edge_predicates")
     assert "edge_property_post_filter" in pattern_plan["warnings"]
 
+    full_edge_plan = db.explain_edge_query(
+        {
+            "filter": {"property": "role", "eq": "engineer"},
+            "allow_full_scan": True,
+        }
+    )
+    assert plan_has_kind(full_edge_plan["root"], "fallback_full_edge_scan")
+
+    missing_edge_plan = db.explain_edge_query(
+        {"label": "MISSING", "from_ids": [ids["active_high"]]}
+    )
+    assert "unknown_edge_label" in missing_edge_plan["warnings"]
+    assert missing_edge_plan["public_inputs"]["edge_labels"] == [
+        {"alias": None, "name": "MISSING", "known": False, "mode": None}
+    ]
+
 
 def test_query_validation_errors(db):
     seed_query_graph(db)
 
     with pytest.raises(Exception, match="use filter"):
         db.query_node_ids(
-            {"type_id": 1, "predicates": [{"property": {"key": "status", "op": "eq"}}]}
+            {"label_filter": node_lf("Person"), "predicates": [{"property": {"key": "status", "op": "eq"}}]}
         )
     with pytest.raises(Exception, match="both gt and gte"):
-        db.query_node_ids({"type_id": 1, "filter": {"property": "score", "gt": 1, "gte": 2}})
+        db.query_node_ids({"label_filter": node_lf("Person"), "filter": {"property": "score", "gt": 1, "gte": 2}})
     with pytest.raises(Exception, match="use filter"):
-        db.query_node_ids({"type_id": 1, "where": {"status": {"eq": "active"}}})
+        db.query_node_ids({"label_filter": node_lf("Person"), "where": {"status": {"eq": "active"}}})
     with pytest.raises(Exception, match="use filter"):
         db.query_pattern({"nodes": [{"alias": "a", "where": {"status": {"eq": "active"}}}], "edges": [], "limit": 1})
-    with pytest.raises(Exception, match="edge pattern filter is not supported"):
+    with pytest.raises(Exception, match="full scan|anchor|allow_full_scan"):
+        db.query_edge_ids({"filter": {"weight": {"gte": 1}}})
+    with pytest.raises(Exception, match="both gt and gte"):
+        db.query_edge_ids({"label": "WORKS_AT", "filter": {"weight": {"gt": 1, "gte": 2}}})
+    for field in ("where", "predicates"):
+        with pytest.raises(Exception, match="use filter"):
+            db.query_edge_ids({"label": "WORKS_AT", field: {"role": {"eq": "engineer"}}})
+        with pytest.raises(Exception, match="use filter"):
+            db.query_edges({"label": "WORKS_AT", field: {"role": {"eq": "engineer"}}})
+        with pytest.raises(Exception, match="use filter"):
+            db.explain_edge_query({"label": "WORKS_AT", field: {"role": {"eq": "engineer"}}})
+    with pytest.raises(Exception, match="use filter"):
         db.query_pattern(
             {
                 "nodes": [{"alias": "a"}],
@@ -344,6 +469,7 @@ def test_query_validation_errors(db):
                         "from_alias": "a",
                         "to_alias": "b",
                         "filter": {"property": "role", "eq": "engineer"},
+                        "where": {"role": {"eq": "engineer"}},
                     }
                 ],
                 "limit": 1,
@@ -357,30 +483,63 @@ def test_query_numeric_fields_reject_bool(db):
     seed_query_graph(db)
 
     invalid_node_requests = [
-        {"type_id": True},
         {"ids": [True]},
-        {"type_id": 1, "after": True},
-        {"type_id": 1, "limit": True},
-        {"type_id": 1, "filter": {"updated_at": {"gte": True}}},
+        {"label_filter": node_lf("Person"), "after": True},
+        {"label_filter": node_lf("Person"), "limit": True},
+        {"label_filter": node_lf("Person"), "filter": {"updated_at": {"gte": True}}},
     ]
     for request in invalid_node_requests:
         with pytest.raises(TypeError, match="bool"):
             db.query_node_ids(request)
 
-    invalid_pattern_requests = [
+    invalid_edge_requests = [
+        {"label": True},
+        {"ids": [True]},
+        {"from_ids": [True]},
+        {"to_ids": [True]},
+        {"endpoint_ids": [True]},
+        {"label": "WORKS_AT", "after": True},
+        {"label": "WORKS_AT", "limit": True},
+        {"label": "WORKS_AT", "filter": {"valid_at": True}},
+        {"label": "WORKS_AT", "filter": {"weight": {"gte": True}}},
+    ]
+    for request in invalid_edge_requests:
+        with pytest.raises(TypeError, match="bool"):
+            db.query_edge_ids(request)
+
+    invalid_pattern_bool_requests = [
         {"nodes": [], "edges": [], "limit": True},
         {"nodes": [], "edges": [], "limit": 1, "at_epoch": True},
-        {"nodes": [{"alias": "a", "type_id": True}], "edges": [], "limit": 1},
         {"nodes": [{"alias": "a", "ids": [True]}], "edges": [], "limit": 1},
-        {
-            "nodes": [],
-            "edges": [{"from_alias": "a", "to_alias": "b", "type_filter": [True]}],
-            "limit": 1,
-        },
     ]
-    for request in invalid_pattern_requests:
+    for request in invalid_pattern_bool_requests:
         with pytest.raises(TypeError, match="bool"):
             db.query_pattern(request)
+    with pytest.raises(TypeError, match="str"):
+        db.query_node_ids({"label_filter": {"labels": [True], "mode": "all"}})
+    with pytest.raises(TypeError, match="str"):
+        db.query_pattern(
+            {
+                "nodes": [
+                    {"alias": "a", "label_filter": {"labels": [True], "mode": "all"}}
+                ],
+                "edges": [],
+                "limit": 1,
+            }
+        )
+    with pytest.raises(TypeError, match="str"):
+        db.query_pattern(
+            {
+                "nodes": [],
+                "edges": [{"from_alias": "a", "to_alias": "b", "label_filter": [True]}],
+                "limit": 1,
+            }
+        )
+
+    with pytest.raises(ValueError, match="label.*label_filter"):
+        db.query_node_ids({"label": "Person"})
+    with pytest.raises(ValueError, match="label.*label_filter"):
+        db.query_pattern({"nodes": [{"alias": "a", "label": "Person"}], "edges": [], "limit": 1})
 
 
 def test_query_boolean_filter_and_value_semantics(db):
@@ -389,7 +548,7 @@ def test_query_boolean_filter_and_value_semantics(db):
     assert sorted(
         db.query_node_ids(
             {
-                "type_id": 1,
+                "label_filter": node_lf("Person"),
                 "filter": {
                     "or": [
                         {"property": "status", "eq": "active"},
@@ -406,38 +565,38 @@ def test_query_boolean_filter_and_value_semantics(db):
     ]
 
     assert db.query_node_ids(
-        {"type_id": 1, "filter": {"property": "status", "in": ["nested"]}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "status", "in": ["nested"]}}
     ).items.to_list() == [ids["nested"]]
     assert db.query_node_ids(
-        {"type_id": 1, "filter": {"property": "tag", "eq": None}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "tag", "eq": None}}
     ).items.to_list() == [ids["null_tag"]]
     assert db.query_node_ids(
-        {"type_id": 1, "filter": {"property": "tag", "in": [None]}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "tag", "in": [None]}}
     ).items.to_list() == [ids["null_tag"]]
     assert db.query_node_ids(
-        {"type_id": 1, "filter": {"property": "tag", "exists": True}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "tag", "exists": True}}
     ).items.to_list() == [ids["null_tag"]]
     assert ids["null_tag"] not in db.query_node_ids(
-        {"type_id": 1, "filter": {"property": "tag", "missing": True}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "tag", "missing": True}}
     ).items.to_list()
 
     assert db.query_node_ids(
         {
-            "type_id": 1,
+            "label_filter": node_lf("Person"),
             "filter": {"property": "payload", "eq": {"items": [1, "1", None]}},
         }
     ).items.to_list() == [ids["nested"]]
     assert db.query_node_ids(
-        {"type_id": 1, "filter": {"property": "status", "eq": "1"}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "status", "eq": "1"}}
     ).items.to_list() == []
 
-    int_node = db.upsert_node(1, "int-value", props={"kind": 1})
-    float_node = db.upsert_node(1, "float-value", props={"kind": 1.0})
+    int_node = db.upsert_node("Person", "int-value", props={"kind": 1})
+    float_node = db.upsert_node("Person", "float-value", props={"kind": 1.0})
     assert db.query_node_ids(
-        {"type_id": 1, "filter": {"property": "kind", "eq": 1}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "kind", "eq": 1}}
     ).items.to_list() == [int_node]
     assert db.query_node_ids(
-        {"type_id": 1, "filter": {"property": "kind", "eq": 1.0}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "kind", "eq": 1.0}}
     ).items.to_list() == [float_node]
 
 
@@ -464,7 +623,7 @@ def test_query_invalid_canonical_filter_shapes(db):
     ]
     for filter_expr, pattern in invalid_filters:
         with pytest.raises(Exception, match=pattern):
-            db.query_node_ids({"type_id": 1, "filter": filter_expr})
+            db.query_node_ids({"label_filter": node_lf("Person"), "filter": filter_expr})
 
     with pytest.raises(Exception, match="use filter"):
         db.query_pattern(
@@ -485,18 +644,18 @@ def test_query_invalid_canonical_filter_shapes(db):
 
 def test_query_boolean_explain_serialization(db):
     seed_query_graph(db)
-    db.ensure_node_property_index(1, "status", "equality")
+    db.ensure_node_property_index("Person", "status", "equality")
     wait_for_index_state(
         db,
         lambda infos: next(
-            (info for info in infos if info.type_id == 1 and info.prop_key == "status"),
+            (info for info in infos if info.label == "Person" and info.prop_key == "status"),
             None,
         ),
     )
 
     indexed_or = db.explain_node_query(
         {
-            "type_id": 1,
+            "label_filter": node_lf("Person"),
             "filter": {
                 "or": [
                     {"property": "status", "eq": "active"},
@@ -510,7 +669,7 @@ def test_query_boolean_explain_serialization(db):
 
     fallback_or = db.explain_node_query(
         {
-            "type_id": 1,
+            "label_filter": node_lf("Person"),
             "filter": {
                 "or": [
                     {"property": "status", "eq": "active"},
@@ -524,7 +683,7 @@ def test_query_boolean_explain_serialization(db):
 
     empty = db.explain_node_query(
         {
-            "type_id": 1,
+            "label_filter": node_lf("Person"),
             "filter": {
                 "and": [
                     {"property": "status", "eq": "active"},
@@ -539,28 +698,56 @@ def test_query_boolean_explain_serialization(db):
 @pytest.mark.asyncio
 async def test_async_query_parity(async_db):
     active_high = await async_db.upsert_node(
-        1, "active-high", props={"status": "active", "score": 90}
+        "Person", "active-high", props={"status": "active", "score": 90}
     )
     inactive = await async_db.upsert_node(
-        1, "inactive", props={"status": "inactive", "score": 95}
+        "Person", "inactive", props={"status": "inactive", "score": 95}
     )
-    acme = await async_db.upsert_node(2, "acme")
-    await async_db.upsert_edge(active_high, acme, 10)
+    acme = await async_db.upsert_node("Company", "acme")
+    works_at = await async_db.upsert_edge(
+        active_high, acme, "WORKS_AT", props={"role": "engineer"}
+    )
 
     ids = await async_db.query_node_ids(
-        NodeQueryRequest(type_id=1, filter={"property": "status", "eq": "active"})
+        NodeQueryRequest(label_filter=node_lf("Person"), filter={"property": "status", "eq": "active"})
     )
     assert ids.items.to_list() == [active_high]
 
     nodes = await async_db.query_nodes(
-        {"type_id": 1, "filter": {"property": "score", "gte": 80}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "score", "gte": 80}}
     )
     assert [node.id for node in nodes.items] == [active_high, inactive]
 
     plan = await async_db.explain_node_query(
-        {"type_id": 1, "filter": {"property": "status", "eq": "active"}}
+        {"label_filter": node_lf("Person"), "filter": {"property": "status", "eq": "active"}}
     )
     assert plan["kind"] == "node_query"
+
+    edge_ids = await async_db.query_edge_ids(
+        {"from_ids": [active_high], "filter": {"property": "role", "eq": "engineer"}}
+    )
+    assert edge_ids.items.to_list() == [works_at]
+
+    edges = await async_db.query_edges(
+        {"ids": [works_at], "filter": {"valid_at": int(time.time() * 1000)}}
+    )
+    assert [edge.id for edge in edges.items] == [works_at]
+
+    edge_plan = await async_db.explain_edge_query({"ids": [works_at]})
+    assert edge_plan["kind"] == "edge_query"
+
+    with pytest.raises(Exception, match="use filter"):
+        await async_db.query_edge_ids(
+            {"label": "WORKS_AT", "where": {"role": {"eq": "engineer"}}}
+        )
+    with pytest.raises(Exception, match="use filter"):
+        await async_db.query_edges(
+            {"label": "WORKS_AT", "predicates": {"role": {"eq": "engineer"}}}
+        )
+    with pytest.raises(Exception, match="use filter"):
+        await async_db.explain_edge_query(
+            {"label": "WORKS_AT", "where": {"role": {"eq": "engineer"}}}
+        )
 
     pattern = await async_db.query_pattern(
         {
@@ -570,14 +757,14 @@ async def test_async_query_parity(async_db):
                     "ids": [active_high],
                     "filter": {"property": "status", "eq": "active"},
                 },
-                {"alias": "company", "type_id": 2, "keys": ["acme"]},
+                {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
             ],
             "edges": [
                 {
                     "alias": "employment",
                     "from_alias": "person",
                     "to_alias": "company",
-                    "type_filter": [10],
+                    "label_filter": ["WORKS_AT"],
                 }
             ],
             "limit": 10,
@@ -593,14 +780,14 @@ async def test_async_query_parity(async_db):
                     "ids": [active_high],
                     "filter": {"property": "status", "eq": "active"},
                 },
-                {"alias": "company", "type_id": 2, "keys": ["acme"]},
+                {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
             ],
             "edges": [
                 {
                     "alias": "employment",
                     "from_alias": "person",
                     "to_alias": "company",
-                    "type_filter": [10],
+                    "label_filter": ["WORKS_AT"],
                 }
             ],
             "limit": 10,

@@ -1,10 +1,10 @@
 use overgraph::{
-    DatabaseEngine, DbOptions, DegreeOptions, DenseMetric, DenseVectorConfig, EdgeInput,
-    ExportOptions, HnswConfig, IsConnectedOptions, NeighborOptions, NodeFilterExpr, NodeInput,
-    NodeQuery, PageRequest, PprOptions, PropValue, PropertyRangeBound, SecondaryIndexKind,
-    SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPathOptions, TopKOptions,
-    TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest,
-    WalSyncMode,
+    DatabaseEngine, DbOptions, DegreeOptions, DenseMetric, DenseVectorConfig, EdgeFilterExpr,
+    EdgeInput, EdgeQuery, ExportOptions, HnswConfig, IsConnectedOptions, LabelMatchMode,
+    NeighborOptions, NodeFilterExpr, NodeInput, NodeLabelFilter, NodeQuery, PageRequest,
+    PprOptions, PropValue, PropertyRangeBound, SecondaryIndexKind, SecondaryIndexRangeDomain,
+    SecondaryIndexState, ShortestPathOptions, TopKOptions, TraverseOptions, UpsertEdgeOptions,
+    UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, WalSyncMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -317,7 +317,7 @@ fn main() -> Result<(), String> {
         let stats = run_bench_growth(iter_cfg, |i| {
             engine
                 .upsert_node(
-                    1,
+                    "BenchNode",
                     &format!("node-{i}"),
                     UpsertNodeOptions {
                         props: idx_props(i),
@@ -335,7 +335,7 @@ fn main() -> Result<(), String> {
             iter_cfg,
             1,
             stats,
-            json!({"type_id": 1, "with_props": true, "weight": 1.0}),
+            json!({"label_id": 1, "with_props": true, "weight": 1.0}),
             scenario_comparability(&scenario_contract, scenario_id),
         ));
     }
@@ -347,7 +347,7 @@ fn main() -> Result<(), String> {
         let engine = open_db(&tmp_root.db_path("crud-upsert-edge"))?;
         let node_inputs: Vec<NodeInput> = (0..(iter_cfg.warmup + iter_cfg.iters + 1))
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("e-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -356,7 +356,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         let node_ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs)
             .map_err(|e| e.to_string())?;
 
         let stats = run_bench_growth(iter_cfg, |i| {
@@ -364,7 +364,7 @@ fn main() -> Result<(), String> {
                 .upsert_edge(
                     node_ids[i],
                     node_ids[i + 1],
-                    1,
+                    "BenchEdge",
                     UpsertEdgeOptions::default(),
                 )
                 .map(|_| ())
@@ -378,7 +378,7 @@ fn main() -> Result<(), String> {
             iter_cfg,
             1,
             stats,
-            json!({"edge_type_id": 1, "weight": 1.0}),
+            json!({"edge_label": "BenchEdge", "weight": 1.0}),
             scenario_comparability(&scenario_contract, scenario_id),
         ));
     }
@@ -391,7 +391,7 @@ fn main() -> Result<(), String> {
         let stats = run_bench(iter_cfg, |i| {
             let inputs: Vec<NodeInput> = (0..cfg.batch_nodes)
                 .map(|j| NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("bn-{i}-{j}"),
                     props: idx_props(j),
                     weight: 1.0,
@@ -399,7 +399,7 @@ fn main() -> Result<(), String> {
                     sparse_vector: None,
                 })
                 .collect();
-            engine.batch_upsert_nodes(&inputs).map(|_| ())
+            engine.batch_upsert_nodes(inputs).map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
 
@@ -410,7 +410,7 @@ fn main() -> Result<(), String> {
             iter_cfg,
             cfg.batch_nodes,
             stats,
-            json!({"batch_nodes": cfg.batch_nodes, "type_id": 1, "with_props": true}),
+            json!({"batch_nodes": cfg.batch_nodes, "label_id": 1, "with_props": true}),
             scenario_comparability(&scenario_contract, scenario_id),
         ));
     }
@@ -422,7 +422,7 @@ fn main() -> Result<(), String> {
         let engine = open_db(&tmp_root.db_path("crud-get-node"))?;
         let node_inputs: Vec<NodeInput> = (0..cfg.get_node_nodes)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("gn-{i}"),
                 props: idx_props(i),
                 weight: 1.0,
@@ -431,7 +431,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         let node_ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let stats = run_bench(iter_cfg, |i| {
@@ -459,7 +459,7 @@ fn main() -> Result<(), String> {
         let engine = open_db(&tmp_root.db_path("crud-upsert-node-fixed"))?;
         engine
             .upsert_node(
-                1,
+                "BenchNode",
                 "fixed-node",
                 UpsertNodeOptions {
                     props: idx_props(0),
@@ -470,7 +470,7 @@ fn main() -> Result<(), String> {
         let stats = run_bench(iter_cfg, |i| {
             engine
                 .upsert_node(
-                    1,
+                    "BenchNode",
                     "fixed-node",
                     UpsertNodeOptions {
                         props: idx_props(i),
@@ -488,7 +488,7 @@ fn main() -> Result<(), String> {
             iter_cfg,
             1,
             stats,
-            json!({"type_id": 1, "with_props": true, "weight": 1.0, "fixed_key": true}),
+            json!({"label_id": 1, "with_props": true, "weight": 1.0, "fixed_key": true}),
             scenario_comparability(&scenario_contract, scenario_id),
         ));
     }
@@ -502,14 +502,14 @@ fn main() -> Result<(), String> {
         let engine = DatabaseEngine::open(&tmp_root.db_path("crud-upsert-edge-fixed"), &opts)
             .map_err(|e| e.to_string())?;
         let node_a = engine
-            .upsert_node(1, "fixed-a", UpsertNodeOptions::default())
+            .upsert_node("BenchNode", "fixed-a", UpsertNodeOptions::default())
             .map_err(|e| e.to_string())?;
         let node_b = engine
-            .upsert_node(1, "fixed-b", UpsertNodeOptions::default())
+            .upsert_node("BenchNode", "fixed-b", UpsertNodeOptions::default())
             .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .upsert_edge(node_a, node_b, 1, UpsertEdgeOptions::default())
+                .upsert_edge(node_a, node_b, "BenchEdge", UpsertEdgeOptions::default())
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -521,7 +521,7 @@ fn main() -> Result<(), String> {
             iter_cfg,
             1,
             stats,
-            json!({"edge_type_id": 1, "weight": 1.0, "edge_uniqueness": true, "fixed_triple": true}),
+            json!({"edge_label": "BenchEdge", "weight": 1.0, "edge_uniqueness": true, "fixed_triple": true}),
             scenario_comparability(&scenario_contract, scenario_id),
         ));
     }
@@ -532,7 +532,7 @@ fn main() -> Result<(), String> {
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let engine = open_db(&tmp_root.db_path("trav-neighbors"))?;
         let mut node_inputs = vec![NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -540,7 +540,7 @@ fn main() -> Result<(), String> {
             sparse_vector: None,
         }];
         node_inputs.extend((0..cfg.fanout).map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("n-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -548,7 +548,7 @@ fn main() -> Result<(), String> {
             sparse_vector: None,
         }));
         let ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
         let hub = ids[0];
         let edge_inputs: Vec<EdgeInput> = ids[1..]
@@ -556,7 +556,7 @@ fn main() -> Result<(), String> {
             .map(|&n| EdgeInput {
                 from: hub,
                 to: n,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -564,7 +564,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         engine
-            .batch_upsert_edges(&edge_inputs)
+            .batch_upsert_edges(edge_inputs.clone())
             .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
             engine
@@ -649,7 +649,7 @@ fn main() -> Result<(), String> {
                 "layout": "memtable",
                 "min_depth": 1,
                 "max_depth": 3,
-                "node_type_filter": null,
+                "node_label_filter": null,
                 "branching": [level1, level2, level3]
             }),
             scenario_comparability(&scenario_contract, scenario_id),
@@ -682,7 +682,7 @@ fn main() -> Result<(), String> {
                 "layout": "segment",
                 "min_depth": 1,
                 "max_depth": 3,
-                "node_type_filter": null,
+                "node_label_filter": null,
                 "branching": [level1, level2, level3]
             }),
             scenario_comparability(&scenario_contract, scenario_id),
@@ -701,7 +701,10 @@ fn main() -> Result<(), String> {
                     root,
                     3,
                     &TraverseOptions {
-                        node_type_filter: Some(vec![2u32]),
+                        emit_node_label_filter: Some(NodeLabelFilter {
+                            labels: vec![bench_node_label(2)],
+                            mode: LabelMatchMode::Any,
+                        }),
                         ..Default::default()
                     },
                 )
@@ -721,7 +724,10 @@ fn main() -> Result<(), String> {
                 "layout": "memtable",
                 "min_depth": 1,
                 "max_depth": 3,
-                "node_type_filter": [2],
+                "node_label_filter": {
+                    "labels": [bench_node_label(2)],
+                    "mode": "any"
+                },
                 "branching": [level1, level2, level3]
             }),
             scenario_comparability(&scenario_contract, scenario_id),
@@ -741,7 +747,10 @@ fn main() -> Result<(), String> {
                     root,
                     3,
                     &TraverseOptions {
-                        node_type_filter: Some(vec![2u32]),
+                        emit_node_label_filter: Some(NodeLabelFilter {
+                            labels: vec![bench_node_label(2)],
+                            mode: LabelMatchMode::Any,
+                        }),
                         ..Default::default()
                     },
                 )
@@ -761,7 +770,10 @@ fn main() -> Result<(), String> {
                 "layout": "segment",
                 "min_depth": 1,
                 "max_depth": 3,
-                "node_type_filter": [2],
+                "node_label_filter": {
+                    "labels": [bench_node_label(2)],
+                    "mode": "any"
+                },
                 "branching": [level1, level2, level3]
             }),
             scenario_comparability(&scenario_contract, scenario_id),
@@ -774,7 +786,7 @@ fn main() -> Result<(), String> {
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let engine = open_db(&tmp_root.db_path("trav-degree"))?;
         let mut node_inputs = vec![NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -782,7 +794,7 @@ fn main() -> Result<(), String> {
             sparse_vector: None,
         }];
         node_inputs.extend((0..cfg.fanout).map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("d-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -790,7 +802,7 @@ fn main() -> Result<(), String> {
             sparse_vector: None,
         }));
         let ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
         let hub = ids[0];
         let edge_inputs: Vec<EdgeInput> = ids[1..]
@@ -798,7 +810,7 @@ fn main() -> Result<(), String> {
             .map(|&n| EdgeInput {
                 from: hub,
                 to: n,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -806,7 +818,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         engine
-            .batch_upsert_edges(&edge_inputs)
+            .batch_upsert_edges(edge_inputs.clone())
             .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
             engine.degree(hub, &DegreeOptions::default()).map(|_| ())
@@ -834,7 +846,7 @@ fn main() -> Result<(), String> {
             Vec::with_capacity(cfg.batch_nodes * (1 + cfg.fanout));
         for h in 0..cfg.batch_nodes {
             node_inputs.push(NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("hub-{h}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -843,7 +855,7 @@ fn main() -> Result<(), String> {
             });
             for i in 0..cfg.fanout {
                 node_inputs.push(NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("dt-{h}-{i}"),
                     props: BTreeMap::new(),
                     weight: 1.0,
@@ -853,7 +865,7 @@ fn main() -> Result<(), String> {
             }
         }
         let all_ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
         let stride = 1 + cfg.fanout;
         let hub_ids: Vec<u64> = (0..cfg.batch_nodes).map(|h| all_ids[h * stride]).collect();
@@ -865,7 +877,7 @@ fn main() -> Result<(), String> {
                 edge_inputs.push(EdgeInput {
                     from: hub,
                     to: spoke,
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0,
                     valid_from: None,
@@ -874,7 +886,7 @@ fn main() -> Result<(), String> {
             }
         }
         engine
-            .batch_upsert_edges(&edge_inputs)
+            .batch_upsert_edges(edge_inputs.clone())
             .map_err(|e| e.to_string())?;
         let stats = run_bench(iter_cfg, |_i| {
             engine
@@ -903,7 +915,7 @@ fn main() -> Result<(), String> {
 
         let node_inputs: Vec<NodeInput> = (0..cfg.shortest_path_nodes)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("sp-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -912,7 +924,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         let node_ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let offset_a = *cfg
@@ -932,7 +944,7 @@ fn main() -> Result<(), String> {
                     EdgeInput {
                         from,
                         to: to1,
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -941,7 +953,7 @@ fn main() -> Result<(), String> {
                     EdgeInput {
                         from,
                         to: to2,
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -951,7 +963,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         engine
-            .batch_upsert_edges(&edge_inputs)
+            .batch_upsert_edges(edge_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let sp_from = node_ids[0];
@@ -988,7 +1000,7 @@ fn main() -> Result<(), String> {
 
         let node_inputs: Vec<NodeInput> = (0..cfg.shortest_path_nodes)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("ic-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -997,7 +1009,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         let node_ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let offset_a = *cfg
@@ -1017,7 +1029,7 @@ fn main() -> Result<(), String> {
                     EdgeInput {
                         from,
                         to: to1,
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -1026,7 +1038,7 @@ fn main() -> Result<(), String> {
                     EdgeInput {
                         from,
                         to: to2,
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -1036,7 +1048,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         engine
-            .batch_upsert_edges(&edge_inputs)
+            .batch_upsert_edges(edge_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let sp_from = node_ids[0];
@@ -1070,7 +1082,7 @@ fn main() -> Result<(), String> {
         let iter_cfg = scenario_iterations(&args, &scenario_contract, scenario_id);
         let engine = open_db(&tmp_root.db_path("adv-top-k"))?;
         let mut node_inputs = vec![NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1078,7 +1090,7 @@ fn main() -> Result<(), String> {
             sparse_vector: None,
         }];
         node_inputs.extend((0..cfg.top_k_candidates).map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("tk-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1086,7 +1098,7 @@ fn main() -> Result<(), String> {
             sparse_vector: None,
         }));
         let ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
         let hub = ids[0];
         let edge_inputs: Vec<EdgeInput> = ids[1..]
@@ -1097,7 +1109,7 @@ fn main() -> Result<(), String> {
                 EdgeInput {
                     from: hub,
                     to: n,
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight,
                     valid_from: None,
@@ -1106,7 +1118,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         engine
-            .batch_upsert_edges(&edge_inputs)
+            .batch_upsert_edges(edge_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let stats = run_bench(iter_cfg, |_i| {
@@ -1140,7 +1152,7 @@ fn main() -> Result<(), String> {
         let engine = open_db(&tmp_root.db_path("adv-time-range"))?;
         let node_inputs: Vec<NodeInput> = (0..cfg.time_range_nodes)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("tr-{i}"),
                 props: idx_props(i),
                 weight: 1.0,
@@ -1149,13 +1161,14 @@ fn main() -> Result<(), String> {
             })
             .collect();
         engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let to_ms = now_millis() + cfg.time_range_window_ms;
+        let label = bench_node_label(1);
         let stats = run_bench(iter_cfg, |_i| {
             engine
-                .find_nodes_by_time_range(1, cfg.time_range_from_ms, to_ms)
+                .find_nodes_by_time_range(&label, cfg.time_range_from_ms, to_ms)
                 .map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -1168,7 +1181,7 @@ fn main() -> Result<(), String> {
             1,
             stats,
             json!({
-                "type_id": 1,
+                "label_id": 1,
                 "preload_nodes": cfg.time_range_nodes,
                 "from_ms": cfg.time_range_from_ms,
                 "to_ms_window": cfg.time_range_window_ms
@@ -1185,7 +1198,7 @@ fn main() -> Result<(), String> {
 
         let node_inputs: Vec<NodeInput> = (0..cfg.ppr_nodes)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("ppr-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1194,7 +1207,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         let node_ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let offset_a = *cfg
@@ -1214,7 +1227,7 @@ fn main() -> Result<(), String> {
                     EdgeInput {
                         from,
                         to: to1,
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -1223,7 +1236,7 @@ fn main() -> Result<(), String> {
                     EdgeInput {
                         from,
                         to: to2,
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.7,
                         valid_from: None,
@@ -1233,7 +1246,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         engine
-            .batch_upsert_edges(&edge_inputs)
+            .batch_upsert_edges(edge_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let seeds: Vec<u64> = node_ids
@@ -1279,7 +1292,7 @@ fn main() -> Result<(), String> {
 
         let node_inputs: Vec<NodeInput> = (0..cfg.export_nodes)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("ex-{i}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1288,7 +1301,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         let node_ids = engine
-            .batch_upsert_nodes(&node_inputs)
+            .batch_upsert_nodes(node_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let edge_inputs: Vec<EdgeInput> = (0..cfg.export_edges)
@@ -1299,7 +1312,7 @@ fn main() -> Result<(), String> {
                     Some(EdgeInput {
                         from,
                         to,
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -1311,7 +1324,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         engine
-            .batch_upsert_edges(&edge_inputs)
+            .batch_upsert_edges(edge_inputs.clone())
             .map_err(|e| e.to_string())?;
 
         let export_opts = ExportOptions {
@@ -1347,7 +1360,7 @@ fn main() -> Result<(), String> {
         let stats = run_bench(iter_cfg, |i| {
             let nodes: Vec<NodeInput> = (0..cfg.flush_nodes_per_iter)
                 .map(|j| NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("fl-{i}-{j}"),
                     props: idx_props(j),
                     weight: 1.0,
@@ -1355,7 +1368,7 @@ fn main() -> Result<(), String> {
                     sparse_vector: None,
                 })
                 .collect();
-            let node_ids = engine.batch_upsert_nodes(&nodes)?;
+            let node_ids = engine.batch_upsert_nodes(nodes.clone())?;
 
             let mut edges = Vec::new();
             let edge_count = cfg
@@ -1365,14 +1378,14 @@ fn main() -> Result<(), String> {
                 edges.push(EdgeInput {
                     from: node_ids[j],
                     to: node_ids[j + 1],
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0,
                     valid_from: None,
                     valid_to: None,
                 });
             }
-            engine.batch_upsert_edges(&edges)?;
+            engine.batch_upsert_edges(edges.clone())?;
             engine.flush().map(|_| ())
         })?;
         engine.close().map_err(|e| e.to_string())?;
@@ -1402,7 +1415,7 @@ fn main() -> Result<(), String> {
             .map(|i| {
                 let seed = 1729u64.wrapping_mul(i as u64 + 1);
                 NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("v-{i}"),
                     props: BTreeMap::new(),
                     weight: 1.0,
@@ -1416,7 +1429,7 @@ fn main() -> Result<(), String> {
             })
             .collect();
         engine
-            .batch_upsert_nodes(&inputs)
+            .batch_upsert_nodes(inputs.clone())
             .map_err(|e| e.to_string())?;
         engine.flush().map_err(|e| e.to_string())?;
 
@@ -1432,7 +1445,7 @@ fn main() -> Result<(), String> {
             dense_query: Some(dense_query),
             sparse_query: Some(sparse_query),
             k: cfg.vector_k,
-            type_filter: None,
+            label_filter: None,
             ef_search: None,
             scope: None,
             dense_weight: None,
@@ -1609,7 +1622,7 @@ fn build_depth_two_traversal_graph(
     cfg: &EffectiveConfigResolved,
 ) -> Result<u64, String> {
     let mut node_inputs = vec![NodeInput {
-        type_id: 1,
+        labels: vec![bench_node_label(1)],
         key: "root".to_string(),
         props: BTreeMap::new(),
         weight: 1.0,
@@ -1618,7 +1631,7 @@ fn build_depth_two_traversal_graph(
     }];
     for i in 0..cfg.two_hop_mid {
         node_inputs.push(NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("m-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1627,7 +1640,7 @@ fn build_depth_two_traversal_graph(
         });
         for j in 0..cfg.two_hop_leaves_per_mid {
             node_inputs.push(NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("l-{i}-{j}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1637,7 +1650,7 @@ fn build_depth_two_traversal_graph(
         }
     }
     let all_ids = engine
-        .batch_upsert_nodes(&node_inputs)
+        .batch_upsert_nodes(node_inputs.clone())
         .map_err(|e| e.to_string())?;
     let root = all_ids[0];
     let mid_stride = 1 + cfg.two_hop_leaves_per_mid;
@@ -1647,7 +1660,7 @@ fn build_depth_two_traversal_graph(
         edge_inputs.push(EdgeInput {
             from: root,
             to: mid,
-            type_id: 1,
+            label: "BenchEdge1".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
@@ -1658,7 +1671,7 @@ fn build_depth_two_traversal_graph(
             edge_inputs.push(EdgeInput {
                 from: mid,
                 to: leaf,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -1667,7 +1680,7 @@ fn build_depth_two_traversal_graph(
         }
     }
     engine
-        .batch_upsert_edges(&edge_inputs)
+        .batch_upsert_edges(edge_inputs.clone())
         .map_err(|e| e.to_string())?;
     Ok(root)
 }
@@ -1678,7 +1691,7 @@ fn build_deep_traversal_graph(
 ) -> Result<(u64, usize, usize, usize), String> {
     let (level1, level2, level3) = traverse_deep_branching(fanout);
     let mut node_inputs = vec![NodeInput {
-        type_id: 1,
+        labels: vec![bench_node_label(1)],
         key: "root".to_string(),
         props: BTreeMap::new(),
         weight: 1.0,
@@ -1687,7 +1700,7 @@ fn build_deep_traversal_graph(
     }];
     for i in 0..level1 {
         node_inputs.push(NodeInput {
-            type_id: 11,
+            labels: vec![bench_node_label(11)],
             key: format!("lvl1-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1698,7 +1711,7 @@ fn build_deep_traversal_graph(
     for i in 0..level1 {
         for j in 0..level2 {
             node_inputs.push(NodeInput {
-                type_id: if (i + j) % 2 == 0 { 2 } else { 3 },
+                labels: vec![bench_node_label(if (i + j) % 2 == 0 { 2 } else { 3 })],
                 key: format!("lvl2-{i}-{j}"),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1711,7 +1724,7 @@ fn build_deep_traversal_graph(
         for j in 0..level2 {
             for k in 0..level3 {
                 node_inputs.push(NodeInput {
-                    type_id: if (i + j + k) % 2 == 0 { 2 } else { 3 },
+                    labels: vec![bench_node_label(if (i + j + k) % 2 == 0 { 2 } else { 3 })],
                     key: format!("lvl3-{i}-{j}-{k}"),
                     props: BTreeMap::new(),
                     weight: 1.0,
@@ -1722,7 +1735,7 @@ fn build_deep_traversal_graph(
         }
     }
     let ids = engine
-        .batch_upsert_nodes(&node_inputs)
+        .batch_upsert_nodes(node_inputs.clone())
         .map_err(|e| e.to_string())?;
     let root = ids[0];
     let level1_offset = 1usize;
@@ -1734,7 +1747,7 @@ fn build_deep_traversal_graph(
         edge_inputs.push(EdgeInput {
             from: root,
             to: lvl1,
-            type_id: 1,
+            label: "BenchEdge1".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
@@ -1746,7 +1759,7 @@ fn build_deep_traversal_graph(
             edge_inputs.push(EdgeInput {
                 from: lvl1,
                 to: lvl2,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -1757,7 +1770,7 @@ fn build_deep_traversal_graph(
                 edge_inputs.push(EdgeInput {
                     from: lvl2,
                     to: ids[level3_offset + lvl3_idx],
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0,
                     valid_from: None,
@@ -1767,7 +1780,7 @@ fn build_deep_traversal_graph(
         }
     }
     engine
-        .batch_upsert_edges(&edge_inputs)
+        .batch_upsert_edges(edge_inputs.clone())
         .map_err(|e| e.to_string())?;
     Ok((root, level1, level2, level3))
 }
@@ -1847,7 +1860,9 @@ fn benchmark_db_options() -> DbOptions {
 
 fn open_db(path: &Path) -> Result<DatabaseEngine, String> {
     let opts = benchmark_db_options();
-    DatabaseEngine::open(path, &opts).map_err(|e| e.to_string())
+    let engine = DatabaseEngine::open(path, &opts).map_err(|e| e.to_string())?;
+    seed_bench_label_tokens(&engine)?;
+    Ok(engine)
 }
 
 fn open_vector_db(path: &Path, dim: u32) -> Result<DatabaseEngine, String> {
@@ -1857,18 +1872,55 @@ fn open_vector_db(path: &Path, dim: u32) -> Result<DatabaseEngine, String> {
         metric: DenseMetric::Cosine,
         hnsw: HnswConfig::default(),
     });
-    DatabaseEngine::open(path, &opts).map_err(|e| e.to_string())
+    let engine = DatabaseEngine::open(path, &opts).map_err(|e| e.to_string())?;
+    seed_bench_label_tokens(&engine)?;
+    Ok(engine)
+}
+
+fn seed_bench_label_tokens(engine: &DatabaseEngine) -> Result<(), String> {
+    for label_id in 1..=256 {
+        let node_id = engine
+            .ensure_node_label(&bench_node_label(label_id))
+            .map_err(|e| e.to_string())?;
+        let edge_label_id = engine
+            .ensure_edge_label(&format!("BenchEdge{label_id}"))
+            .map_err(|e| e.to_string())?;
+        if node_id != label_id || edge_label_id != label_id {
+            return Err(format!(
+                "benchmark label-token seed drifted for label_id {label_id}: node={node_id}, edge={edge_label_id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bench_node_label(label_id: u32) -> String {
+    format!("BenchNode{label_id}")
 }
 
 fn query_bench_props(i: usize) -> BTreeMap<String, PropValue> {
     let mut props = BTreeMap::new();
     props.insert(
         "status".to_string(),
-        PropValue::String(if i % 10 == 0 { "active" } else { "inactive" }.to_string()),
+        PropValue::String(
+            if i.is_multiple_of(10) {
+                "active"
+            } else {
+                "inactive"
+            }
+            .to_string(),
+        ),
     );
     props.insert(
         "tier".to_string(),
-        PropValue::String(if i % 20 == 0 { "gold" } else { "standard" }.to_string()),
+        PropValue::String(
+            if i.is_multiple_of(20) {
+                "gold"
+            } else {
+                "standard"
+            }
+            .to_string(),
+        ),
     );
     props.insert("score".to_string(), PropValue::Int((i % 100) as i64));
     props
@@ -1926,19 +1978,20 @@ fn build_query_benchmark_engine(
     preload_nodes: usize,
 ) -> Result<(DatabaseEngine, QueryBenchmarkLayout), String> {
     let engine = open_db(path)?;
+    let node_label = bench_node_label(1);
     let status = engine
-        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(&node_label, "status", SecondaryIndexKind::Equality)
         .map_err(|e| e.to_string())?;
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready)?;
 
     let tier = engine
-        .ensure_node_property_index(1, "tier", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(&node_label, "tier", SecondaryIndexKind::Equality)
         .map_err(|e| e.to_string())?;
     wait_for_property_index_state(&engine, tier.index_id, SecondaryIndexState::Ready)?;
 
     let score = engine
         .ensure_node_property_index(
-            1,
+            &node_label,
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -1952,7 +2005,7 @@ fn build_query_benchmark_engine(
         let start = segment * layout.segment_nodes;
         let inputs: Vec<NodeInput> = (start..start + layout.segment_nodes)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("q-{i}"),
                 props: query_bench_props(i),
                 weight: 1.0,
@@ -1961,7 +2014,7 @@ fn build_query_benchmark_engine(
             })
             .collect();
         engine
-            .batch_upsert_nodes(&inputs)
+            .batch_upsert_nodes(inputs.clone())
             .map_err(|e| e.to_string())?;
         engine.flush().map_err(|e| e.to_string())?;
     }
@@ -1969,7 +2022,7 @@ fn build_query_benchmark_engine(
     let tail_start = layout.segments * layout.segment_nodes;
     let tail_inputs: Vec<NodeInput> = (tail_start..tail_start + layout.memtable_tail_nodes)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("q-{i}"),
             props: query_bench_props(i),
             weight: 1.0,
@@ -1978,7 +2031,7 @@ fn build_query_benchmark_engine(
         })
         .collect();
     engine
-        .batch_upsert_nodes(&tail_inputs)
+        .batch_upsert_nodes(tail_inputs.clone())
         .map_err(|e| e.to_string())?;
 
     Ok((engine, layout))
@@ -1986,7 +2039,10 @@ fn build_query_benchmark_engine(
 
 fn query_ids_intersected_request(limit: usize) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![
             NodeFilterExpr::PropertyEquals {
                 key: "status".to_string(),
@@ -2007,7 +2063,10 @@ fn query_ids_intersected_request(limit: usize) -> NodeQuery {
 
 fn query_nodes_hydrated_request(limit: usize) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![
             NodeFilterExpr::PropertyEquals {
                 key: "status".to_string(),
@@ -2019,6 +2078,137 @@ fn query_nodes_hydrated_request(limit: usize) -> NodeQuery {
                 upper: None,
             },
         ],
+        page: PageRequest {
+            limit: Some(limit),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+struct EdgeBenchmarkLayout {
+    segments: usize,
+    segment_edges: usize,
+    memtable_tail_edges: usize,
+}
+
+struct EdgeBenchmarkFixture {
+    engine: DatabaseEngine,
+    layout: EdgeBenchmarkLayout,
+    source_id: u64,
+}
+
+fn build_edge_query_benchmark_engine(
+    path: &Path,
+    preload_edges: usize,
+) -> Result<EdgeBenchmarkFixture, String> {
+    let engine = open_db(path)?;
+    let source_count = 1usize;
+    let target_count = preload_edges.max(1);
+    let mut nodes = Vec::with_capacity(source_count + target_count);
+    nodes.extend((0..source_count).map(|i| NodeInput {
+        labels: vec![bench_node_label(1)],
+        key: format!("edge-source-{i}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
+    nodes.extend((0..target_count).map(|i| NodeInput {
+        labels: vec![bench_node_label(2)],
+        key: format!("edge-target-{i}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
+    let ids = engine
+        .batch_upsert_nodes(nodes.clone())
+        .map_err(|e| e.to_string())?;
+    let source_ids = &ids[..source_count];
+    let target_ids = &ids[source_count..];
+    let source_id = source_ids[0];
+
+    let segments = if preload_edges >= 2 { 1 } else { 0 };
+    let segment_edges = if segments == 0 {
+        0
+    } else {
+        (preload_edges / 2).max(1)
+    };
+    let memtable_tail_edges = preload_edges.saturating_sub(segment_edges);
+    let make_edges = |start: usize, count: usize| -> Vec<EdgeInput> {
+        (start..start + count)
+            .map(|i| {
+                let mut props = BTreeMap::new();
+                props.insert(
+                    "role".to_string(),
+                    PropValue::String(if i % 10 == 0 { "lead" } else { "member" }.to_string()),
+                );
+                EdgeInput {
+                    from: source_ids[i % source_count],
+                    to: target_ids[i % target_ids.len()],
+                    label: "BenchEdge10".to_string(),
+                    props,
+                    weight: if i % 2 == 0 { 2.0 } else { 0.5 },
+                    valid_from: None,
+                    valid_to: None,
+                }
+            })
+            .collect()
+    };
+    if segment_edges > 0 {
+        engine
+            .batch_upsert_edges(make_edges(0, segment_edges))
+            .map_err(|e| e.to_string())?;
+        engine.flush().map_err(|e| e.to_string())?;
+    }
+    if memtable_tail_edges > 0 {
+        engine
+            .batch_upsert_edges(make_edges(segment_edges, memtable_tail_edges))
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(EdgeBenchmarkFixture {
+        engine,
+        layout: EdgeBenchmarkLayout {
+            segments,
+            segment_edges,
+            memtable_tail_edges,
+        },
+        source_id,
+    })
+}
+
+fn query_edge_ids_request(source_id: u64, limit: usize) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge10".to_string()),
+        from_ids: vec![source_id],
+        filter: Some(EdgeFilterExpr::WeightRange {
+            lower: Some(1.0),
+            upper: None,
+        }),
+        page: PageRequest {
+            limit: Some(limit),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn query_edges_hydrated_request(source_id: u64, limit: usize) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge10".to_string()),
+        from_ids: vec![source_id],
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::WeightRange {
+                lower: Some(1.0),
+                upper: None,
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "role".to_string(),
+                value: PropValue::String("lead".to_string()),
+            },
+        ])),
         page: PageRequest {
             limit: Some(limit),
             after: None,
@@ -2056,7 +2246,7 @@ fn push_query_scenarios(
             1,
             stats,
             json!({
-                "type_id": 1,
+                "label_id": 1,
                 "preload_nodes": preload_nodes,
                 "segments": layout.segments,
                 "segment_nodes": layout.segment_nodes,
@@ -2087,12 +2277,78 @@ fn push_query_scenarios(
             1,
             stats,
             json!({
-                "type_id": 1,
+                "label_id": 1,
                 "preload_nodes": preload_nodes,
                 "segments": layout.segments,
                 "segment_nodes": layout.segment_nodes,
                 "memtable_tail_nodes": layout.memtable_tail_nodes,
                 "predicates": ["status_eq_active", "score_gte_50"],
+                "limit": limit
+            }),
+            scenario_comparability(scenario_contract, scenario_id),
+        ));
+    }
+
+    {
+        let scenario_id = "S-QUERY-003";
+        let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+        let fixture = build_edge_query_benchmark_engine(
+            &tmp_root.db_path("query-edge-ids-endpoint-metadata"),
+            preload_nodes,
+        )?;
+        let request = query_edge_ids_request(fixture.source_id, limit);
+        let stats = run_bench(iter_cfg, |_i| {
+            fixture.engine.query_edge_ids(&request).map(|_| ())
+        })?;
+        fixture.engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "query_edge_ids_endpoint_metadata",
+            "query",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "label_id": 10,
+                "preload_edges": preload_nodes,
+                "segments": fixture.layout.segments,
+                "segment_edges": fixture.layout.segment_edges,
+                "memtable_tail_edges": fixture.layout.memtable_tail_edges,
+                "filter": "weight_gte_1",
+                "limit": limit
+            }),
+            scenario_comparability(scenario_contract, scenario_id),
+        ));
+    }
+
+    {
+        let scenario_id = "S-QUERY-004";
+        let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+        let fixture = build_edge_query_benchmark_engine(
+            &tmp_root.db_path("query-edges-endpoint-property-hydrated"),
+            preload_nodes,
+        )?;
+        let request = query_edges_hydrated_request(fixture.source_id, limit);
+        let stats = run_bench(iter_cfg, |_i| {
+            fixture.engine.query_edges(&request).map(|_| ())
+        })?;
+        fixture.engine.close().map_err(|e| e.to_string())?;
+
+        scenarios.push(make_scenario(
+            scenario_id,
+            "query_edges_endpoint_property_hydrated",
+            "query",
+            iter_cfg,
+            1,
+            stats,
+            json!({
+                "label_id": 10,
+                "preload_edges": preload_nodes,
+                "segments": fixture.layout.segments,
+                "segment_edges": fixture.layout.segment_edges,
+                "memtable_tail_edges": fixture.layout.memtable_tail_edges,
+                "filter": "weight_gte_1_and_role_eq_lead",
                 "limit": limit
             }),
             scenario_comparability(scenario_contract, scenario_id),

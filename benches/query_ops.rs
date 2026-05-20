@@ -1,8 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, EdgeInput, EdgePattern, GraphPatternQuery,
-    NodeFilterExpr, NodeInput, NodePattern, NodeQuery, PageRequest, PatternOrder, PropValue,
-    PropertyRangeBound, SecondaryIndexKind, SecondaryIndexRangeDomain, SecondaryIndexState,
+    DatabaseEngine, DbOptions, Direction, EdgeFilterExpr, EdgeInput, EdgePattern, EdgeQuery,
+    GraphPatternQuery, LabelMatchMode, NodeFilterExpr, NodeInput, NodeLabelFilter, NodePattern,
+    NodeQuery, PageRequest, PatternOrder, PropValue, PropertyRangeBound, SecondaryIndexKind,
+    SecondaryIndexRangeDomain, SecondaryIndexState,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,7 +13,7 @@ const QUERY_NODES_PER_SEGMENT: usize = 5_000;
 const QUERY_MEMTABLE_TAIL_COUNT: usize = 5_000;
 const QUERY_LIMIT: usize = 100;
 const QUERY_LARGE_UNIVERSE_COUNT: usize = 25_000;
-const QUERY_SMALL_TYPE_COUNT: usize = 128;
+const QUERY_SMALL_LABEL_COUNT: usize = 128;
 const QUERY_LARGE_IN_VALUE_COUNT: usize = 512;
 
 macro_rules! filter_and {
@@ -35,11 +36,33 @@ fn temp_db_with_edge_uniqueness(edge_uniqueness: bool) -> (tempfile::TempDir, Da
         ..DbOptions::default()
     };
     let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    seed_bench_label_tokens(&engine);
     (dir, engine)
 }
 
 fn temp_db() -> (tempfile::TempDir, DatabaseEngine) {
     temp_db_with_edge_uniqueness(true)
+}
+
+fn seed_bench_label_tokens(engine: &DatabaseEngine) {
+    for label_token_id in 1..=256 {
+        assert_eq!(
+            engine
+                .ensure_node_label(&bench_node_label(label_token_id))
+                .unwrap(),
+            label_token_id
+        );
+        assert_eq!(
+            engine
+                .ensure_edge_label(&format!("BenchEdge{label_token_id}"))
+                .unwrap(),
+            label_token_id
+        );
+    }
+}
+
+fn bench_node_label(label_token_id: u32) -> String {
+    format!("BenchNode{label_token_id}")
 }
 
 fn query_props(i: usize) -> BTreeMap<String, PropValue> {
@@ -81,7 +104,7 @@ fn query_props(i: usize) -> BTreeMap<String, PropValue> {
 fn query_nodes(prefix: &str, start: usize, count: usize) -> Vec<NodeInput> {
     (start..start + count)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("{prefix}-{i}"),
             props: query_props(i),
             weight: 1.0,
@@ -91,10 +114,15 @@ fn query_nodes(prefix: &str, start: usize, count: usize) -> Vec<NodeInput> {
         .collect()
 }
 
-fn query_nodes_with_type(type_id: u32, prefix: &str, start: usize, count: usize) -> Vec<NodeInput> {
+fn query_nodes_with_label_id(
+    label_id: u32,
+    prefix: &str,
+    start: usize,
+    count: usize,
+) -> Vec<NodeInput> {
     (start..start + count)
         .map(|i| NodeInput {
-            type_id,
+            labels: vec![bench_node_label(label_id)],
             key: format!("{prefix}-{i}"),
             props: query_props(i),
             weight: 1.0,
@@ -129,25 +157,51 @@ fn wait_for_property_index_state(
     }
 }
 
+fn wait_for_edge_property_index_state(
+    engine: &DatabaseEngine,
+    index_id: u64,
+    expected_state: SecondaryIndexState,
+) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if engine
+            .list_edge_property_indexes()
+            .unwrap()
+            .into_iter()
+            .any(|info| info.index_id == index_id && info.state == expected_state)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for edge property index {} to reach {:?}",
+            index_id,
+            expected_state
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn ensure_query_indexes(engine: &mut DatabaseEngine) {
+    let label = bench_node_label(1);
     let status = engine
-        .ensure_node_property_index(1, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(&label, "status", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(engine, status.index_id, SecondaryIndexState::Ready);
 
     let tier = engine
-        .ensure_node_property_index(1, "tier", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(&label, "tier", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(engine, tier.index_id, SecondaryIndexState::Ready);
 
     let tenant = engine
-        .ensure_node_property_index(1, "tenant", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(&label, "tenant", SecondaryIndexKind::Equality)
         .unwrap();
     wait_for_property_index_state(engine, tenant.index_id, SecondaryIndexState::Ready);
 
     let score = engine
         .ensure_node_property_index(
-            1,
+            &label,
             "score",
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -168,13 +222,13 @@ fn load_query_mixed_sources(engine: &DatabaseEngine, prefix: &str) {
     for segment in 0..QUERY_SEGMENT_COUNT {
         let start = segment * QUERY_NODES_PER_SEGMENT;
         let nodes = query_nodes(prefix, start, QUERY_NODES_PER_SEGMENT);
-        engine.batch_upsert_nodes(&nodes).unwrap();
+        engine.batch_upsert_nodes(nodes.clone()).unwrap();
         engine.flush().unwrap();
     }
 
     let tail_start = QUERY_SEGMENT_COUNT * QUERY_NODES_PER_SEGMENT;
     let tail_nodes = query_nodes(prefix, tail_start, QUERY_MEMTABLE_TAIL_COUNT);
-    engine.batch_upsert_nodes(&tail_nodes).unwrap();
+    engine.batch_upsert_nodes(tail_nodes.clone()).unwrap();
 }
 
 fn build_fallback_query_engine() -> (tempfile::TempDir, DatabaseEngine) {
@@ -183,29 +237,32 @@ fn build_fallback_query_engine() -> (tempfile::TempDir, DatabaseEngine) {
     (dir, engine)
 }
 
-fn build_small_type_universe_engine() -> (tempfile::TempDir, DatabaseEngine) {
+fn build_small_label_universe_engine() -> (tempfile::TempDir, DatabaseEngine) {
     let (dir, engine) = temp_db();
-    let filler = query_nodes_with_type(2, "large-universe", 0, QUERY_LARGE_UNIVERSE_COUNT);
-    engine.batch_upsert_nodes(&filler).unwrap();
+    let filler = query_nodes_with_label_id(2, "large-universe", 0, QUERY_LARGE_UNIVERSE_COUNT);
+    engine.batch_upsert_nodes(filler.clone()).unwrap();
     engine.flush().unwrap();
 
-    let segment_small = query_nodes_with_type(1, "small-type", 0, QUERY_SMALL_TYPE_COUNT / 2);
-    engine.batch_upsert_nodes(&segment_small).unwrap();
+    let segment_small = query_nodes_with_label_id(1, "small-label", 0, QUERY_SMALL_LABEL_COUNT / 2);
+    engine.batch_upsert_nodes(segment_small.clone()).unwrap();
     engine.flush().unwrap();
 
-    let memtable_small = query_nodes_with_type(
+    let memtable_small = query_nodes_with_label_id(
         1,
-        "small-type",
-        QUERY_SMALL_TYPE_COUNT / 2,
-        QUERY_SMALL_TYPE_COUNT - QUERY_SMALL_TYPE_COUNT / 2,
+        "small-label",
+        QUERY_SMALL_LABEL_COUNT / 2,
+        QUERY_SMALL_LABEL_COUNT - QUERY_SMALL_LABEL_COUNT / 2,
     );
-    engine.batch_upsert_nodes(&memtable_small).unwrap();
+    engine.batch_upsert_nodes(memtable_small.clone()).unwrap();
     (dir, engine)
 }
 
 fn two_equality_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![
             NodeFilterExpr::PropertyEquals {
                 key: "status".to_string(),
@@ -223,7 +280,10 @@ fn two_equality_query(limit: Option<usize>) -> NodeQuery {
 
 fn equality_and_range_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![
             NodeFilterExpr::PropertyEquals {
                 key: "status".to_string(),
@@ -242,7 +302,10 @@ fn equality_and_range_query(limit: Option<usize>) -> NodeQuery {
 
 fn broad_equality_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![NodeFilterExpr::PropertyEquals {
             key: "status".to_string(),
             value: PropValue::String("inactive".to_string()),
@@ -254,7 +317,10 @@ fn broad_equality_query(limit: Option<usize>) -> NodeQuery {
 
 fn broad_equality_and_selective_equality_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![
             NodeFilterExpr::PropertyEquals {
                 key: "status".to_string(),
@@ -272,7 +338,10 @@ fn broad_equality_and_selective_equality_query(limit: Option<usize>) -> NodeQuer
 
 fn broad_equality_and_selective_range_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![
             NodeFilterExpr::PropertyEquals {
                 key: "status".to_string(),
@@ -291,7 +360,10 @@ fn broad_equality_and_selective_range_query(limit: Option<usize>) -> NodeQuery {
 
 fn range_stats_selective_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![NodeFilterExpr::PropertyRange {
             key: "score".to_string(),
             lower: Some(PropertyRangeBound::Included(PropValue::Int(7))),
@@ -304,7 +376,10 @@ fn range_stats_selective_query(limit: Option<usize>) -> NodeQuery {
 
 fn range_stats_broad_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![NodeFilterExpr::PropertyRange {
             key: "score".to_string(),
             lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
@@ -325,7 +400,10 @@ fn now_millis_for_bench() -> i64 {
 
 fn timestamp_stats_recent_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![NodeFilterExpr::UpdatedAtRange {
             lower_ms: Some(now_millis_for_bench().saturating_sub(60_000)),
             upper_ms: None,
@@ -337,7 +415,10 @@ fn timestamp_stats_recent_query(limit: Option<usize>) -> NodeQuery {
 
 fn timestamp_stats_broad_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![NodeFilterExpr::UpdatedAtRange {
             lower_ms: Some(0),
             upper_ms: Some(i64::MAX),
@@ -347,9 +428,12 @@ fn timestamp_stats_broad_query(limit: Option<usize>) -> NodeQuery {
     }
 }
 
-fn type_scan_fallback_query() -> NodeQuery {
+fn label_scan_fallback_query() -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: filter_and![NodeFilterExpr::PropertyEquals {
             key: "region".to_string(),
             value: PropValue::String("r03".to_string()),
@@ -362,9 +446,12 @@ fn type_scan_fallback_query() -> NodeQuery {
     }
 }
 
-fn type_scoped_verify_only_boolean_query() -> NodeQuery {
+fn label_scoped_verify_only_boolean_query() -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: Some(NodeFilterExpr::And(vec![
             NodeFilterExpr::Or(vec![
                 NodeFilterExpr::PropertyEquals {
@@ -411,7 +498,10 @@ fn score_at_least_filter(value: i64) -> NodeFilterExpr {
 
 fn boolean_or_union_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: Some(NodeFilterExpr::Or(vec![
             tenant_eq_filter("t07"),
             tenant_eq_filter("t11"),
@@ -423,7 +513,10 @@ fn boolean_or_union_query(limit: Option<usize>) -> NodeQuery {
 
 fn boolean_in_union_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: Some(NodeFilterExpr::PropertyIn {
             key: "tenant".to_string(),
             values: vec![
@@ -440,7 +533,10 @@ fn boolean_in_union_query(limit: Option<usize>) -> NodeQuery {
 
 fn boolean_and_or_range_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: Some(NodeFilterExpr::And(vec![
             NodeFilterExpr::Or(vec![
                 tenant_eq_filter("t91"),
@@ -454,9 +550,12 @@ fn boolean_and_or_range_query(limit: Option<usize>) -> NodeQuery {
     }
 }
 
-fn boolean_verify_only_type_fallback_query(limit: Option<usize>) -> NodeQuery {
+fn boolean_verify_only_label_fallback_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: Some(NodeFilterExpr::Or(vec![
             tenant_eq_filter("t07"),
             NodeFilterExpr::PropertyMissing {
@@ -475,7 +574,10 @@ fn boolean_large_in_verify_only_query(limit: Option<usize>) -> NodeQuery {
     values.push(PropValue::String("r03".to_string()));
 
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         filter: Some(NodeFilterExpr::PropertyIn {
             key: "region".to_string(),
             values,
@@ -485,17 +587,23 @@ fn boolean_large_in_verify_only_query(limit: Option<usize>) -> NodeQuery {
     }
 }
 
-fn type_only_query(limit: Option<usize>) -> NodeQuery {
+fn label_only_query(limit: Option<usize>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         page: PageRequest { limit, after: None },
         ..Default::default()
     }
 }
 
-fn type_with_large_explicit_ids_query(ids: Vec<u64>) -> NodeQuery {
+fn label_with_large_explicit_ids_query(ids: Vec<u64>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         ids,
         page: PageRequest {
             limit: Some(QUERY_LIMIT),
@@ -505,9 +613,12 @@ fn type_with_large_explicit_ids_query(ids: Vec<u64>) -> NodeQuery {
     }
 }
 
-fn type_with_large_keys_query(keys: Vec<String>) -> NodeQuery {
+fn label_with_large_keys_query(keys: Vec<String>) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         keys,
         page: PageRequest {
             limit: Some(QUERY_LIMIT),
@@ -564,7 +675,10 @@ fn explicit_ids_query(ids: &[u64]) -> NodeQuery {
 
 fn explicit_ids_and_selective_property_query(ids: &[u64]) -> NodeQuery {
     NodeQuery {
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         ids: ids.to_vec(),
         filter: filter_and![NodeFilterExpr::PropertyEquals {
             key: "tenant".to_string(),
@@ -594,17 +708,17 @@ fn bench_node_queries(c: &mut Criterion) {
         b.iter(|| black_box(engine.query_nodes(black_box(&query)).unwrap()));
     });
 
-    group.bench_function("query_node_ids_type_scan_fallback", |b| {
+    group.bench_function("query_node_ids_label_scan_fallback", |b| {
         let (_dir, engine) = build_fallback_query_engine();
-        let query = type_scan_fallback_query();
+        let query = label_scan_fallback_query();
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
 
     group.bench_function(
-        "query_node_ids_type_scoped_verify_only_boolean_filter",
+        "query_node_ids_label_scoped_verify_only_boolean_filter",
         |b| {
             let (_dir, engine) = build_fallback_query_engine();
-            let query = type_scoped_verify_only_boolean_query();
+            let query = label_scoped_verify_only_boolean_query();
             b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
         },
     );
@@ -627,14 +741,14 @@ fn bench_node_queries(c: &mut Criterion) {
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
 
-    group.bench_function("query_node_ids_boolean_verify_only_type_fallback", |b| {
+    group.bench_function("query_node_ids_boolean_verify_only_label_fallback", |b| {
         let (_dir, engine) = build_fallback_query_engine();
-        let query = boolean_verify_only_type_fallback_query(Some(QUERY_LIMIT));
+        let query = boolean_verify_only_label_fallback_query(Some(QUERY_LIMIT));
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
 
     group.bench_function(
-        "query_node_ids_boolean_large_in_verify_only_type_fallback",
+        "query_node_ids_boolean_large_in_verify_only_label_fallback",
         |b| {
             let (_dir, engine) = build_fallback_query_engine();
             let query = boolean_large_in_verify_only_query(Some(QUERY_LIMIT));
@@ -668,26 +782,26 @@ fn bench_node_queries(c: &mut Criterion) {
         b.iter(|| black_box(engine.query_nodes(black_box(&query)).unwrap()));
     });
 
-    group.bench_function("query_node_ids_type_only", |b| {
+    group.bench_function("query_node_ids_label_only", |b| {
         let (_dir, engine) = build_fallback_query_engine();
-        let query = type_only_query(Some(QUERY_LIMIT));
+        let query = label_only_query(Some(QUERY_LIMIT));
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
 
-    group.bench_function("query_node_ids_type_vs_large_explicit_ids", |b| {
-        let (_dir, engine) = build_small_type_universe_engine();
-        let ids = (1..=(QUERY_LARGE_UNIVERSE_COUNT + QUERY_SMALL_TYPE_COUNT) as u64).collect();
-        let query = type_with_large_explicit_ids_query(ids);
+    group.bench_function("query_node_ids_label_vs_large_explicit_ids", |b| {
+        let (_dir, engine) = build_small_label_universe_engine();
+        let ids = (1..=(QUERY_LARGE_UNIVERSE_COUNT + QUERY_SMALL_LABEL_COUNT) as u64).collect();
+        let query = label_with_large_explicit_ids_query(ids);
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
 
-    group.bench_function("query_node_ids_type_vs_large_keys", |b| {
-        let (_dir, engine) = build_small_type_universe_engine();
+    group.bench_function("query_node_ids_label_vs_large_keys", |b| {
+        let (_dir, engine) = build_small_label_universe_engine();
         let mut keys: Vec<String> = (0..QUERY_LARGE_UNIVERSE_COUNT)
             .map(|i| format!("missing-key-{i}"))
             .collect();
-        keys.extend((0..QUERY_SMALL_TYPE_COUNT).map(|i| format!("small-type-{i}")));
-        let query = type_with_large_keys_query(keys);
+        keys.extend((0..QUERY_SMALL_LABEL_COUNT).map(|i| format!("small-label-{i}")));
+        let query = label_with_large_keys_query(keys);
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
 
@@ -700,7 +814,7 @@ fn bench_node_queries(c: &mut Criterion) {
     group.bench_function("query_node_ids_explicit_ids_verify", |b| {
         let (_dir, engine) = build_indexed_query_engine();
         let nodes = query_nodes("explicit", 0, 512);
-        let ids = engine.batch_upsert_nodes(&nodes).unwrap();
+        let ids = engine.batch_upsert_nodes(nodes.clone()).unwrap();
         let query = explicit_ids_query(&ids);
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
@@ -797,7 +911,8 @@ fn bench_node_queries(c: &mut Criterion) {
 
     group.bench_function("query_node_ids_large_explicit_ids_selective_index", |b| {
         let (_dir, engine) = build_indexed_query_engine();
-        let ids = engine.nodes_by_type(1).unwrap();
+        let label = bench_node_label(1);
+        let ids = engine.nodes_by_labels(&label).unwrap();
         let query = explicit_ids_and_selective_property_query(&ids);
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
@@ -837,15 +952,423 @@ fn bench_node_queries(c: &mut Criterion) {
     group.finish();
 }
 
+fn edge_query_props(i: usize) -> BTreeMap<String, PropValue> {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "role".to_string(),
+        PropValue::String(
+            if i.is_multiple_of(10) {
+                "lead"
+            } else {
+                "member"
+            }
+            .to_string(),
+        ),
+    );
+    props.insert("score".to_string(), PropValue::Int((i % 100) as i64));
+    props
+}
+
+fn build_edge_query_engine() -> (tempfile::TempDir, DatabaseEngine, u64, Vec<u64>, i64) {
+    let (dir, engine) = temp_db();
+    let edge_count = QUERY_NODES_PER_SEGMENT + QUERY_MEMTABLE_TAIL_COUNT;
+    let valid_epoch = 1_700_000_000_100i64;
+    let mut nodes = Vec::with_capacity(edge_count + 1);
+    nodes.push(NodeInput {
+        labels: vec![bench_node_label(1)],
+        key: "edge-query-source".to_string(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    });
+    nodes.extend((0..edge_count).map(|i| NodeInput {
+        labels: vec![bench_node_label(2)],
+        key: format!("edge-query-target-{i}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
+    let node_ids = engine.batch_upsert_nodes(nodes.clone()).unwrap();
+    let source_id = node_ids[0];
+    let target_ids = &node_ids[1..];
+    let make_edges = |start: usize, count: usize| -> Vec<EdgeInput> {
+        (start..start + count)
+            .map(|i| EdgeInput {
+                from: source_id,
+                to: target_ids[i],
+                label: "BenchEdge10".to_string(),
+                props: edge_query_props(i),
+                weight: if i.is_multiple_of(2) { 2.0 } else { 0.5 },
+                valid_from: Some(1_700_000_000_000),
+                valid_to: Some(1_700_000_010_000),
+            })
+            .collect()
+    };
+
+    let mut edge_ids = engine
+        .batch_upsert_edges(make_edges(0, QUERY_NODES_PER_SEGMENT))
+        .unwrap();
+    engine.flush().unwrap();
+    edge_ids.extend(
+        engine
+            .batch_upsert_edges(make_edges(
+                QUERY_NODES_PER_SEGMENT,
+                QUERY_MEMTABLE_TAIL_COUNT,
+            ))
+            .unwrap(),
+    );
+    (dir, engine, source_id, edge_ids, valid_epoch)
+}
+
+fn build_edge_query_indexed_engine() -> (tempfile::TempDir, DatabaseEngine, u64, Vec<u64>, i64) {
+    let (dir, engine, source_id, edge_ids, valid_epoch) = build_edge_query_engine();
+    let label = "BenchEdge10".to_string();
+    let role = engine
+        .ensure_edge_property_index(&label, "role", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, role.index_id, SecondaryIndexState::Ready);
+    let score = engine
+        .ensure_edge_property_index(
+            &label,
+            "score",
+            SecondaryIndexKind::Range {
+                domain: SecondaryIndexRangeDomain::Int,
+            },
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
+    (dir, engine, source_id, edge_ids, valid_epoch)
+}
+
+fn edge_query_with_filter(source_id: u64, filter: Option<EdgeFilterExpr>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge10".to_string()),
+        from_ids: vec![source_id],
+        filter,
+        page: PageRequest {
+            limit: Some(QUERY_LIMIT),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn edge_pattern_filter_query(source_id: u64, filter: Option<EdgeFilterExpr>) -> GraphPatternQuery {
+    GraphPatternQuery {
+        nodes: vec![
+            NodePattern {
+                alias: "source".to_string(),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(1)],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: vec![source_id],
+                keys: Vec::new(),
+                filter: None,
+            },
+            NodePattern {
+                alias: "target".to_string(),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(2)],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: None,
+            },
+        ],
+        edges: vec![EdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec!["BenchEdge10".to_string()],
+            filter,
+        }],
+        at_epoch: None,
+        limit: QUERY_LIMIT,
+        order: PatternOrder::AnchorThenAliasesAsc,
+    }
+}
+
+fn edge_property_anchor_pattern_query() -> GraphPatternQuery {
+    GraphPatternQuery {
+        nodes: vec![
+            NodePattern {
+                alias: "source".to_string(),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(1)],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: None,
+            },
+            NodePattern {
+                alias: "target".to_string(),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(2)],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: None,
+            },
+        ],
+        edges: vec![EdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec!["BenchEdge10".to_string()],
+            filter: Some(EdgeFilterExpr::PropertyEquals {
+                key: "role".to_string(),
+                value: PropValue::String("lead".to_string()),
+            }),
+        }],
+        at_epoch: None,
+        limit: QUERY_LIMIT,
+        order: PatternOrder::AnchorThenAliasesAsc,
+    }
+}
+
+fn bench_edge_queries(c: &mut Criterion) {
+    let mut group = c.benchmark_group("query_edge_planner");
+    group.sample_size(20);
+
+    group.bench_function("query_edge_ids_explicit_ids", |b| {
+        let (_dir, engine, _source_id, edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = EdgeQuery {
+            ids: edge_ids.iter().take(512).copied().collect(),
+            filter: Some(EdgeFilterExpr::WeightRange {
+                lower: Some(1.0),
+                upper: None,
+            }),
+            page: PageRequest {
+                limit: Some(QUERY_LIMIT),
+                after: None,
+            },
+            ..Default::default()
+        };
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_label_only", |b| {
+        let (_dir, engine, _source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = EdgeQuery {
+            label: Some("BenchEdge10".to_string()),
+            page: PageRequest {
+                limit: Some(QUERY_LIMIT),
+                after: None,
+            },
+            ..Default::default()
+        };
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_from_endpoint_label", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_query_with_filter(source_id, None);
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_endpoint_list_label", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = EdgeQuery {
+            label: Some("BenchEdge10".to_string()),
+            endpoint_ids: vec![source_id],
+            page: PageRequest {
+                limit: Some(QUERY_LIMIT),
+                after: None,
+            },
+            ..Default::default()
+        };
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_weight_range", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::WeightRange {
+                lower: Some(1.0),
+                upper: None,
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_updated_at_range", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::UpdatedAtRange {
+                lower_ms: Some(0),
+                upper_ms: None,
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_valid_at_endpoint", |b| {
+        let (_dir, engine, source_id, _edge_ids, valid_epoch) = build_edge_query_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::ValidAt {
+                epoch_ms: valid_epoch,
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_property_verifier_bounded", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::PropertyEquals {
+                key: "role".to_string(),
+                value: PropValue::String("lead".to_string()),
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_property_indexed_equality", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_indexed_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::PropertyEquals {
+                key: "role".to_string(),
+                value: PropValue::String("lead".to_string()),
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_property_indexed_range", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_indexed_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(90))),
+                upper: None,
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edges_metadata_final_page", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::WeightRange {
+                lower: Some(1.0),
+                upper: None,
+            }),
+        );
+        b.iter(|| black_box(engine.query_edges(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_pattern_edge_metadata_filter", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_pattern_filter_query(
+            source_id,
+            Some(EdgeFilterExpr::WeightRange {
+                lower: Some(1.0),
+                upper: None,
+            }),
+        );
+        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_pattern_edge_property_filter", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_pattern_filter_query(
+            source_id,
+            Some(EdgeFilterExpr::PropertyEquals {
+                key: "role".to_string(),
+                value: PropValue::String("lead".to_string()),
+            }),
+        );
+        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_pattern_edge_property_anchor_indexed", |b| {
+        let (_dir, engine, _source_id, _edge_ids, _valid_epoch) = build_edge_query_indexed_engine();
+        let query = edge_property_anchor_pattern_query();
+        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
+    });
+
+    group.finish();
+
+    let mut property_group = c.benchmark_group("edge_property_index_queries");
+    property_group.sample_size(20);
+
+    property_group.bench_function("equality_fallback_scan", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::PropertyEquals {
+                key: "role".to_string(),
+                value: PropValue::String("lead".to_string()),
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    property_group.bench_function("equality_declared", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_indexed_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::PropertyEquals {
+                key: "role".to_string(),
+                value: PropValue::String("lead".to_string()),
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    property_group.bench_function("range_fallback_scan", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(90))),
+                upper: None,
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    property_group.bench_function("range_declared", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_indexed_engine();
+        let query = edge_query_with_filter(
+            source_id,
+            Some(EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(90))),
+                upper: None,
+            }),
+        );
+        b.iter(|| black_box(engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    property_group.finish();
+}
+
 fn build_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
     let (dir, mut engine) = temp_db();
     ensure_query_indexes(&mut engine);
     let account_inputs = query_nodes("acct", 0, 1_000);
-    let account_ids = engine.batch_upsert_nodes(&account_inputs).unwrap();
+    let account_ids = engine.batch_upsert_nodes(account_inputs.clone()).unwrap();
 
     let companies: Vec<NodeInput> = (0..200)
         .map(|i| NodeInput {
-            type_id: 2,
+            labels: vec![bench_node_label(2)],
             key: format!("company-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -853,7 +1376,7 @@ fn build_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
             sparse_vector: None,
         })
         .collect();
-    let company_ids = engine.batch_upsert_nodes(&companies).unwrap();
+    let company_ids = engine.batch_upsert_nodes(companies.clone()).unwrap();
 
     let edges: Vec<EdgeInput> = account_ids
         .iter()
@@ -861,14 +1384,14 @@ fn build_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
         .map(|(i, &from)| EdgeInput {
             from,
             to: company_ids[i % company_ids.len()],
-            type_id: 10,
+            label: "BenchEdge10".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         })
         .collect();
-    engine.batch_upsert_edges(&edges).unwrap();
+    engine.batch_upsert_edges(edges.clone()).unwrap();
     engine.flush().unwrap();
     (dir, engine, company_ids[0])
 }
@@ -878,7 +1401,10 @@ fn linear_pattern_query() -> GraphPatternQuery {
         nodes: vec![
             NodePattern {
                 alias: "person".to_string(),
-                type_id: Some(1),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(1)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: Vec::new(),
                 keys: Vec::new(),
                 filter: filter_and![NodeFilterExpr::PropertyEquals {
@@ -888,7 +1414,10 @@ fn linear_pattern_query() -> GraphPatternQuery {
             },
             NodePattern {
                 alias: "company".to_string(),
-                type_id: Some(2),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(2)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: Vec::new(),
                 keys: Vec::new(),
                 filter: None,
@@ -899,8 +1428,8 @@ fn linear_pattern_query() -> GraphPatternQuery {
             from_alias: "person".to_string(),
             to_alias: "company".to_string(),
             direction: Direction::Outgoing,
-            type_filter: Some(vec![10]),
-            property_predicates: Vec::new(),
+            label_filter: vec!["BenchEdge10".to_string()],
+            filter: None,
         }],
         at_epoch: None,
         limit: QUERY_LIMIT,
@@ -921,7 +1450,10 @@ fn branching_pattern_query(company_id: u64) -> GraphPatternQuery {
     let mut query = linear_pattern_query();
     query.nodes.push(NodePattern {
         alias: "peer".to_string(),
-        type_id: Some(1),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
         ids: Vec::new(),
         keys: Vec::new(),
         filter: filter_and![NodeFilterExpr::PropertyEquals {
@@ -934,8 +1466,8 @@ fn branching_pattern_query(company_id: u64) -> GraphPatternQuery {
         from_alias: "peer".to_string(),
         to_alias: "company".to_string(),
         direction: Direction::Outgoing,
-        type_filter: Some(vec![10]),
-        property_predicates: Vec::new(),
+        label_filter: vec!["BenchEdge10".to_string()],
+        filter: None,
     });
     query.nodes[1].ids = vec![company_id];
     query
@@ -944,8 +1476,8 @@ fn branching_pattern_query(company_id: u64) -> GraphPatternQuery {
 fn build_high_fanout_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
     let (dir, engine) = temp_db();
     let source = engine
-        .batch_upsert_nodes(&[NodeInput {
-            type_id: 1,
+        .batch_upsert_nodes(vec![NodeInput {
+            labels: vec![bench_node_label(1)],
             key: "fanout-source".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -955,7 +1487,7 @@ fn build_high_fanout_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64
         .unwrap()[0];
     let targets: Vec<NodeInput> = (0..5_000)
         .map(|i| NodeInput {
-            type_id: 2,
+            labels: vec![bench_node_label(2)],
             key: format!("fanout-target-{i}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -963,20 +1495,20 @@ fn build_high_fanout_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64
             sparse_vector: None,
         })
         .collect();
-    let target_ids = engine.batch_upsert_nodes(&targets).unwrap();
+    let target_ids = engine.batch_upsert_nodes(targets.clone()).unwrap();
     let edges: Vec<EdgeInput> = target_ids
         .iter()
         .map(|&target| EdgeInput {
             from: source,
             to: target,
-            type_id: 10,
+            label: "BenchEdge10".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         })
         .collect();
-    engine.batch_upsert_edges(&edges).unwrap();
+    engine.batch_upsert_edges(edges.clone()).unwrap();
     engine.flush().unwrap();
     (dir, engine, source)
 }
@@ -984,8 +1516,8 @@ fn build_high_fanout_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64
 fn build_fanout_anchor_choice_engine() -> (tempfile::TempDir, DatabaseEngine) {
     let (dir, engine) = temp_db();
     let hub = engine
-        .batch_upsert_nodes(&[NodeInput {
-            type_id: 1,
+        .batch_upsert_nodes(vec![NodeInput {
+            labels: vec![bench_node_label(1)],
             key: "small-hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -995,7 +1527,7 @@ fn build_fanout_anchor_choice_engine() -> (tempfile::TempDir, DatabaseEngine) {
         .unwrap()[0];
     let mid_inputs: Vec<_> = (0..500)
         .map(|index| NodeInput {
-            type_id: 3,
+            labels: vec![bench_node_label(3)],
             key: format!("mid-{index:03}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1003,10 +1535,10 @@ fn build_fanout_anchor_choice_engine() -> (tempfile::TempDir, DatabaseEngine) {
             sparse_vector: None,
         })
         .collect();
-    let mids = engine.batch_upsert_nodes(&mid_inputs).unwrap();
+    let mids = engine.batch_upsert_nodes(mid_inputs.clone()).unwrap();
     let anchor_inputs: Vec<_> = (0..32)
         .map(|index| NodeInput {
-            type_id: 2,
+            labels: vec![bench_node_label(2)],
             key: format!("anchor-{index:02}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1014,13 +1546,13 @@ fn build_fanout_anchor_choice_engine() -> (tempfile::TempDir, DatabaseEngine) {
             sparse_vector: None,
         })
         .collect();
-    let anchors = engine.batch_upsert_nodes(&anchor_inputs).unwrap();
+    let anchors = engine.batch_upsert_nodes(anchor_inputs.clone()).unwrap();
     let mut edges = Vec::new();
     for &mid in &mids {
         edges.push(EdgeInput {
             from: hub,
             to: mid,
-            type_id: 10,
+            label: "BenchEdge10".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
@@ -1031,14 +1563,14 @@ fn build_fanout_anchor_choice_engine() -> (tempfile::TempDir, DatabaseEngine) {
         edges.push(EdgeInput {
             from: *mid,
             to: *anchor,
-            type_id: 20,
+            label: "BenchEdge20".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         });
     }
-    engine.batch_upsert_edges(&edges).unwrap();
+    engine.batch_upsert_edges(edges.clone()).unwrap();
     engine.flush().unwrap();
     (dir, engine)
 }
@@ -1048,21 +1580,30 @@ fn fanout_anchor_choice_query() -> GraphPatternQuery {
         nodes: vec![
             NodePattern {
                 alias: "small_hub".to_string(),
-                type_id: Some(1),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(1)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: Vec::new(),
                 keys: Vec::new(),
                 filter: None,
             },
             NodePattern {
                 alias: "larger_anchor".to_string(),
-                type_id: Some(2),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(2)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: Vec::new(),
                 keys: Vec::new(),
                 filter: None,
             },
             NodePattern {
                 alias: "middle".to_string(),
-                type_id: Some(3),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(3)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: Vec::new(),
                 keys: Vec::new(),
                 filter: None,
@@ -1074,16 +1615,16 @@ fn fanout_anchor_choice_query() -> GraphPatternQuery {
                 from_alias: "small_hub".to_string(),
                 to_alias: "middle".to_string(),
                 direction: Direction::Outgoing,
-                type_filter: Some(vec![10]),
-                property_predicates: Vec::new(),
+                label_filter: vec!["BenchEdge10".to_string()],
+                filter: None,
             },
             EdgePattern {
                 alias: Some("middle_to_anchor".to_string()),
                 from_alias: "middle".to_string(),
                 to_alias: "larger_anchor".to_string(),
                 direction: Direction::Outgoing,
-                type_filter: Some(vec![20]),
-                property_predicates: Vec::new(),
+                label_filter: vec!["BenchEdge20".to_string()],
+                filter: None,
             },
         ],
         at_epoch: None,
@@ -1095,8 +1636,8 @@ fn fanout_anchor_choice_query() -> GraphPatternQuery {
 fn build_high_hub_delay_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
     let (dir, engine) = temp_db();
     let root = engine
-        .batch_upsert_nodes(&[NodeInput {
-            type_id: 1,
+        .batch_upsert_nodes(vec![NodeInput {
+            labels: vec![bench_node_label(1)],
             key: "root".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1105,8 +1646,8 @@ fn build_high_hub_delay_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
         }])
         .unwrap()[0];
     let low = engine
-        .batch_upsert_nodes(&[NodeInput {
-            type_id: 3,
+        .batch_upsert_nodes(vec![NodeInput {
+            labels: vec![bench_node_label(3)],
             key: "low".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1116,7 +1657,7 @@ fn build_high_hub_delay_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
         .unwrap()[0];
     let target_inputs: Vec<_> = (0..512)
         .map(|index| NodeInput {
-            type_id: 2,
+            labels: vec![bench_node_label(2)],
             key: format!("hub-target-{index:03}"),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1124,11 +1665,11 @@ fn build_high_hub_delay_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
             sparse_vector: None,
         })
         .collect();
-    let targets = engine.batch_upsert_nodes(&target_inputs).unwrap();
+    let targets = engine.batch_upsert_nodes(target_inputs.clone()).unwrap();
     let mut edges = vec![EdgeInput {
         from: root,
         to: low,
-        type_id: 20,
+        label: "BenchEdge20".to_string(),
         props: BTreeMap::new(),
         weight: 1.0,
         valid_from: None,
@@ -1138,14 +1679,14 @@ fn build_high_hub_delay_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
         edges.push(EdgeInput {
             from: root,
             to: target,
-            type_id: 10,
+            label: "BenchEdge10".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         });
     }
-    engine.batch_upsert_edges(&edges).unwrap();
+    engine.batch_upsert_edges(edges.clone()).unwrap();
     engine.flush().unwrap();
     (dir, engine, root)
 }
@@ -1155,21 +1696,30 @@ fn high_hub_delay_query(root: u64) -> GraphPatternQuery {
         nodes: vec![
             NodePattern {
                 alias: "root".to_string(),
-                type_id: Some(1),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(1)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: vec![root],
                 keys: Vec::new(),
                 filter: None,
             },
             NodePattern {
                 alias: "hub_target".to_string(),
-                type_id: Some(2),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(2)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: Vec::new(),
                 keys: Vec::new(),
                 filter: None,
             },
             NodePattern {
                 alias: "low_target".to_string(),
-                type_id: Some(3),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(3)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: Vec::new(),
                 keys: Vec::new(),
                 filter: None,
@@ -1181,16 +1731,16 @@ fn high_hub_delay_query(root: u64) -> GraphPatternQuery {
                 from_alias: "root".to_string(),
                 to_alias: "hub_target".to_string(),
                 direction: Direction::Outgoing,
-                type_filter: Some(vec![10]),
-                property_predicates: Vec::new(),
+                label_filter: vec!["BenchEdge10".to_string()],
+                filter: None,
             },
             EdgePattern {
                 alias: Some("zzz_low".to_string()),
                 from_alias: "root".to_string(),
                 to_alias: "low_target".to_string(),
                 direction: Direction::Outgoing,
-                type_filter: Some(vec![20]),
-                property_predicates: Vec::new(),
+                label_filter: vec!["BenchEdge20".to_string()],
+                filter: None,
             },
         ],
         at_epoch: None,
@@ -1202,8 +1752,8 @@ fn high_hub_delay_query(root: u64) -> GraphPatternQuery {
 fn build_parallel_edge_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
     let (dir, engine) = temp_db_with_edge_uniqueness(false);
     let source = engine
-        .batch_upsert_nodes(&[NodeInput {
-            type_id: 1,
+        .batch_upsert_nodes(vec![NodeInput {
+            labels: vec![bench_node_label(1)],
             key: "parallel-source".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1212,8 +1762,8 @@ fn build_parallel_edge_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u
         }])
         .unwrap()[0];
     let target = engine
-        .batch_upsert_nodes(&[NodeInput {
-            type_id: 2,
+        .batch_upsert_nodes(vec![NodeInput {
+            labels: vec![bench_node_label(2)],
             key: "parallel-target".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1225,14 +1775,14 @@ fn build_parallel_edge_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u
         .map(|_| EdgeInput {
             from: source,
             to: target,
-            type_id: 10,
+            label: "BenchEdge10".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         })
         .collect();
-    engine.batch_upsert_edges(&edges).unwrap();
+    engine.batch_upsert_edges(edges.clone()).unwrap();
     engine.flush().unwrap();
     (dir, engine, source)
 }
@@ -1242,14 +1792,20 @@ fn unnamed_edge_constraint_query(source_id: u64) -> GraphPatternQuery {
         nodes: vec![
             NodePattern {
                 alias: "source".to_string(),
-                type_id: Some(1),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(1)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: vec![source_id],
                 keys: Vec::new(),
                 filter: None,
             },
             NodePattern {
                 alias: "target".to_string(),
-                type_id: Some(2),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(2)],
+                    mode: LabelMatchMode::All,
+                }),
                 ids: Vec::new(),
                 keys: Vec::new(),
                 filter: None,
@@ -1260,8 +1816,8 @@ fn unnamed_edge_constraint_query(source_id: u64) -> GraphPatternQuery {
             from_alias: "source".to_string(),
             to_alias: "target".to_string(),
             direction: Direction::Outgoing,
-            type_filter: Some(vec![10]),
-            property_predicates: Vec::new(),
+            label_filter: vec!["BenchEdge10".to_string()],
+            filter: None,
         }],
         at_epoch: None,
         limit: QUERY_LIMIT,
@@ -1318,5 +1874,10 @@ fn bench_pattern_queries(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_node_queries, bench_pattern_queries);
+criterion_group!(
+    benches,
+    bench_node_queries,
+    bench_pattern_queries,
+    bench_edge_queries
+);
 criterion_main!(benches);

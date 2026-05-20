@@ -1,5 +1,6 @@
 use crate::error::EngineError;
-use crate::types::ManifestState;
+use crate::segment_writer::SEGMENT_FORMAT_VERSION;
+use crate::types::{validate_label_token_name, ManifestState, LABEL_TOKEN_SCHEMA_VERSION};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -13,7 +14,7 @@ const MANIFEST_PREV: &str = "manifest.prev";
 /// 2. If manifest.current exists, rename to manifest.prev
 /// 3. Rename manifest.tmp → manifest.current
 /// 4. fsync the directory to make the rename durable
-pub fn write_manifest(db_dir: &Path, state: &ManifestState) -> Result<(), EngineError> {
+pub(crate) fn write_manifest(db_dir: &Path, state: &ManifestState) -> Result<(), EngineError> {
     let tmp_path = db_dir.join(MANIFEST_TMP);
     let current_path = db_dir.join(MANIFEST_CURRENT);
     let prev_path = db_dir.join(MANIFEST_PREV);
@@ -47,7 +48,7 @@ pub fn write_manifest(db_dir: &Path, state: &ManifestState) -> Result<(), Engine
 /// 1. manifest.current (normal path)
 /// 2. manifest.tmp (crash between rename steps; tmp has the newest state)
 /// 3. manifest.prev (fallback if current is corrupt)
-pub fn load_manifest(db_dir: &Path) -> Result<Option<ManifestState>, EngineError> {
+pub(crate) fn load_manifest(db_dir: &Path) -> Result<Option<ManifestState>, EngineError> {
     let current_path = db_dir.join(MANIFEST_CURRENT);
     let tmp_path = db_dir.join(MANIFEST_TMP);
     let prev_path = db_dir.join(MANIFEST_PREV);
@@ -82,12 +83,88 @@ fn try_load_manifest_file(path: &Path) -> Result<Option<ManifestState>, EngineEr
 
     let content = fs::read_to_string(path)?;
     match serde_json::from_str::<ManifestState>(&content) {
-        Ok(state) => Ok(Some(state)),
+        Ok(state) => {
+            validate_manifest_identity(&state)?;
+            Ok(Some(state))
+        }
         Err(e) => {
             eprintln!("warning: corrupt manifest at {}: {}", path.display(), e);
             Ok(None)
         }
     }
+}
+
+fn validate_manifest_identity(state: &ManifestState) -> Result<(), EngineError> {
+    validate_label_token_manifest(state)?;
+    for segment in &state.segments {
+        if segment.segment_format_version != SEGMENT_FORMAT_VERSION
+            || segment.segment_data_id == [0; 32]
+        {
+            return Err(EngineError::ManifestError(format!(
+                "unsupported segment manifest entry for segment {}; rebuild the database",
+                segment.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_label_token_manifest(state: &ManifestState) -> Result<(), EngineError> {
+    if state.label_token_schema_version == 0 {
+        return Err(EngineError::ManifestError(
+            "database manifest is missing label token schema; recreate the database".to_string(),
+        ));
+    }
+    if state.label_token_schema_version != LABEL_TOKEN_SCHEMA_VERSION {
+        return Err(EngineError::ManifestError(format!(
+            "unsupported label token schema version: expected {}, got {}",
+            LABEL_TOKEN_SCHEMA_VERSION, state.label_token_schema_version
+        )));
+    }
+    validate_token_namespace(
+        "node label",
+        &state.node_label_tokens,
+        state.next_node_label_id,
+    )?;
+    validate_token_namespace(
+        "edge label",
+        &state.edge_label_tokens,
+        state.next_edge_label_id,
+    )?;
+    Ok(())
+}
+
+fn validate_token_namespace(
+    namespace: &str,
+    tokens: &std::collections::BTreeMap<String, u32>,
+    next_id: u32,
+) -> Result<(), EngineError> {
+    let mut ids = std::collections::BTreeMap::new();
+    let mut max_id = 0u32;
+    for (name, &label_id) in tokens {
+        if let Err(error) = validate_label_token_name(name) {
+            return Err(EngineError::ManifestError(format!(
+                "{namespace} token name '{name}' is invalid: {error}"
+            )));
+        }
+        if label_id == 0 {
+            return Err(EngineError::ManifestError(format!(
+                "{namespace} token '{name}' uses reserved label_id 0"
+            )));
+        }
+        if let Some(existing_name) = ids.insert(label_id, name) {
+            return Err(EngineError::ManifestError(format!(
+                "{namespace} token conflict: label_id {label_id} is assigned to both '{existing_name}' and '{name}'"
+            )));
+        }
+        max_id = max_id.max(label_id);
+    }
+    if next_id <= max_id {
+        return Err(EngineError::ManifestError(format!(
+            "{namespace} next token id {next_id} must be greater than max assigned id {max_id}"
+        )));
+    }
+    Ok(())
 }
 
 /// fsync a directory to make rename operations durable.
@@ -103,8 +180,12 @@ fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Read-only manifest load. Same priority chain as `load_manifest` but never
-/// writes to disk. Safe to call on a live or crashed database without side effects.
+/// Diagnostic read-only manifest load.
+///
+/// This uses the same priority chain as `load_manifest` but never writes to
+/// disk, so diagnostic tooling can inspect a live or crashed database without
+/// side effects. The returned `ManifestState` is a raw manifest view and may
+/// include internal numeric token IDs; ordinary graph APIs use names instead.
 pub fn load_manifest_readonly(db_dir: &Path) -> Result<Option<ManifestState>, EngineError> {
     let current_path = db_dir.join(MANIFEST_CURRENT);
     let tmp_path = db_dir.join(MANIFEST_TMP);
@@ -123,9 +204,14 @@ pub fn load_manifest_readonly(db_dir: &Path) -> Result<Option<ManifestState>, En
 }
 
 /// Create a fresh default manifest state.
-pub fn default_manifest() -> ManifestState {
+pub(crate) fn default_manifest() -> ManifestState {
     ManifestState {
         version: 1,
+        label_token_schema_version: LABEL_TOKEN_SCHEMA_VERSION,
+        node_label_tokens: std::collections::BTreeMap::new(),
+        edge_label_tokens: std::collections::BTreeMap::new(),
+        next_node_label_id: 1,
+        next_edge_label_id: 1,
         segments: Vec::new(),
         next_node_id: 1,
         next_edge_id: 1,
@@ -155,6 +241,8 @@ mod tests {
                 id: 1,
                 node_count: 100,
                 edge_count: 200,
+                segment_format_version: 10,
+                segment_data_id: [1; 32],
             }],
             next_node_id: 101,
             next_edge_id: 201,
@@ -253,6 +341,11 @@ mod tests {
     fn test_default_manifest() {
         let m = default_manifest();
         assert_eq!(m.version, 1);
+        assert_eq!(m.label_token_schema_version, LABEL_TOKEN_SCHEMA_VERSION);
+        assert!(m.node_label_tokens.is_empty());
+        assert!(m.edge_label_tokens.is_empty());
+        assert_eq!(m.next_node_label_id, 1);
+        assert_eq!(m.next_edge_label_id, 1);
         assert!(m.segments.is_empty());
         assert_eq!(m.next_node_id, 1);
         assert_eq!(m.next_edge_id, 1);
@@ -267,6 +360,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let legacy_json = r#"{
   "version": 1,
+  "label_token_schema_version": 1,
+  "node_label_tokens": {},
+  "edge_label_tokens": {},
+  "next_node_label_id": 1,
+  "next_edge_label_id": 1,
   "segments": [],
   "next_node_id": 10,
   "next_edge_id": 20,
@@ -323,6 +421,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let legacy_json = r#"{
   "version": 1,
+  "label_token_schema_version": 1,
+  "node_label_tokens": {},
+  "edge_label_tokens": {},
+  "next_node_label_id": 1,
+  "next_edge_label_id": 1,
   "segments": [],
   "next_node_id": 10,
   "next_edge_id": 20,
@@ -337,5 +440,139 @@ mod tests {
         let loaded = load_manifest(dir.path()).unwrap().unwrap();
         assert!(loaded.secondary_indexes.is_empty());
         assert_eq!(loaded.next_secondary_index_id, 0);
+    }
+
+    #[test]
+    fn test_load_manifest_missing_label_token_schema_rejected() {
+        let dir = TempDir::new().unwrap();
+        let legacy_json = r#"{
+  "version": 1,
+  "segments": [],
+  "next_node_id": 10,
+  "next_edge_id": 20,
+  "prune_policies": {}
+}"#;
+        fs::write(dir.path().join(MANIFEST_CURRENT), legacy_json).unwrap();
+
+        let err = load_manifest(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("missing label token schema"));
+    }
+
+    #[test]
+    fn test_load_manifest_rejects_label_token_reverse_conflict() {
+        let dir = TempDir::new().unwrap();
+        let mut state = default_manifest();
+        state.node_label_tokens.insert("Person".to_string(), 1);
+        state.node_label_tokens.insert("Company".to_string(), 1);
+        state.next_node_label_id = 2;
+        write_manifest(dir.path(), &state).unwrap();
+
+        let current_path = dir.path().join(MANIFEST_CURRENT);
+        let err = try_load_manifest_file(&current_path).unwrap_err();
+        assert!(err.to_string().contains("token conflict"));
+    }
+
+    #[test]
+    fn test_load_manifest_rejects_label_token_next_id_not_above_max() {
+        let dir = TempDir::new().unwrap();
+        let mut state = default_manifest();
+        state.edge_label_tokens.insert("KNOWS".to_string(), 3);
+        state.next_edge_label_id = 3;
+        write_manifest(dir.path(), &state).unwrap();
+
+        let current_path = dir.path().join(MANIFEST_CURRENT);
+        let err = try_load_manifest_file(&current_path).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must be greater than max assigned"));
+    }
+
+    #[test]
+    fn test_load_manifest_rejects_invalid_label_token_names() {
+        let dir = TempDir::new().unwrap();
+        let mut state = default_manifest();
+        state.node_label_tokens.insert(" Person".to_string(), 1);
+        state.next_node_label_id = 2;
+        write_manifest(dir.path(), &state).unwrap();
+
+        let current_path = dir.path().join(MANIFEST_CURRENT);
+        let err = try_load_manifest_file(&current_path).unwrap_err();
+        assert!(err.to_string().contains("token name"));
+        assert!(err.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn test_manifest_round_trip_node_and_edge_secondary_indexes() {
+        let dir = TempDir::new().unwrap();
+        let state = ManifestState {
+            next_secondary_index_id: 4,
+            secondary_indexes: vec![
+                crate::types::SecondaryIndexManifestEntry {
+                    index_id: 0,
+                    target: crate::types::SecondaryIndexTarget::NodeProperty {
+                        label_id: 1,
+                        prop_key: "color".to_string(),
+                    },
+                    kind: crate::types::SecondaryIndexKind::Equality,
+                    state: crate::types::SecondaryIndexState::Building,
+                    last_error: None,
+                },
+                crate::types::SecondaryIndexManifestEntry {
+                    index_id: 1,
+                    target: crate::types::SecondaryIndexTarget::EdgeProperty {
+                        label_id: 2,
+                        prop_key: "weight".to_string(),
+                    },
+                    kind: crate::types::SecondaryIndexKind::Range {
+                        domain: crate::types::SecondaryIndexRangeDomain::Float,
+                    },
+                    state: crate::types::SecondaryIndexState::Building,
+                    last_error: None,
+                },
+                crate::types::SecondaryIndexManifestEntry {
+                    index_id: 2,
+                    target: crate::types::SecondaryIndexTarget::EdgeProperty {
+                        label_id: 1,
+                        prop_key: "label".to_string(),
+                    },
+                    kind: crate::types::SecondaryIndexKind::Equality,
+                    state: crate::types::SecondaryIndexState::Ready,
+                    last_error: None,
+                },
+            ],
+            ..default_manifest()
+        };
+        write_manifest(dir.path(), &state).unwrap();
+
+        let raw_manifest = fs::read_to_string(dir.path().join(MANIFEST_CURRENT)).unwrap();
+        assert!(raw_manifest.contains("\"label_id\""));
+        assert!(!raw_manifest.contains(concat!("\"", "type", "_id\"")));
+
+        let loaded = load_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.secondary_indexes.len(), 3);
+        assert_eq!(loaded.next_secondary_index_id, 4);
+        assert!(matches!(
+            &loaded.secondary_indexes[0].target,
+            crate::types::SecondaryIndexTarget::NodeProperty { label_id: 1, .. }
+        ));
+        assert!(matches!(
+            &loaded.secondary_indexes[1].target,
+            crate::types::SecondaryIndexTarget::EdgeProperty { label_id: 2, .. }
+        ));
+        assert_eq!(loaded.secondary_indexes[1].index_id, 1);
+        assert!(matches!(
+            loaded.secondary_indexes[1].kind,
+            crate::types::SecondaryIndexKind::Range {
+                domain: crate::types::SecondaryIndexRangeDomain::Float
+            }
+        ));
+        assert!(matches!(
+            &loaded.secondary_indexes[2].target,
+            crate::types::SecondaryIndexTarget::EdgeProperty { label_id: 1, .. }
+        ));
+        assert_eq!(
+            loaded.secondary_indexes[2].state,
+            crate::types::SecondaryIndexState::Ready
+        );
     }
 }

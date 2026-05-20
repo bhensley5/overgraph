@@ -8,34 +8,38 @@ from typing import Any, Callable
 from .overgraph import (
     OverGraph,
     IdArray,
-    PyAdjacencyExport,
-    PyCompactionProgress,
-    PyCompactionStats,
-    PyDbStats,
-    PyEdgePageResult,
-    PyEdgeRecord,
-    PyIdPageResult,
-    PyNamedPrunePolicy,
-    PyNeighborEntry,
-    PyNeighborPageResult,
-    PyNodePropertyIndexInfo,
-    PyNodePageResult,
-    PyNodeRecord,
-    PyPatchResult,
-    PyPprResult,
-    PyPropertyRangeBound,
-    PyPropertyRangeCursor,
-    PyPropertyRangePageResult,
-    PyPruneResult,
-    PySegmentInfo,
-    PyShortestPath,
-    PySubgraph,
-    PyTraversalCursor,
-    PyTraversalHit,
-    PyTraversalPageResult,
-    PyTxnCommitResult,
-    PyVectorHit,
-    PyWriteTxn,
+    AdjacencyExport,
+    CompactionProgress,
+    CompactionStats,
+    DbStats,
+    EdgePageResult,
+    EdgePropertyIndexInfo,
+    EdgeView,
+    EdgeLabelInfo,
+    IdPageResult,
+    NamedPrunePolicy,
+    NeighborEntry,
+    NeighborPageResult,
+    NodeLabelInfo,
+    NodePropertyIndexInfo,
+    NodePageResult,
+    NodeView,
+    PatchResult,
+    PprResult,
+    PropertyRangeBound,
+    PropertyRangeCursor,
+    PropertyRangePageResult,
+    PruneResult,
+    ScrubReport,
+    SegmentInfo,
+    ShortestPath,
+    Subgraph,
+    TraversalCursor,
+    TraversalHit,
+    TraversalPageResult,
+    TxnCommitResult,
+    VectorHit,
+    WriteTxn,
 )
 
 
@@ -48,7 +52,7 @@ class AsyncWriteTxn:
 
     __slots__ = ("_txn", "_lock")
 
-    def __init__(self, txn: PyWriteTxn) -> None:
+    def __init__(self, txn: WriteTxn) -> None:
         self._txn = txn
         self._lock = asyncio.Lock()
 
@@ -57,7 +61,7 @@ class AsyncWriteTxn:
 
     async def upsert_node(
         self,
-        type_id: int,
+        labels: str | list[str] | tuple[str, ...],
         key: str,
         *,
         props: dict[str, Any] | None = None,
@@ -68,7 +72,7 @@ class AsyncWriteTxn:
         async with self._lock:
             return await asyncio.to_thread(
                 self._txn.upsert_node,
-                type_id,
+                labels,
                 key,
                 props=props,
                 weight=weight,
@@ -79,7 +83,7 @@ class AsyncWriteTxn:
     async def upsert_node_as(
         self,
         alias: str,
-        type_id: int,
+        labels: str | list[str] | tuple[str, ...],
         key: str,
         *,
         props: dict[str, Any] | None = None,
@@ -91,7 +95,7 @@ class AsyncWriteTxn:
             return await asyncio.to_thread(
                 self._txn.upsert_node_as,
                 alias,
-                type_id,
+                labels,
                 key,
                 props=props,
                 weight=weight,
@@ -99,11 +103,19 @@ class AsyncWriteTxn:
                 sparse_vector=sparse_vector,
             )
 
+    async def add_node_label(self, target: dict[str, Any], label: str) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(self._txn.add_node_label, target, label)
+
+    async def remove_node_label(self, target: dict[str, Any], label: str) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(self._txn.remove_node_label, target, label)
+
     async def upsert_edge(
         self,
         from_ref: dict[str, Any],
         to_ref: dict[str, Any],
-        type_id: int,
+        label: str,
         *,
         props: dict[str, Any] | None = None,
         weight: float = 1.0,
@@ -115,7 +127,7 @@ class AsyncWriteTxn:
                 self._txn.upsert_edge,
                 from_ref,
                 to_ref,
-                type_id,
+                label,
                 props=props,
                 weight=weight,
                 valid_from=valid_from,
@@ -127,7 +139,7 @@ class AsyncWriteTxn:
         alias: str,
         from_ref: dict[str, Any],
         to_ref: dict[str, Any],
-        type_id: int,
+        label: str,
         *,
         props: dict[str, Any] | None = None,
         weight: float = 1.0,
@@ -140,7 +152,7 @@ class AsyncWriteTxn:
                 alias,
                 from_ref,
                 to_ref,
-                type_id,
+                label,
                 props=props,
                 weight=weight,
                 valid_from=valid_from,
@@ -171,22 +183,22 @@ class AsyncWriteTxn:
         async with self._lock:
             return await asyncio.to_thread(self._txn.get_edge, target)
 
-    async def get_node_by_key(self, type_id: int, key: str) -> dict[str, Any] | None:
+    async def get_node_by_key(self, label: str, key: str) -> dict[str, Any] | None:
         async with self._lock:
-            return await asyncio.to_thread(self._txn.get_node_by_key, type_id, key)
+            return await asyncio.to_thread(self._txn.get_node_by_key, label, key)
 
     async def get_edge_by_triple(
         self,
         from_ref: dict[str, Any],
         to_ref: dict[str, Any],
-        type_id: int,
+        label: str,
     ) -> dict[str, Any] | None:
         async with self._lock:
             return await asyncio.to_thread(
-                self._txn.get_edge_by_triple, from_ref, to_ref, type_id
+                self._txn.get_edge_by_triple, from_ref, to_ref, label
             )
 
-    async def commit(self) -> PyTxnCommitResult:
+    async def commit(self) -> TxnCommitResult:
         async with self._lock:
             return await asyncio.to_thread(self._txn.commit)
 
@@ -225,14 +237,43 @@ class AsyncOverGraph:
     ) -> None:
         await self.close()
 
-    async def stats(self) -> PyDbStats:
+    async def stats(self) -> DbStats:
         return await asyncio.to_thread(self._db.stats)
+
+    async def scrub(self) -> "ScrubReport":
+        return await asyncio.to_thread(self._db.scrub)
+
+    # --- Catalog ---
+
+    async def ensure_node_label(self, label: str) -> int:
+        return await asyncio.to_thread(self._db.ensure_node_label, label)
+
+    async def ensure_edge_label(self, label: str) -> int:
+        return await asyncio.to_thread(self._db.ensure_edge_label, label)
+
+    async def get_node_label_id(self, label: str) -> int | None:
+        return await asyncio.to_thread(self._db.get_node_label_id, label)
+
+    async def get_edge_label_id(self, label: str) -> int | None:
+        return await asyncio.to_thread(self._db.get_edge_label_id, label)
+
+    async def get_node_label(self, label_id: int) -> str | None:
+        return await asyncio.to_thread(self._db.get_node_label, label_id)
+
+    async def get_edge_label(self, label_id: int) -> str | None:
+        return await asyncio.to_thread(self._db.get_edge_label, label_id)
+
+    async def list_node_labels(self) -> list[NodeLabelInfo]:
+        return await asyncio.to_thread(self._db.list_node_labels)
+
+    async def list_edge_labels(self) -> list[EdgeLabelInfo]:
+        return await asyncio.to_thread(self._db.list_edge_labels)
 
     # --- Single CRUD ---
 
     async def upsert_node(
         self,
-        type_id: int,
+        labels: str | list[str] | tuple[str, ...],
         key: str,
         *,
         props: dict[str, Any] | None = None,
@@ -241,16 +282,22 @@ class AsyncOverGraph:
         sparse_vector: list[tuple[int, float]] | None = None,
     ) -> int:
         return await asyncio.to_thread(
-            self._db.upsert_node, type_id, key,
+            self._db.upsert_node, labels, key,
             props=props, weight=weight,
             dense_vector=dense_vector, sparse_vector=sparse_vector,
         )
+
+    async def add_node_label(self, node_id: int, label: str) -> bool:
+        return await asyncio.to_thread(self._db.add_node_label, node_id, label)
+
+    async def remove_node_label(self, node_id: int, label: str) -> bool:
+        return await asyncio.to_thread(self._db.remove_node_label, node_id, label)
 
     async def upsert_edge(
         self,
         from_id: int,
         to_id: int,
-        type_id: int,
+        label: str,
         *,
         props: dict[str, Any] | None = None,
         weight: float = 1.0,
@@ -258,21 +305,21 @@ class AsyncOverGraph:
         valid_to: int | None = None,
     ) -> int:
         return await asyncio.to_thread(
-            self._db.upsert_edge, from_id, to_id, type_id,
+            self._db.upsert_edge, from_id, to_id, label,
             props=props, weight=weight, valid_from=valid_from, valid_to=valid_to,
         )
 
-    async def get_node(self, node_id: int) -> PyNodeRecord | None:
+    async def get_node(self, node_id: int) -> NodeView | None:
         return await asyncio.to_thread(self._db.get_node, node_id)
 
-    async def get_edge(self, edge_id: int) -> PyEdgeRecord | None:
+    async def get_edge(self, edge_id: int) -> EdgeView | None:
         return await asyncio.to_thread(self._db.get_edge, edge_id)
 
-    async def get_node_by_key(self, type_id: int, key: str) -> PyNodeRecord | None:
-        return await asyncio.to_thread(self._db.get_node_by_key, type_id, key)
+    async def get_node_by_key(self, label: str, key: str) -> NodeView | None:
+        return await asyncio.to_thread(self._db.get_node_by_key, label, key)
 
-    async def get_edge_by_triple(self, from_id: int, to_id: int, type_id: int) -> PyEdgeRecord | None:
-        return await asyncio.to_thread(self._db.get_edge_by_triple, from_id, to_id, type_id)
+    async def get_edge_by_triple(self, from_id: int, to_id: int, label: str) -> EdgeView | None:
+        return await asyncio.to_thread(self._db.get_edge_by_triple, from_id, to_id, label)
 
     async def delete_node(self, node_id: int) -> None:
         await asyncio.to_thread(self._db.delete_node, node_id)
@@ -280,7 +327,7 @@ class AsyncOverGraph:
     async def delete_edge(self, edge_id: int) -> None:
         await asyncio.to_thread(self._db.delete_edge, edge_id)
 
-    async def invalidate_edge(self, edge_id: int, valid_to: int) -> PyEdgeRecord | None:
+    async def invalidate_edge(self, edge_id: int, valid_to: int) -> EdgeView | None:
         return await asyncio.to_thread(self._db.invalidate_edge, edge_id, valid_to)
 
     # --- Batch ---
@@ -291,16 +338,16 @@ class AsyncOverGraph:
     async def batch_upsert_edges(self, edges: list[dict[str, Any]]) -> list[int]:
         return await asyncio.to_thread(self._db.batch_upsert_edges, edges)
 
-    async def get_nodes(self, node_ids: list[int]) -> list[PyNodeRecord | None]:
+    async def get_nodes(self, node_ids: list[int]) -> list[NodeView | None]:
         return await asyncio.to_thread(self._db.get_nodes, node_ids)
 
-    async def get_nodes_by_keys(self, keys: list[tuple[int, str]]) -> list[PyNodeRecord | None]:
+    async def get_nodes_by_keys(self, keys: list[dict[str, Any]]) -> list[NodeView | None]:
         return await asyncio.to_thread(self._db.get_nodes_by_keys, keys)
 
-    async def get_edges(self, edge_ids: list[int]) -> list[PyEdgeRecord | None]:
+    async def get_edges(self, edge_ids: list[int]) -> list[EdgeView | None]:
         return await asyncio.to_thread(self._db.get_edges, edge_ids)
 
-    async def graph_patch(self, patch: dict[str, Any]) -> PyPatchResult:
+    async def graph_patch(self, patch: dict[str, Any]) -> PatchResult:
         return await asyncio.to_thread(self._db.graph_patch, patch)
 
     async def begin_write_txn(self) -> AsyncWriteTxn:
@@ -309,14 +356,20 @@ class AsyncOverGraph:
 
     # --- Queries ---
 
-    async def find_nodes(self, type_id: int, prop_key: str, prop_value: Any) -> IdArray:
-        return await asyncio.to_thread(self._db.find_nodes, type_id, prop_key, prop_value)
+    async def find_nodes(self, label: str, prop_key: str, prop_value: Any) -> IdArray:
+        return await asyncio.to_thread(self._db.find_nodes, label, prop_key, prop_value)
 
-    async def query_node_ids(self, request: Any) -> PyIdPageResult:
+    async def query_node_ids(self, request: Any) -> IdPageResult:
         return await asyncio.to_thread(self._db.query_node_ids, request)
 
-    async def query_nodes(self, request: Any) -> PyNodePageResult:
+    async def query_nodes(self, request: Any) -> NodePageResult:
         return await asyncio.to_thread(self._db.query_nodes, request)
+
+    async def query_edge_ids(self, request: Any) -> IdPageResult:
+        return await asyncio.to_thread(self._db.query_edge_ids, request)
+
+    async def query_edges(self, request: Any) -> EdgePageResult:
+        return await asyncio.to_thread(self._db.query_edges, request)
 
     async def query_pattern(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.query_pattern, request)
@@ -324,20 +377,23 @@ class AsyncOverGraph:
     async def explain_node_query(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.explain_node_query, request)
 
+    async def explain_edge_query(self, request: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.explain_edge_query, request)
+
     async def explain_pattern_query(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.explain_pattern_query, request)
 
     async def ensure_node_property_index(
         self,
-        type_id: int,
+        label: str,
         prop_key: str,
         kind: str,
         *,
         domain: str | None = None,
-    ) -> PyNodePropertyIndexInfo:
+    ) -> NodePropertyIndexInfo:
         return await asyncio.to_thread(
             self._db.ensure_node_property_index,
-            type_id,
+            label,
             prop_key,
             kind,
             domain=domain,
@@ -345,7 +401,7 @@ class AsyncOverGraph:
 
     async def drop_node_property_index(
         self,
-        type_id: int,
+        label: str,
         prop_key: str,
         kind: str,
         *,
@@ -353,49 +409,84 @@ class AsyncOverGraph:
     ) -> bool:
         return await asyncio.to_thread(
             self._db.drop_node_property_index,
-            type_id,
+            label,
             prop_key,
             kind,
             domain=domain,
         )
 
-    async def list_node_property_indexes(self) -> list[PyNodePropertyIndexInfo]:
+    async def list_node_property_indexes(self) -> list[NodePropertyIndexInfo]:
         return await asyncio.to_thread(self._db.list_node_property_indexes)
 
-    async def nodes_by_type(self, type_id: int) -> IdArray:
-        return await asyncio.to_thread(self._db.nodes_by_type, type_id)
+    async def ensure_edge_property_index(
+        self,
+        label: str,
+        prop_key: str,
+        kind: str,
+        *,
+        domain: str | None = None,
+    ) -> EdgePropertyIndexInfo:
+        return await asyncio.to_thread(
+            self._db.ensure_edge_property_index,
+            label,
+            prop_key,
+            kind,
+            domain=domain,
+        )
 
-    async def edges_by_type(self, type_id: int) -> IdArray:
-        return await asyncio.to_thread(self._db.edges_by_type, type_id)
+    async def drop_edge_property_index(
+        self,
+        label: str,
+        prop_key: str,
+        kind: str,
+        *,
+        domain: str | None = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._db.drop_edge_property_index,
+            label,
+            prop_key,
+            kind,
+            domain=domain,
+        )
 
-    async def get_nodes_by_type(self, type_id: int) -> list[PyNodeRecord]:
-        return await asyncio.to_thread(self._db.get_nodes_by_type, type_id)
+    async def list_edge_property_indexes(self) -> list[EdgePropertyIndexInfo]:
+        return await asyncio.to_thread(self._db.list_edge_property_indexes)
 
-    async def get_edges_by_type(self, type_id: int) -> list[PyEdgeRecord]:
-        return await asyncio.to_thread(self._db.get_edges_by_type, type_id)
+    async def nodes_by_labels(self, labels: str | list[str] | tuple[str, ...]) -> IdArray:
+        return await asyncio.to_thread(self._db.nodes_by_labels, labels)
 
-    async def count_nodes_by_type(self, type_id: int) -> int:
-        return await asyncio.to_thread(self._db.count_nodes_by_type, type_id)
+    async def edges_by_label(self, label: str) -> IdArray:
+        return await asyncio.to_thread(self._db.edges_by_label, label)
 
-    async def count_edges_by_type(self, type_id: int) -> int:
-        return await asyncio.to_thread(self._db.count_edges_by_type, type_id)
+    async def get_nodes_by_labels(self, labels: str | list[str] | tuple[str, ...]) -> list[NodeView]:
+        return await asyncio.to_thread(self._db.get_nodes_by_labels, labels)
+
+    async def get_edges_by_label(self, label: str) -> list[EdgeView]:
+        return await asyncio.to_thread(self._db.get_edges_by_label, label)
+
+    async def count_nodes_by_labels(self, labels: str | list[str] | tuple[str, ...]) -> int:
+        return await asyncio.to_thread(self._db.count_nodes_by_labels, labels)
+
+    async def count_edges_by_label(self, label: str) -> int:
+        return await asyncio.to_thread(self._db.count_edges_by_label, label)
 
     async def find_nodes_by_time_range(
-        self, type_id: int, from_ms: int, to_ms: int
+        self, label: str, from_ms: int, to_ms: int
     ) -> IdArray:
         return await asyncio.to_thread(
-            self._db.find_nodes_by_time_range, type_id, from_ms, to_ms
+            self._db.find_nodes_by_time_range, label, from_ms, to_ms
         )
 
     async def find_nodes_range(
         self,
-        type_id: int,
+        label: str,
         prop_key: str,
-        lower: PyPropertyRangeBound | None = None,
-        upper: PyPropertyRangeBound | None = None,
+        lower: PropertyRangeBound | None = None,
+        upper: PropertyRangeBound | None = None,
     ) -> IdArray:
         return await asyncio.to_thread(
-            self._db.find_nodes_range, type_id, prop_key, lower, upper
+            self._db.find_nodes_range, label, prop_key, lower, upper
         )
 
     # --- Traversal ---
@@ -405,14 +496,14 @@ class AsyncOverGraph:
         node_id: int,
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         limit: int | None = None,
         at_epoch: int | None = None,
         decay_lambda: float | None = None,
-    ) -> list[PyNeighborEntry]:
+    ) -> list[NeighborEntry]:
         return await asyncio.to_thread(
             self._db.neighbors, node_id,
-            direction=direction, type_filter=type_filter, limit=limit,
+            direction=direction, edge_label_filter=edge_label_filter, limit=limit,
             at_epoch=at_epoch, decay_lambda=decay_lambda,
         )
 
@@ -423,21 +514,21 @@ class AsyncOverGraph:
         *,
         min_depth: int = 1,
         direction: str = "outgoing",
-        edge_type_filter: list[int] | None = None,
-        node_type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
+        emit_node_label_filter: dict[str, Any] | None = None,
         at_epoch: int | None = None,
         decay_lambda: float | None = None,
         limit: int | None = None,
-        cursor: PyTraversalCursor | None = None,
-    ) -> PyTraversalPageResult:
+        cursor: TraversalCursor | None = None,
+    ) -> TraversalPageResult:
         return await asyncio.to_thread(
             self._db.traverse,
             start,
             max_depth,
             min_depth=min_depth,
             direction=direction,
-            edge_type_filter=edge_type_filter,
-            node_type_filter=node_type_filter,
+            edge_label_filter=edge_label_filter,
+            emit_node_label_filter=emit_node_label_filter,
             at_epoch=at_epoch,
             decay_lambda=decay_lambda,
             limit=limit,
@@ -449,13 +540,13 @@ class AsyncOverGraph:
         node_ids: list[int],
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         at_epoch: int | None = None,
         decay_lambda: float | None = None,
-    ) -> dict[int, list[PyNeighborEntry]]:
+    ) -> dict[int, list[NeighborEntry]]:
         return await asyncio.to_thread(
             self._db.neighbors_batch, node_ids,
-            direction=direction, type_filter=type_filter,
+            direction=direction, edge_label_filter=edge_label_filter,
             at_epoch=at_epoch, decay_lambda=decay_lambda,
         )
 
@@ -464,12 +555,12 @@ class AsyncOverGraph:
         node_id: int,
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         at_epoch: int | None = None,
     ) -> int:
         return await asyncio.to_thread(
             self._db.degree, node_id,
-            direction=direction, type_filter=type_filter, at_epoch=at_epoch,
+            direction=direction, edge_label_filter=edge_label_filter, at_epoch=at_epoch,
         )
 
     async def sum_edge_weights(
@@ -477,12 +568,12 @@ class AsyncOverGraph:
         node_id: int,
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         at_epoch: int | None = None,
     ) -> float:
         return await asyncio.to_thread(
             self._db.sum_edge_weights, node_id,
-            direction=direction, type_filter=type_filter, at_epoch=at_epoch,
+            direction=direction, edge_label_filter=edge_label_filter, at_epoch=at_epoch,
         )
 
     async def avg_edge_weight(
@@ -490,12 +581,12 @@ class AsyncOverGraph:
         node_id: int,
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         at_epoch: int | None = None,
     ) -> float | None:
         return await asyncio.to_thread(
             self._db.avg_edge_weight, node_id,
-            direction=direction, type_filter=type_filter, at_epoch=at_epoch,
+            direction=direction, edge_label_filter=edge_label_filter, at_epoch=at_epoch,
         )
 
     async def degrees(
@@ -503,12 +594,12 @@ class AsyncOverGraph:
         node_ids: list[int],
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         at_epoch: int | None = None,
     ) -> dict[int, int]:
         return await asyncio.to_thread(
             self._db.degrees, node_ids,
-            direction=direction, type_filter=type_filter, at_epoch=at_epoch,
+            direction=direction, edge_label_filter=edge_label_filter, at_epoch=at_epoch,
         )
 
     async def shortest_path(
@@ -517,15 +608,15 @@ class AsyncOverGraph:
         to_id: int,
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         weight_field: str | None = None,
         at_epoch: int | None = None,
         max_depth: int | None = None,
         max_cost: float | None = None,
-    ) -> PyShortestPath | None:
+    ) -> ShortestPath | None:
         return await asyncio.to_thread(
             self._db.shortest_path, from_id, to_id,
-            direction=direction, type_filter=type_filter, weight_field=weight_field,
+            direction=direction, edge_label_filter=edge_label_filter, weight_field=weight_field,
             at_epoch=at_epoch, max_depth=max_depth, max_cost=max_cost,
         )
 
@@ -535,13 +626,13 @@ class AsyncOverGraph:
         to_id: int,
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         at_epoch: int | None = None,
         max_depth: int | None = None,
     ) -> bool:
         return await asyncio.to_thread(
             self._db.is_connected, from_id, to_id,
-            direction=direction, type_filter=type_filter,
+            direction=direction, edge_label_filter=edge_label_filter,
             at_epoch=at_epoch, max_depth=max_depth,
         )
 
@@ -551,16 +642,16 @@ class AsyncOverGraph:
         to_id: int,
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         weight_field: str | None = None,
         at_epoch: int | None = None,
         max_depth: int | None = None,
         max_cost: float | None = None,
         max_paths: int | None = None,
-    ) -> list[PyShortestPath]:
+    ) -> list[ShortestPath]:
         return await asyncio.to_thread(
             self._db.all_shortest_paths, from_id, to_id,
-            direction=direction, type_filter=type_filter, weight_field=weight_field,
+            direction=direction, edge_label_filter=edge_label_filter, weight_field=weight_field,
             at_epoch=at_epoch, max_depth=max_depth, max_cost=max_cost, max_paths=max_paths,
         )
 
@@ -576,14 +667,14 @@ class AsyncOverGraph:
         k: int,
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         scoring: str = "weight",
         at_epoch: int | None = None,
         decay_lambda: float | None = None,
-    ) -> list[PyNeighborEntry]:
+    ) -> list[NeighborEntry]:
         return await asyncio.to_thread(
             self._db.top_k_neighbors, node_id, k,
-            direction=direction, type_filter=type_filter, scoring=scoring,
+            direction=direction, edge_label_filter=edge_label_filter, scoring=scoring,
             at_epoch=at_epoch, decay_lambda=decay_lambda,
         )
 
@@ -593,13 +684,15 @@ class AsyncOverGraph:
         max_depth: int,
         *,
         direction: str = "outgoing",
-        edge_type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
+        node_label_filter: dict[str, Any] | None = None,
         at_epoch: int | None = None,
-    ) -> PySubgraph:
+    ) -> Subgraph:
         return await asyncio.to_thread(
             self._db.extract_subgraph,
             start_node_id, max_depth,
-            direction=direction, edge_type_filter=edge_type_filter, at_epoch=at_epoch,
+            direction=direction, edge_label_filter=edge_label_filter,
+            node_label_filter=node_label_filter, at_epoch=at_epoch,
         )
 
     # --- Retention ---
@@ -609,11 +702,11 @@ class AsyncOverGraph:
         *,
         max_age_ms: int | None = None,
         max_weight: float | None = None,
-        type_id: int | None = None,
-    ) -> PyPruneResult:
+        label: str | None = None,
+    ) -> PruneResult:
         return await asyncio.to_thread(
             self._db.prune,
-            max_age_ms=max_age_ms, max_weight=max_weight, type_id=type_id,
+            max_age_ms=max_age_ms, max_weight=max_weight, label=label,
         )
 
     async def set_prune_policy(
@@ -622,17 +715,17 @@ class AsyncOverGraph:
         *,
         max_age_ms: int | None = None,
         max_weight: float | None = None,
-        type_id: int | None = None,
+        label: str | None = None,
     ) -> None:
         await asyncio.to_thread(
             self._db.set_prune_policy, name,
-            max_age_ms=max_age_ms, max_weight=max_weight, type_id=type_id,
+            max_age_ms=max_age_ms, max_weight=max_weight, label=label,
         )
 
     async def remove_prune_policy(self, name: str) -> bool:
         return await asyncio.to_thread(self._db.remove_prune_policy, name)
 
-    async def list_prune_policies(self) -> list[PyNamedPrunePolicy]:
+    async def list_prune_policies(self) -> list[NamedPrunePolicy]:
         return await asyncio.to_thread(self._db.list_prune_policies)
 
     # --- Maintenance ---
@@ -640,94 +733,102 @@ class AsyncOverGraph:
     async def sync(self) -> None:
         await asyncio.to_thread(self._db.sync)
 
-    async def flush(self) -> PySegmentInfo | None:
+    async def flush(self) -> SegmentInfo | None:
         return await asyncio.to_thread(self._db.flush)
 
     async def ingest_mode(self) -> None:
         return await asyncio.to_thread(self._db.ingest_mode)
 
-    async def end_ingest(self) -> PyCompactionStats | None:
+    async def end_ingest(self) -> CompactionStats | None:
         return await asyncio.to_thread(self._db.end_ingest)
 
-    async def compact(self) -> PyCompactionStats | None:
+    async def compact(self) -> CompactionStats | None:
         return await asyncio.to_thread(self._db.compact)
 
     async def compact_with_progress(
-        self, callback: Callable[[PyCompactionProgress], bool]
-    ) -> PyCompactionStats | None:
+        self, callback: Callable[[CompactionProgress], bool]
+    ) -> CompactionStats | None:
         return await asyncio.to_thread(self._db.compact_with_progress, callback)
 
     # --- Pagination ---
 
-    async def nodes_by_type_paged(
-        self, type_id: int, *, limit: int | None = None, after: int | None = None
-    ) -> PyIdPageResult:
+    async def nodes_by_labels_paged(
+        self,
+        labels: str | list[str] | tuple[str, ...],
+        *,
+        limit: int | None = None,
+        after: int | None = None,
+    ) -> IdPageResult:
         return await asyncio.to_thread(
-            self._db.nodes_by_type_paged, type_id, limit=limit, after=after,
+            self._db.nodes_by_labels_paged, labels, limit=limit, after=after,
         )
 
-    async def edges_by_type_paged(
-        self, type_id: int, *, limit: int | None = None, after: int | None = None
-    ) -> PyIdPageResult:
+    async def edges_by_label_paged(
+        self, label: str, *, limit: int | None = None, after: int | None = None
+    ) -> IdPageResult:
         return await asyncio.to_thread(
-            self._db.edges_by_type_paged, type_id, limit=limit, after=after,
+            self._db.edges_by_label_paged, label, limit=limit, after=after,
         )
 
-    async def get_nodes_by_type_paged(
-        self, type_id: int, *, limit: int | None = None, after: int | None = None
-    ) -> PyNodePageResult:
+    async def get_nodes_by_labels_paged(
+        self,
+        labels: str | list[str] | tuple[str, ...],
+        *,
+        limit: int | None = None,
+        after: int | None = None,
+    ) -> NodePageResult:
         return await asyncio.to_thread(
-            self._db.get_nodes_by_type_paged, type_id, limit=limit, after=after,
+            self._db.get_nodes_by_labels_paged, labels, limit=limit, after=after,
         )
 
-    async def get_edges_by_type_paged(
-        self, type_id: int, *, limit: int | None = None, after: int | None = None
-    ) -> PyEdgePageResult:
+    async def get_edges_by_label_paged(
+        self, label: str, *, limit: int | None = None, after: int | None = None
+    ) -> EdgePageResult:
         return await asyncio.to_thread(
-            self._db.get_edges_by_type_paged, type_id, limit=limit, after=after,
+            self._db.get_edges_by_label_paged, label, limit=limit, after=after,
         )
 
     async def find_nodes_paged(
         self,
-        type_id: int,
+        label: str,
         prop_key: str,
         prop_value: Any,
         *,
         limit: int | None = None,
         after: int | None = None,
-    ) -> PyIdPageResult:
+    ) -> IdPageResult:
         return await asyncio.to_thread(
-            self._db.find_nodes_paged, type_id, prop_key, prop_value,
+            self._db.find_nodes_paged, label, prop_key, prop_value,
             limit=limit, after=after,
         )
 
     async def find_nodes_by_time_range_paged(
         self,
-        type_id: int,
+        label: str,
         from_ms: int,
         to_ms: int,
         *,
         limit: int | None = None,
         after: int | None = None,
-    ) -> PyIdPageResult:
+    ) -> IdPageResult:
         return await asyncio.to_thread(
-            self._db.find_nodes_by_time_range_paged, type_id, from_ms, to_ms,
+            self._db.find_nodes_by_time_range_paged, label, from_ms, to_ms,
             limit=limit, after=after,
         )
 
     async def find_nodes_range_paged(
         self,
-        type_id: int,
+        label: str,
         prop_key: str,
-        lower: PyPropertyRangeBound | None = None,
-        upper: PyPropertyRangeBound | None = None,
+        lower: PropertyRangeBound | None = None,
+        upper: PropertyRangeBound | None = None,
         *,
         limit: int | None = None,
-        after: PyPropertyRangeCursor | None = None,
-    ) -> PyPropertyRangePageResult:
+        after: PropertyRangeCursor | None = None,
+    ) -> PropertyRangePageResult:
         return await asyncio.to_thread(
             self._db.find_nodes_range_paged,
-            type_id,
+            label,
             prop_key,
             lower,
             upper,
@@ -740,15 +841,15 @@ class AsyncOverGraph:
         node_id: int,
         *,
         direction: str = "outgoing",
-        type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         limit: int | None = None,
         after: int | None = None,
         at_epoch: int | None = None,
         decay_lambda: float | None = None,
-    ) -> PyNeighborPageResult:
+    ) -> NeighborPageResult:
         return await asyncio.to_thread(
             self._db.neighbors_paged, node_id,
-            direction=direction, type_filter=type_filter, limit=limit,
+            direction=direction, edge_label_filter=edge_label_filter, limit=limit,
             after=after, at_epoch=at_epoch, decay_lambda=decay_lambda,
         )
 
@@ -763,40 +864,40 @@ class AsyncOverGraph:
         max_iterations: int | None = None,
         epsilon: float | None = None,
         approx_residual_tolerance: float | None = None,
-        edge_type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
         max_results: int | None = None,
-    ) -> PyPprResult:
+    ) -> PprResult:
         return await asyncio.to_thread(
             self._db.personalized_pagerank, seed_node_ids,
             algorithm=algorithm,
             damping_factor=damping_factor, max_iterations=max_iterations,
             epsilon=epsilon, approx_residual_tolerance=approx_residual_tolerance,
-            edge_type_filter=edge_type_filter, max_results=max_results,
+            edge_label_filter=edge_label_filter, max_results=max_results,
         )
 
     async def export_adjacency(
         self,
         *,
-        node_type_filter: list[int] | None = None,
-        edge_type_filter: list[int] | None = None,
+        node_label_filter: dict[str, Any] | None = None,
+        edge_label_filter: list[str] | None = None,
         include_weights: bool = True,
-    ) -> PyAdjacencyExport:
+    ) -> AdjacencyExport:
         return await asyncio.to_thread(
             self._db.export_adjacency,
-            node_type_filter=node_type_filter, edge_type_filter=edge_type_filter,
+            node_label_filter=node_label_filter, edge_label_filter=edge_label_filter,
             include_weights=include_weights,
         )
 
     async def connected_components(
         self,
         *,
-        edge_type_filter: list[int] | None = None,
-        node_type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
+        node_label_filter: dict[str, Any] | None = None,
         at_epoch: int | None = None,
     ) -> dict[int, int]:
         return await asyncio.to_thread(
             self._db.connected_components,
-            edge_type_filter=edge_type_filter, node_type_filter=node_type_filter,
+            edge_label_filter=edge_label_filter, node_label_filter=node_label_filter,
             at_epoch=at_epoch,
         )
 
@@ -804,13 +905,13 @@ class AsyncOverGraph:
         self,
         node_id: int,
         *,
-        edge_type_filter: list[int] | None = None,
-        node_type_filter: list[int] | None = None,
+        edge_label_filter: list[str] | None = None,
+        node_label_filter: dict[str, Any] | None = None,
         at_epoch: int | None = None,
     ) -> list[int]:
         return await asyncio.to_thread(
             self._db.component_of, node_id,
-            edge_type_filter=edge_type_filter, node_type_filter=node_type_filter,
+            edge_label_filter=edge_label_filter, node_label_filter=node_label_filter,
             at_epoch=at_epoch,
         )
 
@@ -823,24 +924,24 @@ class AsyncOverGraph:
         *,
         dense_query: list[float] | None = None,
         sparse_query: list[tuple[int, float]] | None = None,
-        type_filter: list[int] | None = None,
+        label_filter: dict[str, Any] | None = None,
         ef_search: int | None = None,
         scope_start_node_id: int | None = None,
         scope_max_depth: int | None = None,
         scope_direction: str | None = None,
-        scope_edge_type_filter: list[int] | None = None,
+        scope_edge_label_filter: list[str] | None = None,
         scope_at_epoch: int | None = None,
         dense_weight: float | None = None,
         sparse_weight: float | None = None,
         fusion_mode: str | None = None,
-    ) -> list[PyVectorHit]:
+    ) -> list[VectorHit]:
         return await asyncio.to_thread(
             self._db.vector_search,
             mode, k,
             dense_query=dense_query, sparse_query=sparse_query,
-            type_filter=type_filter, ef_search=ef_search,
+            label_filter=label_filter, ef_search=ef_search,
             scope_start_node_id=scope_start_node_id, scope_max_depth=scope_max_depth,
-            scope_direction=scope_direction, scope_edge_type_filter=scope_edge_type_filter,
+            scope_direction=scope_direction, scope_edge_label_filter=scope_edge_label_filter,
             scope_at_epoch=scope_at_epoch,
             dense_weight=dense_weight, sparse_weight=sparse_weight,
             fusion_mode=fusion_mode,

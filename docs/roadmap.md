@@ -15,10 +15,17 @@ Active development. These are the things we're building right now.
 OverGraph has always been API-first: you call functions, not write query strings. The query planner keeps that philosophy but adds a planning layer underneath. You describe what you want with a builder pattern, and the planner figures out the fastest way to get it.
 
 - **Query IR and builder API.** A composable query model for node predicates and small graph patterns. Aliases, compound predicates, hydration modes, deterministic ordering, limits. Works across Rust, Node.js, and Python.
-- **Index-backed candidate sources.** The planner automatically selects from node ID/key lookups, type indexes, equality and range property indexes, timestamp filters, and adjacency sources. It picks the most selective anchor, intersects multiple sources, and falls back gracefully when no index covers the query.
+- **Index-backed candidate sources.** The planner automatically selects from node ID/key lookups, node-label indexes, equality and range property indexes, timestamp filters, and adjacency sources. It picks the most selective anchor, intersects multiple sources, and falls back gracefully when no index covers the query.
 - **Compound predicate planning.** Multi-predicate queries that intersect index results instead of scanning. The planner chooses the cheapest path and verifies remaining predicates after the index narrows the candidates. Full scans require explicit opt-in.
 - **Graph pattern matching.** Describe a small subgraph pattern (linear chains, branching shapes, repeated-variable equality) and the planner finds matches using the same index infrastructure. Built on the traversal substrate, not a separate engine.
 - **Explain output.** Every query produces an inspectable plan so you can see exactly which indexes were used, what was filtered, and where time went.
+
+### Multi-label nodes
+
+Nodes can carry one to ten public labels. Public records expose `labels`, node-label
+convenience APIs use plural names, multi-label convenience scans use `All` semantics,
+and explicit label filters expose `Any`/`All` modes for query, traversal, vector, and
+export APIs. Edges remain single-label.
 
 ---
 
@@ -27,7 +34,7 @@ OverGraph has always been API-first: you call functions, not write query strings
 Queued up behind the current work. These build directly on the query planner.
 
 ### Compound and composite indexes
-Declare a single index over ordered property tuples like `(type_id, status, score)` or `(type_id, tenant_id, updated_at)` with prefix semantics. The planner picks them up automatically.
+Declare a single index over ordered property tuples like `(label, status, score)` or `(label, tenant_id, updated_at)` with prefix semantics. The planner picks them up automatically.
 
 ### Boolean predicate planning
 Extend queries beyond AND-only to support `OR`, `NOT`, `IN`, `exists`, and `missing` with index-union/intersection support.
@@ -36,7 +43,7 @@ Extend queries beyond AND-only to support `OR`, `NOT`, `IN`, `exists`, and `miss
 Return exactly what you need: selected properties, selected metadata fields, or compact payloads. Avoid full record hydration when you only need IDs or a few fields.
 
 ### Edge queries and edge indexes
-Promote edge predicates from post-filters to planned query sources. Query by edge type + property, endpoint + edge property, temporal windows, or weight ranges directly.
+Promote edge predicates from post-filters to planned query sources. Query by edge label + property, endpoint + edge property, temporal windows, or weight ranges directly.
 
 ### Graph pattern queries v2
 Pagination and cursors for pattern results. Variable-length path patterns. Optional pattern pieces. Better branch-order costing.
@@ -45,7 +52,7 @@ Pagination and cursors for pattern results. Variable-length path patterns. Optio
 A read-only query-string surface that compiles into the native query IR and planner. You get the convenience of a familiar syntax without giving up the API-first foundation underneath. This is an adapter, not a replacement.
 
 ### Planner statistics and selectivity model
-Durable stats for per-type counts, property cardinality, value distribution, and adjacency fanout so the planner can make evidence-based decisions instead of heuristic guesses.
+Durable stats for per-label and per-edge-label counts, property cardinality, value distribution, and adjacency fanout so the planner can make evidence-based decisions instead of heuristic guesses.
 
 ### Graph-algorithm-scoped vector search
 Generalize vector search scoping beyond traversal start points. Run dense, sparse, or hybrid search over query results, pattern matches, PPR neighborhoods, community memberships, or explicit node sets.
@@ -85,9 +92,6 @@ Betweenness centrality and harmonic closeness over graph projections. Reuses pro
 
 ### Triangle counting and clustering coefficients
 Sorted adjacency intersection for per-node and global triangle counts. Clustering coefficients for identifying tightly connected neighborhoods.
-
-### Multi-label nodes
-Upgrade from a single `type_id` to `type_ids` with any/all matching. Format version bump with migration.
 
 ### Schema and constraints
 Optional property validation, required fields, edge endpoint constraints, and uniqueness enforcement. Manifest-stored, fully opt-in. Schemas are never required.

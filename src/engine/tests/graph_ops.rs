@@ -1,5 +1,16 @@
 // Graph algorithm tests: degree, shortest path, BFS, Dijkstra, all_shortest_paths.
 
+fn graph_filter_names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
+}
+
+fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFilter {
+    NodeLabelFilter {
+        labels: graph_filter_names(names),
+        mode,
+    }
+}
+
     // --- Phase 18a: Degree counts + aggregations ---
 
     #[test]
@@ -7,12 +18,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
@@ -31,15 +42,15 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         // a→b, b→a, a→c
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, a, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2); // a→b, a→c
@@ -50,35 +61,35 @@
     }
 
     #[test]
-    fn test_degree_type_filter() {
+    fn test_degree_label_filter() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "REPORTS_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         assert_eq!(
-            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![10]), ..Default::default() })
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, edge_label_filter: Some(vec!["KNOWS".to_string()]), ..Default::default() })
                 .unwrap(),
             1
         );
         assert_eq!(
-            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![20]), ..Default::default() })
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, edge_label_filter: Some(vec!["REPORTS_TO".to_string()]), ..Default::default() })
                 .unwrap(),
             1
         );
         assert_eq!(
-            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![10, 20]), ..Default::default() })
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, edge_label_filter: Some(vec!["KNOWS".to_string(), "REPORTS_TO".to_string()]), ..Default::default() })
                 .unwrap(),
             2
         );
         assert_eq!(
-            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![99]), ..Default::default() })
+            db.degree(a, &DegreeOptions { direction: Direction::Outgoing, edge_label_filter: Some(vec!["MISSING_EDGE_LABEL".to_string()]), ..Default::default() })
                 .unwrap(),
             0
         );
@@ -91,8 +102,8 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // Self-loop: appears in both adj_out and adj_in but must count once
@@ -109,14 +120,14 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap(); // self-loop
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap(); // outgoing
-        db.upsert_edge(c, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(c, a, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap(); // incoming
 
         assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2); // self-loop + a→b
@@ -142,10 +153,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let e = db
-            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
@@ -160,9 +171,9 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
@@ -177,12 +188,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
@@ -207,14 +218,14 @@
         };
         let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Re-upsert same edge (same from/to/type → same edge_id with uniqueness)
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
 
         assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 1);
@@ -234,9 +245,9 @@
 
         {
             let db = open_imm(&db_path);
-            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() })
+            let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.5, ..Default::default() })
                 .unwrap();
             db.flush().unwrap();
             db.close().unwrap();
@@ -253,12 +264,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.5, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.5, ..Default::default() })
             .unwrap();
 
         let sum = db
@@ -281,13 +292,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // Crosses memtable + segment
@@ -304,12 +315,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
 
         let avg = db
@@ -339,25 +350,30 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 20, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, c, "REPORTS_TO", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(d, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(d, a, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, d, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
+        db.upsert_edge(a, d, "KNOWS", UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
 
         for dir_val in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
-            for tf in [None, Some(vec![10u32]), Some(vec![20]), Some(vec![10, 20])] {
+            for tf in [
+                None,
+                Some(vec!["KNOWS"]),
+                Some(vec!["REPORTS_TO"]),
+                Some(vec!["KNOWS", "REPORTS_TO"]),
+            ] {
                 let tf_ref = tf.as_deref();
-                let deg = db.degree(a, &DegreeOptions { direction: dir_val, type_filter: tf_ref.map(|s| s.to_vec()), ..Default::default() }).unwrap();
-                let nbrs = db.neighbors(a, &NeighborOptions { direction: dir_val, type_filter: tf_ref.map(|s| s.to_vec()), ..Default::default() }).unwrap();
+                let deg = db.degree(a, &DegreeOptions { direction: dir_val, edge_label_filter: tf_ref.map(graph_filter_names), ..Default::default() }).unwrap();
+                let nbrs = db.neighbors(a, &NeighborOptions { direction: dir_val, edge_label_filter: tf_ref.map(graph_filter_names), ..Default::default() }).unwrap();
                 assert_eq!(
                     deg,
                     nbrs.len() as u64,
@@ -379,12 +395,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.5, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.5, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.5, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
@@ -405,12 +421,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "keep", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "prune_me", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let a = db.upsert_node("Person", "hub", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "keep", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "prune_me", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // Before policy: degree=2, sum=5.0
@@ -426,7 +442,7 @@
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
@@ -455,13 +471,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
@@ -480,8 +496,8 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
@@ -499,14 +515,14 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let degs = db
@@ -525,27 +541,32 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 20, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, c, "REPORTS_TO", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(d, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(d, a, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let ids = [a, b, c, d];
         for dir_val in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
-            for tf in [None, Some(vec![10u32]), Some(vec![20]), Some(vec![10, 20])] {
+            for tf in [
+                None,
+                Some(vec!["KNOWS"]),
+                Some(vec!["REPORTS_TO"]),
+                Some(vec!["KNOWS", "REPORTS_TO"]),
+            ] {
                 let tf_ref = tf.as_deref();
-                let batch = db.degrees(&ids, &DegreeOptions { direction: dir_val, type_filter: tf_ref.map(|s| s.to_vec()), ..Default::default() }).unwrap();
+                let batch = db.degrees(&ids, &DegreeOptions { direction: dir_val, edge_label_filter: tf_ref.map(graph_filter_names), ..Default::default() }).unwrap();
                 for &nid in &ids {
-                    let individual = db.degree(nid, &DegreeOptions { direction: dir_val, type_filter: tf_ref.map(|s| s.to_vec()), ..Default::default() }).unwrap();
+                    let individual = db.degree(nid, &DegreeOptions { direction: dir_val, edge_label_filter: tf_ref.map(graph_filter_names), ..Default::default() }).unwrap();
                     let batch_val = batch.get(&nid).copied().unwrap_or(0);
                     assert_eq!(
                         batch_val, individual,
@@ -564,16 +585,16 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // a has edges in segment1, segment2; b has edge in memtable
@@ -600,12 +621,12 @@
         };
         let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
 
         let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
@@ -619,13 +640,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
         db.delete_edge(e1).unwrap();
@@ -641,11 +662,11 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
@@ -670,12 +691,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // Pass unsorted, with duplicates
@@ -694,13 +715,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
@@ -720,12 +741,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "keep", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "prune_me", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "hub", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "keep", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "prune_me", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // Before policy
@@ -737,7 +758,7 @@
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
@@ -761,20 +782,20 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 20, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(b, c, "REPORTS_TO", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(d, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
+        db.upsert_edge(d, a, "KNOWS", UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
 
         let ids = [a, b, c, d];
@@ -802,10 +823,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         // Edge with valid_to = 1 (expired since epoch start)
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, valid_from: None, valid_to: Some(1), ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 5.0, valid_from: None, valid_to: Some(1), ..Default::default() })
             .unwrap();
 
         assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 0);
@@ -828,11 +849,11 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         // Edge with valid_from far in the future
         let future = now_millis() + 100_000_000;
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, valid_from: Some(future), valid_to: None, ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 5.0, valid_from: Some(future), valid_to: None, ..Default::default() })
             .unwrap();
 
         assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 0);
@@ -855,13 +876,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 7.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 7.0, ..Default::default() })
             .unwrap();
 
         // Invalidate e1
@@ -887,13 +908,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         // a→b: valid, a→c: expired
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(1), ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(1), ..Default::default() })
             .unwrap();
 
         let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
@@ -907,10 +928,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let future = now_millis() + 100_000_000;
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(future), valid_to: None, ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(future), valid_to: None, ..Default::default() })
             .unwrap();
 
         let degs = db.degrees(&[a], &DegreeOptions::default()).unwrap();
@@ -924,10 +945,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.invalidate_edge(e1, 1).unwrap();
 
@@ -943,13 +964,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         // a→b: valid, a→c: expired
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, valid_from: None, valid_to: Some(1), ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, valid_from: None, valid_to: Some(1), ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
@@ -974,14 +995,14 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         // a→b: valid 1000..5000
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(1000), valid_to: Some(5000), ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(1000), valid_to: Some(5000), ..Default::default() })
             .unwrap();
         // a→c: valid 3000..8000
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, valid_from: Some(3000), valid_to: Some(8000), ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, valid_from: Some(3000), valid_to: Some(8000), ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
@@ -1052,10 +1073,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
@@ -1097,10 +1118,10 @@
         let mut nodes = Vec::new();
         for i in 0..5u64 {
             let key = format!("chain_{}", i);
-            nodes.push(db.upsert_node(1, &key, UpsertNodeOptions::default()).unwrap());
+            nodes.push(db.upsert_node("Person", &key, UpsertNodeOptions::default()).unwrap());
         }
         for i in 0..4 {
-            db.upsert_edge(nodes[i], nodes[i + 1], 10, UpsertEdgeOptions::default())
+            db.upsert_edge(nodes[i], nodes[i + 1], "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
         }
         nodes
@@ -1113,17 +1134,17 @@
     ///   \ /
     ///    D
     fn build_diamond(db: &mut DatabaseEngine) -> (u64, u64, u64, u64) {
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         (a, b, c, d)
     }
@@ -1132,10 +1153,10 @@
     fn test_shortest_path_direct_neighbors() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let e = db
-            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let path = db
@@ -1174,8 +1195,8 @@
     fn test_shortest_path_no_path_disconnected() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         // No edge between a and b
 
         let path = db
@@ -1190,7 +1211,7 @@
     fn test_shortest_path_same_node() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
 
         let path = db
             .shortest_path(a, a, &ShortestPathOptions::default())
@@ -1228,9 +1249,9 @@
     fn test_shortest_path_directed_no_reverse() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // a -> b exists, but b -> a in Outgoing direction does not
@@ -1272,34 +1293,34 @@
     }
 
     #[test]
-    fn test_shortest_path_edge_type_filter() {
+    fn test_shortest_path_edge_label_filter() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
-        // Direct path a->c with type 20
-        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default())
+        // Direct path a->c with label 20
+        db.upsert_edge(a, c, "REPORTS_TO", UpsertEdgeOptions::default())
             .unwrap();
-        // Indirect path a->b->c with type 10
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        // Indirect path a->b->c with label 10
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
-        // Filter to type 10 only. Must go through b.
+        // Filter to label 10 only. Must go through b.
         let path = db
-            .shortest_path(a, c, &ShortestPathOptions { type_filter: Some(vec![10]), ..Default::default() })
+            .shortest_path(a, c, &ShortestPathOptions { edge_label_filter: Some(vec!["KNOWS".to_string()]), ..Default::default() })
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
         assert_eq!(p.total_cost, 2.0);
         assert_eq!(p.nodes, vec![a, b, c]);
 
-        // Filter to type 20. Direct path.
+        // Filter to label 20. Direct path.
         let path = db
-            .shortest_path(a, c, &ShortestPathOptions { type_filter: Some(vec![20]), ..Default::default() })
+            .shortest_path(a, c, &ShortestPathOptions { edge_label_filter: Some(vec!["REPORTS_TO".to_string()]), ..Default::default() })
             .unwrap();
         assert!(path.is_some());
         let p = path.unwrap();
@@ -1335,15 +1356,15 @@
     fn test_shortest_path_temporal_filtering() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
         // Edge a->b valid from 100 to 200
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(200), ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(200), ..Default::default() })
             .unwrap();
         // Edge b->c valid from 100 to 300
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(300), ..Default::default() })
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(300), ..Default::default() })
             .unwrap();
 
         // At time 150: both edges valid, path exists
@@ -1392,7 +1413,7 @@
     fn test_is_connected_same_node() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
 
         assert!(db
             .is_connected(a, a, &IsConnectedOptions::default())
@@ -1405,8 +1426,8 @@
     fn test_is_connected_disconnected() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         assert!(!db
             .is_connected(a, b, &IsConnectedOptions::default())
@@ -1458,21 +1479,21 @@
         let db = open_imm(&dir.path().join("db"));
 
         // First segment: a -> b -> c
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Second segment: c -> d -> e
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        let e = db.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        let e = db.upsert_node("Person", "e", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(d, e, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(d, e, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
@@ -1493,14 +1514,14 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
@@ -1520,17 +1541,17 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
         // Direct path a->c and indirect a->b->c
         let direct = db
-            .upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+            .upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // Delete direct edge
@@ -1552,19 +1573,19 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
         // a->b->c and a->d->c
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(d, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(d, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
@@ -1588,20 +1609,20 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
         let cheap_ab = db
-            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         let cheap_bc = db
-            .upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+            .upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, d, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+        db.upsert_edge(a, d, "KNOWS", UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(d, c, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+        db.upsert_edge(d, c, "KNOWS", UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
@@ -1651,7 +1672,7 @@
 
         db.ingest_mode().unwrap();
         for i in 0..10 {
-            db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+            db.upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             db.flush().unwrap();
         }
@@ -1660,7 +1681,7 @@
 
         // All data survives
         for i in 0..10 {
-            assert!(db.get_node_by_key(1, &format!("n{}", i)).unwrap().is_some());
+            assert!(db.get_node_by_key("Person", &format!("n{}", i)).unwrap().is_some());
         }
 
         let stats = db.end_ingest().unwrap().unwrap();
@@ -1669,7 +1690,7 @@
 
         // All data still intact after compaction
         for i in 0..10 {
-            assert!(db.get_node_by_key(1, &format!("n{}", i)).unwrap().is_some());
+            assert!(db.get_node_by_key("Person", &format!("n{}", i)).unwrap().is_some());
         }
 
         db.close().unwrap();
@@ -1723,30 +1744,30 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let end = db.upsert_node(1, "end", UpsertNodeOptions::default()).unwrap();
-        let bridge = db.upsert_node(1, "bridge", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let end = db.upsert_node("Person", "end", UpsertNodeOptions::default()).unwrap();
+        let bridge = db.upsert_node("Person", "bridge", UpsertNodeOptions::default()).unwrap();
 
         // 100 dead-end nodes from start
         for i in 0..100 {
             let key = format!("dead_s_{}", i);
-            let n = db.upsert_node(1, &key, UpsertNodeOptions::default()).unwrap();
-            db.upsert_edge(start, n, 10, UpsertEdgeOptions::default())
+            let n = db.upsert_node("Person", &key, UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(start, n, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
         }
 
         // 100 dead-end nodes from end (incoming)
         for i in 0..100 {
             let key = format!("dead_e_{}", i);
-            let n = db.upsert_node(1, &key, UpsertNodeOptions::default()).unwrap();
-            db.upsert_edge(n, end, 10, UpsertEdgeOptions::default())
+            let n = db.upsert_node("Person", &key, UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(n, end, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
         }
 
         // The actual path: start -> bridge -> end
-        db.upsert_edge(start, bridge, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, bridge, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(bridge, end, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(bridge, end, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let path = db
@@ -1764,14 +1785,14 @@
     fn test_shortest_path_incoming_direction() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
         // Edges: a -> b -> c
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // From c to a following Incoming edges (reverse traversal)
@@ -1793,19 +1814,19 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
         // Cycle: a -> b -> c -> a, with d only reachable from c
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, a, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // Should find path despite cycle
@@ -1824,7 +1845,7 @@
     fn test_shortest_path_nonexistent_node() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
 
         // Node 999999 was never created
         let path = db
@@ -1849,18 +1870,18 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-        let visible = db.upsert_node(1, "visible", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node("Person", "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let visible = db.upsert_node("Person", "visible", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, hidden, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, hidden, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(hidden, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(hidden, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, visible, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, visible, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(visible, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(visible, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         db.set_prune_policy(
@@ -1868,7 +1889,7 @@
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
@@ -1905,27 +1926,79 @@
     }
 
     #[test]
+    fn test_path_apis_exclude_pruned_multi_label_nodes() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db
+            .upsert_node("Person", "a", UpsertNodeOptions::default())
+            .unwrap();
+        let hidden = db
+            .upsert_node(
+                &["Person", "Hidden"],
+                "hidden",
+                UpsertNodeOptions {
+                    weight: 0.2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let c = db
+            .upsert_node("Person", "c", UpsertNodeOptions::default())
+            .unwrap();
+
+        db.upsert_edge(a, hidden, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+        db.upsert_edge(hidden, c, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+
+        db.set_prune_policy(
+            "hide-low-hidden",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.5),
+                label: Some("Hidden".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert!(db
+            .shortest_path(a, c, &ShortestPathOptions::default())
+            .unwrap()
+            .is_none());
+        assert!(!db
+            .is_connected(a, c, &IsConnectedOptions::default())
+            .unwrap());
+        assert!(db
+            .all_shortest_paths(a, c, &AllShortestPathsOptions::default())
+            .unwrap()
+            .is_empty());
+
+        db.close().unwrap();
+    }
+
+    #[test]
     fn test_weighted_path_apis_respect_prune_policy_visibility() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-        let visible = db.upsert_node(1, "visible", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node("Person", "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let visible = db.upsert_node("Person", "visible", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
         let mut cheap = BTreeMap::new();
         cheap.insert("cost".to_string(), PropValue::Float(1.0));
         let mut expensive = BTreeMap::new();
         expensive.insert("cost".to_string(), PropValue::Float(10.0));
 
-        db.upsert_edge(a, hidden, 10, UpsertEdgeOptions { props: cheap.clone(), ..Default::default() })
+        db.upsert_edge(a, hidden, "KNOWS", UpsertEdgeOptions { props: cheap.clone(), ..Default::default() })
             .unwrap();
-        db.upsert_edge(hidden, c, 10, UpsertEdgeOptions { props: cheap, ..Default::default() })
+        db.upsert_edge(hidden, c, "KNOWS", UpsertEdgeOptions { props: cheap, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, visible, 10, UpsertEdgeOptions { props: expensive.clone(), weight: 10.0, ..Default::default() })
+        db.upsert_edge(a, visible, "KNOWS", UpsertEdgeOptions { props: expensive.clone(), weight: 10.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(visible, c, 10, UpsertEdgeOptions { props: expensive, weight: 10.0, ..Default::default() })
+        db.upsert_edge(visible, c, "KNOWS", UpsertEdgeOptions { props: expensive, weight: 10.0, ..Default::default() })
             .unwrap();
 
         db.set_prune_policy(
@@ -1933,7 +2006,7 @@
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
@@ -1970,15 +2043,15 @@
         // BFS shortest: A->B (1 hop). Dijkstra shortest: A->C->B (cost 5)
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 10.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 10.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         let _ec = db
-            .upsert_edge(c, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+            .upsert_edge(c, b, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let path = db
@@ -1998,21 +2071,21 @@
         // Use a custom property "cost" on edges
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
         let mut props_ab = BTreeMap::new();
         props_ab.insert("cost".to_string(), PropValue::Float(100.0));
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { props: props_ab, weight: 1.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { props: props_ab, weight: 1.0, ..Default::default() }).unwrap();
 
         let mut props_ac = BTreeMap::new();
         props_ac.insert("cost".to_string(), PropValue::Float(1.0));
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { props: props_ac, weight: 1.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { props: props_ac, weight: 1.0, ..Default::default() }).unwrap();
 
         let mut props_cb = BTreeMap::new();
         props_cb.insert("cost".to_string(), PropValue::Float(2.0));
-        db.upsert_edge(c, b, 10, UpsertEdgeOptions { props: props_cb, weight: 1.0, ..Default::default() }).unwrap();
+        db.upsert_edge(c, b, "KNOWS", UpsertEdgeOptions { props: props_cb, weight: 1.0, ..Default::default() }).unwrap();
 
         let path = db
             .shortest_path(a, b, &ShortestPathOptions { weight_field: Some("cost".to_string()), ..Default::default() })
@@ -2031,14 +2104,14 @@
         // max_cost=4 should exclude both, returning None
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, b, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
+        db.upsert_edge(c, b, "KNOWS", UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
 
         // max_cost=4: nothing reachable
@@ -2061,9 +2134,9 @@
     fn test_dijkstra_negative_weight_error() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: -1.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: -1.0, ..Default::default() })
             .unwrap();
 
         let result = db.shortest_path(a, b, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() });
@@ -2080,21 +2153,21 @@
         // The !w.is_finite() guard must catch it.
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("w".to_string(), PropValue::Float(f64::NAN));
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { props, weight: 1.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { props, weight: 1.0, ..Default::default() }).unwrap();
 
         let result = db.shortest_path(a, b, &ShortestPathOptions { weight_field: Some("w".to_string()), ..Default::default() });
         assert!(result.is_err());
 
         // Also test Infinity
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         let mut props2 = BTreeMap::new();
         props2.insert("w".to_string(), PropValue::Float(f64::INFINITY));
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { props: props2, weight: 1.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { props: props2, weight: 1.0, ..Default::default() }).unwrap();
 
         let result = db.shortest_path(a, c, &ShortestPathOptions { weight_field: Some("w".to_string()), ..Default::default() });
         assert!(result.is_err());
@@ -2111,15 +2184,15 @@
         // but the total path is 3 hops. Must be rejected.
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // max_depth=2: 3-hop path should be rejected
@@ -2144,12 +2217,12 @@
         // A->B (weight 0), B->C (weight 0)
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
 
         let path = db
@@ -2166,7 +2239,7 @@
     fn test_dijkstra_same_node() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
 
         let path = db
             .shortest_path(a, a, &ShortestPathOptions { weight_field: Some("weight".to_string()), ..Default::default() })
@@ -2193,19 +2266,19 @@
         // side meets first.
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, d, 10, UpsertEdgeOptions { weight: 10.0, ..Default::default() })
+        db.upsert_edge(a, d, "KNOWS", UpsertEdgeOptions { weight: 10.0, ..Default::default() })
             .unwrap();
 
         let path = db
@@ -2224,8 +2297,8 @@
     fn test_dijkstra_no_path() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         // No edges
 
         let path = db
@@ -2240,12 +2313,12 @@
     fn test_dijkstra_after_flush() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
@@ -2263,13 +2336,13 @@
     fn test_dijkstra_after_compact() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
@@ -2290,21 +2363,21 @@
         // A->D->E->C (3 hops, cost 1+1+1=3)
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        let e = db.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        let e = db.upsert_node("Person", "e", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 100.0, ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 100.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 100.0, ..Default::default() })
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions { weight: 100.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(d, e, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(d, e, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(e, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(e, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // BFS: 2 hops (A->B->C)
@@ -2330,15 +2403,15 @@
         // A->B->C->D, all weight 1
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         // max_depth=1: can only reach B from A side
@@ -2400,7 +2473,7 @@
     fn test_all_shortest_paths_bfs_same_node() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
 
         let paths = db
             .all_shortest_paths(a, a, &AllShortestPathsOptions::default())
@@ -2416,8 +2489,8 @@
     fn test_all_shortest_paths_bfs_no_path() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         let paths = db
             .all_shortest_paths(a, b, &AllShortestPathsOptions::default())
@@ -2432,17 +2505,17 @@
         // Diamond with equal weights: A->B(w=3)->D and A->C(w=3)->D, both cost 6
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let paths = db
@@ -2462,17 +2535,17 @@
     fn test_all_shortest_paths_dijkstra_max_paths() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let paths = db
@@ -2487,8 +2560,8 @@
     fn test_all_shortest_paths_dijkstra_no_path() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         let paths = db
             .all_shortest_paths(a, b, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() })
@@ -2502,9 +2575,9 @@
     fn test_all_shortest_paths_negative_weight_error() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: -5.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: -5.0, ..Default::default() })
             .unwrap();
 
         let result = db.all_shortest_paths(a, b, &AllShortestPathsOptions { weight_field: Some("weight".to_string()), ..Default::default() });
@@ -2532,18 +2605,18 @@
     fn test_all_shortest_paths_bfs_after_compact() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
@@ -2564,12 +2637,12 @@
         // Use PropValue::Int for the weight field
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("distance".to_string(), PropValue::Int(7));
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { props, weight: 1.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { props, weight: 1.0, ..Default::default() }).unwrap();
 
         let path = db
             .shortest_path(a, b, &ShortestPathOptions { weight_field: Some("distance".to_string()), ..Default::default() })
@@ -2603,20 +2676,20 @@
         // With max_depth=2: must find the 2-hop path S→A→T, not return None.
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(s, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
+        let s = db.upsert_node("Person", "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node("Person", "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, "KNOWS", UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, t, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, t, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(s, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, t, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(c, t, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // Without max_depth
@@ -2647,23 +2720,23 @@
         // still recover the shorter-hop equal-cost route.
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let v = db.upsert_node(1, "v", UpsertNodeOptions::default()).unwrap();
-        let x = db.upsert_node(1, "x", UpsertNodeOptions::default()).unwrap();
-        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(s, a, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
+        let s = db.upsert_node("Person", "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let v = db.upsert_node("Person", "v", UpsertNodeOptions::default()).unwrap();
+        let x = db.upsert_node("Person", "x", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node("Person", "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, "KNOWS", UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, v, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, v, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, x, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(s, x, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(x, v, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
+        db.upsert_edge(x, v, "KNOWS", UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(v, t, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
+        db.upsert_edge(v, t, "KNOWS", UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
 
         let path = db
@@ -2682,20 +2755,20 @@
         // valid path instead of filtering the global optimum down to nothing.
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(s, a, 10, UpsertEdgeOptions::default())
+        let s = db.upsert_node("Person", "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node("Person", "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, t, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, t, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(s, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, t, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(c, t, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let path = db
@@ -2715,14 +2788,14 @@
         // Must not stack-overflow; should return path(s) with cost 1
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node("Person", "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, a, 10, UpsertEdgeOptions { weight: 0.0, ..Default::default() })
+        db.upsert_edge(b, a, "KNOWS", UpsertEdgeOptions { weight: 0.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, t, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, t, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let paths = db
@@ -2746,20 +2819,20 @@
         // max_depth=3: both paths
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(s, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() })
+        let s = db.upsert_node("Person", "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node("Person", "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, "KNOWS", UpsertEdgeOptions { weight: 4.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, t, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, t, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(s, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, t, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(c, t, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         // max_depth=2: only the 2-hop path
@@ -2786,20 +2859,20 @@
     fn test_all_shortest_paths_dijkstra_max_depth_uses_best_constrained_cost() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let s = db.upsert_node(1, "s", UpsertNodeOptions::default()).unwrap();
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let t = db.upsert_node(1, "t", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(s, a, 10, UpsertEdgeOptions::default())
+        let s = db.upsert_node("Person", "s", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let t = db.upsert_node("Person", "t", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(s, a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, t, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, t, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(s, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(s, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, t, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(c, t, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let paths = db
@@ -2816,17 +2889,17 @@
     fn test_all_shortest_paths_dijkstra_after_flush_weighted() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
@@ -2848,17 +2921,17 @@
 
         let (a, d) = {
             let db = open_imm(&db_path);
-            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-            let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+            let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
-            db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+            db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
-            db.upsert_edge(b, d, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+            db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
                 .unwrap();
-            db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+            db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
                 .unwrap();
             db.flush().unwrap();
             db.compact().unwrap();
@@ -2903,12 +2976,12 @@
         // A->B->C, query with Direction::Both from C to A should find path
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let path = db
@@ -2926,16 +2999,16 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Bridge edge in memtable only
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let path = db
@@ -2961,15 +3034,15 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", UpsertNodeOptions::default())
+            .upsert_node("Person", "center", UpsertNodeOptions::default())
             .unwrap();
         let mut edge_ids = Vec::new();
         for i in 0..8 {
             let neighbor = engine
-                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             let eid = engine
-                .upsert_edge(center, neighbor, 10, UpsertEdgeOptions::default())
+                .upsert_edge(center, neighbor, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
             edge_ids.push(eid);
         }
@@ -3017,16 +3090,16 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", UpsertNodeOptions::default())
+            .upsert_node("Person", "center", UpsertNodeOptions::default())
             .unwrap();
 
         // Create 4 edges, flush to segment
         for i in 0..4 {
             let n = engine
-                .upsert_node(1, &format!("seg{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("seg{}", i), UpsertNodeOptions::default())
                 .unwrap();
             engine
-                .upsert_edge(center, n, 10, UpsertEdgeOptions::default())
+                .upsert_edge(center, n, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
         }
         engine.flush().unwrap();
@@ -3034,10 +3107,10 @@
         // Create 4 more in memtable
         for i in 0..4 {
             let n = engine
-                .upsert_node(1, &format!("mem{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("mem{}", i), UpsertNodeOptions::default())
                 .unwrap();
             engine
-                .upsert_edge(center, n, 10, UpsertEdgeOptions::default())
+                .upsert_edge(center, n, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
         }
 
@@ -3070,20 +3143,20 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", UpsertNodeOptions::default())
+            .upsert_node("Person", "center", UpsertNodeOptions::default())
             .unwrap();
-        let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions::default()).unwrap();
-        let n2 = engine.upsert_node(1, "n2", UpsertNodeOptions::default()).unwrap();
-        let n3 = engine.upsert_node(1, "n3", UpsertNodeOptions::default()).unwrap();
+        let n1 = engine.upsert_node("Person", "n1", UpsertNodeOptions::default()).unwrap();
+        let n2 = engine.upsert_node("Person", "n2", UpsertNodeOptions::default()).unwrap();
+        let n3 = engine.upsert_node("Person", "n3", UpsertNodeOptions::default()).unwrap();
 
         engine
-            .upsert_edge(center, n1, 10, UpsertEdgeOptions::default())
+            .upsert_edge(center, n1, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         let e2 = engine
-            .upsert_edge(center, n2, 10, UpsertEdgeOptions::default())
+            .upsert_edge(center, n2, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(center, n3, 10, UpsertEdgeOptions::default())
+            .upsert_edge(center, n3, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         engine.delete_edge(e2).unwrap();
@@ -3105,18 +3178,18 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", UpsertNodeOptions::default())
+            .upsert_node("Person", "center", UpsertNodeOptions::default())
             .unwrap();
-        let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions::default()).unwrap();
-        let n2 = engine.upsert_node(1, "n2", UpsertNodeOptions::default()).unwrap();
+        let n1 = engine.upsert_node("Person", "n1", UpsertNodeOptions::default()).unwrap();
+        let n2 = engine.upsert_node("Person", "n2", UpsertNodeOptions::default()).unwrap();
 
         // Edge valid from 100 to 200
         engine
-            .upsert_edge(center, n1, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(200), ..Default::default() })
+            .upsert_edge(center, n1, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(200), ..Default::default() })
             .unwrap();
         // Edge valid from 150 to 300
         engine
-            .upsert_edge(center, n2, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(150), valid_to: Some(300), ..Default::default() })
+            .upsert_edge(center, n2, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(150), valid_to: Some(300), ..Default::default() })
             .unwrap();
 
         // At epoch 175, both valid
@@ -3147,14 +3220,14 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", UpsertNodeOptions::default())
+            .upsert_node("Person", "center", UpsertNodeOptions::default())
             .unwrap();
         for i in 0..15 {
             let n = engine
-                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             engine
-                .upsert_edge(center, n, 10, UpsertEdgeOptions::default())
+                .upsert_edge(center, n, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
         }
 
@@ -3194,14 +3267,14 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", UpsertNodeOptions::default())
+            .upsert_node("Person", "center", UpsertNodeOptions::default())
             .unwrap();
-        let n_past = engine.upsert_node(1, "past", UpsertNodeOptions::default()).unwrap();
+        let n_past = engine.upsert_node("Person", "past", UpsertNodeOptions::default()).unwrap();
         let n_current = engine
-            .upsert_node(1, "current", UpsertNodeOptions::default())
+            .upsert_node("Person", "current", UpsertNodeOptions::default())
             .unwrap();
         let n_future = engine
-            .upsert_node(1, "future", UpsertNodeOptions::default())
+            .upsert_node("Person", "future", UpsertNodeOptions::default())
             .unwrap();
 
         let now = SystemTime::now()
@@ -3212,19 +3285,19 @@
         // Expired edge (valid_to in the past)
         engine
             .upsert_edge(
-                center, n_past, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(now - 2000), valid_to: Some(now - 1000), ..Default::default() },
+                center, n_past, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(now - 2000), valid_to: Some(now - 1000), ..Default::default() },
             )
             .unwrap();
         // Currently valid edge
         engine
             .upsert_edge(
-                center, n_current, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(now - 1000), valid_to: Some(now + 100_000), ..Default::default() },
+                center, n_current, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(now - 1000), valid_to: Some(now + 100_000), ..Default::default() },
             )
             .unwrap();
         // Future edge (valid_from in the future)
         engine
             .upsert_edge(
-                center, n_future, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(now + 50_000), valid_to: Some(now + 100_000), ..Default::default() },
+                center, n_future, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(now + 50_000), valid_to: Some(now + 100_000), ..Default::default() },
             )
             .unwrap();
 
@@ -3259,7 +3332,7 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", UpsertNodeOptions::default())
+            .upsert_node("Person", "center", UpsertNodeOptions::default())
             .unwrap();
         let epoch = 500_000i64;
         let mut valid_node_ids = Vec::new();
@@ -3267,13 +3340,13 @@
         // Create 10 edges, alternating valid/invalid at epoch=500000
         for i in 0..10u64 {
             let n = engine
-                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             if i % 2 == 0 {
                 // Valid: valid_from=100000, valid_to=900000
                 engine
                     .upsert_edge(
-                        center, n, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100_000), valid_to: Some(900_000), ..Default::default() },
+                        center, n, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(100_000), valid_to: Some(900_000), ..Default::default() },
                     )
                     .unwrap();
                 valid_node_ids.push(n);
@@ -3281,7 +3354,7 @@
                 // Invalid at epoch: valid_from=600000, valid_to=900000
                 engine
                     .upsert_edge(
-                        center, n, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(600_000), valid_to: Some(900_000), ..Default::default() },
+                        center, n, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(600_000), valid_to: Some(900_000), ..Default::default() },
                     )
                     .unwrap();
             }
@@ -3321,17 +3394,17 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
-            .upsert_node(1, "center", UpsertNodeOptions::default())
+            .upsert_node("Person", "center", UpsertNodeOptions::default())
             .unwrap();
         let mut visible_neighbors = Vec::new();
 
         for i in 0..17u64 {
             let weight = if i < 12 { 0.1 } else { 1.0 };
             let node_id = engine
-                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight, ..Default::default() })
+                .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions { weight, ..Default::default() })
                 .unwrap();
             engine
-                .upsert_edge(center, node_id, 10, UpsertEdgeOptions::default())
+                .upsert_edge(center, node_id, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
             if weight > 0.5 {
                 visible_neighbors.push(node_id);
@@ -3344,7 +3417,7 @@
                 PrunePolicy {
                     max_age_ms: None,
                     max_weight: Some(0.5),
-                    type_id: None,
+                    label: None,
                 },
             )
             .unwrap();
@@ -3375,18 +3448,18 @@
     }
 
     #[test]
-    fn test_nodes_by_type_paged_policy_cursor_correctness() {
-        // Verify cursor is pushed down in policy-filtered nodes_by_type_paged.
+    fn test_nodes_by_labels_paged_policy_cursor_correctness() {
+        // Verify cursor is pushed down in policy-filtered nodes_by_labels_paged.
         // Page 2 should not re-return page 1 items.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        // Create 10 nodes of type 1
+        // Create 10 Person-labeled nodes.
         let mut all_ids = Vec::new();
         for i in 0..10 {
             let id = engine
-                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default())
                 .unwrap();
             all_ids.push(id);
         }
@@ -3399,7 +3472,7 @@
                 PrunePolicy {
                     max_age_ms: Some(999_999_999),
                     max_weight: None,
-                    type_id: Some(999), // non-matching type, excludes nothing
+                    label: Some("SpecialNode999".to_string()), // non-matching type, excludes nothing
                 },
             )
             .unwrap();
@@ -3409,8 +3482,7 @@
         let mut cursor: Option<u64> = None;
         loop {
             let page = engine
-                .nodes_by_type_paged(
-                    1,
+                .nodes_by_labels_paged("Person",
                     &PageRequest {
                         limit: Some(3),
                         after: cursor,
@@ -3452,7 +3524,7 @@
                 }),
             );
             let id = engine
-                .upsert_node(1, &format!("n{}", i), UpsertNodeOptions { props, ..Default::default() })
+                .upsert_node("Person", &format!("n{}", i), UpsertNodeOptions { props, ..Default::default() })
                 .unwrap();
             if i % 3 == 0 {
                 matching_ids.push(id);
@@ -3465,7 +3537,7 @@
         loop {
             let page = engine
                 .find_nodes_paged(
-                    1,
+                    "Person",
                     "color",
                     &PropValue::String("red".to_string()),
                     &PageRequest {
@@ -3502,7 +3574,7 @@
             let mut props = BTreeMap::new();
             props.insert("tag".to_string(), PropValue::String("yes".to_string()));
             let id = engine
-                .upsert_node(1, &format!("pre{}", i), UpsertNodeOptions { props, ..Default::default() })
+                .upsert_node("Person", &format!("pre{}", i), UpsertNodeOptions { props, ..Default::default() })
                 .unwrap();
             all_matching.push(id);
         }
@@ -3511,7 +3583,7 @@
             let mut props = BTreeMap::new();
             props.insert("tag".to_string(), PropValue::String("yes".to_string()));
             let id = engine
-                .upsert_node(1, &format!("post{}", i), UpsertNodeOptions { props, ..Default::default() })
+                .upsert_node("Person", &format!("post{}", i), UpsertNodeOptions { props, ..Default::default() })
                 .unwrap();
             all_matching.push(id);
         }
@@ -3522,7 +3594,7 @@
         loop {
             let page = engine
                 .find_nodes_paged(
-                    1,
+                    "Person",
                     "tag",
                     &PropValue::String("yes".to_string()),
                     &PageRequest {
@@ -3553,7 +3625,7 @@
 
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
-        let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions { props, ..Default::default() }).unwrap();
+        let n1 = engine.upsert_node("Person", "n1", UpsertNodeOptions { props, ..Default::default() }).unwrap();
 
         // Flush: n1 with color=red goes to segment
         engine.flush().unwrap();
@@ -3561,11 +3633,11 @@
         // Update n1 to color=blue in memtable
         let mut props2 = BTreeMap::new();
         props2.insert("color".to_string(), PropValue::String("blue".to_string()));
-        engine.upsert_node(1, "n1", UpsertNodeOptions { props: props2, ..Default::default() }).unwrap();
+        engine.upsert_node("Person", "n1", UpsertNodeOptions { props: props2, ..Default::default() }).unwrap();
 
         // find_nodes for color=red must NOT return n1 (stale segment match)
         let red = engine
-            .find_nodes(1, "color", &PropValue::String("red".to_string()))
+            .find_nodes("Person", "color", &PropValue::String("red".to_string()))
             .unwrap();
         assert!(
             !red.contains(&n1),
@@ -3574,14 +3646,14 @@
 
         // find_nodes for color=blue SHOULD return n1
         let blue = engine
-            .find_nodes(1, "color", &PropValue::String("blue".to_string()))
+            .find_nodes("Person", "color", &PropValue::String("blue".to_string()))
             .unwrap();
         assert!(blue.contains(&n1));
 
         // Parity: find_nodes_paged must agree
         let red_paged = engine
             .find_nodes_paged(
-                1,
+                "Person",
                 "color",
                 &PropValue::String("red".to_string()),
                 &PageRequest {
@@ -3594,7 +3666,7 @@
 
         let blue_paged = engine
             .find_nodes_paged(
-                1,
+                "Person",
                 "color",
                 &PropValue::String("blue".to_string()),
                 &PageRequest {
@@ -3615,7 +3687,7 @@
 
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
-        let n1 = engine.upsert_node(1, "n1", UpsertNodeOptions { props, ..Default::default() }).unwrap();
+        let n1 = engine.upsert_node("Person", "n1", UpsertNodeOptions { props, ..Default::default() }).unwrap();
 
         // Flush: S1 has n1 with color=red
         engine.flush().unwrap();
@@ -3623,12 +3695,12 @@
         // Update and flush again: S2 has n1 with color=blue
         let mut props2 = BTreeMap::new();
         props2.insert("color".to_string(), PropValue::String("blue".to_string()));
-        engine.upsert_node(1, "n1", UpsertNodeOptions { props: props2, ..Default::default() }).unwrap();
+        engine.upsert_node("Person", "n1", UpsertNodeOptions { props: props2, ..Default::default() }).unwrap();
         engine.flush().unwrap();
 
         // find_nodes for color=red must NOT return n1
         let red = engine
-            .find_nodes(1, "color", &PropValue::String("red".to_string()))
+            .find_nodes("Person", "color", &PropValue::String("red".to_string()))
             .unwrap();
         assert!(
             !red.contains(&n1),
@@ -3636,7 +3708,7 @@
         );
 
         let blue = engine
-            .find_nodes(1, "color", &PropValue::String("blue".to_string()))
+            .find_nodes("Person", "color", &PropValue::String("blue".to_string()))
             .unwrap();
         assert!(blue.contains(&n1));
     }
@@ -3648,24 +3720,24 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let depth1_low = db.upsert_node(1, "depth1-low", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let depth1_low = db.upsert_node("Person", "depth1-low", UpsertNodeOptions::default()).unwrap();
         let depth1_high = db
-            .upsert_node(1, "depth1-high", UpsertNodeOptions::default())
+            .upsert_node("Person", "depth1-high", UpsertNodeOptions::default())
             .unwrap();
-        let depth2_low = db.upsert_node(1, "depth2-low", UpsertNodeOptions::default()).unwrap();
-        let depth2_mid = db.upsert_node(1, "depth2-mid", UpsertNodeOptions::default()).unwrap();
-        let depth2_high = db.upsert_node(1, "depth2-high", UpsertNodeOptions::default()).unwrap();
+        let depth2_low = db.upsert_node("Person", "depth2-low", UpsertNodeOptions::default()).unwrap();
+        let depth2_mid = db.upsert_node("Person", "depth2-mid", UpsertNodeOptions::default()).unwrap();
+        let depth2_high = db.upsert_node("Person", "depth2-high", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, depth1_high, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, depth1_high, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, depth1_low, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, depth1_low, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(depth1_high, depth2_high, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(depth1_high, depth2_high, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(depth1_high, depth2_mid, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(depth1_high, depth2_mid, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(depth1_low, depth2_low, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(depth1_low, depth2_low, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
@@ -3697,15 +3769,15 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let depth2_only = db
@@ -3745,7 +3817,7 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
         let page = db
             .traverse(start, 3, &TraverseOptions { min_depth: 0, limit: Some(1), ..Default::default() })
             .unwrap();
@@ -3762,26 +3834,26 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let middle = db.upsert_node(2, "middle", UpsertNodeOptions::default()).unwrap();
-        let hidden = db.upsert_node(2, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let middle = db.upsert_node("Company", "middle", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node("Company", "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
 
-        db.upsert_edge(start, middle, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, middle, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(middle, hidden, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(middle, hidden, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.set_prune_policy(
             "low_weight",
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
 
         let page = db
-            .traverse(start, 2, &TraverseOptions { node_type_filter: Some(vec![2]), limit: Some(1), ..Default::default() })
+            .traverse(start, 2, &TraverseOptions { emit_node_label_filter: Some(graph_node_label_filter(&["Company"], LabelMatchMode::Any)), limit: Some(1), ..Default::default() })
             .unwrap();
 
         assert_eq!(page.items.len(), 1);
@@ -3792,22 +3864,103 @@
     }
 
     #[test]
+    fn test_traverse_emit_label_filter_supports_single_any_all_multi_label() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let start = db
+            .upsert_node("Person", "start", UpsertNodeOptions::default())
+            .unwrap();
+        let bridge = db
+            .upsert_node("Company", "bridge", UpsertNodeOptions::default())
+            .unwrap();
+        let article = db
+            .upsert_node(&["Article", "Featured"], "article", UpsertNodeOptions::default())
+            .unwrap();
+        let draft = db
+            .upsert_node("Article", "draft", UpsertNodeOptions::default())
+            .unwrap();
+
+        db.upsert_edge(start, bridge, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+        db.upsert_edge(bridge, article, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+        db.upsert_edge(bridge, draft, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+
+        let single = db
+            .traverse(
+                start,
+                2,
+                &TraverseOptions {
+                    emit_node_label_filter: Some(graph_node_label_filter(
+                        &["Article"],
+                        LabelMatchMode::Any,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            single.items.iter().map(|hit| hit.node_id).collect::<Vec<_>>(),
+            vec![article, draft]
+        );
+
+        let any = db
+            .traverse(
+                start,
+                2,
+                &TraverseOptions {
+                    emit_node_label_filter: Some(graph_node_label_filter(
+                        &["Company", "Featured"],
+                        LabelMatchMode::Any,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            any.items.iter().map(|hit| hit.node_id).collect::<Vec<_>>(),
+            vec![bridge, article]
+        );
+
+        let all = db
+            .traverse(
+                start,
+                2,
+                &TraverseOptions {
+                    emit_node_label_filter: Some(graph_node_label_filter(
+                        &["Article", "Featured"],
+                        LabelMatchMode::All,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(all.items.len(), 1);
+        assert_eq!(all.items[0].node_id, article);
+        assert_eq!(all.items[0].depth, 2);
+
+        db.close().unwrap();
+    }
+
+    #[test]
     fn test_traverse_cycle_safe_and_unique() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, a, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
@@ -3828,16 +3981,16 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let p1 = db
@@ -3864,16 +4017,16 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let p1 = db
@@ -3914,13 +4067,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let page = db
@@ -3943,10 +4096,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let page = db
@@ -3962,24 +4115,24 @@
     }
 
     #[test]
-    fn test_traverse_edge_filter_and_node_type_filter_is_emission_only() {
+    fn test_traverse_edge_filter_and_node_label_filter_is_emission_only() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let middle = db.upsert_node(2, "middle", UpsertNodeOptions::default()).unwrap();
-        let target = db.upsert_node(3, "target", UpsertNodeOptions::default()).unwrap();
-        let wrong_edge = db.upsert_node(3, "wrong-edge", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let middle = db.upsert_node("Company", "middle", UpsertNodeOptions::default()).unwrap();
+        let target = db.upsert_node("Article", "target", UpsertNodeOptions::default()).unwrap();
+        let wrong_edge = db.upsert_node("Article", "wrong-edge", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, middle, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, middle, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(middle, target, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(middle, target, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, wrong_edge, 20, UpsertEdgeOptions::default())
+        db.upsert_edge(start, wrong_edge, "REPORTS_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
-            .traverse(start, 2, &TraverseOptions { edge_type_filter: Some(vec![10]), node_type_filter: Some(vec![3]), ..Default::default() })
+            .traverse(start, 2, &TraverseOptions { edge_label_filter: Some(vec!["KNOWS".to_string()]), emit_node_label_filter: Some(graph_node_label_filter(&["Article"], LabelMatchMode::Any)), ..Default::default() })
             .unwrap();
 
         let pairs: Vec<(u64, u32)> = result.items.iter().map(|hit| (hit.node_id, hit.depth)).collect();
@@ -3993,16 +4146,16 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let incoming = db
@@ -4032,30 +4185,30 @@
     }
 
     #[test]
-    fn test_traverse_pagination_with_node_type_filter_uses_filtered_path() {
+    fn test_traverse_pagination_with_node_label_filter_uses_filtered_path() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let mid_a = db.upsert_node(2, "mid-a", UpsertNodeOptions::default()).unwrap();
-        let mid_b = db.upsert_node(2, "mid-b", UpsertNodeOptions::default()).unwrap();
-        let hit_a = db.upsert_node(3, "hit-a", UpsertNodeOptions::default()).unwrap();
-        let hit_b = db.upsert_node(3, "hit-b", UpsertNodeOptions::default()).unwrap();
-        let skip = db.upsert_node(4, "skip", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let mid_a = db.upsert_node("Company", "mid-a", UpsertNodeOptions::default()).unwrap();
+        let mid_b = db.upsert_node("Company", "mid-b", UpsertNodeOptions::default()).unwrap();
+        let hit_a = db.upsert_node("Article", "hit-a", UpsertNodeOptions::default()).unwrap();
+        let hit_b = db.upsert_node("Article", "hit-b", UpsertNodeOptions::default()).unwrap();
+        let skip = db.upsert_node("Topic", "skip", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, mid_a, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, mid_a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, mid_b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, mid_b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(mid_a, hit_a, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(mid_a, hit_a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(mid_a, skip, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(mid_a, skip, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(mid_b, hit_b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(mid_b, hit_b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let p1 = db
-            .traverse(start, 2, &TraverseOptions { node_type_filter: Some(vec![3]), limit: Some(1), ..Default::default() })
+            .traverse(start, 2, &TraverseOptions { emit_node_label_filter: Some(graph_node_label_filter(&["Article"], LabelMatchMode::Any)), limit: Some(1), ..Default::default() })
             .unwrap();
         assert_eq!(
             p1.items
@@ -4073,7 +4226,7 @@
         );
 
         let p2 = db
-            .traverse(start, 2, &TraverseOptions { node_type_filter: Some(vec![3]), limit: Some(1), cursor: p1.next_cursor.clone(), ..Default::default() })
+            .traverse(start, 2, &TraverseOptions { emit_node_label_filter: Some(graph_node_label_filter(&["Article"], LabelMatchMode::Any)), limit: Some(1), cursor: p1.next_cursor.clone(), ..Default::default() })
             .unwrap();
         assert_eq!(
             p2.items
@@ -4092,26 +4245,26 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node("Person", "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
         let hidden_target = db
-            .upsert_node(1, "hidden-target", UpsertNodeOptions::default())
+            .upsert_node("Person", "hidden-target", UpsertNodeOptions::default())
             .unwrap();
-        let deleted = db.upsert_node(1, "deleted", UpsertNodeOptions::default()).unwrap();
-        let future = db.upsert_node(1, "future", UpsertNodeOptions::default()).unwrap();
-        let visible = db.upsert_node(1, "visible", UpsertNodeOptions::default()).unwrap();
+        let deleted = db.upsert_node("Person", "deleted", UpsertNodeOptions::default()).unwrap();
+        let future = db.upsert_node("Person", "future", UpsertNodeOptions::default()).unwrap();
+        let visible = db.upsert_node("Person", "visible", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, hidden, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() })
+        db.upsert_edge(start, hidden, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() })
             .unwrap();
         db.upsert_edge(
-            hidden, hidden_target, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() },
+            hidden, hidden_target, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() },
         )
         .unwrap();
-        db.upsert_edge(start, deleted, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() })
+        db.upsert_edge(start, deleted, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() })
             .unwrap();
-        db.upsert_edge(start, future, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(5_000), valid_to: Some(6_000), ..Default::default() })
+        db.upsert_edge(start, future, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(5_000), valid_to: Some(6_000), ..Default::default() })
             .unwrap();
-        db.upsert_edge(start, visible, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() })
+        db.upsert_edge(start, visible, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(i64::MAX), ..Default::default() })
             .unwrap();
         db.delete_node(deleted).unwrap();
         db.set_prune_policy(
@@ -4119,7 +4272,7 @@
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
@@ -4139,16 +4292,16 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let keep_a = db.upsert_node(1, "keep-a", UpsertNodeOptions::default()).unwrap();
-        let hidden = db.upsert_node(1, "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-        let keep_b = db.upsert_node(1, "keep-b", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let keep_a = db.upsert_node("Person", "keep-a", UpsertNodeOptions::default()).unwrap();
+        let hidden = db.upsert_node("Person", "hidden", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let keep_b = db.upsert_node("Person", "keep-b", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, keep_a, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, keep_a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, hidden, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, hidden, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, keep_b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, keep_b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         db.set_prune_policy(
@@ -4156,7 +4309,7 @@
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
@@ -4199,16 +4352,16 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let hidden_start = db.upsert_node(1, "hidden-start", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
-        let next = db.upsert_node(1, "next", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(hidden_start, next, 10, UpsertEdgeOptions::default())
+        let hidden_start = db.upsert_node("Person", "hidden-start", UpsertNodeOptions { weight: 0.2, ..Default::default() }).unwrap();
+        let next = db.upsert_node("Person", "next", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(hidden_start, next, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.set_prune_policy(
             "low_weight",
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
@@ -4234,16 +4387,16 @@
         let db_path = dir.path().join("db");
         let db = open_imm(&db_path);
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(start, d, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, d, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let baseline = db
@@ -4277,18 +4430,18 @@
         let db_path = dir.path().join("db");
         let db = open_imm(&db_path);
 
-        let start = db.upsert_node(1, "start", UpsertNodeOptions::default()).unwrap();
-        let middle = db.upsert_node(1, "middle", UpsertNodeOptions::default()).unwrap();
-        let target = db.upsert_node(1, "target", UpsertNodeOptions::default()).unwrap();
+        let start = db.upsert_node("Person", "start", UpsertNodeOptions::default()).unwrap();
+        let middle = db.upsert_node("Person", "middle", UpsertNodeOptions::default()).unwrap();
+        let target = db.upsert_node("Person", "target", UpsertNodeOptions::default()).unwrap();
 
-        db.upsert_edge(start, middle, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(start, middle, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         let older_edge = db
-            .upsert_edge(middle, target, 10, UpsertEdgeOptions::default())
+            .upsert_edge(middle, target, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
         let newer_edge = db
-            .upsert_edge(middle, target, 11, UpsertEdgeOptions::default())
+            .upsert_edge(middle, target, "BLOCKS", UpsertEdgeOptions::default())
             .unwrap();
         assert!(older_edge < newer_edge);
 
@@ -4308,8 +4461,8 @@
         engine: &DatabaseEngine,
         start: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
-        node_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[&str]>,
+        node_label_filter: Option<&[&str]>,
         at_epoch: Option<i64>,
         decay_lambda: Option<f64>,
         limit: Option<usize>,
@@ -4319,8 +4472,9 @@
             .traverse(start, 2, &TraverseOptions {
                 min_depth: 2,
                 direction,
-                edge_type_filter: edge_type_filter.map(|s| s.to_vec()),
-                node_type_filter: node_type_filter.map(|s| s.to_vec()),
+                edge_label_filter: edge_label_filter.map(graph_filter_names),
+                emit_node_label_filter: node_label_filter
+                    .map(|labels| graph_node_label_filter(labels, LabelMatchMode::Any)),
                 at_epoch,
                 decay_lambda,
                 limit,
@@ -4335,15 +4489,15 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        let e = engine.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
-        engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
-        engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
-        engine.upsert_edge(b, d, 1, UpsertEdgeOptions::default()).unwrap();
-        engine.upsert_edge(b, e, 1, UpsertEdgeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        let e = engine.upsert_node("Person", "e", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, d, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, e, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
 
         let p1 = traverse_depth_two_page(
             &engine,
@@ -4390,17 +4544,17 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         for i in 0..5 {
             let b = engine
-                .upsert_node(1, &format!("b{i}"), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("b{i}"), UpsertNodeOptions::default())
                 .unwrap();
-            engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
+            engine.upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
             for j in 0..2 {
                 let c = engine
-                    .upsert_node(1, &format!("c{i}_{j}"), UpsertNodeOptions::default())
+                    .upsert_node("Person", &format!("c{i}_{j}"), UpsertNodeOptions::default())
                     .unwrap();
-                engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
+                engine.upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
             }
         }
 
@@ -4445,11 +4599,11 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
-        engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
 
         let page = traverse_depth_two_page(
             &engine,
@@ -4475,22 +4629,22 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(10, "c", UpsertNodeOptions::default()).unwrap();
-        let d = engine.upsert_node(10, "d", UpsertNodeOptions::default()).unwrap();
-        let e = engine.upsert_node(20, "e", UpsertNodeOptions::default()).unwrap();
-        engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
-        engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
-        engine.upsert_edge(b, d, 2, UpsertEdgeOptions::default()).unwrap();
-        engine.upsert_edge(b, e, 1, UpsertEdgeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Document", "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node("Document", "d", UpsertNodeOptions::default()).unwrap();
+        let e = engine.upsert_node("Group", "e", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, d, "WORKS_AT", UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, e, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
 
         let hits = traverse_depth_two_page(
             &engine,
             a,
             Direction::Outgoing,
-            Some(&[1]),
-            Some(&[10]),
+            Some(&["RELATES_TO"]),
+            Some(&["Document"]),
             None,
             None,
             None,
@@ -4506,15 +4660,15 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        engine.upsert_edge(a, b, 1, UpsertEdgeOptions::default()).unwrap();
-        engine.upsert_edge(b, c, 1, UpsertEdgeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
+        engine.upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
         engine.flush().unwrap();
 
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        engine.upsert_edge(b, d, 1, UpsertEdgeOptions::default()).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        engine.upsert_edge(b, d, "RELATES_TO", UpsertEdgeOptions::default()).unwrap();
 
         let page = traverse_depth_two_page(
             &engine,
@@ -4545,13 +4699,13 @@
 
         // Create edge and flush to segment
         let e1 = engine
-            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
+            .upsert_edge(1, 2, "KNOWS", UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         engine.flush().unwrap();
 
         // Upsert same triple, should find existing in segment and reuse ID
         let e2 = engine
-            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
+            .upsert_edge(1, 2, "KNOWS", UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         assert_eq!(e1, e2, "same triple should reuse edge ID across flush");
 
@@ -4561,7 +4715,7 @@
 
         // Different triple still gets new ID
         let e3 = engine
-            .upsert_edge(1, 2, 20, UpsertEdgeOptions::default())
+            .upsert_edge(1, 2, "REPORTS_TO", UpsertEdgeOptions::default())
             .unwrap();
         assert_ne!(e1, e3);
 
@@ -4575,10 +4729,10 @@
 
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let n1 = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let n2 = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let n1 = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let n2 = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let eid = engine
-            .upsert_edge(n1, n2, 1, UpsertEdgeOptions { weight: 0.42, ..Default::default() })
+            .upsert_edge(n1, n2, "RELATES_TO", UpsertEdgeOptions { weight: 0.42, ..Default::default() })
             .unwrap();
         engine.flush().unwrap();
 
@@ -4610,7 +4764,7 @@
 
         // Create edge and flush (segment 1 has the edge)
         let e1 = engine
-            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
+            .upsert_edge(1, 2, "KNOWS", UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         engine.flush().unwrap();
 
@@ -4621,7 +4775,7 @@
         // Now both segments are on disk, memtable is clean.
         // Upserting the same triple should get a NEW ID, not resurrect the deleted edge.
         let e2 = engine
-            .upsert_edge(1, 2, 10, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
+            .upsert_edge(1, 2, "KNOWS", UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         assert_ne!(
             e1, e2,
@@ -4641,23 +4795,23 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let e = engine.upsert_node(1, "e", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let e = engine.upsert_node("Person", "e", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.1, ..Default::default() })
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions { weight: 0.1, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
+            .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, d, 1, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
+            .upsert_edge(a, d, "RELATES_TO", UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, e, 1, UpsertEdgeOptions { weight: 0.3, ..Default::default() })
+            .upsert_edge(a, e, "RELATES_TO", UpsertEdgeOptions { weight: 0.3, ..Default::default() })
             .unwrap();
 
         // Top 2 by weight: c (0.9) and d (0.5)
@@ -4679,20 +4833,20 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         // Edges with explicit valid_from to control recency
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(1000), valid_to: None, ..Default::default() })
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions { weight: 1.0, valid_from: Some(1000), valid_to: None, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(3000), valid_to: None, ..Default::default() })
+            .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions { weight: 1.0, valid_from: Some(3000), valid_to: None, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, d, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(2000), valid_to: None, ..Default::default() })
+            .upsert_edge(a, d, "RELATES_TO", UpsertEdgeOptions { weight: 1.0, valid_from: Some(2000), valid_to: None, ..Default::default() })
             .unwrap();
 
         // Top 2 by recency: c (3000) and d (2000)
@@ -4712,10 +4866,10 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -4724,13 +4878,13 @@
 
         // b: high weight but old, c: medium weight and recent, d: low weight very recent
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(now - 7_200_000), valid_to: None, ..Default::default() })
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions { weight: 1.0, valid_from: Some(now - 7_200_000), valid_to: None, ..Default::default() })
             .unwrap(); // 2 hours ago
         engine
-            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.8, valid_from: Some(now - 600_000), valid_to: None, ..Default::default() })
+            .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions { weight: 0.8, valid_from: Some(now - 600_000), valid_to: None, ..Default::default() })
             .unwrap(); // 10 min ago
         engine
-            .upsert_edge(a, d, 1, UpsertEdgeOptions { weight: 0.3, valid_from: Some(now - 60_000), valid_to: None, ..Default::default() })
+            .upsert_edge(a, d, "RELATES_TO", UpsertEdgeOptions { weight: 0.3, valid_from: Some(now - 60_000), valid_to: None, ..Default::default() })
             .unwrap(); // 1 min ago
 
         // With strong decay (lambda=1.0), recent edges should beat old heavy ones
@@ -4752,10 +4906,10 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let result = engine
@@ -4772,14 +4926,14 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.3, ..Default::default() })
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions { weight: 0.3, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.7, ..Default::default() })
+            .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions { weight: 0.7, ..Default::default() })
             .unwrap();
 
         // k=10 but only 2 neighbors. Returns all 2, sorted desc
@@ -4794,29 +4948,29 @@
     }
 
     #[test]
-    fn test_top_k_with_type_filter() {
+    fn test_top_k_with_label_filter() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 2, UpsertEdgeOptions { weight: 0.8, ..Default::default() })
+            .upsert_edge(a, c, "WORKS_AT", UpsertEdgeOptions { weight: 0.8, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, d, 1, UpsertEdgeOptions { weight: 0.7, ..Default::default() })
+            .upsert_edge(a, d, "RELATES_TO", UpsertEdgeOptions { weight: 0.7, ..Default::default() })
             .unwrap();
 
-        // Top 1 of edge type 1 only
+        // Top 1 for the RELATES_TO edge label only.
         let result = engine
-            .top_k_neighbors(a, 1, &TopKOptions { type_filter: Some(vec![1]), ..Default::default() })
+            .top_k_neighbors(a, 1, &TopKOptions { edge_label_filter: Some(vec!["RELATES_TO".to_string()]), ..Default::default() })
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].node_id, b);
@@ -4830,15 +4984,15 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.8, ..Default::default() })
+            .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions { weight: 0.8, ..Default::default() })
             .unwrap();
 
         engine.delete_node(b).unwrap();
@@ -4858,16 +5012,16 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
         engine.flush().unwrap();
 
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         engine
-            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 0.9, ..Default::default() })
+            .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions { weight: 0.9, ..Default::default() })
             .unwrap();
 
         // Top 1 should be c (0.9) from memtable, beating b (0.5) from segment
@@ -4886,7 +5040,7 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
         let result = engine.top_k_neighbors(a, 5, &TopKOptions { scoring: ScoringMode::DecayAdjusted { lambda: -1.0 }, ..Default::default() });
         assert!(result.is_err());
@@ -4905,18 +5059,18 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
         let e_ab = engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+            .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
+            .upsert_edge(c, d, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -4938,18 +5092,18 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+            .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
+            .upsert_edge(c, d, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -4970,21 +5124,21 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, d, 1, UpsertEdgeOptions::default())
+            .upsert_edge(b, d, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
+            .upsert_edge(c, d, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5008,17 +5162,17 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+            .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         let e_ca = engine
-            .upsert_edge(c, a, 1, UpsertEdgeOptions::default())
+            .upsert_edge(c, a, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5042,13 +5196,13 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let e_aa = engine
-            .upsert_edge(a, a, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, a, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         let e_ab = engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5071,10 +5225,10 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5112,11 +5266,11 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let _c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let _c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5136,14 +5290,14 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+            .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5164,14 +5318,14 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(c, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5186,36 +5340,163 @@
     }
 
     #[test]
-    fn test_subgraph_edge_type_filter() {
-        // A→B (type 1), A→C (type 2), B→D (type 1).
-        // Filter by type 1 → A, B, D (not C).
+    fn test_subgraph_edge_label_filter() {
+        // A→B (label 1), A→C (label 2), B→D (label 1).
+        // Filter by label 1 → A, B, D (not C).
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(a, c, 2, UpsertEdgeOptions::default())
+            .upsert_edge(a, c, "WORKS_AT", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, d, 1, UpsertEdgeOptions::default())
+            .upsert_edge(b, d, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
-            .extract_subgraph(a, 2, &SubgraphOptions { edge_type_filter: Some(vec![1]), ..Default::default() })
+            .extract_subgraph(a, 2, &SubgraphOptions { edge_label_filter: Some(vec!["RELATES_TO".to_string()]), ..Default::default() })
             .unwrap();
 
         let node_ids: NodeIdSet = sg.nodes.iter().map(|n| n.id).collect();
         assert_eq!(node_ids, NodeIdSet::from_iter([a, b, d]));
         assert_eq!(sg.edges.len(), 2);
-        // All edges should be type 1
-        assert!(sg.edges.iter().all(|e| e.type_id == 1));
+        // All edges should be label 1
+        assert!(sg.edges.iter().all(|e| e.label == "RELATES_TO".to_string()));
+
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_subgraph_node_label_filter_uses_single_any_all_eligibility() {
+        let dir = TempDir::new().unwrap();
+        let engine = DatabaseEngine::open(&dir.path().join("testdb"), &DbOptions::default()).unwrap();
+
+        let root = engine
+            .upsert_node(
+                &["Person", "Featured"],
+                "root",
+                UpsertNodeOptions::default(),
+            )
+            .unwrap();
+        let bridge = engine
+            .upsert_node("Person", "bridge", UpsertNodeOptions::default())
+            .unwrap();
+        let target = engine
+            .upsert_node(
+                &["Person", "Featured"],
+                "target",
+                UpsertNodeOptions::default(),
+            )
+            .unwrap();
+        let blocked = engine
+            .upsert_node(
+                &["Company", "Featured"],
+                "blocked",
+                UpsertNodeOptions::default(),
+            )
+            .unwrap();
+
+        engine
+            .upsert_edge(root, bridge, "RELATES_TO", UpsertEdgeOptions::default())
+            .unwrap();
+        engine
+            .upsert_edge(bridge, target, "RELATES_TO", UpsertEdgeOptions::default())
+            .unwrap();
+        engine
+            .upsert_edge(root, target, "RELATES_TO", UpsertEdgeOptions::default())
+            .unwrap();
+        engine
+            .upsert_edge(root, blocked, "RELATES_TO", UpsertEdgeOptions::default())
+            .unwrap();
+
+        let person = engine
+            .extract_subgraph(
+                root,
+                2,
+                &SubgraphOptions {
+                    node_label_filter: Some(graph_node_label_filter(
+                        &["Person"],
+                        LabelMatchMode::Any,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            person.nodes.iter().map(|node| node.id).collect::<NodeIdSet>(),
+            NodeIdSet::from_iter([root, bridge, target])
+        );
+        assert_eq!(person.edges.len(), 3);
+
+        let any_featured_or_company = engine
+            .extract_subgraph(
+                root,
+                1,
+                &SubgraphOptions {
+                    node_label_filter: Some(graph_node_label_filter(
+                        &["Featured", "Company"],
+                        LabelMatchMode::Any,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            any_featured_or_company
+                .nodes
+                .iter()
+                .map(|node| node.id)
+                .collect::<NodeIdSet>(),
+            NodeIdSet::from_iter([root, target, blocked])
+        );
+        assert_eq!(any_featured_or_company.edges.len(), 2);
+
+        let all_person_featured = engine
+            .extract_subgraph(
+                root,
+                2,
+                &SubgraphOptions {
+                    node_label_filter: Some(graph_node_label_filter(
+                        &["Person", "Featured"],
+                        LabelMatchMode::All,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            all_person_featured
+                .nodes
+                .iter()
+                .map(|node| node.id)
+                .collect::<NodeIdSet>(),
+            NodeIdSet::from_iter([root, target])
+        );
+        assert_eq!(all_person_featured.edges.len(), 1);
+
+        let start_filtered = engine
+            .extract_subgraph(
+                bridge,
+                2,
+                &SubgraphOptions {
+                    node_label_filter: Some(graph_node_label_filter(
+                        &["Person", "Featured"],
+                        LabelMatchMode::All,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(start_filtered.nodes.is_empty());
+        assert!(start_filtered.edges.is_empty());
 
         engine.close().unwrap();
     }
@@ -5231,16 +5512,16 @@
         };
         let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine.flush().unwrap();
 
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+            .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5261,14 +5542,14 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+            .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine.delete_node(b).unwrap();
 
@@ -5291,14 +5572,14 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         let e1 = engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine.delete_edge(e1).unwrap();
 
@@ -5321,14 +5602,14 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(200), ..Default::default() })
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions { weight: 1.0, valid_from: Some(100), valid_to: Some(200), ..Default::default() })
             .unwrap();
         engine
-            .upsert_edge(a, c, 1, UpsertEdgeOptions { weight: 1.0, valid_from: Some(300), valid_to: Some(400), ..Default::default() })
+            .upsert_edge(a, c, "RELATES_TO", UpsertEdgeOptions { weight: 1.0, valid_from: Some(300), valid_to: Some(400), ..Default::default() })
             .unwrap();
 
         let sg_150 = engine
@@ -5353,14 +5634,14 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "hub", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "hub", UpsertNodeOptions::default()).unwrap();
         let mut expected = NodeIdSet::from_iter([a]);
         for i in 0..50 {
             let n = engine
-                .upsert_node(1, &format!("spoke_{}", i), UpsertNodeOptions::default())
+                .upsert_node("Person", &format!("spoke_{}", i), UpsertNodeOptions::default())
                 .unwrap();
             engine
-                .upsert_edge(a, n, 1, UpsertEdgeOptions::default())
+                .upsert_edge(a, n, "RELATES_TO", UpsertEdgeOptions::default())
                 .unwrap();
             expected.insert(n);
         }
@@ -5383,22 +5664,22 @@
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = engine.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = engine.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = engine.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        let e = engine.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = engine.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = engine.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        let e = engine.upsert_node("Person", "e", UpsertNodeOptions::default()).unwrap();
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(b, c, 1, UpsertEdgeOptions::default())
+            .upsert_edge(b, c, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(c, d, 1, UpsertEdgeOptions::default())
+            .upsert_edge(c, d, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
         engine
-            .upsert_edge(d, e, 1, UpsertEdgeOptions::default())
+            .upsert_edge(d, e, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5421,14 +5702,14 @@
 
         let mut props_a = BTreeMap::new();
         props_a.insert("name".to_string(), PropValue::String("Alice".to_string()));
-        let a = engine.upsert_node(1, "a", UpsertNodeOptions { props: props_a, weight: 0.9, ..Default::default() }).unwrap();
+        let a = engine.upsert_node("Person", "a", UpsertNodeOptions { props: props_a, weight: 0.9, ..Default::default() }).unwrap();
 
         let mut props_b = BTreeMap::new();
         props_b.insert("name".to_string(), PropValue::String("Bob".to_string()));
-        let b = engine.upsert_node(2, "b", UpsertNodeOptions { props: props_b, weight: 0.7, ..Default::default() }).unwrap();
+        let b = engine.upsert_node("Company", "b", UpsertNodeOptions { props: props_b, weight: 0.7, ..Default::default() }).unwrap();
 
         engine
-            .upsert_edge(a, b, 1, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "RELATES_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let sg = engine
@@ -5436,7 +5717,7 @@
             .unwrap();
 
         let node_a = sg.nodes.iter().find(|n| n.id == a).unwrap();
-        assert_eq!(node_a.type_id, 1);
+        assert_eq!(node_a.labels.as_slice(), ["Person"]);
         assert_eq!(node_a.key, "a");
         assert_eq!(
             node_a.props.get("name"),
@@ -5444,7 +5725,7 @@
         );
 
         let node_b = sg.nodes.iter().find(|n| n.id == b).unwrap();
-        assert_eq!(node_b.type_id, 2);
+        assert_eq!(node_b.labels.as_slice(), ["Company"]);
         assert_eq!(
             node_b.props.get("name"),
             Some(&PropValue::String("Bob".to_string()))
@@ -5459,14 +5740,14 @@
     fn test_neighbors_batch_basic() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
@@ -5485,21 +5766,21 @@
         let mut ids = Vec::new();
         for i in 0..5 {
             ids.push(
-                db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
+                db.upsert_node("Person", &format!("n{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
                     .unwrap(),
             );
         }
-        db.upsert_edge(ids[0], ids[1], 10, UpsertEdgeOptions::default())
+        db.upsert_edge(ids[0], ids[1], "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(ids[0], ids[2], 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(ids[0], ids[2], "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(ids[1], ids[2], 20, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        db.upsert_edge(ids[1], ids[2], "REPORTS_TO", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
-        db.upsert_edge(ids[2], ids[3], 10, UpsertEdgeOptions { weight: 1.5, ..Default::default() })
+        db.upsert_edge(ids[2], ids[3], "KNOWS", UpsertEdgeOptions { weight: 1.5, ..Default::default() })
             .unwrap();
-        db.upsert_edge(ids[3], ids[4], 20, UpsertEdgeOptions { weight: 0.5, ..Default::default() })
+        db.upsert_edge(ids[3], ids[4], "REPORTS_TO", UpsertEdgeOptions { weight: 0.5, ..Default::default() })
             .unwrap();
-        db.upsert_edge(ids[4], ids[0], 10, UpsertEdgeOptions::default())
+        db.upsert_edge(ids[4], ids[0], "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let batch = db
@@ -5521,22 +5802,22 @@
     }
 
     #[test]
-    fn test_neighbors_batch_with_type_filter() {
+    fn test_neighbors_batch_with_label_filter() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "REPORTS_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
-            .neighbors_batch(&[a], &NeighborOptions { direction: Direction::Outgoing, type_filter: Some(vec![10]), ..Default::default() })
+            .neighbors_batch(&[a], &NeighborOptions { direction: Direction::Outgoing, edge_label_filter: Some(vec!["KNOWS".to_string()]), ..Default::default() })
             .unwrap();
         assert_eq!(result.get(&a).unwrap().len(), 1);
-        assert_eq!(result[&a][0].edge_type_id, 10);
+        assert_eq!(result[&a][0].label, "KNOWS".to_string());
         db.close().unwrap();
     }
 
@@ -5544,19 +5825,19 @@
     fn test_neighbors_batch_cross_segment() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
-        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
         db.flush().unwrap();
 
-        let d = db.upsert_node(1, "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        db.upsert_edge(b, d, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() })
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() })
             .unwrap();
 
         let result = db
@@ -5571,14 +5852,14 @@
     fn test_neighbors_batch_dedup_across_sources() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
         // Re-upsert same edge triple. Should dedup (triple lookup across segments)
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
 
         // Batch and individual MUST return the same results
@@ -5603,13 +5884,13 @@
     fn test_neighbors_batch_respects_tombstones() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let e1 = db
-            .upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         db.flush().unwrap();
 
@@ -5628,12 +5909,12 @@
     fn test_neighbors_batch_direction_both() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(c, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
@@ -5648,12 +5929,12 @@
     fn test_neighbors_batch_self_loop_dedup() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         // Self-loop: A→A appears in both adj_out and adj_in
-        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let result = db
@@ -5688,12 +5969,12 @@
     fn test_neighbors_batch_unsorted_input() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(c, a, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        db.upsert_edge(c, a, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
 
         // Input in reverse order. Batch method sorts internally
@@ -5714,7 +5995,7 @@
         let mut node_ids = Vec::new();
         for i in 0..50 {
             node_ids.push(
-                db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
+                db.upsert_node("Person", &format!("n{}", i), UpsertNodeOptions { weight: 0.5, ..Default::default() })
                     .unwrap(),
             );
         }
@@ -5722,11 +6003,11 @@
             let t1 = (i + 1) % 50;
             let t2 = (i + 25) % 50;
             db.upsert_edge(
-                node_ids[i], node_ids[t1], 10, UpsertEdgeOptions::default(),
+                node_ids[i], node_ids[t1], "KNOWS", UpsertEdgeOptions::default(),
             )
             .unwrap();
             db.upsert_edge(
-                node_ids[i], node_ids[t2], 20, UpsertEdgeOptions { weight: 0.5, ..Default::default() },
+                node_ids[i], node_ids[t2], "REPORTS_TO", UpsertEdgeOptions { weight: 0.5, ..Default::default() },
             )
             .unwrap();
         }
@@ -5737,7 +6018,7 @@
         for i in 0..10 {
             let t = (i + 5) % 50;
             db.upsert_edge(
-                node_ids[i], node_ids[t], 30, UpsertEdgeOptions { weight: 0.3, ..Default::default() },
+                node_ids[i], node_ids[t], "RATES", UpsertEdgeOptions { weight: 0.3, ..Default::default() },
             )
             .unwrap();
         }
@@ -5771,8 +6052,8 @@
     fn test_self_loop_neighbors_outgoing() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
 
         let out = db
@@ -5803,14 +6084,14 @@
     fn test_self_loop_survives_flush_and_compact() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let e = db
-            .upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() })
+            .upsert_edge(a, a, "KNOWS", UpsertEdgeOptions { weight: 2.5, ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
         // Add a second segment to enable compaction
-        let _b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let _b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         db.flush().unwrap();
         db.compact().unwrap();
 
@@ -5838,8 +6119,8 @@
     fn test_self_loop_in_top_k() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions { weight: 5.0, ..Default::default() })
             .unwrap();
 
         let top = db
@@ -5858,15 +6139,15 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
         // a→b (w=2.0), a→c (w=3.0), b→c (w=1.5)
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 1.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions { weight: 1.5, ..Default::default() }).unwrap();
 
         let ea = db.degree_cache_entry(a);
         assert_eq!(ea.out_degree, 2);
@@ -5900,10 +6181,10 @@
         let path = dir.path().join("db");
         {
             let db = open_imm(&path);
-            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
-            db.upsert_edge(b, a, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() }).unwrap();
+            let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
+            db.upsert_edge(b, a, "KNOWS", UpsertEdgeOptions { weight: 2.5, ..Default::default() }).unwrap();
             db.flush().unwrap();
             db.close().unwrap();
         }
@@ -5931,14 +6212,14 @@
         let path = dir.path().join("db");
         {
             let db = open_imm(&path);
-            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
             // a→b in segment
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
             // a→c in WAL (unflushed)
-            db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+            db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
             db.close().unwrap();
         }
 
@@ -5963,11 +6244,11 @@
         let path = dir.path().join("db");
         {
             let db = open_imm(&path);
-            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-            let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-            db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+            let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+            let e1 = db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
             db.flush().unwrap();
             // Delete one edge. Tombstone in WAL.
             db.delete_edge(e1).unwrap();
@@ -5995,12 +6276,12 @@
         let path = dir.path().join("db");
         {
             let db = open_imm(&path);
-            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
             // Self-loop on a
-            db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
+            db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
             // Normal edge a→b
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
             db.close().unwrap();
         }
 
@@ -6036,25 +6317,25 @@
 
             let mut nodes = Vec::new();
             for i in 0..10 {
-                nodes.push(db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default()).unwrap());
+                nodes.push(db.upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default()).unwrap());
             }
 
             // Chain: 0→1→2→...→9
             for i in 0..9 {
-                db.upsert_edge(nodes[i], nodes[i + 1], 10, UpsertEdgeOptions { weight: (i as f32) + 0.5, ..Default::default() }).unwrap();
+                db.upsert_edge(nodes[i], nodes[i + 1], "KNOWS", UpsertEdgeOptions { weight: (i as f32) + 0.5, ..Default::default() }).unwrap();
             }
             // Hub: node 0 → all others (2..10)
             for i in 2..10 {
-                db.upsert_edge(nodes[0], nodes[i], 20, UpsertEdgeOptions::default()).unwrap();
+                db.upsert_edge(nodes[0], nodes[i], "REPORTS_TO", UpsertEdgeOptions::default()).unwrap();
             }
             // Self-loop on node 5
-            db.upsert_edge(nodes[5], nodes[5], 10, UpsertEdgeOptions { weight: 7.0, ..Default::default() }).unwrap();
+            db.upsert_edge(nodes[5], nodes[5], "KNOWS", UpsertEdgeOptions { weight: 7.0, ..Default::default() }).unwrap();
 
             // Flush half to segments
             db.flush().unwrap();
 
             // Add edge in WAL (unflushed)
-            db.upsert_edge(nodes[9], nodes[0], 10, UpsertEdgeOptions { weight: 0.1, ..Default::default() }).unwrap();
+            db.upsert_edge(nodes[9], nodes[0], "KNOWS", UpsertEdgeOptions { weight: 0.1, ..Default::default() }).unwrap();
             db.close().unwrap();
         }
 
@@ -6097,15 +6378,15 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         // Before any edges: cache should be empty for these nodes
         assert_eq!(db.degree_cache_entry(a).out_degree, 0);
         assert_eq!(db.degree_cache_entry(b).in_degree, 0);
 
         // Insert edge a→b
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.5, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.5, ..Default::default() }).unwrap();
 
         let ea = db.degree_cache_entry(a);
         assert_eq!(ea.out_degree, 1);
@@ -6127,16 +6408,16 @@
         let opts = DbOptions { edge_uniqueness: true, ..Default::default() };
         let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         // Insert edge a→b with weight 2.0
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
         assert_eq!(db.degree_cache_entry(a).out_degree, 1);
         assert!((db.degree_cache_entry(a).out_weight_sum - 2.0).abs() < 1e-10);
 
-        // Update same edge (same from, to, type_id) with weight 5.0
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 5.0, ..Default::default() }).unwrap();
+        // Update same edge (same from, to, label_id) with weight 5.0
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 5.0, ..Default::default() }).unwrap();
 
         // Degree should NOT change, only weight
         let ea = db.degree_cache_entry(a);
@@ -6155,10 +6436,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
-        let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
+        let e1 = db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
         assert_eq!(db.degree_cache_entry(a).out_degree, 1);
 
         // Delete the edge (still in memtable, not flushed)
@@ -6179,12 +6460,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
-        let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
+        let e1 = db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
 
         // Flush to segments. Edges are now segment-only.
         db.flush().unwrap();
@@ -6209,14 +6490,14 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
         // a→b, b→c, c→a (triangle)
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(c, a, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(c, a, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         assert_eq!(db.degree_cache_entry(a).out_degree, 1);
         assert_eq!(db.degree_cache_entry(a).in_degree, 1);
@@ -6249,11 +6530,11 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         // Insert self-loop on a
-        let sl = db.upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
+        let sl = db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
 
         let ea = db.degree_cache_entry(a);
         assert_eq!(ea.out_degree, 1);
@@ -6264,7 +6545,7 @@
         assert_eq!((ea.out_degree + ea.in_degree - ea.self_loop_count) as u64, 1);
 
         // Add normal edge a→b
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let ea2 = db.degree_cache_entry(a);
         assert_eq!(ea2.out_degree, 2);
@@ -6293,10 +6574,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
-        let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let e1 = db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.delete_edge(e1).unwrap();
 
         let ea_after_first = db.degree_cache_entry(a);
@@ -6323,14 +6604,14 @@
         {
             let db = open_imm(&path);
 
-            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
             // Insert edges
-            let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
-            db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
-            db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+            let e1 = db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+            db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 3.0, ..Default::default() }).unwrap();
+            db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
             assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
             assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap(), 2);
@@ -6350,7 +6631,7 @@
             assert_eq!(db.degree(b, &DegreeOptions { direction: Direction::Incoming, ..Default::default() }).unwrap(), 0);
 
             // Add more edges and flush again for compaction
-            db.upsert_edge(c, a, 10, UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
+            db.upsert_edge(c, a, "KNOWS", UpsertEdgeOptions { weight: 4.0, ..Default::default() }).unwrap();
             db.flush().unwrap();
 
             // Compact
@@ -6378,28 +6659,28 @@
 
     #[test]
     fn test_degree_cache_filtered_queries_bypass_cache() {
-        // Verify that type-filtered and temporal queries still use the walk path
+        // Verify that label-filtered and temporal queries still use the walk path
         // (they should return different results from the cache-backed unfiltered path
-        // when type filtering narrows the result set).
+        // when label filtering narrows the result set).
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
-        // a→b with type 10, a→c with type 20
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default()).unwrap();
+        // a→b with label 10, a→c with label 20
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, c, "REPORTS_TO", UpsertEdgeOptions::default()).unwrap();
 
         // Unfiltered: both edges
         assert_eq!(db.degree(a, &DegreeOptions::default()).unwrap(), 2);
 
-        // Type-filtered: only type 10 (uses walk path, not cache)
-        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![10]), ..Default::default() }).unwrap(), 1);
+        // Label-filtered: only label 10 (uses walk path, not cache)
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, edge_label_filter: Some(vec!["KNOWS".to_string()]), ..Default::default() }).unwrap(), 1);
 
-        // Type-filtered: only type 20
-        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, type_filter: Some(vec![20]), ..Default::default() }).unwrap(), 1);
+        // Label-filtered: only label 20
+        assert_eq!(db.degree(a, &DegreeOptions { direction: Direction::Outgoing, edge_label_filter: Some(vec!["REPORTS_TO".to_string()]), ..Default::default() }).unwrap(), 1);
 
         // Temporal: at_epoch=Some(now) should still work via walk
         let now = std::time::SystemTime::now()
@@ -6421,19 +6702,19 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         // Timeless edge. Cache should be used.
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         let entry_a = db.degree_cache_entry(a);
         assert_eq!(entry_a.temporal_edge_count, 0);
         assert_eq!(entry_a.out_degree, 1);
 
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         // Temporal edge (valid_to = now + 10 seconds)
         let future_expiry = now_millis() + 10_000;
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
             .unwrap();
 
         // Node a now has temporal_edge_count > 0
@@ -6459,12 +6740,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         let future_expiry = now_millis() + 10_000;
         let e = db
-            .upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
+            .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
             .unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 1);
         assert_eq!(db.degree_cache_entry(b).temporal_edge_count, 1);
@@ -6478,21 +6759,21 @@
     fn test_degree_cache_temporal_to_timeless_update() {
         // Updating an edge from temporal to timeless should decrement
         // temporal_edge_count. Requires edge_uniqueness so the second
-        // upsert replaces the first (same from/to/type_id).
+        // upsert replaces the first (same from/to/label_id).
         let dir = TempDir::new().unwrap();
         let opts = DbOptions { edge_uniqueness: true, ..Default::default() };
         let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         let future_expiry = now_millis() + 10_000;
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
             .unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 1);
 
         // Re-upsert same edge with valid_to = None (timeless)
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 0);
         assert_eq!(db.degree_cache_entry(b).temporal_edge_count, 0);
     }
@@ -6503,10 +6784,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
-        let e = db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let e = db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 0);
 
         // Invalidate (sets valid_to to past → temporal + not valid)
@@ -6524,11 +6805,11 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
 
         let future_expiry = now_millis() + 10_000;
         let e = db
-            .upsert_edge(a, a, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
+            .upsert_edge(a, a, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(future_expiry), ..Default::default() })
             .unwrap();
         assert_eq!(db.degree_cache_entry(a).temporal_edge_count, 1); // once, not twice
 
@@ -6544,15 +6825,15 @@
         let path = dir.path().join("db");
         {
             let db = open_imm(&path);
-            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
             // Timeless edge
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
             // Temporal edge
             let future = now_millis() + 100_000;
-            db.upsert_edge(a, c, 10, UpsertEdgeOptions { weight: 2.0, valid_from: None, valid_to: Some(future), ..Default::default() })
+            db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions { weight: 2.0, valid_from: None, valid_to: Some(future), ..Default::default() })
                 .unwrap();
             db.flush().unwrap();
             db.close().unwrap();
@@ -6560,11 +6841,11 @@
         {
             let db = open_imm(&path);
             // After reopen + rebuild, temporal count should reflect the temporal edge
-            let entry_a = db.degree_cache_entry(db.get_node_by_key(1, "a").unwrap().unwrap().id);
+            let entry_a = db.degree_cache_entry(db.get_node_by_key("Person", "a").unwrap().unwrap().id);
             assert_eq!(entry_a.temporal_edge_count, 1);
-            let entry_b = db.degree_cache_entry(db.get_node_by_key(1, "b").unwrap().unwrap().id);
+            let entry_b = db.degree_cache_entry(db.get_node_by_key("Person", "b").unwrap().unwrap().id);
             assert_eq!(entry_b.temporal_edge_count, 0);
-            let entry_c = db.degree_cache_entry(db.get_node_by_key(1, "c").unwrap().unwrap().id);
+            let entry_c = db.degree_cache_entry(db.get_node_by_key("Person", "c").unwrap().unwrap().id);
             assert_eq!(entry_c.temporal_edge_count, 1);
         }
     }
@@ -6576,11 +6857,11 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         // Already expired (valid_to = 1ms after epoch)
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(1), ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: None, valid_to: Some(1), ..Default::default() }).unwrap();
 
         let entry = db.degree_cache_entry(a);
         assert_eq!(entry.out_degree, 0); // not counted (expired)
@@ -6599,12 +6880,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         // Future-dated edge: valid_from = far future, valid_to = infinity
         let far_future = i64::MAX - 1_000_000;
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(far_future), valid_to: None, ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(far_future), valid_to: None, ..Default::default() }).unwrap();
 
         let entry_a = db.degree_cache_entry(a);
         let entry_b = db.degree_cache_entry(b);
@@ -6635,10 +6916,10 @@
         let b;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
             let far_future = i64::MAX - 1_000_000;
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(far_future), valid_to: None, ..Default::default() }).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(far_future), valid_to: None, ..Default::default() }).unwrap();
             db.flush().unwrap();
             db.close().unwrap();
         }
@@ -6658,15 +6939,15 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let before = db.active_degree_overlay_for_test();
 
         let mut txn = db.begin_write_txn().unwrap();
         txn.upsert_edge(
             TxnNodeRef::Id(a),
             TxnNodeRef::Id(b),
-            10,
+            &"KNOWS".to_string(),
             UpsertEdgeOptions {
                 weight: 2.5,
                 ..Default::default()
@@ -6699,8 +6980,8 @@
         };
         let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
 
         let before_rollback = db.active_degree_overlay_for_test();
         let mut rollback_txn = db.begin_write_txn().unwrap();
@@ -6708,7 +6989,7 @@
             .upsert_edge(
                 TxnNodeRef::Id(a),
                 TxnNodeRef::Id(b),
-                10,
+                &"KNOWS".to_string(),
                 UpsertEdgeOptions::default(),
             )
             .unwrap();
@@ -6724,7 +7005,7 @@
             .upsert_edge(
                 TxnNodeRef::Id(a),
                 TxnNodeRef::Id(b),
-                10,
+                &"KNOWS".to_string(),
                 UpsertEdgeOptions {
                     weight: 2.0,
                     ..Default::default()
@@ -6734,7 +7015,7 @@
         db.upsert_edge(
             a,
             b,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 3.0,
                 ..Default::default()
@@ -6763,17 +7044,17 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let overlay_before_node_only = db.active_degree_overlay_for_test();
-        db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         assert!(std::sync::Arc::ptr_eq(
             &overlay_before_node_only,
             &db.active_degree_overlay_for_test()
         ));
 
         let stale = db.published_read_view_for_test();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
         assert_eq!(stale.degree_entry_for_test(a).out_degree, 0);
         assert_eq!(db.degree_cache_entry(a).out_degree, 1);
@@ -6786,14 +7067,14 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let now = now_millis();
         let first = EdgeRecord {
             id: 42,
             from: a,
             to: b,
-            type_id: 10,
+            label_id: 10,
             props: std::collections::BTreeMap::new(),
             created_at: now,
             updated_at: now,
@@ -6806,7 +7087,7 @@
         second.updated_at = now + 1;
         second.weight = 5.0;
 
-        db.write_op_batch(&[WalOp::UpsertEdge(first), WalOp::UpsertEdge(second)])
+        write_internal_wal_op_batch(&db, &[WalOp::UpsertEdge(first), WalOp::UpsertEdge(second)])
             .unwrap();
 
         let entry_a = db.degree_cache_entry(a);
@@ -6824,9 +7105,9 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() })
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() })
             .unwrap();
 
         db.flush().unwrap();
@@ -6840,11 +7121,11 @@
         assert_eq!(entry_a.out_degree, 1);
         assert!((entry_a.out_weight_sum - 2.0).abs() < 1e-10);
 
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(
             a,
             c,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 3.0,
                 ..Default::default()
@@ -6863,12 +7144,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
         db.compact().unwrap();
@@ -6888,12 +7169,12 @@
         let db = open_imm(&dir.path().join("db"));
 
         let hub = db
-            .upsert_node(1, "hub", UpsertNodeOptions::default())
+            .upsert_node("Person", "hub", UpsertNodeOptions::default())
             .unwrap();
         let mut leaves = Vec::new();
         for idx in 0..320 {
             leaves.push(
-                db.upsert_node(1, &format!("leaf-{idx}"), UpsertNodeOptions::default())
+                db.upsert_node("Person", &format!("leaf-{idx}"), UpsertNodeOptions::default())
                     .unwrap(),
             );
         }
@@ -6904,7 +7185,7 @@
                 db.upsert_edge(
                     hub,
                     leaf,
-                    10,
+                    "KNOWS",
                     UpsertEdgeOptions {
                         weight: 1.5,
                         ..Default::default()
@@ -6943,13 +7224,13 @@
         };
         let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(
             a,
             b,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 2.0,
                 ..Default::default()
@@ -6960,7 +7241,7 @@
             .upsert_edge(
                 a,
                 c,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 4.0,
                     ..Default::default()
@@ -6972,7 +7253,7 @@
         db.upsert_edge(
             a,
             b,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 5.0,
                 ..Default::default()
@@ -7009,12 +7290,12 @@
         let c;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
-            db.upsert_edge(a, c, 10, UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
             db.close().unwrap();
         }
@@ -7042,12 +7323,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
-        db.upsert_edge(a, c, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
         db.set_prune_policy(
@@ -7055,7 +7336,7 @@
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.0),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
@@ -7204,7 +7485,7 @@
             id,
             from,
             to,
-            type_id: 10,
+            label_id: 10,
             props: std::collections::BTreeMap::new(),
             created_at: 1_000,
             updated_at: 1_500,
@@ -7221,7 +7502,7 @@
             id,
             from,
             to,
-            type_id: 10,
+            label_id: 10,
             props: std::collections::BTreeMap::new(),
             created_at: 1_000,
             updated_at: now,
@@ -7237,13 +7518,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(
             a,
             b,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 2.0,
                 ..Default::default()
@@ -7253,7 +7534,7 @@
         db.upsert_edge(
             a,
             c,
-            20,
+            "REPORTS_TO",
             UpsertEdgeOptions {
                 weight: 3.0,
                 ..Default::default()
@@ -7275,7 +7556,7 @@
             &db,
             a,
             DegreeOptions {
-                type_filter: Some(vec![10]),
+                edge_label_filter: Some(vec!["KNOWS".to_string()]),
                 ..Default::default()
             },
             1,
@@ -7303,7 +7584,7 @@
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.0),
-                type_id: None,
+                label: None,
             },
         )
         .unwrap();
@@ -7326,12 +7607,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         db.upsert_edge(
             a,
             b,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 weight: 2.0,
                 ..Default::default()
@@ -7384,12 +7665,12 @@
         let a;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
             db.upsert_edge(
                 a,
                 b,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 2.0,
                     ..Default::default()
@@ -7417,16 +7698,16 @@
         let temporal_dir = TempDir::new().unwrap();
         let temporal = open_imm(&temporal_dir.path().join("db"));
         let x = temporal
-            .upsert_node(1, "x", UpsertNodeOptions::default())
+            .upsert_node("Person", "x", UpsertNodeOptions::default())
             .unwrap();
         let y = temporal
-            .upsert_node(1, "y", UpsertNodeOptions::default())
+            .upsert_node("Person", "y", UpsertNodeOptions::default())
             .unwrap();
         temporal
             .upsert_edge(
                 x,
                 y,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 4.0,
                     valid_to: Some(now_millis() + 10_000),
@@ -7454,9 +7735,9 @@
         let a;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            db.write_op(&WalOp::UpsertEdge(historical_temporal_edge(42, a, b, 2.0)))
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            write_internal_wal_op(&db, &WalOp::UpsertEdge(historical_temporal_edge(42, a, b, 2.0)))
                 .unwrap();
 
             assert_scalar_degree_family_routes(
@@ -7471,7 +7752,7 @@
             );
 
             db.flush().unwrap();
-            db.write_op(&WalOp::DeleteEdge {
+            write_internal_wal_op(&db, &WalOp::DeleteEdge {
                 id: 42,
                 deleted_at: now_millis(),
             })
@@ -7513,13 +7794,13 @@
         let a;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            db.write_op(&WalOp::UpsertEdge(historical_temporal_edge(42, a, b, 2.0)))
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            write_internal_wal_op(&db, &WalOp::UpsertEdge(historical_temporal_edge(42, a, b, 2.0)))
                 .unwrap();
             db.flush().unwrap();
 
-            db.write_op(&WalOp::UpsertEdge(current_timeless_edge(42, a, b, 5.0)))
+            write_internal_wal_op(&db, &WalOp::UpsertEdge(current_timeless_edge(42, a, b, 5.0)))
                 .unwrap();
 
             assert_scalar_degree_family_routes(
@@ -7556,12 +7837,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
             .unwrap();
-        db.upsert_edge(a, c, 20, UpsertEdgeOptions::default())
+        db.upsert_edge(a, c, "REPORTS_TO", UpsertEdgeOptions::default())
             .unwrap();
 
         db.reset_degree_query_routes();
@@ -7580,7 +7861,7 @@
             .degrees(
                 &[a, b, c],
                 &DegreeOptions {
-                    type_filter: Some(vec![10]),
+                    edge_label_filter: Some(vec!["KNOWS".to_string()]),
                     ..Default::default()
                 },
             )
@@ -7593,7 +7874,7 @@
         db.upsert_edge(
             b,
             c,
-            10,
+            "KNOWS",
             UpsertEdgeOptions {
                 valid_to: Some(now_millis() + 10_000),
                 ..Default::default()
@@ -7622,13 +7903,13 @@
         let d;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
             db.upsert_edge(
                 a,
                 b,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 2.0,
                     ..Default::default()
@@ -7638,7 +7919,7 @@
             db.upsert_edge(
                 c,
                 a,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 6.0,
                     ..Default::default()
@@ -7648,7 +7929,7 @@
             db.upsert_edge(
                 a,
                 a,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 4.0,
                     ..Default::default()
@@ -7667,11 +7948,11 @@
             assert_eq!(db.segments_for_test().len(), 1);
             assert_degree_family_all_directions_fast_match_walk(&db, a, &initial_batch);
 
-            d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+            d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
             db.upsert_edge(
                 a,
                 d,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 8.0,
                     ..Default::default()
@@ -7705,15 +7986,15 @@
         let a;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-            let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+            let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
             db.upsert_edge(
                 a,
                 b,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 2.0,
                     ..Default::default()
@@ -7735,7 +8016,7 @@
             db.upsert_edge(
                 a,
                 c,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 3.0,
                     ..Default::default()
@@ -7757,7 +8038,7 @@
             db.upsert_edge(
                 a,
                 d,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 4.0,
                     ..Default::default()
@@ -7817,14 +8098,14 @@
         let edge_ab;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
             edge_ab = db
                 .upsert_edge(
                     a,
                     b,
-                    10,
+                    "KNOWS",
                     UpsertEdgeOptions {
                         weight: 2.0,
                         ..Default::default()
@@ -7834,7 +8115,7 @@
             db.upsert_edge(
                 a,
                 c,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 3.0,
                     ..Default::default()
@@ -7902,12 +8183,12 @@
         let b;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
             db.upsert_edge(
                 a,
                 b,
-                10,
+                "KNOWS",
                 UpsertEdgeOptions {
                     weight: 4.0,
                     ..Default::default()
@@ -7976,13 +8257,13 @@
         let a;
         {
             let db = open_imm(&path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default())
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
             db.flush().unwrap();
-            db.upsert_edge(a, c, 10, UpsertEdgeOptions::default())
+            db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
             db.flush().unwrap();
             db.close().unwrap();
@@ -8026,15 +8307,15 @@
 
         let mut nodes = Vec::new();
         for i in 0..5 {
-            nodes.push(db.upsert_node(1, &format!("n{}", i), UpsertNodeOptions::default()).unwrap());
+            nodes.push(db.upsert_node("Person", &format!("n{}", i), UpsertNodeOptions::default()).unwrap());
         }
 
         // Star topology: 0 → 1,2,3,4
         for i in 1..5 {
-            db.upsert_edge(nodes[0], nodes[i], 10, UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(nodes[0], nodes[i], "KNOWS", UpsertEdgeOptions::default()).unwrap();
         }
         // Self-loop on node 2
-        db.upsert_edge(nodes[2], nodes[2], 10, UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
+        db.upsert_edge(nodes[2], nodes[2], "KNOWS", UpsertEdgeOptions { weight: 2.0, ..Default::default() }).unwrap();
 
         let batch = db.degrees(&nodes, &DegreeOptions { direction: Direction::Both, ..Default::default() }).unwrap();
 
@@ -8056,11 +8337,11 @@
         let db = open_imm(&dir.path().join("db"));
 
         // A - B - C (all connected via directed edges, WCC ignores direction)
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 3);
@@ -8079,16 +8360,16 @@
         let db = open_imm(&dir.path().join("db"));
 
         // Component 1: A - B
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         // Component 2: C - D - E
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        let e = db.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(d, e, 10, UpsertEdgeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        let e = db.upsert_node("Person", "e", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(d, e, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 5);
@@ -8110,9 +8391,9 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         // No edges. Each node is its own component.
 
         let comps = db.connected_components(&ComponentOptions::default()).unwrap();
@@ -8132,10 +8413,10 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         // Self-loop on A, no connection to B.
-        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 2);
@@ -8150,13 +8431,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         // Multiple edges between A and B shouldn't create multiple links.
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 20, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, a, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "REPORTS_TO", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, a, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 3);
@@ -8173,11 +8454,11 @@
         let db = open_imm(&dir.path().join("db"));
 
         // A - B - C
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let e1 = db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let e1 = db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         // Delete edge A-B: now A is isolated, B-C connected.
         db.delete_edge(e1).unwrap();
@@ -8200,55 +8481,139 @@
     }
 
     #[test]
-    fn test_wcc_edge_type_filter() {
+    fn test_wcc_edge_label_filter() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        // Edge type 10: A - B
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        // Edge type 20: B - C
-        db.upsert_edge(b, c, 20, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        // Edge label 10: A - B
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        // Edge label 20: B - C
+        db.upsert_edge(b, c, "REPORTS_TO", UpsertEdgeOptions::default()).unwrap();
 
-        // Filter by type 10 only: only A-B connected.
-        let comps = db.connected_components(&ComponentOptions { edge_type_filter: Some(vec![10]), ..Default::default() }).unwrap();
+        // Filter by label 10 only: only A-B connected.
+        let comps = db.connected_components(&ComponentOptions { edge_label_filter: Some(vec!["KNOWS".to_string()]), ..Default::default() }).unwrap();
         assert_eq!(comps[&a], a);
         assert_eq!(comps[&b], a);
-        assert_eq!(comps[&c], c); // isolated when type 20 excluded
+        assert_eq!(comps[&c], c); // isolated when label 20 excluded
 
-        // Filter by type 20 only: only B-C connected.
-        let comps2 = db.connected_components(&ComponentOptions { edge_type_filter: Some(vec![20]), ..Default::default() }).unwrap();
-        assert_eq!(comps2[&a], a); // isolated when type 10 excluded
+        // Filter by label 20 only: only B-C connected.
+        let comps2 = db.connected_components(&ComponentOptions { edge_label_filter: Some(vec!["REPORTS_TO".to_string()]), ..Default::default() }).unwrap();
+        assert_eq!(comps2[&a], a); // isolated when label 10 excluded
         assert_eq!(comps2[&b], comps2[&c]); // connected
 
         db.close().unwrap();
     }
 
     #[test]
-    fn test_wcc_node_type_filter() {
+    fn test_wcc_node_label_filter() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
         // Type 1: A, B.  Type 2: C
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(2, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Company", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
-        // Filter by node type 1: only A and B visible.
-        let comps = db.connected_components(&ComponentOptions { node_type_filter: Some(vec![1]), ..Default::default() }).unwrap();
+        // Filter by node label 1: only A and B visible.
+        let comps = db.connected_components(&ComponentOptions { node_label_filter: Some(graph_node_label_filter(&["Person"], LabelMatchMode::Any)), ..Default::default() }).unwrap();
         assert_eq!(comps.len(), 2);
         assert_eq!(comps[&a], a);
         assert_eq!(comps[&b], a);
         assert!(!comps.contains_key(&c));
 
-        // Filter by node type 2: only C visible, isolated.
-        let comps2 = db.connected_components(&ComponentOptions { node_type_filter: Some(vec![2]), ..Default::default() }).unwrap();
+        // Filter by node label 2: only C visible, isolated.
+        let comps2 = db.connected_components(&ComponentOptions { node_label_filter: Some(graph_node_label_filter(&["Company"], LabelMatchMode::Any)), ..Default::default() }).unwrap();
         assert_eq!(comps2.len(), 1);
         assert_eq!(comps2[&c], c);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_wcc_and_component_of_node_label_filter_support_any_all_multi_label() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db
+            .upsert_node(
+                &["Person", "Employee"],
+                "a",
+                UpsertNodeOptions::default(),
+            )
+            .unwrap();
+        let b = db
+            .upsert_node(
+                &["Person", "Employee"],
+                "b",
+                UpsertNodeOptions::default(),
+            )
+            .unwrap();
+        let c = db
+            .upsert_node("Person", "c", UpsertNodeOptions::default())
+            .unwrap();
+        let d = db
+            .upsert_node("Employee", "d", UpsertNodeOptions::default())
+            .unwrap();
+
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+        db.upsert_edge(b, d, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+
+        let all_filter = graph_node_label_filter(&["Person", "Employee"], LabelMatchMode::All);
+        let all_components = db
+            .connected_components(&ComponentOptions {
+                node_label_filter: Some(all_filter.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(all_components.len(), 2);
+        assert_eq!(all_components[&a], a);
+        assert_eq!(all_components[&b], a);
+        assert!(!all_components.contains_key(&c));
+        assert!(!all_components.contains_key(&d));
+        assert_eq!(
+            db.component_of(
+                a,
+                &ComponentOptions {
+                    node_label_filter: Some(all_filter),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            vec![a, b]
+        );
+
+        let any_filter = graph_node_label_filter(&["Employee"], LabelMatchMode::Any);
+        let any_components = db
+            .connected_components(&ComponentOptions {
+                node_label_filter: Some(any_filter.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(any_components.len(), 3);
+        assert_eq!(any_components[&a], a);
+        assert_eq!(any_components[&b], a);
+        assert_eq!(any_components[&d], a);
+        assert!(!any_components.contains_key(&c));
+        assert_eq!(
+            db.component_of(
+                a,
+                &ComponentOptions {
+                    node_label_filter: Some(any_filter),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            vec![a, b, d]
+        );
 
         db.close().unwrap();
     }
@@ -8258,15 +8623,15 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         db.flush().unwrap();
 
         // Add more data in memtable after flush.
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         // All three in one component (segment edge + memtable edge).
@@ -8282,12 +8647,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
         db.compact().unwrap();
@@ -8307,11 +8672,11 @@
 
         {
             let db = open_imm(&db_path);
-            let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-            db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+            let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
             db.close().unwrap();
         }
@@ -8339,12 +8704,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
         // Only directed edges: A→B, C→B
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(c, b, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(c, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         // All three in one component (WCC ignores direction).
@@ -8361,11 +8726,11 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(c, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, a, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(c, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, a, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         // Run twice. Must produce identical results.
         let comps1 = db.connected_components(&ComponentOptions::default()).unwrap();
@@ -8384,11 +8749,11 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // low weight
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // low weight
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         // Register prune policy that hides weight <= 0.5.
         db.set_prune_policy(
@@ -8396,7 +8761,7 @@
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         ).unwrap();
 
@@ -8411,17 +8776,84 @@
     }
 
     #[test]
+    fn test_wcc_unconstrained_prune_policy_checks_unique_multi_label_nodes_once() {
+        let dir = TempDir::new().unwrap();
+        let db = open_imm(&dir.path().join("db"));
+
+        let a = db
+            .upsert_node(
+                &["Person", "Employee"],
+                "a",
+                UpsertNodeOptions::default(),
+            )
+            .unwrap();
+        let b = db
+            .upsert_node(
+                &["Person", "Manager"],
+                "b",
+                UpsertNodeOptions {
+                    weight: 0.1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let c = db
+            .upsert_node(
+                &["Company", "Employee"],
+                "c",
+                UpsertNodeOptions::default(),
+            )
+            .unwrap();
+        let d = db
+            .upsert_node("Company", "d", UpsertNodeOptions::default())
+            .unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+        db.upsert_edge(a, d, "KNOWS", UpsertEdgeOptions::default())
+            .unwrap();
+        db.flush().unwrap();
+
+        db.set_prune_policy(
+            "low_weight",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.5),
+                label: None,
+            },
+        )
+        .unwrap();
+
+        db.reset_query_execution_counters_for_test();
+        let comps = db.connected_components(&ComponentOptions::default()).unwrap();
+        let counters = db.query_execution_counter_snapshot_for_test();
+
+        assert_eq!(comps.len(), 3);
+        assert!(!comps.contains_key(&b));
+        assert_eq!(comps[&a], a);
+        assert_eq!(comps[&d], a);
+        assert_eq!(comps[&c], c);
+        assert_eq!(
+            counters.node_visibility_meta_reads, 4,
+            "unconstrained WCC prune filtering should verify once per unique node, not once per label membership"
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
     fn test_wcc_memtable_only() {
         // WCC should work with memtable-only data (no flush).
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let comps = db.connected_components(&ComponentOptions::default()).unwrap();
         assert_eq!(comps.len(), 4);
@@ -8440,12 +8872,12 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         // D is isolated.
 
         let mut members = db.component_of(a, &ComponentOptions::default()).unwrap();
@@ -8467,7 +8899,7 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
 
         let members = db.component_of(99999, &ComponentOptions::default()).unwrap();
         assert!(members.is_empty());
@@ -8480,9 +8912,9 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.delete_node(a).unwrap();
 
         let members = db.component_of(a, &ComponentOptions::default()).unwrap();
@@ -8496,40 +8928,40 @@
     }
 
     #[test]
-    fn test_component_of_node_type_filter() {
+    fn test_component_of_node_label_filter() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(2, "b", UpsertNodeOptions::default()).unwrap(); // type 2
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Company", "b", UpsertNodeOptions::default()).unwrap(); // Company label
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
-        // Filter by type 1: B (type 2) is invisible, so A and C are isolated.
-        let members = db.component_of(a, &ComponentOptions { node_type_filter: Some(vec![1]), ..Default::default() }).unwrap();
+        // Filter by Person label: B (Company) is invisible, so A and C are isolated.
+        let members = db.component_of(a, &ComponentOptions { node_label_filter: Some(graph_node_label_filter(&["Person"], LabelMatchMode::Any)), ..Default::default() }).unwrap();
         assert_eq!(members, vec![a]);
 
-        // Start from type 2 node with type 1 filter → empty.
-        let members_b = db.component_of(b, &ComponentOptions { node_type_filter: Some(vec![1]), ..Default::default() }).unwrap();
+        // Start from Company node with Person filter -> empty.
+        let members_b = db.component_of(b, &ComponentOptions { node_label_filter: Some(graph_node_label_filter(&["Person"], LabelMatchMode::Any)), ..Default::default() }).unwrap();
         assert!(members_b.is_empty());
 
         db.close().unwrap();
     }
 
     #[test]
-    fn test_component_of_edge_type_filter() {
+    fn test_component_of_edge_label_filter() {
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 20, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "REPORTS_TO", UpsertEdgeOptions::default()).unwrap();
 
-        // Filter by edge type 10: only A-B connected.
-        let members = db.component_of(a, &ComponentOptions { edge_type_filter: Some(vec![10]), ..Default::default() }).unwrap();
+        // Filter by KNOWS edge label: only A-B connected.
+        let members = db.component_of(a, &ComponentOptions { edge_label_filter: Some(vec!["KNOWS".to_string()]), ..Default::default() }).unwrap();
         assert_eq!(members, vec![a, b]);
 
         db.close().unwrap();
@@ -8540,13 +8972,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let members = db.component_of(a, &ComponentOptions::default()).unwrap();
         assert_eq!(members, vec![a, b, c]);
@@ -8559,13 +8991,13 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         db.flush().unwrap();
 
         db.compact().unwrap();
@@ -8586,11 +9018,11 @@
 
         {
             let db = open_imm(&db_path);
-            a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-            b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-            c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-            db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-            db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+            a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+            b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+            c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+            db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+            db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
             db.close().unwrap();
         }
@@ -8605,18 +9037,18 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // low weight
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.1, ..Default::default() }).unwrap(); // low weight
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         db.set_prune_policy(
             "low_weight",
             PrunePolicy {
                 max_age_ms: None,
                 max_weight: Some(0.5),
-                type_id: None,
+                label: None,
             },
         ).unwrap();
 
@@ -8640,14 +9072,14 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        let e = db.upsert_node(1, "e", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(d, e, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        let e = db.upsert_node("Person", "e", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(d, e, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let comps = db.connected_components(&ComponentOptions::default()).unwrap();
 
@@ -8671,26 +9103,25 @@
 
     #[test]
     fn test_wcc_agrees_with_component_of_filtered() {
-        // Cross-consistency under both node_type_filter and edge_type_filter.
+        // Cross-consistency under both node_label_filter and edge_label_filter.
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(2, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(b, c, 20, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions::default()).unwrap();
-        db.upsert_edge(a, d, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Company", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "REPORTS_TO", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(a, d, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
-        // Node type filter = [1], edge type filter = [10]
-        let ntf = Some(&[1u32][..]);
-        let etf = Some(&[10u32][..]);
+        let ntf = Some(&["Person"][..]);
+        let etf = Some(&["KNOWS"][..]);
 
-        let comps = db.connected_components(&ComponentOptions { edge_type_filter: etf.map(|s| s.to_vec()), node_type_filter: ntf.map(|s| s.to_vec()), ..Default::default() }).unwrap();
+        let comps = db.connected_components(&ComponentOptions { edge_label_filter: etf.map(graph_filter_names), node_label_filter: ntf.map(|labels| graph_node_label_filter(labels, LabelMatchMode::Any)), ..Default::default() }).unwrap();
         for &node in &[a, c, d] {
-            let members = db.component_of(node, &ComponentOptions { edge_type_filter: etf.map(|s| s.to_vec()), node_type_filter: ntf.map(|s| s.to_vec()), ..Default::default() }).unwrap();
+            let members = db.component_of(node, &ComponentOptions { edge_label_filter: etf.map(graph_filter_names), node_label_filter: ntf.map(|labels| graph_node_label_filter(labels, LabelMatchMode::Any)), ..Default::default() }).unwrap();
             let comp_id = comps[&node];
             for &member in &members {
                 assert_eq!(comps[&member], comp_id,
@@ -8709,8 +9140,8 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, a, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, a, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         let members = db.component_of(a, &ComponentOptions::default()).unwrap();
         assert_eq!(members, vec![a]);
@@ -8725,9 +9156,9 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default()).unwrap();
 
         // Starting from B, should still find A (Direction::Both in BFS).
         let members = db.component_of(b, &ComponentOptions::default()).unwrap();
@@ -8742,20 +9173,20 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
-        let d = db.upsert_node(1, "d", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
+        let d = db.upsert_node("Person", "d", UpsertNodeOptions::default()).unwrap();
 
         let now = now_millis();
 
         // A→B: valid window [0, 1000). Expired at `now` but valid at epoch 500.
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(1000), ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(1000), ..Default::default() }).unwrap();
         // B→C: always valid
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions::default()).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
         // C→D: not yet valid (valid_from far in the future)
         let future = now + 100_000_000;
-        db.upsert_edge(c, d, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(future), valid_to: None, ..Default::default() }).unwrap();
+        db.upsert_edge(c, d, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(future), valid_to: None, ..Default::default() }).unwrap();
 
         // With at_epoch=None (defaults to now):
         //   A→B expired → A isolated
@@ -8779,14 +9210,14 @@
         let dir2 = TempDir::new().unwrap();
         let db2 = open_imm(&dir2.path().join("db"));
 
-        let a2 = db2.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b2 = db2.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c2 = db2.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a2 = db2.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b2 = db2.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c2 = db2.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
         // A→B: valid [0, 1000)
-        db2.upsert_edge(a2, b2, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(1000), ..Default::default() }).unwrap();
+        db2.upsert_edge(a2, b2, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(1000), ..Default::default() }).unwrap();
         // B→C: valid [0, i64::MAX)
-        db2.upsert_edge(b2, c2, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: None, ..Default::default() }).unwrap();
+        db2.upsert_edge(b2, c2, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: None, ..Default::default() }).unwrap();
 
         // at_epoch=500: both edges valid → all connected
         let comps_t500 = db2.connected_components(&ComponentOptions { at_epoch: Some(500), ..Default::default() }).unwrap();
@@ -8808,14 +9239,14 @@
         let dir = TempDir::new().unwrap();
         let db = open_imm(&dir.path().join("db"));
 
-        let a = db.upsert_node(1, "a", UpsertNodeOptions::default()).unwrap();
-        let b = db.upsert_node(1, "b", UpsertNodeOptions::default()).unwrap();
-        let c = db.upsert_node(1, "c", UpsertNodeOptions::default()).unwrap();
+        let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
+        let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
+        let c = db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
 
         // A→B: valid [0, 1000)
-        db.upsert_edge(a, b, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(1000), ..Default::default() }).unwrap();
+        db.upsert_edge(a, b, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: Some(1000), ..Default::default() }).unwrap();
         // B→C: always valid from epoch 0
-        db.upsert_edge(b, c, 10, UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: None, ..Default::default() }).unwrap();
+        db.upsert_edge(b, c, "KNOWS", UpsertEdgeOptions { weight: 1.0, valid_from: Some(0), valid_to: None, ..Default::default() }).unwrap();
 
         // at_epoch=2000: A→B expired → A alone, B-C together.
         let members_a = db.component_of(a, &ComponentOptions { at_epoch: Some(2000), ..Default::default() }).unwrap();

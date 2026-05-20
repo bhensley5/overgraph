@@ -35,10 +35,13 @@ Files:
 - Node.js: `connector-benchmark-v3-parity` (shared-profile + shared scenario-contract harness)
 - Python: `connector-benchmark-v2-parity` (shared-profile + shared scenario-contract harness)
 - Phase 20b adds Criterion `write_txn/*` microbenches for explicit 4/16/64-intent commits, a 16-intent implicit batch comparator, and a same-key conflict-heavy workload. Connector benchmark harnesses should mirror this with ordered `stage(operations)` arrays for Node.js and Python.
-- Phase 23 adds `query_ops` Criterion microbenchmarks and shared query-only parity scenarios:
+- Phase 23 adds `query_ops` Criterion microbenchmarks and shared query-only parity scenarios.
+  Phase 26 extends the same query set with direct edge query parity:
   - `S-QUERY-001` / `query_node_ids_intersected_predicates`
   - `S-QUERY-002` / `query_nodes_intersected_predicates_hydrated`
-  Run only the cross-language Phase 23 matrix with:
+  - `S-QUERY-003` / `query_edge_ids_endpoint_metadata`
+  - `S-QUERY-004` / `query_edges_endpoint_property_hydrated`
+  Run only the cross-language query matrix with:
   `scripts/bench/run-rust.sh --scenario-set query --profile small --warmup 20 --iters 80`
   plus the matching Node.js and Python wrapper commands.
 

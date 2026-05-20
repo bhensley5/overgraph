@@ -4,36 +4,51 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi_derive::napi;
 use overgraph::{
-    AdjacencyExport, AllShortestPathsOptions, CompactionPhase, CompactionStats, ComponentOptions,
-    DatabaseEngine, DbOptions, DbStats, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
-    EdgeInput, EdgePattern, EdgePostFilterPredicate, EdgeRecord, EngineError, ExportOptions,
-    FusionMode, GraphPatch, GraphPatternQuery, HnswConfig, IsConnectedOptions, NeighborEntry,
-    NeighborOptions, NodeFilterExpr, NodeIdMap, NodeInput, NodePattern, NodePropertyIndexInfo,
-    NodeQuery, NodeQueryOrder, NodeRecord, PageRequest, PageResult, PatternOrder, PprAlgorithm,
-    PprOptions, PprResult, PropValue, PropertyRangeBound, PropertyRangeCursor,
-    PropertyRangePageRequest, PropertyRangePageResult, PrunePolicy, PruneResult, QueryMatch,
-    QueryNodeIdsResult, QueryNodesResult, QueryPatternResult, QueryPlan, QueryPlanKind,
-    QueryPlanNode, QueryPlanWarning, ScoringMode, SecondaryIndexKind, SecondaryIndexRangeDomain,
-    SecondaryIndexState, ShortestPath, ShortestPathOptions, Subgraph, SubgraphOptions, TopKOptions,
-    TraversalCursor, TraversalHit, TraversalPageResult, TraverseOptions, TxnCommitResult,
-    TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef, TxnNodeView, UpsertEdgeOptions,
-    UpsertNodeOptions, VectorHit, VectorSearchMode, VectorSearchRequest, VectorSearchScope,
-    WalSyncMode, WriteTxn,
+    AdjacencyExport as CoreAdjacencyExport, AllShortestPathsOptions as CoreAllShortestPathsOptions,
+    CompactionPhase, CompactionStats as CoreCompactionStats, ComponentOptions, DatabaseEngine,
+    DbOptions as CoreDbOptions, DbStats as CoreDbStats, DegreeOptions as CoreDegreeOptions,
+    DenseMetric, DenseVectorConfig as CoreDenseVectorConfig, Direction, EdgeFilterExpr,
+    EdgeInput as CoreEdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo, EdgePattern,
+    EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
+    EdgeView as CoreEdgeView, EngineError, ExportOptions as CoreExportOptions, FusionMode,
+    GraphPatch as CoreGraphPatch, GraphPatternQuery, HnswConfig,
+    IsConnectedOptions as CoreIsConnectedOptions, LabelMatchMode as CoreLabelMatchMode,
+    NeighborEntry as CoreNeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap,
+    NodeInput as CoreNodeInput, NodeKeyQuery, NodeLabelFilter as CoreNodeLabelFilter,
+    NodeLabelInfo as CoreNodeLabelInfo, NodePattern,
+    NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
+    NodeView as CoreNodeView, PageRequest, PageResult, PatternOrder, PprAlgorithm, PprOptions,
+    PprResult as CorePprResult, PropValue, PropertyRangeBound as CorePropertyRangeBound,
+    PropertyRangeCursor as CorePropertyRangeCursor, PropertyRangePageRequest,
+    PropertyRangePageResult as CorePropertyRangePageResult, PrunePolicy as CorePrunePolicy,
+    PrunePolicyInfo, PruneResult as CorePruneResult, QueryEdgeIdsResult, QueryEdgesResult,
+    QueryMatch, QueryNodeIdsResult, QueryNodesResult, QueryPatternResult, QueryPlan, QueryPlanKind,
+    QueryPlanNode, QueryPlanWarning, ScoringMode, ScrubReport as CoreScrubReport,
+    SecondaryIndexKind as CoreSecondaryIndexKind, SecondaryIndexRangeDomain, SecondaryIndexState,
+    ShortestPath as CoreShortestPath, ShortestPathOptions as CoreShortestPathOptions, Subgraph,
+    SubgraphOptions, TopKOptions, TraversalCursor as CoreTraversalCursor,
+    TraversalHit as CoreTraversalHit, TraversalPageResult as CoreTraversalPageResult,
+    TraverseOptions as CoreTraverseOptions, TxnCommitResult as CoreTxnCommitResult,
+    TxnEdgeRef as CoreTxnEdgeRef, TxnEdgeView as CoreTxnEdgeView, TxnIntent, TxnLocalRef,
+    TxnNodeRef as CoreTxnNodeRef, TxnNodeView as CoreTxnNodeView,
+    UpsertEdgeOptions as CoreUpsertEdgeOptions, UpsertNodeOptions as CoreUpsertNodeOptions,
+    VectorHit as CoreVectorHit, VectorSearchMode, VectorSearchRequest,
+    VectorSearchScope as CoreVectorSearchScope, WalSyncMode, WriteTxn as CoreWriteTxn,
 };
 
 /// ThreadsafeFunction with `CalleeHandled = false` so the JS callback
 /// receives `(progress)` directly, not error-first `(null, progress)`.
 type ProgressTsfn = napi::threadsafe_function::ThreadsafeFunction<
-    JsCompactionProgress,
+    CompactionProgress,
     Unknown<'static>,
-    JsCompactionProgress,
+    CompactionProgress,
     Status,
     false,
 >;
 
-pub struct JsJsonValue(serde_json::Value);
+pub struct JsonPayload(serde_json::Value);
 
-impl TypeName for JsJsonValue {
+impl TypeName for JsonPayload {
     fn type_name() -> &'static str {
         "Object"
     }
@@ -43,7 +58,7 @@ impl TypeName for JsJsonValue {
     }
 }
 
-impl ToNapiValue for JsJsonValue {
+impl ToNapiValue for JsonPayload {
     unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
         unsafe { serde_json::Value::to_napi_value(env, val.0) }
     }
@@ -70,7 +85,7 @@ impl OverGraph {
     // --- Lifecycle ---
 
     #[napi(factory)]
-    pub fn open(path: String, options: Option<JsDbOptions>) -> Result<OverGraph> {
+    pub fn open(path: String, options: Option<DbOptions>) -> Result<OverGraph> {
         let opts = options.map(|o| o.into()).unwrap_or_default();
         let engine = DatabaseEngine::open(Path::new(&path), &opts)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -80,7 +95,7 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn close(&self, options: Option<JsCloseOptions>) -> Result<()> {
+    pub fn close(&self, options: Option<CloseOptions>) -> Result<()> {
         let force = options.as_ref().and_then(|o| o.force).unwrap_or(false);
         let engine = {
             let mut guard = self
@@ -103,21 +118,68 @@ impl OverGraph {
         Ok(())
     }
 
-    // --- Single upserts ---
+    // --- Catalog diagnostics ---
 
     #[napi]
+    pub fn ensure_node_label(&self, label: String) -> Result<u32> {
+        with_engine(self, |eng| eng.ensure_node_label(&label))
+    }
+
+    #[napi]
+    pub fn ensure_edge_label(&self, label: String) -> Result<u32> {
+        with_engine(self, |eng| eng.ensure_edge_label(&label))
+    }
+
+    #[napi]
+    pub fn get_node_label_id(&self, label: String) -> Result<Option<u32>> {
+        with_engine_ref(self, |eng| eng.get_node_label_id(&label))
+    }
+
+    #[napi]
+    pub fn get_edge_label_id(&self, label: String) -> Result<Option<u32>> {
+        with_engine_ref(self, |eng| eng.get_edge_label_id(&label))
+    }
+
+    #[napi]
+    pub fn get_node_label(&self, label_id: u32) -> Result<Option<String>> {
+        with_engine_ref(self, |eng| eng.get_node_label(label_id))
+    }
+
+    #[napi]
+    pub fn get_edge_label(&self, label_id: u32) -> Result<Option<String>> {
+        with_engine_ref(self, |eng| eng.get_edge_label(label_id))
+    }
+
+    #[napi]
+    pub fn list_node_labels(&self) -> Result<Vec<NodeLabelInfo>> {
+        let infos = with_engine_ref(self, |eng| eng.list_node_labels())?;
+        Ok(infos.into_iter().map(Into::into).collect())
+    }
+
+    #[napi]
+    pub fn list_edge_labels(&self) -> Result<Vec<EdgeLabelInfo>> {
+        let infos = with_engine_ref(self, |eng| eng.list_edge_labels())?;
+        Ok(infos.into_iter().map(Into::into).collect())
+    }
+
+    // --- Single upserts ---
+
+    #[napi(
+        ts_args_type = "labels: string | string[], key: string, options?: UpsertNodeOptions | null"
+    )]
     pub fn upsert_node(
         &self,
-        type_id: u32,
+        labels: serde_json::Value,
         key: String,
-        options: Option<JsUpsertNodeOptions>,
+        options: Option<UpsertNodeOptions>,
     ) -> Result<f64> {
+        let labels = parse_js_node_labels_arg(&labels, "upsertNode labels")?;
         let (props, weight, dense_vector, sparse_vector) = match options {
             Some(o) => (o.props, o.weight, o.dense_vector, o.sparse_vector),
             None => (None, None, None, None),
         };
         let props = convert_js_props(props);
-        let opts = UpsertNodeOptions {
+        let opts = CoreUpsertNodeOptions {
             props,
             weight: weight.unwrap_or(1.0) as f32,
             dense_vector: dense_vector.map(|dv| dv.into_iter().map(|x| x as f32).collect()),
@@ -127,8 +189,20 @@ impl OverGraph {
                     .collect()
             }),
         };
-        let id = with_engine(self, |eng| eng.upsert_node(type_id, &key, opts))?;
+        let id = with_engine(self, |eng| eng.upsert_node(labels, &key, opts))?;
         u64_to_f64(id)
+    }
+
+    #[napi]
+    pub fn add_node_label(&self, node_id: f64, label: String) -> Result<bool> {
+        let node_id = f64_to_u64(node_id)?;
+        with_engine(self, |eng| eng.add_node_label(node_id, &label))
+    }
+
+    #[napi]
+    pub fn remove_node_label(&self, node_id: f64, label: String) -> Result<bool> {
+        let node_id = f64_to_u64(node_id)?;
+        with_engine(self, |eng| eng.remove_node_label(node_id, &label))
     }
 
     #[napi]
@@ -136,8 +210,8 @@ impl OverGraph {
         &self,
         from: f64,
         to: f64,
-        type_id: u32,
-        options: Option<JsUpsertEdgeOptions>,
+        label: String,
+        options: Option<UpsertEdgeOptions>,
     ) -> Result<f64> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
@@ -146,31 +220,34 @@ impl OverGraph {
             None => (None, None, None, None),
         };
         let props = convert_js_props(props);
-        let opts = UpsertEdgeOptions {
+        let opts = CoreUpsertEdgeOptions {
             props,
             weight: weight.unwrap_or(1.0) as f32,
             valid_from,
             valid_to,
         };
-        let id = with_engine(self, |eng| eng.upsert_edge(from, to, type_id, opts))?;
+        let id = with_engine(self, |eng| eng.upsert_edge(from, to, &label, opts))?;
         u64_to_f64(id)
     }
 
     // --- Batch upserts (JSON object path) ---
 
     #[napi]
-    pub fn batch_upsert_nodes(&self, nodes: Vec<JsNodeInput>) -> Result<Float64Array> {
-        let inputs: Vec<NodeInput> = nodes.into_iter().map(|n| n.into()).collect();
-        let ids = with_engine(self, |eng| eng.batch_upsert_nodes(&inputs))?;
+    pub fn batch_upsert_nodes(&self, nodes: Vec<NodeInput>) -> Result<Float64Array> {
+        let inputs: Vec<CoreNodeInput> = nodes
+            .into_iter()
+            .map(NodeInput::try_into)
+            .collect::<Result<Vec<_>>>()?;
+        let ids = with_engine(self, |eng| eng.batch_upsert_nodes(inputs))?;
         ids_to_float64_array(&ids)
     }
 
     #[napi]
-    pub fn batch_upsert_edges(&self, edges: Vec<JsEdgeInput>) -> Result<Float64Array> {
-        let inputs: std::result::Result<Vec<EdgeInput>, _> =
+    pub fn batch_upsert_edges(&self, edges: Vec<EdgeInput>) -> Result<Float64Array> {
+        let inputs: std::result::Result<Vec<CoreEdgeInput>, _> =
             edges.into_iter().map(|e| e.try_into()).collect();
         let inputs = inputs?;
-        let ids = with_engine(self, |eng| eng.batch_upsert_edges(&inputs))?;
+        let ids = with_engine(self, |eng| eng.batch_upsert_edges(inputs))?;
         ids_to_float64_array(&ids)
     }
 
@@ -179,52 +256,55 @@ impl OverGraph {
     /// Batch upsert nodes from a packed binary Buffer. See `packNodeBatch()` in JS.
     ///
     /// Binary format (little-endian):
-    ///   [count: u32]
+    ///   [magic: 4 bytes "OGNB"][version: u16 = 2][count: u32]
     ///   per node:
-    ///     [type_id: u32][weight: f32][key_len: u16][key: utf8][props_len: u32][props: json utf8]
+    ///     [label_count: u8] repeated [label_len: u16][label: utf8][weight: f32]
+    ///     [key_len: u16][key: utf8][props_len: u32][props: json utf8]
     #[napi]
     pub fn batch_upsert_nodes_binary(&self, buffer: Buffer) -> Result<Float64Array> {
         let inputs = decode_node_batch(&buffer)?;
-        let ids = with_engine(self, |eng| eng.batch_upsert_nodes(&inputs))?;
+        let ids = with_engine(self, |eng| eng.batch_upsert_nodes(inputs))?;
         ids_to_float64_array(&ids)
     }
 
     /// Batch upsert edges from a packed binary Buffer. See `packEdgeBatch()` in JS.
     ///
     /// Binary format (little-endian):
-    ///   [count: u32]
+    ///   [magic: 4 bytes "OGEB"][version: u16 = 1][count: u32]
     ///   per edge:
-    ///     [from: u64][to: u64][type_id: u32][weight: f32]
+    ///     [from: u64][to: u64][label_len: u16][label: utf8][weight: f32]
     ///     [valid_from: i64][valid_to: i64][props_len: u32][props: json utf8]
+    /// In this packed format, valid_from=0 and valid_to=0 are sentinels for
+    /// engine defaults (created_at and no expiration), not explicit epoch 0.
     #[napi]
     pub fn batch_upsert_edges_binary(&self, buffer: Buffer) -> Result<Float64Array> {
         let inputs = decode_edge_batch(&buffer)?;
-        let ids = with_engine(self, |eng| eng.batch_upsert_edges(&inputs))?;
+        let ids = with_engine(self, |eng| eng.batch_upsert_edges(inputs))?;
         ids_to_float64_array(&ids)
     }
 
     // --- Gets ---
 
     #[napi]
-    pub fn get_node(&self, id: f64) -> Result<Option<JsNodeRecord>> {
+    pub fn get_node(&self, id: f64) -> Result<Option<NodeView>> {
         let id = f64_to_u64(id)?;
         let raw = with_engine_ref(self, |eng| eng.get_node(id))?;
-        raw.map(JsNodeRecord::try_from).transpose()
+        raw.map(NodeView::try_from).transpose()
     }
 
     #[napi]
-    pub fn get_edge(&self, id: f64) -> Result<Option<JsEdgeRecord>> {
+    pub fn get_edge(&self, id: f64) -> Result<Option<EdgeView>> {
         let id = f64_to_u64(id)?;
         let raw = with_engine_ref(self, |eng| eng.get_edge(id))?;
-        raw.map(JsEdgeRecord::try_from).transpose()
+        raw.map(EdgeView::try_from).transpose()
     }
 
     // --- Key/triple lookups ---
 
     #[napi]
-    pub fn get_node_by_key(&self, type_id: u32, key: String) -> Result<Option<JsNodeRecord>> {
-        let raw = with_engine_ref(self, |eng| eng.get_node_by_key(type_id, &key))?;
-        raw.map(JsNodeRecord::try_from).transpose()
+    pub fn get_node_by_key(&self, label: String, key: String) -> Result<Option<NodeView>> {
+        let raw = with_engine_ref(self, |eng| eng.get_node_by_key(&label, &key))?;
+        raw.map(NodeView::try_from).transpose()
     }
 
     #[napi]
@@ -232,18 +312,18 @@ impl OverGraph {
         &self,
         from: f64,
         to: f64,
-        type_id: u32,
-    ) -> Result<Option<JsEdgeRecord>> {
+        label: String,
+    ) -> Result<Option<EdgeView>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        let raw = with_engine_ref(self, |eng| eng.get_edge_by_triple(from, to, type_id))?;
-        raw.map(JsEdgeRecord::try_from).transpose()
+        let raw = with_engine_ref(self, |eng| eng.get_edge_by_triple(from, to, &label))?;
+        raw.map(EdgeView::try_from).transpose()
     }
 
     // --- Bulk reads ---
 
     #[napi]
-    pub fn get_nodes(&self, ids: Vec<f64>) -> Result<Vec<Option<JsNodeRecord>>> {
+    pub fn get_nodes(&self, ids: Vec<f64>) -> Result<Vec<Option<NodeView>>> {
         let ids: Vec<u64> = ids
             .into_iter()
             .map(f64_to_u64)
@@ -251,23 +331,25 @@ impl OverGraph {
         let results = with_engine_ref(self, |eng| eng.get_nodes(&ids))?;
         results
             .into_iter()
-            .map(|r| r.map(JsNodeRecord::try_from).transpose())
+            .map(|r| r.map(NodeView::try_from).transpose())
             .collect::<Result<Vec<_>>>()
     }
 
     #[napi]
-    pub fn get_nodes_by_keys(&self, keys: Vec<JsKeyQuery>) -> Result<Vec<Option<JsNodeRecord>>> {
-        let owned: Vec<(u32, String)> = keys.into_iter().map(|k| (k.type_id, k.key)).collect();
-        let refs: Vec<(u32, &str)> = owned.iter().map(|(t, k)| (*t, k.as_str())).collect();
-        let results = with_engine_ref(self, |eng| eng.get_nodes_by_keys(&refs))?;
+    pub fn get_nodes_by_keys(&self, keys: Vec<KeyQuery>) -> Result<Vec<Option<NodeView>>> {
+        let owned: Vec<NodeKeyQuery> = keys
+            .into_iter()
+            .map(KeyQuery::try_into)
+            .collect::<Result<Vec<_>>>()?;
+        let results = with_engine_ref(self, |eng| eng.get_nodes_by_keys(&owned))?;
         results
             .into_iter()
-            .map(|r| r.map(JsNodeRecord::try_from).transpose())
+            .map(|r| r.map(NodeView::try_from).transpose())
             .collect::<Result<Vec<_>>>()
     }
 
     #[napi]
-    pub fn get_edges(&self, ids: Vec<f64>) -> Result<Vec<Option<JsEdgeRecord>>> {
+    pub fn get_edges(&self, ids: Vec<f64>) -> Result<Vec<Option<EdgeView>>> {
         let ids: Vec<u64> = ids
             .into_iter()
             .map(f64_to_u64)
@@ -275,7 +357,7 @@ impl OverGraph {
         let results = with_engine_ref(self, |eng| eng.get_edges(&ids))?;
         results
             .into_iter()
-            .map(|r| r.map(JsEdgeRecord::try_from).transpose())
+            .map(|r| r.map(EdgeView::try_from).transpose())
             .collect::<Result<Vec<_>>>()
     }
 
@@ -296,30 +378,30 @@ impl OverGraph {
     // --- Temporal invalidation ---
 
     #[napi]
-    pub fn invalidate_edge(&self, id: f64, valid_to: i64) -> Result<Option<JsEdgeRecord>> {
+    pub fn invalidate_edge(&self, id: f64, valid_to: i64) -> Result<Option<EdgeView>> {
         let id = f64_to_u64(id)?;
         let raw = with_engine(self, |eng| eng.invalidate_edge(id, valid_to))?;
-        raw.map(JsEdgeRecord::try_from).transpose()
+        raw.map(EdgeView::try_from).transpose()
     }
 
     #[napi]
-    pub fn graph_patch(&self, patch: JsGraphPatch) -> Result<JsPatchResult> {
+    pub fn graph_patch(&self, patch: GraphPatch) -> Result<PatchResult> {
         let rust_patch = js_patch_to_rust(patch)?;
-        let result = with_engine(self, |eng| eng.graph_patch(&rust_patch))?;
-        Ok(JsPatchResult {
+        let result = with_engine(self, |eng| eng.graph_patch(rust_patch))?;
+        Ok(PatchResult {
             node_ids: ids_to_float64_array(&result.node_ids)?,
             edge_ids: ids_to_float64_array(&result.edge_ids)?,
         })
     }
 
     #[napi]
-    pub fn begin_write_txn(&self) -> Result<JsWriteTxn> {
+    pub fn begin_write_txn(&self) -> Result<WriteTxn> {
         let txn = with_engine_ref(self, |eng| eng.begin_write_txn())?;
         Ok(write_txn_to_js(txn))
     }
 
-    #[napi(ts_return_type = "Promise<JsWriteTxn>")]
-    pub fn begin_write_txn_async(&self) -> AsyncTask<EngineReadOp<WriteTxn, JsWriteTxn>> {
+    #[napi(ts_return_type = "Promise<WriteTxn>")]
+    pub fn begin_write_txn_async(&self) -> AsyncTask<EngineReadOp<CoreWriteTxn, WriteTxn>> {
         AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             |eng| eng.begin_write_txn(),
@@ -330,15 +412,11 @@ impl OverGraph {
     // --- Retention / Forgetting ---
 
     #[napi]
-    pub fn prune(&self, policy: JsPrunePolicy) -> Result<JsPruneResult> {
-        let rust_policy = PrunePolicy {
-            max_age_ms: policy.max_age_ms.map(|v| v as i64),
-            max_weight: policy.max_weight.map(|v| v as f32),
-            type_id: policy.type_id,
-        };
+    pub fn prune(&self, policy: PrunePolicy) -> Result<PruneResult> {
+        let rust_policy = js_prune_policy_to_rust(policy, "prune")?;
         with_engine(self, |eng| {
             let result = eng.prune(&rust_policy)?;
-            Ok(JsPruneResult {
+            Ok(PruneResult {
                 nodes_pruned: result.nodes_pruned as i64,
                 edges_pruned: result.edges_pruned as i64,
             })
@@ -348,12 +426,8 @@ impl OverGraph {
     // --- Named prune policies (compaction-filter auto-prune) ---
 
     #[napi]
-    pub fn set_prune_policy(&self, name: String, policy: JsPrunePolicy) -> Result<()> {
-        let rust_policy = PrunePolicy {
-            max_age_ms: policy.max_age_ms.map(|v| v as i64),
-            max_weight: policy.max_weight.map(|v| v as f32),
-            type_id: policy.type_id,
-        };
+    pub fn set_prune_policy(&self, name: String, policy: PrunePolicy) -> Result<()> {
+        let rust_policy = js_prune_policy_to_rust(policy, "setPrunePolicy")?;
         with_engine(self, |eng| {
             eng.set_prune_policy(&name, rust_policy)?;
             Ok(())
@@ -366,17 +440,17 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn list_prune_policies(&self) -> Result<Vec<JsNamedPrunePolicy>> {
+    pub fn list_prune_policies(&self) -> Result<Vec<NamedPrunePolicy>> {
         with_engine_ref(self, |eng| {
             Ok(eng
                 .list_prune_policies()?
                 .into_iter()
-                .map(|(name, p)| JsNamedPrunePolicy {
-                    name,
-                    policy: JsPrunePolicy {
-                        max_age_ms: p.max_age_ms.map(|v| v as f64),
-                        max_weight: p.max_weight.map(|v| v as f64),
-                        type_id: p.type_id,
+                .map(|info| NamedPrunePolicy {
+                    name: info.name,
+                    policy: PrunePolicy {
+                        max_age_ms: info.policy.max_age_ms.map(|v| v as f64),
+                        max_weight: info.policy.max_weight.map(|v| v as f64),
+                        label: info.policy.label,
                     },
                 })
                 .collect())
@@ -387,13 +461,9 @@ impl OverGraph {
     pub fn set_prune_policy_async(
         &self,
         name: String,
-        policy: JsPrunePolicy,
+        policy: PrunePolicy,
     ) -> Result<AsyncTask<EngineOp<(), ()>>> {
-        let rust_policy = PrunePolicy {
-            max_age_ms: policy.max_age_ms.map(|v| v as i64),
-            max_weight: policy.max_weight.map(|v| v as f32),
-            type_id: policy.type_id,
-        };
+        let rust_policy = js_prune_policy_to_rust(policy, "setPrunePolicyAsync")?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             move |eng| {
@@ -416,22 +486,22 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsNamedPrunePolicy>>")]
+    #[napi(ts_return_type = "Promise<Array<NamedPrunePolicy>>")]
     pub fn list_prune_policies_async(
         &self,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<(String, PrunePolicy)>, Vec<JsNamedPrunePolicy>>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Vec<PrunePolicyInfo>, Vec<NamedPrunePolicy>>>> {
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.list_prune_policies(),
             |policies| {
                 Ok(policies
                     .into_iter()
-                    .map(|(name, p)| JsNamedPrunePolicy {
-                        name,
-                        policy: JsPrunePolicy {
-                            max_age_ms: p.max_age_ms.map(|v| v as f64),
-                            max_weight: p.max_weight.map(|v| v as f64),
-                            type_id: p.type_id,
+                    .map(|info| NamedPrunePolicy {
+                        name: info.name,
+                        policy: PrunePolicy {
+                            max_age_ms: info.policy.max_age_ms.map(|v| v as f64),
+                            max_weight: info.policy.max_weight.map(|v| v as f64),
+                            label: info.policy.label,
                         },
                     })
                     .collect())
@@ -445,13 +515,13 @@ impl OverGraph {
     pub fn neighbors(
         &self,
         node_id: f64,
-        options: Option<JsNeighborsOptions>,
-    ) -> Result<Vec<JsNeighborEntry>> {
+        options: Option<NeighborsOptions>,
+    ) -> Result<Vec<NeighborEntry>> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, limit, at_epoch, decay_lambda) = match options {
+        let (direction, edge_label_filter, limit, at_epoch, decay_lambda) = match options {
             Some(o) => (
                 o.direction,
-                o.type_filter,
+                o.edge_label_filter,
                 o.limit,
                 o.at_epoch,
                 o.decay_lambda,
@@ -463,7 +533,7 @@ impl OverGraph {
         let decay = decay_lambda.map(|v| v as f32);
         let opts = NeighborOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             limit: lim,
             at_epoch,
             decay_lambda: decay,
@@ -477,14 +547,14 @@ impl OverGraph {
         &self,
         start_node_id: f64,
         max_depth: u32,
-        options: Option<JsTraverseOptions>,
-    ) -> Result<JsTraversalPageResult> {
+        options: Option<TraverseOptions>,
+    ) -> Result<TraversalPageResult> {
         let start_node_id = f64_to_u64(start_node_id)?;
         let (
             direction,
             min_depth,
-            edge_type_filter,
-            node_type_filter,
+            edge_label_filter,
+            emit_node_label_filter,
             at_epoch,
             decay_lambda,
             limit,
@@ -493,8 +563,10 @@ impl OverGraph {
             Some(o) => (
                 o.direction,
                 o.min_depth,
-                o.edge_type_filter,
-                o.node_type_filter,
+                o.edge_label_filter,
+                o.emit_node_label_filter
+                    .map(js_node_label_filter_to_rust)
+                    .transpose()?,
                 o.at_epoch,
                 o.decay_lambda,
                 o.limit,
@@ -505,11 +577,11 @@ impl OverGraph {
         let dir = parse_direction(direction.as_deref())?;
         let min_depth = min_depth.unwrap_or(1);
         let cursor = cursor.map(js_traversal_cursor_to_rust).transpose()?;
-        let opts = TraverseOptions {
+        let opts = CoreTraverseOptions {
             min_depth,
             direction: dir,
-            edge_type_filter,
-            node_type_filter,
+            edge_label_filter,
+            emit_node_label_filter,
             at_epoch,
             decay_lambda,
             limit: limit.map(|v| v as usize),
@@ -524,13 +596,13 @@ impl OverGraph {
         &self,
         node_id: f64,
         k: u32,
-        options: Option<JsTopKNeighborsOptions>,
-    ) -> Result<Vec<JsNeighborEntry>> {
+        options: Option<TopKNeighborsOptions>,
+    ) -> Result<Vec<NeighborEntry>> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, scoring, decay_lambda, at_epoch) = match options {
+        let (direction, edge_label_filter, scoring, decay_lambda, at_epoch) = match options {
             Some(o) => (
                 o.direction,
-                o.type_filter,
+                o.edge_label_filter,
                 o.scoring,
                 o.decay_lambda,
                 o.at_epoch,
@@ -541,7 +613,7 @@ impl OverGraph {
         let scoring_mode = parse_scoring_mode(scoring.as_deref(), decay_lambda)?;
         let opts = TopKOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             scoring: scoring_mode,
             at_epoch,
         };
@@ -554,17 +626,25 @@ impl OverGraph {
         &self,
         start_node_id: f64,
         max_depth: u32,
-        options: Option<JsExtractSubgraphOptions>,
-    ) -> Result<JsSubgraphResult> {
+        options: Option<ExtractSubgraphOptions>,
+    ) -> Result<SubgraphResult> {
         let start = f64_to_u64(start_node_id)?;
-        let (direction, edge_type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.edge_type_filter, o.at_epoch),
-            None => (None, None, None),
+        let (direction, edge_label_filter, node_label_filter, at_epoch) = match options {
+            Some(o) => (
+                o.direction,
+                o.edge_label_filter,
+                o.node_label_filter
+                    .map(js_node_label_filter_to_rust)
+                    .transpose()?,
+                o.at_epoch,
+            ),
+            None => (None, None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
         let opts = SubgraphOptions {
             direction: dir,
-            edge_type_filter,
+            edge_label_filter,
+            node_label_filter,
             at_epoch,
         };
         let sg = with_engine_ref(self, |eng| eng.extract_subgraph(start, max_depth, &opts))?;
@@ -577,21 +657,21 @@ impl OverGraph {
     pub fn neighbors_batch(
         &self,
         node_ids: Vec<f64>,
-        options: Option<JsNeighborsBatchOptions>,
-    ) -> Result<Vec<JsNeighborBatchEntry>> {
+        options: Option<NeighborsBatchOptions>,
+    ) -> Result<Vec<NeighborBatchEntry>> {
         let ids: Vec<u64> = node_ids
             .into_iter()
             .map(f64_to_u64)
             .collect::<Result<Vec<_>>>()?;
-        let (direction, type_filter, at_epoch, decay_lambda) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch, o.decay_lambda),
+        let (direction, edge_label_filter, at_epoch, decay_lambda) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch, o.decay_lambda),
             None => (None, None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
         let decay = decay_lambda.map(|v| v as f32);
         let opts = NeighborOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             limit: None,
             at_epoch,
             decay_lambda: decay,
@@ -603,16 +683,16 @@ impl OverGraph {
     // --- Degree counts + aggregations (Phase 18a) ---
 
     #[napi]
-    pub fn degree(&self, node_id: f64, options: Option<JsDegreeOptions>) -> Result<i64> {
+    pub fn degree(&self, node_id: f64, options: Option<DegreeOptions>) -> Result<i64> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch),
+        let (direction, edge_label_filter, at_epoch) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch),
             None => (None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = DegreeOptions {
+        let opts = CoreDegreeOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             at_epoch,
         };
         let count: u64 = with_engine_ref(self, |eng| eng.degree(node_id, &opts))?;
@@ -623,17 +703,17 @@ impl OverGraph {
     pub fn sum_edge_weights(
         &self,
         node_id: f64,
-        options: Option<JsSumEdgeWeightsOptions>,
+        options: Option<SumEdgeWeightsOptions>,
     ) -> Result<f64> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch),
+        let (direction, edge_label_filter, at_epoch) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch),
             None => (None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = DegreeOptions {
+        let opts = CoreDegreeOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             at_epoch,
         };
         with_engine_ref(self, |eng| eng.sum_edge_weights(node_id, &opts))
@@ -643,17 +723,17 @@ impl OverGraph {
     pub fn avg_edge_weight(
         &self,
         node_id: f64,
-        options: Option<JsAvgEdgeWeightOptions>,
+        options: Option<AvgEdgeWeightOptions>,
     ) -> Result<Option<f64>> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch),
+        let (direction, edge_label_filter, at_epoch) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch),
             None => (None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = DegreeOptions {
+        let opts = CoreDegreeOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             at_epoch,
         };
         with_engine_ref(self, |eng| eng.avg_edge_weight(node_id, &opts))
@@ -663,27 +743,27 @@ impl OverGraph {
     pub fn degrees(
         &self,
         node_ids: Vec<f64>,
-        options: Option<JsDegreesOptions>,
-    ) -> Result<Vec<JsDegreeBatchEntry>> {
+        options: Option<DegreesOptions>,
+    ) -> Result<Vec<DegreeBatchEntry>> {
         let ids: Vec<u64> = node_ids
             .into_iter()
             .map(f64_to_u64)
             .collect::<Result<Vec<_>>>()?;
-        let (direction, type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch),
+        let (direction, edge_label_filter, at_epoch) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch),
             None => (None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = DegreeOptions {
+        let opts = CoreDegreeOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             at_epoch,
         };
         let map = with_engine_ref(self, |eng| eng.degrees(&ids, &opts))?;
-        let mut entries: Vec<JsDegreeBatchEntry> = map
+        let mut entries: Vec<DegreeBatchEntry> = map
             .into_iter()
             .map(|(node_id, degree)| {
-                Ok(JsDegreeBatchEntry {
+                Ok(DegreeBatchEntry {
                     node_id: u64_to_f64(node_id)?,
                     degree: u64_to_safe_i64(degree)?,
                 })
@@ -700,31 +780,32 @@ impl OverGraph {
         &self,
         from: f64,
         to: f64,
-        options: Option<JsShortestPathOptions>,
-    ) -> Result<Option<JsShortestPath>> {
+        options: Option<ShortestPathOptions>,
+    ) -> Result<Option<ShortestPath>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        let (direction, type_filter, weight_field, at_epoch, max_depth, max_cost) = match options {
-            Some(o) => (
-                o.direction,
-                o.type_filter,
-                o.weight_field,
-                o.at_epoch,
-                o.max_depth,
-                o.max_cost,
-            ),
-            None => (None, None, None, None, None, None),
-        };
+        let (direction, edge_label_filter, weight_field, at_epoch, max_depth, max_cost) =
+            match options {
+                Some(o) => (
+                    o.direction,
+                    o.edge_label_filter,
+                    o.weight_field,
+                    o.at_epoch,
+                    o.max_depth,
+                    o.max_cost,
+                ),
+                None => (None, None, None, None, None, None),
+            };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = ShortestPathOptions {
+        let opts = CoreShortestPathOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             weight_field,
             at_epoch,
             max_depth,
             max_cost,
         };
-        let result: Option<ShortestPath> =
+        let result: Option<CoreShortestPath> =
             with_engine_ref(self, |eng| eng.shortest_path(from, to, &opts))?;
         result.map(shortest_path_to_js).transpose()
     }
@@ -734,18 +815,18 @@ impl OverGraph {
         &self,
         from: f64,
         to: f64,
-        options: Option<JsIsConnectedOptions>,
+        options: Option<IsConnectedOptions>,
     ) -> Result<bool> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        let (direction, type_filter, at_epoch, max_depth) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch, o.max_depth),
+        let (direction, edge_label_filter, at_epoch, max_depth) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch, o.max_depth),
             None => (None, None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = IsConnectedOptions {
+        let opts = CoreIsConnectedOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             at_epoch,
             max_depth,
         };
@@ -757,15 +838,15 @@ impl OverGraph {
         &self,
         from: f64,
         to: f64,
-        options: Option<JsAllShortestPathsOptions>,
-    ) -> Result<Vec<JsShortestPath>> {
+        options: Option<AllShortestPathsOptions>,
+    ) -> Result<Vec<ShortestPath>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        let (direction, type_filter, weight_field, at_epoch, max_depth, max_cost, max_paths) =
+        let (direction, edge_label_filter, weight_field, at_epoch, max_depth, max_cost, max_paths) =
             match options {
                 Some(o) => (
                     o.direction,
-                    o.type_filter,
+                    o.edge_label_filter,
                     o.weight_field,
                     o.at_epoch,
                     o.max_depth,
@@ -775,16 +856,16 @@ impl OverGraph {
                 None => (None, None, None, None, None, None, None),
             };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = AllShortestPathsOptions {
+        let opts = CoreAllShortestPathsOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter,
             weight_field,
             at_epoch,
             max_depth,
             max_cost,
             max_paths: max_paths.map(|n| n as usize),
         };
-        let paths: Vec<ShortestPath> =
+        let paths: Vec<CoreShortestPath> =
             with_engine_ref(self, |eng| eng.all_shortest_paths(from, to, &opts))?;
         paths.into_iter().map(shortest_path_to_js).collect()
     }
@@ -792,20 +873,20 @@ impl OverGraph {
     #[napi]
     pub fn find_nodes(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
         prop_value: serde_json::Value,
     ) -> Result<Float64Array> {
         let pv = json_to_prop_value(&prop_value);
-        let ids = with_engine_ref(self, |eng| eng.find_nodes(type_id, &prop_key, &pv))?;
+        let ids = with_engine_ref(self, |eng| eng.find_nodes(&label, &prop_key, &pv))?;
         ids_to_float64_array(&ids)
     }
 
     #[napi(
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
-        ts_return_type = "JsIdPageResult"
+        ts_return_type = "IdPageResult"
     )]
-    pub fn query_node_ids(&self, request: serde_json::Value) -> Result<JsIdPageResult> {
+    pub fn query_node_ids(&self, request: serde_json::Value) -> Result<IdPageResult> {
         let query = parse_js_node_query(&request)?;
         let result = with_engine_ref(self, |eng| eng.query_node_ids(&query))?;
         query_node_ids_to_js(result)
@@ -813,19 +894,39 @@ impl OverGraph {
 
     #[napi(
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
-        ts_return_type = "JsNodePageResult"
+        ts_return_type = "NodePageResult"
     )]
-    pub fn query_nodes(&self, request: serde_json::Value) -> Result<JsNodePageResult> {
+    pub fn query_nodes(&self, request: serde_json::Value) -> Result<NodePageResult> {
         let query = parse_js_node_query(&request)?;
         let result = with_engine_ref(self, |eng| eng.query_nodes(&query))?;
         query_nodes_to_js(result)
     }
 
     #[napi(
+        ts_args_type = "request: import('./query-types').QueryEdgeRequest",
+        ts_return_type = "IdPageResult"
+    )]
+    pub fn query_edge_ids(&self, request: serde_json::Value) -> Result<IdPageResult> {
+        let query = parse_js_edge_query(&request)?;
+        let result = with_engine_ref(self, |eng| eng.query_edge_ids(&query))?;
+        query_edge_ids_to_js(result)
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryEdgeRequest",
+        ts_return_type = "EdgePageResult"
+    )]
+    pub fn query_edges(&self, request: serde_json::Value) -> Result<EdgePageResult> {
+        let query = parse_js_edge_query(&request)?;
+        let result = with_engine_ref(self, |eng| eng.query_edges(&query))?;
+        query_edges_to_js(result)
+    }
+
+    #[napi(
         ts_args_type = "request: import('./query-types').GraphPatternRequest",
         ts_return_type = "import('./query-types').QueryPatternResult"
     )]
-    pub fn query_pattern(&self, request: serde_json::Value) -> Result<JsJsonValue> {
+    pub fn query_pattern(&self, request: serde_json::Value) -> Result<JsonPayload> {
         let query = parse_js_graph_pattern_query(&request)?;
         let result = with_engine_ref(self, |eng| eng.query_pattern(&query))?;
         query_pattern_result_to_js(result)
@@ -835,9 +936,19 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
         ts_return_type = "import('./query-types').QueryPlan"
     )]
-    pub fn explain_node_query(&self, request: serde_json::Value) -> Result<JsJsonValue> {
+    pub fn explain_node_query(&self, request: serde_json::Value) -> Result<JsonPayload> {
         let query = parse_js_node_query(&request)?;
         let plan = with_engine_ref(self, |eng| eng.explain_node_query(&query))?;
+        query_plan_to_js(plan)
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryEdgeRequest",
+        ts_return_type = "import('./query-types').QueryPlan"
+    )]
+    pub fn explain_edge_query(&self, request: serde_json::Value) -> Result<JsonPayload> {
+        let query = parse_js_edge_query(&request)?;
+        let plan = with_engine_ref(self, |eng| eng.explain_edge_query(&query))?;
         query_plan_to_js(plan)
     }
 
@@ -845,7 +956,7 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').GraphPatternRequest",
         ts_return_type = "import('./query-types').QueryPlan"
     )]
-    pub fn explain_pattern_query(&self, request: serde_json::Value) -> Result<JsJsonValue> {
+    pub fn explain_pattern_query(&self, request: serde_json::Value) -> Result<JsonPayload> {
         let query = parse_js_graph_pattern_query(&request)?;
         let plan = with_engine_ref(self, |eng| eng.explain_pattern_query(&query))?;
         query_plan_to_js(plan)
@@ -854,13 +965,13 @@ impl OverGraph {
     #[napi]
     pub fn ensure_node_property_index(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
-        kind: JsSecondaryIndexKind,
-    ) -> Result<JsNodePropertyIndexInfo> {
+        kind: SecondaryIndexKind,
+    ) -> Result<NodePropertyIndexInfo> {
         let kind = js_secondary_index_kind_to_rust(kind)?;
         let info = with_engine(self, |eng| {
-            eng.ensure_node_property_index(type_id, &prop_key, kind.clone())
+            eng.ensure_node_property_index(&label, &prop_key, kind.clone())
         })?;
         node_property_index_info_to_js(info)
     }
@@ -868,18 +979,18 @@ impl OverGraph {
     #[napi]
     pub fn drop_node_property_index(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
-        kind: JsSecondaryIndexKind,
+        kind: SecondaryIndexKind,
     ) -> Result<bool> {
         let kind = js_secondary_index_kind_to_rust(kind)?;
         with_engine(self, |eng| {
-            eng.drop_node_property_index(type_id, &prop_key, kind.clone())
+            eng.drop_node_property_index(&label, &prop_key, kind.clone())
         })
     }
 
     #[napi]
-    pub fn list_node_property_indexes(&self) -> Result<Vec<JsNodePropertyIndexInfo>> {
+    pub fn list_node_property_indexes(&self) -> Result<Vec<NodePropertyIndexInfo>> {
         let infos = with_engine_ref(self, |eng| eng.list_node_property_indexes())?;
         infos
             .into_iter()
@@ -887,106 +998,151 @@ impl OverGraph {
             .collect()
     }
 
-    /// Return all node IDs of a given type (unpaged).
     #[napi]
-    pub fn nodes_by_type(&self, type_id: u32) -> Result<Float64Array> {
-        let ids = with_engine_ref(self, |eng| eng.nodes_by_type(type_id))?;
+    pub fn ensure_edge_property_index(
+        &self,
+        label: String,
+        prop_key: String,
+        kind: SecondaryIndexKind,
+    ) -> Result<EdgePropertyIndexInfo> {
+        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let info = with_engine(self, |eng| {
+            eng.ensure_edge_property_index(&label, &prop_key, kind.clone())
+        })?;
+        edge_property_index_info_to_js(info)
+    }
+
+    #[napi]
+    pub fn drop_edge_property_index(
+        &self,
+        label: String,
+        prop_key: String,
+        kind: SecondaryIndexKind,
+    ) -> Result<bool> {
+        let kind = js_secondary_index_kind_to_rust(kind)?;
+        with_engine(self, |eng| {
+            eng.drop_edge_property_index(&label, &prop_key, kind.clone())
+        })
+    }
+
+    #[napi]
+    pub fn list_edge_property_indexes(&self) -> Result<Vec<EdgePropertyIndexInfo>> {
+        let infos = with_engine_ref(self, |eng| eng.list_edge_property_indexes())?;
+        infos
+            .into_iter()
+            .map(edge_property_index_info_to_js)
+            .collect()
+    }
+
+    /// Return all node IDs containing every supplied node label (unpaged).
+    #[napi(ts_args_type = "labels: string | string[]")]
+    pub fn nodes_by_labels(&self, labels: serde_json::Value) -> Result<Float64Array> {
+        let labels = parse_js_node_labels_arg(&labels, "nodesByLabels labels")?;
+        let ids = with_engine_ref(self, |eng| eng.nodes_by_labels(labels))?;
         ids_to_float64_array(&ids)
     }
 
-    /// Return all edge IDs of a given type (unpaged).
+    /// Return all edge IDs of a given label (unpaged).
     #[napi]
-    pub fn edges_by_type(&self, type_id: u32) -> Result<Float64Array> {
-        let ids = with_engine_ref(self, |eng| eng.edges_by_type(type_id))?;
+    pub fn edges_by_label(&self, label: String) -> Result<Float64Array> {
+        let ids = with_engine_ref(self, |eng| eng.edges_by_label(&label))?;
         ids_to_float64_array(&ids)
     }
 
-    #[napi]
-    pub fn get_nodes_by_type(&self, type_id: u32) -> Result<Vec<JsNodeRecord>> {
-        let records = with_engine_ref(self, |eng| eng.get_nodes_by_type(type_id))?;
+    #[napi(ts_args_type = "labels: string | string[]")]
+    pub fn get_nodes_by_labels(&self, labels: serde_json::Value) -> Result<Vec<NodeView>> {
+        let labels = parse_js_node_labels_arg(&labels, "getNodesByLabels labels")?;
+        let records = with_engine_ref(self, |eng| eng.get_nodes_by_labels(labels))?;
         records
             .into_iter()
-            .map(JsNodeRecord::try_from)
+            .map(NodeView::try_from)
             .collect::<Result<Vec<_>>>()
     }
 
     #[napi]
-    pub fn get_edges_by_type(&self, type_id: u32) -> Result<Vec<JsEdgeRecord>> {
-        let records = with_engine_ref(self, |eng| eng.get_edges_by_type(type_id))?;
+    pub fn get_edges_by_label(&self, label: String) -> Result<Vec<EdgeView>> {
+        let records = with_engine_ref(self, |eng| eng.get_edges_by_label(&label))?;
         records
             .into_iter()
-            .map(JsEdgeRecord::try_from)
+            .map(EdgeView::try_from)
             .collect::<Result<Vec<_>>>()
     }
 
-    #[napi]
-    pub fn count_nodes_by_type(&self, type_id: u32) -> Result<i64> {
-        with_engine_ref(self, |eng| Ok(eng.count_nodes_by_type(type_id)? as i64))
+    #[napi(ts_args_type = "labels: string | string[]")]
+    pub fn count_nodes_by_labels(&self, labels: serde_json::Value) -> Result<i64> {
+        let labels = parse_js_node_labels_arg(&labels, "countNodesByLabels labels")?;
+        with_engine_ref(self, |eng| Ok(eng.count_nodes_by_labels(labels)? as i64))
     }
 
     #[napi]
-    pub fn count_edges_by_type(&self, type_id: u32) -> Result<i64> {
-        with_engine_ref(self, |eng| Ok(eng.count_edges_by_type(type_id)? as i64))
+    pub fn count_edges_by_label(&self, label: String) -> Result<i64> {
+        with_engine_ref(self, |eng| Ok(eng.count_edges_by_label(&label)? as i64))
     }
 
     // --- Paginated queries (sync) ---
 
-    #[napi]
-    pub fn nodes_by_type_paged(
+    #[napi(
+        ts_args_type = "labels: string | string[], limit?: number | null, after?: number | null"
+    )]
+    pub fn nodes_by_labels_paged(
         &self,
-        type_id: u32,
+        labels: serde_json::Value,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<JsIdPageResult> {
+    ) -> Result<IdPageResult> {
+        let labels = parse_js_node_labels_arg(&labels, "nodesByLabelsPaged labels")?;
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| eng.nodes_by_type_paged(type_id, &page))?;
+        let raw = with_engine_ref(self, |eng| eng.nodes_by_labels_paged(labels, &page))?;
         id_page_to_js(raw)
     }
 
     #[napi]
-    pub fn edges_by_type_paged(
+    pub fn edges_by_label_paged(
         &self,
-        type_id: u32,
+        label: String,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<JsIdPageResult> {
+    ) -> Result<IdPageResult> {
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| eng.edges_by_type_paged(type_id, &page))?;
+        let raw = with_engine_ref(self, |eng| eng.edges_by_label_paged(&label, &page))?;
         id_page_to_js(raw)
     }
 
-    #[napi]
-    pub fn get_nodes_by_type_paged(
+    #[napi(
+        ts_args_type = "labels: string | string[], limit?: number | null, after?: number | null"
+    )]
+    pub fn get_nodes_by_labels_paged(
         &self,
-        type_id: u32,
+        labels: serde_json::Value,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<JsNodePageResult> {
+    ) -> Result<NodePageResult> {
+        let labels = parse_js_node_labels_arg(&labels, "getNodesByLabelsPaged labels")?;
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| eng.get_nodes_by_type_paged(type_id, &page))?;
+        let raw = with_engine_ref(self, |eng| eng.get_nodes_by_labels_paged(labels, &page))?;
         node_page_to_js(raw)
     }
 
     #[napi]
-    pub fn get_edges_by_type_paged(
+    pub fn get_edges_by_label_paged(
         &self,
-        type_id: u32,
+        label: String,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<JsEdgePageResult> {
+    ) -> Result<EdgePageResult> {
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| eng.get_edges_by_type_paged(type_id, &page))?;
+        let raw = with_engine_ref(self, |eng| eng.get_edges_by_label_paged(&label, &page))?;
         edge_page_to_js(raw)
     }
 
     #[napi]
     pub fn find_nodes_paged(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
         prop_value: serde_json::Value,
-        options: Option<JsFindNodesPagedOptions>,
-    ) -> Result<JsIdPageResult> {
+        options: Option<FindNodesPagedOptions>,
+    ) -> Result<IdPageResult> {
         let pv = json_to_prop_value(&prop_value);
         let (limit, after) = match options {
             Some(o) => (o.limit, o.after),
@@ -994,7 +1150,7 @@ impl OverGraph {
         };
         let page = make_page_request(limit, after)?;
         let raw = with_engine_ref(self, |eng| {
-            eng.find_nodes_paged(type_id, &prop_key, &pv, &page)
+            eng.find_nodes_paged(&label, &prop_key, &pv, &page)
         })?;
         id_page_to_js(raw)
     }
@@ -1002,12 +1158,12 @@ impl OverGraph {
     #[napi]
     pub fn find_nodes_by_time_range(
         &self,
-        type_id: u32,
+        label: String,
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Float64Array> {
         let ids = with_engine_ref(self, |eng| {
-            eng.find_nodes_by_time_range(type_id, from_ms, to_ms)
+            eng.find_nodes_by_time_range(&label, from_ms, to_ms)
         })?;
         ids_to_float64_array(&ids)
     }
@@ -1015,10 +1171,10 @@ impl OverGraph {
     #[napi]
     pub fn find_nodes_range(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
-        lower: Option<JsPropertyRangeBound>,
-        upper: Option<JsPropertyRangeBound>,
+        lower: Option<PropertyRangeBound>,
+        upper: Option<PropertyRangeBound>,
     ) -> Result<Float64Array> {
         let lower = lower
             .as_ref()
@@ -1029,7 +1185,7 @@ impl OverGraph {
             .map(js_property_range_bound_to_rust)
             .transpose()?;
         let ids = with_engine_ref(self, |eng| {
-            eng.find_nodes_range(type_id, &prop_key, lower.as_ref(), upper.as_ref())
+            eng.find_nodes_range(&label, &prop_key, lower.as_ref(), upper.as_ref())
         })?;
         ids_to_float64_array(&ids)
     }
@@ -1037,18 +1193,18 @@ impl OverGraph {
     #[napi]
     pub fn find_nodes_by_time_range_paged(
         &self,
-        type_id: u32,
+        label: String,
         from_ms: i64,
         to_ms: i64,
-        options: Option<JsFindNodesByTimeRangePagedOptions>,
-    ) -> Result<JsIdPageResult> {
+        options: Option<FindNodesByTimeRangePagedOptions>,
+    ) -> Result<IdPageResult> {
         let (limit, after) = match options {
             Some(o) => (o.limit, o.after),
             None => (None, None),
         };
         let page = make_page_request(limit, after)?;
         let raw = with_engine_ref(self, |eng| {
-            eng.find_nodes_by_time_range_paged(type_id, from_ms, to_ms, &page)
+            eng.find_nodes_by_time_range_paged(&label, from_ms, to_ms, &page)
         })?;
         id_page_to_js(raw)
     }
@@ -1056,12 +1212,12 @@ impl OverGraph {
     #[napi]
     pub fn find_nodes_range_paged(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
-        lower: Option<JsPropertyRangeBound>,
-        upper: Option<JsPropertyRangeBound>,
-        options: Option<JsFindNodesRangePagedOptions>,
-    ) -> Result<JsPropertyRangePageResult> {
+        lower: Option<PropertyRangeBound>,
+        upper: Option<PropertyRangeBound>,
+        options: Option<FindNodesRangePagedOptions>,
+    ) -> Result<PropertyRangePageResult> {
         let lower = lower
             .as_ref()
             .map(js_property_range_bound_to_rust)
@@ -1072,7 +1228,7 @@ impl OverGraph {
             .transpose()?;
         let page = make_property_range_page_request(options)?;
         let raw = with_engine_ref(self, |eng| {
-            eng.find_nodes_range_paged(type_id, &prop_key, lower.as_ref(), upper.as_ref(), &page)
+            eng.find_nodes_range_paged(&label, &prop_key, lower.as_ref(), upper.as_ref(), &page)
         })?;
         property_range_page_to_js(raw)
     }
@@ -1081,8 +1237,8 @@ impl OverGraph {
     pub fn personalized_pagerank(
         &self,
         seed_node_ids: Vec<f64>,
-        options: Option<JsPersonalizedPagerankOptions>,
-    ) -> Result<JsPprResult> {
+        options: Option<PersonalizedPagerankOptions>,
+    ) -> Result<PprResult> {
         let seeds: Vec<u64> = seed_node_ids
             .into_iter()
             .map(f64_to_u64)
@@ -1093,7 +1249,7 @@ impl OverGraph {
             max_iterations,
             epsilon,
             approx_residual_tolerance,
-            edge_type_filter,
+            edge_label_filter,
             max_results,
         ) = match &options {
             Some(o) => (
@@ -1102,7 +1258,7 @@ impl OverGraph {
                 o.max_iterations,
                 o.epsilon,
                 o.approx_residual_tolerance,
-                o.edge_type_filter.clone(),
+                o.edge_label_filter.clone(),
                 o.max_results,
             ),
             None => (None, None, None, None, None, None, None),
@@ -1113,7 +1269,7 @@ impl OverGraph {
             &max_iterations,
             &epsilon,
             &approx_residual_tolerance,
-            &edge_type_filter,
+            &edge_label_filter,
             &max_results,
         )?;
         let result = with_engine_ref(self, |eng| eng.personalized_pagerank(&seeds, &opts))?;
@@ -1121,12 +1277,12 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn export_adjacency(&self, options: Option<JsExportOptions>) -> Result<JsAdjacencyExport> {
+    pub fn export_adjacency(&self, options: Option<ExportOptions>) -> Result<AdjacencyExport> {
         let include_weights = options
             .as_ref()
             .and_then(|o| o.include_weights)
             .unwrap_or(true);
-        let opts = js_export_options_to_rust(options);
+        let opts = js_export_options_to_rust(options)?;
         let result = with_engine_ref(self, |eng| eng.export_adjacency(&opts))?;
         adjacency_export_to_js(result, include_weights)
     }
@@ -1135,13 +1291,13 @@ impl OverGraph {
     pub fn neighbors_paged(
         &self,
         node_id: f64,
-        options: Option<JsNeighborsPagedOptions>,
-    ) -> Result<JsNeighborPageResult> {
+        options: Option<NeighborsPagedOptions>,
+    ) -> Result<NeighborPageResult> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, limit, after, at_epoch, decay_lambda) = match options {
+        let (direction, edge_label_filter, limit, after, at_epoch, decay_lambda) = match options {
             Some(o) => (
                 o.direction,
-                o.type_filter,
+                o.edge_label_filter,
                 o.limit,
                 o.after,
                 o.at_epoch,
@@ -1154,7 +1310,7 @@ impl OverGraph {
         let decay = decay_lambda.map(|v| v as f32);
         let opts = NeighborOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             limit: None,
             at_epoch,
             decay_lambda: decay,
@@ -1168,22 +1324,28 @@ impl OverGraph {
     #[napi]
     pub fn connected_components(
         &self,
-        options: Option<JsConnectedComponentsOptions>,
-    ) -> Result<Vec<JsComponentEntry>> {
-        let (edge_type_filter, node_type_filter, at_epoch) = match options {
-            Some(o) => (o.edge_type_filter, o.node_type_filter, o.at_epoch),
+        options: Option<ConnectedComponentsOptions>,
+    ) -> Result<Vec<ComponentEntry>> {
+        let (edge_label_filter, node_label_filter, at_epoch) = match options {
+            Some(o) => (
+                o.edge_label_filter,
+                o.node_label_filter
+                    .map(js_node_label_filter_to_rust)
+                    .transpose()?,
+                o.at_epoch,
+            ),
             None => (None, None, None),
         };
         let opts = ComponentOptions {
-            edge_type_filter,
-            node_type_filter,
+            edge_label_filter,
+            node_label_filter,
             at_epoch,
         };
         let map = with_engine_ref(self, |eng| eng.connected_components(&opts))?;
-        let mut entries: Vec<JsComponentEntry> = map
+        let mut entries: Vec<ComponentEntry> = map
             .into_iter()
             .map(|(node_id, component_id)| {
-                Ok(JsComponentEntry {
+                Ok(ComponentEntry {
                     node_id: u64_to_f64(node_id)?,
                     component_id: u64_to_f64(component_id)?,
                 })
@@ -1197,16 +1359,22 @@ impl OverGraph {
     pub fn component_of(
         &self,
         node_id: f64,
-        options: Option<JsComponentOfOptions>,
+        options: Option<ComponentOfOptions>,
     ) -> Result<Float64Array> {
         let node_id = f64_to_u64(node_id)?;
-        let (edge_type_filter, node_type_filter, at_epoch) = match options {
-            Some(o) => (o.edge_type_filter, o.node_type_filter, o.at_epoch),
+        let (edge_label_filter, node_label_filter, at_epoch) = match options {
+            Some(o) => (
+                o.edge_label_filter,
+                o.node_label_filter
+                    .map(js_node_label_filter_to_rust)
+                    .transpose()?,
+                o.at_epoch,
+            ),
             None => (None, None, None),
         };
         let opts = ComponentOptions {
-            edge_type_filter,
-            node_type_filter,
+            edge_label_filter,
+            node_label_filter,
             at_epoch,
         };
         let members = with_engine_ref(self, |eng| eng.component_of(node_id, &opts))?;
@@ -1219,13 +1387,16 @@ impl OverGraph {
     pub fn vector_search(
         &self,
         mode: String,
-        options: JsVectorSearchOptions,
-    ) -> Result<Vec<JsVectorHit>> {
+        options: VectorSearchOptions,
+    ) -> Result<Vec<VectorHit>> {
         let mode = parse_vector_search_mode(&mode)?;
         let k = options.k;
         let dense_query = options.dense_query;
         let sparse_query = options.sparse_query;
-        let type_filter = options.type_filter;
+        let label_filter = options
+            .label_filter
+            .map(js_node_label_filter_to_rust)
+            .transpose()?;
         let ef_search = options.ef_search;
         let scope = options.scope;
         let dense_weight = options.dense_weight;
@@ -1240,11 +1411,11 @@ impl OverGraph {
         });
         let scope = match scope {
             None => None,
-            Some(s) => Some(VectorSearchScope {
+            Some(s) => Some(CoreVectorSearchScope {
                 start_node_id: f64_to_u64(s.start_node_id)?,
                 max_depth: s.max_depth,
                 direction: parse_direction(s.direction.as_deref())?,
-                edge_type_filter: s.edge_type_filter,
+                edge_label_filter: s.edge_label_filter,
                 at_epoch: s.at_epoch,
             }),
         };
@@ -1253,7 +1424,7 @@ impl OverGraph {
             dense_query: dense_q,
             sparse_query: sparse_q,
             k: k as usize,
-            type_filter,
+            label_filter,
             ef_search: ef_search.map(|v| v as usize),
             scope,
             dense_weight: dense_weight.map(|v| v as f32),
@@ -1263,7 +1434,7 @@ impl OverGraph {
         let hits = with_engine_ref(self, |eng| eng.vector_search(&request))?;
         hits.into_iter()
             .map(|h| {
-                Ok(JsVectorHit {
+                Ok(VectorHit {
                     node_id: u64_to_f64(h.node_id)?,
                     score: h.score as f64,
                 })
@@ -1297,26 +1468,26 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn end_ingest(&self) -> Result<Option<JsCompactionStats>> {
+    pub fn end_ingest(&self) -> Result<Option<CompactionStats>> {
         with_engine(self, |eng| Ok(eng.end_ingest()?.map(|s| s.into())))
     }
 
     #[napi]
-    pub fn compact(&self) -> Result<Option<JsCompactionStats>> {
+    pub fn compact(&self) -> Result<Option<CompactionStats>> {
         with_engine(self, |eng| Ok(eng.compact()?.map(|s| s.into())))
     }
 
     /// Compact with a progress callback. The callback receives a progress object
     /// and should return `true` to continue or `false` to cancel.
     /// Runs synchronously. Blocks the event loop.
-    #[napi(ts_args_type = "callback: (progress: JsCompactionProgress) => boolean")]
+    #[napi(ts_args_type = "callback: (progress: CompactionProgress) => boolean")]
     pub fn compact_with_progress(
         &self,
-        callback: Function<JsCompactionProgress, bool>,
-    ) -> Result<Option<JsCompactionStats>> {
+        callback: Function<CompactionProgress, bool>,
+    ) -> Result<Option<CompactionStats>> {
         with_engine(self, |eng| {
             let result = eng.compact_with_progress(|progress| {
-                let js_progress = JsCompactionProgress {
+                let js_progress = CompactionProgress {
                     phase: match progress.phase {
                         CompactionPhase::CollectingTombstones => {
                             "collecting_tombstones".to_string()
@@ -1345,8 +1516,13 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn stats(&self) -> Result<JsDbStats> {
+    pub fn stats(&self) -> Result<DbStats> {
         with_engine_ref(self, |eng| Ok(eng.stats()?.into()))
+    }
+
+    #[napi]
+    pub fn scrub(&self) -> Result<ScrubReport> {
+        with_engine_ref(self, |eng| Ok(eng.scrub()?.into()))
     }
 
     // ============================
@@ -1354,7 +1530,7 @@ impl OverGraph {
     // ============================
 
     #[napi(ts_return_type = "Promise<void>")]
-    pub fn close_async(&self, options: Option<JsCloseOptions>) -> AsyncTask<CloseOp> {
+    pub fn close_async(&self, options: Option<CloseOptions>) -> AsyncTask<CloseOp> {
         let force = options.as_ref().and_then(|o| o.force).unwrap_or(false);
         AsyncTask::new(CloseOp {
             db: self.inner.clone(),
@@ -1362,8 +1538,8 @@ impl OverGraph {
         })
     }
 
-    #[napi(ts_return_type = "Promise<JsDbStats>")]
-    pub fn stats_async(&self) -> AsyncTask<EngineReadOp<DbStats, JsDbStats>> {
+    #[napi(ts_return_type = "Promise<DbStats>")]
+    pub fn stats_async(&self) -> AsyncTask<EngineReadOp<CoreDbStats, DbStats>> {
         AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             |eng| eng.stats(),
@@ -1371,19 +1547,120 @@ impl OverGraph {
         ))
     }
 
+    #[napi(ts_return_type = "Promise<ScrubReport>")]
+    pub fn scrub_async(&self) -> AsyncTask<EngineReadOp<CoreScrubReport, ScrubReport>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            |eng| eng.scrub(),
+            |r| Ok(r.into()),
+        ))
+    }
+
     #[napi(ts_return_type = "Promise<number>")]
+    pub fn ensure_node_label_async(&self, label: String) -> AsyncTask<EngineOp<u32, u32>> {
+        AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.ensure_node_label(&label),
+            Ok,
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<number>")]
+    pub fn ensure_edge_label_async(&self, label: String) -> AsyncTask<EngineOp<u32, u32>> {
+        AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.ensure_edge_label(&label),
+            Ok,
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<number | null>")]
+    pub fn get_node_label_id_async(
+        &self,
+        label: String,
+    ) -> AsyncTask<EngineReadOp<Option<u32>, Option<u32>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.get_node_label_id(&label),
+            Ok,
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<number | null>")]
+    pub fn get_edge_label_id_async(
+        &self,
+        label: String,
+    ) -> AsyncTask<EngineReadOp<Option<u32>, Option<u32>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.get_edge_label_id(&label),
+            Ok,
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<string | null>")]
+    pub fn get_node_label_async(
+        &self,
+        label_id: u32,
+    ) -> AsyncTask<EngineReadOp<Option<String>, Option<String>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.get_node_label(label_id),
+            Ok,
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<string | null>")]
+    pub fn get_edge_label_async(
+        &self,
+        label_id: u32,
+    ) -> AsyncTask<EngineReadOp<Option<String>, Option<String>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.get_edge_label(label_id),
+            Ok,
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<Array<NodeLabelInfo>>")]
+    pub fn list_node_labels_async(
+        &self,
+    ) -> AsyncTask<EngineReadOp<Vec<CoreNodeLabelInfo>, Vec<NodeLabelInfo>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            |eng| eng.list_node_labels(),
+            |infos| Ok(infos.into_iter().map(Into::into).collect()),
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<Array<EdgeLabelInfo>>")]
+    pub fn list_edge_labels_async(
+        &self,
+    ) -> AsyncTask<EngineReadOp<Vec<CoreEdgeLabelInfo>, Vec<EdgeLabelInfo>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            |eng| eng.list_edge_labels(),
+            |infos| Ok(infos.into_iter().map(Into::into).collect()),
+        ))
+    }
+
+    #[napi(
+        ts_args_type = "labels: string | string[], key: string, options?: UpsertNodeOptions | null",
+        ts_return_type = "Promise<number>"
+    )]
     pub fn upsert_node_async(
         &self,
-        type_id: u32,
+        labels: serde_json::Value,
         key: String,
-        options: Option<JsUpsertNodeOptions>,
-    ) -> AsyncTask<EngineOp<u64, f64>> {
+        options: Option<UpsertNodeOptions>,
+    ) -> Result<AsyncTask<EngineOp<u64, f64>>> {
+        let labels = parse_js_node_labels_arg(&labels, "upsertNodeAsync labels")?;
         let (props, weight, dense_vector, sparse_vector) = match options {
             Some(o) => (o.props, o.weight, o.dense_vector, o.sparse_vector),
             None => (None, None, None, None),
         };
         let props = convert_js_props(props);
-        let opts = UpsertNodeOptions {
+        let opts = CoreUpsertNodeOptions {
             props,
             weight: weight.unwrap_or(1.0) as f32,
             dense_vector: dense_vector.map(|dv| dv.into_iter().map(|x| x as f32).collect()),
@@ -1393,11 +1670,39 @@ impl OverGraph {
                     .collect()
             }),
         };
-        AsyncTask::new(EngineOp::new(
+        Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.upsert_node(type_id, &key, opts),
+            move |eng| eng.upsert_node(labels, &key, opts),
             u64_to_f64,
-        ))
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn add_node_label_async(
+        &self,
+        node_id: f64,
+        label: String,
+    ) -> Result<AsyncTask<EngineOp<bool, bool>>> {
+        let node_id = f64_to_u64(node_id)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.add_node_label(node_id, &label),
+            Ok,
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn remove_node_label_async(
+        &self,
+        node_id: f64,
+        label: String,
+    ) -> Result<AsyncTask<EngineOp<bool, bool>>> {
+        let node_id = f64_to_u64(node_id)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.remove_node_label(node_id, &label),
+            Ok,
+        )))
     }
 
     #[napi(ts_return_type = "Promise<number>")]
@@ -1405,8 +1710,8 @@ impl OverGraph {
         &self,
         from: f64,
         to: f64,
-        type_id: u32,
-        options: Option<JsUpsertEdgeOptions>,
+        label: String,
+        options: Option<UpsertEdgeOptions>,
     ) -> Result<AsyncTask<EngineOp<u64, f64>>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
@@ -1415,7 +1720,7 @@ impl OverGraph {
             None => (None, None, None, None),
         };
         let props = convert_js_props(props);
-        let opts = UpsertEdgeOptions {
+        let opts = CoreUpsertEdgeOptions {
             props,
             weight: weight.unwrap_or(1.0) as f32,
             valid_from,
@@ -1423,7 +1728,7 @@ impl OverGraph {
         };
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.upsert_edge(from, to, type_id, opts),
+            move |eng| eng.upsert_edge(from, to, &label, opts),
             u64_to_f64,
         )))
     }
@@ -1431,27 +1736,30 @@ impl OverGraph {
     #[napi(ts_return_type = "Promise<Float64Array>")]
     pub fn batch_upsert_nodes_async(
         &self,
-        nodes: Vec<JsNodeInput>,
-    ) -> AsyncTask<EngineOp<Vec<u64>, Float64Array>> {
-        let inputs: Vec<NodeInput> = nodes.into_iter().map(|n| n.into()).collect();
-        AsyncTask::new(EngineOp::new(
+        nodes: Vec<NodeInput>,
+    ) -> Result<AsyncTask<EngineOp<Vec<u64>, Float64Array>>> {
+        let inputs: Vec<CoreNodeInput> = nodes
+            .into_iter()
+            .map(NodeInput::try_into)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.batch_upsert_nodes(&inputs),
+            move |eng| eng.batch_upsert_nodes(inputs),
             |ids| ids_to_float64_array(&ids),
-        ))
+        )))
     }
 
     #[napi(ts_return_type = "Promise<Float64Array>")]
     pub fn batch_upsert_edges_async(
         &self,
-        edges: Vec<JsEdgeInput>,
+        edges: Vec<EdgeInput>,
     ) -> Result<AsyncTask<EngineOp<Vec<u64>, Float64Array>>> {
-        let inputs: std::result::Result<Vec<EdgeInput>, _> =
+        let inputs: std::result::Result<Vec<CoreEdgeInput>, _> =
             edges.into_iter().map(|e| e.try_into()).collect();
         let inputs = inputs?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.batch_upsert_edges(&inputs),
+            move |eng| eng.batch_upsert_edges(inputs),
             |ids| ids_to_float64_array(&ids),
         )))
     }
@@ -1464,7 +1772,7 @@ impl OverGraph {
         let inputs = decode_node_batch(&buffer)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.batch_upsert_nodes(&inputs),
+            move |eng| eng.batch_upsert_nodes(inputs),
             |ids| ids_to_float64_array(&ids),
         )))
     }
@@ -1477,71 +1785,71 @@ impl OverGraph {
         let inputs = decode_edge_batch(&buffer)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.batch_upsert_edges(&inputs),
+            move |eng| eng.batch_upsert_edges(inputs),
             |ids| ids_to_float64_array(&ids),
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsNodeRecord | null>")]
+    #[napi(ts_return_type = "Promise<NodeView | null>")]
     pub fn get_node_async(
         &self,
         id: f64,
-    ) -> Result<AsyncTask<EngineReadOp<Option<NodeRecord>, Option<JsNodeRecord>>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Option<CoreNodeView>, Option<NodeView>>>> {
         let id = f64_to_u64(id)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_node(id),
-            |n| n.map(JsNodeRecord::try_from).transpose(),
+            |n| n.map(NodeView::try_from).transpose(),
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsEdgeRecord | null>")]
+    #[napi(ts_return_type = "Promise<EdgeView | null>")]
     pub fn get_edge_async(
         &self,
         id: f64,
-    ) -> Result<AsyncTask<EngineReadOp<Option<EdgeRecord>, Option<JsEdgeRecord>>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Option<CoreEdgeView>, Option<EdgeView>>>> {
         let id = f64_to_u64(id)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.get_edge(id),
-            |e| e.map(JsEdgeRecord::try_from).transpose(),
+            |e| e.map(EdgeView::try_from).transpose(),
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsNodeRecord | null>")]
+    #[napi(ts_return_type = "Promise<NodeView | null>")]
     pub fn get_node_by_key_async(
         &self,
-        type_id: u32,
+        label: String,
         key: String,
-    ) -> AsyncTask<EngineReadOp<Option<NodeRecord>, Option<JsNodeRecord>>> {
+    ) -> AsyncTask<EngineReadOp<Option<CoreNodeView>, Option<NodeView>>> {
         AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.get_node_by_key(type_id, &key),
-            |n| n.map(JsNodeRecord::try_from).transpose(),
+            move |eng| eng.get_node_by_key(&label, &key),
+            |n| n.map(NodeView::try_from).transpose(),
         ))
     }
 
-    #[napi(ts_return_type = "Promise<JsEdgeRecord | null>")]
+    #[napi(ts_return_type = "Promise<EdgeView | null>")]
     pub fn get_edge_by_triple_async(
         &self,
         from: f64,
         to: f64,
-        type_id: u32,
-    ) -> Result<AsyncTask<EngineReadOp<Option<EdgeRecord>, Option<JsEdgeRecord>>>> {
+        label: String,
+    ) -> Result<AsyncTask<EngineReadOp<Option<CoreEdgeView>, Option<EdgeView>>>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.get_edge_by_triple(from, to, type_id),
-            |e| e.map(JsEdgeRecord::try_from).transpose(),
+            move |eng| eng.get_edge_by_triple(from, to, &label),
+            |e| e.map(EdgeView::try_from).transpose(),
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsNodeRecord | null>>")]
+    #[napi(ts_return_type = "Promise<Array<NodeView | null>>")]
     pub fn get_nodes_async(
         &self,
         ids: Vec<f64>,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<Option<NodeRecord>>, Vec<Option<JsNodeRecord>>>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Vec<Option<CoreNodeView>>, Vec<Option<NodeView>>>>> {
         let ids: Vec<u64> = ids
             .into_iter()
             .map(f64_to_u64)
@@ -1552,38 +1860,38 @@ impl OverGraph {
             |results| {
                 results
                     .into_iter()
-                    .map(|r| r.map(JsNodeRecord::try_from).transpose())
+                    .map(|r| r.map(NodeView::try_from).transpose())
                     .collect::<Result<Vec<_>>>()
             },
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsNodeRecord | null>>")]
+    #[napi(ts_return_type = "Promise<Array<NodeView | null>>")]
     pub fn get_nodes_by_keys_async(
         &self,
-        keys: Vec<JsKeyQuery>,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<Option<NodeRecord>>, Vec<Option<JsNodeRecord>>>>> {
-        let owned: Vec<(u32, String)> = keys.into_iter().map(|k| (k.type_id, k.key)).collect();
+        keys: Vec<KeyQuery>,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<Option<CoreNodeView>>, Vec<Option<NodeView>>>>> {
+        let owned: Vec<NodeKeyQuery> = keys
+            .into_iter()
+            .map(KeyQuery::try_into)
+            .collect::<Result<Vec<_>>>()?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| {
-                let refs: Vec<(u32, &str)> = owned.iter().map(|(t, k)| (*t, k.as_str())).collect();
-                eng.get_nodes_by_keys(&refs)
-            },
+            move |eng| eng.get_nodes_by_keys(&owned),
             |results| {
                 results
                     .into_iter()
-                    .map(|r| r.map(JsNodeRecord::try_from).transpose())
+                    .map(|r| r.map(NodeView::try_from).transpose())
                     .collect::<Result<Vec<_>>>()
             },
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsEdgeRecord | null>>")]
+    #[napi(ts_return_type = "Promise<Array<EdgeView | null>>")]
     pub fn get_edges_async(
         &self,
         ids: Vec<f64>,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<Option<EdgeRecord>>, Vec<Option<JsEdgeRecord>>>>> {
+    ) -> Result<AsyncTask<EngineReadOp<Vec<Option<CoreEdgeView>>, Vec<Option<EdgeView>>>>> {
         let ids: Vec<u64> = ids
             .into_iter()
             .map(f64_to_u64)
@@ -1594,7 +1902,7 @@ impl OverGraph {
             |results| {
                 results
                     .into_iter()
-                    .map(|r| r.map(JsEdgeRecord::try_from).transpose())
+                    .map(|r| r.map(EdgeView::try_from).transpose())
                     .collect::<Result<Vec<_>>>()
             },
         )))
@@ -1620,31 +1928,31 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsEdgeRecord | null>")]
+    #[napi(ts_return_type = "Promise<EdgeView | null>")]
     pub fn invalidate_edge_async(
         &self,
         id: f64,
         valid_to: i64,
-    ) -> Result<AsyncTask<EngineOp<Option<EdgeRecord>, Option<JsEdgeRecord>>>> {
+    ) -> Result<AsyncTask<EngineOp<Option<CoreEdgeView>, Option<EdgeView>>>> {
         let id = f64_to_u64(id)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             move |eng| eng.invalidate_edge(id, valid_to),
-            |e| e.map(JsEdgeRecord::try_from).transpose(),
+            |e| e.map(EdgeView::try_from).transpose(),
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsPatchResult>")]
+    #[napi(ts_return_type = "Promise<PatchResult>")]
     pub fn graph_patch_async(
         &self,
-        patch: JsGraphPatch,
-    ) -> Result<AsyncTask<EngineOp<overgraph::PatchResult, JsPatchResult>>> {
+        patch: GraphPatch,
+    ) -> Result<AsyncTask<EngineOp<overgraph::PatchResult, PatchResult>>> {
         let rust_patch = js_patch_to_rust(patch)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.graph_patch(&rust_patch),
+            move |eng| eng.graph_patch(rust_patch),
             |result| {
-                Ok(JsPatchResult {
+                Ok(PatchResult {
                     node_ids: ids_to_float64_array(&result.node_ids)?,
                     edge_ids: ids_to_float64_array(&result.edge_ids)?,
                 })
@@ -1652,21 +1960,17 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsPruneResult>")]
+    #[napi(ts_return_type = "Promise<PruneResult>")]
     pub fn prune_async(
         &self,
-        policy: JsPrunePolicy,
-    ) -> Result<AsyncTask<EngineOp<PruneResult, JsPruneResult>>> {
-        let rust_policy = PrunePolicy {
-            max_age_ms: policy.max_age_ms.map(|v| v as i64),
-            max_weight: policy.max_weight.map(|v| v as f32),
-            type_id: policy.type_id,
-        };
+        policy: PrunePolicy,
+    ) -> Result<AsyncTask<EngineOp<CorePruneResult, PruneResult>>> {
+        let rust_policy = js_prune_policy_to_rust(policy, "pruneAsync")?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             move |eng| eng.prune(&rust_policy),
             |result| {
-                Ok(JsPruneResult {
+                Ok(PruneResult {
                     nodes_pruned: result.nodes_pruned as i64,
                     edges_pruned: result.edges_pruned as i64,
                 })
@@ -1674,17 +1978,17 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsNeighborEntry>>")]
+    #[napi(ts_return_type = "Promise<Array<NeighborEntry>>")]
     pub fn neighbors_async(
         &self,
         node_id: f64,
-        options: Option<JsNeighborsOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<NeighborEntry>, Vec<JsNeighborEntry>>>> {
+        options: Option<NeighborsOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<CoreNeighborEntry>, Vec<NeighborEntry>>>> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, limit, at_epoch, decay_lambda) = match options {
+        let (direction, edge_label_filter, limit, at_epoch, decay_lambda) = match options {
             Some(o) => (
                 o.direction,
-                o.type_filter,
+                o.edge_label_filter,
                 o.limit,
                 o.at_epoch,
                 o.decay_lambda,
@@ -1696,7 +2000,7 @@ impl OverGraph {
         let decay = decay_lambda.map(|v| v as f32);
         let opts = NeighborOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             limit: lim,
             at_epoch,
             decay_lambda: decay,
@@ -1708,19 +2012,19 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsTraversalPageResult>")]
+    #[napi(ts_return_type = "Promise<TraversalPageResult>")]
     pub fn traverse_async(
         &self,
         start_node_id: f64,
         max_depth: u32,
-        options: Option<JsTraverseOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<TraversalPageResult, JsTraversalPageResult>>> {
+        options: Option<TraverseOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<CoreTraversalPageResult, TraversalPageResult>>> {
         let start_node_id = f64_to_u64(start_node_id)?;
         let (
             direction,
             min_depth,
-            edge_type_filter,
-            node_type_filter,
+            edge_label_filter,
+            node_label_filter,
             at_epoch,
             decay_lambda,
             limit,
@@ -1729,8 +2033,10 @@ impl OverGraph {
             Some(o) => (
                 o.direction,
                 o.min_depth,
-                o.edge_type_filter,
-                o.node_type_filter,
+                o.edge_label_filter,
+                o.emit_node_label_filter
+                    .map(js_node_label_filter_to_rust)
+                    .transpose()?,
                 o.at_epoch,
                 o.decay_lambda,
                 o.limit,
@@ -1741,11 +2047,11 @@ impl OverGraph {
         let dir = parse_direction(direction.as_deref())?;
         let min_depth = min_depth.unwrap_or(1);
         let cursor = cursor.map(js_traversal_cursor_to_rust).transpose()?;
-        let opts = TraverseOptions {
+        let opts = CoreTraverseOptions {
             min_depth,
             direction: dir,
-            edge_type_filter,
-            node_type_filter,
+            edge_label_filter,
+            emit_node_label_filter: node_label_filter,
             at_epoch,
             decay_lambda,
             limit: limit.map(|v| v as usize),
@@ -1758,18 +2064,18 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsNeighborEntry>>")]
+    #[napi(ts_return_type = "Promise<Array<NeighborEntry>>")]
     pub fn top_k_neighbors_async(
         &self,
         node_id: f64,
         k: u32,
-        options: Option<JsTopKNeighborsOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<NeighborEntry>, Vec<JsNeighborEntry>>>> {
+        options: Option<TopKNeighborsOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<CoreNeighborEntry>, Vec<NeighborEntry>>>> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, scoring, decay_lambda, at_epoch) = match options {
+        let (direction, edge_label_filter, scoring, decay_lambda, at_epoch) = match options {
             Some(o) => (
                 o.direction,
-                o.type_filter,
+                o.edge_label_filter,
                 o.scoring,
                 o.decay_lambda,
                 o.at_epoch,
@@ -1780,7 +2086,7 @@ impl OverGraph {
         let scoring_mode = parse_scoring_mode(scoring.as_deref(), decay_lambda)?;
         let opts = TopKOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             scoring: scoring_mode,
             at_epoch,
         };
@@ -1791,22 +2097,30 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsSubgraphResult>")]
+    #[napi(ts_return_type = "Promise<SubgraphResult>")]
     pub fn extract_subgraph_async(
         &self,
         start_node_id: f64,
         max_depth: u32,
-        options: Option<JsExtractSubgraphOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<Subgraph, JsSubgraphResult>>> {
+        options: Option<ExtractSubgraphOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<Subgraph, SubgraphResult>>> {
         let start = f64_to_u64(start_node_id)?;
-        let (direction, edge_type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.edge_type_filter, o.at_epoch),
-            None => (None, None, None),
+        let (direction, edge_label_filter, node_label_filter, at_epoch) = match options {
+            Some(o) => (
+                o.direction,
+                o.edge_label_filter,
+                o.node_label_filter
+                    .map(js_node_label_filter_to_rust)
+                    .transpose()?,
+                o.at_epoch,
+            ),
+            None => (None, None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
         let opts = SubgraphOptions {
             direction: dir,
-            edge_type_filter,
+            edge_label_filter,
+            node_label_filter,
             at_epoch,
         };
         Ok(AsyncTask::new(EngineReadOp::new(
@@ -1819,26 +2133,26 @@ impl OverGraph {
     #[napi(ts_return_type = "Promise<Float64Array>")]
     pub fn find_nodes_async(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
         prop_value: serde_json::Value,
     ) -> AsyncTask<EngineReadOp<Vec<u64>, Float64Array>> {
         let pv = json_to_prop_value(&prop_value);
         AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.find_nodes(type_id, &prop_key, &pv),
+            move |eng| eng.find_nodes(&label, &prop_key, &pv),
             |ids| ids_to_float64_array(&ids),
         ))
     }
 
     #[napi(
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
-        ts_return_type = "Promise<JsIdPageResult>"
+        ts_return_type = "Promise<IdPageResult>"
     )]
     pub fn query_node_ids_async(
         &self,
         request: serde_json::Value,
-    ) -> Result<AsyncTask<EngineReadOp<QueryNodeIdsResult, JsIdPageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<QueryNodeIdsResult, IdPageResult>>> {
         let query = parse_js_node_query(&request)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
@@ -1849,17 +2163,49 @@ impl OverGraph {
 
     #[napi(
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
-        ts_return_type = "Promise<JsNodePageResult>"
+        ts_return_type = "Promise<NodePageResult>"
     )]
     pub fn query_nodes_async(
         &self,
         request: serde_json::Value,
-    ) -> Result<AsyncTask<EngineReadOp<QueryNodesResult, JsNodePageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<QueryNodesResult, NodePageResult>>> {
         let query = parse_js_node_query(&request)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.query_nodes(&query),
             query_nodes_to_js,
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryEdgeRequest",
+        ts_return_type = "Promise<IdPageResult>"
+    )]
+    pub fn query_edge_ids_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<QueryEdgeIdsResult, IdPageResult>>> {
+        let query = parse_js_edge_query(&request)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.query_edge_ids(&query),
+            query_edge_ids_to_js,
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryEdgeRequest",
+        ts_return_type = "Promise<EdgePageResult>"
+    )]
+    pub fn query_edges_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<QueryEdgesResult, EdgePageResult>>> {
+        let query = parse_js_edge_query(&request)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.query_edges(&query),
+            query_edges_to_js,
         )))
     }
 
@@ -1870,7 +2216,7 @@ impl OverGraph {
     pub fn query_pattern_async(
         &self,
         request: serde_json::Value,
-    ) -> Result<AsyncTask<EngineReadOp<QueryPatternResult, JsJsonValue>>> {
+    ) -> Result<AsyncTask<EngineReadOp<QueryPatternResult, JsonPayload>>> {
         let query = parse_js_graph_pattern_query(&request)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
@@ -1886,11 +2232,27 @@ impl OverGraph {
     pub fn explain_node_query_async(
         &self,
         request: serde_json::Value,
-    ) -> Result<AsyncTask<EngineReadOp<QueryPlan, JsJsonValue>>> {
+    ) -> Result<AsyncTask<EngineReadOp<QueryPlan, JsonPayload>>> {
         let query = parse_js_node_query(&request)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.explain_node_query(&query),
+            query_plan_to_js,
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').QueryEdgeRequest",
+        ts_return_type = "Promise<import('./query-types').QueryPlan>"
+    )]
+    pub fn explain_edge_query_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<QueryPlan, JsonPayload>>> {
+        let query = parse_js_edge_query(&request)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.explain_edge_query(&query),
             query_plan_to_js,
         )))
     }
@@ -1902,7 +2264,7 @@ impl OverGraph {
     pub fn explain_pattern_query_async(
         &self,
         request: serde_json::Value,
-    ) -> Result<AsyncTask<EngineReadOp<QueryPlan, JsJsonValue>>> {
+    ) -> Result<AsyncTask<EngineReadOp<QueryPlan, JsonPayload>>> {
         let query = parse_js_graph_pattern_query(&request)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
@@ -1911,17 +2273,17 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsNodePropertyIndexInfo>")]
+    #[napi(ts_return_type = "Promise<NodePropertyIndexInfo>")]
     pub fn ensure_node_property_index_async(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
-        kind: JsSecondaryIndexKind,
-    ) -> Result<AsyncTask<EngineOp<NodePropertyIndexInfo, JsNodePropertyIndexInfo>>> {
+        kind: SecondaryIndexKind,
+    ) -> Result<AsyncTask<EngineOp<CoreNodePropertyIndexInfo, NodePropertyIndexInfo>>> {
         let kind = js_secondary_index_kind_to_rust(kind)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.ensure_node_property_index(type_id, &prop_key, kind.clone()),
+            move |eng| eng.ensure_node_property_index(&label, &prop_key, kind.clone()),
             node_property_index_info_to_js,
         )))
     }
@@ -1929,22 +2291,22 @@ impl OverGraph {
     #[napi(ts_return_type = "Promise<boolean>")]
     pub fn drop_node_property_index_async(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
-        kind: JsSecondaryIndexKind,
+        kind: SecondaryIndexKind,
     ) -> Result<AsyncTask<EngineOp<bool, bool>>> {
         let kind = js_secondary_index_kind_to_rust(kind)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.drop_node_property_index(type_id, &prop_key, kind.clone()),
+            move |eng| eng.drop_node_property_index(&label, &prop_key, kind.clone()),
             Ok,
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsNodePropertyIndexInfo>>")]
+    #[napi(ts_return_type = "Promise<Array<NodePropertyIndexInfo>>")]
     pub fn list_node_property_indexes_async(
         &self,
-    ) -> AsyncTask<EngineReadOp<Vec<NodePropertyIndexInfo>, Vec<JsNodePropertyIndexInfo>>> {
+    ) -> AsyncTask<EngineReadOp<Vec<CoreNodePropertyIndexInfo>, Vec<NodePropertyIndexInfo>>> {
         AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             |eng| eng.list_node_property_indexes(),
@@ -1952,13 +2314,54 @@ impl OverGraph {
         ))
     }
 
+    #[napi(ts_return_type = "Promise<EdgePropertyIndexInfo>")]
+    pub fn ensure_edge_property_index_async(
+        &self,
+        label: String,
+        prop_key: String,
+        kind: SecondaryIndexKind,
+    ) -> Result<AsyncTask<EngineOp<CoreEdgePropertyIndexInfo, EdgePropertyIndexInfo>>> {
+        let kind = js_secondary_index_kind_to_rust(kind)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.ensure_edge_property_index(&label, &prop_key, kind.clone()),
+            edge_property_index_info_to_js,
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn drop_edge_property_index_async(
+        &self,
+        label: String,
+        prop_key: String,
+        kind: SecondaryIndexKind,
+    ) -> Result<AsyncTask<EngineOp<bool, bool>>> {
+        let kind = js_secondary_index_kind_to_rust(kind)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.drop_edge_property_index(&label, &prop_key, kind.clone()),
+            Ok,
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<Array<EdgePropertyIndexInfo>>")]
+    pub fn list_edge_property_indexes_async(
+        &self,
+    ) -> AsyncTask<EngineReadOp<Vec<CoreEdgePropertyIndexInfo>, Vec<EdgePropertyIndexInfo>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            |eng| eng.list_edge_property_indexes(),
+            edge_property_index_infos_to_js,
+        ))
+    }
+
     #[napi(ts_return_type = "Promise<Float64Array>")]
     pub fn find_nodes_range_async(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
-        lower: Option<JsPropertyRangeBound>,
-        upper: Option<JsPropertyRangeBound>,
+        lower: Option<PropertyRangeBound>,
+        upper: Option<PropertyRangeBound>,
     ) -> Result<AsyncTask<EngineReadOp<Vec<u64>, Float64Array>>> {
         let lower = lower
             .as_ref()
@@ -1970,20 +2373,20 @@ impl OverGraph {
             .transpose()?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.find_nodes_range(type_id, &prop_key, lower.as_ref(), upper.as_ref()),
+            move |eng| eng.find_nodes_range(&label, &prop_key, lower.as_ref(), upper.as_ref()),
             |ids| ids_to_float64_array(&ids),
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsPropertyRangePageResult>")]
+    #[napi(ts_return_type = "Promise<PropertyRangePageResult>")]
     pub fn find_nodes_range_paged_async(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
-        lower: Option<JsPropertyRangeBound>,
-        upper: Option<JsPropertyRangeBound>,
-        options: Option<JsFindNodesRangePagedOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<PropertyRangePageResult<u64>, JsPropertyRangePageResult>>>
+        lower: Option<PropertyRangeBound>,
+        upper: Option<PropertyRangeBound>,
+        options: Option<FindNodesRangePagedOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<CorePropertyRangePageResult<u64>, PropertyRangePageResult>>>
     {
         let lower = lower
             .as_ref()
@@ -1997,114 +2400,123 @@ impl OverGraph {
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| {
-                eng.find_nodes_range_paged(
-                    type_id,
-                    &prop_key,
-                    lower.as_ref(),
-                    upper.as_ref(),
-                    &page,
-                )
+                eng.find_nodes_range_paged(&label, &prop_key, lower.as_ref(), upper.as_ref(), &page)
             },
             property_range_page_to_js,
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsNodeRecord>>")]
-    pub fn get_nodes_by_type_async(
+    #[napi(
+        ts_args_type = "labels: string | string[]",
+        ts_return_type = "Promise<Array<NodeView>>"
+    )]
+    pub fn get_nodes_by_labels_async(
         &self,
-        type_id: u32,
-    ) -> AsyncTask<EngineReadOp<Vec<NodeRecord>, Vec<JsNodeRecord>>> {
-        AsyncTask::new(EngineReadOp::new(
+        labels: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<CoreNodeView>, Vec<NodeView>>>> {
+        let labels = parse_js_node_labels_arg(&labels, "getNodesByLabelsAsync labels")?;
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.get_nodes_by_type(type_id),
+            move |eng| eng.get_nodes_by_labels(labels),
             |records| {
                 records
                     .into_iter()
-                    .map(JsNodeRecord::try_from)
+                    .map(NodeView::try_from)
+                    .collect::<Result<Vec<_>>>()
+            },
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<Array<EdgeView>>")]
+    pub fn get_edges_by_label_async(
+        &self,
+        label: String,
+    ) -> AsyncTask<EngineReadOp<Vec<CoreEdgeView>, Vec<EdgeView>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.get_edges_by_label(&label),
+            |records| {
+                records
+                    .into_iter()
+                    .map(EdgeView::try_from)
                     .collect::<Result<Vec<_>>>()
             },
         ))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsEdgeRecord>>")]
-    pub fn get_edges_by_type_async(
+    #[napi(
+        ts_args_type = "labels: string | string[]",
+        ts_return_type = "Promise<number>"
+    )]
+    pub fn count_nodes_by_labels_async(
         &self,
-        type_id: u32,
-    ) -> AsyncTask<EngineReadOp<Vec<EdgeRecord>, Vec<JsEdgeRecord>>> {
-        AsyncTask::new(EngineReadOp::new(
+        labels: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<u64, i64>>> {
+        let labels = parse_js_node_labels_arg(&labels, "countNodesByLabelsAsync labels")?;
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.get_edges_by_type(type_id),
-            |records| {
-                records
-                    .into_iter()
-                    .map(JsEdgeRecord::try_from)
-                    .collect::<Result<Vec<_>>>()
-            },
-        ))
+            move |eng| eng.count_nodes_by_labels(labels),
+            |count| Ok(count as i64),
+        )))
     }
 
     #[napi(ts_return_type = "Promise<number>")]
-    pub fn count_nodes_by_type_async(&self, type_id: u32) -> AsyncTask<EngineReadOp<u64, i64>> {
+    pub fn count_edges_by_label_async(&self, label: String) -> AsyncTask<EngineReadOp<u64, i64>> {
         AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.count_nodes_by_type(type_id),
+            move |eng| eng.count_edges_by_label(&label),
             |count| Ok(count as i64),
         ))
     }
 
-    #[napi(ts_return_type = "Promise<number>")]
-    pub fn count_edges_by_type_async(&self, type_id: u32) -> AsyncTask<EngineReadOp<u64, i64>> {
-        AsyncTask::new(EngineReadOp::new(
+    #[napi(
+        ts_args_type = "labels: string | string[]",
+        ts_return_type = "Promise<Float64Array>"
+    )]
+    pub fn nodes_by_labels_async(
+        &self,
+        labels: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<u64>, Float64Array>>> {
+        let labels = parse_js_node_labels_arg(&labels, "nodesByLabelsAsync labels")?;
+        Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.count_edges_by_type(type_id),
-            |count| Ok(count as i64),
-        ))
+            move |eng| eng.nodes_by_labels(labels),
+            |ids| ids_to_float64_array(&ids),
+        )))
     }
 
     #[napi(ts_return_type = "Promise<Float64Array>")]
-    pub fn nodes_by_type_async(
+    pub fn edges_by_label_async(
         &self,
-        type_id: u32,
+        label: String,
     ) -> AsyncTask<EngineReadOp<Vec<u64>, Float64Array>> {
         AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.nodes_by_type(type_id),
+            move |eng| eng.edges_by_label(&label),
             |ids| ids_to_float64_array(&ids),
         ))
     }
 
-    #[napi(ts_return_type = "Promise<Float64Array>")]
-    pub fn edges_by_type_async(
-        &self,
-        type_id: u32,
-    ) -> AsyncTask<EngineReadOp<Vec<u64>, Float64Array>> {
-        AsyncTask::new(EngineReadOp::new(
-            self.inner.clone(),
-            move |eng| eng.edges_by_type(type_id),
-            |ids| ids_to_float64_array(&ids),
-        ))
-    }
-
-    #[napi(ts_return_type = "Promise<Array<JsNeighborBatchEntry>>")]
+    #[napi(ts_return_type = "Promise<Array<NeighborBatchEntry>>")]
     pub fn neighbors_batch_async(
         &self,
         node_ids: Vec<f64>,
-        options: Option<JsNeighborsBatchOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<NodeIdMap<Vec<NeighborEntry>>, Vec<JsNeighborBatchEntry>>>>
+        options: Option<NeighborsBatchOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<NodeIdMap<Vec<CoreNeighborEntry>>, Vec<NeighborBatchEntry>>>>
     {
         let ids: Vec<u64> = node_ids
             .into_iter()
             .map(f64_to_u64)
             .collect::<Result<Vec<_>>>()?;
-        let (direction, type_filter, at_epoch, decay_lambda) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch, o.decay_lambda),
+        let (direction, edge_label_filter, at_epoch, decay_lambda) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch, o.decay_lambda),
             None => (None, None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
         let decay = decay_lambda.map(|v| v as f32);
         let opts = NeighborOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             limit: None,
             at_epoch,
             decay_lambda: decay,
@@ -2122,17 +2534,17 @@ impl OverGraph {
     pub fn degree_async(
         &self,
         node_id: f64,
-        options: Option<JsDegreeOptions>,
+        options: Option<DegreeOptions>,
     ) -> Result<AsyncTask<EngineReadOp<u64, i64>>> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch),
+        let (direction, edge_label_filter, at_epoch) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch),
             None => (None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = DegreeOptions {
+        let opts = CoreDegreeOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             at_epoch,
         };
         Ok(AsyncTask::new(EngineReadOp::new(
@@ -2146,17 +2558,17 @@ impl OverGraph {
     pub fn sum_edge_weights_async(
         &self,
         node_id: f64,
-        options: Option<JsSumEdgeWeightsOptions>,
+        options: Option<SumEdgeWeightsOptions>,
     ) -> Result<AsyncTask<EngineReadOp<f64, f64>>> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch),
+        let (direction, edge_label_filter, at_epoch) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch),
             None => (None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = DegreeOptions {
+        let opts = CoreDegreeOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             at_epoch,
         };
         Ok(AsyncTask::new(EngineReadOp::new(
@@ -2170,17 +2582,17 @@ impl OverGraph {
     pub fn avg_edge_weight_async(
         &self,
         node_id: f64,
-        options: Option<JsAvgEdgeWeightOptions>,
+        options: Option<AvgEdgeWeightOptions>,
     ) -> Result<AsyncTask<EngineReadOp<Option<f64>, Option<f64>>>> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch),
+        let (direction, edge_label_filter, at_epoch) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch),
             None => (None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = DegreeOptions {
+        let opts = CoreDegreeOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             at_epoch,
         };
         Ok(AsyncTask::new(EngineReadOp::new(
@@ -2190,34 +2602,34 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsDegreeBatchEntry>>")]
+    #[napi(ts_return_type = "Promise<Array<DegreeBatchEntry>>")]
     pub fn degrees_async(
         &self,
         node_ids: Vec<f64>,
-        options: Option<JsDegreesOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<NodeIdMap<u64>, Vec<JsDegreeBatchEntry>>>> {
+        options: Option<DegreesOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<NodeIdMap<u64>, Vec<DegreeBatchEntry>>>> {
         let ids: Vec<u64> = node_ids
             .into_iter()
             .map(f64_to_u64)
             .collect::<Result<Vec<_>>>()?;
-        let (direction, type_filter, at_epoch) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch),
+        let (direction, edge_label_filter, at_epoch) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch),
             None => (None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = DegreeOptions {
+        let opts = CoreDegreeOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             at_epoch,
         };
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.degrees(&ids, &opts),
             |map| {
-                let mut entries: Vec<JsDegreeBatchEntry> = map
+                let mut entries: Vec<DegreeBatchEntry> = map
                     .into_iter()
                     .map(|(node_id, degree)| {
-                        Ok(JsDegreeBatchEntry {
+                        Ok(DegreeBatchEntry {
                             node_id: u64_to_f64(node_id)?,
                             degree: u64_to_safe_i64(degree)?,
                         })
@@ -2231,30 +2643,31 @@ impl OverGraph {
 
     // --- Shortest path (async, Phase 18b) ---
 
-    #[napi(ts_return_type = "Promise<JsShortestPath | null>")]
+    #[napi(ts_return_type = "Promise<ShortestPath | null>")]
     pub fn shortest_path_async(
         &self,
         from: f64,
         to: f64,
-        options: Option<JsShortestPathOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<Option<ShortestPath>, Option<JsShortestPath>>>> {
+        options: Option<ShortestPathOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<Option<CoreShortestPath>, Option<ShortestPath>>>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        let (direction, type_filter, weight_field, at_epoch, max_depth, max_cost) = match options {
-            Some(o) => (
-                o.direction,
-                o.type_filter,
-                o.weight_field,
-                o.at_epoch,
-                o.max_depth,
-                o.max_cost,
-            ),
-            None => (None, None, None, None, None, None),
-        };
+        let (direction, edge_label_filter, weight_field, at_epoch, max_depth, max_cost) =
+            match options {
+                Some(o) => (
+                    o.direction,
+                    o.edge_label_filter,
+                    o.weight_field,
+                    o.at_epoch,
+                    o.max_depth,
+                    o.max_cost,
+                ),
+                None => (None, None, None, None, None, None),
+            };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = ShortestPathOptions {
+        let opts = CoreShortestPathOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             weight_field,
             at_epoch,
             max_depth,
@@ -2272,18 +2685,18 @@ impl OverGraph {
         &self,
         from: f64,
         to: f64,
-        options: Option<JsIsConnectedOptions>,
+        options: Option<IsConnectedOptions>,
     ) -> Result<AsyncTask<EngineReadOp<bool, bool>>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        let (direction, type_filter, at_epoch, max_depth) = match options {
-            Some(o) => (o.direction, o.type_filter, o.at_epoch, o.max_depth),
+        let (direction, edge_label_filter, at_epoch, max_depth) = match options {
+            Some(o) => (o.direction, o.edge_label_filter, o.at_epoch, o.max_depth),
             None => (None, None, None, None),
         };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = IsConnectedOptions {
+        let opts = CoreIsConnectedOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             at_epoch,
             max_depth,
         };
@@ -2294,20 +2707,20 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsShortestPath>>")]
+    #[napi(ts_return_type = "Promise<Array<ShortestPath>>")]
     pub fn all_shortest_paths_async(
         &self,
         from: f64,
         to: f64,
-        options: Option<JsAllShortestPathsOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<ShortestPath>, Vec<JsShortestPath>>>> {
+        options: Option<AllShortestPathsOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<CoreShortestPath>, Vec<ShortestPath>>>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        let (direction, type_filter, weight_field, at_epoch, max_depth, max_cost, max_paths) =
+        let (direction, edge_label_filter, weight_field, at_epoch, max_depth, max_cost, max_paths) =
             match options {
                 Some(o) => (
                     o.direction,
-                    o.type_filter,
+                    o.edge_label_filter,
                     o.weight_field,
                     o.at_epoch,
                     o.max_depth,
@@ -2317,9 +2730,9 @@ impl OverGraph {
                 None => (None, None, None, None, None, None, None),
             };
         let dir = parse_direction(direction.as_deref())?;
-        let opts = AllShortestPathsOptions {
+        let opts = CoreAllShortestPathsOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             weight_field,
             at_epoch,
             max_depth,
@@ -2335,74 +2748,82 @@ impl OverGraph {
 
     // --- Paginated queries (async) ---
 
-    #[napi(ts_return_type = "Promise<JsIdPageResult>")]
-    pub fn nodes_by_type_paged_async(
+    #[napi(
+        ts_args_type = "labels: string | string[], limit?: number | null, after?: number | null",
+        ts_return_type = "Promise<IdPageResult>"
+    )]
+    pub fn nodes_by_labels_paged_async(
         &self,
-        type_id: u32,
+        labels: serde_json::Value,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, JsIdPageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, IdPageResult>>> {
+        let labels = parse_js_node_labels_arg(&labels, "nodesByLabelsPagedAsync labels")?;
         let page = make_page_request(limit, after)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.nodes_by_type_paged(type_id, &page),
+            move |eng| eng.nodes_by_labels_paged(labels, &page),
             id_page_to_js,
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsIdPageResult>")]
-    pub fn edges_by_type_paged_async(
+    #[napi(ts_return_type = "Promise<IdPageResult>")]
+    pub fn edges_by_label_paged_async(
         &self,
-        type_id: u32,
+        label: String,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, JsIdPageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, IdPageResult>>> {
         let page = make_page_request(limit, after)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.edges_by_type_paged(type_id, &page),
+            move |eng| eng.edges_by_label_paged(&label, &page),
             id_page_to_js,
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsNodePageResult>")]
-    pub fn get_nodes_by_type_paged_async(
+    #[napi(
+        ts_args_type = "labels: string | string[], limit?: number | null, after?: number | null",
+        ts_return_type = "Promise<NodePageResult>"
+    )]
+    pub fn get_nodes_by_labels_paged_async(
         &self,
-        type_id: u32,
+        labels: serde_json::Value,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineReadOp<PageResult<NodeRecord>, JsNodePageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<CoreNodeView>, NodePageResult>>> {
+        let labels = parse_js_node_labels_arg(&labels, "getNodesByLabelsPagedAsync labels")?;
         let page = make_page_request(limit, after)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.get_nodes_by_type_paged(type_id, &page),
+            move |eng| eng.get_nodes_by_labels_paged(labels, &page),
             node_page_to_js,
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsEdgePageResult>")]
-    pub fn get_edges_by_type_paged_async(
+    #[napi(ts_return_type = "Promise<EdgePageResult>")]
+    pub fn get_edges_by_label_paged_async(
         &self,
-        type_id: u32,
+        label: String,
         limit: Option<u32>,
         after: Option<f64>,
-    ) -> Result<AsyncTask<EngineReadOp<PageResult<EdgeRecord>, JsEdgePageResult>>> {
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<CoreEdgeView>, EdgePageResult>>> {
         let page = make_page_request(limit, after)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.get_edges_by_type_paged(type_id, &page),
+            move |eng| eng.get_edges_by_label_paged(&label, &page),
             edge_page_to_js,
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsIdPageResult>")]
+    #[napi(ts_return_type = "Promise<IdPageResult>")]
     pub fn find_nodes_paged_async(
         &self,
-        type_id: u32,
+        label: String,
         prop_key: String,
         prop_value: serde_json::Value,
-        options: Option<JsFindNodesPagedOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, JsIdPageResult>>> {
+        options: Option<FindNodesPagedOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, IdPageResult>>> {
         let pv = json_to_prop_value(&prop_value);
         let (limit, after) = match options {
             Some(o) => (o.limit, o.after),
@@ -2411,7 +2832,7 @@ impl OverGraph {
         let page = make_page_request(limit, after)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.find_nodes_paged(type_id, &prop_key, &pv, &page),
+            move |eng| eng.find_nodes_paged(&label, &prop_key, &pv, &page),
             id_page_to_js,
         )))
     }
@@ -2419,25 +2840,25 @@ impl OverGraph {
     #[napi(ts_return_type = "Promise<Float64Array>")]
     pub fn find_nodes_by_time_range_async(
         &self,
-        type_id: u32,
+        label: String,
         from_ms: i64,
         to_ms: i64,
     ) -> Result<AsyncTask<EngineReadOp<Vec<u64>, Float64Array>>> {
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.find_nodes_by_time_range(type_id, from_ms, to_ms),
+            move |eng| eng.find_nodes_by_time_range(&label, from_ms, to_ms),
             |ids| ids_to_float64_array(&ids),
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsIdPageResult>")]
+    #[napi(ts_return_type = "Promise<IdPageResult>")]
     pub fn find_nodes_by_time_range_paged_async(
         &self,
-        type_id: u32,
+        label: String,
         from_ms: i64,
         to_ms: i64,
-        options: Option<JsFindNodesByTimeRangePagedOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, JsIdPageResult>>> {
+        options: Option<FindNodesByTimeRangePagedOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<u64>, IdPageResult>>> {
         let (limit, after) = match options {
             Some(o) => (o.limit, o.after),
             None => (None, None),
@@ -2445,17 +2866,17 @@ impl OverGraph {
         let page = make_page_request(limit, after)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.find_nodes_by_time_range_paged(type_id, from_ms, to_ms, &page),
+            move |eng| eng.find_nodes_by_time_range_paged(&label, from_ms, to_ms, &page),
             id_page_to_js,
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsPprResult>")]
+    #[napi(ts_return_type = "Promise<PprResult>")]
     pub fn personalized_pagerank_async(
         &self,
         seed_node_ids: Vec<f64>,
-        options: Option<JsPersonalizedPagerankOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<PprResult, JsPprResult>>> {
+        options: Option<PersonalizedPagerankOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<CorePprResult, PprResult>>> {
         let seeds: Vec<u64> = seed_node_ids
             .into_iter()
             .map(f64_to_u64)
@@ -2466,18 +2887,21 @@ impl OverGraph {
             max_iterations,
             epsilon,
             approx_residual_tolerance,
-            edge_type_filter,
+            edge_label_filter,
             max_results,
         ) = match &options {
-            Some(o) => (
-                o.algorithm.as_deref(),
-                o.damping_factor,
-                o.max_iterations,
-                o.epsilon,
-                o.approx_residual_tolerance,
-                o.edge_type_filter.clone(),
-                o.max_results,
-            ),
+            Some(o) => {
+                let edge_label_filter = o.edge_label_filter.clone();
+                (
+                    o.algorithm.as_deref(),
+                    o.damping_factor,
+                    o.max_iterations,
+                    o.epsilon,
+                    o.approx_residual_tolerance,
+                    edge_label_filter,
+                    o.max_results,
+                )
+            }
             None => (None, None, None, None, None, None, None),
         };
         let opts = js_ppr_options_to_ppr_options(
@@ -2486,7 +2910,7 @@ impl OverGraph {
             &max_iterations,
             &epsilon,
             &approx_residual_tolerance,
-            &edge_type_filter,
+            &edge_label_filter,
             &max_results,
         )?;
         Ok(AsyncTask::new(EngineReadOp::new(
@@ -2496,16 +2920,16 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsAdjacencyExport>")]
+    #[napi(ts_return_type = "Promise<AdjacencyExport>")]
     pub fn export_adjacency_async(
         &self,
-        options: Option<JsExportOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<(AdjacencyExport, bool), JsAdjacencyExport>>> {
+        options: Option<ExportOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<(CoreAdjacencyExport, bool), AdjacencyExport>>> {
         let include_weights = options
             .as_ref()
             .and_then(|o| o.include_weights)
             .unwrap_or(true);
-        let opts = js_export_options_to_rust(options);
+        let opts = js_export_options_to_rust(options)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| Ok((eng.export_adjacency(&opts)?, include_weights)),
@@ -2513,17 +2937,17 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<JsNeighborPageResult>")]
+    #[napi(ts_return_type = "Promise<NeighborPageResult>")]
     pub fn neighbors_paged_async(
         &self,
         node_id: f64,
-        options: Option<JsNeighborsPagedOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<PageResult<NeighborEntry>, JsNeighborPageResult>>> {
+        options: Option<NeighborsPagedOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<PageResult<CoreNeighborEntry>, NeighborPageResult>>> {
         let node_id = f64_to_u64(node_id)?;
-        let (direction, type_filter, limit, after, at_epoch, decay_lambda) = match options {
+        let (direction, edge_label_filter, limit, after, at_epoch, decay_lambda) = match options {
             Some(o) => (
                 o.direction,
-                o.type_filter,
+                o.edge_label_filter,
                 o.limit,
                 o.after,
                 o.at_epoch,
@@ -2536,7 +2960,7 @@ impl OverGraph {
         let decay = decay_lambda.map(|v| v as f32);
         let opts = NeighborOptions {
             direction: dir,
-            type_filter,
+            edge_label_filter: edge_label_filter,
             limit: None,
             at_epoch,
             decay_lambda: decay,
@@ -2550,28 +2974,34 @@ impl OverGraph {
 
     // --- Connected Components (async, Phase 18d) ---
 
-    #[napi(ts_return_type = "Promise<Array<JsComponentEntry>>")]
+    #[napi(ts_return_type = "Promise<Array<ComponentEntry>>")]
     pub fn connected_components_async(
         &self,
-        options: Option<JsConnectedComponentsOptions>,
-    ) -> Result<AsyncTask<EngineReadOp<NodeIdMap<u64>, Vec<JsComponentEntry>>>> {
-        let (edge_type_filter, node_type_filter, at_epoch) = match options {
-            Some(o) => (o.edge_type_filter, o.node_type_filter, o.at_epoch),
+        options: Option<ConnectedComponentsOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<NodeIdMap<u64>, Vec<ComponentEntry>>>> {
+        let (edge_label_filter, node_label_filter, at_epoch) = match options {
+            Some(o) => (
+                o.edge_label_filter,
+                o.node_label_filter
+                    .map(js_node_label_filter_to_rust)
+                    .transpose()?,
+                o.at_epoch,
+            ),
             None => (None, None, None),
         };
         let opts = ComponentOptions {
-            edge_type_filter,
-            node_type_filter,
+            edge_label_filter,
+            node_label_filter: node_label_filter,
             at_epoch,
         };
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
             move |eng| eng.connected_components(&opts),
             |map| {
-                let mut entries: Vec<JsComponentEntry> = map
+                let mut entries: Vec<ComponentEntry> = map
                     .into_iter()
                     .map(|(node_id, component_id)| {
-                        Ok(JsComponentEntry {
+                        Ok(ComponentEntry {
                             node_id: u64_to_f64(node_id)?,
                             component_id: u64_to_f64(component_id)?,
                         })
@@ -2587,16 +3017,22 @@ impl OverGraph {
     pub fn component_of_async(
         &self,
         node_id: f64,
-        options: Option<JsComponentOfOptions>,
+        options: Option<ComponentOfOptions>,
     ) -> Result<AsyncTask<EngineReadOp<Vec<u64>, Float64Array>>> {
         let node_id = f64_to_u64(node_id)?;
-        let (edge_type_filter, node_type_filter, at_epoch) = match options {
-            Some(o) => (o.edge_type_filter, o.node_type_filter, o.at_epoch),
+        let (edge_label_filter, node_label_filter, at_epoch) = match options {
+            Some(o) => (
+                o.edge_label_filter,
+                o.node_label_filter
+                    .map(js_node_label_filter_to_rust)
+                    .transpose()?,
+                o.at_epoch,
+            ),
             None => (None, None, None),
         };
         let opts = ComponentOptions {
-            edge_type_filter,
-            node_type_filter,
+            edge_label_filter,
+            node_label_filter: node_label_filter,
             at_epoch,
         };
         Ok(AsyncTask::new(EngineReadOp::new(
@@ -2606,17 +3042,20 @@ impl OverGraph {
         )))
     }
 
-    #[napi(ts_return_type = "Promise<Array<JsVectorHit>>")]
+    #[napi(ts_return_type = "Promise<Array<VectorHit>>")]
     pub fn vector_search_async(
         &self,
         mode: String,
-        options: JsVectorSearchOptions,
-    ) -> Result<AsyncTask<EngineReadOp<Vec<VectorHit>, Vec<JsVectorHit>>>> {
+        options: VectorSearchOptions,
+    ) -> Result<AsyncTask<EngineReadOp<Vec<CoreVectorHit>, Vec<VectorHit>>>> {
         let mode = parse_vector_search_mode(&mode)?;
         let k = options.k;
         let dense_query = options.dense_query;
         let sparse_query = options.sparse_query;
-        let type_filter = options.type_filter;
+        let label_filter = options
+            .label_filter
+            .map(js_node_label_filter_to_rust)
+            .transpose()?;
         let ef_search = options.ef_search;
         let scope = options.scope;
         let dense_weight = options.dense_weight;
@@ -2631,11 +3070,11 @@ impl OverGraph {
         });
         let scope = match scope {
             None => None,
-            Some(s) => Some(VectorSearchScope {
+            Some(s) => Some(CoreVectorSearchScope {
                 start_node_id: f64_to_u64(s.start_node_id)?,
                 max_depth: s.max_depth,
                 direction: parse_direction(s.direction.as_deref())?,
-                edge_type_filter: s.edge_type_filter,
+                edge_label_filter: s.edge_label_filter,
                 at_epoch: s.at_epoch,
             }),
         };
@@ -2644,7 +3083,7 @@ impl OverGraph {
             dense_query: dense_q,
             sparse_query: sparse_q,
             k: k as usize,
-            type_filter,
+            label_filter,
             ef_search: ef_search.map(|v| v as usize),
             scope,
             dense_weight: dense_weight.map(|v| v as f32),
@@ -2657,7 +3096,7 @@ impl OverGraph {
             |hits| {
                 hits.into_iter()
                     .map(|h| {
-                        Ok(JsVectorHit {
+                        Ok(VectorHit {
                             node_id: u64_to_f64(h.node_id)?,
                             score: h.score as f64,
                         })
@@ -2700,10 +3139,10 @@ impl OverGraph {
         ))
     }
 
-    #[napi(ts_return_type = "Promise<JsCompactionStats | null>")]
+    #[napi(ts_return_type = "Promise<CompactionStats | null>")]
     pub fn end_ingest_async(
         &self,
-    ) -> AsyncTask<EngineOp<Option<CompactionStats>, Option<JsCompactionStats>>> {
+    ) -> AsyncTask<EngineOp<Option<CoreCompactionStats>, Option<CompactionStats>>> {
         AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             |eng| eng.end_ingest(),
@@ -2711,10 +3150,10 @@ impl OverGraph {
         ))
     }
 
-    #[napi(ts_return_type = "Promise<JsCompactionStats | null>")]
+    #[napi(ts_return_type = "Promise<CompactionStats | null>")]
     pub fn compact_async(
         &self,
-    ) -> AsyncTask<EngineOp<Option<CompactionStats>, Option<JsCompactionStats>>> {
+    ) -> AsyncTask<EngineOp<Option<CoreCompactionStats>, Option<CompactionStats>>> {
         AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             |eng| eng.compact(),
@@ -2727,8 +3166,8 @@ impl OverGraph {
     /// Note: the database write lock is held for the entire compaction, so other operations on this
     /// instance will block until compaction completes. The JS event loop remains responsive.
     #[napi(
-        ts_args_type = "callback: (progress: JsCompactionProgress) => void",
-        ts_return_type = "Promise<JsCompactionStats | null>"
+        ts_args_type = "callback: (progress: CompactionProgress) => void",
+        ts_return_type = "Promise<CompactionStats | null>"
     )]
     pub fn compact_with_progress_async(
         &self,
@@ -2741,9 +3180,9 @@ impl OverGraph {
     }
 }
 
-#[napi(js_name = "WriteTxn")]
-pub struct JsWriteTxn {
-    inner: Arc<Mutex<Option<WriteTxn>>>,
+#[napi]
+pub struct WriteTxn {
+    inner: Arc<Mutex<Option<CoreWriteTxn>>>,
     async_order: Arc<TxnAsyncOrder>,
 }
 
@@ -2814,65 +3253,86 @@ impl Drop for TxnAsyncTurn {
     }
 }
 
-fn write_txn_to_js(txn: WriteTxn) -> JsWriteTxn {
-    JsWriteTxn {
+fn write_txn_to_js(txn: CoreWriteTxn) -> WriteTxn {
+    WriteTxn {
         inner: Arc::new(Mutex::new(Some(txn))),
         async_order: Arc::new(TxnAsyncOrder::new()),
     }
 }
 
 #[napi]
-impl JsWriteTxn {
-    #[napi]
+impl WriteTxn {
+    #[napi(
+        ts_args_type = "labels: string | string[], key: string, options?: UpsertNodeOptions | null"
+    )]
     pub fn upsert_node(
         &self,
-        type_id: u32,
+        labels: serde_json::Value,
         key: String,
-        options: Option<JsUpsertNodeOptions>,
-    ) -> Result<JsTxnNodeRef> {
-        with_txn(&self.inner, |txn| {
-            txn.upsert_node(type_id, &key, js_upsert_node_options(options))
+        options: Option<UpsertNodeOptions>,
+    ) -> Result<TxnNodeRef> {
+        let labels = parse_js_node_labels_arg(&labels, "transaction upsertNode labels")?;
+        let ref_label = labels.first().cloned().ok_or_else(|| {
+            napi::Error::from_reason("transaction upsertNode requires labels".to_string())
         })?;
-        Ok(JsTxnNodeRef {
+        with_txn(&self.inner, |txn| {
+            txn.upsert_node(labels, &key, js_upsert_node_options(options))
+        })?;
+        Ok(TxnNodeRef {
             id: None,
-            type_id: Some(type_id),
+            labels: Some(txn_node_ref_labels_value(ref_label)),
             key: Some(key),
             local: None,
         })
     }
 
-    #[napi]
+    #[napi(
+        ts_args_type = "alias: string, labels: string | string[], key: string, options?: UpsertNodeOptions | null"
+    )]
     pub fn upsert_node_as(
         &self,
         alias: String,
-        type_id: u32,
+        labels: serde_json::Value,
         key: String,
-        options: Option<JsUpsertNodeOptions>,
-    ) -> Result<JsTxnNodeRef> {
+        options: Option<UpsertNodeOptions>,
+    ) -> Result<TxnNodeRef> {
+        let labels = parse_js_node_labels_arg(&labels, "transaction upsertNodeAs labels")?;
         let node_ref = with_txn(&self.inner, |txn| {
-            txn.upsert_node_as(&alias, type_id, &key, js_upsert_node_options(options))
+            txn.upsert_node_as(&alias, labels, &key, js_upsert_node_options(options))
         })?;
         txn_node_ref_to_js(node_ref)
     }
 
     #[napi]
+    pub fn add_node_label(&self, target: TxnNodeRef, label: String) -> Result<bool> {
+        let target = js_txn_node_ref_to_rust(target)?;
+        with_txn(&self.inner, |txn| txn.add_node_label(target, &label))
+    }
+
+    #[napi]
+    pub fn remove_node_label(&self, target: TxnNodeRef, label: String) -> Result<bool> {
+        let target = js_txn_node_ref_to_rust(target)?;
+        with_txn(&self.inner, |txn| txn.remove_node_label(target, &label))
+    }
+
+    #[napi]
     pub fn upsert_edge(
         &self,
-        from: JsTxnNodeRef,
-        to: JsTxnNodeRef,
-        type_id: u32,
-        options: Option<JsUpsertEdgeOptions>,
-    ) -> Result<JsTxnEdgeRef> {
+        from: TxnNodeRef,
+        to: TxnNodeRef,
+        label: String,
+        options: Option<UpsertEdgeOptions>,
+    ) -> Result<TxnEdgeRef> {
         let from_rust = js_txn_node_ref_to_rust(from.clone())?;
         let to_rust = js_txn_node_ref_to_rust(to.clone())?;
         with_txn(&self.inner, |txn| {
-            txn.upsert_edge(from_rust, to_rust, type_id, js_upsert_edge_options(options))
+            txn.upsert_edge(from_rust, to_rust, &label, js_upsert_edge_options(options))
         })?;
-        Ok(JsTxnEdgeRef {
+        Ok(TxnEdgeRef {
             id: None,
             from: Some(from),
             to: Some(to),
-            type_id: Some(type_id),
+            label: Some(label),
             local: None,
         })
     }
@@ -2881,39 +3341,41 @@ impl JsWriteTxn {
     pub fn upsert_edge_as(
         &self,
         alias: String,
-        from: JsTxnNodeRef,
-        to: JsTxnNodeRef,
-        type_id: u32,
-        options: Option<JsUpsertEdgeOptions>,
-    ) -> Result<JsTxnEdgeRef> {
+        from: TxnNodeRef,
+        to: TxnNodeRef,
+        label: String,
+        options: Option<UpsertEdgeOptions>,
+    ) -> Result<TxnEdgeRef> {
         let from = js_txn_node_ref_to_rust(from)?;
         let to = js_txn_node_ref_to_rust(to)?;
         let edge_ref = with_txn(&self.inner, |txn| {
-            txn.upsert_edge_as(&alias, from, to, type_id, js_upsert_edge_options(options))
+            txn.upsert_edge_as(&alias, from, to, &label, js_upsert_edge_options(options))
         })?;
         txn_edge_ref_to_js(edge_ref)
     }
 
     #[napi]
-    pub fn delete_node(&self, target: JsTxnNodeRef) -> Result<()> {
+    pub fn delete_node(&self, target: TxnNodeRef) -> Result<()> {
         let target = js_txn_node_ref_to_rust(target)?;
         with_txn(&self.inner, |txn| txn.delete_node(target))
     }
 
     #[napi]
-    pub fn delete_edge(&self, target: JsTxnEdgeRef) -> Result<()> {
+    pub fn delete_edge(&self, target: TxnEdgeRef) -> Result<()> {
         let target = js_txn_edge_ref_to_rust(target)?;
         with_txn(&self.inner, |txn| txn.delete_edge(target))
     }
 
     #[napi]
-    pub fn invalidate_edge(&self, target: JsTxnEdgeRef, valid_to: i64) -> Result<()> {
+    pub fn invalidate_edge(&self, target: TxnEdgeRef, valid_to: i64) -> Result<()> {
         let target = js_txn_edge_ref_to_rust(target)?;
         with_txn(&self.inner, |txn| txn.invalidate_edge(target, valid_to))
     }
 
-    #[napi]
-    pub fn stage(&self, operations: Vec<JsTxnOperation>) -> Result<()> {
+    #[napi(
+        ts_args_type = "operations: Array<{ op: 'upsertNode'; alias?: string; labels: string | string[]; key: string; props?: Record<string, any>; weight?: number; denseVector?: Array<number>; sparseVector?: Array<SparseEntry> } | { op: 'upsertEdge'; alias?: string; from: TxnNodeRef; to: TxnNodeRef; label: string; props?: Record<string, any>; weight?: number; validFrom?: number; validTo?: number } | { op: 'deleteNode'; target: TxnEdgeOrNodeRef } | { op: 'deleteEdge'; target: TxnEdgeOrNodeRef } | { op: 'invalidateEdge'; target: TxnEdgeOrNodeRef; validTo: number }>"
+    )]
+    pub fn stage(&self, operations: Vec<serde_json::Value>) -> Result<()> {
         let intents = operations
             .into_iter()
             .map(js_txn_operation_to_rust)
@@ -2922,40 +3384,40 @@ impl JsWriteTxn {
     }
 
     #[napi]
-    pub fn get_node(&self, target: JsTxnNodeRef) -> Result<Option<JsTxnNodeView>> {
+    pub fn get_node(&self, target: TxnNodeRef) -> Result<Option<TxnNodeView>> {
         let target = js_txn_node_ref_to_rust(target)?;
         let view = with_txn_ref(&self.inner, |txn| txn.get_node(target))?;
         view.map(txn_node_view_to_js).transpose()
     }
 
     #[napi]
-    pub fn get_edge(&self, target: JsTxnEdgeRef) -> Result<Option<JsTxnEdgeView>> {
+    pub fn get_edge(&self, target: TxnEdgeRef) -> Result<Option<TxnEdgeView>> {
         let target = js_txn_edge_ref_to_rust(target)?;
         let view = with_txn_ref(&self.inner, |txn| txn.get_edge(target))?;
         view.map(txn_edge_view_to_js).transpose()
     }
 
     #[napi]
-    pub fn get_node_by_key(&self, type_id: u32, key: String) -> Result<Option<JsTxnNodeView>> {
-        let view = with_txn_ref(&self.inner, |txn| txn.get_node_by_key(type_id, &key))?;
+    pub fn get_node_by_key(&self, label: String, key: String) -> Result<Option<TxnNodeView>> {
+        let view = with_txn_ref(&self.inner, |txn| txn.get_node_by_key(&label, &key))?;
         view.map(txn_node_view_to_js).transpose()
     }
 
     #[napi]
     pub fn get_edge_by_triple(
         &self,
-        from: JsTxnNodeRef,
-        to: JsTxnNodeRef,
-        type_id: u32,
-    ) -> Result<Option<JsTxnEdgeView>> {
+        from: TxnNodeRef,
+        to: TxnNodeRef,
+        label: String,
+    ) -> Result<Option<TxnEdgeView>> {
         let from = js_txn_node_ref_to_rust(from)?;
         let to = js_txn_node_ref_to_rust(to)?;
-        let view = with_txn_ref(&self.inner, |txn| txn.get_edge_by_triple(from, to, type_id))?;
+        let view = with_txn_ref(&self.inner, |txn| txn.get_edge_by_triple(from, to, &label))?;
         view.map(txn_edge_view_to_js).transpose()
     }
 
     #[napi]
-    pub fn commit(&self) -> Result<JsTxnCommitResult> {
+    pub fn commit(&self) -> Result<TxnCommitResult> {
         let result = with_txn_take(&self.inner, |txn| txn.commit())?;
         txn_commit_result_to_js(result)
     }
@@ -2965,21 +3427,28 @@ impl JsWriteTxn {
         with_txn_take(&self.inner, |txn| txn.rollback())
     }
 
-    #[napi(ts_return_type = "Promise<JsTxnNodeRef>")]
+    #[napi(
+        ts_args_type = "labels: string | string[], key: string, options?: UpsertNodeOptions | null",
+        ts_return_type = "Promise<TxnNodeRef>"
+    )]
     pub fn upsert_node_async(
         &self,
-        type_id: u32,
+        labels: serde_json::Value,
         key: String,
-        options: Option<JsUpsertNodeOptions>,
-    ) -> Result<AsyncTask<TxnAsyncOp<JsTxnNodeRef, JsTxnNodeRef>>> {
+        options: Option<UpsertNodeOptions>,
+    ) -> Result<AsyncTask<TxnAsyncOp<TxnNodeRef, TxnNodeRef>>> {
+        let labels = parse_js_node_labels_arg(&labels, "transaction upsertNodeAsync labels")?;
+        let ref_label = labels.first().cloned().ok_or_else(|| {
+            napi::Error::from_reason("transaction upsertNodeAsync requires labels".to_string())
+        })?;
         let opts = js_upsert_node_options(options);
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
             move |txn| {
-                txn.upsert_node(type_id, &key, opts)?;
-                Ok(JsTxnNodeRef {
+                txn.upsert_node(labels, &key, opts)?;
+                Ok(TxnNodeRef {
                     id: None,
-                    type_id: Some(type_id),
+                    labels: Some(txn_node_ref_labels_value(ref_label)),
                     key: Some(key),
                     local: None,
                 })
@@ -2988,42 +3457,74 @@ impl JsWriteTxn {
         )?))
     }
 
-    #[napi(ts_return_type = "Promise<JsTxnNodeRef>")]
+    #[napi(
+        ts_args_type = "alias: string, labels: string | string[], key: string, options?: UpsertNodeOptions | null",
+        ts_return_type = "Promise<TxnNodeRef>"
+    )]
     pub fn upsert_node_as_async(
         &self,
         alias: String,
-        type_id: u32,
+        labels: serde_json::Value,
         key: String,
-        options: Option<JsUpsertNodeOptions>,
-    ) -> Result<AsyncTask<TxnAsyncOp<TxnNodeRef, JsTxnNodeRef>>> {
+        options: Option<UpsertNodeOptions>,
+    ) -> Result<AsyncTask<TxnAsyncOp<CoreTxnNodeRef, TxnNodeRef>>> {
+        let labels = parse_js_node_labels_arg(&labels, "transaction upsertNodeAsAsync labels")?;
         let opts = js_upsert_node_options(options);
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
-            move |txn| txn.upsert_node_as(&alias, type_id, &key, opts),
+            move |txn| txn.upsert_node_as(&alias, labels, &key, opts),
             txn_node_ref_to_js,
         )?))
     }
 
-    #[napi(ts_return_type = "Promise<JsTxnEdgeRef>")]
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn add_node_label_async(
+        &self,
+        target: TxnNodeRef,
+        label: String,
+    ) -> Result<AsyncTask<TxnAsyncOp<bool, bool>>> {
+        let target = js_txn_node_ref_to_rust(target)?;
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.add_node_label(target, &label),
+            Ok,
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn remove_node_label_async(
+        &self,
+        target: TxnNodeRef,
+        label: String,
+    ) -> Result<AsyncTask<TxnAsyncOp<bool, bool>>> {
+        let target = js_txn_node_ref_to_rust(target)?;
+        Ok(AsyncTask::new(TxnAsyncOp::new(
+            self,
+            move |txn| txn.remove_node_label(target, &label),
+            Ok,
+        )?))
+    }
+
+    #[napi(ts_return_type = "Promise<TxnEdgeRef>")]
     pub fn upsert_edge_async(
         &self,
-        from: JsTxnNodeRef,
-        to: JsTxnNodeRef,
-        type_id: u32,
-        options: Option<JsUpsertEdgeOptions>,
-    ) -> Result<AsyncTask<TxnAsyncOp<JsTxnEdgeRef, JsTxnEdgeRef>>> {
+        from: TxnNodeRef,
+        to: TxnNodeRef,
+        label: String,
+        options: Option<UpsertEdgeOptions>,
+    ) -> Result<AsyncTask<TxnAsyncOp<TxnEdgeRef, TxnEdgeRef>>> {
         let from_rust = js_txn_node_ref_to_rust(from.clone())?;
         let to_rust = js_txn_node_ref_to_rust(to.clone())?;
         let opts = js_upsert_edge_options(options);
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
             move |txn| {
-                txn.upsert_edge(from_rust, to_rust, type_id, opts)?;
-                Ok(JsTxnEdgeRef {
+                txn.upsert_edge(from_rust, to_rust, &label, opts)?;
+                Ok(TxnEdgeRef {
                     id: None,
                     from: Some(from),
                     to: Some(to),
-                    type_id: Some(type_id),
+                    label: Some(label),
                     local: None,
                 })
             },
@@ -3031,27 +3532,27 @@ impl JsWriteTxn {
         )?))
     }
 
-    #[napi(ts_return_type = "Promise<JsTxnEdgeRef>")]
+    #[napi(ts_return_type = "Promise<TxnEdgeRef>")]
     pub fn upsert_edge_as_async(
         &self,
         alias: String,
-        from: JsTxnNodeRef,
-        to: JsTxnNodeRef,
-        type_id: u32,
-        options: Option<JsUpsertEdgeOptions>,
-    ) -> Result<AsyncTask<TxnAsyncOp<TxnEdgeRef, JsTxnEdgeRef>>> {
+        from: TxnNodeRef,
+        to: TxnNodeRef,
+        label: String,
+        options: Option<UpsertEdgeOptions>,
+    ) -> Result<AsyncTask<TxnAsyncOp<CoreTxnEdgeRef, TxnEdgeRef>>> {
         let from = js_txn_node_ref_to_rust(from)?;
         let to = js_txn_node_ref_to_rust(to)?;
         let opts = js_upsert_edge_options(options);
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
-            move |txn| txn.upsert_edge_as(&alias, from, to, type_id, opts),
+            move |txn| txn.upsert_edge_as(&alias, from, to, &label, opts),
             txn_edge_ref_to_js,
         )?))
     }
 
     #[napi(ts_return_type = "Promise<void>")]
-    pub fn delete_node_async(&self, target: JsTxnNodeRef) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
+    pub fn delete_node_async(&self, target: TxnNodeRef) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
         let target = js_txn_node_ref_to_rust(target)?;
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
@@ -3061,7 +3562,7 @@ impl JsWriteTxn {
     }
 
     #[napi(ts_return_type = "Promise<void>")]
-    pub fn delete_edge_async(&self, target: JsTxnEdgeRef) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
+    pub fn delete_edge_async(&self, target: TxnEdgeRef) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
         let target = js_txn_edge_ref_to_rust(target)?;
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
@@ -3073,7 +3574,7 @@ impl JsWriteTxn {
     #[napi(ts_return_type = "Promise<void>")]
     pub fn invalidate_edge_async(
         &self,
-        target: JsTxnEdgeRef,
+        target: TxnEdgeRef,
         valid_to: i64,
     ) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
         let target = js_txn_edge_ref_to_rust(target)?;
@@ -3084,10 +3585,13 @@ impl JsWriteTxn {
         )?))
     }
 
-    #[napi(ts_return_type = "Promise<void>")]
+    #[napi(
+        ts_args_type = "operations: Array<{ op: 'upsertNode'; alias?: string; labels: string | string[]; key: string; props?: Record<string, any>; weight?: number; denseVector?: Array<number>; sparseVector?: Array<SparseEntry> } | { op: 'upsertEdge'; alias?: string; from: TxnNodeRef; to: TxnNodeRef; label: string; props?: Record<string, any>; weight?: number; validFrom?: number; validTo?: number } | { op: 'deleteNode'; target: TxnEdgeOrNodeRef } | { op: 'deleteEdge'; target: TxnEdgeOrNodeRef } | { op: 'invalidateEdge'; target: TxnEdgeOrNodeRef; validTo: number }>",
+        ts_return_type = "Promise<void>"
+    )]
     pub fn stage_async(
         &self,
-        operations: Vec<JsTxnOperation>,
+        operations: Vec<serde_json::Value>,
     ) -> Result<AsyncTask<TxnAsyncOp<(), ()>>> {
         let intents = operations
             .into_iter()
@@ -3100,11 +3604,11 @@ impl JsWriteTxn {
         )?))
     }
 
-    #[napi(ts_return_type = "Promise<JsTxnNodeView | null>")]
+    #[napi(ts_return_type = "Promise<TxnNodeView | null>")]
     pub fn get_node_async(
         &self,
-        target: JsTxnNodeRef,
-    ) -> Result<AsyncTask<TxnAsyncOp<Option<TxnNodeView>, Option<JsTxnNodeView>>>> {
+        target: TxnNodeRef,
+    ) -> Result<AsyncTask<TxnAsyncOp<Option<CoreTxnNodeView>, Option<TxnNodeView>>>> {
         let target = js_txn_node_ref_to_rust(target)?;
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
@@ -3113,11 +3617,11 @@ impl JsWriteTxn {
         )?))
     }
 
-    #[napi(ts_return_type = "Promise<JsTxnEdgeView | null>")]
+    #[napi(ts_return_type = "Promise<TxnEdgeView | null>")]
     pub fn get_edge_async(
         &self,
-        target: JsTxnEdgeRef,
-    ) -> Result<AsyncTask<TxnAsyncOp<Option<TxnEdgeView>, Option<JsTxnEdgeView>>>> {
+        target: TxnEdgeRef,
+    ) -> Result<AsyncTask<TxnAsyncOp<Option<CoreTxnEdgeView>, Option<TxnEdgeView>>>> {
         let target = js_txn_edge_ref_to_rust(target)?;
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
@@ -3126,39 +3630,39 @@ impl JsWriteTxn {
         )?))
     }
 
-    #[napi(ts_return_type = "Promise<JsTxnNodeView | null>")]
+    #[napi(ts_return_type = "Promise<TxnNodeView | null>")]
     pub fn get_node_by_key_async(
         &self,
-        type_id: u32,
+        label: String,
         key: String,
-    ) -> Result<AsyncTask<TxnAsyncOp<Option<TxnNodeView>, Option<JsTxnNodeView>>>> {
+    ) -> Result<AsyncTask<TxnAsyncOp<Option<CoreTxnNodeView>, Option<TxnNodeView>>>> {
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
-            move |txn| txn.get_node_by_key(type_id, &key),
+            move |txn| txn.get_node_by_key(&label, &key),
             |view| view.map(txn_node_view_to_js).transpose(),
         )?))
     }
 
-    #[napi(ts_return_type = "Promise<JsTxnEdgeView | null>")]
+    #[napi(ts_return_type = "Promise<TxnEdgeView | null>")]
     pub fn get_edge_by_triple_async(
         &self,
-        from: JsTxnNodeRef,
-        to: JsTxnNodeRef,
-        type_id: u32,
-    ) -> Result<AsyncTask<TxnAsyncOp<Option<TxnEdgeView>, Option<JsTxnEdgeView>>>> {
+        from: TxnNodeRef,
+        to: TxnNodeRef,
+        label: String,
+    ) -> Result<AsyncTask<TxnAsyncOp<Option<CoreTxnEdgeView>, Option<TxnEdgeView>>>> {
         let from = js_txn_node_ref_to_rust(from)?;
         let to = js_txn_node_ref_to_rust(to)?;
         Ok(AsyncTask::new(TxnAsyncOp::new(
             self,
-            move |txn| txn.get_edge_by_triple(from, to, type_id),
+            move |txn| txn.get_edge_by_triple(from, to, &label),
             |view| view.map(txn_edge_view_to_js).transpose(),
         )?))
     }
 
-    #[napi(ts_return_type = "Promise<JsTxnCommitResult>")]
+    #[napi(ts_return_type = "Promise<TxnCommitResult>")]
     pub fn commit_async(
         &self,
-    ) -> Result<AsyncTask<TxnAsyncTakeOp<TxnCommitResult, JsTxnCommitResult>>> {
+    ) -> Result<AsyncTask<TxnAsyncTakeOp<CoreTxnCommitResult, TxnCommitResult>>> {
         Ok(AsyncTask::new(TxnAsyncTakeOp::new(
             self,
             |txn| txn.commit(),
@@ -3181,7 +3685,7 @@ impl JsWriteTxn {
 // ============================================================
 
 #[napi(object)]
-pub struct JsCloseOptions {
+pub struct CloseOptions {
     /// If true, cancel any in-progress background compaction instead of waiting.
     pub force: Option<bool>,
 }
@@ -3191,15 +3695,15 @@ pub struct JsCloseOptions {
 // ============================================================
 
 #[napi(object)]
-pub struct JsUpsertNodeOptions {
+pub struct UpsertNodeOptions {
     pub props: Option<HashMap<String, serde_json::Value>>,
     pub weight: Option<f64>,
     pub dense_vector: Option<Vec<f64>>,
-    pub sparse_vector: Option<Vec<JsSparseEntry>>,
+    pub sparse_vector: Option<Vec<SparseEntry>>,
 }
 
 #[napi(object)]
-pub struct JsUpsertEdgeOptions {
+pub struct UpsertEdgeOptions {
     pub props: Option<HashMap<String, serde_json::Value>>,
     pub weight: Option<f64>,
     pub valid_from: Option<i64>,
@@ -3207,18 +3711,18 @@ pub struct JsUpsertEdgeOptions {
 }
 
 #[napi(object)]
-pub struct JsNeighborsOptions {
+pub struct NeighborsOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub limit: Option<u32>,
     pub at_epoch: Option<i64>,
     pub decay_lambda: Option<f64>,
 }
 
 #[napi(object)]
-pub struct JsNeighborsPagedOptions {
+pub struct NeighborsPagedOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub limit: Option<u32>,
     pub after: Option<f64>,
     pub at_epoch: Option<i64>,
@@ -3226,45 +3730,54 @@ pub struct JsNeighborsPagedOptions {
 }
 
 #[napi(object)]
-pub struct JsNeighborsBatchOptions {
+pub struct NeighborsBatchOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub at_epoch: Option<i64>,
     pub decay_lambda: Option<f64>,
 }
 
 #[napi(object)]
-pub struct JsTraverseOptions {
+#[derive(Clone)]
+pub struct NodeLabelFilter {
+    pub labels: Vec<String>,
+    #[napi(ts_type = "'any' | 'all'")]
+    pub mode: String,
+}
+
+#[napi(object)]
+pub struct TraverseOptions {
     pub min_depth: Option<u32>,
     pub direction: Option<String>,
-    pub edge_type_filter: Option<Vec<u32>>,
-    pub node_type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
+    pub emit_node_label_filter: Option<NodeLabelFilter>,
     pub at_epoch: Option<i64>,
     pub decay_lambda: Option<f64>,
     pub limit: Option<u32>,
-    pub cursor: Option<JsTraversalCursor>,
+    pub cursor: Option<TraversalCursor>,
 }
 
 #[napi(object)]
-pub struct JsTopKNeighborsOptions {
+pub struct TopKNeighborsOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub scoring: Option<String>,
     pub decay_lambda: Option<f64>,
     pub at_epoch: Option<i64>,
 }
 
 #[napi(object)]
-pub struct JsExtractSubgraphOptions {
+pub struct ExtractSubgraphOptions {
     pub direction: Option<String>,
-    pub edge_type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
+    pub node_label_filter: Option<NodeLabelFilter>,
     pub at_epoch: Option<i64>,
 }
 
 #[napi(object)]
-pub struct JsShortestPathOptions {
+pub struct ShortestPathOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub weight_field: Option<String>,
     pub at_epoch: Option<i64>,
     pub max_depth: Option<u32>,
@@ -3272,9 +3785,9 @@ pub struct JsShortestPathOptions {
 }
 
 #[napi(object)]
-pub struct JsAllShortestPathsOptions {
+pub struct AllShortestPathsOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub weight_field: Option<String>,
     pub at_epoch: Option<i64>,
     pub max_depth: Option<u32>,
@@ -3283,85 +3796,85 @@ pub struct JsAllShortestPathsOptions {
 }
 
 #[napi(object)]
-pub struct JsIsConnectedOptions {
+pub struct IsConnectedOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub at_epoch: Option<i64>,
     pub max_depth: Option<u32>,
 }
 
 #[napi(object)]
-pub struct JsConnectedComponentsOptions {
-    pub edge_type_filter: Option<Vec<u32>>,
-    pub node_type_filter: Option<Vec<u32>>,
+pub struct ConnectedComponentsOptions {
+    pub edge_label_filter: Option<Vec<String>>,
+    pub node_label_filter: Option<NodeLabelFilter>,
     pub at_epoch: Option<i64>,
 }
 
 #[napi(object)]
-pub struct JsComponentOfOptions {
-    pub edge_type_filter: Option<Vec<u32>>,
-    pub node_type_filter: Option<Vec<u32>>,
+pub struct ComponentOfOptions {
+    pub edge_label_filter: Option<Vec<String>>,
+    pub node_label_filter: Option<NodeLabelFilter>,
     pub at_epoch: Option<i64>,
 }
 
 #[napi(object)]
-pub struct JsDegreeOptions {
+pub struct DegreeOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub at_epoch: Option<i64>,
 }
 
 #[napi(object)]
-pub struct JsSumEdgeWeightsOptions {
+pub struct SumEdgeWeightsOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub at_epoch: Option<i64>,
 }
 
 #[napi(object)]
-pub struct JsAvgEdgeWeightOptions {
+pub struct AvgEdgeWeightOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub at_epoch: Option<i64>,
 }
 
 #[napi(object)]
-pub struct JsDegreesOptions {
+pub struct DegreesOptions {
     pub direction: Option<String>,
-    pub type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub at_epoch: Option<i64>,
 }
 
 #[napi(object)]
-pub struct JsVectorSearchOptions {
+pub struct VectorSearchOptions {
     pub k: u32,
     pub dense_query: Option<Vec<f64>>,
-    pub sparse_query: Option<Vec<JsSparseEntry>>,
-    pub type_filter: Option<Vec<u32>>,
+    pub sparse_query: Option<Vec<SparseEntry>>,
+    pub label_filter: Option<NodeLabelFilter>,
     pub ef_search: Option<u32>,
-    pub scope: Option<JsVectorSearchScope>,
+    pub scope: Option<VectorSearchScope>,
     pub dense_weight: Option<f64>,
     pub sparse_weight: Option<f64>,
     pub fusion_mode: Option<String>,
 }
 
 #[napi(object)]
-pub struct JsFindNodesPagedOptions {
+pub struct FindNodesPagedOptions {
     pub limit: Option<u32>,
     pub after: Option<f64>,
 }
 
 #[napi(object)]
 #[derive(Clone)]
-pub struct JsSecondaryIndexKind {
+pub struct SecondaryIndexKind {
     pub kind: String,
     pub domain: Option<String>,
 }
 
 #[napi(object)]
-pub struct JsNodePropertyIndexInfo {
+pub struct NodePropertyIndexInfo {
     pub index_id: f64,
-    pub type_id: u32,
+    pub label: String,
     pub prop_key: String,
     pub kind: String,
     pub domain: Option<String>,
@@ -3370,8 +3883,49 @@ pub struct JsNodePropertyIndexInfo {
 }
 
 #[napi(object)]
+pub struct EdgePropertyIndexInfo {
+    pub index_id: f64,
+    pub label: String,
+    pub prop_key: String,
+    pub kind: String,
+    pub domain: Option<String>,
+    pub state: String,
+    pub last_error: Option<String>,
+}
+
+#[napi(object)]
+pub struct NodeLabelInfo {
+    pub label: String,
+    pub label_id: u32,
+}
+
+impl From<CoreNodeLabelInfo> for NodeLabelInfo {
+    fn from(info: CoreNodeLabelInfo) -> Self {
+        Self {
+            label: info.label,
+            label_id: info.label_id,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct EdgeLabelInfo {
+    pub label: String,
+    pub label_id: u32,
+}
+
+impl From<CoreEdgeLabelInfo> for EdgeLabelInfo {
+    fn from(info: CoreEdgeLabelInfo) -> Self {
+        Self {
+            label: info.label,
+            label_id: info.label_id,
+        }
+    }
+}
+
+#[napi(object)]
 #[derive(Clone)]
-pub struct JsPropertyRangeBound {
+pub struct PropertyRangeBound {
     pub value: f64,
     pub inclusive: Option<bool>,
     pub domain: String,
@@ -3379,7 +3933,7 @@ pub struct JsPropertyRangeBound {
 
 #[napi(object)]
 #[derive(Clone)]
-pub struct JsPropertyRangeCursor {
+pub struct PropertyRangeCursor {
     pub value: f64,
     pub node_id: f64,
     pub domain: String,
@@ -3387,30 +3941,30 @@ pub struct JsPropertyRangeCursor {
 
 #[napi(object)]
 #[derive(Clone)]
-pub struct JsFindNodesRangePagedOptions {
+pub struct FindNodesRangePagedOptions {
     pub limit: Option<u32>,
-    pub after: Option<JsPropertyRangeCursor>,
+    pub after: Option<PropertyRangeCursor>,
 }
 
 #[napi(object)]
-pub struct JsFindNodesByTimeRangePagedOptions {
+pub struct FindNodesByTimeRangePagedOptions {
     pub limit: Option<u32>,
     pub after: Option<f64>,
 }
 
 #[napi(object)]
-pub struct JsPersonalizedPagerankOptions {
+pub struct PersonalizedPagerankOptions {
     pub algorithm: Option<String>,
     pub damping_factor: Option<f64>,
     pub max_iterations: Option<u32>,
     pub epsilon: Option<f64>,
     pub approx_residual_tolerance: Option<f64>,
-    pub edge_type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub max_results: Option<u32>,
 }
 
 #[napi(object)]
-pub struct JsDbStats {
+pub struct DbStats {
     /// Bytes buffered in WAL but not yet fsynced. Always 0 in immediate mode.
     pub pending_wal_bytes: u32,
     /// Number of on-disk segments.
@@ -3437,9 +3991,9 @@ pub struct JsDbStats {
     pub oldest_retained_wal_generation_id: f64,
 }
 
-impl From<DbStats> for JsDbStats {
-    fn from(s: DbStats) -> Self {
-        JsDbStats {
+impl From<CoreDbStats> for DbStats {
+    fn from(s: CoreDbStats) -> Self {
+        DbStats {
             pending_wal_bytes: s.pending_wal_bytes.min(u32::MAX as usize) as u32,
             segment_count: s.segment_count.min(u32::MAX as usize) as u32,
             node_tombstone_count: s.node_tombstone_count.min(u32::MAX as usize) as u32,
@@ -3457,22 +4011,81 @@ impl From<DbStats> for JsDbStats {
 }
 
 #[napi(object)]
-pub struct JsDenseVectorConfig {
+pub struct ScrubReport {
+    pub segments: Vec<SegmentScrubResult>,
+    pub total_components_checked: f64,
+    pub total_components_ok: f64,
+    pub total_components_failed: f64,
+    pub total_bytes_digested: f64,
+    pub duration_ms: f64,
+}
+
+#[napi(object)]
+pub struct SegmentScrubResult {
+    pub segment_id: f64,
+    pub findings: Vec<ComponentScrubFinding>,
+    pub components_ok: f64,
+    pub bytes_digested: f64,
+}
+
+#[napi(object)]
+pub struct ComponentScrubFinding {
+    pub component_kind: String,
+    pub finding_type: String,
+    pub detail: String,
+}
+
+impl From<CoreScrubReport> for ScrubReport {
+    fn from(r: CoreScrubReport) -> Self {
+        ScrubReport {
+            segments: r.segments.into_iter().map(|s| s.into()).collect(),
+            total_components_checked: r.total_components_checked as f64,
+            total_components_ok: r.total_components_ok as f64,
+            total_components_failed: r.total_components_failed as f64,
+            total_bytes_digested: r.total_bytes_digested as f64,
+            duration_ms: r.duration_ms as f64,
+        }
+    }
+}
+
+impl From<overgraph::SegmentScrubResult> for SegmentScrubResult {
+    fn from(s: overgraph::SegmentScrubResult) -> Self {
+        SegmentScrubResult {
+            segment_id: s.segment_id as f64,
+            findings: s.findings.into_iter().map(|f| f.into()).collect(),
+            components_ok: s.components_ok as f64,
+            bytes_digested: s.bytes_digested as f64,
+        }
+    }
+}
+
+impl From<overgraph::ComponentScrubFinding> for ComponentScrubFinding {
+    fn from(f: overgraph::ComponentScrubFinding) -> Self {
+        ComponentScrubFinding {
+            component_kind: f.component_kind,
+            finding_type: format!("{:?}", f.finding_type),
+            detail: f.detail,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct DenseVectorConfig {
     pub dimension: u32,
     pub metric: Option<String>,
 }
 
 #[napi(object)]
-pub struct JsDbOptions {
+pub struct DbOptions {
     pub create_if_missing: Option<bool>,
     pub edge_uniqueness: Option<bool>,
     pub memtable_flush_threshold: Option<u32>,
-    /// Trigger compaction automatically after this many flushes. Default 5, 0 = disabled.
+    /// Trigger compaction automatically after this many flushes. Default 4, 0 = disabled.
     pub compact_after_n_flushes: Option<u32>,
-    pub dense_vector: Option<JsDenseVectorConfig>,
+    pub dense_vector: Option<DenseVectorConfig>,
     /// WAL sync mode: 'immediate' or 'group-commit' (default).
     pub wal_sync_mode: Option<String>,
-    /// Group commit sync interval in milliseconds. Default: 10.
+    /// Group commit sync interval in milliseconds. Default: 50.
     pub group_commit_interval_ms: Option<u32>,
     /// Hard cap on memtable size in bytes. Writes trigger a flush when exceeded. 0 = disabled.
     pub memtable_hard_cap_bytes: Option<u32>,
@@ -3481,9 +4094,9 @@ pub struct JsDbOptions {
     pub max_immutable_memtables: Option<u32>,
 }
 
-impl From<JsDbOptions> for DbOptions {
-    fn from(js: JsDbOptions) -> Self {
-        let defaults = DbOptions::default();
+impl From<DbOptions> for CoreDbOptions {
+    fn from(js: DbOptions) -> Self {
+        let defaults = CoreDbOptions::default();
         let wal_sync_mode = match js.wal_sync_mode.as_deref() {
             Some("immediate") => WalSyncMode::Immediate,
             _ => {
@@ -3502,13 +4115,13 @@ impl From<JsDbOptions> for DbOptions {
                 Some("dot_product") => DenseMetric::DotProduct,
                 _ => DenseMetric::Cosine,
             };
-            DenseVectorConfig {
+            CoreDenseVectorConfig {
                 dimension: dv.dimension,
                 metric,
                 hnsw: HnswConfig::default(),
             }
         });
-        DbOptions {
+        CoreDbOptions {
             create_if_missing: js.create_if_missing.unwrap_or(defaults.create_if_missing),
             edge_uniqueness: js.edge_uniqueness.unwrap_or(defaults.edge_uniqueness),
             memtable_flush_threshold: js
@@ -3533,25 +4146,40 @@ impl From<JsDbOptions> for DbOptions {
 }
 
 #[napi(object)]
-pub struct JsKeyQuery {
-    pub type_id: u32,
+pub struct KeyQuery {
+    pub label: String,
     pub key: String,
 }
 
+impl TryFrom<KeyQuery> for NodeKeyQuery {
+    type Error = napi::Error;
+
+    fn try_from(js: KeyQuery) -> std::result::Result<Self, Self::Error> {
+        Ok(NodeKeyQuery {
+            label: js.label,
+            key: js.key,
+        })
+    }
+}
+
 #[napi(object)]
-pub struct JsNodeInput {
-    pub type_id: u32,
+pub struct NodeInput {
+    #[napi(ts_type = "string | string[]")]
+    pub labels: serde_json::Value,
     pub key: String,
     pub props: Option<HashMap<String, serde_json::Value>>,
     pub weight: Option<f64>,
     pub dense_vector: Option<Vec<f64>>,
-    pub sparse_vector: Option<Vec<JsSparseEntry>>,
+    pub sparse_vector: Option<Vec<SparseEntry>>,
 }
 
-impl From<JsNodeInput> for NodeInput {
-    fn from(js: JsNodeInput) -> Self {
-        NodeInput {
-            type_id: js.type_id,
+impl TryFrom<NodeInput> for CoreNodeInput {
+    type Error = napi::Error;
+
+    fn try_from(js: NodeInput) -> std::result::Result<Self, Self::Error> {
+        let labels = parse_js_node_labels_arg(&js.labels, "NodeInput labels")?;
+        Ok(CoreNodeInput {
+            labels,
             key: js.key,
             props: convert_js_props(js.props),
             weight: js.weight.unwrap_or(1.0) as f32,
@@ -3563,84 +4191,71 @@ impl From<JsNodeInput> for NodeInput {
                     .map(|e| (e.dimension, e.value as f32))
                     .collect()
             }),
-        }
+        })
     }
 }
 
 #[napi(object)]
-pub struct JsSparseEntry {
+#[derive(Clone)]
+pub struct SparseEntry {
     pub dimension: u32,
     pub value: f64,
 }
 
 #[napi(object)]
 #[derive(Clone)]
-pub struct JsTxnNodeRef {
+pub struct TxnNodeRef {
     pub id: Option<f64>,
-    pub type_id: Option<u32>,
+    #[napi(ts_type = "string | string[]")]
+    pub labels: Option<serde_json::Value>,
     pub key: Option<String>,
     pub local: Option<String>,
 }
 
 #[napi(object)]
 #[derive(Clone)]
-pub struct JsTxnEdgeRef {
+pub struct TxnEdgeRef {
     pub id: Option<f64>,
-    pub from: Option<JsTxnNodeRef>,
-    pub to: Option<JsTxnNodeRef>,
-    pub type_id: Option<u32>,
+    pub from: Option<TxnNodeRef>,
+    pub to: Option<TxnNodeRef>,
+    pub label: Option<String>,
     pub local: Option<String>,
-}
-
-#[napi(object)]
-pub struct JsTxnOperation {
-    pub op: String,
-    pub alias: Option<String>,
-    pub type_id: Option<u32>,
-    pub key: Option<String>,
-    pub props: Option<HashMap<String, serde_json::Value>>,
-    pub weight: Option<f64>,
-    pub dense_vector: Option<Vec<f64>>,
-    pub sparse_vector: Option<Vec<JsSparseEntry>>,
-    pub from: Option<JsTxnNodeRef>,
-    pub to: Option<JsTxnNodeRef>,
-    pub target: Option<JsTxnEdgeOrNodeRef>,
-    pub valid_from: Option<i64>,
-    pub valid_to: Option<i64>,
 }
 
 #[napi(object)]
 #[derive(Clone)]
-pub struct JsTxnEdgeOrNodeRef {
+pub struct TxnEdgeOrNodeRef {
     pub id: Option<f64>,
-    pub type_id: Option<u32>,
+    #[napi(ts_type = "string | string[]")]
+    pub labels: Option<serde_json::Value>,
+    pub label: Option<String>,
     pub key: Option<String>,
     pub local: Option<String>,
-    pub from: Option<JsTxnNodeRef>,
-    pub to: Option<JsTxnNodeRef>,
+    pub from: Option<TxnNodeRef>,
+    pub to: Option<TxnNodeRef>,
 }
 
 #[napi(object)]
-pub struct JsTxnNodeView {
+pub struct TxnNodeView {
     pub id: Option<f64>,
     pub local: Option<String>,
-    pub type_id: u32,
+    pub labels: Vec<String>,
     pub key: String,
     pub props: HashMap<String, serde_json::Value>,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
     pub weight: f64,
     pub dense_vector: Option<Vec<f64>>,
-    pub sparse_vector: Option<Vec<JsSparseEntry>>,
+    pub sparse_vector: Option<Vec<SparseEntry>>,
 }
 
 #[napi(object)]
-pub struct JsTxnEdgeView {
+pub struct TxnEdgeView {
     pub id: Option<f64>,
     pub local: Option<String>,
-    pub from: JsTxnNodeRef,
-    pub to: JsTxnNodeRef,
-    pub type_id: u32,
+    pub from: TxnNodeRef,
+    pub to: TxnNodeRef,
+    pub label: String,
     pub props: HashMap<String, serde_json::Value>,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
@@ -3650,7 +4265,7 @@ pub struct JsTxnEdgeView {
 }
 
 #[napi(object)]
-pub struct JsTxnCommitResult {
+pub struct TxnCommitResult {
     pub node_ids: Float64Array,
     pub edge_ids: Float64Array,
     pub node_aliases: HashMap<String, f64>,
@@ -3658,38 +4273,38 @@ pub struct JsTxnCommitResult {
 }
 
 #[napi(object)]
-pub struct JsVectorSearchScope {
+pub struct VectorSearchScope {
     pub start_node_id: f64,
     pub max_depth: u32,
     pub direction: Option<String>,
-    pub edge_type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub at_epoch: Option<i64>,
 }
 
 #[napi(object)]
-pub struct JsVectorHit {
+pub struct VectorHit {
     pub node_id: f64,
     pub score: f64,
 }
 
 #[napi(object)]
-pub struct JsEdgeInput {
+pub struct EdgeInput {
     pub from: f64,
     pub to: f64,
-    pub type_id: u32,
+    pub label: String,
     pub props: Option<HashMap<String, serde_json::Value>>,
     pub weight: Option<f64>,
     pub valid_from: Option<i64>,
     pub valid_to: Option<i64>,
 }
 
-impl TryFrom<JsEdgeInput> for EdgeInput {
+impl TryFrom<EdgeInput> for CoreEdgeInput {
     type Error = napi::Error;
-    fn try_from(js: JsEdgeInput) -> std::result::Result<Self, Self::Error> {
-        Ok(EdgeInput {
+    fn try_from(js: EdgeInput) -> std::result::Result<Self, Self::Error> {
+        Ok(CoreEdgeInput {
             from: f64_to_u64(js.from)?,
             to: f64_to_u64(js.to)?,
-            type_id: js.type_id,
+            label: js.label,
             props: convert_js_props(js.props),
             weight: js.weight.unwrap_or(1.0) as f32,
             valid_from: js.valid_from,
@@ -3698,28 +4313,30 @@ impl TryFrom<JsEdgeInput> for EdgeInput {
     }
 }
 
-/// Node record: eager primitives, lazy props. Props are Arc-shared so
+/// Node view: eager primitives, lazy props. Props are Arc-shared so
 /// container getters (page results, subgraph) avoid cloning the BTreeMap.
 #[napi]
-pub struct JsNodeRecord {
+pub struct NodeView {
     id_val: f64,
-    type_id_val: u32,
+    labels_val: Vec<String>,
     key_val: String,
     created_at_val: i64,
     updated_at_val: i64,
     weight_val: f64,
+    dense_vector_val: Option<Vec<f64>>,
+    sparse_vector_val: Option<Vec<SparseEntry>>,
     props_raw: Arc<BTreeMap<String, PropValue>>,
 }
 
 #[napi]
-impl JsNodeRecord {
+impl NodeView {
     #[napi(getter)]
     pub fn id(&self) -> f64 {
         self.id_val
     }
     #[napi(getter)]
-    pub fn type_id(&self) -> u32 {
-        self.type_id_val
+    pub fn labels(&self) -> Vec<String> {
+        self.labels_val.clone()
     }
     #[napi(getter)]
     pub fn key(&self) -> String {
@@ -3741,31 +4358,51 @@ impl JsNodeRecord {
     pub fn weight(&self) -> f64 {
         self.weight_val
     }
+    #[napi(getter)]
+    pub fn dense_vector(&self) -> Option<Vec<f64>> {
+        self.dense_vector_val.clone()
+    }
+    #[napi(getter)]
+    pub fn sparse_vector(&self) -> Option<Vec<SparseEntry>> {
+        self.sparse_vector_val.clone()
+    }
 }
 
-impl TryFrom<NodeRecord> for JsNodeRecord {
+impl TryFrom<CoreNodeView> for NodeView {
     type Error = napi::Error;
-    fn try_from(n: NodeRecord) -> Result<Self> {
-        Ok(JsNodeRecord {
+    fn try_from(n: CoreNodeView) -> Result<Self> {
+        Ok(NodeView {
             id_val: u64_to_f64(n.id)?,
-            type_id_val: n.type_id,
+            labels_val: n.labels,
             key_val: n.key,
             created_at_val: n.created_at,
             updated_at_val: n.updated_at,
             weight_val: n.weight as f64,
+            dense_vector_val: n
+                .dense_vector
+                .map(|values| values.into_iter().map(|v| v as f64).collect()),
+            sparse_vector_val: n.sparse_vector.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(dimension, value)| SparseEntry {
+                        dimension,
+                        value: value as f64,
+                    })
+                    .collect()
+            }),
             props_raw: Arc::new(n.props),
         })
     }
 }
 
-/// Edge record: eager primitives, lazy props. Props are Arc-shared so
+/// Edge view: eager primitives, lazy props. Props are Arc-shared so
 /// container getters (page results, subgraph) avoid cloning the BTreeMap.
 #[napi]
-pub struct JsEdgeRecord {
+pub struct EdgeView {
     id_val: f64,
     from_val: f64,
     to_val: f64,
-    type_id_val: u32,
+    label_val: String,
     created_at_val: i64,
     updated_at_val: i64,
     weight_val: f64,
@@ -3775,7 +4412,7 @@ pub struct JsEdgeRecord {
 }
 
 #[napi]
-impl JsEdgeRecord {
+impl EdgeView {
     #[napi(getter)]
     pub fn id(&self) -> f64 {
         self.id_val
@@ -3789,8 +4426,8 @@ impl JsEdgeRecord {
         self.to_val
     }
     #[napi(getter)]
-    pub fn type_id(&self) -> u32 {
-        self.type_id_val
+    pub fn label(&self) -> String {
+        self.label_val.clone()
     }
     #[napi(getter)]
     pub fn props(&self) -> HashMap<String, serde_json::Value> {
@@ -3818,14 +4455,14 @@ impl JsEdgeRecord {
     }
 }
 
-impl TryFrom<EdgeRecord> for JsEdgeRecord {
+impl TryFrom<CoreEdgeView> for EdgeView {
     type Error = napi::Error;
-    fn try_from(e: EdgeRecord) -> Result<Self> {
-        Ok(JsEdgeRecord {
+    fn try_from(e: CoreEdgeView) -> Result<Self> {
+        Ok(EdgeView {
             id_val: u64_to_f64(e.id)?,
             from_val: u64_to_f64(e.from)?,
             to_val: u64_to_f64(e.to)?,
-            type_id_val: e.type_id,
+            label_val: e.label,
             created_at_val: e.created_at,
             updated_at_val: e.updated_at,
             weight_val: e.weight as f64,
@@ -3839,20 +4476,20 @@ impl TryFrom<EdgeRecord> for JsEdgeRecord {
 /// A single neighbor entry as a plain JS object.
 #[napi(object)]
 #[derive(Clone)]
-pub struct JsNeighborEntry {
+pub struct NeighborEntry {
     pub node_id: f64,
     pub edge_id: f64,
-    pub edge_type_id: u32,
+    pub label: String,
     pub weight: f64,
     pub valid_from: i64,
     pub valid_to: i64,
 }
 
-fn neighbor_to_js_entry(e: &NeighborEntry) -> Result<JsNeighborEntry> {
-    Ok(JsNeighborEntry {
+fn neighbor_to_js_entry(e: &CoreNeighborEntry) -> Result<NeighborEntry> {
+    Ok(NeighborEntry {
         node_id: u64_to_f64(e.node_id)?,
         edge_id: u64_to_f64(e.edge_id)?,
-        edge_type_id: e.edge_type_id,
+        label: e.label.clone(),
         weight: e.weight as f64,
         valid_from: e.valid_from,
         valid_to: e.valid_to,
@@ -3860,32 +4497,32 @@ fn neighbor_to_js_entry(e: &NeighborEntry) -> Result<JsNeighborEntry> {
 }
 
 #[napi(object)]
-pub struct JsNeighborBatchEntry {
+pub struct NeighborBatchEntry {
     pub query_node_id: f64,
-    pub neighbors: Vec<JsNeighborEntry>,
+    pub neighbors: Vec<NeighborEntry>,
 }
 
 #[napi(object)]
-pub struct JsDegreeBatchEntry {
+pub struct DegreeBatchEntry {
     pub node_id: f64,
     pub degree: i64,
 }
 
 #[napi(object)]
-pub struct JsComponentEntry {
+pub struct ComponentEntry {
     pub node_id: f64,
     pub component_id: f64,
 }
 
 #[napi(object)]
-pub struct JsShortestPath {
+pub struct ShortestPath {
     pub nodes: Vec<f64>,
     pub edges: Vec<f64>,
     pub total_cost: f64,
 }
 
-fn shortest_path_to_js(sp: ShortestPath) -> Result<JsShortestPath> {
-    Ok(JsShortestPath {
+fn shortest_path_to_js(sp: CoreShortestPath) -> Result<ShortestPath> {
+    Ok(ShortestPath {
         nodes: sp
             .nodes
             .into_iter()
@@ -3901,7 +4538,7 @@ fn shortest_path_to_js(sp: ShortestPath) -> Result<JsShortestPath> {
 }
 
 #[napi(object)]
-pub struct JsTraversalHit {
+pub struct TraversalHit {
     pub node_id: f64,
     pub depth: u32,
     pub via_edge_id: Option<f64>,
@@ -3909,19 +4546,19 @@ pub struct JsTraversalHit {
 }
 
 #[napi(object)]
-pub struct JsTraversalCursor {
+pub struct TraversalCursor {
     pub depth: u32,
     pub last_node_id: f64,
 }
 
 #[napi(object)]
-pub struct JsTraversalPageResult {
-    pub items: Vec<JsTraversalHit>,
-    pub next_cursor: Option<JsTraversalCursor>,
+pub struct TraversalPageResult {
+    pub items: Vec<TraversalHit>,
+    pub next_cursor: Option<TraversalCursor>,
 }
 
-fn traversal_hit_to_js(hit: TraversalHit) -> Result<JsTraversalHit> {
-    Ok(JsTraversalHit {
+fn traversal_hit_to_js(hit: CoreTraversalHit) -> Result<TraversalHit> {
+    Ok(TraversalHit {
         node_id: u64_to_f64(hit.node_id)?,
         depth: hit.depth,
         via_edge_id: hit.via_edge_id.map(u64_to_f64).transpose()?,
@@ -3929,22 +4566,22 @@ fn traversal_hit_to_js(hit: TraversalHit) -> Result<JsTraversalHit> {
     })
 }
 
-fn traversal_cursor_to_js(cursor: TraversalCursor) -> Result<JsTraversalCursor> {
-    Ok(JsTraversalCursor {
+fn traversal_cursor_to_js(cursor: CoreTraversalCursor) -> Result<TraversalCursor> {
+    Ok(TraversalCursor {
         depth: cursor.depth,
         last_node_id: u64_to_f64(cursor.last_node_id)?,
     })
 }
 
-fn js_traversal_cursor_to_rust(cursor: JsTraversalCursor) -> Result<TraversalCursor> {
-    Ok(TraversalCursor {
+fn js_traversal_cursor_to_rust(cursor: TraversalCursor) -> Result<CoreTraversalCursor> {
+    Ok(CoreTraversalCursor {
         depth: cursor.depth,
         last_node_id: f64_to_u64(cursor.last_node_id)?,
     })
 }
 
-fn traversal_page_to_js(page: TraversalPageResult) -> Result<JsTraversalPageResult> {
-    Ok(JsTraversalPageResult {
+fn traversal_page_to_js(page: CoreTraversalPageResult) -> Result<TraversalPageResult> {
+    Ok(TraversalPageResult {
         items: page
             .items
             .into_iter()
@@ -3955,37 +4592,39 @@ fn traversal_page_to_js(page: TraversalPageResult) -> Result<JsTraversalPageResu
 }
 
 #[napi]
-pub struct JsSubgraphResult {
-    nodes_vec: Vec<JsNodeRecord>,
-    edges_vec: Vec<JsEdgeRecord>,
+pub struct SubgraphResult {
+    nodes_vec: Vec<NodeView>,
+    edges_vec: Vec<EdgeView>,
 }
 
 #[napi]
-impl JsSubgraphResult {
+impl SubgraphResult {
     #[napi(getter)]
-    pub fn nodes(&self) -> Vec<JsNodeRecord> {
+    pub fn nodes(&self) -> Vec<NodeView> {
         self.nodes_vec
             .iter()
-            .map(|n| JsNodeRecord {
+            .map(|n| NodeView {
                 id_val: n.id_val,
-                type_id_val: n.type_id_val,
+                labels_val: n.labels_val.clone(),
                 key_val: n.key_val.clone(),
                 created_at_val: n.created_at_val,
                 updated_at_val: n.updated_at_val,
                 weight_val: n.weight_val,
+                dense_vector_val: n.dense_vector_val.clone(),
+                sparse_vector_val: n.sparse_vector_val.clone(),
                 props_raw: Arc::clone(&n.props_raw),
             })
             .collect()
     }
     #[napi(getter)]
-    pub fn edges(&self) -> Vec<JsEdgeRecord> {
+    pub fn edges(&self) -> Vec<EdgeView> {
         self.edges_vec
             .iter()
-            .map(|e| JsEdgeRecord {
+            .map(|e| EdgeView {
                 id_val: e.id_val,
                 from_val: e.from_val,
                 to_val: e.to_val,
-                type_id_val: e.type_id_val,
+                label_val: e.label_val.clone(),
                 created_at_val: e.created_at_val,
                 updated_at_val: e.updated_at_val,
                 weight_val: e.weight_val,
@@ -3997,17 +4636,17 @@ impl JsSubgraphResult {
     }
 }
 
-fn subgraph_to_js(sg: Subgraph) -> Result<JsSubgraphResult> {
-    Ok(JsSubgraphResult {
+fn subgraph_to_js(sg: Subgraph) -> Result<SubgraphResult> {
+    Ok(SubgraphResult {
         nodes_vec: sg
             .nodes
             .into_iter()
-            .map(JsNodeRecord::try_from)
+            .map(NodeView::try_from)
             .collect::<Result<Vec<_>>>()?,
         edges_vec: sg
             .edges
             .into_iter()
-            .map(JsEdgeRecord::try_from)
+            .map(EdgeView::try_from)
             .collect::<Result<Vec<_>>>()?,
     })
 }
@@ -4015,30 +4654,32 @@ fn subgraph_to_js(sg: Subgraph) -> Result<JsSubgraphResult> {
 // --- Pagination result types ---
 
 #[napi(object)]
-pub struct JsIdPageResult {
+pub struct IdPageResult {
     pub items: Float64Array,
     pub next_cursor: Option<f64>,
 }
 
 #[napi]
-pub struct JsNodePageResult {
-    items_vec: Vec<JsNodeRecord>,
+pub struct NodePageResult {
+    items_vec: Vec<NodeView>,
     cursor: Option<u64>,
 }
 
 #[napi]
-impl JsNodePageResult {
+impl NodePageResult {
     #[napi(getter)]
-    pub fn items(&self) -> Vec<JsNodeRecord> {
+    pub fn items(&self) -> Vec<NodeView> {
         self.items_vec
             .iter()
-            .map(|n| JsNodeRecord {
+            .map(|n| NodeView {
                 id_val: n.id_val,
-                type_id_val: n.type_id_val,
+                labels_val: n.labels_val.clone(),
                 key_val: n.key_val.clone(),
                 created_at_val: n.created_at_val,
                 updated_at_val: n.updated_at_val,
                 weight_val: n.weight_val,
+                dense_vector_val: n.dense_vector_val.clone(),
+                sparse_vector_val: n.sparse_vector_val.clone(),
                 props_raw: Arc::clone(&n.props_raw),
             })
             .collect()
@@ -4050,22 +4691,22 @@ impl JsNodePageResult {
 }
 
 #[napi]
-pub struct JsEdgePageResult {
-    items_vec: Vec<JsEdgeRecord>,
+pub struct EdgePageResult {
+    items_vec: Vec<EdgeView>,
     cursor: Option<u64>,
 }
 
 #[napi]
-impl JsEdgePageResult {
+impl EdgePageResult {
     #[napi(getter)]
-    pub fn items(&self) -> Vec<JsEdgeRecord> {
+    pub fn items(&self) -> Vec<EdgeView> {
         self.items_vec
             .iter()
-            .map(|e| JsEdgeRecord {
+            .map(|e| EdgeView {
                 id_val: e.id_val,
                 from_val: e.from_val,
                 to_val: e.to_val,
-                type_id_val: e.type_id_val,
+                label_val: e.label_val.clone(),
                 created_at_val: e.created_at_val,
                 updated_at_val: e.updated_at_val,
                 weight_val: e.weight_val,
@@ -4082,15 +4723,15 @@ impl JsEdgePageResult {
 }
 
 #[napi]
-pub struct JsNeighborPageResult {
-    items_vec: Vec<JsNeighborEntry>,
+pub struct NeighborPageResult {
+    items_vec: Vec<NeighborEntry>,
     cursor: Option<u64>,
 }
 
 #[napi]
-impl JsNeighborPageResult {
+impl NeighborPageResult {
     #[napi(getter)]
-    pub fn items(&self) -> Vec<JsNeighborEntry> {
+    pub fn items(&self) -> Vec<NeighborEntry> {
         self.items_vec.clone()
     }
 
@@ -4100,53 +4741,55 @@ impl JsNeighborPageResult {
     }
 }
 
-fn id_page_to_js(page: PageResult<u64>) -> Result<JsIdPageResult> {
-    Ok(JsIdPageResult {
+fn id_page_to_js(page: PageResult<u64>) -> Result<IdPageResult> {
+    Ok(IdPageResult {
         items: ids_to_float64_array(&page.items)?,
         next_cursor: page.next_cursor.map(u64_to_f64).transpose()?,
     })
 }
 
-fn node_page_to_js(page: PageResult<NodeRecord>) -> Result<JsNodePageResult> {
-    Ok(JsNodePageResult {
+fn node_page_to_js(page: PageResult<CoreNodeView>) -> Result<NodePageResult> {
+    Ok(NodePageResult {
         items_vec: page
             .items
             .into_iter()
-            .map(JsNodeRecord::try_from)
+            .map(NodeView::try_from)
             .collect::<Result<Vec<_>>>()?,
         cursor: page.next_cursor,
     })
 }
 
-fn edge_page_to_js(page: PageResult<EdgeRecord>) -> Result<JsEdgePageResult> {
-    Ok(JsEdgePageResult {
+fn edge_page_to_js(page: PageResult<CoreEdgeView>) -> Result<EdgePageResult> {
+    Ok(EdgePageResult {
         items_vec: page
             .items
             .into_iter()
-            .map(JsEdgeRecord::try_from)
+            .map(EdgeView::try_from)
             .collect::<Result<Vec<_>>>()?,
         cursor: page.next_cursor,
     })
 }
 
-fn neighbor_page_to_js(page: PageResult<NeighborEntry>) -> Result<JsNeighborPageResult> {
-    Ok(JsNeighborPageResult {
+fn neighbor_page_to_js(page: PageResult<CoreNeighborEntry>) -> Result<NeighborPageResult> {
+    Ok(NeighborPageResult {
         items_vec: neighbor_entries_to_js(page.items)?,
         cursor: page.next_cursor,
     })
 }
 
 #[napi(object)]
-pub struct JsPropertyRangePageResult {
+pub struct PropertyRangePageResult {
     pub items: Float64Array,
-    pub next_cursor: Option<JsPropertyRangeCursor>,
+    pub next_cursor: Option<PropertyRangeCursor>,
 }
 
-fn node_property_index_info_to_js(info: NodePropertyIndexInfo) -> Result<JsNodePropertyIndexInfo> {
+fn node_property_index_info_to_js(
+    info: CoreNodePropertyIndexInfo,
+) -> Result<NodePropertyIndexInfo> {
     let (kind, domain) = secondary_index_kind_to_js(&info.kind);
-    Ok(JsNodePropertyIndexInfo {
+    Ok(NodePropertyIndexInfo {
         index_id: u64_to_f64(info.index_id)?,
-        type_id: info.type_id,
+        label: info.label,
         prop_key: info.prop_key,
         kind,
         domain,
@@ -4156,35 +4799,61 @@ fn node_property_index_info_to_js(info: NodePropertyIndexInfo) -> Result<JsNodeP
 }
 
 fn node_property_index_infos_to_js(
-    infos: Vec<NodePropertyIndexInfo>,
-) -> Result<Vec<JsNodePropertyIndexInfo>> {
+    infos: Vec<CoreNodePropertyIndexInfo>,
+) -> Result<Vec<NodePropertyIndexInfo>> {
     infos
         .into_iter()
         .map(node_property_index_info_to_js)
         .collect()
 }
 
-fn property_range_cursor_to_js(cursor: PropertyRangeCursor) -> Result<JsPropertyRangeCursor> {
+fn edge_property_index_info_to_js(
+    info: CoreEdgePropertyIndexInfo,
+) -> Result<EdgePropertyIndexInfo> {
+    let (kind, domain) = secondary_index_kind_to_js(&info.kind);
+    Ok(EdgePropertyIndexInfo {
+        index_id: u64_to_f64(info.index_id)?,
+        label: info.label,
+        prop_key: info.prop_key,
+        kind,
+        domain,
+        state: secondary_index_state_to_js(info.state).to_string(),
+        last_error: info.last_error,
+    })
+}
+
+fn edge_property_index_infos_to_js(
+    infos: Vec<CoreEdgePropertyIndexInfo>,
+) -> Result<Vec<EdgePropertyIndexInfo>> {
+    infos
+        .into_iter()
+        .map(edge_property_index_info_to_js)
+        .collect()
+}
+
+fn property_range_cursor_to_js(cursor: CorePropertyRangeCursor) -> Result<PropertyRangeCursor> {
     let (value, domain) = prop_value_to_js_numeric_parts(&cursor.value)?;
-    Ok(JsPropertyRangeCursor {
+    Ok(PropertyRangeCursor {
         value,
         node_id: u64_to_f64(cursor.node_id)?,
         domain,
     })
 }
 
-fn js_property_range_cursor_to_rust(cursor: JsPropertyRangeCursor) -> Result<PropertyRangeCursor> {
+fn js_property_range_cursor_to_rust(
+    cursor: PropertyRangeCursor,
+) -> Result<CorePropertyRangeCursor> {
     let domain = parse_secondary_index_range_domain(Some(cursor.domain.as_str()))?;
-    Ok(PropertyRangeCursor {
+    Ok(CorePropertyRangeCursor {
         value: js_numeric_to_prop_value(cursor.value, domain)?,
         node_id: f64_to_u64(cursor.node_id)?,
     })
 }
 
 fn property_range_page_to_js(
-    page: PropertyRangePageResult<u64>,
-) -> Result<JsPropertyRangePageResult> {
-    Ok(JsPropertyRangePageResult {
+    page: CorePropertyRangePageResult<u64>,
+) -> Result<PropertyRangePageResult> {
+    Ok(PropertyRangePageResult {
         items: ids_to_float64_array(&page.items)?,
         next_cursor: page
             .next_cursor
@@ -4201,26 +4870,44 @@ fn make_page_request(limit: Option<u32>, after: Option<f64>) -> napi::Result<Pag
     })
 }
 
-fn query_node_ids_to_js(result: QueryNodeIdsResult) -> Result<JsIdPageResult> {
-    Ok(JsIdPageResult {
+fn query_node_ids_to_js(result: QueryNodeIdsResult) -> Result<IdPageResult> {
+    Ok(IdPageResult {
         items: ids_to_float64_array(&result.items)?,
         next_cursor: result.next_cursor.map(u64_to_f64).transpose()?,
     })
 }
 
-fn query_nodes_to_js(result: QueryNodesResult) -> Result<JsNodePageResult> {
-    Ok(JsNodePageResult {
+fn query_edge_ids_to_js(result: QueryEdgeIdsResult) -> Result<IdPageResult> {
+    Ok(IdPageResult {
+        items: ids_to_float64_array(&result.edge_ids)?,
+        next_cursor: result.next_cursor.map(u64_to_f64).transpose()?,
+    })
+}
+
+fn query_nodes_to_js(result: QueryNodesResult) -> Result<NodePageResult> {
+    Ok(NodePageResult {
         items_vec: result
             .items
             .into_iter()
-            .map(JsNodeRecord::try_from)
+            .map(NodeView::try_from)
             .collect::<Result<Vec<_>>>()?,
         cursor: result.next_cursor,
     })
 }
 
-fn query_pattern_result_to_js(result: QueryPatternResult) -> Result<JsJsonValue> {
-    Ok(JsJsonValue(serde_json::json!({
+fn query_edges_to_js(result: QueryEdgesResult) -> Result<EdgePageResult> {
+    Ok(EdgePageResult {
+        items_vec: result
+            .edges
+            .into_iter()
+            .map(EdgeView::try_from)
+            .collect::<Result<Vec<_>>>()?,
+        cursor: result.next_cursor,
+    })
+}
+
+fn query_pattern_result_to_js(result: QueryPatternResult) -> Result<JsonPayload> {
+    Ok(JsonPayload(serde_json::json!({
         "matches": result
             .matches
             .into_iter()
@@ -4245,8 +4932,8 @@ fn query_match_to_js(match_: QueryMatch) -> Result<serde_json::Value> {
     }))
 }
 
-fn query_plan_to_js(plan: QueryPlan) -> Result<JsJsonValue> {
-    Ok(JsJsonValue(serde_json::json!({
+fn query_plan_to_js(plan: QueryPlan) -> Result<JsonPayload> {
+    Ok(JsonPayload(serde_json::json!({
         "kind": query_plan_kind_to_js(&plan.kind),
         "root": query_plan_node_to_js(plan.root),
         "estimatedCandidates": plan.estimated_candidates.map(|count| count as f64),
@@ -4255,12 +4942,19 @@ fn query_plan_to_js(plan: QueryPlan) -> Result<JsJsonValue> {
             .iter()
             .map(query_plan_warning_to_js)
             .collect::<Vec<_>>(),
+        "notes": plan
+            .notes
+            .iter()
+            .map(query_plan_note_to_js)
+            .collect::<Vec<_>>(),
+        "publicInputs": query_plan_public_inputs_to_js(plan.public_inputs),
     })))
 }
 
 fn query_plan_kind_to_js(kind: &QueryPlanKind) -> &'static str {
     match kind {
         QueryPlanKind::NodeQuery => "node_query",
+        QueryPlanKind::EdgeQuery => "edge_query",
         QueryPlanKind::PatternQuery => "pattern_query",
     }
 }
@@ -4269,7 +4963,8 @@ fn query_plan_node_to_js(node: QueryPlanNode) -> serde_json::Value {
     match node {
         QueryPlanNode::ExplicitIds => serde_json::json!({ "kind": "explicit_ids" }),
         QueryPlanNode::KeyLookup => serde_json::json!({ "kind": "key_lookup" }),
-        QueryPlanNode::NodeTypeIndex => serde_json::json!({ "kind": "node_type_index" }),
+        QueryPlanNode::NodeLabelIndex => serde_json::json!({ "kind": "node_label_index" }),
+        QueryPlanNode::NodeLabelAnyIndex => serde_json::json!({ "kind": "node_label_any_index" }),
         QueryPlanNode::PropertyEqualityIndex => {
             serde_json::json!({ "kind": "property_equality_index" })
         }
@@ -4278,6 +4973,24 @@ fn query_plan_node_to_js(node: QueryPlanNode) -> serde_json::Value {
         }
         QueryPlanNode::TimestampIndex => serde_json::json!({ "kind": "timestamp_index" }),
         QueryPlanNode::AdjacencyExpansion => serde_json::json!({ "kind": "adjacency_expansion" }),
+        QueryPlanNode::ExplicitEdgeIds => serde_json::json!({ "kind": "explicit_edge_ids" }),
+        QueryPlanNode::EdgeLabelIndex => serde_json::json!({ "kind": "edge_label_index" }),
+        QueryPlanNode::EdgeTripleIndex => serde_json::json!({ "kind": "edge_triple_index" }),
+        QueryPlanNode::EdgeEndpointAdjacency => {
+            serde_json::json!({ "kind": "edge_endpoint_adjacency" })
+        }
+        QueryPlanNode::EdgeWeightIndex => serde_json::json!({ "kind": "edge_weight_index" }),
+        QueryPlanNode::EdgeUpdatedAtIndex => {
+            serde_json::json!({ "kind": "edge_updated_at_index" })
+        }
+        QueryPlanNode::EdgeValidityIndex => serde_json::json!({ "kind": "edge_validity_index" }),
+        QueryPlanNode::EdgeMetadataScan => serde_json::json!({ "kind": "edge_metadata_scan" }),
+        QueryPlanNode::EdgePropertyEqualityIndex => {
+            serde_json::json!({ "kind": "edge_property_equality_index" })
+        }
+        QueryPlanNode::EdgePropertyRangeIndex => {
+            serde_json::json!({ "kind": "edge_property_range_index" })
+        }
         QueryPlanNode::Intersect { inputs } => serde_json::json!({
             "kind": "intersect",
             "inputs": inputs.into_iter().map(query_plan_node_to_js).collect::<Vec<_>>(),
@@ -4288,6 +5001,10 @@ fn query_plan_node_to_js(node: QueryPlanNode) -> serde_json::Value {
         }),
         QueryPlanNode::VerifyNodeFilter { input } => serde_json::json!({
             "kind": "verify_node_filter",
+            "input": query_plan_node_to_js(*input),
+        }),
+        QueryPlanNode::VerifyEdgeFilter { input } => serde_json::json!({
+            "kind": "verify_edge_filter",
             "input": query_plan_node_to_js(*input),
         }),
         QueryPlanNode::VerifyEdgePredicates { input } => serde_json::json!({
@@ -4302,12 +5019,69 @@ fn query_plan_node_to_js(node: QueryPlanNode) -> serde_json::Value {
             "anchorAlias": anchor_alias,
             "input": query_plan_node_to_js(*input),
         }),
-        QueryPlanNode::FallbackTypeScan => serde_json::json!({ "kind": "fallback_type_scan" }),
+        QueryPlanNode::PatternEdgeAnchor { edge_alias, input } => serde_json::json!({
+            "kind": "pattern_edge_anchor",
+            "edgeAlias": edge_alias,
+            "input": query_plan_node_to_js(*input),
+        }),
+        QueryPlanNode::FallbackNodeLabelScan => {
+            serde_json::json!({ "kind": "fallback_node_label_scan" })
+        }
         QueryPlanNode::FallbackFullNodeScan => {
             serde_json::json!({ "kind": "fallback_full_node_scan" })
         }
+        QueryPlanNode::FallbackEdgeLabelScan => {
+            serde_json::json!({ "kind": "fallback_edge_label_scan" })
+        }
+        QueryPlanNode::FallbackFullEdgeScan => {
+            serde_json::json!({ "kind": "fallback_full_edge_scan" })
+        }
         QueryPlanNode::EmptyResult => serde_json::json!({ "kind": "empty_result" }),
     }
+}
+
+fn query_plan_note_to_js(note: &overgraph::QueryPlanNote) -> &'static str {
+    match note {
+        overgraph::QueryPlanNote::NodeLabelAnyDedupeBeforePagination => {
+            "node_label_any_dedupe_before_pagination"
+        }
+        overgraph::QueryPlanNote::NodeLabelAnyFinalVerification => {
+            "node_label_any_final_verification"
+        }
+        overgraph::QueryPlanNote::NodeLabelAllSupersetVerification => {
+            "node_label_all_superset_verification"
+        }
+        overgraph::QueryPlanNote::StaleNodeLabelMembershipVerification => {
+            "stale_node_label_membership_verification"
+        }
+    }
+}
+
+fn query_plan_public_inputs_to_js(inputs: overgraph::QueryPlanPublicInputs) -> serde_json::Value {
+    serde_json::json!({
+        "nodeLabels": inputs
+            .node_labels
+            .into_iter()
+            .map(query_plan_public_name_to_js)
+            .collect::<Vec<_>>(),
+        "edgeLabels": inputs
+            .edge_labels
+            .into_iter()
+            .map(query_plan_public_name_to_js)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn query_plan_public_name_to_js(name: overgraph::QueryPlanPublicName) -> serde_json::Value {
+    serde_json::json!({
+        "alias": name.alias,
+        "name": name.name,
+        "known": name.known,
+        "mode": name.mode.map(|mode| match mode {
+            CoreLabelMatchMode::Any => "any",
+            CoreLabelMatchMode::All => "all",
+        }),
+    })
 }
 
 fn query_plan_warning_to_js(warning: &QueryPlanWarning) -> &'static str {
@@ -4325,11 +5099,29 @@ fn query_plan_warning_to_js(warning: &QueryPlanWarning) -> &'static str {
         QueryPlanWarning::VerifyOnlyFilter => "verify_only_filter",
         QueryPlanWarning::BooleanBranchFallback => "boolean_branch_fallback",
         QueryPlanWarning::PlanningProbeBudgetExceeded => "planning_probe_budget_exceeded",
+        QueryPlanWarning::UnknownNodeLabel => "unknown_node_label",
+        QueryPlanWarning::UnknownEdgeLabel => "unknown_edge_label",
     }
 }
 
 fn parse_js_node_query(value: &serde_json::Value) -> Result<NodeQuery> {
     let object = js_object(value, "node query request")?;
+    ensure_only_js_fields(
+        object,
+        &[
+            "labelFilter",
+            "ids",
+            "keys",
+            "filter",
+            "orderBy",
+            "limit",
+            "after",
+            "allowFullScan",
+            "where",
+            "predicates",
+        ],
+        "node query request",
+    )?;
     let page = PageRequest {
         limit: parse_js_limit(object, "node query limit")?,
         after: parse_js_optional_u64_field(object, "after", "node query after")?,
@@ -4352,7 +5144,11 @@ fn parse_js_node_query(value: &serde_json::Value) -> Result<NodeQuery> {
         },
     };
     Ok(NodeQuery {
-        type_id: parse_js_optional_u32_field(object, "typeId", "node query typeId")?,
+        label_filter: parse_js_node_label_filter_field(
+            object,
+            "labelFilter",
+            "node query labelFilter",
+        )?,
         ids: parse_js_optional_u64_array_field(object, "ids", "node query ids")?,
         keys: parse_js_optional_string_array_field(object, "keys", "node query keys")?,
         filter: parse_js_node_filter(object, "updatedAt", "node query")?,
@@ -4362,6 +5158,42 @@ fn parse_js_node_query(value: &serde_json::Value) -> Result<NodeQuery> {
             object,
             "allowFullScan",
             "node query allowFullScan",
+        )?
+        .unwrap_or(false),
+    })
+}
+
+fn parse_js_edge_query(value: &serde_json::Value) -> Result<EdgeQuery> {
+    let object = js_object(value, "edge query request")?;
+    reject_js_legacy_node_predicate_fields(object, "edge query")?;
+    let page = PageRequest {
+        limit: parse_js_limit(object, "edge query limit")?,
+        after: parse_js_optional_u64_field(object, "after", "edge query after")?,
+    };
+    Ok(EdgeQuery {
+        label: parse_js_optional_string_field(object, "label", "edge query label")?,
+        ids: parse_js_optional_u64_array_field(object, "ids", "edge query ids")?,
+        from_ids: parse_js_optional_u64_array_field(object, "fromIds", "edge query fromIds")?,
+        to_ids: parse_js_optional_u64_array_field(object, "toIds", "edge query toIds")?,
+        endpoint_ids: parse_js_optional_u64_array_field(
+            object,
+            "endpointIds",
+            "edge query endpointIds",
+        )?,
+        filter: parse_js_edge_filter(
+            object,
+            "updatedAt",
+            "validAt",
+            "validFrom",
+            "validTo",
+            "edge query",
+        )?,
+        page,
+        order: EdgeQueryOrder::EdgeIdAsc,
+        allow_full_scan: parse_js_optional_bool_field(
+            object,
+            "allowFullScan",
+            "edge query allowFullScan",
         )?
         .unwrap_or(false),
     })
@@ -4420,9 +5252,26 @@ fn parse_js_graph_pattern_query(value: &serde_json::Value) -> Result<GraphPatter
 
 fn parse_js_node_pattern(value: &serde_json::Value) -> Result<NodePattern> {
     let object = js_object(value, "node pattern")?;
+    ensure_only_js_fields(
+        object,
+        &[
+            "alias",
+            "labelFilter",
+            "ids",
+            "keys",
+            "filter",
+            "where",
+            "predicates",
+        ],
+        "node pattern",
+    )?;
     Ok(NodePattern {
         alias: parse_js_required_string_field(object, "alias", "node pattern alias")?,
-        type_id: parse_js_optional_u32_field(object, "typeId", "node pattern typeId")?,
+        label_filter: parse_js_node_label_filter_field(
+            object,
+            "labelFilter",
+            "node pattern labelFilter",
+        )?,
         ids: parse_js_optional_u64_array_field(object, "ids", "node pattern ids")?,
         keys: parse_js_optional_string_array_field(object, "keys", "node pattern keys")?,
         filter: parse_js_node_filter(object, "updatedAt", "node pattern")?,
@@ -4431,12 +5280,7 @@ fn parse_js_node_pattern(value: &serde_json::Value) -> Result<NodePattern> {
 
 fn parse_js_edge_pattern(value: &serde_json::Value) -> Result<EdgePattern> {
     let object = js_object(value, "edge pattern")?;
-    if object.contains_key("filter") {
-        return Err(napi::Error::from_reason(
-            "edge pattern filter is not supported in Phase 24; use edge pattern where or predicates"
-                .to_string(),
-        ));
-    }
+    reject_js_legacy_node_predicate_fields(object, "edge pattern")?;
     let direction = match js_non_null_field(object, "direction") {
         None => Direction::Outgoing,
         Some(value) => parse_direction(Some(value.as_str().ok_or_else(|| {
@@ -4448,13 +5292,71 @@ fn parse_js_edge_pattern(value: &serde_json::Value) -> Result<EdgePattern> {
         from_alias: parse_js_required_string_field(object, "fromAlias", "edge pattern fromAlias")?,
         to_alias: parse_js_required_string_field(object, "toAlias", "edge pattern toAlias")?,
         direction,
-        type_filter: parse_js_optional_u32_array_field(
+        label_filter: parse_js_optional_string_array_field(
             object,
-            "typeFilter",
-            "edge pattern typeFilter",
+            "labelFilter",
+            "edge pattern labelFilter",
         )?,
-        property_predicates: parse_js_edge_predicates(object, "edge pattern")?,
+        filter: parse_js_edge_filter(
+            object,
+            "updatedAt",
+            "validAt",
+            "validFrom",
+            "validTo",
+            "edge pattern",
+        )?,
     })
+}
+
+fn parse_js_node_labels_arg(value: &serde_json::Value, context: &str) -> Result<Vec<String>> {
+    match value {
+        serde_json::Value::String(label) => Ok(vec![label.clone()]),
+        serde_json::Value::Array(labels) => labels
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.as_str().map(ToString::to_string).ok_or_else(|| {
+                    napi::Error::from_reason(format!("{}[{}] must be a string", context, index))
+                })
+            })
+            .collect(),
+        _ => Err(napi::Error::from_reason(format!(
+            "{} must be a string or string array",
+            context
+        ))),
+    }
+}
+
+fn js_node_label_filter_to_rust(filter: NodeLabelFilter) -> Result<CoreNodeLabelFilter> {
+    let mode = match filter.mode.as_str() {
+        "any" => CoreLabelMatchMode::Any,
+        "all" => CoreLabelMatchMode::All,
+        other => {
+            return Err(napi::Error::from_reason(format!(
+                "node label filter mode must be 'any' or 'all', got '{}'",
+                other
+            )));
+        }
+    };
+    Ok(CoreNodeLabelFilter {
+        labels: filter.labels,
+        mode,
+    })
+}
+
+fn parse_js_node_label_filter_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<CoreNodeLabelFilter>> {
+    let Some(value) = js_non_null_field(object, key) else {
+        return Ok(None);
+    };
+    let filter = js_object(value, context)?;
+    ensure_only_js_fields(filter, &["labels", "mode"], context)?;
+    let labels = parse_js_required_string_array_field(filter, "labels", context)?;
+    let mode = parse_js_required_string_field(filter, "mode", context)?;
+    js_node_label_filter_to_rust(NodeLabelFilter { labels, mode }).map(Some)
 }
 
 fn reject_js_legacy_node_predicate_fields(
@@ -4488,6 +5390,28 @@ fn parse_js_node_filter(
             parse_js_node_filter_expr(value, updated_at_key, &format!("{} filter", context))
                 .map(Some)
         }
+    }
+}
+
+fn parse_js_edge_filter(
+    object: &serde_json::Map<String, serde_json::Value>,
+    updated_at_key: &str,
+    valid_at_key: &str,
+    valid_from_key: &str,
+    valid_to_key: &str,
+    context: &str,
+) -> Result<Option<EdgeFilterExpr>> {
+    match object.get("filter") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => parse_js_edge_filter_expr(
+            value,
+            updated_at_key,
+            valid_at_key,
+            valid_from_key,
+            valid_to_key,
+            &format!("{} filter", context),
+        )
+        .map(Some),
     }
 }
 
@@ -4580,58 +5504,148 @@ fn parse_js_node_filter_expr(
     )))
 }
 
-fn parse_js_edge_predicates(
-    object: &serde_json::Map<String, serde_json::Value>,
+fn parse_js_edge_filter_expr(
+    value: &serde_json::Value,
+    updated_at_key: &str,
+    valid_at_key: &str,
+    valid_from_key: &str,
+    valid_to_key: &str,
     context: &str,
-) -> Result<Vec<EdgePostFilterPredicate>> {
-    let mut predicates = Vec::new();
-    if let Some(where_value) = js_non_null_field(object, "where") {
-        let where_object = js_object(where_value, &format!("{} where", context))?;
-        for (key, value) in where_object {
-            predicates.push(parse_js_property_edge_predicate(
-                key.clone(),
-                value,
-                &format!("{} where.{}", context, key),
-            )?);
-        }
+) -> Result<EdgeFilterExpr> {
+    let object = js_object(value, context)?;
+    if object.is_empty() {
+        return Err(napi::Error::from_reason(format!(
+            "{} must not be an empty object",
+            context
+        )));
     }
-    if let Some(predicates_value) = js_non_null_field(object, "predicates") {
-        for (index, value) in js_array(predicates_value, &format!("{} predicates", context))?
+
+    let selectors = [
+        "and",
+        "or",
+        "not",
+        "property",
+        "weight",
+        updated_at_key,
+        valid_at_key,
+        valid_from_key,
+        valid_to_key,
+    ]
+    .iter()
+    .filter(|field| object.contains_key(**field))
+    .count();
+    if selectors != 1 {
+        return Err(napi::Error::from_reason(format!(
+            "{} must contain exactly one boolean tag or leaf selector",
+            context
+        )));
+    }
+    reject_js_uppercase_filter_fields(object, context)?;
+
+    if let Some(value) = object.get("and") {
+        ensure_only_js_fields(object, &["and"], context)?;
+        let children = js_array(value, &format!("{} and", context))?;
+        if children.is_empty() {
+            return Err(napi::Error::from_reason(format!(
+                "{} and must contain at least one child",
+                context
+            )));
+        }
+        return children
             .iter()
             .enumerate()
-        {
-            let predicate_object = js_object(value, &format!("{} predicates[{}]", context, index))?;
-            if predicate_object.len() != 1 {
-                return Err(napi::Error::from_reason(format!(
-                    "{} predicates[{}] must contain exactly one top-level predicate tag",
-                    context, index
-                )));
-            }
-            let (tag, payload) = predicate_object.iter().next().unwrap();
-            match tag.as_str() {
-                "property" => predicates.push(parse_js_explicit_property_edge_predicate(
-                    payload,
-                    &format!("{} predicates[{}].property", context, index),
-                )?),
-                other => {
-                    return Err(napi::Error::from_reason(format!(
-                        "Unknown edge predicate tag '{}'. Only 'property' is supported.",
-                        other
-                    )));
-                }
-            }
-        }
+            .map(|(index, child)| {
+                parse_js_edge_filter_expr(
+                    child,
+                    updated_at_key,
+                    valid_at_key,
+                    valid_from_key,
+                    valid_to_key,
+                    &format!("{} and[{}]", context, index),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(EdgeFilterExpr::And);
     }
-    Ok(predicates)
-}
+    if let Some(value) = object.get("or") {
+        ensure_only_js_fields(object, &["or"], context)?;
+        let children = js_array(value, &format!("{} or", context))?;
+        if children.is_empty() {
+            return Err(napi::Error::from_reason(format!(
+                "{} or must contain at least one child",
+                context
+            )));
+        }
+        return children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                parse_js_edge_filter_expr(
+                    child,
+                    updated_at_key,
+                    valid_at_key,
+                    valid_from_key,
+                    valid_to_key,
+                    &format!("{} or[{}]", context, index),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(EdgeFilterExpr::Or);
+    }
+    if let Some(value) = object.get("not") {
+        ensure_only_js_fields(object, &["not"], context)?;
+        return parse_js_edge_filter_expr(
+            value,
+            updated_at_key,
+            valid_at_key,
+            valid_from_key,
+            valid_to_key,
+            &format!("{} not", context),
+        )
+        .map(Box::new)
+        .map(EdgeFilterExpr::Not);
+    }
+    if object.contains_key("property") {
+        return parse_js_property_edge_filter(object, context);
+    }
+    if let Some(value) = object.get("weight") {
+        ensure_only_js_fields(object, &["weight"], context)?;
+        let range = js_object(value, &format!("{} weight", context))?;
+        let (lower, upper) = parse_js_f32_range_bounds(range, &format!("{} weight", context))?;
+        return Ok(EdgeFilterExpr::WeightRange { lower, upper });
+    }
+    if let Some(value) = object.get(updated_at_key) {
+        ensure_only_js_fields(object, &[updated_at_key], context)?;
+        let range = js_object(value, &format!("{} {}", context, updated_at_key))?;
+        let (lower_ms, upper_ms) =
+            parse_js_i64_range_bounds(range, &format!("{} {}", context, updated_at_key))?;
+        return Ok(EdgeFilterExpr::UpdatedAtRange { lower_ms, upper_ms });
+    }
+    if let Some(value) = object.get(valid_at_key) {
+        ensure_only_js_fields(object, &[valid_at_key], context)?;
+        return Ok(EdgeFilterExpr::ValidAt {
+            epoch_ms: js_number_to_i64(value, &format!("{} {}", context, valid_at_key))?,
+        });
+    }
+    if let Some(value) = object.get(valid_from_key) {
+        ensure_only_js_fields(object, &[valid_from_key], context)?;
+        let range = js_object(value, &format!("{} {}", context, valid_from_key))?;
+        let (lower_ms, upper_ms) =
+            parse_js_i64_range_bounds(range, &format!("{} {}", context, valid_from_key))?;
+        return Ok(EdgeFilterExpr::ValidFromRange { lower_ms, upper_ms });
+    }
+    if let Some(value) = object.get(valid_to_key) {
+        ensure_only_js_fields(object, &[valid_to_key], context)?;
+        let range = js_object(value, &format!("{} {}", context, valid_to_key))?;
+        let (lower_ms, upper_ms) =
+            parse_js_i64_range_bounds(range, &format!("{} {}", context, valid_to_key))?;
+        return Ok(EdgeFilterExpr::ValidToRange { lower_ms, upper_ms });
+    }
 
-fn parse_js_explicit_property_edge_predicate(
-    value: &serde_json::Value,
-    context: &str,
-) -> Result<EdgePostFilterPredicate> {
-    let object = js_object(value, context)?;
-    let key = parse_js_required_string_field(object, "key", &format!("{} key", context))?;
-    parse_js_property_edge_predicate(key, value, context)
+    Err(napi::Error::from_reason(format!(
+        "{} must contain a valid filter selector",
+        context
+    )))
 }
 
 fn parse_js_property_node_filter(
@@ -4704,74 +5718,74 @@ fn parse_js_property_node_filter(
     unreachable!("operator family count was checked above")
 }
 
-fn parse_js_property_edge_predicate(
-    key: String,
-    value: &serde_json::Value,
+fn parse_js_property_edge_filter(
+    object: &serde_json::Map<String, serde_json::Value>,
     context: &str,
-) -> Result<EdgePostFilterPredicate> {
-    let parsed = parse_js_property_predicate(value, context)?;
-    Ok(match parsed {
-        JsParsedPropertyPredicate::Equals(value) => {
-            EdgePostFilterPredicate::PropertyEquals { key, value }
-        }
-        JsParsedPropertyPredicate::Range { lower, upper } => {
-            EdgePostFilterPredicate::PropertyRange { key, lower, upper }
-        }
-    })
-}
-
-enum JsParsedPropertyPredicate {
-    Equals(PropValue),
-    Range {
-        lower: Option<PropertyRangeBound>,
-        upper: Option<PropertyRangeBound>,
-    },
-}
-
-fn parse_js_property_predicate(
-    value: &serde_json::Value,
-    context: &str,
-) -> Result<JsParsedPropertyPredicate> {
-    let object = js_object(value, context)?;
-    match js_non_null_field(object, "op") {
-        Some(op_value) => match op_value.as_str() {
-            Some("eq") => {
-                ensure_no_js_fields(object, &["gt", "gte", "lt", "lte", "eq"], context)?;
-                let value = object.get("value").ok_or_else(|| {
-                    napi::Error::from_reason(format!("{} eq predicate requires value", context))
-                })?;
-                Ok(JsParsedPropertyPredicate::Equals(json_to_prop_value(value)))
-            }
-            Some("range") => {
-                ensure_no_js_fields(object, &["value", "eq"], context)?;
-                let (lower, upper) = parse_js_property_range_bounds(object, context)?;
-                Ok(JsParsedPropertyPredicate::Range { lower, upper })
-            }
-            Some(other) => Err(napi::Error::from_reason(format!(
-                "Unknown predicate op '{}'. Valid ops are 'eq' and 'range'.",
-                other
-            ))),
-            None => Err(napi::Error::from_reason(format!(
-                "{} predicate op must be a string",
-                context
-            ))),
-        },
-        None if object.contains_key("eq") => {
-            ensure_no_js_fields(object, &["value", "gt", "gte", "lt", "lte"], context)?;
-            Ok(JsParsedPropertyPredicate::Equals(json_to_prop_value(
-                object.get("eq").unwrap(),
-            )))
-        }
-        None if has_any_js_field(object, &["gt", "gte", "lt", "lte"]) => {
-            ensure_no_js_fields(object, &["value", "eq"], context)?;
-            let (lower, upper) = parse_js_property_range_bounds(object, context)?;
-            Ok(JsParsedPropertyPredicate::Range { lower, upper })
-        }
-        None => Err(napi::Error::from_reason(format!(
-            "{} predicate requires op, eq, or range bounds",
+) -> Result<EdgeFilterExpr> {
+    let key = parse_js_required_string_field(object, "property", &format!("{} property", context))?;
+    if key.is_empty() {
+        return Err(napi::Error::from_reason(format!(
+            "{} property must be non-empty",
             context
-        ))),
+        )));
     }
+
+    let has_range = has_any_js_field(object, &["gt", "gte", "lt", "lte"]);
+    let families = [
+        object.contains_key("eq"),
+        object.contains_key("in"),
+        has_range,
+        object.contains_key("exists"),
+        object.contains_key("missing"),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if families != 1 {
+        return Err(napi::Error::from_reason(format!(
+            "{} property filter must specify exactly one operator family",
+            context
+        )));
+    }
+
+    if let Some(value) = object.get("eq") {
+        ensure_only_js_fields(object, &["property", "eq"], context)?;
+        return Ok(EdgeFilterExpr::PropertyEquals {
+            key,
+            value: json_to_prop_value(value),
+        });
+    }
+    if let Some(value) = object.get("in") {
+        ensure_only_js_fields(object, &["property", "in"], context)?;
+        let values = js_array(value, &format!("{} in", context))?;
+        if values.is_empty() {
+            return Err(napi::Error::from_reason(format!(
+                "{} in must contain at least one value",
+                context
+            )));
+        }
+        return Ok(EdgeFilterExpr::PropertyIn {
+            key,
+            values: values.iter().map(json_to_prop_value).collect(),
+        });
+    }
+    if has_range {
+        ensure_only_js_fields(object, &["property", "gt", "gte", "lt", "lte"], context)?;
+        let (lower, upper) = parse_js_property_range_bounds(object, context)?;
+        return Ok(EdgeFilterExpr::PropertyRange { key, lower, upper });
+    }
+    if object.contains_key("exists") {
+        ensure_only_js_fields(object, &["property", "exists"], context)?;
+        require_js_true_field(object, "exists", context)?;
+        return Ok(EdgeFilterExpr::PropertyExists { key });
+    }
+    if object.contains_key("missing") {
+        ensure_only_js_fields(object, &["property", "missing"], context)?;
+        require_js_true_field(object, "missing", context)?;
+        return Ok(EdgeFilterExpr::PropertyMissing { key });
+    }
+
+    unreachable!("operator family count was checked above")
 }
 
 fn parse_js_updated_at_filter(
@@ -4792,7 +5806,10 @@ fn parse_js_updated_at_filter(
 fn parse_js_property_range_bounds(
     object: &serde_json::Map<String, serde_json::Value>,
     context: &str,
-) -> Result<(Option<PropertyRangeBound>, Option<PropertyRangeBound>)> {
+) -> Result<(
+    Option<CorePropertyRangeBound>,
+    Option<CorePropertyRangeBound>,
+)> {
     if object.contains_key("gt") && object.contains_key("gte") {
         return Err(napi::Error::from_reason(format!(
             "{} range predicate cannot specify both gt and gte",
@@ -4806,18 +5823,18 @@ fn parse_js_property_range_bounds(
         )));
     }
     let lower = if let Some(value) = object.get("gt") {
-        Some(PropertyRangeBound::Excluded(json_to_prop_value(value)))
+        Some(CorePropertyRangeBound::Excluded(json_to_prop_value(value)))
     } else {
         object
             .get("gte")
-            .map(|value| PropertyRangeBound::Included(json_to_prop_value(value)))
+            .map(|value| CorePropertyRangeBound::Included(json_to_prop_value(value)))
     };
     let upper = if let Some(value) = object.get("lt") {
-        Some(PropertyRangeBound::Excluded(json_to_prop_value(value)))
+        Some(CorePropertyRangeBound::Excluded(json_to_prop_value(value)))
     } else {
         object
             .get("lte")
-            .map(|value| PropertyRangeBound::Included(json_to_prop_value(value)))
+            .map(|value| CorePropertyRangeBound::Included(json_to_prop_value(value)))
     };
     if lower.is_none() && upper.is_none() {
         return Err(napi::Error::from_reason(format!(
@@ -4887,6 +5904,53 @@ fn parse_js_i64_range_bounds(
     Ok((lower, upper))
 }
 
+fn parse_js_f32_range_bounds(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<(Option<f32>, Option<f32>)> {
+    if object.contains_key("gt") && object.contains_key("gte") {
+        return Err(napi::Error::from_reason(format!(
+            "{} range predicate cannot specify both gt and gte",
+            context
+        )));
+    }
+    if object.contains_key("lt") && object.contains_key("lte") {
+        return Err(napi::Error::from_reason(format!(
+            "{} range predicate cannot specify both lt and lte",
+            context
+        )));
+    }
+    let lower = if let Some(value) = object.get("gt") {
+        Some(next_up_f32(js_number_to_f32(
+            value,
+            &format!("{} gt", context),
+        )?))
+    } else {
+        object
+            .get("gte")
+            .map(|value| js_number_to_f32(value, &format!("{} gte", context)))
+            .transpose()?
+    };
+    let upper = if let Some(value) = object.get("lt") {
+        Some(next_down_f32(js_number_to_f32(
+            value,
+            &format!("{} lt", context),
+        )?))
+    } else {
+        object
+            .get("lte")
+            .map(|value| js_number_to_f32(value, &format!("{} lte", context)))
+            .transpose()?
+    };
+    if lower.is_none() && upper.is_none() {
+        return Err(napi::Error::from_reason(format!(
+            "{} range predicate requires at least one of gt, gte, lt, or lte",
+            context
+        )));
+    }
+    Ok((lower, upper))
+}
+
 fn js_object<'a>(
     value: &'a serde_json::Value,
     context: &str,
@@ -4945,20 +6009,6 @@ fn parse_js_optional_i64_field(
 ) -> Result<Option<i64>> {
     js_non_null_field(object, key)
         .map(|value| js_number_to_i64(value, context))
-        .transpose()
-}
-
-fn parse_js_optional_u32_field(
-    object: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    context: &str,
-) -> Result<Option<u32>> {
-    js_non_null_field(object, key)
-        .map(|value| {
-            let value = js_number_to_u64(value, context)?;
-            u32::try_from(value)
-                .map_err(|_| napi::Error::from_reason(format!("{} must fit in u32", context)))
-        })
         .transpose()
 }
 
@@ -5021,28 +6071,6 @@ fn parse_js_optional_u64_array_field(
     }
 }
 
-fn parse_js_optional_u32_array_field(
-    object: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    context: &str,
-) -> Result<Option<Vec<u32>>> {
-    match js_non_null_field(object, key) {
-        None => Ok(None),
-        Some(value) => Ok(Some(
-            js_array(value, context)?
-                .iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    let value = js_number_to_u64(value, &format!("{}[{}]", context, index))?;
-                    u32::try_from(value).map_err(|_| {
-                        napi::Error::from_reason(format!("{}[{}] must fit in u32", context, index))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )),
-    }
-}
-
 fn parse_js_optional_string_array_field(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -5060,6 +6088,24 @@ fn parse_js_optional_string_array_field(
             })
             .collect(),
     }
+}
+
+fn parse_js_required_string_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    let value = js_non_null_field(object, key)
+        .ok_or_else(|| napi::Error::from_reason(format!("{} {} is required", context, key)))?;
+    js_array(value, &format!("{} {}", context, key))?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.as_str().map(ToString::to_string).ok_or_else(|| {
+                napi::Error::from_reason(format!("{} {}[{}] must be a string", context, key, index))
+            })
+        })
+        .collect()
 }
 
 fn js_number_to_u64(value: &serde_json::Value, context: &str) -> Result<u64> {
@@ -5086,6 +6132,56 @@ fn js_number_to_i64(value: &serde_json::Value, context: &str) -> Result<i64> {
     Ok(number as i64)
 }
 
+fn js_number_to_f32(value: &serde_json::Value, context: &str) -> Result<f32> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| napi::Error::from_reason(format!("{} must be a number", context)))?;
+    if !number.is_finite() || number < f32::MIN as f64 || number > f32::MAX as f64 {
+        return Err(napi::Error::from_reason(format!(
+            "{} must be a finite f32 number",
+            context
+        )));
+    }
+    let parsed = number as f32;
+    if parsed.is_nan() {
+        return Err(napi::Error::from_reason(format!(
+            "{} must not be NaN",
+            context
+        )));
+    }
+    Ok(parsed)
+}
+
+fn next_up_f32(value: f32) -> f32 {
+    if value == f32::INFINITY {
+        return value;
+    }
+    if value == -0.0 {
+        return f32::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value >= 0.0 {
+        f32::from_bits(bits + 1)
+    } else {
+        f32::from_bits(bits - 1)
+    }
+}
+
+fn next_down_f32(value: f32) -> f32 {
+    if value == f32::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f32::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f32::from_bits(bits - 1)
+    } else {
+        f32::from_bits(bits + 1)
+    }
+}
+
 fn has_any_js_field(object: &serde_json::Map<String, serde_json::Value>, fields: &[&str]) -> bool {
     fields.iter().any(|field| object.contains_key(*field))
 }
@@ -5097,22 +6193,6 @@ fn ensure_only_js_fields(
 ) -> Result<()> {
     for field in object.keys() {
         if !allowed.iter().any(|allowed| *allowed == field) {
-            return Err(napi::Error::from_reason(format!(
-                "{} does not accept field '{}'",
-                context, field
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn ensure_no_js_fields(
-    object: &serde_json::Map<String, serde_json::Value>,
-    fields: &[&str],
-    context: &str,
-) -> Result<()> {
-    for field in fields {
-        if object.contains_key(*field) {
             return Err(napi::Error::from_reason(format!(
                 "{} does not accept field '{}'",
                 context, field
@@ -5155,7 +6235,7 @@ fn reject_js_uppercase_filter_fields(
 }
 
 fn make_property_range_page_request(
-    options: Option<JsFindNodesRangePagedOptions>,
+    options: Option<FindNodesRangePagedOptions>,
 ) -> Result<PropertyRangePageRequest> {
     let (limit, after) = match options {
         Some(options) => (options.limit, options.after),
@@ -5168,7 +6248,7 @@ fn make_property_range_page_request(
 }
 
 #[napi(object)]
-pub struct JsCompactionProgress {
+pub struct CompactionProgress {
     pub phase: String,
     pub segments_processed: u32,
     pub total_segments: u32,
@@ -5177,7 +6257,7 @@ pub struct JsCompactionProgress {
 }
 
 #[napi(object)]
-pub struct JsCompactionStats {
+pub struct CompactionStats {
     pub segments_merged: u32,
     pub nodes_kept: i64,
     pub nodes_removed: i64,
@@ -5191,8 +6271,8 @@ pub struct JsCompactionStats {
     pub edges_auto_pruned: i64,
 }
 
-impl From<CompactionStats> for JsCompactionStats {
-    fn from(s: CompactionStats) -> Self {
+impl From<CoreCompactionStats> for CompactionStats {
+    fn from(s: CoreCompactionStats) -> Self {
         // All casts are safe: segment counts are small, and node/edge counts from compaction
         // never approach i64::MAX in practice (sequential IDs from 1).
         debug_assert!(s.segments_merged <= u32::MAX as usize);
@@ -5202,7 +6282,7 @@ impl From<CompactionStats> for JsCompactionStats {
         debug_assert!(s.edges_removed <= i64::MAX as u64);
         debug_assert!(s.duration_ms <= i64::MAX as u64);
         debug_assert!(s.output_segment_id <= i64::MAX as u64);
-        JsCompactionStats {
+        CompactionStats {
             segments_merged: s.segments_merged as u32,
             nodes_kept: s.nodes_kept as i64,
             nodes_removed: s.nodes_removed as i64,
@@ -5217,23 +6297,23 @@ impl From<CompactionStats> for JsCompactionStats {
 }
 
 #[napi(object)]
-pub struct JsPrunePolicy {
+pub struct PrunePolicy {
     /// Prune nodes older than this many milliseconds. Optional.
     pub max_age_ms: Option<f64>,
     /// Prune nodes with weight <= this threshold. Optional.
     pub max_weight: Option<f64>,
-    /// Scope to a single node type. Optional.
-    pub type_id: Option<u32>,
+    /// Scope to a single node label. Optional.
+    pub label: Option<String>,
 }
 
 #[napi(object)]
-pub struct JsNamedPrunePolicy {
+pub struct NamedPrunePolicy {
     pub name: String,
-    pub policy: JsPrunePolicy,
+    pub policy: PrunePolicy,
 }
 
 #[napi(object)]
-pub struct JsPruneResult {
+pub struct PruneResult {
     /// Number of nodes pruned.
     pub nodes_pruned: i64,
     /// Number of edges cascade-deleted.
@@ -5241,22 +6321,22 @@ pub struct JsPruneResult {
 }
 
 #[napi(object)]
-pub struct JsEdgeInvalidation {
+pub struct EdgeInvalidation {
     pub edge_id: f64,
     pub valid_to: i64,
 }
 
 #[napi(object)]
-pub struct JsGraphPatch {
-    pub upsert_nodes: Option<Vec<JsNodeInput>>,
-    pub upsert_edges: Option<Vec<JsEdgeInput>>,
-    pub invalidate_edges: Option<Vec<JsEdgeInvalidation>>,
+pub struct GraphPatch {
+    pub upsert_nodes: Option<Vec<NodeInput>>,
+    pub upsert_edges: Option<Vec<EdgeInput>>,
+    pub invalidate_edges: Option<Vec<EdgeInvalidation>>,
     pub delete_node_ids: Option<Vec<f64>>,
     pub delete_edge_ids: Option<Vec<f64>>,
 }
 
 #[napi(object)]
-pub struct JsPatchResult {
+pub struct PatchResult {
     pub node_ids: Float64Array,
     pub edge_ids: Float64Array,
 }
@@ -5264,40 +6344,48 @@ pub struct JsPatchResult {
 // --- PPR types ---
 
 #[napi(object)]
-pub struct JsPprResult {
+pub struct PprResult {
     pub node_ids: Float64Array,
     pub scores: Float64Array,
     pub iterations: u32,
     pub converged: bool,
     pub algorithm: String,
-    pub approx: Option<JsPprApproxMeta>,
+    pub approx: Option<PprApproxMeta>,
 }
 
 #[napi(object)]
-pub struct JsPprApproxMeta {
+pub struct PprApproxMeta {
     pub residual_tolerance: f64,
     pub pushes: f64,
     pub max_remaining_residual: f64,
 }
 
-fn ppr_result_to_js(r: PprResult) -> Result<JsPprResult> {
+fn ppr_result_to_js(r: CorePprResult) -> Result<PprResult> {
     let mut node_ids_raw = Vec::with_capacity(r.scores.len());
     let mut scores = Vec::with_capacity(r.scores.len());
     for (id, score) in &r.scores {
         node_ids_raw.push(u64_to_f64(*id)?);
         scores.push(*score);
     }
-    Ok(JsPprResult {
+    Ok(PprResult {
         node_ids: Float64Array::new(node_ids_raw),
         scores: Float64Array::new(scores),
         iterations: r.iterations,
         converged: r.converged,
         algorithm: ppr_algorithm_to_js(r.algorithm).to_string(),
-        approx: r.approx.map(|a| JsPprApproxMeta {
+        approx: r.approx.map(|a| PprApproxMeta {
             residual_tolerance: a.residual_tolerance,
             pushes: a.pushes as f64,
             max_remaining_residual: a.max_remaining_residual,
         }),
+    })
+}
+
+fn js_prune_policy_to_rust(policy: PrunePolicy, _context: &str) -> Result<CorePrunePolicy> {
+    Ok(CorePrunePolicy {
+        max_age_ms: policy.max_age_ms.map(|v| v as i64),
+        max_weight: policy.max_weight.map(|v| v as f32),
+        label: policy.label,
     })
 }
 
@@ -5307,7 +6395,7 @@ fn js_ppr_options_to_ppr_options(
     max_iterations: &Option<u32>,
     epsilon: &Option<f64>,
     approx_residual_tolerance: &Option<f64>,
-    edge_type_filter: &Option<Vec<u32>>,
+    edge_label_filter: &Option<Vec<String>>,
     max_results: &Option<u32>,
 ) -> Result<PprOptions> {
     let defaults = PprOptions::default();
@@ -5318,7 +6406,7 @@ fn js_ppr_options_to_ppr_options(
         epsilon: epsilon.unwrap_or(1e-6),
         approx_residual_tolerance: approx_residual_tolerance
             .unwrap_or(defaults.approx_residual_tolerance),
-        edge_type_filter: edge_type_filter.clone(),
+        edge_label_filter: edge_label_filter.clone(),
         max_results: max_results.map(|v| v as usize),
     })
 }
@@ -5326,22 +6414,26 @@ fn js_ppr_options_to_ppr_options(
 // --- Export types ---
 
 #[napi(object)]
-pub struct JsExportOptions {
-    pub node_type_filter: Option<Vec<u32>>,
-    pub edge_type_filter: Option<Vec<u32>>,
+pub struct ExportOptions {
+    pub node_label_filter: Option<NodeLabelFilter>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub include_weights: Option<bool>,
 }
 
 #[napi(object)]
-pub struct JsAdjacencyExport {
+pub struct AdjacencyExport {
     pub node_ids: Float64Array,
+    pub edge_labels: Vec<String>,
     pub edge_from: Float64Array,
     pub edge_to: Float64Array,
-    pub edge_type_ids: Uint32Array,
+    pub edge_label_indexes: Uint32Array,
     pub edge_weights: Option<Float64Array>,
 }
 
-fn adjacency_export_to_js(r: AdjacencyExport, include_weights: bool) -> Result<JsAdjacencyExport> {
+fn adjacency_export_to_js(
+    r: CoreAdjacencyExport,
+    include_weights: bool,
+) -> Result<AdjacencyExport> {
     let node_ids_vec: Vec<f64> = r
         .node_ids
         .iter()
@@ -5350,19 +6442,22 @@ fn adjacency_export_to_js(r: AdjacencyExport, include_weights: bool) -> Result<J
     let node_ids = Float64Array::new(node_ids_vec);
     let mut from_raw = Vec::with_capacity(r.edges.len());
     let mut to_raw = Vec::with_capacity(r.edges.len());
-    let mut type_ids = Vec::with_capacity(r.edges.len());
+    let mut type_indexes = Vec::with_capacity(r.edges.len());
     let mut weights = Vec::with_capacity(r.edges.len());
-    for &(f, t, tid, w) in &r.edges {
-        from_raw.push(u64_to_f64(f)?);
-        to_raw.push(u64_to_f64(t)?);
-        type_ids.push(tid);
-        weights.push(w as f64);
+    for edge in &r.edges {
+        from_raw.push(u64_to_f64(edge.from)?);
+        to_raw.push(u64_to_f64(edge.to)?);
+        type_indexes.push(edge.edge_label_index);
+        if let Some(weight) = edge.weight {
+            weights.push(weight as f64);
+        }
     }
-    Ok(JsAdjacencyExport {
+    Ok(AdjacencyExport {
         node_ids,
+        edge_labels: r.edge_labels,
         edge_from: Float64Array::new(from_raw),
         edge_to: Float64Array::new(to_raw),
-        edge_type_ids: Uint32Array::new(type_ids),
+        edge_label_indexes: Uint32Array::new(type_indexes),
         edge_weights: if include_weights {
             Some(Float64Array::new(weights))
         } else {
@@ -5371,26 +6466,29 @@ fn adjacency_export_to_js(r: AdjacencyExport, include_weights: bool) -> Result<J
     })
 }
 
-fn js_export_options_to_rust(opts: Option<JsExportOptions>) -> ExportOptions {
+fn js_export_options_to_rust(opts: Option<ExportOptions>) -> Result<CoreExportOptions> {
     match opts {
-        None => ExportOptions::default(),
-        Some(o) => ExportOptions {
-            node_type_filter: o.node_type_filter,
-            edge_type_filter: o.edge_type_filter,
+        None => Ok(CoreExportOptions::default()),
+        Some(o) => Ok(CoreExportOptions {
+            node_label_filter: o
+                .node_label_filter
+                .map(js_node_label_filter_to_rust)
+                .transpose()?,
+            edge_label_filter: o.edge_label_filter,
             include_weights: o.include_weights.unwrap_or(true),
-        },
+        }),
     }
 }
 
-fn js_patch_to_rust(patch: JsGraphPatch) -> napi::Result<GraphPatch> {
-    let upsert_nodes: Vec<NodeInput> = patch
+fn js_patch_to_rust(patch: GraphPatch) -> napi::Result<CoreGraphPatch> {
+    let upsert_nodes: Vec<CoreNodeInput> = patch
         .upsert_nodes
         .unwrap_or_default()
         .into_iter()
-        .map(|n| n.into())
-        .collect();
+        .map(NodeInput::try_into)
+        .collect::<Result<Vec<_>>>()?;
 
-    let upsert_edges: Vec<EdgeInput> = patch
+    let upsert_edges: Vec<CoreEdgeInput> = patch
         .upsert_edges
         .unwrap_or_default()
         .into_iter()
@@ -5418,7 +6516,7 @@ fn js_patch_to_rust(patch: JsGraphPatch) -> napi::Result<GraphPatch> {
         .map(f64_to_u64)
         .collect::<napi::Result<Vec<_>>>()?;
 
-    Ok(GraphPatch {
+    Ok(CoreGraphPatch {
         upsert_nodes,
         upsert_edges,
         invalidate_edges,
@@ -5552,14 +6650,14 @@ pub struct CompactProgressOp {
 }
 
 impl Task for CompactProgressOp {
-    type Output = Option<CompactionStats>;
-    type JsValue = Option<JsCompactionStats>;
+    type Output = Option<CoreCompactionStats>;
+    type JsValue = Option<CompactionStats>;
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
         let engine = clone_engine_handle(&self.db)?;
         let tsfn = &self.tsfn;
         let result = engine.compact_with_progress(|progress| {
-            let js_progress = JsCompactionProgress {
+            let js_progress = CompactionProgress {
                 phase: match progress.phase {
                     CompactionPhase::CollectingTombstones => "collecting_tombstones".to_string(),
                     CompactionPhase::MergingNodes => "merging_nodes".to_string(),
@@ -5587,17 +6685,17 @@ impl Task for CompactProgressOp {
 /// Async task for stateful transaction operations. Tickets preserve JS call order
 /// even when libuv schedules multiple operations on the same transaction in parallel.
 pub struct TxnAsyncOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
-    inner: Arc<Mutex<Option<WriteTxn>>>,
+    inner: Arc<Mutex<Option<CoreWriteTxn>>>,
     order: Arc<TxnAsyncOrder>,
     ticket: u64,
-    op: Option<Box<dyn FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError> + Send>>,
+    op: Option<Box<dyn FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError> + Send>>,
     convert: fn(T) -> napi::Result<J>,
 }
 
 impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> TxnAsyncOp<T, J> {
     fn new(
-        txn: &JsWriteTxn,
-        op: impl FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError> + Send + 'static,
+        txn: &WriteTxn,
+        op: impl FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError> + Send + 'static,
         convert: fn(T) -> napi::Result<J>,
     ) -> Result<Self> {
         let ticket = txn.async_order.reserve_ticket()?;
@@ -5637,17 +6735,17 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for TxnAsyncOp
 
 /// Async task for transaction operations that consume the transaction handle.
 pub struct TxnAsyncTakeOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
-    inner: Arc<Mutex<Option<WriteTxn>>>,
+    inner: Arc<Mutex<Option<CoreWriteTxn>>>,
     order: Arc<TxnAsyncOrder>,
     ticket: u64,
-    op: Option<Box<dyn FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError> + Send>>,
+    op: Option<Box<dyn FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError> + Send>>,
     convert: fn(T) -> napi::Result<J>,
 }
 
 impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> TxnAsyncTakeOp<T, J> {
     fn new(
-        txn: &JsWriteTxn,
-        op: impl FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError> + Send + 'static,
+        txn: &WriteTxn,
+        op: impl FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError> + Send + 'static,
         convert: fn(T) -> napi::Result<J>,
     ) -> Result<Self> {
         let ticket = txn.async_order.reserve_ticket()?;
@@ -5721,9 +6819,9 @@ fn clone_engine_handle(db: &Arc<Mutex<Option<InnerDb>>>) -> Result<DatabaseEngin
     Ok(inner.engine.clone())
 }
 
-fn with_txn<F, T>(inner: &Arc<Mutex<Option<WriteTxn>>>, f: F) -> Result<T>
+fn with_txn<F, T>(inner: &Arc<Mutex<Option<CoreWriteTxn>>>, f: F) -> Result<T>
 where
-    F: FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError>,
+    F: FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError>,
 {
     let mut guard = inner
         .lock()
@@ -5734,9 +6832,9 @@ where
     f(txn).map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
-fn with_txn_ref<F, T>(inner: &Arc<Mutex<Option<WriteTxn>>>, f: F) -> Result<T>
+fn with_txn_ref<F, T>(inner: &Arc<Mutex<Option<CoreWriteTxn>>>, f: F) -> Result<T>
 where
-    F: FnOnce(&WriteTxn) -> std::result::Result<T, EngineError>,
+    F: FnOnce(&CoreWriteTxn) -> std::result::Result<T, EngineError>,
 {
     let guard = inner
         .lock()
@@ -5747,9 +6845,9 @@ where
     f(txn).map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
-fn with_txn_take<F, T>(inner: &Arc<Mutex<Option<WriteTxn>>>, f: F) -> Result<T>
+fn with_txn_take<F, T>(inner: &Arc<Mutex<Option<CoreWriteTxn>>>, f: F) -> Result<T>
 where
-    F: FnOnce(&mut WriteTxn) -> std::result::Result<T, EngineError>,
+    F: FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError>,
 {
     let mut txn = {
         let mut guard = inner
@@ -5762,12 +6860,12 @@ where
     f(&mut txn).map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
-fn js_upsert_node_options(options: Option<JsUpsertNodeOptions>) -> UpsertNodeOptions {
+fn js_upsert_node_options(options: Option<UpsertNodeOptions>) -> CoreUpsertNodeOptions {
     let (props, weight, dense_vector, sparse_vector) = match options {
         Some(o) => (o.props, o.weight, o.dense_vector, o.sparse_vector),
         None => (None, None, None, None),
     };
-    UpsertNodeOptions {
+    CoreUpsertNodeOptions {
         props: convert_js_props(props),
         weight: weight.unwrap_or(1.0) as f32,
         dense_vector: dense_vector.map(|dv| dv.into_iter().map(|x| x as f32).collect()),
@@ -5779,12 +6877,12 @@ fn js_upsert_node_options(options: Option<JsUpsertNodeOptions>) -> UpsertNodeOpt
     }
 }
 
-fn js_upsert_edge_options(options: Option<JsUpsertEdgeOptions>) -> UpsertEdgeOptions {
+fn js_upsert_edge_options(options: Option<UpsertEdgeOptions>) -> CoreUpsertEdgeOptions {
     let (props, weight, valid_from, valid_to) = match options {
         Some(o) => (o.props, o.weight, o.valid_from, o.valid_to),
         None => (None, None, None, None),
     };
-    UpsertEdgeOptions {
+    CoreUpsertEdgeOptions {
         props: convert_js_props(props),
         weight: weight.unwrap_or(1.0) as f32,
         valid_from,
@@ -5792,96 +6890,117 @@ fn js_upsert_edge_options(options: Option<JsUpsertEdgeOptions>) -> UpsertEdgeOpt
     }
 }
 
-fn js_txn_node_ref_to_rust(value: JsTxnNodeRef) -> Result<TxnNodeRef> {
+fn txn_node_ref_labels_value(label: String) -> serde_json::Value {
+    serde_json::Value::Array(vec![serde_json::Value::String(label)])
+}
+
+fn parse_txn_node_ref_label(labels: serde_json::Value, context: &str) -> Result<String> {
+    let labels = parse_js_node_labels_arg(&labels, context)?;
+    if labels.len() != 1 {
+        return Err(napi::Error::from_reason(format!(
+            "{} must contain exactly one label",
+            context
+        )));
+    }
+    Ok(labels.into_iter().next().unwrap())
+}
+
+fn js_txn_node_ref_to_rust(value: TxnNodeRef) -> Result<CoreTxnNodeRef> {
     let has_id = value.id.is_some();
-    let has_key = value.type_id.is_some() || value.key.is_some();
+    let has_key = value.labels.is_some() || value.key.is_some();
     let has_local = value.local.is_some();
     match (has_id, has_key, has_local) {
-        (true, false, false) => Ok(TxnNodeRef::Id(f64_to_u64(value.id.unwrap())?)),
-        (false, true, false) => Ok(TxnNodeRef::Key {
-            type_id: value.type_id.ok_or_else(|| {
-                napi::Error::from_reason("node key ref requires typeId".to_string())
-            })?,
+        (true, false, false) => Ok(CoreTxnNodeRef::Id(f64_to_u64(value.id.unwrap())?)),
+        (false, true, false) => Ok(CoreTxnNodeRef::Key {
+            label: parse_txn_node_ref_label(
+                value.labels.ok_or_else(|| {
+                    napi::Error::from_reason("node key ref requires labels".to_string())
+                })?,
+                "node key ref labels",
+            )?,
             key: value
                 .key
                 .ok_or_else(|| napi::Error::from_reason("node key ref requires key".to_string()))?,
         }),
-        (false, false, true) => Ok(TxnNodeRef::Local(TxnLocalRef::Alias(value.local.unwrap()))),
+        (false, false, true) => Ok(CoreTxnNodeRef::Local(TxnLocalRef::Alias(
+            value.local.unwrap(),
+        ))),
         _ => Err(napi::Error::from_reason(
-            "node ref must be exactly one of { id }, { typeId, key }, or { local }".to_string(),
+            "node ref must be exactly one of { id }, { labels, key }, or { local }".to_string(),
         )),
     }
 }
 
-fn js_txn_edge_ref_to_rust(value: JsTxnEdgeRef) -> Result<TxnEdgeRef> {
+fn js_txn_edge_ref_to_rust(value: TxnEdgeRef) -> Result<CoreTxnEdgeRef> {
     let has_id = value.id.is_some();
-    let has_triple = value.from.is_some() || value.to.is_some() || value.type_id.is_some();
+    let has_triple = value.from.is_some() || value.to.is_some() || value.label.is_some();
     let has_local = value.local.is_some();
     match (has_id, has_triple, has_local) {
-        (true, false, false) => Ok(TxnEdgeRef::Id(f64_to_u64(value.id.unwrap())?)),
-        (false, true, false) => Ok(TxnEdgeRef::Triple {
+        (true, false, false) => Ok(CoreTxnEdgeRef::Id(f64_to_u64(value.id.unwrap())?)),
+        (false, true, false) => Ok(CoreTxnEdgeRef::Triple {
             from: js_txn_node_ref_to_rust(value.from.ok_or_else(|| {
                 napi::Error::from_reason("edge triple ref requires from".to_string())
             })?)?,
             to: js_txn_node_ref_to_rust(value.to.ok_or_else(|| {
                 napi::Error::from_reason("edge triple ref requires to".to_string())
             })?)?,
-            type_id: value.type_id.ok_or_else(|| {
-                napi::Error::from_reason("edge triple ref requires typeId".to_string())
+            label: value.label.ok_or_else(|| {
+                napi::Error::from_reason("edge triple ref requires label".to_string())
             })?,
         }),
-        (false, false, true) => Ok(TxnEdgeRef::Local(TxnLocalRef::Alias(value.local.unwrap()))),
+        (false, false, true) => Ok(CoreTxnEdgeRef::Local(TxnLocalRef::Alias(
+            value.local.unwrap(),
+        ))),
         _ => Err(napi::Error::from_reason(
-            "edge ref must be exactly one of { id }, { from, to, typeId }, or { local }"
-                .to_string(),
+            "edge ref must be exactly one of { id }, { from, to, label }, or { local }".to_string(),
         )),
     }
 }
 
-fn txn_node_ref_to_js(value: TxnNodeRef) -> Result<JsTxnNodeRef> {
+fn txn_node_ref_to_js(value: CoreTxnNodeRef) -> Result<TxnNodeRef> {
     match value {
-        TxnNodeRef::Id(id) => Ok(JsTxnNodeRef {
+        CoreTxnNodeRef::Id(id) => Ok(TxnNodeRef {
             id: Some(u64_to_f64(id)?),
-            type_id: None,
+            labels: None,
             key: None,
             local: None,
         }),
-        TxnNodeRef::Key { type_id, key } => Ok(JsTxnNodeRef {
+        CoreTxnNodeRef::Key { label, key } => Ok(TxnNodeRef {
             id: None,
-            type_id: Some(type_id),
+            labels: Some(txn_node_ref_labels_value(label)),
             key: Some(key),
             local: None,
         }),
-        TxnNodeRef::Local(local) => Ok(JsTxnNodeRef {
+        CoreTxnNodeRef::Local(local) => Ok(TxnNodeRef {
             id: None,
-            type_id: None,
+            labels: None,
             key: None,
             local: txn_local_ref_to_js(local),
         }),
     }
 }
 
-fn txn_edge_ref_to_js(value: TxnEdgeRef) -> Result<JsTxnEdgeRef> {
+fn txn_edge_ref_to_js(value: CoreTxnEdgeRef) -> Result<TxnEdgeRef> {
     match value {
-        TxnEdgeRef::Id(id) => Ok(JsTxnEdgeRef {
+        CoreTxnEdgeRef::Id(id) => Ok(TxnEdgeRef {
             id: Some(u64_to_f64(id)?),
             from: None,
             to: None,
-            type_id: None,
+            label: None,
             local: None,
         }),
-        TxnEdgeRef::Triple { from, to, type_id } => Ok(JsTxnEdgeRef {
+        CoreTxnEdgeRef::Triple { from, to, label } => Ok(TxnEdgeRef {
             id: None,
             from: Some(txn_node_ref_to_js(from)?),
             to: Some(txn_node_ref_to_js(to)?),
-            type_id: Some(type_id),
+            label: Some(label),
             local: None,
         }),
-        TxnEdgeRef::Local(local) => Ok(JsTxnEdgeRef {
+        CoreTxnEdgeRef::Local(local) => Ok(TxnEdgeRef {
             id: None,
             from: None,
             to: None,
-            type_id: None,
+            label: None,
             local: txn_local_ref_to_js(local),
         }),
     }
@@ -5894,11 +7013,11 @@ fn txn_local_ref_to_js(local: TxnLocalRef) -> Option<String> {
     }
 }
 
-fn txn_node_view_to_js(view: TxnNodeView) -> Result<JsTxnNodeView> {
-    Ok(JsTxnNodeView {
+fn txn_node_view_to_js(view: CoreTxnNodeView) -> Result<TxnNodeView> {
+    Ok(TxnNodeView {
         id: view.id.map(u64_to_f64).transpose()?,
         local: view.local.and_then(txn_local_ref_to_js),
-        type_id: view.type_id,
+        labels: view.labels,
         key: view.key,
         props: props_to_json(view.props),
         created_at: view.created_at,
@@ -5909,7 +7028,7 @@ fn txn_node_view_to_js(view: TxnNodeView) -> Result<JsTxnNodeView> {
             .map(|v| v.into_iter().map(|x| x as f64).collect()),
         sparse_vector: view.sparse_vector.map(|v| {
             v.into_iter()
-                .map(|(dimension, value)| JsSparseEntry {
+                .map(|(dimension, value)| SparseEntry {
                     dimension,
                     value: value as f64,
                 })
@@ -5918,13 +7037,13 @@ fn txn_node_view_to_js(view: TxnNodeView) -> Result<JsTxnNodeView> {
     })
 }
 
-fn txn_edge_view_to_js(view: TxnEdgeView) -> Result<JsTxnEdgeView> {
-    Ok(JsTxnEdgeView {
+fn txn_edge_view_to_js(view: CoreTxnEdgeView) -> Result<TxnEdgeView> {
+    Ok(TxnEdgeView {
         id: view.id.map(u64_to_f64).transpose()?,
         local: view.local.and_then(txn_local_ref_to_js),
         from: txn_node_ref_to_js(view.from)?,
         to: txn_node_ref_to_js(view.to)?,
-        type_id: view.type_id,
+        label: view.label,
         props: props_to_json(view.props),
         created_at: view.created_at,
         updated_at: view.updated_at,
@@ -5934,60 +7053,97 @@ fn txn_edge_view_to_js(view: TxnEdgeView) -> Result<JsTxnEdgeView> {
     })
 }
 
-fn js_txn_operation_to_rust(op: JsTxnOperation) -> Result<TxnIntent> {
-    match op.op.as_str() {
+fn js_txn_operation_to_rust(value: serde_json::Value) -> Result<TxnIntent> {
+    let object = js_object(&value, "transaction operation")?;
+    let op = parse_js_required_string_field(object, "op", "transaction operation op")?;
+    match op.as_str() {
         "upsertNode" => Ok(TxnIntent::UpsertNode {
-            alias: op.alias,
-            type_id: op.type_id.ok_or_else(|| {
-                napi::Error::from_reason("upsertNode requires typeId".to_string())
-            })?,
-            key: op
-                .key
-                .ok_or_else(|| napi::Error::from_reason("upsertNode requires key".to_string()))?,
-            options: UpsertNodeOptions {
-                props: convert_js_props(op.props),
-                weight: op.weight.unwrap_or(1.0) as f32,
-                dense_vector: op
-                    .dense_vector
-                    .map(|v| v.into_iter().map(|x| x as f32).collect()),
-                sparse_vector: op.sparse_vector.map(|v| {
+            alias: parse_js_optional_string_field(object, "alias", "upsertNode alias")?,
+            labels: parse_js_node_labels_arg(
+                js_non_null_field(object, "labels")
+                    .ok_or_else(|| napi::Error::from_reason("upsertNode requires labels"))?,
+                "upsertNode labels",
+            )?,
+            key: js_non_null_field(object, "key")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+                .ok_or_else(|| napi::Error::from_reason("upsertNode requires key"))?,
+            options: CoreUpsertNodeOptions {
+                props: convert_js_props(parse_js_optional_props_field(
+                    object,
+                    "props",
+                    "upsertNode props",
+                )?),
+                weight: parse_js_optional_f64_field(object, "weight", "upsertNode weight")?
+                    .unwrap_or(1.0) as f32,
+                dense_vector: parse_js_optional_f64_array_field(
+                    object,
+                    "denseVector",
+                    "upsertNode denseVector",
+                )?
+                .map(|v| v.into_iter().map(|x| x as f32).collect()),
+                sparse_vector: parse_js_optional_sparse_vector_field(
+                    object,
+                    "sparseVector",
+                    "upsertNode sparseVector",
+                )?
+                .map(|v| {
                     v.into_iter()
                         .map(|e| (e.dimension, e.value as f32))
                         .collect()
                 }),
             },
         }),
-        "upsertEdge" => {
-            Ok(TxnIntent::UpsertEdge {
-                alias: op.alias,
-                from: js_txn_node_ref_to_rust(op.from.ok_or_else(|| {
-                    napi::Error::from_reason("upsertEdge requires from".to_string())
-                })?)?,
-                to: js_txn_node_ref_to_rust(op.to.ok_or_else(|| {
-                    napi::Error::from_reason("upsertEdge requires to".to_string())
-                })?)?,
-                type_id: op.type_id.ok_or_else(|| {
-                    napi::Error::from_reason("upsertEdge requires typeId".to_string())
-                })?,
-                options: UpsertEdgeOptions {
-                    props: convert_js_props(op.props),
-                    weight: op.weight.unwrap_or(1.0) as f32,
-                    valid_from: op.valid_from,
-                    valid_to: op.valid_to,
-                },
-            })
-        }
+        "upsertEdge" => Ok(TxnIntent::UpsertEdge {
+            alias: parse_js_optional_string_field(object, "alias", "upsertEdge alias")?,
+            from: js_txn_node_ref_to_rust(parse_js_required_txn_node_ref_field(
+                object,
+                "from",
+                "upsertEdge from",
+            )?)?,
+            to: js_txn_node_ref_to_rust(parse_js_required_txn_node_ref_field(
+                object,
+                "to",
+                "upsertEdge to",
+            )?)?,
+            label: js_non_null_field(object, "label")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+                .ok_or_else(|| napi::Error::from_reason("upsertEdge requires label"))?,
+            options: CoreUpsertEdgeOptions {
+                props: convert_js_props(parse_js_optional_props_field(
+                    object,
+                    "props",
+                    "upsertEdge props",
+                )?),
+                weight: parse_js_optional_f64_field(object, "weight", "upsertEdge weight")?
+                    .unwrap_or(1.0) as f32,
+                valid_from: parse_js_optional_i64_field(
+                    object,
+                    "validFrom",
+                    "upsertEdge validFrom",
+                )?,
+                valid_to: parse_js_optional_i64_field(object, "validTo", "upsertEdge validTo")?,
+            },
+        }),
         "deleteNode" => Ok(TxnIntent::DeleteNode {
-            target: js_txn_node_ref_to_rust(txn_target_as_node(op.target)?)?,
+            target: js_txn_node_ref_to_rust(txn_target_as_node(
+                parse_js_required_txn_target_field(object, "target", "deleteNode target")?,
+            )?)?,
         }),
         "deleteEdge" => Ok(TxnIntent::DeleteEdge {
-            target: js_txn_edge_ref_to_rust(txn_target_as_edge(op.target)?)?,
+            target: js_txn_edge_ref_to_rust(txn_target_as_edge(
+                parse_js_required_txn_target_field(object, "target", "deleteEdge target")?,
+            )?)?,
         }),
         "invalidateEdge" => Ok(TxnIntent::InvalidateEdge {
-            target: js_txn_edge_ref_to_rust(txn_target_as_edge(op.target)?)?,
-            valid_to: op.valid_to.ok_or_else(|| {
-                napi::Error::from_reason("invalidateEdge requires validTo".to_string())
-            })?,
+            target: js_txn_edge_ref_to_rust(txn_target_as_edge(
+                parse_js_required_txn_target_field(object, "target", "invalidateEdge target")?,
+            )?)?,
+            valid_to: js_non_null_field(object, "validTo")
+                .map(|value| js_number_to_i64(value, "invalidateEdge validTo"))
+                .transpose()?
+                .ok_or_else(|| napi::Error::from_reason("invalidateEdge requires validTo"))?,
         }),
         other => Err(napi::Error::from_reason(format!(
             "invalid transaction op '{}'",
@@ -5996,28 +7152,172 @@ fn js_txn_operation_to_rust(op: JsTxnOperation) -> Result<TxnIntent> {
     }
 }
 
-fn txn_target_as_node(target: Option<JsTxnEdgeOrNodeRef>) -> Result<JsTxnNodeRef> {
-    let target = target.ok_or_else(|| napi::Error::from_reason("operation requires target"))?;
-    Ok(JsTxnNodeRef {
+fn parse_js_optional_f64_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<f64>> {
+    js_non_null_field(object, key)
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| napi::Error::from_reason(format!("{} must be a number", context)))
+        })
+        .transpose()
+}
+
+fn parse_js_optional_props_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<HashMap<String, serde_json::Value>>> {
+    js_non_null_field(object, key)
+        .map(|value| {
+            Ok(js_object(value, context)?
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect())
+        })
+        .transpose()
+}
+
+fn parse_js_optional_f64_array_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<Vec<f64>>> {
+    js_non_null_field(object, key)
+        .map(|value| {
+            js_array(value, context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    value.as_f64().ok_or_else(|| {
+                        napi::Error::from_reason(format!("{}[{}] must be a number", context, index))
+                    })
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn parse_js_optional_sparse_vector_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<Vec<SparseEntry>>> {
+    js_non_null_field(object, key)
+        .map(|value| {
+            js_array(value, context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let entry = js_object(value, &format!("{}[{}]", context, index))?;
+                    let dimension = js_non_null_field(entry, "dimension")
+                        .ok_or_else(|| {
+                            napi::Error::from_reason(format!(
+                                "{}[{}].dimension is required",
+                                context, index
+                            ))
+                        })
+                        .and_then(|value| {
+                            let dimension = js_number_to_u64(
+                                value,
+                                &format!("{}[{}].dimension", context, index),
+                            )?;
+                            u32::try_from(dimension).map_err(|_| {
+                                napi::Error::from_reason(format!(
+                                    "{}[{}].dimension is too large",
+                                    context, index
+                                ))
+                            })
+                        })?;
+                    let value = js_non_null_field(entry, "value")
+                        .and_then(|value| value.as_f64())
+                        .ok_or_else(|| {
+                            napi::Error::from_reason(format!(
+                                "{}[{}].value must be a number",
+                                context, index
+                            ))
+                        })?;
+                    Ok(SparseEntry { dimension, value })
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn parse_js_required_txn_node_ref_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<TxnNodeRef> {
+    parse_js_txn_node_ref(
+        js_non_null_field(object, key)
+            .ok_or_else(|| napi::Error::from_reason(format!("{} is required", context)))?,
+        context,
+    )
+}
+
+fn parse_js_txn_node_ref(value: &serde_json::Value, context: &str) -> Result<TxnNodeRef> {
+    let object = js_object(value, context)?;
+    Ok(TxnNodeRef {
+        id: parse_js_optional_f64_field(object, "id", &format!("{} id", context))?,
+        labels: js_non_null_field(object, "labels").cloned(),
+        key: parse_js_optional_string_field(object, "key", &format!("{} key", context))?,
+        local: parse_js_optional_string_field(object, "local", &format!("{} local", context))?,
+    })
+}
+
+fn parse_js_required_txn_target_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<TxnEdgeOrNodeRef> {
+    parse_js_txn_target(
+        js_non_null_field(object, key)
+            .ok_or_else(|| napi::Error::from_reason(format!("{} is required", context)))?,
+        context,
+    )
+}
+
+fn parse_js_txn_target(value: &serde_json::Value, context: &str) -> Result<TxnEdgeOrNodeRef> {
+    let object = js_object(value, context)?;
+    Ok(TxnEdgeOrNodeRef {
+        id: parse_js_optional_f64_field(object, "id", &format!("{} id", context))?,
+        labels: js_non_null_field(object, "labels").cloned(),
+        label: parse_js_optional_string_field(object, "label", &format!("{} label", context))?,
+        key: parse_js_optional_string_field(object, "key", &format!("{} key", context))?,
+        local: parse_js_optional_string_field(object, "local", &format!("{} local", context))?,
+        from: js_non_null_field(object, "from")
+            .map(|value| parse_js_txn_node_ref(value, &format!("{} from", context)))
+            .transpose()?,
+        to: js_non_null_field(object, "to")
+            .map(|value| parse_js_txn_node_ref(value, &format!("{} to", context)))
+            .transpose()?,
+    })
+}
+
+fn txn_target_as_node(target: TxnEdgeOrNodeRef) -> Result<TxnNodeRef> {
+    Ok(TxnNodeRef {
         id: target.id,
-        type_id: target.type_id,
+        labels: target.labels,
         key: target.key,
         local: target.local,
     })
 }
 
-fn txn_target_as_edge(target: Option<JsTxnEdgeOrNodeRef>) -> Result<JsTxnEdgeRef> {
-    let target = target.ok_or_else(|| napi::Error::from_reason("operation requires target"))?;
-    Ok(JsTxnEdgeRef {
+fn txn_target_as_edge(target: TxnEdgeOrNodeRef) -> Result<TxnEdgeRef> {
+    Ok(TxnEdgeRef {
         id: target.id,
         from: target.from,
         to: target.to,
-        type_id: target.type_id,
+        label: target.label,
         local: target.local,
     })
 }
 
-fn txn_commit_result_to_js(result: TxnCommitResult) -> Result<JsTxnCommitResult> {
+fn txn_commit_result_to_js(result: CoreTxnCommitResult) -> Result<TxnCommitResult> {
     let node_aliases = result
         .local_node_ids
         .into_iter()
@@ -6034,7 +7334,7 @@ fn txn_commit_result_to_js(result: TxnCommitResult) -> Result<JsTxnCommitResult>
             TxnLocalRef::Slot(_) => None,
         })
         .collect::<Result<HashMap<_, _>>>()?;
-    Ok(JsTxnCommitResult {
+    Ok(TxnCommitResult {
         node_ids: ids_to_float64_array(&result.node_ids)?,
         edge_ids: ids_to_float64_array(&result.edge_ids)?,
         node_aliases,
@@ -6173,17 +7473,17 @@ fn secondary_index_state_to_js(state: SecondaryIndexState) -> &'static str {
     }
 }
 
-fn secondary_index_kind_to_js(kind: &SecondaryIndexKind) -> (String, Option<String>) {
+fn secondary_index_kind_to_js(kind: &CoreSecondaryIndexKind) -> (String, Option<String>) {
     match kind {
-        SecondaryIndexKind::Equality => ("equality".to_string(), None),
-        SecondaryIndexKind::Range { domain } => (
+        CoreSecondaryIndexKind::Equality => ("equality".to_string(), None),
+        CoreSecondaryIndexKind::Range { domain } => (
             "range".to_string(),
             Some(secondary_index_domain_to_js(*domain).to_string()),
         ),
     }
 }
 
-fn js_secondary_index_kind_to_rust(kind: JsSecondaryIndexKind) -> Result<SecondaryIndexKind> {
+fn js_secondary_index_kind_to_rust(kind: SecondaryIndexKind) -> Result<CoreSecondaryIndexKind> {
     match kind.kind.as_str() {
         "equality" => {
             if kind.domain.is_some() {
@@ -6191,9 +7491,9 @@ fn js_secondary_index_kind_to_rust(kind: JsSecondaryIndexKind) -> Result<Seconda
                     "Equality indexes do not accept a range domain.".to_string(),
                 ));
             }
-            Ok(SecondaryIndexKind::Equality)
+            Ok(CoreSecondaryIndexKind::Equality)
         }
-        "range" => Ok(SecondaryIndexKind::Range {
+        "range" => Ok(CoreSecondaryIndexKind::Range {
             domain: parse_secondary_index_range_domain(kind.domain.as_deref())?,
         }),
         other => Err(napi::Error::from_reason(format!(
@@ -6251,13 +7551,13 @@ fn prop_value_to_js_numeric_parts(value: &PropValue) -> Result<(f64, String)> {
     }
 }
 
-fn js_property_range_bound_to_rust(bound: &JsPropertyRangeBound) -> Result<PropertyRangeBound> {
+fn js_property_range_bound_to_rust(bound: &PropertyRangeBound) -> Result<CorePropertyRangeBound> {
     let domain = parse_secondary_index_range_domain(Some(bound.domain.as_str()))?;
     let value = js_numeric_to_prop_value(bound.value, domain)?;
     if bound.inclusive.unwrap_or(true) {
-        Ok(PropertyRangeBound::Included(value))
+        Ok(CorePropertyRangeBound::Included(value))
     } else {
-        Ok(PropertyRangeBound::Excluded(value))
+        Ok(CorePropertyRangeBound::Excluded(value))
     }
 }
 
@@ -6414,10 +7714,10 @@ impl<'a> BinaryReader<'a> {
         Ok(slice)
     }
 
-    fn read_utf8(&mut self, len: usize) -> napi::Result<&'a str> {
+    fn read_utf8_with_context(&mut self, len: usize, context: &str) -> napi::Result<&'a str> {
         let bytes = self.read_bytes(len)?;
         std::str::from_utf8(bytes)
-            .map_err(|e| napi::Error::from_reason(format!("Invalid UTF-8 in key: {}", e)))
+            .map_err(|e| napi::Error::from_reason(format!("Invalid UTF-8 in {}: {}", context, e)))
     }
 }
 
@@ -6441,27 +7741,90 @@ fn decode_props_json(reader: &mut BinaryReader) -> napi::Result<BTreeMap<String,
     }
 }
 
-/// Decode a binary buffer into a Vec<NodeInput>.
+const NODE_BATCH_MAGIC: &[u8; 4] = b"OGNB";
+const EDGE_BATCH_MAGIC: &[u8; 4] = b"OGEB";
+const NODE_BINARY_BATCH_VERSION: u16 = 2;
+const EDGE_BINARY_BATCH_VERSION: u16 = 1;
+const BINARY_BATCH_HEADER_LEN: usize = 10;
+const MAX_NODE_LABELS_PER_NODE: usize = 10;
+
+fn decode_binary_batch_header(
+    reader: &mut BinaryReader<'_>,
+    expected_magic: &[u8; 4],
+    expected_version: u16,
+    context: &str,
+) -> napi::Result<usize> {
+    let magic = reader.read_bytes(4)?;
+    if magic != expected_magic {
+        return Err(napi::Error::from_reason(format!(
+            "Invalid {} binary batch format: missing magic header",
+            context
+        )));
+    }
+    let version = reader.read_u16_le()?;
+    if version != expected_version {
+        if context == "node" && version == 1 {
+            return Err(napi::Error::from_reason(
+                "Unsupported node binary batch version 1; OGNB v1 single-label buffers are no longer supported, expected version 2".to_string(),
+            ));
+        }
+        return Err(napi::Error::from_reason(format!(
+            "Unsupported {} binary batch version {}; expected {}",
+            context, version, expected_version
+        )));
+    }
+    Ok(reader.read_u32_le()? as usize)
+}
+
+/// Decode a binary buffer into a Vec<CoreNodeInput>.
 ///
 /// Format (little-endian):
-///   [count: u32]
+///   [magic: 4 bytes "OGNB"][version: u16 = 2][count: u32]
 ///   per node:
-///     [type_id: u32][weight: f32][key_len: u16][key: utf8][props_len: u32][props: json utf8]
-fn decode_node_batch(buf: &[u8]) -> napi::Result<Vec<NodeInput>> {
+///     [label_count: u8] repeated [label_len: u16][label: utf8][weight: f32]
+///     [key_len: u16][key: utf8][props_len: u32][props: json utf8]
+fn decode_node_batch(buf: &[u8]) -> napi::Result<Vec<CoreNodeInput>> {
     let mut reader = BinaryReader::new(buf);
-    let count = reader.read_u32_le()? as usize;
-    // Cap allocation: minimum node record is 14 bytes (type_id + weight + key_len + props_len)
-    let max_possible = buf.len().saturating_sub(4) / 14;
+    let count = decode_binary_batch_header(
+        &mut reader,
+        NODE_BATCH_MAGIC,
+        NODE_BINARY_BATCH_VERSION,
+        "node",
+    )?;
+    // Cap allocation: minimum v2 node record is 14 bytes.
+    let max_possible = buf.len().saturating_sub(BINARY_BATCH_HEADER_LEN) / 14;
     let mut inputs = Vec::with_capacity(count.min(max_possible));
 
     for _ in 0..count {
-        let type_id = reader.read_u32_le()?;
+        let label_count = reader.read_bytes(1)?[0] as usize;
+        if label_count == 0 || label_count > MAX_NODE_LABELS_PER_NODE {
+            return Err(napi::Error::from_reason(
+                "Binary node label count must be between 1 and 10".to_string(),
+            ));
+        }
+        let mut labels = Vec::with_capacity(label_count);
+        for label_index in 0..label_count {
+            let label_len = reader.read_u16_le()? as usize;
+            if label_len == 0 || label_len > 255 {
+                return Err(napi::Error::from_reason(format!(
+                    "Binary node label {} length must be between 1 and 255 bytes",
+                    label_index
+                )));
+            }
+            labels.push(
+                reader
+                    .read_utf8_with_context(label_len, "node label")?
+                    .to_string(),
+            );
+        }
         let weight = reader.read_f32_le()?;
         let key_len = reader.read_u16_le()? as usize;
-        let key = reader.read_utf8(key_len)?.to_string();
+        let key = reader
+            .read_utf8_with_context(key_len, "node key")?
+            .to_string();
         let props = decode_props_json(&mut reader)?;
-        inputs.push(NodeInput {
-            type_id,
+        inputs.push(CoreNodeInput {
+            labels,
             key,
             props,
             weight,
@@ -6481,35 +7844,48 @@ fn decode_node_batch(buf: &[u8]) -> napi::Result<Vec<NodeInput>> {
     Ok(inputs)
 }
 
-/// Decode a binary buffer into a Vec<EdgeInput>.
+/// Decode a binary buffer into a Vec<CoreEdgeInput>.
 ///
 /// Format (little-endian):
-///   [count: u32]
+///   [magic: 4 bytes "OGEB"][version: u16 = 1][count: u32]
 ///   per edge:
-///     [from: u64][to: u64][type_id: u32][weight: f32]
+///     [from: u64][to: u64][label_len: u16][label: utf8][weight: f32]
 ///     [valid_from: i64][valid_to: i64]
 ///     [props_len: u32][props: json utf8]
 ///
 /// Sentinel values: valid_from=0 → None (engine default), valid_to=0 → None (engine default).
-fn decode_edge_batch(buf: &[u8]) -> napi::Result<Vec<EdgeInput>> {
+fn decode_edge_batch(buf: &[u8]) -> napi::Result<Vec<CoreEdgeInput>> {
     let mut reader = BinaryReader::new(buf);
-    let count = reader.read_u32_le()? as usize;
-    // Cap allocation: minimum edge record is 36 bytes (from + to + type_id + weight + valid_from + valid_to + props_len)
-    let max_possible = buf.len().saturating_sub(4) / 36;
+    let count = decode_binary_batch_header(
+        &mut reader,
+        EDGE_BATCH_MAGIC,
+        EDGE_BINARY_BATCH_VERSION,
+        "edge",
+    )?;
+    // Cap allocation: minimum edge record is 35 bytes.
+    let max_possible = buf.len().saturating_sub(BINARY_BATCH_HEADER_LEN) / 35;
     let mut inputs = Vec::with_capacity(count.min(max_possible));
 
     for _ in 0..count {
         let from = reader.read_u64_le()?;
         let to = reader.read_u64_le()?;
-        let type_id = reader.read_u32_le()?;
+        let label_len = reader.read_u16_le()? as usize;
+        if label_len == 0 || label_len > 255 {
+            return Err(napi::Error::from_reason(
+                "Binary edge label length must be between 1 and 255 bytes".to_string(),
+            ));
+        }
+        let label = reader
+            .read_utf8_with_context(label_len, "edge label")?
+            .to_string();
         let weight = reader.read_f32_le()?;
         let valid_from_raw = reader.read_i64_le()?;
         let valid_to_raw = reader.read_i64_le()?;
         let props = decode_props_json(&mut reader)?;
-        inputs.push(EdgeInput {
+        inputs.push(CoreEdgeInput {
             from,
             to,
-            type_id,
+            label,
             props,
             weight,
             valid_from: if valid_from_raw == 0 {
@@ -6536,17 +7912,17 @@ fn decode_edge_batch(buf: &[u8]) -> napi::Result<Vec<EdgeInput>> {
     Ok(inputs)
 }
 
-fn neighbor_entries_to_js(entries: Vec<NeighborEntry>) -> Result<Vec<JsNeighborEntry>> {
+fn neighbor_entries_to_js(entries: Vec<CoreNeighborEntry>) -> Result<Vec<NeighborEntry>> {
     entries.iter().map(neighbor_to_js_entry).collect()
 }
 
 fn convert_batch_result(
-    map: impl IntoIterator<Item = (u64, Vec<NeighborEntry>)>,
-) -> Result<Vec<JsNeighborBatchEntry>> {
-    let mut entries: Vec<JsNeighborBatchEntry> = map
+    map: impl IntoIterator<Item = (u64, Vec<CoreNeighborEntry>)>,
+) -> Result<Vec<NeighborBatchEntry>> {
+    let mut entries: Vec<NeighborBatchEntry> = map
         .into_iter()
         .map(|(query_id, neighbors)| {
-            Ok(JsNeighborBatchEntry {
+            Ok(NeighborBatchEntry {
                 query_node_id: u64_to_f64(query_id)?,
                 neighbors: neighbor_entries_to_js(neighbors)?,
             })

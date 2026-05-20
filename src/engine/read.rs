@@ -24,20 +24,51 @@ impl PartialOrd for SparseTopKEntry {
     }
 }
 
-enum TypeScanNodeSource<'a> {
+struct ResolvedVectorSearchScope {
+    start_node_id: u64,
+    max_depth: u32,
+    direction: Direction,
+    edge_label_filter: Option<Vec<u32>>,
+    at_epoch: Option<i64>,
+}
+
+struct ResolvedVectorSearchRequest<'a> {
+    mode: VectorSearchMode,
+    dense_query: Option<&'a DenseVector>,
+    sparse_query: Option<&'a SparseVector>,
+    k: usize,
+    label_filter: ResolvedNodeLabelFilter,
+    ef_search: Option<usize>,
+    scope: Option<ResolvedVectorSearchScope>,
+    dense_weight: Option<f32>,
+    sparse_weight: Option<f32>,
+    fusion_mode: Option<FusionMode>,
+}
+
+fn finish_verified_id_page(mut items: Vec<u64>, limit: usize) -> PageResult<u64> {
+    let next_cursor = if limit > 0 && items.len() > limit {
+        items.truncate(limit);
+        items.last().copied()
+    } else {
+        None
+    };
+    PageResult { items, next_cursor }
+}
+
+enum NodeLabelScanSource<'a> {
     Owned(Vec<u64>),
     Segment {
         segment: &'a SegmentReader,
-        posting: SegmentTypePosting,
+        posting: SegmentLabelPosting,
     },
 }
 
-impl TypeScanNodeSource<'_> {
+impl NodeLabelScanSource<'_> {
     fn get_id(&self, index: usize) -> Result<Option<u64>, EngineError> {
         match self {
-            TypeScanNodeSource::Owned(ids) => Ok(ids.get(index).copied()),
-            TypeScanNodeSource::Segment { segment, posting } => {
-                segment.node_type_id_at_posting(*posting, index)
+            NodeLabelScanSource::Owned(ids) => Ok(ids.get(index).copied()),
+            NodeLabelScanSource::Segment { segment, posting } => {
+                segment.node_id_at_label_posting(*posting, index)
             }
         }
     }
@@ -47,12 +78,12 @@ impl TypeScanNodeSource<'_> {
             return Ok(0);
         };
         match self {
-            TypeScanNodeSource::Owned(ids) => match ids.binary_search(&after) {
+            NodeLabelScanSource::Owned(ids) => match ids.binary_search(&after) {
                 Ok(index) => Ok(index + 1),
                 Err(index) => Ok(index),
             },
-            TypeScanNodeSource::Segment { segment, posting } => {
-                segment.node_type_id_lower_bound_posting(*posting, after)
+            NodeLabelScanSource::Segment { segment, posting } => {
+                segment.node_label_posting_lower_bound(*posting, after)
             }
         }
     }
@@ -532,7 +563,7 @@ impl ReadView {
     }
 
     /// Batch-compute the set of node IDs that should be excluded by prune policies.
-    /// Uses the batched merge-walk (`get_nodes_raw`) instead of N individual lookups.
+    /// Uses latest-source visibility metadata instead of hydrating full records.
     /// Returns an empty set when no policies are registered (zero overhead).
     fn policy_excluded_node_ids(&self, node_ids: &[u64]) -> Result<NodeIdSet, EngineError> {
         if self.manifest.prune_policies.is_empty() || node_ids.is_empty() {
@@ -540,12 +571,12 @@ impl ReadView {
         }
         let cutoffs =
             PrecomputedPruneCutoffs::from_policies(&self.manifest.prune_policies, now_millis());
-        let records = self.get_nodes_raw(node_ids)?;
+        let visibility = self.sources().find_node_visibility_meta(node_ids)?;
         let mut excluded = NodeIdSet::default();
-        for (i, slot) in records.iter().enumerate() {
-            if let Some(ref node) = slot {
-                if cutoffs.excludes(node) {
-                    excluded.insert(node_ids[i]);
+        for (&node_id, state) in node_ids.iter().zip(visibility.iter()) {
+            if let NodeVisibilityState::Live(meta) = state {
+                if cutoffs.excludes_fields(&meta.label_ids, meta.updated_at, meta.weight) {
+                    excluded.insert(node_id);
                 }
             }
         }
@@ -567,14 +598,14 @@ impl ReadView {
 
     fn ready_equality_node_matches(
         node: Option<&NodeRecord>,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         prop_value: &PropValue,
     ) -> bool {
         let Some(node) = node else {
             return false;
         };
-        if node.type_id != type_id
+        if !node.label_ids.contains(label_id)
             || !node
                 .props
                 .get(prop_key)
@@ -597,11 +628,13 @@ impl ReadView {
             return Ok(NodeIdSet::default());
         }
 
-        let records = self.get_nodes_raw(node_ids)?;
+        let visibility = self.sources().find_node_visibility_meta(node_ids)?;
         let mut visible = NodeIdSet::with_capacity_and_hasher(node_ids.len(), Default::default());
-        for (&node_id, slot) in node_ids.iter().zip(records.iter()) {
-            if let Some(node) = slot {
-                if policy_cutoffs.is_none_or(|cutoffs| !cutoffs.excludes(node)) {
+        for (&node_id, state) in node_ids.iter().zip(visibility.iter()) {
+            if let NodeVisibilityState::Live(meta) = state {
+                if policy_cutoffs
+                    .is_none_or(|cutoffs| !cutoffs.excludes_fields(&meta.label_ids, meta.updated_at, meta.weight))
+                {
                     visible.insert(node_id);
                 }
             }
@@ -657,7 +690,7 @@ impl ReadView {
         &self,
         merged_ids: &[u64],
         memtable_verified: &NodeIdSet,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         prop_value: &PropValue,
     ) -> Result<NodeIdSet, EngineError> {
@@ -677,12 +710,11 @@ impl ReadView {
             return Ok(visible);
         }
 
+        let segment_candidates =
+            self.filter_node_ids_by_current_label(segment_candidates, label_id)?;
         let batch_results = self.get_nodes_raw(&segment_candidates)?;
-        for (id, node) in segment_candidates
-            .into_iter()
-            .zip(batch_results.into_iter())
-        {
-            if Self::ready_equality_node_matches(node.as_ref(), type_id, prop_key, prop_value) {
+        for (id, node) in segment_candidates.into_iter().zip(batch_results.into_iter()) {
+            if Self::ready_equality_node_matches(node.as_ref(), label_id, prop_key, prop_value) {
                 visible.insert(id);
             }
         }
@@ -708,7 +740,7 @@ impl ReadView {
             prop_value,
             self.snapshot_seq,
         );
-        let mut memtable_verified: NodeIdSet = memtable_ids.iter().copied().collect();
+        let memtable_verified: NodeIdSet = memtable_ids.iter().copied().collect();
         let mut deleted_above = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
@@ -724,7 +756,6 @@ impl ReadView {
                 .into_iter()
                 .filter(|id| !deleted_above.contains(id))
                 .collect();
-            memtable_verified.extend(ids.iter().copied());
             segment_ids.push(ids);
             deleted_above.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
         }
@@ -967,7 +998,7 @@ impl ReadView {
 
             let deleted = NodeIdSet::default();
             let page = PageRequest::default();
-            let merged = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &page);
+            let merged = merge_record_ids_paged(memtable_ids, segment_ids, &deleted, &page);
             return Ok((Some(merged.items), followup));
         };
 
@@ -1148,7 +1179,7 @@ impl ReadView {
             limit: Some(limit),
             after: None,
         };
-        let merged = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &page);
+        let merged = merge_record_ids_paged(memtable_ids, segment_ids, &deleted, &page);
         Ok((Some(merged.items), followup))
     }
 
@@ -1230,40 +1261,103 @@ impl ReadView {
         Some(SecondaryIndexReadFollowup::RangeSidecarFailure { index_id, error })
     }
 
-    fn nodes_by_type_paged_unfiltered(
+    fn nodes_by_single_label_id_paged_unfiltered(
         &self,
-        type_id: u32,
+        single_label_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        let deleted = self.sources().collect_deleted_nodes();
-        let memtable_ids = self.memtable.visible_nodes_by_type(type_id, self.snapshot_seq);
-        let mut segment_ids: Vec<Vec<u64>> =
-            Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
-        for epoch in &self.immutable_epochs {
-            segment_ids.push(epoch.memtable.visible_nodes_by_type(type_id, self.snapshot_seq));
+        if self.immutable_epochs.is_empty() && self.segments.is_empty() {
+            let deleted = NodeIdSet::default();
+            return Ok(merge_record_ids_paged(
+                self.memtable
+                    .visible_nodes_by_label_id(single_label_id, self.snapshot_seq),
+                Vec::new(),
+                &deleted,
+                page,
+            ));
         }
-        for seg in &self.segments {
-            segment_ids.push(seg.nodes_by_type(type_id)?);
-        }
-        Ok(merge_type_ids_paged(
-            memtable_ids,
-            segment_ids,
-            &deleted,
-            page,
-        ))
+
+        let limit = page.limit.unwrap_or(0);
+        let target = page_verify_target(limit);
+        let chunk_limit = match page.limit {
+            Some(limit) if limit > 0 => limit.saturating_add(1).saturating_mul(4).max(limit + 1),
+            _ => QUERY_VERIFY_CHUNK,
+        };
+        let mut collected = Vec::with_capacity(if limit > 0 { limit } else { 0 });
+
+        self.scan_raw_node_label_candidates(&[single_label_id], page.after, chunk_limit, |chunk| {
+            #[cfg(test)]
+            self.note_node_visibility_meta_reads(chunk.len());
+            let visibility = self.sources().find_node_visibility_meta(chunk)?;
+            for (&node_id, state) in chunk.iter().zip(visibility.iter()) {
+                if matches!(
+                    state,
+                    NodeVisibilityState::Live(meta) if meta.label_ids.contains(single_label_id)
+                ) {
+                    collected.push(node_id);
+                    if collected.len() >= target {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+
+        let next_cursor = if limit > 0 && collected.len() > limit {
+            collected.truncate(limit);
+            collected.last().copied()
+        } else {
+            None
+        };
+        Ok(PageResult {
+            items: collected,
+            next_cursor,
+        })
     }
 
-    fn scan_type_ids_unfiltered<F>(
+    fn single_label_node_sources(
         &self,
-        type_id: u32,
+        single_label_id: u32,
+    ) -> Result<Vec<NodeLabelScanSource<'_>>, EngineError> {
+        let mut sources = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
+        sources.push(NodeLabelScanSource::Owned(
+            self.memtable
+                .visible_nodes_by_label_id(single_label_id, self.snapshot_seq),
+        ));
+        for epoch in &self.immutable_epochs {
+            sources.push(NodeLabelScanSource::Owned(
+                epoch
+                    .memtable
+                    .visible_nodes_by_label_id(single_label_id, self.snapshot_seq),
+            ));
+        }
+        for segment in &self.segments {
+            if let Some(posting) = segment.node_label_posting(single_label_id)? {
+                sources.push(NodeLabelScanSource::Segment {
+                    segment: segment.as_ref(),
+                    posting,
+                });
+            }
+        }
+        Ok(sources)
+    }
+
+    fn scan_raw_node_label_candidates<F>(
+        &self,
+        label_ids: &[u32],
         start_after: Option<u64>,
+        chunk_limit: usize,
         mut visitor: F,
     ) -> Result<(), EngineError>
     where
-        F: FnMut(u64) -> ControlFlow<()>,
+        F: FnMut(&[u64]) -> Result<ControlFlow<()>, EngineError>,
     {
-        let deleted = self.sources().collect_deleted_nodes();
-        let sources = self.type_scan_node_sources(type_id)?;
+        let chunk_limit = chunk_limit.max(1);
+        let mut sources = Vec::new();
+        for &label_id in label_ids {
+            sources.extend(self.single_label_node_sources(label_id)?);
+        }
+
         let mut heap = BinaryHeap::new();
         for (source_index, source) in sources.iter().enumerate() {
             let start = source.seek_after(start_after)?;
@@ -1272,6 +1366,7 @@ impl ReadView {
             }
         }
 
+        let mut chunk = Vec::with_capacity(chunk_limit);
         let mut last_seen = None;
         while let Some(Reverse((node_id, source_index, offset))) = heap.pop() {
             let next_offset = offset + 1;
@@ -1283,47 +1378,24 @@ impl ReadView {
                 continue;
             }
             last_seen = Some(node_id);
-            if deleted.contains(&node_id) {
-                continue;
-            }
-            if visitor(node_id).is_break() {
-                return Ok(());
+            chunk.push(node_id);
+            if chunk.len() >= chunk_limit {
+                if visitor(&chunk)?.is_break() {
+                    return Ok(());
+                }
+                chunk.clear();
             }
         }
 
+        if !chunk.is_empty() {
+            let _ = visitor(&chunk)?;
+        }
         Ok(())
     }
 
-    fn type_scan_node_sources(
+    fn scan_nodes_by_single_label_id_filtered<F>(
         &self,
-        type_id: u32,
-    ) -> Result<Vec<TypeScanNodeSource<'_>>, EngineError> {
-        let mut sources = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
-        sources.push(TypeScanNodeSource::Owned(
-            self.memtable
-                .visible_nodes_by_type(type_id, self.snapshot_seq),
-        ));
-        for epoch in &self.immutable_epochs {
-            sources.push(TypeScanNodeSource::Owned(
-                epoch
-                    .memtable
-                    .visible_nodes_by_type(type_id, self.snapshot_seq),
-            ));
-        }
-        for segment in &self.segments {
-            if let Some(posting) = segment.node_type_posting(type_id)? {
-                sources.push(TypeScanNodeSource::Segment {
-                    segment: segment.as_ref(),
-                    posting,
-                });
-            }
-        }
-        Ok(sources)
-    }
-
-    fn scan_nodes_by_type_filtered<F>(
-        &self,
-        type_id: u32,
+        single_label_id: u32,
         start_after: Option<u64>,
         chunk_limit: usize,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
@@ -1333,7 +1405,7 @@ impl ReadView {
         F: FnMut(u64, &NodeRecord) -> Result<ControlFlow<()>, EngineError>,
     {
         let chunk_limit = chunk_limit.max(1);
-        let sources = self.type_scan_node_sources(type_id)?;
+        let sources = self.single_label_node_sources(single_label_id)?;
         let mut heap = BinaryHeap::new();
         for (source_index, source) in sources.iter().enumerate() {
             let start = source.seek_after(start_after)?;
@@ -1357,7 +1429,12 @@ impl ReadView {
             chunk.push(node_id);
             if chunk.len() >= chunk_limit {
                 if self
-                    .visit_type_scan_chunk(type_id, &chunk, policy_cutoffs, &mut visitor)?
+                    .visit_single_label_scan_chunk(
+                        single_label_id,
+                        &chunk,
+                        policy_cutoffs,
+                        &mut visitor,
+                    )?
                     .is_break()
                 {
                     return Ok(());
@@ -1367,14 +1444,19 @@ impl ReadView {
         }
 
         if !chunk.is_empty() {
-            let _ = self.visit_type_scan_chunk(type_id, &chunk, policy_cutoffs, &mut visitor)?;
+            let _ = self.visit_single_label_scan_chunk(
+                single_label_id,
+                &chunk,
+                policy_cutoffs,
+                &mut visitor,
+            )?;
         }
         Ok(())
     }
 
-    fn visit_type_scan_chunk<F>(
+    fn visit_single_label_scan_chunk<F>(
         &self,
-        type_id: u32,
+        single_label_id: u32,
         chunk: &[u64],
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         visitor: &mut F,
@@ -1387,7 +1469,7 @@ impl ReadView {
             let Some(node) = node.as_ref() else {
                 continue;
             };
-            if node.type_id != type_id {
+            if !node.label_ids.contains(single_label_id) {
                 continue;
             }
             if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
@@ -1484,14 +1566,14 @@ impl ReadView {
 
     fn find_nodes_scan_fallback(
         &self,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         prop_value: &PropValue,
     ) -> Result<Vec<u64>, EngineError> {
         let policy_cutoffs = self.query_policy_cutoffs();
         let mut results = Vec::new();
-        self.scan_nodes_by_type_filtered(
-            type_id,
+        self.scan_nodes_by_single_label_id_filtered(
+            label_id,
             None,
             256,
             policy_cutoffs.as_ref(),
@@ -1511,7 +1593,7 @@ impl ReadView {
 
     fn find_nodes_paged_scan_fallback(
         &self,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         prop_value: &PropValue,
         page: &PageRequest,
@@ -1525,8 +1607,8 @@ impl ReadView {
 
         if limit == 0 {
             let mut items = Vec::new();
-            self.scan_nodes_by_type_filtered(
-                type_id,
+            self.scan_nodes_by_single_label_id_filtered(
+                label_id,
                 page.after,
                 chunk_limit,
                 policy_cutoffs.as_ref(),
@@ -1547,10 +1629,10 @@ impl ReadView {
             });
         }
 
+        let target = page_verify_target(limit);
         let mut items = Vec::with_capacity(limit);
-        let mut next_cursor = None;
-        self.scan_nodes_by_type_filtered(
-            type_id,
+        self.scan_nodes_by_single_label_id_filtered(
+            label_id,
             page.after,
             chunk_limit,
             policy_cutoffs.as_ref(),
@@ -1561,26 +1643,25 @@ impl ReadView {
                     .is_some_and(|value| value == prop_value)
                 {
                     items.push(node_id);
-                    if items.len() >= limit {
-                        next_cursor = Some(node_id);
+                    if items.len() >= target {
                         return Ok(ControlFlow::Break(()));
                     }
                 }
                 Ok(ControlFlow::Continue(()))
             },
         )?;
-        Ok(PageResult { items, next_cursor })
+        Ok(finish_verified_id_page(items, limit))
     }
 
     fn find_nodes_ready_equality_index(
         &self,
-        type_id: u32,
+        label_id: u32,
         index_id: u64,
         prop_key: &str,
         prop_value: &PropValue,
     ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
         let (page, followup) = self.find_nodes_paged_ready_equality_index(
-            type_id,
+            label_id,
             index_id,
             prop_key,
             prop_value,
@@ -1591,7 +1672,7 @@ impl ReadView {
 
     fn find_nodes_paged_ready_equality_index(
         &self,
-        type_id: u32,
+        label_id: u32,
         index_id: u64,
         prop_key: &str,
         prop_value: &PropValue,
@@ -1615,11 +1696,11 @@ impl ReadView {
                 limit: None,
                 after: page.after,
             };
-            let merged = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &all_page);
+            let merged = merge_record_ids_paged(memtable_ids, segment_ids, &deleted, &all_page);
             let visible = self.ready_equality_verified_node_ids(
                 &merged.items,
                 &memtable_verified,
-                type_id,
+                label_id,
                 prop_key,
                 prop_value,
             )?;
@@ -1637,7 +1718,11 @@ impl ReadView {
                 followup,
             ))
         } else {
-            let chunk_limit = limit.saturating_mul(4).max(limit);
+            let target = page_verify_target(limit);
+            let chunk_limit = limit
+                .saturating_add(1)
+                .saturating_mul(4)
+                .max(limit.saturating_add(1));
             let mut collected = Vec::with_capacity(limit);
             let mut cursor = page.after;
 
@@ -1646,7 +1731,7 @@ impl ReadView {
                     limit: Some(chunk_limit),
                     after: cursor,
                 };
-                let merged = merge_type_ids_paged(
+                let merged = merge_record_ids_paged(
                     memtable_ids.clone(),
                     segment_ids.clone(),
                     &deleted,
@@ -1665,7 +1750,7 @@ impl ReadView {
                 let visible = self.ready_equality_verified_node_ids(
                     &merged.items,
                     &memtable_verified,
-                    type_id,
+                    label_id,
                     prop_key,
                     prop_value,
                 )?;
@@ -1673,12 +1758,10 @@ impl ReadView {
                 for id in merged.items {
                     if visible.contains(&id) && !excluded.contains(&id) {
                         collected.push(id);
-                        if collected.len() >= limit {
+                        if collected.len() >= target {
+                            let page = finish_verified_id_page(collected, limit);
                             return Ok((
-                                Some(PageResult {
-                                    items: collected,
-                                    next_cursor: Some(id),
-                                }),
+                                Some(page),
                                 followup,
                             ));
                         }
@@ -1701,7 +1784,7 @@ impl ReadView {
 
     fn ready_range_node_value(
         node: Option<&NodeRecord>,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         domain: SecondaryIndexRangeDomain,
         lower: Option<&PropertyRangeBound>,
@@ -1709,7 +1792,7 @@ impl ReadView {
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Option<PropValue> {
         let node = node?;
-        if node.type_id != type_id
+        if !node.label_ids.contains(label_id)
             || policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node))
         {
             return None;
@@ -1949,7 +2032,7 @@ impl ReadView {
     #[allow(clippy::too_many_arguments)]
     fn find_nodes_paged_ready_range_index(
         &self,
-        type_id: u32,
+        label_id: u32,
         index_id: u64,
         prop_key: &str,
         domain: SecondaryIndexRangeDomain,
@@ -2049,14 +2132,25 @@ impl ReadView {
             }
 
             let node_ids: Vec<u64> = pending.iter().map(|&(_, node_id)| node_id).collect();
+            let current_label_ids = self.filter_node_ids_by_current_label(node_ids, label_id)?;
+            let current_label_ids: NodeIdSet = current_label_ids.into_iter().collect();
+            let node_ids: Vec<u64> = pending
+                .iter()
+                .filter_map(|&(_, node_id)| current_label_ids.contains(&node_id).then_some(node_id))
+                .collect();
             let hydrated = self.get_nodes_raw(&node_ids)?;
-            for ((_, node_id), node) in pending.iter().zip(hydrated.into_iter()) {
+            let mut hydrated = hydrated.into_iter();
+            for (_, node_id) in pending
+                .iter()
+                .filter(|(_, node_id)| current_label_ids.contains(node_id))
+            {
                 if visible.len() >= target_visible {
                     break;
                 }
+                let node = hydrated.next().flatten();
                 let Some(value) = Self::ready_range_node_value(
                     node.as_ref(),
-                    type_id,
+                    label_id,
                     prop_key,
                     domain,
                     lower,
@@ -2139,7 +2233,7 @@ impl ReadView {
     #[allow(clippy::too_many_arguments)]
     fn collect_property_range_scan_matches(
         &self,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         domain: SecondaryIndexRangeDomain,
         lower: Option<&PropertyRangeBound>,
@@ -2151,8 +2245,8 @@ impl ReadView {
         let mut matches = Vec::new();
         let mut bounded: Option<BinaryHeap<RangeScanMatch>> =
             max_results.map(|_| BinaryHeap::new());
-        self.scan_nodes_by_type_filtered(
-            type_id,
+        self.scan_nodes_by_single_label_id_filtered(
+            label_id,
             None,
             256,
             policy_cutoffs.as_ref(),
@@ -2203,7 +2297,7 @@ impl ReadView {
         candidate_ids: &NodeIdSet,
         query: &[f32],
         metric: DenseMetric,
-        type_filter: Option<&[u32]>,
+        label_filter: &ResolvedNodeLabelFilter,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<Vec<VectorHit>, EngineError> {
         if candidate_ids.is_empty() {
@@ -2220,7 +2314,7 @@ impl ReadView {
             self.snapshot_seq,
             &mut remaining,
             &mut |node_id, node| {
-                if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
+                if !node_label_filter_matches(label_filter, &node.label_ids) {
                     return;
                 }
                 if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
@@ -2253,7 +2347,7 @@ impl ReadView {
                 self.snapshot_seq,
                 &mut next_remaining_imm,
                 &mut |node_id, node| {
-                    if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
+                    if !node_label_filter_matches(label_filter, &node.label_ids) {
                         return;
                     }
                     if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
@@ -2286,10 +2380,10 @@ impl ReadView {
                 query,
                 metric,
                 query_norm,
-                |type_id, updated_at, weight| {
-                    type_filter.is_none_or(|types| types.contains(&type_id))
+                |label_ids, updated_at, weight| {
+                    node_label_filter_matches(label_filter, &label_ids)
                         && policy_cutoffs.is_none_or(|cutoffs| {
-                            !cutoffs.excludes_fields(type_id, updated_at, weight)
+                            !cutoffs.excludes_fields(&label_ids, updated_at, weight)
                         })
                 },
                 &mut hits,
@@ -2314,6 +2408,62 @@ impl ReadView {
                 .total_cmp(&left.score)
                 .then_with(|| left.node_id.cmp(&right.node_id))
         });
+    }
+
+    fn hidden_node_ids_before_segment(
+        &self,
+        segment_index: usize,
+        initial_hidden_ids: &NodeIdSet,
+    ) -> Result<NodeIdSet, EngineError> {
+        let mut hidden_ids = initial_hidden_ids.clone();
+        for segment in self.segments.iter().take(segment_index) {
+            hidden_ids.extend(segment.deleted_node_id_iter());
+            hidden_ids.extend(segment.node_ids()?.iter().copied());
+        }
+        Ok(hidden_ids)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn score_exact_dense_segment(
+        &self,
+        segment_index: usize,
+        query: &[f32],
+        metric: DenseMetric,
+        query_norm: Option<f32>,
+        scope_ids: Option<&NodeIdSet>,
+        initial_hidden_ids: &NodeIdSet,
+        label_filter: &ResolvedNodeLabelFilter,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        candidate_ids: &mut NodeIdSet,
+        hits: &mut Vec<VectorHit>,
+    ) -> Result<(), EngineError> {
+        let segment = &self.segments[segment_index];
+        if segment.dense_vector_count() == 0 {
+            return Ok(());
+        }
+
+        let hidden_ids = self.hidden_node_ids_before_segment(segment_index, initial_hidden_ids)?;
+        let mut segment_hits = Vec::new();
+        segment.exact_dense_vector_search(
+            query,
+            metric,
+            query_norm,
+            scope_ids,
+            &hidden_ids,
+            |label_ids, updated_at, weight| {
+                node_label_filter_matches(label_filter, &label_ids)
+                    && policy_cutoffs.is_none_or(|cutoffs| {
+                        !cutoffs.excludes_fields(&label_ids, updated_at, weight)
+                    })
+            },
+            &mut segment_hits,
+        )?;
+        for hit in segment_hits {
+            if candidate_ids.insert(hit.node_id) {
+                hits.push(hit);
+            }
+        }
+        Ok(())
     }
 
     fn push_sparse_top_k(
@@ -2360,13 +2510,13 @@ impl ReadView {
         scores: NodeIdMap<f32>,
         hidden_ids: &mut NodeIdSet,
         scope_ids: Option<&NodeIdSet>,
-        type_filter: Option<&[u32]>,
+        label_filter: &ResolvedNodeLabelFilter,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         top_hits: &mut BinaryHeap<SparseTopKEntry>,
         k: usize,
         has_older_segments: bool,
         candidates: &mut Vec<(u64, f32)>,
-        meta_results: &mut Vec<Option<(u32, i64, f32)>>,
+        meta_results: &mut Vec<Option<(NodeLabelSet, i64, f32)>>,
         remaining: &mut Vec<(usize, u64)>,
     ) -> Result<(), EngineError> {
         // Early exit: no scores at all from this segment.
@@ -2425,14 +2575,14 @@ impl ReadView {
 
         segment.get_node_meta_batch(remaining, meta_results)?;
         for (index, &(node_id, score)) in candidates.iter().enumerate() {
-            let Some((type_id, updated_at, weight)) = meta_results[index] else {
+            let Some((label_ids, updated_at, weight)) = meta_results[index] else {
                 continue;
             };
-            if type_filter.is_some_and(|types| !types.contains(&type_id)) {
+            if !node_label_filter_matches(label_filter, &label_ids) {
                 continue;
             }
             if policy_cutoffs
-                .is_some_and(|cutoffs| cutoffs.excludes_fields(type_id, updated_at, weight))
+                .is_some_and(|cutoffs| cutoffs.excludes_fields(&label_ids, updated_at, weight))
             {
                 continue;
             }
@@ -2445,10 +2595,54 @@ impl ReadView {
         Ok(())
     }
 
+    fn hide_segment_nodes_for_older_segments(
+        segment: &SegmentReader,
+        hidden_ids: &mut NodeIdSet,
+    ) -> Result<(), EngineError> {
+        hidden_ids.extend(segment.deleted_node_id_iter());
+        hidden_ids.extend(segment.node_ids()?.iter().copied());
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sparse_reduce_exact_segment_scores(
+        segment: &SegmentReader,
+        query: &[(u32, f32)],
+        hidden_ids: &mut NodeIdSet,
+        scope_ids: Option<&NodeIdSet>,
+        label_filter: &ResolvedNodeLabelFilter,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        top_hits: &mut BinaryHeap<SparseTopKEntry>,
+        k: usize,
+        has_older_segments: bool,
+        exact_hits: &mut Vec<(u64, f32)>,
+    ) -> Result<(), EngineError> {
+        exact_hits.clear();
+        segment.exact_sparse_vector_scores(
+            query,
+            scope_ids,
+            hidden_ids,
+            |label_ids, updated_at, weight| {
+                node_label_filter_matches(label_filter, &label_ids)
+                    && policy_cutoffs.is_none_or(|cutoffs| {
+                        !cutoffs.excludes_fields(&label_ids, updated_at, weight)
+                    })
+            },
+            exact_hits,
+        )?;
+        for &(node_id, score) in exact_hits.iter() {
+            Self::push_sparse_top_k(top_hits, k, node_id, score);
+        }
+        if has_older_segments {
+            Self::hide_segment_nodes_for_older_segments(segment, hidden_ids)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // Dense tail scan needs all context inline for hot-path efficiency
     fn exact_dense_tail_candidates(
         &self,
-        segments: &[(&SegmentReader, usize)],
+        segments: &[(usize, &SegmentReader, usize)],
         exhausted: &[bool],
         query: &[f32],
         metric: DenseMetric,
@@ -2460,7 +2654,7 @@ impl ReadView {
             .iter()
             .zip(exhausted.iter())
             .filter(|(_, ex)| !**ex)
-            .map(|((seg, _), _)| *seg)
+            .map(|((_, seg, _), _)| *seg)
             .collect();
 
         if work_items.is_empty() {
@@ -2534,18 +2728,28 @@ impl ReadView {
 
     /// Resolve a `VectorSearchScope` into a set of reachable node IDs using
     /// the existing traversal substrate. The start node (depth 0) is included.
-    fn resolve_scope_ids(&self, scope: &VectorSearchScope) -> Result<NodeIdSet, EngineError> {
+    fn resolve_scope_ids(&self, scope: &ResolvedVectorSearchScope) -> Result<NodeIdSet, EngineError> {
         let traverse_opts = TraverseOptions {
             min_depth: 0,
             direction: scope.direction,
-            edge_type_filter: scope.edge_type_filter.clone(),
-            node_type_filter: None,
+            edge_label_filter: None,
+            emit_node_label_filter: None,
             at_epoch: scope.at_epoch,
             decay_lambda: None,
             limit: None,
             cursor: None,
         };
-        let result = self.traverse(scope.start_node_id, scope.max_depth, &traverse_opts)?;
+        let result = if scope.edge_label_filter.is_none() {
+            self.traverse(scope.start_node_id, scope.max_depth, &traverse_opts)?
+        } else {
+            self.traverse_resolved(
+                scope.start_node_id,
+                scope.max_depth,
+                &traverse_opts,
+                scope.edge_label_filter.as_deref(),
+                &ResolvedNodeLabelFilter::Unconstrained,
+            )?
+        };
         let mut ids =
             NodeIdSet::with_capacity_and_hasher(result.items.len(), NodeIdBuildHasher::default());
         for hit in &result.items {
@@ -2556,7 +2760,7 @@ impl ReadView {
 
     fn vector_search_dense(
         &self,
-        request: &VectorSearchRequest,
+        request: &ResolvedVectorSearchRequest<'_>,
     ) -> Result<Vec<VectorHit>, EngineError> {
         let scope_ids = match &request.scope {
             Some(scope) => Some(self.resolve_scope_ids(scope)?),
@@ -2567,11 +2771,11 @@ impl ReadView {
 
     fn vector_search_dense_with_scope(
         &self,
-        request: &VectorSearchRequest,
+        request: &ResolvedVectorSearchRequest<'_>,
         k: usize,
         scope_ids: Option<&NodeIdSet>,
     ) -> Result<Vec<VectorHit>, EngineError> {
-        let Some(query) = request.dense_query.as_ref() else {
+        let Some(query) = request.dense_query else {
             return Err(EngineError::InvalidOperation(
                 "vector_search(mode=\"dense\") requires dense_query".into(),
             ));
@@ -2593,16 +2797,17 @@ impl ReadView {
             }
         }
 
-        let type_filter = request.type_filter.as_deref();
+        let label_filter = &request.label_filter;
         let policy_cutoffs = self.query_policy_cutoffs();
 
-        let searchable_segments: Vec<(&SegmentReader, usize)> = self
+        let searchable_segments: Vec<(usize, &SegmentReader, usize)> = self
             .segments
             .iter()
-            .filter_map(|segment| {
+            .enumerate()
+            .filter_map(|(segment_index, segment)| {
                 segment
                     .dense_hnsw_header()
-                    .map(|header| (segment.as_ref(), header.point_count as usize))
+                    .map(|header| (segment_index, segment.as_ref(), header.point_count as usize))
             })
             .collect();
 
@@ -2628,16 +2833,19 @@ impl ReadView {
                         ControlFlow::Continue(())
                     });
             }
-            let total_dense_points: usize =
-                searchable_segments.iter().map(|(_, pc)| *pc).sum::<usize>()
-                    + active_dense_points
-                    + immutable_dense_points;
+            let total_dense_points: usize = self
+                .segments
+                .iter()
+                .map(|segment| segment.dense_vector_count())
+                .sum::<usize>()
+                + active_dense_points
+                + immutable_dense_points;
             if scope.len() <= total_dense_points / 20 || scope.len() <= 2048 {
                 let mut hits = self.score_dense_candidate_ids(
                     scope,
                     query,
                     config.metric,
-                    type_filter,
+                    label_filter,
                     policy_cutoffs.as_ref(),
                 )?;
                 hits.truncate(k);
@@ -2650,12 +2858,16 @@ impl ReadView {
         let mut active_node_ids =
             NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
         let mut candidate_ids = NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
+        let mut initial_hidden_ids =
+            NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
+        initial_hidden_ids.extend(active_deleted.iter().copied());
         let _ = self
             .memtable
             .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
                 active_node_ids.insert(node.id);
+                initial_hidden_ids.insert(node.id);
                 if node.dense_vector.is_some()
-                    && type_filter.is_none_or(|types| types.contains(&node.type_id))
+                    && node_label_filter_matches(label_filter, &node.label_ids)
                     && scope_ids.is_none_or(|scope| scope.contains(&node.id))
                 {
                     candidate_ids.insert(node.id);
@@ -2666,13 +2878,15 @@ impl ReadView {
         // Note: candidate_ids is a NodeIdSet, so duplicates across immutable memtables
         // are harmless; score_dense_candidate_ids does a proper newest-first lookup.
         for epoch in &self.immutable_epochs {
+            initial_hidden_ids.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
             let _ = epoch
                 .memtable
                 .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
+                    initial_hidden_ids.insert(node.id);
                     if node.dense_vector.is_some()
                         && !active_deleted.contains(&node.id)
                         && !active_node_ids.contains(&node.id)
-                        && type_filter.is_none_or(|types| types.contains(&node.type_id))
+                        && node_label_filter_matches(label_filter, &node.label_ids)
                         && scope_ids.is_none_or(|scope| scope.contains(&node.id))
                     {
                         candidate_ids.insert(node.id);
@@ -2681,17 +2895,48 @@ impl ReadView {
                 });
         }
 
-        if candidate_ids.is_empty() && searchable_segments.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut hits = self.score_dense_candidate_ids(
             &candidate_ids,
             query,
             config.metric,
-            type_filter,
+            label_filter,
             policy_cutoffs.as_ref(),
         )?;
+        let query_norm = crate::dense_hnsw::dense_query_norm(config.metric, query);
+        let mut segment_hidden_ids = initial_hidden_ids.clone();
+        for (segment_index, segment) in self.segments.iter().enumerate() {
+            if segment.dense_vector_count() > 0 && segment.dense_hnsw_header().is_none() {
+                let mut segment_hits = Vec::new();
+                segment.exact_dense_vector_search(
+                    query,
+                    config.metric,
+                    query_norm,
+                    scope_ids,
+                    &segment_hidden_ids,
+                    |label_ids, updated_at, weight| {
+                        node_label_filter_matches(label_filter, &label_ids)
+                            && policy_cutoffs.as_ref().is_none_or(|cutoffs| {
+                                !cutoffs.excludes_fields(&label_ids, updated_at, weight)
+                            })
+                    },
+                    &mut segment_hits,
+                )?;
+                for hit in segment_hits {
+                    if candidate_ids.insert(hit.node_id) {
+                        hits.push(hit);
+                    }
+                }
+            }
+            if segment_index + 1 < self.segments.len() {
+                Self::hide_segment_nodes_for_older_segments(segment, &mut segment_hidden_ids)?;
+            }
+        }
+        Self::sort_vector_hits(&mut hits);
+
+        if candidate_ids.is_empty() && searchable_segments.is_empty() {
+            hits.truncate(k);
+            return Ok(hits);
+        }
 
         let mut fetch_limit = request
             .ef_search
@@ -2704,21 +2949,18 @@ impl ReadView {
             let mut segment_exhausted = Vec::with_capacity(searchable_segments.len());
             let mut new_candidate_ids =
                 NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
+            let mut direct_exact_hits_added = false;
 
             // Threshold on total searchable segments (not just non-trivial ones)
             // because the serial path must still push into segment_exhausted for limit==0 entries.
             if searchable_segments.len() <= 1 {
-                for (segment, point_count) in &searchable_segments {
+                for (segment_index, segment, point_count) in &searchable_segments {
                     let limit = fetch_limit.min(*point_count);
                     if limit == 0 {
                         segment_exhausted.push(true);
                         continue;
                     }
                     let is_exhausted = limit >= *point_count;
-                    if !is_exhausted {
-                        exhausted_segments = false;
-                    }
-                    segment_exhausted.push(is_exhausted);
                     let ef_search = request
                         .ef_search
                         .unwrap_or(fetch_limit)
@@ -2726,13 +2968,37 @@ impl ReadView {
                         .min(*point_count);
 
                     let segment_hits = if let Some(scope) = scope_ids {
-                        segment.search_dense_hnsw_scoped(query, ef_search, limit, scope)?
+                        segment.search_dense_hnsw_scoped(query, ef_search, limit, scope)
                     } else {
-                        segment.search_dense_hnsw(query, ef_search, limit)?
+                        segment.search_dense_hnsw(query, ef_search, limit)
                     };
-                    for (node_id, _) in segment_hits {
-                        if candidate_ids.insert(node_id) {
-                            new_candidate_ids.insert(node_id);
+                    match segment_hits {
+                        Ok(segment_hits) => {
+                            if !is_exhausted {
+                                exhausted_segments = false;
+                            }
+                            segment_exhausted.push(is_exhausted);
+                            for (node_id, _) in segment_hits {
+                                if candidate_ids.insert(node_id) {
+                                    new_candidate_ids.insert(node_id);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            segment_exhausted.push(true);
+                            self.score_exact_dense_segment(
+                                *segment_index,
+                                query,
+                                config.metric,
+                                query_norm,
+                                scope_ids,
+                                &initial_hidden_ids,
+                                label_filter,
+                                policy_cutoffs.as_ref(),
+                                &mut candidate_ids,
+                                &mut hits,
+                            )?;
+                            direct_exact_hits_added = true;
                         }
                     }
                 }
@@ -2740,26 +3006,27 @@ impl ReadView {
                 // Multi-segment parallel path: collect per-segment results then reduce.
                 let user_ef = request.ef_search;
                 #[allow(clippy::type_complexity)]
-                let per_segment_results: Vec<
+                let per_segment_results: Vec<(
+                    usize,
                     Result<(Vec<(u64, f32)>, bool), EngineError>,
-                > = crate::parallel::engine_cpu_install(|| {
+                )> = crate::parallel::engine_cpu_install(|| {
                     use rayon::prelude::*;
                     searchable_segments
                         .par_iter()
-                        .map(|(segment, point_count)| {
+                        .map(|(segment_index, segment, point_count)| {
                             let limit = fetch_limit.min(*point_count);
                             if limit == 0 {
-                                return Ok((Vec::new(), true));
+                                return (*segment_index, Ok((Vec::new(), true)));
                             }
                             let is_exhausted = limit >= *point_count;
                             let ef_search =
                                 user_ef.unwrap_or(fetch_limit).max(limit).min(*point_count);
-                            let hits = if let Some(scope) = scope_ids {
-                                segment.search_dense_hnsw_scoped(query, ef_search, limit, scope)?
+                            let result = if let Some(scope) = scope_ids {
+                                segment.search_dense_hnsw_scoped(query, ef_search, limit, scope)
                             } else {
-                                segment.search_dense_hnsw(query, ef_search, limit)?
+                                segment.search_dense_hnsw(query, ef_search, limit)
                             };
-                            Ok((hits, is_exhausted))
+                            (*segment_index, result.map(|hits| (hits, is_exhausted)))
                         })
                         .collect()
                 });
@@ -2767,19 +3034,38 @@ impl ReadView {
                 // Serial reduce: merge per-segment results preserving input order.
                 let total_hits: usize = per_segment_results
                     .iter()
-                    .filter_map(|r| r.as_ref().ok())
+                    .filter_map(|(_, r)| r.as_ref().ok())
                     .map(|(hits, _)| hits.len())
                     .sum();
                 new_candidate_ids.reserve(total_hits);
-                for result in per_segment_results {
-                    let (hits, is_exhausted) = result?;
-                    if !is_exhausted {
-                        exhausted_segments = false;
-                    }
-                    segment_exhausted.push(is_exhausted);
-                    for (node_id, _) in hits {
-                        if candidate_ids.insert(node_id) {
-                            new_candidate_ids.insert(node_id);
+                for (segment_index, result) in per_segment_results {
+                    match result {
+                        Ok((hits, is_exhausted)) => {
+                            if !is_exhausted {
+                                exhausted_segments = false;
+                            }
+                            segment_exhausted.push(is_exhausted);
+                            for (node_id, _) in hits {
+                                if candidate_ids.insert(node_id) {
+                                    new_candidate_ids.insert(node_id);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            segment_exhausted.push(true);
+                            self.score_exact_dense_segment(
+                                segment_index,
+                                query,
+                                config.metric,
+                                query_norm,
+                                scope_ids,
+                                &initial_hidden_ids,
+                                label_filter,
+                                policy_cutoffs.as_ref(),
+                                &mut candidate_ids,
+                                &mut hits,
+                            )?;
+                            direct_exact_hits_added = true;
                         }
                     }
                 }
@@ -2790,9 +3076,11 @@ impl ReadView {
                     &new_candidate_ids,
                     query,
                     config.metric,
-                    type_filter,
+                    label_filter,
                     policy_cutoffs.as_ref(),
                 )?);
+            }
+            if !new_candidate_ids.is_empty() || direct_exact_hits_added {
                 Self::sort_vector_hits(&mut hits);
             }
 
@@ -2812,7 +3100,7 @@ impl ReadView {
                         &tail_candidate_ids,
                         query,
                         config.metric,
-                        type_filter,
+                        label_filter,
                         policy_cutoffs.as_ref(),
                     )?);
                     Self::sort_vector_hits(&mut hits);
@@ -2837,11 +3125,11 @@ impl ReadView {
 
     fn vector_search_sparse_with_scope(
         &self,
-        request: &VectorSearchRequest,
+        request: &ResolvedVectorSearchRequest<'_>,
         k: usize,
         scope_ids: Option<&NodeIdSet>,
     ) -> Result<Vec<VectorHit>, EngineError> {
-        let Some(query) = request.sparse_query.as_ref() else {
+        let Some(query) = request.sparse_query else {
             return Err(EngineError::InvalidOperation(
                 "vector_search(mode=\"sparse\") requires sparse_query".into(),
             ));
@@ -2854,7 +3142,7 @@ impl ReadView {
             return Ok(Vec::new());
         };
 
-        let type_filter = request.type_filter.as_deref();
+        let label_filter = &request.label_filter;
         let policy_cutoffs = self.query_policy_cutoffs();
 
         // Small-scope fast path: score scope nodes directly instead of
@@ -2865,7 +3153,7 @@ impl ReadView {
                     k,
                     &query,
                     scope,
-                    type_filter,
+                    label_filter,
                     policy_cutoffs.as_ref(),
                 );
             }
@@ -2885,7 +3173,7 @@ impl ReadView {
                 if scope_ids.is_some_and(|scope| !scope.contains(&node.id)) {
                     return ControlFlow::Continue(());
                 }
-                if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
+                if !node_label_filter_matches(label_filter, &node.label_ids) {
                     return ControlFlow::Continue(());
                 }
                 if policy_cutoffs
@@ -2913,7 +3201,7 @@ impl ReadView {
                     if scope_ids.is_some_and(|scope| !scope.contains(&node.id)) {
                         return ControlFlow::Continue(());
                     }
-                    if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
+                    if !node_label_filter_matches(label_filter, &node.label_ids) {
                         return ControlFlow::Continue(());
                     }
                     if policy_cutoffs
@@ -2937,39 +3225,71 @@ impl ReadView {
         let sparse_segment_count = self
             .segments
             .iter()
-            .filter(|seg| !seg.raw_sparse_posting_index_mmap().is_empty())
+            .filter(|seg| seg.sparse_postings_available())
             .count();
+        let has_sparse_fallback_segments = self
+            .segments
+            .iter()
+            .any(|seg| seg.sparse_vector_count() > 0 && !seg.sparse_postings_available());
 
         // Reusable buffers for the reduce loop — allocated once, cleared per iteration.
         let mut candidates: Vec<(u64, f32)> = Vec::new();
-        let mut meta_results: Vec<Option<(u32, i64, f32)>> = Vec::new();
+        let mut meta_results: Vec<Option<(NodeLabelSet, i64, f32)>> = Vec::new();
         let mut remaining: Vec<(usize, u64)> = Vec::new();
+        let mut exact_hits: Vec<(u64, f32)> = Vec::new();
 
-        if sparse_segment_count <= 1 {
-            // Single-segment / no-sparse fast path: skip rayon overhead.
+        if sparse_segment_count <= 1 || has_sparse_fallback_segments {
+            // Single-segment / fallback path: keep newest-to-oldest visibility
+            // state local so unavailable or failing postings can exact-scan
+            // their segment from vector source truth.
             for (segment_index, segment) in self.segments.iter().enumerate() {
                 let has_older_segments = segment_index + 1 < self.segments.len();
-                let mut scores = NodeIdMap::default();
-                accumulate_sparse_posting_scores(
-                    segment.raw_sparse_posting_index_mmap(),
-                    segment.raw_sparse_postings_mmap(),
-                    &query,
-                    &mut scores,
-                )?;
-                Self::sparse_reduce_segment_scores(
-                    segment,
-                    scores,
-                    &mut hidden_ids,
-                    scope_ids,
-                    type_filter,
-                    policy_cutoffs.as_ref(),
-                    &mut top_hits,
-                    k,
-                    has_older_segments,
-                    &mut candidates,
-                    &mut meta_results,
-                    &mut remaining,
-                )?;
+                if segment.sparse_postings_available() {
+                    let mut scores = NodeIdMap::default();
+                    match segment.accumulate_sparse_posting_scores(&query, &mut scores) {
+                        Ok(()) => Self::sparse_reduce_segment_scores(
+                            segment,
+                            scores,
+                            &mut hidden_ids,
+                            scope_ids,
+                            label_filter,
+                            policy_cutoffs.as_ref(),
+                            &mut top_hits,
+                            k,
+                            has_older_segments,
+                            &mut candidates,
+                            &mut meta_results,
+                            &mut remaining,
+                        )?,
+                        Err(_) => Self::sparse_reduce_exact_segment_scores(
+                            segment,
+                            &query,
+                            &mut hidden_ids,
+                            scope_ids,
+                            label_filter,
+                            policy_cutoffs.as_ref(),
+                            &mut top_hits,
+                            k,
+                            has_older_segments,
+                            &mut exact_hits,
+                        )?,
+                    }
+                } else if segment.sparse_vector_count() > 0 {
+                    Self::sparse_reduce_exact_segment_scores(
+                        segment,
+                        &query,
+                        &mut hidden_ids,
+                        scope_ids,
+                        label_filter,
+                        policy_cutoffs.as_ref(),
+                        &mut top_hits,
+                        k,
+                        has_older_segments,
+                        &mut exact_hits,
+                    )?;
+                } else if has_older_segments {
+                    Self::hide_segment_nodes_for_older_segments(segment, &mut hidden_ids)?;
+                }
             }
         } else {
             // Multi-segment parallel path: parallel score, serial reduce.
@@ -2984,12 +3304,7 @@ impl ReadView {
                                 cap,
                                 NodeIdBuildHasher::default(),
                             );
-                            accumulate_sparse_posting_scores(
-                                segment.raw_sparse_posting_index_mmap(),
-                                segment.raw_sparse_postings_mmap(),
-                                &query,
-                                &mut scores,
-                            )?;
+                            segment.accumulate_sparse_posting_scores(&query, &mut scores)?;
                             Ok(scores)
                         })
                         .collect()
@@ -3000,21 +3315,34 @@ impl ReadView {
                 self.segments.iter().zip(per_segment_scores).enumerate()
             {
                 let has_older_segments = segment_index + 1 < self.segments.len();
-                let scores = scores_result?;
-                Self::sparse_reduce_segment_scores(
-                    segment,
-                    scores,
-                    &mut hidden_ids,
-                    scope_ids,
-                    type_filter,
-                    policy_cutoffs.as_ref(),
-                    &mut top_hits,
-                    k,
-                    has_older_segments,
-                    &mut candidates,
-                    &mut meta_results,
-                    &mut remaining,
-                )?;
+                match scores_result {
+                    Ok(scores) => Self::sparse_reduce_segment_scores(
+                        segment,
+                        scores,
+                        &mut hidden_ids,
+                        scope_ids,
+                        label_filter,
+                        policy_cutoffs.as_ref(),
+                        &mut top_hits,
+                        k,
+                        has_older_segments,
+                        &mut candidates,
+                        &mut meta_results,
+                        &mut remaining,
+                    )?,
+                    Err(_) => Self::sparse_reduce_exact_segment_scores(
+                        segment,
+                        &query,
+                        &mut hidden_ids,
+                        scope_ids,
+                        label_filter,
+                        policy_cutoffs.as_ref(),
+                        &mut top_hits,
+                        k,
+                        has_older_segments,
+                        &mut exact_hits,
+                    )?,
+                }
             }
         }
 
@@ -3028,7 +3356,7 @@ impl ReadView {
         k: usize,
         query: &[(u32, f32)],
         scope_ids: &NodeIdSet,
-        type_filter: Option<&[u32]>,
+        label_filter: &ResolvedNodeLabelFilter,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<Vec<VectorHit>, EngineError> {
         let mut top_hits = BinaryHeap::with_capacity(k);
@@ -3044,7 +3372,7 @@ impl ReadView {
             self.snapshot_seq,
             &mut remaining,
             &mut |node_id, node| {
-                if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
+                if !node_label_filter_matches(label_filter, &node.label_ids) {
                     return;
                 }
                 if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
@@ -3070,7 +3398,7 @@ impl ReadView {
                 self.snapshot_seq,
                 &mut next,
                 &mut |node_id, node| {
-                    if type_filter.is_some_and(|types| !types.contains(&node.type_id)) {
+                    if !node_label_filter_matches(label_filter, &node.label_ids) {
                         return;
                     }
                     if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
@@ -3105,10 +3433,10 @@ impl ReadView {
             segment.score_sparse_candidates_sorted(
                 &remaining,
                 query,
-                |type_id, updated_at, weight| {
-                    type_filter.is_none_or(|types| types.contains(&type_id))
+                |label_ids, updated_at, weight| {
+                    node_label_filter_matches(label_filter, &label_ids)
                         && policy_cutoffs.is_none_or(|cutoffs| {
-                            !cutoffs.excludes_fields(type_id, updated_at, weight)
+                            !cutoffs.excludes_fields(&label_ids, updated_at, weight)
                         })
                 },
                 &mut segment_hits,
@@ -3128,7 +3456,7 @@ impl ReadView {
     /// results using the selected fusion mode.
     fn vector_search_hybrid(
         &self,
-        request: &VectorSearchRequest,
+        request: &ResolvedVectorSearchRequest<'_>,
     ) -> Result<Vec<VectorHit>, EngineError> {
         let has_dense = request.dense_query.is_some();
         let has_sparse = request.sparse_query.is_some();
@@ -3202,6 +3530,99 @@ impl ReadView {
         Ok(fused)
     }
 
+    fn validate_vector_search_dense_shape(
+        &self,
+        query: Option<&DenseVector>,
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<(), EngineError> {
+        let Some(query) = query else {
+            return Err(EngineError::InvalidOperation(
+                "vector_search(mode=\"dense\") requires dense_query".into(),
+            ));
+        };
+        if k == 0 {
+            return Ok(());
+        }
+
+        let Some(config) = self.manifest.dense_vector.as_ref() else {
+            return Ok(());
+        };
+        validate_dense_vector(query, config)?;
+
+        if ef_search == Some(0) {
+            return Err(EngineError::InvalidOperation(
+                "vector_search ef_search must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_vector_search_sparse_shape(
+        &self,
+        query: Option<&SparseVector>,
+        k: usize,
+    ) -> Result<(), EngineError> {
+        let Some(query) = query else {
+            return Err(EngineError::InvalidOperation(
+                "vector_search(mode=\"sparse\") requires sparse_query".into(),
+            ));
+        };
+        if k == 0 {
+            return Ok(());
+        }
+        let _ = canonicalize_sparse_vector(query)?;
+        Ok(())
+    }
+
+    fn validate_vector_search_shape(
+        &self,
+        request: &VectorSearchRequest,
+    ) -> Result<(), EngineError> {
+        match request.mode {
+            VectorSearchMode::Dense => self.validate_vector_search_dense_shape(
+                request.dense_query.as_ref(),
+                request.k,
+                request.ef_search,
+            ),
+            VectorSearchMode::Sparse => {
+                self.validate_vector_search_sparse_shape(request.sparse_query.as_ref(), request.k)
+            }
+            VectorSearchMode::Hybrid => {
+                let has_dense = request.dense_query.is_some();
+                let has_sparse = request.sparse_query.is_some();
+
+                if !has_dense && !has_sparse {
+                    return Err(EngineError::InvalidOperation(
+                        "vector_search(mode=\"hybrid\") requires at least one of dense_query or sparse_query".into(),
+                    ));
+                }
+
+                if has_dense && !has_sparse {
+                    return self.validate_vector_search_dense_shape(
+                        request.dense_query.as_ref(),
+                        request.k,
+                        request.ef_search,
+                    );
+                }
+                if has_sparse && !has_dense {
+                    return self
+                        .validate_vector_search_sparse_shape(request.sparse_query.as_ref(), request.k);
+                }
+                if request.k == 0 {
+                    return Ok(());
+                }
+
+                self.validate_vector_search_dense_shape(
+                    request.dense_query.as_ref(),
+                    request.k,
+                    request.ef_search,
+                )?;
+                self.validate_vector_search_sparse_shape(request.sparse_query.as_ref(), request.k)
+            }
+        }
+    }
+
     /// Search node vectors and return scored node IDs.
     ///
     /// Supports `mode="dense"`, `mode="sparse"`, and `mode="hybrid"`.
@@ -3210,58 +3631,146 @@ impl ReadView {
         &self,
         request: &VectorSearchRequest,
     ) -> Result<Vec<VectorHit>, EngineError> {
-        match request.mode {
-            VectorSearchMode::Dense => self.vector_search_dense(request),
+        let label_filter = self
+            .label_catalog
+            .resolve_node_label_filter_request(request.label_filter.as_ref())?;
+        let scope = request
+            .scope
+            .as_ref()
+            .map(|scope| {
+                let edge_label_filter = match self
+                    .label_catalog
+                    .resolve_edge_label_filter_for_read(scope.edge_label_filter.as_deref())?
+                {
+                    LabelFilterResolution::Unconstrained => None,
+                    LabelFilterResolution::Known(label_ids) => Some(label_ids),
+                    LabelFilterResolution::EmptyConstraint => Some(Vec::new()),
+                };
+                Ok::<ResolvedVectorSearchScope, EngineError>(ResolvedVectorSearchScope {
+                    start_node_id: scope.start_node_id,
+                    max_depth: scope.max_depth,
+                    direction: scope.direction,
+                    edge_label_filter,
+                    at_epoch: scope.at_epoch,
+                })
+            })
+            .transpose()?;
+        if label_filter.is_empty_constraint() {
+            self.validate_vector_search_shape(request)?;
+            return Ok(Vec::new());
+        };
+        let resolved = ResolvedVectorSearchRequest {
+            mode: request.mode,
+            dense_query: request.dense_query.as_ref(),
+            sparse_query: request.sparse_query.as_ref(),
+            k: request.k,
+            label_filter,
+            ef_search: request.ef_search,
+            scope,
+            dense_weight: request.dense_weight,
+            sparse_weight: request.sparse_weight,
+            fusion_mode: request.fusion_mode,
+        };
+
+        match resolved.mode {
+            VectorSearchMode::Dense => self.vector_search_dense(&resolved),
             VectorSearchMode::Sparse => {
-                let scope_ids = match &request.scope {
+                let scope_ids = match &resolved.scope {
                     Some(scope) => Some(self.resolve_scope_ids(scope)?),
                     None => None,
                 };
-                self.vector_search_sparse_with_scope(request, request.k, scope_ids.as_ref())
+                self.vector_search_sparse_with_scope(&resolved, resolved.k, scope_ids.as_ref())
             }
-            VectorSearchMode::Hybrid => self.vector_search_hybrid(request),
+            VectorSearchMode::Hybrid => self.vector_search_hybrid(&resolved),
         }
     }
 
     // --- Secondary index queries ---
 
-    /// Return all live node IDs with the given type_id (raw, unfiltered).
-    /// Used internally by collect_prune_targets.
-    fn nodes_by_type_raw(&self, type_id: u32) -> Result<Vec<u64>, EngineError> {
-        let deleted = self.sources().collect_deleted_nodes();
+    fn filter_node_ids_by_current_label(
+        &self,
+        mut ids: Vec<u64>,
+        label_id: u32,
+    ) -> Result<Vec<u64>, EngineError> {
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        if self.immutable_epochs.is_empty() && self.segments.is_empty() {
+            return Ok(ids);
+        }
 
-        let mut seen = NodeIdSet::default();
-        let mut results = Vec::new();
-
-        for id in self.memtable.visible_nodes_by_type(type_id, self.snapshot_seq) {
-            if !deleted.contains(&id) && seen.insert(id) {
-                results.push(id);
+        let visibility = self.sources().find_node_visibility_meta(&ids)?;
+        let mut filtered = Vec::with_capacity(ids.len());
+        for (node_id, state) in ids.into_iter().zip(visibility.into_iter()) {
+            if matches!(
+                state,
+                NodeVisibilityState::Live(meta) if meta.label_ids.contains(label_id)
+            ) {
+                filtered.push(node_id);
             }
+        }
+        Ok(filtered)
+    }
+
+    fn filter_node_ids_by_current_label_and_time(
+        &self,
+        mut ids: Vec<u64>,
+        label_id: u32,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<u64>, EngineError> {
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+
+        let visibility = self.sources().find_node_visibility_meta(&ids)?;
+        let mut filtered = Vec::with_capacity(ids.len());
+        for (node_id, state) in ids.into_iter().zip(visibility.into_iter()) {
+            if matches!(
+                state,
+                NodeVisibilityState::Live(meta)
+                    if meta.label_ids.contains(label_id)
+                        && meta.updated_at >= from_ms
+                        && meta.updated_at <= to_ms
+            ) {
+                filtered.push(node_id);
+            }
+        }
+        Ok(filtered)
+    }
+
+    /// Return all live node IDs with the given label_id (raw, unfiltered).
+    /// Used internally by collect_prune_targets.
+    fn nodes_by_label_id_raw(&self, label_id: u32) -> Result<Vec<u64>, EngineError> {
+        let mut candidates = Vec::new();
+
+        for id in self.memtable.visible_nodes_by_label_id(label_id, self.snapshot_seq) {
+            candidates.push(id);
         }
 
         for epoch in &self.immutable_epochs {
-            for id in epoch.memtable.visible_nodes_by_type(type_id, self.snapshot_seq) {
-                if !deleted.contains(&id) && seen.insert(id) {
-                    results.push(id);
-                }
+            for id in epoch.memtable.visible_nodes_by_label_id(label_id, self.snapshot_seq) {
+                candidates.push(id);
             }
         }
 
         for seg in &self.segments {
-            for id in seg.nodes_by_type(type_id)? {
-                if !deleted.contains(&id) && seen.insert(id) {
-                    results.push(id);
-                }
+            for id in seg.nodes_by_label_id(label_id)? {
+                candidates.push(id);
             }
         }
 
-        Ok(results)
+        self.filter_node_ids_by_current_label(candidates, label_id)
     }
 
-    /// Return all live node IDs with the given type_id, merged across
+    /// Return all live node IDs with the given label_id, merged across
     /// memtable and all segments. Excludes tombstoned and policy-excluded nodes.
-    pub fn nodes_by_type(&self, type_id: u32) -> Result<Vec<u64>, EngineError> {
-        let mut results = self.nodes_by_type_raw(type_id)?;
+    pub fn nodes_by_label_id(&self, label_id: u32) -> Result<Vec<u64>, EngineError> {
+        let mut results = self.nodes_by_label_id_raw(label_id)?;
 
         // Policy filtering: batch-fetch nodes and exclude matches.
         let excluded = self.policy_excluded_node_ids(&results)?;
@@ -3272,22 +3781,22 @@ impl ReadView {
         Ok(results)
     }
 
-    /// Return all live edge IDs with the given type_id, merged across
+    /// Return all live edge IDs with the given label_id, merged across
     /// memtable and all segments. Excludes tombstoned edges.
-    pub fn edges_by_type(&self, type_id: u32) -> Result<Vec<u64>, EngineError> {
+    pub fn edges_by_label_id(&self, label_id: u32) -> Result<Vec<u64>, EngineError> {
         let deleted = self.sources().collect_deleted_edges();
 
         let mut seen = NodeIdSet::default();
         let mut results = Vec::new();
 
-        for id in self.memtable.visible_edges_by_type(type_id, self.snapshot_seq) {
+        for id in self.memtable.visible_edges_by_label_id(label_id, self.snapshot_seq) {
             if !deleted.contains(&id) && seen.insert(id) {
                 results.push(id);
             }
         }
 
         for epoch in &self.immutable_epochs {
-            for id in epoch.memtable.visible_edges_by_type(type_id, self.snapshot_seq) {
+            for id in epoch.memtable.visible_edges_by_label_id(label_id, self.snapshot_seq) {
                 if !deleted.contains(&id) && seen.insert(id) {
                     results.push(id);
                 }
@@ -3295,7 +3804,7 @@ impl ReadView {
         }
 
         for seg in &self.segments {
-            for id in seg.edges_by_type(type_id)? {
+            for id in seg.edges_by_label_id(label_id)? {
                 if !deleted.contains(&id) && seen.insert(id) {
                     results.push(id);
                 }
@@ -3305,57 +3814,114 @@ impl ReadView {
         Ok(results)
     }
 
-    /// Return all live node records with the given type_id, hydrated from
+    /// Return all live node records with the given label_id, hydrated from
     /// memtable and segments. Excludes tombstoned and policy-excluded nodes.
     ///
-    /// Uses `nodes_by_type()` for the ID list (already policy-filtered), then
+    /// Uses `nodes_by_label_id()` for the ID list (already policy-filtered), then
     /// `get_nodes_raw()` for batch hydration (one merge-walk per segment,
     /// not N individual lookups). Single policy pass, no redundant filtering.
-    pub fn get_nodes_by_type(&self, type_id: u32) -> Result<Vec<NodeRecord>, EngineError> {
-        let ids = self.nodes_by_type(type_id)?;
+    pub fn get_nodes_by_label_id(&self, label_id: u32) -> Result<Vec<NodeRecord>, EngineError> {
+        let ids = self.nodes_by_label_id(label_id)?;
         let results = self.get_nodes_raw(&ids)?;
         Ok(results.into_iter().flatten().collect())
     }
 
-    /// Return all live edge records with the given type_id, hydrated from
+    /// Return all live edge records with the given label_id, hydrated from
     /// memtable and segments. Excludes tombstoned edges.
     ///
-    /// Uses `edges_by_type()` for the ID list, then `get_edges()` for batch
+    /// Uses `edges_by_label_id()` for the ID list, then `get_edges()` for batch
     /// hydration (one merge-walk per segment, not N individual lookups).
-    pub fn get_edges_by_type(&self, type_id: u32) -> Result<Vec<EdgeRecord>, EngineError> {
-        let ids = self.edges_by_type(type_id)?;
+    pub fn get_edges_by_label_id(&self, label_id: u32) -> Result<Vec<EdgeRecord>, EngineError> {
+        let ids = self.edges_by_label_id(label_id)?;
         let results = self.get_edges(&ids)?;
         Ok(results.into_iter().flatten().collect())
     }
 
-    /// Return the count of live nodes with the given type_id without hydrating
-    /// records. Excludes tombstoned and policy-excluded nodes.
-    pub fn count_nodes_by_type(&self, type_id: u32) -> Result<u64, EngineError> {
-        Ok(self.nodes_by_type(type_id)?.len() as u64)
+    fn count_nodes_by_resolved_label_filter(
+        &self,
+        filter: &ResolvedNodeLabelFilter,
+    ) -> Result<u64, EngineError> {
+        let ResolvedNodeLabelFilter::LabelSet {
+            mode,
+            label_ids,
+            ..
+        } = filter
+        else {
+            return match filter {
+                ResolvedNodeLabelFilter::Empty { .. } => Ok(0),
+                ResolvedNodeLabelFilter::Unconstrained => {
+                    let policy_cutoffs = self.query_policy_cutoffs();
+                    Ok(self
+                        .collect_node_ids_for_resolved_label_filter(
+                            filter,
+                            policy_cutoffs.as_ref(),
+                        )?
+                        .len() as u64)
+                }
+                ResolvedNodeLabelFilter::LabelSet { .. } => unreachable!(),
+            };
+        };
+
+        let scan_labels: Vec<u32> = match mode {
+            LabelMatchMode::Any => label_ids.as_slice().to_vec(),
+            LabelMatchMode::All => {
+                if label_ids.len() == 1 {
+                    label_ids.as_slice().to_vec()
+                } else {
+                    let driver = self
+                        .node_label_filter_estimate(label_ids, LabelMatchMode::All)?
+                        .driver_label_id
+                        .unwrap_or_else(|| label_ids.as_slice()[0]);
+                    vec![driver]
+                }
+            }
+        };
+        let policy_cutoffs = self.query_policy_cutoffs();
+        let mut count = 0u64;
+        self.scan_raw_node_label_candidates(&scan_labels, None, QUERY_VERIFY_CHUNK, |chunk| {
+            #[cfg(test)]
+            self.note_node_visibility_meta_reads(chunk.len());
+            let visibility = self.sources().find_node_visibility_meta(chunk)?;
+            for state in visibility {
+                let NodeVisibilityState::Live(meta) = state else {
+                    continue;
+                };
+                if policy_cutoffs.as_ref().is_some_and(|cutoffs| {
+                    cutoffs.excludes_fields(&meta.label_ids, meta.updated_at, meta.weight)
+                }) {
+                    continue;
+                }
+                if node_label_filter_matches(filter, &meta.label_ids) {
+                    count += 1;
+                }
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(count)
     }
 
-    /// Return the count of live edges with the given type_id without hydrating
+    /// Return the count of live edges with the given label_id without hydrating
     /// records. Excludes tombstoned edges (edges are not subject to prune policies).
-    pub fn count_edges_by_type(&self, type_id: u32) -> Result<u64, EngineError> {
-        Ok(self.edges_by_type(type_id)?.len() as u64)
+    pub fn count_edges_by_label_id(&self, label_id: u32) -> Result<u64, EngineError> {
+        Ok(self.edges_by_label_id(label_id)?.len() as u64)
     }
 
-    // --- Paginated type-index queries ---
+    // --- Paginated label-index queries ---
 
-    /// Paginated version of `nodes_by_type`. Returns a page of node IDs sorted
+    /// Paginated version of `nodes_by_label_id`. Returns a page of node IDs sorted
     /// by ID, with cursor-based pagination. Pass `PageRequest::default()` to get
-    /// all results (equivalent to `nodes_by_type`).
+    /// all results (equivalent to `nodes_by_label_id`).
     ///
     /// Uses K-way merge across already-sorted sources with early termination:
     /// O(cursor_position + limit) instead of O(N log N) when no prune policies
     /// are active. With policies, still saves the sort via merge, then applies
     /// policy filtering and cursor on the sorted result.
-    pub fn nodes_by_type_paged(
+    pub fn nodes_by_label_id_paged(
         &self,
-        type_id: u32,
+        label_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        let unfiltered = self.nodes_by_type_paged_unfiltered(type_id, page)?;
+        let unfiltered = self.nodes_by_single_label_id_paged_unfiltered(label_id, page)?;
         if self.manifest.prune_policies.is_empty() {
             // Fast path: merge with early termination, no policy filtering needed
             Ok(unfiltered)
@@ -3381,7 +3947,8 @@ impl ReadView {
                         limit: Some(chunk_limit),
                         after: cursor,
                     };
-                    let chunk = self.nodes_by_type_paged_unfiltered(type_id, &chunk_page)?;
+                    let chunk =
+                        self.nodes_by_single_label_id_paged_unfiltered(label_id, &chunk_page)?;
                     if chunk.items.is_empty() {
                         return Ok(PageResult {
                             items: collected,
@@ -3414,28 +3981,28 @@ impl ReadView {
         }
     }
 
-    /// Paginated version of `edges_by_type`. Returns a page of edge IDs sorted
+    /// Paginated version of `edges_by_label_id`. Returns a page of edge IDs sorted
     /// by ID, with cursor-based pagination. Uses K-way merge with early
     /// termination (edges are not subject to prune policies).
-    pub fn edges_by_type_paged(
+    pub fn edges_by_label_id_paged(
         &self,
-        type_id: u32,
+        label_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
         let deleted = self.sources().collect_deleted_edges();
 
         // Collect sources
-        let memtable_ids = self.memtable.visible_edges_by_type(type_id, self.snapshot_seq);
+        let memtable_ids = self.memtable.visible_edges_by_label_id(label_id, self.snapshot_seq);
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
         for epoch in &self.immutable_epochs {
-            segment_ids.push(epoch.memtable.visible_edges_by_type(type_id, self.snapshot_seq));
+            segment_ids.push(epoch.memtable.visible_edges_by_label_id(label_id, self.snapshot_seq));
         }
         for seg in &self.segments {
-            segment_ids.push(seg.edges_by_type(type_id)?);
+            segment_ids.push(seg.edges_by_label_id(label_id)?);
         }
 
-        Ok(merge_type_ids_paged(
+        Ok(merge_record_ids_paged(
             memtable_ids,
             segment_ids,
             &deleted,
@@ -3443,16 +4010,16 @@ impl ReadView {
         ))
     }
 
-    /// Paginated version of `get_nodes_by_type`. Returns a page of hydrated node
+    /// Paginated version of `get_nodes_by_label_id`. Returns a page of hydrated node
     /// records. Only hydrates records in the requested page (not all then slice).
     /// In rare cases (data inconsistency), the page may contain fewer items than
     /// `limit` even when `next_cursor` is `Some`.
-    pub fn get_nodes_by_type_paged(
+    pub fn get_nodes_by_label_id_paged(
         &self,
-        type_id: u32,
+        label_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<NodeRecord>, EngineError> {
-        let id_page = self.nodes_by_type_paged(type_id, page)?;
+        let id_page = self.nodes_by_label_id_paged(label_id, page)?;
         let hydrated = self.get_nodes_raw(&id_page.items)?;
         let items: Vec<NodeRecord> = hydrated.into_iter().flatten().collect();
         Ok(PageResult {
@@ -3461,16 +4028,16 @@ impl ReadView {
         })
     }
 
-    /// Paginated version of `get_edges_by_type`. Returns a page of hydrated edge
+    /// Paginated version of `get_edges_by_label_id`. Returns a page of hydrated edge
     /// records. Only hydrates records in the requested page (not all then slice).
     /// In rare cases (data inconsistency), the page may contain fewer items than
     /// `limit` even when `next_cursor` is `Some`.
-    pub fn get_edges_by_type_paged(
+    pub fn get_edges_by_label_id_paged(
         &self,
-        type_id: u32,
+        label_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<EdgeRecord>, EngineError> {
-        let id_page = self.edges_by_type_paged(type_id, page)?;
+        let id_page = self.edges_by_label_id_paged(label_id, page)?;
         let hydrated = self.get_edges(&id_page.items)?;
         let items: Vec<EdgeRecord> = hydrated.into_iter().flatten().collect();
         Ok(PageResult {
@@ -3481,7 +4048,7 @@ impl ReadView {
 
     fn timestamp_candidate_ids(
         &self,
-        type_id: u32,
+        label_id: u32,
         from_ms: i64,
         to_ms: i64,
         max_ids: usize,
@@ -3493,7 +4060,7 @@ impl ReadView {
         let mut ids = Vec::with_capacity(max_ids.min(4096));
         let mut seen = NodeIdSet::default();
         let flow = self.memtable.for_each_visible_node_by_time_range_at(
-            type_id,
+            label_id,
             from_ms,
             to_ms,
             self.snapshot_seq,
@@ -3508,7 +4075,7 @@ impl ReadView {
 
         for epoch in &self.immutable_epochs {
             let flow = epoch.memtable.for_each_visible_node_by_time_range_at(
-                type_id,
+                label_id,
                 from_ms,
                 to_ms,
                 self.snapshot_seq,
@@ -3523,7 +4090,7 @@ impl ReadView {
         }
 
         for seg in &self.segments {
-            let flow = seg.for_each_node_by_time_range(type_id, from_ms, to_ms, |node_id| {
+            let flow = seg.for_each_node_by_time_range(label_id, from_ms, to_ms, |node_id| {
                 push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
             })?;
             if flow.is_break() {
@@ -3532,21 +4099,20 @@ impl ReadView {
             }
         }
 
-        ids.sort_unstable();
-        Ok(ids)
+        self.filter_node_ids_by_current_label_and_time(ids, label_id, from_ms, to_ms)
     }
 
     fn find_nodes_outcome(
         &self,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         prop_value: &PropValue,
     ) -> Result<PropertyQueryOutcome<Vec<u64>>, EngineError> {
         let ready_entry =
-            self.node_property_index_entry(type_id, prop_key, &SecondaryIndexKind::Equality);
+            self.node_property_index_entry(label_id, prop_key, &SecondaryIndexKind::Equality);
         if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
             let (results, followup) =
-                self.find_nodes_ready_equality_index(type_id, entry.index_id, prop_key, prop_value)?;
+                self.find_nodes_ready_equality_index(label_id, entry.index_id, prop_key, prop_value)?;
             if let Some(results) = results
             {
                 Ok(PropertyQueryOutcome {
@@ -3556,14 +4122,14 @@ impl ReadView {
                 })
             } else {
                 Ok(PropertyQueryOutcome {
-                    value: self.find_nodes_scan_fallback(type_id, prop_key, prop_value)?,
+                    value: self.find_nodes_scan_fallback(label_id, prop_key, prop_value)?,
                     route: PropertyQueryRouteKind::EqualityScanFallback,
                     followup,
                 })
             }
         } else {
             Ok(PropertyQueryOutcome {
-                value: self.find_nodes_scan_fallback(type_id, prop_key, prop_value)?,
+                value: self.find_nodes_scan_fallback(label_id, prop_key, prop_value)?,
                 route: PropertyQueryRouteKind::EqualityScanFallback,
                 followup: None,
             })
@@ -3572,16 +4138,16 @@ impl ReadView {
 
     fn find_nodes_paged_outcome(
         &self,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         prop_value: &PropValue,
         page: &PageRequest,
     ) -> Result<PropertyQueryOutcome<PageResult<u64>>, EngineError> {
         let ready_entry =
-            self.node_property_index_entry(type_id, prop_key, &SecondaryIndexKind::Equality);
+            self.node_property_index_entry(label_id, prop_key, &SecondaryIndexKind::Equality);
         if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
             let (result, followup) = self.find_nodes_paged_ready_equality_index(
-                type_id,
+                label_id,
                 entry.index_id,
                 prop_key,
                 prop_value,
@@ -3596,7 +4162,7 @@ impl ReadView {
             } else {
                 Ok(PropertyQueryOutcome {
                     value: self.find_nodes_paged_scan_fallback(
-                        type_id, prop_key, prop_value, page,
+                        label_id, prop_key, prop_value, page,
                     )?,
                     route: PropertyQueryRouteKind::EqualityScanFallback,
                     followup,
@@ -3604,7 +4170,7 @@ impl ReadView {
             }
         } else {
             Ok(PropertyQueryOutcome {
-                value: self.find_nodes_paged_scan_fallback(type_id, prop_key, prop_value, page)?,
+                value: self.find_nodes_paged_scan_fallback(label_id, prop_key, prop_value, page)?,
                 route: PropertyQueryRouteKind::EqualityScanFallback,
                 followup: None,
             })
@@ -3613,7 +4179,7 @@ impl ReadView {
 
     fn find_nodes_range_paged_outcome(
         &self,
-        type_id: u32,
+        label_id: u32,
         prop_key: &str,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
@@ -3621,14 +4187,14 @@ impl ReadView {
     ) -> Result<PropertyQueryOutcome<PropertyRangePageResult<u64>>, EngineError> {
         let domain = Self::validate_property_range_bounds(lower, upper, page.after.as_ref())?;
         let ready_entry = self.node_property_index_entry(
-            type_id,
+            label_id,
             prop_key,
             &SecondaryIndexKind::Range { domain },
         );
         let mut followup = None;
         if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
             let (result, ready_followup) = self.find_nodes_paged_ready_range_index(
-                type_id,
+                label_id,
                 entry.index_id,
                 prop_key,
                 domain,
@@ -3649,7 +4215,7 @@ impl ReadView {
         let value = match page.limit {
             Some(limit) if limit > 0 => {
                 let matches = self.collect_property_range_scan_matches(
-                    type_id,
+                    label_id,
                     prop_key,
                     domain,
                     lower,
@@ -3672,7 +4238,7 @@ impl ReadView {
             }
             _ => {
                 let matches = self.collect_property_range_scan_matches(
-                    type_id,
+                    label_id,
                     prop_key,
                     domain,
                     lower,
@@ -3696,12 +4262,12 @@ impl ReadView {
 
     // --- Timestamp range queries ---
 
-    /// Find node IDs of a given type updated within a time range [from_ms, to_ms] (inclusive).
+    /// Find node IDs of a given label updated within a time range [from_ms, to_ms] (inclusive).
     /// Merges across memtable + segments with deduplication.
     /// Excludes tombstoned and policy-pruned nodes.
     pub fn find_nodes_by_time_range(
         &self,
-        type_id: u32,
+        label_id: u32,
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Vec<u64>, EngineError> {
@@ -3710,7 +4276,7 @@ impl ReadView {
             after: None,
         };
         Ok(self
-            .find_nodes_by_time_range_paged(type_id, from_ms, to_ms, &page)?
+            .find_nodes_by_time_range_paged(label_id, from_ms, to_ms, &page)?
             .items)
     }
 
@@ -3721,29 +4287,27 @@ impl ReadView {
     /// segment, sort results by node_id). O(log N) seek per source + O(results) scan.
     pub fn find_nodes_by_time_range_paged(
         &self,
-        type_id: u32,
+        label_id: u32,
         from_ms: i64,
         to_ms: i64,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
         let deleted = self.sources().collect_deleted_nodes();
-
-        // Collect sources: memtable + immutable memtables + segments
         let memtable_ids =
             self.memtable
-                .visible_nodes_by_time_range(type_id, from_ms, to_ms, self.snapshot_seq);
+                .visible_nodes_by_time_range(label_id, from_ms, to_ms, self.snapshot_seq);
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
         for epoch in &self.immutable_epochs {
             segment_ids.push(epoch.memtable.visible_nodes_by_time_range(
-                type_id,
+                label_id,
                 from_ms,
                 to_ms,
                 self.snapshot_seq,
             ));
         }
         for seg in &self.segments {
-            segment_ids.push(seg.nodes_by_time_range(type_id, from_ms, to_ms)?);
+            segment_ids.push(seg.nodes_by_time_range(label_id, from_ms, to_ms)?);
         }
 
         let limit = page.limit.unwrap_or(0);
@@ -3752,87 +4316,73 @@ impl ReadView {
                 limit: None,
                 after: page.after,
             };
-            let all = merge_type_ids_paged(memtable_ids, segment_ids, &deleted, &all_page);
-            let nodes = self.get_nodes_raw(&all.items)?;
-            let mut items: Vec<u64> = Vec::with_capacity(all.items.len());
-            for (id, node) in all.items.iter().zip(nodes.iter()) {
-                if let Some(n) = node {
-                    if n.updated_at >= from_ms && n.updated_at <= to_ms {
-                        items.push(*id);
-                    }
-                }
-            }
-
+            let merged = merge_record_ids_paged(memtable_ids, segment_ids, &deleted, &all_page);
+            let mut items =
+                self.filter_node_ids_by_current_label_and_time(merged.items, label_id, from_ms, to_ms)?;
             if !self.manifest.prune_policies.is_empty() {
                 let excluded = self.policy_excluded_node_ids(&items)?;
                 if !excluded.is_empty() {
                     items.retain(|id| !excluded.contains(id));
                 }
             }
-
-            Ok(PageResult {
+            return Ok(PageResult {
                 items,
                 next_cursor: None,
-            })
-        } else {
-            let chunk_limit = limit.saturating_mul(4).max(limit);
-            let mut collected = Vec::with_capacity(limit);
-            let mut cursor = page.after;
+            });
+        }
 
-            loop {
-                let chunk_page = PageRequest {
-                    limit: Some(chunk_limit),
-                    after: cursor,
-                };
-                let chunk = merge_type_ids_paged(
-                    memtable_ids.clone(),
-                    segment_ids.clone(),
-                    &deleted,
-                    &chunk_page,
-                );
-                if chunk.items.is_empty() {
-                    return Ok(PageResult {
-                        items: collected,
-                        next_cursor: None,
-                    });
-                }
+        let target = page_verify_target(limit);
+        let chunk_limit = limit
+            .saturating_add(1)
+            .saturating_mul(4)
+            .max(limit.saturating_add(1));
+        let mut collected = Vec::with_capacity(limit);
+        let mut cursor = page.after;
+        loop {
+            let chunk_page = PageRequest {
+                limit: Some(chunk_limit),
+                after: cursor,
+            };
+            let chunk = merge_record_ids_paged(
+                memtable_ids.clone(),
+                segment_ids.clone(),
+                &deleted,
+                &chunk_page,
+            );
+            if chunk.items.is_empty() {
+                return Ok(PageResult {
+                    items: collected,
+                    next_cursor: None,
+                });
+            }
 
-                let nodes = self.get_nodes_raw(&chunk.items)?;
-                let mut visible: NodeIdSet =
-                    NodeIdSet::with_capacity_and_hasher(chunk.items.len(), Default::default());
-                for (id, node) in chunk.items.iter().zip(nodes.iter()) {
-                    if let Some(n) = node {
-                        if n.updated_at >= from_ms && n.updated_at <= to_ms {
-                            visible.insert(*id);
-                        }
+            let visible = self.filter_node_ids_by_current_label_and_time(
+                chunk.items.clone(),
+                label_id,
+                from_ms,
+                to_ms,
+            )?;
+            let excluded = if self.manifest.prune_policies.is_empty() {
+                NodeIdSet::default()
+            } else {
+                self.policy_excluded_node_ids(&visible)?
+            };
+            let visible: NodeIdSet = visible.into_iter().collect();
+            for id in chunk.items.iter().copied() {
+                if visible.contains(&id) && !excluded.contains(&id) {
+                    collected.push(id);
+                    if collected.len() >= target {
+                        return Ok(finish_verified_id_page(collected, limit));
                     }
                 }
+                cursor = Some(id);
+            }
 
-                let excluded = if self.manifest.prune_policies.is_empty() {
-                    NodeIdSet::default()
-                } else {
-                    self.policy_excluded_node_ids(&chunk.items)?
-                };
-
-                for id in chunk.items {
-                    if visible.contains(&id) && !excluded.contains(&id) {
-                        collected.push(id);
-                        if collected.len() >= limit {
-                            return Ok(PageResult {
-                                items: collected,
-                                next_cursor: Some(id),
-                            });
-                        }
-                    }
-                    cursor = Some(id);
-                }
-
-                if chunk.next_cursor.is_none() {
-                    return Ok(PageResult {
-                        items: collected,
-                        next_cursor: None,
-                    });
-                }
+            if chunk.next_cursor.is_none() {
+                return Ok(PageResult {
+                    items: collected,
+                    next_cursor: None,
+                });
             }
         }
     }
@@ -3890,7 +4440,13 @@ impl ReadView {
                 "approx_residual_tolerance must be > 0.0".into(),
             ));
         }
-        let edge_filter = options.edge_type_filter.as_deref();
+        let resolved_edge_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let edge_filter = match resolved_edge_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => Some(Vec::new()),
+        };
 
         // Deduplicate seeds and filter to live nodes only.
         // Without this, deleted/non-existent seeds become dangling nodes
@@ -3918,13 +4474,6 @@ impl ReadView {
         let teleport = (1.0 - damping) / num_seeds;
 
         if options.algorithm == PprAlgorithm::ApproxForwardPush {
-            let batch_opts = NeighborOptions {
-                direction: Direction::Outgoing,
-                type_filter: edge_filter.map(|s| s.to_vec()),
-                limit: None,
-                at_epoch: None,
-                decay_lambda: None,
-            };
             let tolerance = options.approx_residual_tolerance;
             let mut reserve: NodeIdMap<f64> =
                 NodeIdMap::with_capacity_and_hasher(seeds.len() * 16, Default::default());
@@ -3953,7 +4502,13 @@ impl ReadView {
                     .collect();
 
                 if !uncached.is_empty() {
-                    let all_neighbors = self.neighbors_batch(&uncached, &batch_opts)?;
+                    let all_neighbors = self.neighbors_batch_resolved(
+                        &uncached,
+                        Direction::Outgoing,
+                        edge_filter.as_deref(),
+                        None,
+                        None,
+                    )?;
                     for &node_id in &uncached {
                         let raw_neighbors: Vec<(u64, f32)> = all_neighbors
                             .get(&node_id)
@@ -4083,14 +4638,13 @@ impl ReadView {
             NodeIdMap::with_capacity_and_hasher(seeds.len() * 16, Default::default());
 
         while !wave.is_empty() {
-            let batch_opts = NeighborOptions {
-                direction: Direction::Outgoing,
-                type_filter: edge_filter.map(|s| s.to_vec()),
-                limit: None,
-                at_epoch: None,
-                decay_lambda: None,
-            };
-            let all_neighbors = self.neighbors_batch(&wave, &batch_opts)?;
+            let all_neighbors = self.neighbors_batch_resolved(
+                &wave,
+                Direction::Outgoing,
+                edge_filter.as_deref(),
+                None,
+                None,
+            )?;
 
             let mut next_wave: Vec<u64> = Vec::new();
             for &node_id in &wave {
@@ -4221,8 +4775,8 @@ impl ReadView {
 
     /// Export the graph's adjacency structure for external community detection.
     ///
-    /// Returns all live node IDs and edges (from, to, type_id, weight),
-    /// filtered by optional node/edge type filters. Respects tombstones
+    /// Returns all live node IDs, export-local edge-label names, and edges,
+    /// filtered by optional node-label and edge-label filters. Respects tombstones
     /// and prune policies. Each edge is emitted once (outgoing direction only).
     ///
     /// Edges are only included if both endpoints are in the exported node set,
@@ -4231,53 +4785,85 @@ impl ReadView {
         &self,
         options: &ExportOptions,
     ) -> Result<AdjacencyExport, EngineError> {
-        // Collect all node type IDs from memtable + immutable memtables + segments
-        let node_types: Vec<u32> = {
-            let mut types: HashSet<u32> =
-                self.memtable.visible_types(self.snapshot_seq).into_iter().collect();
-            for epoch in &self.immutable_epochs {
-                types.extend(epoch.memtable.visible_types(self.snapshot_seq));
-            }
-            for seg in &self.segments {
-                for tid in seg.node_type_ids()? {
-                    types.insert(tid);
-                }
-            }
-            // Apply node type filter
-            if let Some(ref filter) = options.node_type_filter {
-                let allowed: HashSet<u32> = filter.iter().copied().collect();
-                types.retain(|t| allowed.contains(t));
-            }
-            types.into_iter().collect()
+        let resolved_node_filter =
+            self.resolve_node_label_filter_request_for_graph(options.node_label_filter.as_ref())?;
+        let resolved_edge_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let edge_label_filter = match resolved_edge_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => Some(Vec::new()),
         };
+        if resolved_node_filter.is_empty_constraint() {
+            return Ok(AdjacencyExport {
+                node_ids: Vec::new(),
+                node_labels: Vec::new(),
+                node_label_indexes: Vec::new(),
+                edge_labels: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
 
-        // Collect all live node IDs (policy-filtered)
-        let mut node_set: NodeIdSet = NodeIdSet::default();
-        for &tid in &node_types {
-            for id in self.nodes_by_type(tid)? {
-                node_set.insert(id);
+        let policy_cutoffs = self.query_policy_cutoffs();
+        let node_ids = self.collect_node_ids_for_resolved_label_filter(
+            &resolved_node_filter,
+            policy_cutoffs.as_ref(),
+        )?;
+        let node_set: NodeIdSet = node_ids.iter().copied().collect();
+
+        let node_visibility = self.sources().find_node_visibility_meta(&node_ids)?;
+        let mut node_label_sets = Vec::with_capacity(node_ids.len());
+        let mut node_label_index_by_label_id: BTreeMap<u32, u32> = BTreeMap::new();
+        for (&node_id, state) in node_ids.iter().zip(node_visibility.iter()) {
+            let NodeVisibilityState::Live(meta) = state else {
+                return Err(EngineError::InvalidOperation(format!(
+                    "export node {node_id} is not live in latest visibility metadata"
+                )));
+            };
+            node_label_sets.push(meta.label_ids);
+            for &label_id in meta.label_ids.as_slice() {
+                node_label_index_by_label_id.entry(label_id).or_insert(0);
             }
         }
-        let node_ids: Vec<u64> = {
-            let mut ids: Vec<u64> = node_set.iter().copied().collect();
-            ids.sort_unstable();
-            ids
-        };
 
-        let edge_filter_slice = options.edge_type_filter.as_deref();
+        let mut node_labels = Vec::with_capacity(node_label_index_by_label_id.len());
+        for (&label_id, index_slot) in node_label_index_by_label_id.iter_mut() {
+            let label = self
+                .label_catalog
+                .node_label(label_id)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "export node label side table references missing node label_id {label_id}"
+                    ))
+                })?;
+            *index_slot = node_labels.len() as u32;
+            node_labels.push(label);
+        }
+        let node_label_indexes: Vec<Vec<u32>> = node_label_sets
+            .iter()
+            .map(|label_ids| {
+                label_ids
+                    .as_slice()
+                    .iter()
+                    .map(|label_id| node_label_index_by_label_id[label_id])
+                    .collect()
+            })
+            .collect();
 
         // Batch-fetch all outgoing neighbors in one cursor walk per segment
         // instead of O(N) individual binary searches.
-        let batch_opts = NeighborOptions {
-            direction: Direction::Outgoing,
-            type_filter: edge_filter_slice.map(|s| s.to_vec()),
-            limit: None,
-            at_epoch: None,
-            decay_lambda: None,
-        };
-        let all_neighbors = self.neighbors_batch(&node_ids, &batch_opts)?;
+        let all_neighbors = self.neighbors_batch_resolved(
+            &node_ids,
+            Direction::Outgoing,
+            edge_label_filter.as_deref(),
+            None,
+            None,
+        )?;
 
-        let mut edges: Vec<(u64, u64, u32, f32)> = Vec::new();
+        let mut edge_label_indexes: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut edge_labels: Vec<String> = Vec::new();
+        let mut edges: Vec<ExportEdge> = Vec::new();
         for &from_id in &node_ids {
             if let Some(neighbors) = all_neighbors.get(&from_id) {
                 for entry in neighbors {
@@ -4285,16 +4871,41 @@ impl ReadView {
                     if !node_set.contains(&entry.node_id) {
                         continue;
                     }
-                    let weight = if options.include_weights {
-                        entry.weight
-                    } else {
-                        0.0
+                    let edge_label_index = match edge_label_indexes.get(&entry.edge_label_id) {
+                        Some(index) => *index,
+                        None => {
+                            let label = self
+                                .label_catalog
+                                .edge_label(entry.edge_label_id)
+                                .map(str::to_string)
+                                .ok_or_else(|| {
+                                    EngineError::InvalidOperation(format!(
+                                        "export edge {} references missing edge-label label_id {}",
+                                        entry.edge_id, entry.edge_label_id
+                                    ))
+                                })?;
+                            let index = edge_labels.len() as u32;
+                            edge_labels.push(label);
+                            edge_label_indexes.insert(entry.edge_label_id, index);
+                            index
+                        }
                     };
-                    edges.push((from_id, entry.node_id, entry.edge_type_id, weight));
+                    edges.push(ExportEdge {
+                        from: from_id,
+                        to: entry.node_id,
+                        edge_label_index,
+                        weight: options.include_weights.then_some(entry.weight),
+                    });
                 }
             }
         }
 
-        Ok(AdjacencyExport { node_ids, edges })
+        Ok(AdjacencyExport {
+            node_ids,
+            node_labels,
+            node_label_indexes,
+            edge_labels,
+            edges,
+        })
     }
 }

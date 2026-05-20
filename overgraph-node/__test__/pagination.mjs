@@ -21,89 +21,89 @@ function collectIdPages(db, method, ...args) {
   return allItems;
 }
 
-describe('nodesByTypePaged', () => {
+describe('nodesByLabelsPaged', () => {
   let tmpDir, db;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     // Create 10 nodes of type 1
     for (let i = 0; i < 10; i++) {
-      db.upsertNode(1, `node-${i}`);
+      db.upsertNode('Person', `node-${i}`);
     }
     // 3 nodes of type 2
     for (let i = 0; i < 3; i++) {
-      db.upsertNode(2, `other-${i}`);
+      db.upsertNode('Company', `other-${i}`);
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns first page with correct size', () => {
-    const page = db.nodesByTypePaged(1, 3);
+    const page = db.nodesByLabelsPaged('Person', 3);
     assert.equal(page.items.length, 3);
     assert.ok(page.nextCursor !== null && page.nextCursor !== undefined);
     assert.equal(typeof page.nextCursor, 'number');
   });
 
   it('round-trip pagination collects all items', () => {
-    const all = collectIdPages(db, 'nodesByTypePaged', 1, 3);
+    const all = collectIdPages(db, 'nodesByLabelsPaged', 'Person', 3);
     assert.equal(all.length, 10);
   });
 
   it('no limit returns all', () => {
-    const page = db.nodesByTypePaged(1);
+    const page = db.nodesByLabelsPaged('Person');
     assert.equal(page.items.length, 10);
     assert.equal(page.nextCursor, undefined);
   });
 
   it('empty type returns empty page', () => {
-    const page = db.nodesByTypePaged(999, 5);
+    const page = db.nodesByLabelsPaged('UnusedLabel', 5);
     assert.equal(page.items.length, 0);
     assert.equal(page.nextCursor, undefined);
   });
 });
 
-describe('edgesByTypePaged', () => {
+describe('edgesByLabelPaged', () => {
   let tmpDir, db;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     const nodes = [];
     for (let i = 0; i < 6; i++) {
-      nodes.push(db.upsertNode(1, `n${i}`));
+      nodes.push(db.upsertNode('Person', `n${i}`));
     }
     // 5 edges of type 10
     for (let i = 0; i < 5; i++) {
-      db.upsertEdge(nodes[i], nodes[i + 1], 10);
+      db.upsertEdge(nodes[i], nodes[i + 1], 'WORKS_AT');
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('round-trip pagination', () => {
-    const all = collectIdPages(db, 'edgesByTypePaged', 10, 2);
+    const all = collectIdPages(db, 'edgesByLabelPaged', 'WORKS_AT', 2);
     assert.equal(all.length, 5);
   });
 });
 
-describe('getNodesByTypePaged', () => {
+describe('getNodesByLabelsPaged', () => {
   let tmpDir, db;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     for (let i = 0; i < 8; i++) {
-      db.upsertNode(1, `node-${i}`, { props: { idx: i } });
+      db.upsertNode('Person', `node-${i}`, { props: { idx: i } });
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns hydrated records with pagination', () => {
-    const page = db.getNodesByTypePaged(1, 3);
+    const page = db.getNodesByLabelsPaged('Person', 3);
     assert.equal(page.items.length, 3);
     // Each item should be a full record
     for (const item of page.items) {
       assert.equal(typeof item.id, 'number');
       assert.equal(typeof item.key, 'string');
       assert.ok(item.props !== undefined);
-      assert.equal(item.typeId, 1);
+      assert.ok(item.labels.includes('Person'));
     }
     assert.ok(page.nextCursor != null);
   });
@@ -112,7 +112,7 @@ describe('getNodesByTypePaged', () => {
     const allItems = [];
     let cursor = null;
     for (;;) {
-      const page = db.getNodesByTypePaged(1, 3, cursor);
+      const page = db.getNodesByLabelsPaged('Person', 3, cursor);
       allItems.push(...page.items);
       cursor = page.nextCursor;
       if (cursor == null) break;
@@ -124,25 +124,25 @@ describe('getNodesByTypePaged', () => {
   });
 });
 
-describe('getEdgesByTypePaged', () => {
+describe('getEdgesByLabelPaged', () => {
   let tmpDir, db;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    const n1 = db.upsertNode(1, 'a');
-    const n2 = db.upsertNode(1, 'b');
+    const n1 = db.upsertNode('Person', 'a');
+    const n2 = db.upsertNode('Person', 'b');
     for (let i = 0; i < 6; i++) {
-      db.upsertEdge(n1, n2, 10, { weight: 0.5 + i * 0.1 });
+      db.upsertEdge(n1, n2, 'WORKS_AT', { weight: 0.5 + i * 0.1 });
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('returns hydrated edge records with cursor', () => {
-    const page = db.getEdgesByTypePaged(10, 2);
+    const page = db.getEdgesByLabelPaged('WORKS_AT', 2);
     assert.equal(page.items.length, 2);
     for (const item of page.items) {
       assert.equal(typeof item.id, 'number');
-      assert.equal(item.typeId, 10);
+      assert.equal(item.label, 'WORKS_AT');
     }
     assert.ok(page.nextCursor != null);
   });
@@ -154,9 +154,9 @@ describe('findNodesPaged', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     for (let i = 0; i < 7; i++) {
-      db.upsertNode(1, `node-${i}`, { props: { color: 'red' } });
+      db.upsertNode('Person', `node-${i}`, { props: { color: 'red' } });
     }
-    db.upsertNode(1, 'blue-node', { props: { color: 'blue' } });
+    db.upsertNode('Person', 'blue-node', { props: { color: 'blue' } });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -164,7 +164,7 @@ describe('findNodesPaged', () => {
     const allItems = [];
     let cursor = null;
     for (;;) {
-      const page = db.findNodesPaged(1, 'color', 'red', { limit: 3, after: cursor ?? undefined });
+      const page = db.findNodesPaged('Person', 'color', 'red', { limit: 3, after: cursor ?? undefined });
       for (let i = 0; i < page.items.length; i++) {
         allItems.push(page.items[i]);
       }
@@ -175,7 +175,7 @@ describe('findNodesPaged', () => {
   });
 
   it('no matches returns empty', () => {
-    const page = db.findNodesPaged(1, 'color', 'green', { limit: 10 });
+    const page = db.findNodesPaged('Person', 'color', 'green', { limit: 10 });
     assert.equal(page.items.length, 0);
     assert.equal(page.nextCursor, undefined);
   });
@@ -186,10 +186,10 @@ describe('neighborsPaged', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    center = db.upsertNode(1, 'center');
+    center = db.upsertNode('Person', 'center');
     for (let i = 0; i < 12; i++) {
-      const n = db.upsertNode(1, `n${i}`);
-      db.upsertEdge(center, n, 10);
+      const n = db.upsertNode('Person', `n${i}`);
+      db.upsertEdge(center, n, 'WORKS_AT');
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
@@ -199,7 +199,7 @@ describe('neighborsPaged', () => {
     assert.equal(page.items.length, 4);
     assert.equal(typeof page.items[0].nodeId, 'number');
     assert.equal(typeof page.items[0].edgeId, 'number');
-    assert.equal(typeof page.items[0].edgeTypeId, 'number');
+    assert.equal(typeof page.items[0].label, 'string');
     assert.equal(typeof page.items[0].weight, 'number');
     assert.ok(page.nextCursor != null);
     assert.equal(typeof page.nextCursor, 'number');
@@ -235,13 +235,13 @@ describe('traverse pagination', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     // a -> b1, b2, b3; each bi -> ci1, ci2 (6 2-hop targets)
-    a = db.upsertNode(1, 'a');
+    a = db.upsertNode('Person', 'a');
     for (let i = 0; i < 3; i++) {
-      const b = db.upsertNode(1, `b${i}`);
-      db.upsertEdge(a, b, 10);
+      const b = db.upsertNode('Person', `b${i}`);
+      db.upsertEdge(a, b, 'WORKS_AT');
       for (let j = 0; j < 2; j++) {
-        const c = db.upsertNode(1, `c${i}_${j}`);
-        db.upsertEdge(b, c, 10);
+        const c = db.upsertNode('Person', `c${i}_${j}`);
+        db.upsertEdge(b, c, 'WORKS_AT');
       }
     }
   });
@@ -284,32 +284,36 @@ describe('traverse pagination', () => {
   });
 });
 
-describe('traverse node-type filtering', () => {
+describe('traverse node-label filtering', () => {
   let tmpDir, db, a;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    a = db.upsertNode(1, 'a');
-    const b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 10);
-    // 2-hop targets: 3 of type 2, 2 of type 3
+    a = db.upsertNode('Person', 'a');
+    const b = db.upsertNode('Person', 'b');
+    db.upsertEdge(a, b, 'WORKS_AT');
+    // 2-hop targets: 3 Company nodes, 2 Document nodes
     for (let i = 0; i < 3; i++) {
-      const c = db.upsertNode(2, `c-type2-${i}`);
-      db.upsertEdge(b, c, 10);
+      const c = db.upsertNode('Company', `c-type2-${i}`);
+      db.upsertEdge(b, c, 'WORKS_AT');
     }
     for (let i = 0; i < 2; i++) {
-      const d = db.upsertNode(3, `d-type3-${i}`);
-      db.upsertEdge(b, d, 10);
+      const d = db.upsertNode('Document', `d-type3-${i}`);
+      db.upsertEdge(b, d, 'WORKS_AT');
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('filters by target node type with pagination', () => {
+  it('filters by target node label with pagination', () => {
     const allNodeIds = [];
     let cursor = null;
     for (;;) {
       const page = db.traverse(a, 2, {
-        minDepth: 2, direction: 'outgoing', nodeTypeFilter: [2], limit: 2, cursor: cursor ?? undefined
+        minDepth: 2,
+        direction: 'outgoing',
+        emitNodeLabelFilter: { labels: ['Company'], mode: 'all' },
+        limit: 2,
+        cursor: cursor ?? undefined,
       });
       allNodeIds.push(...page.items.map(hit => hit.nodeId));
       cursor = page.nextCursor ?? null;
@@ -329,26 +333,26 @@ describe('pagination cross-segment', () => {
     });
     // Create nodes in two segments
     for (let i = 0; i < 5; i++) {
-      db.upsertNode(1, `seg1-${i}`);
+      db.upsertNode('Person', `seg1-${i}`);
     }
     db.flush();
     for (let i = 0; i < 5; i++) {
-      db.upsertNode(1, `seg2-${i}`);
+      db.upsertNode('Person', `seg2-${i}`);
     }
     // 5 in memtable, 5 in segment
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('nodesByTypePaged merges across memtable and segment', () => {
-    const all = collectIdPages(db, 'nodesByTypePaged', 1, 3);
+  it('nodesByLabelsPaged merges across memtable and segment', () => {
+    const all = collectIdPages(db, 'nodesByLabelsPaged', 'Person', 3);
     assert.equal(all.length, 10);
   });
 
-  it('getNodesByTypePaged merges across sources', () => {
+  it('getNodesByLabelsPaged merges across sources', () => {
     const allItems = [];
     let cursor = null;
     for (;;) {
-      const page = db.getNodesByTypePaged(1, 4, cursor);
+      const page = db.getNodesByLabelsPaged('Person', 4, cursor);
       allItems.push(...page.items);
       cursor = page.nextCursor ?? null;
       if (cursor === null || cursor === undefined) break;
@@ -365,22 +369,22 @@ describe('pagination async variants', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     for (let i = 0; i < 6; i++) {
-      db.upsertNode(1, `n${i}`, { props: { tag: 'a' } });
+      db.upsertNode('Person', `n${i}`, { props: { tag: 'a' } });
     }
-    const n0 = db.findNodes(1, 'tag', 'a')[0];
-    const n1 = db.findNodes(1, 'tag', 'a')[1];
-    db.upsertEdge(n0, n1, 10);
+    const n0 = db.findNodes('Person', 'tag', 'a')[0];
+    const n1 = db.findNodes('Person', 'tag', 'a')[1];
+    db.upsertEdge(n0, n1, 'WORKS_AT');
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('nodesByTypePagedAsync returns promise', async () => {
-    const page = await db.nodesByTypePagedAsync(1, 2);
+  it('nodesByLabelsPagedAsync returns promise', async () => {
+    const page = await db.nodesByLabelsPagedAsync('Person', 2);
     assert.equal(page.items.length, 2);
     assert.ok(page.nextCursor !== undefined);
   });
 
-  it('getNodesByTypePagedAsync returns hydrated records', async () => {
-    const page = await db.getNodesByTypePagedAsync(1, 3);
+  it('getNodesByLabelsPagedAsync returns hydrated records', async () => {
+    const page = await db.getNodesByLabelsPagedAsync('Person', 3);
     assert.equal(page.items.length, 3);
     for (const item of page.items) {
       assert.equal(typeof item.id, 'number');
@@ -389,31 +393,33 @@ describe('pagination async variants', () => {
   });
 
   it('findNodesPagedAsync works', async () => {
-    const page = await db.findNodesPagedAsync(1, 'tag', 'a', { limit: 4 });
+    const page = await db.findNodesPagedAsync('Person', 'tag', 'a', { limit: 4 });
     assert.equal(page.items.length, 4);
     assert.ok(page.nextCursor !== undefined);
   });
 
-  it('edgesByTypePagedAsync works', async () => {
-    const page = await db.edgesByTypePagedAsync(10, 10);
+  it('edgesByLabelPagedAsync works', async () => {
+    const page = await db.edgesByLabelPagedAsync('WORKS_AT', 10);
     assert.equal(page.items.length, 1);
     assert.equal(page.nextCursor, undefined);
   });
 
   it('neighborsPagedAsync returns array result', async () => {
-    const page = await db.neighborsPagedAsync(db.findNodes(1, 'tag', 'a')[0], { direction: 'outgoing', limit: 10 });
+    const page = await db.neighborsPagedAsync(db.findNodes('Person', 'tag', 'a')[0], { direction: 'outgoing', limit: 10 });
     assert.equal(typeof page.items.length, 'number');
     assert.equal(page.nextCursor, null);
   });
 
   it('traverseAsync paginates exact-depth traversal hits', async () => {
-    const page = await db.traverseAsync(db.findNodes(1, 'tag', 'a')[0], 2, { direction: 'outgoing', limit: 10 });
+    const page = await db.traverseAsync(db.findNodes('Person', 'tag', 'a')[0], 2, { direction: 'outgoing', limit: 10 });
     assert.equal(typeof page.items.length, 'number');
   });
 
-  it('traverseAsync accepts node type filters and traversal cursor args', async () => {
-    const page = await db.traverseAsync(db.findNodes(1, 'tag', 'a')[0], 2, {
-      direction: 'outgoing', nodeTypeFilter: [1], limit: 10
+  it('traverseAsync accepts node label filters and traversal cursor args', async () => {
+    const page = await db.traverseAsync(db.findNodes('Person', 'tag', 'a')[0], 2, {
+      direction: 'outgoing',
+      emitNodeLabelFilter: { labels: ['Person'], mode: 'all' },
+      limit: 10,
     });
     assert.equal(typeof page.items.length, 'number');
   });
@@ -425,13 +431,13 @@ describe('pagination single-item pages', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     for (let i = 0; i < 4; i++) {
-      db.upsertNode(1, `n${i}`);
+      db.upsertNode('Person', `n${i}`);
     }
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('page size 1 yields one item per page', () => {
-    const all = collectIdPages(db, 'nodesByTypePaged', 1, 1);
+    const all = collectIdPages(db, 'nodesByLabelsPaged', 'Person', 1);
     assert.equal(all.length, 4);
   });
 });
@@ -441,20 +447,20 @@ describe('pagination cursor at end', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-page-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
-    db.upsertNode(1, 'only');
+    db.upsertNode('Person', 'only');
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('cursor past all IDs returns empty page', () => {
     // Get the one item, then use its cursor
-    const p1 = db.nodesByTypePaged(1, 1);
+    const p1 = db.nodesByLabelsPaged('Person', 1);
     assert.equal(p1.items.length, 1);
     // nextCursor should be undefined since there's only one item
     assert.equal(p1.nextCursor, undefined);
   });
 
   it('large cursor returns empty', () => {
-    const page = db.nodesByTypePaged(1, 10, 9999999999999);
+    const page = db.nodesByLabelsPaged('Person', 10, 9999999999999);
     assert.equal(page.items.length, 0);
     assert.equal(page.nextCursor, undefined);
   });
@@ -467,7 +473,7 @@ describe('pagination with deletions', () => {
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     const ids = [];
     for (let i = 0; i < 5; i++) {
-      ids.push(db.upsertNode(1, `n${i}`));
+      ids.push(db.upsertNode('Person', `n${i}`));
     }
     // Delete node at index 2
     db.deleteNode(ids[2]);
@@ -475,7 +481,7 @@ describe('pagination with deletions', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('deleted nodes excluded from paginated results', () => {
-    const all = collectIdPages(db, 'nodesByTypePaged', 1, 2);
+    const all = collectIdPages(db, 'nodesByLabelsPaged', 'Person', 2);
     assert.equal(all.length, 4); // 5 - 1 deleted
   });
 });

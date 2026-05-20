@@ -1,8 +1,12 @@
 use crate::error::EngineError;
 use crate::types::NodeIdMap;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs::File;
-use std::io::{BufWriter, Write};
+#[cfg(test)]
+use std::io::BufWriter;
+use std::io::Write;
+#[cfg(test)]
 use std::path::Path;
 
 pub const SPARSE_POSTING_INDEX_FILENAME: &str = "sparse_posting_index.dat";
@@ -56,6 +60,35 @@ fn read_u64_at(data: &[u8], offset: usize) -> Result<u64, EngineError> {
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }
 
+fn sparse_posting_index_count(index_data: &[u8]) -> Result<usize, EngineError> {
+    if index_data.len() < 8 {
+        return Err(EngineError::CorruptRecord(format!(
+            "sparse posting index too short: {} bytes",
+            index_data.len()
+        )));
+    }
+
+    let count = usize::try_from(read_u64_at(index_data, 0)?).map_err(|_| {
+        EngineError::CorruptRecord("sparse posting index count exceeds addressable memory".into())
+    })?;
+    let index_bytes = count
+        .checked_mul(SPARSE_POSTING_INDEX_ENTRY_SIZE)
+        .ok_or_else(|| EngineError::CorruptRecord("sparse posting index size overflow".into()))?;
+    let expected_len = 8usize
+        .checked_add(index_bytes)
+        .ok_or_else(|| EngineError::CorruptRecord("sparse posting index size overflow".into()))?;
+    if index_data.len() != expected_len {
+        return Err(EngineError::CorruptRecord(format!(
+            "sparse posting index size {} does not match expected {}",
+            index_data.len(),
+            expected_len
+        )));
+    }
+
+    Ok(count)
+}
+
+#[cfg(test)]
 fn read_f32_at(data: &[u8], offset: usize) -> Result<f32, EngineError> {
     let end = offset
         .checked_add(4)
@@ -193,6 +226,7 @@ fn find_dimension(
     Ok(None)
 }
 
+#[cfg(test)]
 pub(crate) fn write_sparse_posting_files(
     seg_dir: &Path,
     groups: &BTreeMap<u32, Vec<(u64, f32)>>,
@@ -206,7 +240,25 @@ pub(crate) fn write_sparse_posting_files(
     let mut index_w = BufWriter::new(index_file);
     let mut postings_w = BufWriter::new(postings_file);
 
-    write_u64(&mut index_w, groups.len() as u64)?;
+    write_sparse_posting_files_to_writers(&mut index_w, &mut postings_w, groups)?;
+
+    index_w.flush()?;
+    index_w.get_ref().sync_all()?;
+    postings_w.flush()?;
+    postings_w.get_ref().sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn write_sparse_posting_files_to_writers(
+    index_w: &mut impl Write,
+    postings_w: &mut impl Write,
+    groups: &BTreeMap<u32, Vec<(u64, f32)>>,
+) -> Result<(), EngineError> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    write_u64(index_w, groups.len() as u64)?;
 
     let mut data_offset = 0u64;
     for (&dimension_id, postings) in groups {
@@ -217,9 +269,9 @@ pub(crate) fn write_sparse_posting_files(
             )));
         }
 
-        write_u32(&mut index_w, dimension_id)?;
-        write_u64(&mut index_w, data_offset)?;
-        write_u32(&mut index_w, postings.len() as u32)?;
+        write_u32(index_w, dimension_id)?;
+        write_u64(index_w, data_offset)?;
+        write_u32(index_w, postings.len() as u32)?;
 
         for &(node_id, weight) in postings {
             if !weight.is_finite() {
@@ -234,24 +286,25 @@ pub(crate) fn write_sparse_posting_files(
                     dimension_id, node_id
                 )));
             }
-            write_u64(&mut postings_w, node_id)?;
+            write_u64(postings_w, node_id)?;
             postings_w.write_all(&weight.to_le_bytes())?;
         }
 
-        data_offset = data_offset
-            .checked_add(postings.len() as u64 * SPARSE_POSTING_ENTRY_SIZE as u64)
+        let posting_bytes = u64::try_from(postings.len())
+            .ok()
+            .and_then(|len| len.checked_mul(SPARSE_POSTING_ENTRY_SIZE as u64))
             .ok_or_else(|| {
                 EngineError::CorruptRecord("sparse posting data offset overflow".into())
             })?;
+        data_offset = data_offset.checked_add(posting_bytes).ok_or_else(|| {
+            EngineError::CorruptRecord("sparse posting data offset overflow".into())
+        })?;
     }
 
-    index_w.flush()?;
-    index_w.get_ref().sync_all()?;
-    postings_w.flush()?;
-    postings_w.get_ref().sync_all()?;
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_sparse_posting_files(
     index_data: &[u8],
     postings_data: &[u8],
@@ -282,24 +335,7 @@ pub(crate) fn validate_sparse_posting_files(
             "segment has sparse posting files but no sparse vectors".into(),
         ));
     }
-    if index_data.len() < 8 {
-        return Err(EngineError::CorruptRecord(format!(
-            "sparse posting index too short: {} bytes",
-            index_data.len()
-        )));
-    }
-
-    let count = read_u64_at(index_data, 0)? as usize;
-    let expected_len = 8usize
-        .checked_add(count * SPARSE_POSTING_INDEX_ENTRY_SIZE)
-        .ok_or_else(|| EngineError::CorruptRecord("sparse posting index size overflow".into()))?;
-    if index_data.len() != expected_len {
-        return Err(EngineError::CorruptRecord(format!(
-            "sparse posting index size {} does not match expected {}",
-            index_data.len(),
-            expected_len
-        )));
-    }
+    let count = sparse_posting_index_count(index_data)?;
 
     let mut prev_dimension = None;
     let mut next_offset = 0usize;
@@ -384,6 +420,133 @@ pub(crate) fn validate_sparse_posting_files(
     Ok(())
 }
 
+pub(crate) fn validate_sparse_posting_files_for_open(
+    index_data: &[u8],
+    postings_data: &[u8],
+    sparse_vector_count: usize,
+) -> Result<(), EngineError> {
+    if index_data.is_empty() {
+        if !postings_data.is_empty() {
+            return Err(EngineError::CorruptRecord(
+                "sparse postings data exists without sparse posting index".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if postings_data.is_empty() {
+        return Err(EngineError::CorruptRecord(
+            "sparse posting index exists without sparse postings data".into(),
+        ));
+    }
+    if sparse_vector_count == 0 {
+        return Err(EngineError::CorruptRecord(
+            "segment has sparse posting files but no sparse vectors".into(),
+        ));
+    }
+
+    let count = sparse_posting_index_count(index_data)?;
+    if count == 0 {
+        return Err(EngineError::CorruptRecord(
+            "sparse posting index has zero dimensions".into(),
+        ));
+    }
+    if !postings_data
+        .len()
+        .is_multiple_of(SPARSE_POSTING_ENTRY_SIZE)
+    {
+        return Err(EngineError::CorruptRecord(format!(
+            "sparse postings data length {} is not aligned to posting entry size {}",
+            postings_data.len(),
+            SPARSE_POSTING_ENTRY_SIZE
+        )));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_sparse_posting_index_shape_for_search(
+    index_data: &[u8],
+    postings_data: &[u8],
+) -> Result<(), EngineError> {
+    if index_data.is_empty() {
+        if !postings_data.is_empty() {
+            return Err(EngineError::CorruptRecord(
+                "sparse postings data exists without sparse posting index".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if postings_data.is_empty() {
+        return Err(EngineError::CorruptRecord(
+            "sparse posting index exists without sparse postings data".into(),
+        ));
+    }
+
+    let count = sparse_posting_index_count(index_data)?;
+    let mut prev_dimension = None;
+    let mut next_offset = 0usize;
+    for entry_index in 0..count {
+        let base = 8 + entry_index * SPARSE_POSTING_INDEX_ENTRY_SIZE;
+        let dimension_id = read_u32_at(index_data, base)?;
+        let offset = usize::try_from(read_u64_at(index_data, base + 4)?).map_err(|_| {
+            EngineError::CorruptRecord(format!(
+                "sparse posting dimension {} offset exceeds addressable memory",
+                dimension_id
+            ))
+        })?;
+        let posting_count = read_u32_at(index_data, base + 12)? as usize;
+        if posting_count == 0 {
+            return Err(EngineError::CorruptRecord(format!(
+                "sparse posting dimension {} has zero posting count",
+                dimension_id
+            )));
+        }
+        if prev_dimension.is_some_and(|prev| prev >= dimension_id) {
+            return Err(EngineError::CorruptRecord(format!(
+                "sparse posting dimensions are not strictly increasing at {}",
+                dimension_id
+            )));
+        }
+        if offset != next_offset {
+            return Err(EngineError::CorruptRecord(format!(
+                "sparse posting dimension {} offset {} does not match expected {}",
+                dimension_id, offset, next_offset
+            )));
+        }
+
+        let postings_len = posting_count
+            .checked_mul(SPARSE_POSTING_ENTRY_SIZE)
+            .ok_or_else(|| EngineError::CorruptRecord("sparse posting range overflow".into()))?;
+        let end = offset
+            .checked_add(postings_len)
+            .ok_or_else(|| EngineError::CorruptRecord("sparse posting end overflow".into()))?;
+        if end > postings_data.len() {
+            return Err(EngineError::CorruptRecord(format!(
+                "sparse posting dimension {} range [{}, {}) exceeds data length {}",
+                dimension_id,
+                offset,
+                end,
+                postings_data.len()
+            )));
+        }
+
+        prev_dimension = Some(dimension_id);
+        next_offset = end;
+    }
+
+    if next_offset != postings_data.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "sparse postings data has trailing or unreferenced bytes: expected {}, got {}",
+            next_offset,
+            postings_data.len()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn read_sparse_posting_groups(
     index_data: &[u8],
     postings_data: &[u8],
@@ -439,6 +602,7 @@ pub(crate) fn accumulate_sparse_posting_scores(
                     let posting_bytes =
                         sparse_posting_bytes(postings_data, offset, posting_count as usize)?;
                     let mut cursor = posting_bytes.as_ptr();
+                    let mut prev_node_id = None;
                     for _ in 0..posting_count as usize {
                         let (node_id, weight) = unsafe {
                             let node_id =
@@ -447,6 +611,8 @@ pub(crate) fn accumulate_sparse_posting_scores(
                                 u32::from_le(std::ptr::read_unaligned(cursor.add(8) as *const u32));
                             (node_id, f32::from_bits(weight_bits))
                         };
+                        validate_sparse_posting_entry(dimension_id, node_id, weight, prev_node_id)?;
+                        prev_node_id = Some(node_id);
                         *scores.entry(node_id).or_insert(0.0) += query_weight * weight;
                         cursor = unsafe { cursor.add(SPARSE_POSTING_ENTRY_SIZE) };
                     }
@@ -475,6 +641,7 @@ pub(crate) fn accumulate_sparse_posting_scores(
                         let posting_bytes =
                             sparse_posting_bytes(postings_data, offset, posting_count)?;
                         let mut cursor = posting_bytes.as_ptr();
+                        let mut prev_node_id = None;
                         for _ in 0..posting_count {
                             let (node_id, weight) = unsafe {
                                 let node_id =
@@ -484,6 +651,13 @@ pub(crate) fn accumulate_sparse_posting_scores(
                                 ));
                                 (node_id, f32::from_bits(weight_bits))
                             };
+                            validate_sparse_posting_entry(
+                                index_dimension,
+                                node_id,
+                                weight,
+                                prev_node_id,
+                            )?;
+                            prev_node_id = Some(node_id);
                             *scores.entry(node_id).or_insert(0.0) += query_weight * weight;
                             cursor = unsafe { cursor.add(SPARSE_POSTING_ENTRY_SIZE) };
                         }
@@ -493,6 +667,33 @@ pub(crate) fn accumulate_sparse_posting_scores(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_sparse_posting_entry(
+    dimension_id: u32,
+    node_id: u64,
+    weight: f32,
+    prev_node_id: Option<u64>,
+) -> Result<(), EngineError> {
+    if !weight.is_finite() {
+        return Err(EngineError::CorruptRecord(format!(
+            "sparse posting dimension {} node {} has non-finite weight",
+            dimension_id, node_id
+        )));
+    }
+    if weight < 0.0 {
+        return Err(EngineError::CorruptRecord(format!(
+            "sparse posting dimension {} node {} has negative weight",
+            dimension_id, node_id
+        )));
+    }
+    if prev_node_id.is_some_and(|prev| prev >= node_id) {
+        return Err(EngineError::CorruptRecord(format!(
+            "sparse posting dimension {} node IDs are not strictly increasing at {}",
+            dimension_id, node_id
+        )));
     }
     Ok(())
 }
@@ -610,6 +811,23 @@ mod tests {
                 assert!(message.contains("size"));
             }
             other => panic!("expected malformed index length error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_sparse_postings_rejects_index_length_overflow() {
+        let mut index = Vec::new();
+        index.extend_from_slice(&u64::MAX.to_le_bytes());
+        let data = vec![0];
+
+        match validate_sparse_posting_files(&index, &data, 1, true) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("overflow") || message.contains("addressable"));
+            }
+            other => panic!(
+                "expected sparse posting index overflow error, got {:?}",
+                other
+            ),
         }
     }
 

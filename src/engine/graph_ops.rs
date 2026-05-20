@@ -227,6 +227,179 @@ impl UnionFind {
 impl ReadView {
     // --- Degree counts + aggregations (Phase 18a) ---
 
+    fn resolve_edge_label_filter_for_graph(
+        &self,
+        edge_labels: Option<&[String]>,
+    ) -> Result<LabelFilterResolution, EngineError> {
+        self.label_catalog
+            .resolve_edge_label_filter_for_read(edge_labels)
+    }
+
+    fn resolve_node_label_filter_request_for_graph(
+        &self,
+        filter: Option<&NodeLabelFilter>,
+    ) -> Result<ResolvedNodeLabelFilter, EngineError> {
+        self.label_catalog.resolve_node_label_filter_request(filter)
+    }
+
+    fn node_label_filter_is_unconstrained(filter: &ResolvedNodeLabelFilter) -> bool {
+        matches!(filter, ResolvedNodeLabelFilter::Unconstrained)
+    }
+
+    fn filter_node_ids_by_resolved_label_filter(
+        &self,
+        ids: &[u64],
+        filter: &ResolvedNodeLabelFilter,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Result<Vec<u64>, EngineError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if matches!(filter, ResolvedNodeLabelFilter::Empty { .. }) {
+            return Ok(Vec::new());
+        }
+
+        let mut sorted_ids = ids.to_vec();
+        sorted_ids.sort_unstable();
+        sorted_ids.dedup();
+        if Self::node_label_filter_is_unconstrained(filter) && policy_cutoffs.is_none() {
+            return Ok(sorted_ids);
+        }
+
+        let mut filtered = Vec::with_capacity(sorted_ids.len());
+        for chunk in sorted_ids.chunks(QUERY_VERIFY_CHUNK) {
+            #[cfg(test)]
+            self.note_node_visibility_meta_reads(chunk.len());
+            let visibility = self.sources().find_node_visibility_meta(chunk)?;
+            for (&node_id, state) in chunk.iter().zip(visibility.iter()) {
+                let NodeVisibilityState::Live(meta) = state else {
+                    continue;
+                };
+                if policy_cutoffs
+                    .is_some_and(|cutoffs| {
+                        cutoffs.excludes_fields(&meta.label_ids, meta.updated_at, meta.weight)
+                    })
+                {
+                    continue;
+                }
+                if node_label_filter_matches(filter, &meta.label_ids) {
+                    filtered.push(node_id);
+                }
+            }
+        }
+        Ok(filtered)
+    }
+
+    fn collect_unconstrained_node_ids_from_sources(&self) -> Result<Vec<u64>, EngineError> {
+        let mut node_set = IdSet::default();
+        for node_id in self.memtable.visible_node_ids_at(self.snapshot_seq) {
+            node_set.insert(node_id);
+        }
+        for epoch in &self.immutable_epochs {
+            for node_id in epoch.memtable.visible_node_ids_at(self.snapshot_seq) {
+                node_set.insert(node_id);
+            }
+        }
+        for segment in &self.segments {
+            for &node_id in segment.node_ids()? {
+                node_set.insert(node_id);
+            }
+        }
+
+        let mut node_ids: Vec<u64> = node_set.into_iter().collect();
+        node_ids.sort_unstable();
+        Ok(node_ids)
+    }
+
+    fn collect_node_ids_for_resolved_label_filter(
+        &self,
+        filter: &ResolvedNodeLabelFilter,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Result<Vec<u64>, EngineError> {
+        match filter {
+            ResolvedNodeLabelFilter::Empty { .. } => Ok(Vec::new()),
+            ResolvedNodeLabelFilter::Unconstrained => {
+                if policy_cutoffs.is_some() {
+                    let node_ids = self.collect_unconstrained_node_ids_from_sources()?;
+                    return self.filter_node_ids_by_resolved_label_filter(
+                        &node_ids,
+                        filter,
+                        policy_cutoffs,
+                    );
+                }
+
+                let mut label_ids: HashSet<u32> =
+                    self.memtable.visible_node_label_ids(self.snapshot_seq).into_iter().collect();
+                for epoch in &self.immutable_epochs {
+                    label_ids.extend(epoch.memtable.visible_node_label_ids(self.snapshot_seq));
+                }
+                for seg in &self.segments {
+                    for label_id in seg.node_label_ids()? {
+                        label_ids.insert(label_id);
+                    }
+                }
+
+                let mut node_set = IdSet::default();
+                for label_id in label_ids {
+                    for node_id in self.nodes_by_label_id(label_id)? {
+                        node_set.insert(node_id);
+                    }
+                }
+                let mut node_ids: Vec<u64> = node_set.into_iter().collect();
+                node_ids.sort_unstable();
+                Ok(node_ids)
+            }
+            ResolvedNodeLabelFilter::LabelSet {
+                mode,
+                label_ids,
+                ..
+            } => {
+                let scan_labels: Vec<u32> = match mode {
+                    LabelMatchMode::Any => label_ids.as_slice().to_vec(),
+                    LabelMatchMode::All => {
+                        let driver = self
+                            .node_label_filter_estimate(label_ids, LabelMatchMode::All)?
+                            .driver_label_id
+                            .unwrap_or_else(|| label_ids.as_slice()[0]);
+                        vec![driver]
+                    }
+                };
+                let mut node_ids = Vec::new();
+                self.scan_raw_node_label_candidates(
+                    &scan_labels,
+                    None,
+                    QUERY_VERIFY_CHUNK,
+                    |chunk| {
+                        #[cfg(test)]
+                        self.note_node_visibility_meta_reads(chunk.len());
+                        let visibility = self.sources().find_node_visibility_meta(chunk)?;
+                        for (&node_id, state) in chunk.iter().zip(visibility.iter()) {
+                            let NodeVisibilityState::Live(meta) = state else {
+                                continue;
+                            };
+                            if policy_cutoffs
+                                .is_some_and(|cutoffs| {
+                                    cutoffs.excludes_fields(
+                                        &meta.label_ids,
+                                        meta.updated_at,
+                                        meta.weight,
+                                    )
+                                })
+                            {
+                                continue;
+                            }
+                            if node_label_filter_matches(filter, &meta.label_ids) {
+                                node_ids.push(node_id);
+                            }
+                        }
+                        Ok(ControlFlow::Continue(()))
+                    },
+                )?;
+                Ok(node_ids)
+            }
+        }
+    }
+
     pub(crate) fn degree_delta_sum(&self, node_id: u64) -> Option<DegreeDelta> {
         let mut sum = self.active_degree_overlay.get(node_id);
         for epoch in &self.immutable_epochs {
@@ -238,10 +411,12 @@ impl ReadView {
         Some(sum)
     }
 
-    fn degree_fast_path_globally_eligible(&self, options: &DegreeOptions) -> bool {
-        options.type_filter.is_none()
-            && options.at_epoch.is_none()
-            && self.manifest.prune_policies.is_empty()
+    fn degree_fast_path_globally_eligible_resolved(
+        &self,
+        label_filter_ids: Option<&[u32]>,
+        at_epoch: Option<i64>,
+    ) -> bool {
+        label_filter_ids.is_none() && at_epoch.is_none() && self.manifest.prune_policies.is_empty()
     }
 
     fn degree_sidecars_available(&self) -> bool {
@@ -305,13 +480,13 @@ impl ReadView {
     /// segments. Deduplicates by edge_id, skips tombstoned edges/nodes,
     /// applies temporal filtering. No prune policy filtering.
     ///
-    /// Used as the fallback for type-filtered, temporal, or policy-filtered
+    /// Used as the fallback for label-filtered, temporal, or policy-filtered
     /// queries.
     fn degree_stats_raw_walk(
         &self,
         node_id: u64,
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         reference_time: i64,
     ) -> Result<(u64, f64), EngineError> {
         let (deleted_nodes, deleted_edges) = self.collect_tombstones();
@@ -319,7 +494,7 @@ impl ReadView {
         self.degree_stats_raw_walk_inner(
             node_id,
             direction,
-            type_filter,
+            label_filter_ids,
             reference_time,
             &deleted_nodes,
             &deleted_edges,
@@ -334,7 +509,7 @@ impl ReadView {
         &self,
         node_id: u64,
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         reference_time: i64,
         deleted_nodes: &IdSet,
         deleted_edges: &IdSet,
@@ -350,7 +525,7 @@ impl ReadView {
         let _ = self.memtable.for_each_adj_entry_at(
             node_id,
             direction,
-            type_filter,
+            label_filter_ids,
             self.snapshot_seq,
             &mut |edge_id, _neighbor_id, weight, valid_from, valid_to| {
                 seen_edges.insert(edge_id);
@@ -368,7 +543,7 @@ impl ReadView {
             let _ = epoch.memtable.for_each_adj_entry_at(
                 node_id,
                 direction,
-                type_filter,
+                label_filter_ids,
                 self.snapshot_seq,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     if !seen_edges.insert(edge_id) {
@@ -397,7 +572,7 @@ impl ReadView {
             let _ = seg.for_each_adj_posting(
                 node_id,
                 direction,
-                type_filter,
+                label_filter_ids,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     if !seen_edges.insert(edge_id) {
                         return ControlFlow::Continue(());
@@ -429,19 +604,19 @@ impl ReadView {
         &self,
         node_id: u64,
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         reference_time: i64,
     ) -> Result<(u64, f64), EngineError> {
         // No policies → delegate to walk path. Cache acceleration is handled
         // at the public API layer (degree/sum_edge_weights/avg_edge_weight);
         // by the time we reach here, the caller has already determined the
-        // cache cannot be used (type-filtered or temporal query).
+        // cache cannot be used (label-filtered or temporal query).
         if self.manifest.prune_policies.is_empty() {
-            return self.degree_stats_raw_walk(node_id, direction, type_filter, reference_time);
+            return self.degree_stats_raw_walk(node_id, direction, label_filter_ids, reference_time);
         }
 
         // Policy path: track per-neighbor-id stats so we can subtract excluded ones.
-        // This avoids materializing Vec<NeighborEntry> while still respecting policies.
+        // This avoids materializing Vec<NeighborRecord> while still respecting policies.
         let mut neighbor_stats: IdMap<(u64, f64)> = IdMap::default(); // neighbor_id → (count, weight_sum)
         let mut total_count: u64 = 0;
         let mut total_weight: f64 = 0.0;
@@ -465,7 +640,7 @@ impl ReadView {
         let _ = self.memtable.for_each_adj_entry_at(
             node_id,
             direction,
-            type_filter,
+            label_filter_ids,
             self.snapshot_seq,
             &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                 seen_edges.insert(edge_id);
@@ -488,7 +663,7 @@ impl ReadView {
             let _ = epoch.memtable.for_each_adj_entry_at(
                 node_id,
                 direction,
-                type_filter,
+                label_filter_ids,
                 self.snapshot_seq,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     if !seen_edges.insert(edge_id) {
@@ -519,7 +694,7 @@ impl ReadView {
             let _ = seg.for_each_adj_posting(
                 node_id,
                 direction,
-                type_filter,
+                label_filter_ids,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     if !seen_edges.insert(edge_id) {
                         return ControlFlow::Continue(());
@@ -568,7 +743,20 @@ impl ReadView {
         options: &DegreeOptions,
     ) -> Result<DegreeQueryOutcome<u64>, EngineError> {
         let direction = options.direction;
-        if self.degree_fast_path_globally_eligible(options) {
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let label_filter_ids = match resolved_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => {
+                return Ok(DegreeQueryOutcome {
+                    value: 0,
+                    routes: DegreeQueryRouteTally::default(),
+                })
+            }
+        };
+        if self.degree_fast_path_globally_eligible_resolved(label_filter_ids.as_deref(), options.at_epoch)
+        {
             if let Some((count, _)) = self.degree_fast_path_result(node_id, direction) {
                 return Ok(DegreeQueryOutcome {
                     value: count,
@@ -577,9 +765,9 @@ impl ReadView {
             }
         }
 
-        let type_filter = options.type_filter.as_deref();
         let reference_time = options.at_epoch.unwrap_or_else(now_millis);
-        let (count, _) = self.degree_stats(node_id, direction, type_filter, reference_time)?;
+        let (count, _) =
+            self.degree_stats(node_id, direction, label_filter_ids.as_deref(), reference_time)?;
         Ok(DegreeQueryOutcome {
             value: count,
             routes: DegreeQueryRouteTally::walk_path(),
@@ -592,7 +780,20 @@ impl ReadView {
         options: &DegreeOptions,
     ) -> Result<DegreeQueryOutcome<f64>, EngineError> {
         let direction = options.direction;
-        if self.degree_fast_path_globally_eligible(options) {
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let label_filter_ids = match resolved_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => {
+                return Ok(DegreeQueryOutcome {
+                    value: 0.0,
+                    routes: DegreeQueryRouteTally::default(),
+                })
+            }
+        };
+        if self.degree_fast_path_globally_eligible_resolved(label_filter_ids.as_deref(), options.at_epoch)
+        {
             if let Some((_, weight_sum)) = self.degree_fast_path_result(node_id, direction) {
                 return Ok(DegreeQueryOutcome {
                     value: weight_sum,
@@ -601,9 +802,9 @@ impl ReadView {
             }
         }
 
-        let type_filter = options.type_filter.as_deref();
         let reference_time = options.at_epoch.unwrap_or_else(now_millis);
-        let (_, weight_sum) = self.degree_stats(node_id, direction, type_filter, reference_time)?;
+        let (_, weight_sum) =
+            self.degree_stats(node_id, direction, label_filter_ids.as_deref(), reference_time)?;
         Ok(DegreeQueryOutcome {
             value: weight_sum,
             routes: DegreeQueryRouteTally::walk_path(),
@@ -616,7 +817,20 @@ impl ReadView {
         options: &DegreeOptions,
     ) -> Result<DegreeQueryOutcome<Option<f64>>, EngineError> {
         let direction = options.direction;
-        if self.degree_fast_path_globally_eligible(options) {
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let label_filter_ids = match resolved_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => {
+                return Ok(DegreeQueryOutcome {
+                    value: None,
+                    routes: DegreeQueryRouteTally::default(),
+                })
+            }
+        };
+        if self.degree_fast_path_globally_eligible_resolved(label_filter_ids.as_deref(), options.at_epoch)
+        {
             if let Some((count, weight_sum)) = self.degree_fast_path_result(node_id, direction) {
                 return Ok(DegreeQueryOutcome {
                     value: if count == 0 {
@@ -629,10 +843,9 @@ impl ReadView {
             }
         }
 
-        let type_filter = options.type_filter.as_deref();
         let reference_time = options.at_epoch.unwrap_or_else(now_millis);
         let (count, weight_sum) =
-            self.degree_stats(node_id, direction, type_filter, reference_time)?;
+            self.degree_stats(node_id, direction, label_filter_ids.as_deref(), reference_time)?;
         Ok(DegreeQueryOutcome {
             value: if count == 0 {
                 None
@@ -649,7 +862,18 @@ impl ReadView {
         options: &DegreeOptions,
     ) -> Result<DegreeQueryOutcome<NodeIdMap<u64>>, EngineError> {
         let direction = options.direction;
-        let type_filter = options.type_filter.as_deref();
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let label_filter_ids = match resolved_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => {
+                return Ok(DegreeQueryOutcome {
+                    value: NodeIdMap::default(),
+                    routes: DegreeQueryRouteTally::default(),
+                })
+            }
+        };
         if node_ids.is_empty() {
             return Ok(DegreeQueryOutcome {
                 value: NodeIdMap::default(),
@@ -657,7 +881,9 @@ impl ReadView {
             });
         }
 
-        if self.degree_fast_path_globally_eligible(options) && self.degree_sidecars_available() {
+        if self.degree_fast_path_globally_eligible_resolved(label_filter_ids.as_deref(), options.at_epoch)
+            && self.degree_sidecars_available()
+        {
             let sorted_ids: Vec<u64> = {
                 let mut ids = node_ids.to_vec();
                 ids.sort_unstable();
@@ -697,7 +923,8 @@ impl ReadView {
 
         let reference_time = options.at_epoch.unwrap_or_else(now_millis);
         if self.manifest.prune_policies.is_empty() {
-            let value = self.degrees_raw(node_ids, direction, type_filter, reference_time)?;
+            let value =
+                self.degrees_raw(node_ids, direction, label_filter_ids.as_deref(), reference_time)?;
             let mut routes = DegreeQueryRouteTally::default();
             routes.add_walk_paths({
                 let mut ids = node_ids.to_vec();
@@ -707,6 +934,7 @@ impl ReadView {
             });
             return Ok(DegreeQueryOutcome { value, routes });
         }
+        let label_filter_ids = label_filter_ids.as_deref();
 
         // Policy path: single walk tracking both total counts AND per-neighbor
         // counts so we can subtract excluded neighbors after one batch policy check.
@@ -734,7 +962,7 @@ impl ReadView {
             let _ = self.memtable.for_each_adj_entry_at(
                 nid,
                 direction,
-                type_filter,
+                label_filter_ids,
                 self.snapshot_seq,
                 &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                     seen_edges.insert((nid, edge_id));
@@ -760,7 +988,7 @@ impl ReadView {
                 let _ = epoch.memtable.for_each_adj_entry_at(
                     nid,
                     direction,
-                    type_filter,
+                    label_filter_ids,
                     self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((nid, edge_id)) {
@@ -795,7 +1023,7 @@ impl ReadView {
             let _ = seg.for_each_adj_posting_batch(
                 &sorted_ids,
                 direction,
-                type_filter,
+                label_filter_ids,
                 &mut |queried_nid, edge_id, neighbor_id, _weight, valid_from, valid_to| {
                     if !seen_edges.insert((queried_nid, edge_id)) {
                         return ControlFlow::Continue(());
@@ -858,7 +1086,7 @@ impl ReadView {
         &self,
         node_ids: &[u64],
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         reference_time: i64,
     ) -> Result<NodeIdMap<u64>, EngineError> {
         if node_ids.is_empty() {
@@ -888,7 +1116,7 @@ impl ReadView {
             let _ = self.memtable.for_each_adj_entry_at(
                 nid,
                 direction,
-                type_filter,
+                label_filter_ids,
                 self.snapshot_seq,
                 &mut |edge_id, _neighbor_id, _weight, valid_from, valid_to| {
                     seen_edges.insert((nid, edge_id));
@@ -911,7 +1139,7 @@ impl ReadView {
                 let _ = epoch.memtable.for_each_adj_entry_at(
                     nid,
                     direction,
-                    type_filter,
+                    label_filter_ids,
                     self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((nid, edge_id)) {
@@ -942,7 +1170,7 @@ impl ReadView {
             let _ = seg.for_each_adj_posting_batch(
                 &sorted_ids,
                 direction,
-                type_filter,
+                label_filter_ids,
                 &mut |queried_nid, edge_id, neighbor_id, _weight, valid_from, valid_to| {
                     if !seen_edges.insert((queried_nid, edge_id)) {
                         return ControlFlow::Continue(());
@@ -972,7 +1200,7 @@ impl ReadView {
     ///
     /// Algorithm auto-selected from `options.weight_field`:
     /// - `None` → bidirectional BFS (unweighted, hop count)
-    /// - `Some("weight")` → bidirectional Dijkstra reading `NeighborEntry.weight`
+    /// - `Some("weight")` → bidirectional Dijkstra reading `NeighborRecord.weight`
     /// - `Some("<field>")` → bidirectional Dijkstra reading `edge.props[field]` as f64
     ///
     /// Returns `None` if no path exists within the given constraints.
@@ -983,7 +1211,13 @@ impl ReadView {
         options: &ShortestPathOptions,
     ) -> Result<Option<ShortestPath>, EngineError> {
         let direction = options.direction;
-        let edge_type_filter = options.type_filter.as_deref();
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let (edge_label_filter, edge_filter_empty) = match resolved_filter {
+            LabelFilterResolution::Unconstrained => (None, false),
+            LabelFilterResolution::Known(label_ids) => (Some(label_ids), false),
+            LabelFilterResolution::EmptyConstraint => (Some(Vec::new()), true),
+        };
         let weight_field = options.weight_field.as_deref();
         let at_epoch = options.at_epoch;
         let max_depth = options.max_depth;
@@ -1000,6 +1234,9 @@ impl ReadView {
                 total_cost: 0.0,
             }));
         }
+        if edge_filter_empty {
+            return Ok(None);
+        }
         let reference_time = at_epoch.unwrap_or_else(now_millis);
 
         match weight_field {
@@ -1007,7 +1244,7 @@ impl ReadView {
                 from,
                 to,
                 direction,
-                edge_type_filter,
+                edge_label_filter.as_deref(),
                 reference_time,
                 max_depth,
                 policy_cutoffs.as_ref(),
@@ -1016,7 +1253,7 @@ impl ReadView {
                 from,
                 to,
                 direction,
-                edge_type_filter,
+                edge_label_filter.as_deref(),
                 wf,
                 reference_time,
                 max_depth,
@@ -1037,7 +1274,13 @@ impl ReadView {
         options: &IsConnectedOptions,
     ) -> Result<bool, EngineError> {
         let direction = options.direction;
-        let edge_type_filter = options.type_filter.as_deref();
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let (edge_label_filter, edge_filter_empty) = match resolved_filter {
+            LabelFilterResolution::Unconstrained => (None, false),
+            LabelFilterResolution::Known(label_ids) => (Some(label_ids), false),
+            LabelFilterResolution::EmptyConstraint => (Some(Vec::new()), true),
+        };
         let at_epoch = options.at_epoch;
         let max_depth = options.max_depth;
 
@@ -1048,12 +1291,15 @@ impl ReadView {
         if from == to {
             return Ok(true);
         }
+        if edge_filter_empty {
+            return Ok(false);
+        }
         let reference_time = at_epoch.unwrap_or_else(now_millis);
         self.bfs_is_connected(
             from,
             to,
             direction,
-            edge_type_filter,
+            edge_label_filter.as_deref(),
             reference_time,
             max_depth,
             policy_cutoffs.as_ref(),
@@ -1062,7 +1308,7 @@ impl ReadView {
 
     /// Traverse outward from `start` with deterministic BFS ordering.
     ///
-    /// Results are emitted in `(depth ASC, node_id ASC)` order. `node_type_filter`
+    /// Results are emitted in `(depth ASC, node_id ASC)` order. `emit_node_label_filter`
     /// applies only to emitted hits; traversal still expands through visible nodes
     /// that do not match the filter.
     pub fn traverse(
@@ -1072,12 +1318,56 @@ impl ReadView {
         options: &TraverseOptions,
     ) -> Result<TraversalPageResult, EngineError> {
         let min_depth = options.min_depth;
+        let decay_lambda = options.decay_lambda;
+        if min_depth > max_depth {
+            return Err(EngineError::InvalidOperation(
+                "min_depth must be <= max_depth".to_string(),
+            ));
+        }
+        if let Some(lambda) = decay_lambda {
+            if !lambda.is_finite() || lambda < 0.0 {
+                return Err(EngineError::InvalidOperation(
+                    "decay_lambda must be finite and non-negative".to_string(),
+                ));
+            }
+        }
+        let resolved_edge_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let edge_label_filter = match resolved_edge_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => Some(Vec::new()),
+        };
+        let emit_node_label_filter =
+            self.resolve_node_label_filter_request_for_graph(options.emit_node_label_filter.as_ref())?;
+        if emit_node_label_filter.is_empty_constraint() {
+            return Ok(TraversalPageResult {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        self.traverse_resolved(
+            start,
+            max_depth,
+            options,
+            edge_label_filter.as_deref(),
+            &emit_node_label_filter,
+        )
+    }
+
+    fn traverse_resolved(
+        &self,
+        start: u64,
+        max_depth: u32,
+        options: &TraverseOptions,
+        edge_label_filter: Option<&[u32]>,
+        emit_node_label_filter: &ResolvedNodeLabelFilter,
+    ) -> Result<TraversalPageResult, EngineError> {
+        let min_depth = options.min_depth;
         let direction = options.direction;
-        let edge_type_filter = options.edge_type_filter.as_deref();
-        let node_type_filter = options.node_type_filter.as_deref();
         let at_epoch = options.at_epoch;
         let decay_lambda = options.decay_lambda;
-        let limit = options.limit;
         let cursor = options.cursor.as_ref();
         if min_depth > max_depth {
             return Err(EngineError::InvalidOperation(
@@ -1092,7 +1382,7 @@ impl ReadView {
             }
         }
 
-        let limit = limit.unwrap_or(usize::MAX);
+        let limit = options.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(TraversalPageResult {
                 items: Vec::new(),
@@ -1118,17 +1408,21 @@ impl ReadView {
             });
         }
 
-        let node_type_filter: Option<HashSet<u32>> =
-            node_type_filter.map(|types| types.iter().copied().collect());
+        if edge_label_filter.is_some_and(|label_ids| label_ids.is_empty()) {
+            return self.traverse_without_edges(
+                start,
+                options,
+                &start_node,
+                emit_node_label_filter,
+            );
+        }
         let mut hits: Vec<TraversalHit> = Vec::with_capacity(limit.min(64));
         let mut last_emitted_cursor: Option<TraversalCursor> = None;
         let mut has_more = false;
 
         if min_depth == 0
             && Self::traversal_after_cursor(cursor, 0, start)
-            && node_type_filter
-                .as_ref()
-                .is_none_or(|types| types.contains(&start_node.type_id))
+            && node_label_filter_matches(emit_node_label_filter, &start_node.label_ids)
         {
             if hits.len() < limit {
                 hits.push(TraversalHit {
@@ -1168,7 +1462,7 @@ impl ReadView {
             let _ = self.expand_frontier(
                 &frontier,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 reference_time,
                 &mut tombstones,
                 &mut |source, neighbor, edge_id| {
@@ -1201,7 +1495,7 @@ impl ReadView {
 
             self.classify_traversal_layer(
                 &mut layer_order,
-                node_type_filter.as_ref(),
+                emit_node_label_filter,
                 policy_cutoffs.as_ref(),
                 &mut blocked_hidden,
                 &mut visible_nodes,
@@ -1244,6 +1538,35 @@ impl ReadView {
         })
     }
 
+    fn traverse_without_edges(
+        &self,
+        start: u64,
+        options: &TraverseOptions,
+        start_node: &NodeRecord,
+        emit_node_label_filter: &ResolvedNodeLabelFilter,
+    ) -> Result<TraversalPageResult, EngineError> {
+        if options.limit == Some(0)
+            || options.min_depth > 0
+            || !Self::traversal_after_cursor(options.cursor.as_ref(), 0, start)
+            || !node_label_filter_matches(emit_node_label_filter, &start_node.label_ids)
+        {
+            return Ok(TraversalPageResult {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        Ok(TraversalPageResult {
+            items: vec![TraversalHit {
+                node_id: start,
+                depth: 0,
+                via_edge_id: None,
+                score: Self::traversal_score(options.decay_lambda, 0),
+            }],
+            next_cursor: None,
+        })
+    }
+
     /// Reverse a direction for backward search in bidirectional algorithms.
     fn reverse_direction(direction: Direction) -> Direction {
         match direction {
@@ -1279,7 +1602,7 @@ impl ReadView {
     fn classify_traversal_layer(
         &self,
         layer_order: &mut [u64],
-        node_type_filter: Option<&HashSet<u32>>,
+        emit_node_label_filter: &ResolvedNodeLabelFilter,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         blocked_hidden: &mut IdSet,
         visible_nodes: &mut Vec<u64>,
@@ -1292,23 +1615,32 @@ impl ReadView {
         }
 
         layer_order.sort_unstable();
-        if policy_cutoffs.is_none() && node_type_filter.is_none() {
+        if policy_cutoffs.is_none()
+            && Self::node_label_filter_is_unconstrained(emit_node_label_filter)
+        {
             visible_nodes.extend(layer_order.iter().copied());
             emitted_nodes.extend(layer_order.iter().copied());
             return Ok(());
         }
 
-        let nodes = self.get_nodes_raw(layer_order)?;
-        for (&node_id, slot) in layer_order.iter().zip(nodes.iter()) {
-            if let Some(node) = slot {
-                if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                    blocked_hidden.insert(node_id);
-                    continue;
-                }
-                visible_nodes.push(node_id);
-                if node_type_filter.is_none_or(|types| types.contains(&node.type_id)) {
-                    emitted_nodes.push(node_id);
-                }
+        #[cfg(test)]
+        self.note_node_visibility_meta_reads(layer_order.len());
+        let visibility = self.sources().find_node_visibility_meta(layer_order)?;
+        for (&node_id, state) in layer_order.iter().zip(visibility.iter()) {
+            let NodeVisibilityState::Live(meta) = state else {
+                continue;
+            };
+            if policy_cutoffs
+                .is_some_and(|cutoffs| {
+                    cutoffs.excludes_fields(&meta.label_ids, meta.updated_at, meta.weight)
+                })
+            {
+                blocked_hidden.insert(node_id);
+                continue;
+            }
+            visible_nodes.push(node_id);
+            if node_label_filter_matches(emit_node_label_filter, &meta.label_ids) {
+                emitted_nodes.push(node_id);
             }
         }
         Ok(())
@@ -1321,7 +1653,7 @@ impl ReadView {
         &self,
         frontier: &[u64],
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         reference_time: i64,
         tombstones: &mut TraversalTombstoneView<'_>,
         on_neighbor: &mut F,
@@ -1349,7 +1681,7 @@ impl ReadView {
                 .for_each_adj_entry_at(
                     nid,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         seen_edges.insert((nid, edge_id));
@@ -1373,7 +1705,7 @@ impl ReadView {
                     .for_each_adj_entry_at(
                         nid,
                         direction,
-                        edge_type_filter,
+                        edge_label_filter,
                         self.snapshot_seq,
                         &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                             if !seen_edges.insert((nid, edge_id)) {
@@ -1408,7 +1740,7 @@ impl ReadView {
                 .for_each_adj_posting_batch(
                     &sorted_ids,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     &mut |queried_nid, edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((queried_nid, edge_id)) {
                             return ControlFlow::Continue(());
@@ -1624,7 +1956,7 @@ impl ReadView {
         dist: &mut IdMap<f64>,
         settled: &mut IdSet,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         limit_cost: f64,
@@ -1648,7 +1980,7 @@ impl ReadView {
             let _ = self.for_each_search_neighbor(
                 node,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 reference_time,
                 policy_cutoffs,
                 tombstones,
@@ -1699,7 +2031,7 @@ impl ReadView {
         settled: &mut [IdSet],
         layer_best: &mut IdMap<Vec<LayerBestEntry>>,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         max_depth: u32,
@@ -1731,7 +2063,7 @@ impl ReadView {
             let _ = self.for_each_search_neighbor(
                 node,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 reference_time,
                 policy_cutoffs,
                 tombstones,
@@ -1783,7 +2115,7 @@ impl ReadView {
         &self,
         from: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         reference_time: i64,
         best_hops: u32,
         bwd_depth: &IdMap<u32>,
@@ -1815,7 +2147,7 @@ impl ReadView {
             let _ = self.expand_frontier(
                 &frontier,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 reference_time,
                 &mut tombstones,
                 &mut |source, neighbor, edge_id| {
@@ -1897,7 +2229,7 @@ impl ReadView {
         &self,
         node: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
@@ -1914,7 +2246,7 @@ impl ReadView {
         let _ = self.for_each_search_neighbor(
             node,
             direction,
-            edge_type_filter,
+            edge_label_filter,
             reference_time,
             policy_cutoffs,
             tombstones,
@@ -1955,7 +2287,7 @@ impl ReadView {
         &self,
         fwd_dist: &IdMap<f64>,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         best_cost: f64,
@@ -1980,7 +2312,7 @@ impl ReadView {
             let next_steps = self.collect_weighted_successors_from_node(
                 node,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 policy_cutoffs,
@@ -2014,7 +2346,7 @@ impl ReadView {
         &self,
         fwd_dist: &[IdMap<f64>],
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         max_depth: u32,
@@ -2046,7 +2378,7 @@ impl ReadView {
                 let next_steps = self.collect_weighted_successors_from_node(
                     node,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     weight_field,
                     reference_time,
                     policy_cutoffs,
@@ -2084,7 +2416,7 @@ impl ReadView {
         node: u64,
         depth_so_far: u32,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         reference_time: i64,
         best_hops: u32,
         bwd_depth: &IdMap<u32>,
@@ -2100,7 +2432,7 @@ impl ReadView {
                 let _ = self.for_each_search_neighbor(
                     node,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     policy_cutoffs,
                     tombstones,
@@ -2126,7 +2458,7 @@ impl ReadView {
         cache: &mut IdMap<Vec<(u64, u64)>>,
         node: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         best_cost: f64,
@@ -2147,7 +2479,7 @@ impl ReadView {
             self.collect_weighted_successors_from_node(
                 node,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 policy_cutoffs,
@@ -2177,7 +2509,7 @@ impl ReadView {
         node: u64,
         hops_so_far: u32,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         max_depth: u32,
@@ -2203,7 +2535,7 @@ impl ReadView {
             self.collect_weighted_successors_from_node(
                 node,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 policy_cutoffs,
@@ -2231,14 +2563,14 @@ impl ReadView {
     /// Bidirectional BFS shortest path (unweighted).
     ///
     /// Alternates expanding the smaller frontier. Uses callback-based
-    /// adjacency iteration to avoid materializing `Vec<NeighborEntry>`.
+    /// adjacency iteration to avoid materializing `Vec<NeighborRecord>`.
     #[allow(clippy::too_many_arguments)]
     fn bfs_shortest_path(
         &self,
         from: u64,
         to: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         reference_time: i64,
         max_depth: Option<u32>,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
@@ -2284,7 +2616,7 @@ impl ReadView {
                 let _ = self.expand_frontier(
                     &fwd_frontier,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     &mut tombstones,
                     &mut |source, neighbor, edge_id| {
@@ -2345,7 +2677,7 @@ impl ReadView {
                 let _ = self.expand_frontier(
                     &bwd_frontier,
                     bwd_direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     &mut tombstones,
                     &mut |source, neighbor, edge_id| {
@@ -2411,7 +2743,7 @@ impl ReadView {
         from: u64,
         to: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         reference_time: i64,
         max_depth: Option<u32>,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
@@ -2452,7 +2784,7 @@ impl ReadView {
                 let _ = self.expand_frontier(
                     &fwd_frontier,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     &mut tombstones,
                     &mut |_source, neighbor, _edge_id| {
@@ -2505,7 +2837,7 @@ impl ReadView {
                 let _ = self.expand_frontier(
                     &bwd_frontier,
                     bwd_direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     &mut tombstones,
                     &mut |_source, neighbor, _edge_id| {
@@ -2624,7 +2956,7 @@ impl ReadView {
         &self,
         node_id: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         reference_time: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         tombstones: &mut TraversalTombstoneView<'_>,
@@ -2642,7 +2974,7 @@ impl ReadView {
             .for_each_adj_entry_at(
                 node_id,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 self.snapshot_seq,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     scratch.seen_edges.insert(edge_id);
@@ -2683,7 +3015,7 @@ impl ReadView {
                 .for_each_adj_entry_at(
                     node_id,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     self.snapshot_seq,
                     &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                         if !scratch.seen_edges.insert(edge_id) {
@@ -2731,7 +3063,7 @@ impl ReadView {
                 .for_each_adj_posting(
                     node_id,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                         if !scratch.seen_edges.insert(edge_id) {
                             return ControlFlow::Continue(());
@@ -2786,7 +3118,7 @@ impl ReadView {
         from: u64,
         to: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         max_depth: Option<u32>,
@@ -2798,7 +3130,7 @@ impl ReadView {
                 from,
                 to,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 max_hops,
@@ -2871,7 +3203,7 @@ impl ReadView {
                 let _ = self.for_each_search_neighbor(
                     node,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     policy_cutoffs,
                     &mut tombstones,
@@ -2942,7 +3274,7 @@ impl ReadView {
                 let _ = self.for_each_search_neighbor(
                     node,
                     bwd_direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     policy_cutoffs,
                     &mut tombstones,
@@ -3017,7 +3349,7 @@ impl ReadView {
         from: u64,
         to: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         max_depth: u32,
@@ -3103,7 +3435,7 @@ impl ReadView {
                 let _ = self.for_each_search_neighbor(
                     node,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     policy_cutoffs,
                     &mut tombstones,
@@ -3191,7 +3523,7 @@ impl ReadView {
                 let _ = self.for_each_search_neighbor(
                     node,
                     bwd_direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     policy_cutoffs,
                     &mut tombstones,
@@ -3290,7 +3622,13 @@ impl ReadView {
         options: &AllShortestPathsOptions,
     ) -> Result<Vec<ShortestPath>, EngineError> {
         let direction = options.direction;
-        let edge_type_filter = options.type_filter.as_deref();
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let (edge_label_filter, edge_filter_empty) = match resolved_filter {
+            LabelFilterResolution::Unconstrained => (None, false),
+            LabelFilterResolution::Known(label_ids) => (Some(label_ids), false),
+            LabelFilterResolution::EmptyConstraint => (Some(Vec::new()), true),
+        };
         let weight_field = options.weight_field.as_deref();
         let at_epoch = options.at_epoch;
         let max_depth = options.max_depth;
@@ -3308,6 +3646,9 @@ impl ReadView {
                 total_cost: 0.0,
             }]);
         }
+        if edge_filter_empty {
+            return Ok(Vec::new());
+        }
         let reference_time = at_epoch.unwrap_or_else(now_millis);
         let paths_cap = max_paths.unwrap_or(100);
 
@@ -3316,7 +3657,7 @@ impl ReadView {
                 from,
                 to,
                 direction,
-                edge_type_filter,
+                edge_label_filter.as_deref(),
                 reference_time,
                 max_depth,
                 paths_cap,
@@ -3326,7 +3667,7 @@ impl ReadView {
                 from,
                 to,
                 direction,
-                edge_type_filter,
+                edge_label_filter.as_deref(),
                 wf,
                 reference_time,
                 max_depth,
@@ -3344,7 +3685,7 @@ impl ReadView {
         from: u64,
         to: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         reference_time: i64,
         max_depth: Option<u32>,
         max_paths: usize,
@@ -3417,7 +3758,7 @@ impl ReadView {
                 } else {
                     bwd_direction
                 },
-                edge_type_filter,
+                edge_label_filter,
                 reference_time,
                 &mut tombstones,
                 &mut |_source, neighbor, _edge_id| {
@@ -3495,7 +3836,7 @@ impl ReadView {
             let _ = self.expand_frontier(
                 &bwd_frontier,
                 bwd_direction,
-                edge_type_filter,
+                edge_label_filter,
                 reference_time,
                 &mut tombstones,
                 &mut |_source, neighbor, _edge_id| {
@@ -3536,7 +3877,7 @@ impl ReadView {
             let successors = self.build_bfs_shortest_path_successors(
                 from,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 reference_time,
                 best_hops,
                 &bwd_depth,
@@ -3562,7 +3903,7 @@ impl ReadView {
                 to,
                 0,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 reference_time,
                 best_hops,
                 &bwd_depth,
@@ -3586,7 +3927,7 @@ impl ReadView {
         from: u64,
         to: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         max_depth: Option<u32>,
@@ -3599,7 +3940,7 @@ impl ReadView {
                 from,
                 to,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 max_hops,
@@ -3668,7 +4009,7 @@ impl ReadView {
                 let _ = self.for_each_search_neighbor(
                     node,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     policy_cutoffs,
                     &mut tombstones,
@@ -3736,7 +4077,7 @@ impl ReadView {
                 let _ = self.for_each_search_neighbor(
                     node,
                     bwd_direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     policy_cutoffs,
                     &mut tombstones,
@@ -3803,7 +4144,7 @@ impl ReadView {
             &mut bwd_dist,
             &mut bwd_settled,
             bwd_direction,
-            edge_type_filter,
+            edge_label_filter,
             weight_field,
             reference_time,
             mu,
@@ -3817,7 +4158,7 @@ impl ReadView {
             &mut fwd_dist,
             &mut fwd_settled,
             direction,
-            edge_type_filter,
+            edge_label_filter,
             weight_field,
             reference_time,
             mu,
@@ -3841,7 +4182,7 @@ impl ReadView {
             let successors = self.build_weighted_shortest_path_successors(
                 &fwd_dist,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 mu,
@@ -3865,7 +4206,7 @@ impl ReadView {
                 from,
                 to,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 mu,
@@ -3892,7 +4233,7 @@ impl ReadView {
         from: u64,
         to: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         max_depth: u32,
@@ -3980,7 +4321,7 @@ impl ReadView {
                 let _ = self.for_each_search_neighbor(
                     node,
                     direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     policy_cutoffs,
                     &mut tombstones,
@@ -4070,7 +4411,7 @@ impl ReadView {
                 let _ = self.for_each_search_neighbor(
                     node,
                     bwd_direction,
-                    edge_type_filter,
+                    edge_label_filter,
                     reference_time,
                     policy_cutoffs,
                     &mut tombstones,
@@ -4146,7 +4487,7 @@ impl ReadView {
             &mut bwd_settled,
             &mut bwd_best,
             bwd_direction,
-            edge_type_filter,
+            edge_label_filter,
             weight_field,
             reference_time,
             max_depth,
@@ -4162,7 +4503,7 @@ impl ReadView {
             &mut fwd_settled,
             &mut fwd_best,
             direction,
-            edge_type_filter,
+            edge_label_filter,
             weight_field,
             reference_time,
             max_depth,
@@ -4186,7 +4527,7 @@ impl ReadView {
             let successors = self.build_weighted_bounded_shortest_path_successors(
                 &fwd_dist,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 max_depth,
@@ -4214,7 +4555,7 @@ impl ReadView {
                 to,
                 0,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 max_depth,
@@ -4301,7 +4642,7 @@ impl ReadView {
         to: u64,
         depth_so_far: u32,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         reference_time: i64,
         best_hops: u32,
         bwd_depth: &IdMap<u32>,
@@ -4336,7 +4677,7 @@ impl ReadView {
             node,
             depth_so_far,
             direction,
-            edge_type_filter,
+            edge_label_filter,
             reference_time,
             best_hops,
             bwd_depth,
@@ -4353,7 +4694,7 @@ impl ReadView {
                 to,
                 depth_so_far + 1,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 reference_time,
                 best_hops,
                 bwd_depth,
@@ -4478,7 +4819,7 @@ impl ReadView {
         node: u64,
         to: u64,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         best_cost: f64,
@@ -4502,7 +4843,7 @@ impl ReadView {
                 successors_cache,
                 current_node,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 best_cost,
@@ -4576,7 +4917,7 @@ impl ReadView {
         to: u64,
         hops_so_far: u32,
         direction: Direction,
-        edge_type_filter: Option<&[u32]>,
+        edge_label_filter: Option<&[u32]>,
         weight_field: &str,
         reference_time: i64,
         max_depth: u32,
@@ -4602,7 +4943,7 @@ impl ReadView {
                 current_node,
                 hops,
                 direction,
-                edge_type_filter,
+                edge_label_filter,
                 weight_field,
                 reference_time,
                 max_depth,
@@ -4643,12 +4984,12 @@ impl ReadView {
         &self,
         node_id: u64,
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         limit: usize,
         at_epoch: Option<i64>,
         decay_lambda: Option<f32>,
         tombstones: Option<(&IdSet, &IdSet)>,
-    ) -> Result<Vec<NeighborEntry>, EngineError> {
+    ) -> Result<Vec<NeighborRecord>, EngineError> {
         if let Some(l) = decay_lambda {
             if l < 0.0 {
                 return Err(EngineError::InvalidOperation(
@@ -4673,14 +5014,14 @@ impl ReadView {
         // Start with memtable results (fetch without limit to allow for temporal filtering)
         let mut results =
             self.memtable
-                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
+                .neighbors_at(node_id, direction, label_filter_ids, 0, self.snapshot_seq);
         let mut seen_edges: IdSet = results.iter().map(|e| e.edge_id).collect();
 
         // Immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
             let mt_results = epoch
                 .memtable
-                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
+                .neighbors_at(node_id, direction, label_filter_ids, 0, self.snapshot_seq);
             for entry in mt_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -4697,7 +5038,7 @@ impl ReadView {
 
         // Add segment results
         for seg in &self.segments {
-            let seg_results = seg.neighbors(node_id, direction, type_filter, 0)?;
+            let seg_results = seg.neighbors(node_id, direction, label_filter_ids, 0)?;
             for entry in seg_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -4766,9 +5107,15 @@ impl ReadView {
         &self,
         node_id: u64,
         options: &NeighborOptions,
-    ) -> Result<Vec<NeighborEntry>, EngineError> {
+    ) -> Result<Vec<NeighborRecord>, EngineError> {
         let direction = options.direction;
-        let type_filter = options.type_filter.as_deref();
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let label_filter_ids = match resolved_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => return Ok(Vec::new()),
+        };
         let limit = options.limit.unwrap_or(0);
         let at_epoch = options.at_epoch;
         let decay_lambda = options.decay_lambda;
@@ -4778,7 +5125,7 @@ impl ReadView {
             return self.neighbors_raw(
                 node_id,
                 direction,
-                type_filter,
+                label_filter_ids.as_deref(),
                 limit,
                 at_epoch,
                 decay_lambda,
@@ -4790,7 +5137,7 @@ impl ReadView {
         let mut results = self.neighbors_raw(
             node_id,
             direction,
-            type_filter,
+            label_filter_ids.as_deref(),
             0,
             at_epoch,
             decay_lambda,
@@ -4823,7 +5170,7 @@ impl ReadView {
     /// per segment instead of O(M log N) individual binary searches.
     ///
     /// `node_ids` need not be sorted (sorted internally). Returns a
-    /// [`NodeIdMap<Vec<NeighborEntry>>`] mapping each queried node_id to its
+    /// [`NodeIdMap<Vec<NeighborRecord>>`] mapping each queried node_id to its
     /// neighbor entries. `NodeIdMap` is a `HashMap` with identity hashing
     /// optimized for engine-generated numeric IDs.
     ///
@@ -4832,24 +5179,47 @@ impl ReadView {
         &self,
         node_ids: &[u64],
         options: &NeighborOptions,
-    ) -> Result<NodeIdMap<Vec<NeighborEntry>>, EngineError> {
+    ) -> Result<NodeIdMap<Vec<NeighborRecord>>, EngineError> {
         let direction = options.direction;
-        let type_filter = options.type_filter.as_deref();
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let label_filter_ids = match resolved_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => return Ok(NodeIdMap::default()),
+        };
         let at_epoch = options.at_epoch;
         let decay_lambda = options.decay_lambda;
 
+        self.neighbors_batch_resolved(
+            node_ids,
+            direction,
+            label_filter_ids.as_deref(),
+            at_epoch,
+            decay_lambda,
+        )
+    }
+
+    fn neighbors_batch_resolved(
+        &self,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+        at_epoch: Option<i64>,
+        decay_lambda: Option<f32>,
+    ) -> Result<NodeIdMap<Vec<NeighborRecord>>, EngineError> {
         if self.manifest.prune_policies.is_empty() {
             return self.neighbors_batch_raw(
                 node_ids,
                 direction,
-                type_filter,
+                label_filter_ids,
                 at_epoch,
                 decay_lambda,
             );
         }
 
         let mut results =
-            self.neighbors_batch_raw(node_ids, direction, type_filter, at_epoch, decay_lambda)?;
+            self.neighbors_batch_raw(node_ids, direction, label_filter_ids, at_epoch, decay_lambda)?;
 
         // Collect unique neighbor node IDs for batch policy check (dedup avoids
         // redundant merge-walks when many queried nodes share neighbors).
@@ -4881,10 +5251,10 @@ impl ReadView {
         &self,
         node_ids: &[u64],
         direction: Direction,
-        type_filter: Option<&[u32]>,
+        label_filter_ids: Option<&[u32]>,
         at_epoch: Option<i64>,
         decay_lambda: Option<f32>,
-    ) -> Result<NodeIdMap<Vec<NeighborEntry>>, EngineError> {
+    ) -> Result<NodeIdMap<Vec<NeighborRecord>>, EngineError> {
         if node_ids.is_empty() {
             return Ok(NodeIdMap::default());
         }
@@ -4914,7 +5284,7 @@ impl ReadView {
         // Start with memtable results.
         let mut results = self
             .memtable
-            .neighbors_batch_at(&sorted_ids, direction, type_filter, self.snapshot_seq);
+            .neighbors_batch_at(&sorted_ids, direction, label_filter_ids, self.snapshot_seq);
 
         // Track seen edge IDs per node for dedup (memtable/newer segment wins)
         let mut seen_edges: NodeIdMap<NodeIdSet> = NodeIdMap::default();
@@ -4930,7 +5300,7 @@ impl ReadView {
             let mt_results = epoch.memtable.neighbors_batch_at(
                 &sorted_ids,
                 direction,
-                type_filter,
+                label_filter_ids,
                 self.snapshot_seq,
             );
             for (nid, mt_entries) in mt_results {
@@ -4953,7 +5323,7 @@ impl ReadView {
 
         // Merge segment results (newest-to-oldest, one cursor walk per segment)
         for seg in &self.segments {
-            let seg_results = seg.neighbors_batch(&sorted_ids, direction, type_filter)?;
+            let seg_results = seg.neighbors_batch(&sorted_ids, direction, label_filter_ids)?;
             for (nid, seg_entries) in seg_results {
                 let seen = seen_edges.entry(nid).or_default();
                 let node_entries = results.entry(nid).or_default();
@@ -5023,9 +5393,20 @@ impl ReadView {
         node_id: u64,
         options: &NeighborOptions,
         page: &PageRequest,
-    ) -> Result<PageResult<NeighborEntry>, EngineError> {
+    ) -> Result<PageResult<NeighborRecord>, EngineError> {
         let direction = options.direction;
-        let type_filter = options.type_filter.as_deref();
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let label_filter_ids = match resolved_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => {
+                return Ok(PageResult {
+                    items: Vec::new(),
+                    next_cursor: None,
+                })
+            }
+        };
         let at_epoch = options.at_epoch;
         let decay_lambda = options.decay_lambda;
 
@@ -5049,18 +5430,24 @@ impl ReadView {
         // Collect sources: memtable (unsorted) + immutable memtables + segments (sorted by edge_id)
         let memtable_entries =
             self.memtable
-                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
-        let mut segment_entries: Vec<Vec<NeighborEntry>> =
+                .neighbors_at(node_id, direction, label_filter_ids.as_deref(), 0, self.snapshot_seq);
+        let mut segment_entries: Vec<Vec<NeighborRecord>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
         for epoch in &self.immutable_epochs {
             segment_entries.push(
                 epoch
                     .memtable
-                    .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq),
+                    .neighbors_at(
+                        node_id,
+                        direction,
+                        label_filter_ids.as_deref(),
+                        0,
+                        self.snapshot_seq,
+                    ),
             );
         }
         for seg in &self.segments {
-            segment_entries.push(seg.neighbors(node_id, direction, type_filter, 0)?);
+            segment_entries.push(seg.neighbors(node_id, direction, label_filter_ids.as_deref(), 0)?);
         }
 
         if apply_decay {
@@ -5251,9 +5638,15 @@ impl ReadView {
         node_id: u64,
         k: usize,
         options: &TopKOptions,
-    ) -> Result<Vec<NeighborEntry>, EngineError> {
+    ) -> Result<Vec<NeighborRecord>, EngineError> {
         let direction = options.direction;
-        let type_filter = options.type_filter.as_deref();
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let label_filter_ids = match resolved_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => return Ok(Vec::new()),
+        };
         let scoring = options.scoring.clone();
         let at_epoch = options.at_epoch;
 
@@ -5278,7 +5671,7 @@ impl ReadView {
         // Gather all neighbors from memtable + immutable memtables + segments with dedup + deletion filter
         let mut all_entries =
             self.memtable
-                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
+                .neighbors_at(node_id, direction, label_filter_ids.as_deref(), 0, self.snapshot_seq);
         // Filter memtable results against deleted sets (M2 fix)
         all_entries
             .retain(|e| !deleted_edges.contains(&e.edge_id) && !deleted_nodes.contains(&e.node_id));
@@ -5288,7 +5681,7 @@ impl ReadView {
         for epoch in &self.immutable_epochs {
             let mt_results = epoch
                 .memtable
-                .neighbors_at(node_id, direction, type_filter, 0, self.snapshot_seq);
+                .neighbors_at(node_id, direction, label_filter_ids.as_deref(), 0, self.snapshot_seq);
             for entry in mt_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -5304,7 +5697,7 @@ impl ReadView {
         }
 
         for seg in &self.segments {
-            let seg_results = seg.neighbors(node_id, direction, type_filter, 0)?;
+            let seg_results = seg.neighbors(node_id, direction, label_filter_ids.as_deref(), 0)?;
             for entry in seg_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -5338,7 +5731,7 @@ impl ReadView {
         // Use f64 bits for the min-heap key to preserve i64 timestamp precision
         // for Recency scoring (f32 can't represent epoch-millis without loss).
         let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
-        let mut scored: Vec<NeighborEntry> = Vec::new();
+        let mut scored: Vec<NeighborRecord> = Vec::new();
 
         for mut entry in all_entries {
             if !is_edge_valid_at(entry.valid_from, entry.valid_to, reference_time) {
@@ -5380,7 +5773,7 @@ impl ReadView {
         // Sort descending by score
         top_indices.sort_by(|a, b| b.0.cmp(&a.0));
 
-        let results: Vec<NeighborEntry> = top_indices
+        let results: Vec<NeighborRecord> = top_indices
             .into_iter()
             .map(|(_, idx)| scored[idx].clone())
             .collect();
@@ -5393,11 +5786,11 @@ impl ReadView {
     ///
     /// Uses BFS with cycle detection. Edges to already-visited nodes (cross-edges
     /// and back-edges) are included in the result. The traversal respects
-    /// direction and edge type filters.
+    /// direction and edge-label filters.
     ///
     /// - `max_depth`: maximum number of hops. 0 returns just the start node.
     /// - `direction`: which edge direction to follow during traversal.
-    /// - `edge_type_filter`: only traverse edges of these types. `None` = all.
+    /// - `edge_label_filter`: only traverse edges with these labels. `None` = all.
     /// - `at_epoch`: temporal filter. Only include edges valid at this time.
     ///
     /// Returns an empty `Subgraph` if the start node does not exist.
@@ -5408,7 +5801,21 @@ impl ReadView {
         options: &SubgraphOptions,
     ) -> Result<Subgraph, EngineError> {
         let direction = options.direction;
-        let edge_type_filter = options.edge_type_filter.as_deref();
+        let resolved_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let edge_label_filter = match resolved_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => Some(Vec::new()),
+        };
+        let node_label_filter =
+            self.resolve_node_label_filter_request_for_graph(options.node_label_filter.as_ref())?;
+        if node_label_filter.is_empty_constraint() {
+            return Ok(Subgraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
         let at_epoch = options.at_epoch;
         // Check start node exists
         let start_node = match self.get_node(start_node_id)? {
@@ -5420,8 +5827,21 @@ impl ReadView {
                 })
             }
         };
+        if !node_label_filter_matches(&node_label_filter, &start_node.label_ids) {
+            return Ok(Subgraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
+        if edge_label_filter.as_deref().is_some_and(|label_ids| label_ids.is_empty()) {
+            return Ok(Subgraph {
+                nodes: vec![node_view_from_record(start_node, self.label_catalog.as_ref())?],
+                edges: Vec::new(),
+            });
+        }
 
         let mut visited_nodes: IdSet = IdSet::default();
+        let mut blocked_nodes: IdSet = IdSet::default();
         let mut collected_edge_ids: IdSet = IdSet::default();
         let mut node_records: Vec<NodeRecord> = Vec::new();
         let mut edge_records: Vec<EdgeRecord> = Vec::new();
@@ -5429,40 +5849,68 @@ impl ReadView {
         visited_nodes.insert(start_node_id);
         node_records.push(start_node);
 
-        if max_depth == 0 {
-            return Ok(Subgraph {
-                nodes: node_records,
-                edges: edge_records,
-            });
-        }
-
-        // BFS level by level, batch-fetch neighbors for entire frontier
+        // BFS level by level, batch-fetch neighbors for entire frontier.
         let mut frontier: Vec<u64> = vec![start_node_id];
 
         for _depth in 0..max_depth {
             let mut new_edge_ids: Vec<u64> = Vec::new();
             let mut new_node_ids: Vec<u64> = Vec::new();
+            let mut candidate_seen = IdSet::default();
+            let mut candidate_edges: Vec<(u64, u64)> = Vec::new();
 
             // Batch adjacency: one cursor walk per segment for the whole frontier
-            let batch_opts = NeighborOptions {
-                    direction,
-                    type_filter: edge_type_filter.map(|s| s.to_vec()),
-                    limit: None,
-                    at_epoch,
-                    decay_lambda: None,
-                };
-            let all_neighbors = self.neighbors_batch(&frontier, &batch_opts)?;
+            let all_neighbors = self.neighbors_batch_resolved(
+                &frontier,
+                direction,
+                edge_label_filter.as_deref(),
+                at_epoch,
+                None,
+            )?;
 
             for &current_node in &frontier {
                 let empty = Vec::new();
                 let neighbors = all_neighbors.get(&current_node).unwrap_or(&empty);
 
                 for entry in neighbors {
-                    if collected_edge_ids.insert(entry.edge_id) {
-                        new_edge_ids.push(entry.edge_id);
+                    if visited_nodes.contains(&entry.node_id) {
+                        if collected_edge_ids.insert(entry.edge_id) {
+                            new_edge_ids.push(entry.edge_id);
+                        }
+                    } else if blocked_nodes.contains(&entry.node_id) {
+                        continue;
+                    } else {
+                        candidate_edges.push((entry.edge_id, entry.node_id));
+                        if candidate_seen.insert(entry.node_id) {
+                            new_node_ids.push(entry.node_id);
+                        }
                     }
-                    if visited_nodes.insert(entry.node_id) {
-                        new_node_ids.push(entry.node_id);
+                }
+            }
+
+            let node_filter_constrained =
+                !Self::node_label_filter_is_unconstrained(&node_label_filter);
+            let eligible_new_node_ids = if node_filter_constrained {
+                    self.filter_node_ids_by_resolved_label_filter(
+                        &new_node_ids,
+                        &node_label_filter,
+                        None,
+                    )?
+                } else {
+                    new_node_ids.clone()
+                };
+            let eligible_new_nodes: IdSet = eligible_new_node_ids.iter().copied().collect();
+            for (edge_id, node_id) in candidate_edges {
+                if eligible_new_nodes.contains(&node_id) && collected_edge_ids.insert(edge_id) {
+                    new_edge_ids.push(edge_id);
+                }
+            }
+            for &node_id in &eligible_new_node_ids {
+                visited_nodes.insert(node_id);
+            }
+            if node_filter_constrained {
+                for &node_id in &new_node_ids {
+                    if !eligible_new_nodes.contains(&node_id) {
+                        blocked_nodes.insert(node_id);
                     }
                 }
             }
@@ -5473,12 +5921,12 @@ impl ReadView {
                 edge_records.push(edge);
             }
 
-            let fetched_nodes = self.get_nodes(&new_node_ids)?;
+            let fetched_nodes = self.get_nodes(&eligible_new_node_ids)?;
             let mut next_frontier: Vec<u64> = Vec::new();
             for (i, node_opt) in fetched_nodes.into_iter().enumerate() {
                 if let Some(node) = node_opt {
                     node_records.push(node);
-                    next_frontier.push(new_node_ids[i]);
+                    next_frontier.push(eligible_new_node_ids[i]);
                 }
             }
 
@@ -5488,10 +5936,16 @@ impl ReadView {
             }
         }
 
-        Ok(Subgraph {
-            nodes: node_records,
-            edges: edge_records,
-        })
+        let nodes = node_records
+            .into_iter()
+            .map(|node| node_view_from_record(node, self.label_catalog.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let edges = edge_records
+            .into_iter()
+            .map(|edge| edge_view_from_record(edge, self.label_catalog.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Subgraph { nodes, edges })
     }
 
     // --- Connected Components (WCC) ---
@@ -5505,8 +5959,8 @@ impl ReadView {
     /// `NodeIdMap` is a `HashMap` with identity hashing optimized for
     /// engine-generated numeric IDs.
     ///
-    /// - `edge_type_filter`: only consider edges of these types. `None` = all.
-    /// - `node_type_filter`: only include nodes of these types. `None` = all.
+    /// - `edge_label_filter`: only consider edges of these labels. `None` = all.
+    /// - `node_label_filter`: only include nodes with these labels. `None` = all.
     /// - `at_epoch`: reference time for temporal edge visibility. `None` → now.
     ///
     /// Isolated nodes (no visible edges after filtering) become singleton
@@ -5531,52 +5985,37 @@ impl ReadView {
         &self,
         options: &ComponentOptions,
     ) -> Result<NodeIdMap<u64>, EngineError> {
-        let edge_type_filter = options.edge_type_filter.as_deref();
-        let node_type_filter = options.node_type_filter.as_deref();
-        let at_epoch = options.at_epoch;
-        // 1. Collect all visible node IDs (policy-filtered, type-filtered).
-        let node_types: Vec<u32> = {
-            let mut types: HashSet<u32> =
-                self.memtable.visible_types(self.snapshot_seq).into_iter().collect();
-            for epoch in &self.immutable_epochs {
-                types.extend(epoch.memtable.visible_types(self.snapshot_seq));
-            }
-            for seg in &self.segments {
-                for tid in seg.node_type_ids()? {
-                    types.insert(tid);
-                }
-            }
-            if let Some(filter) = node_type_filter {
-                let allowed: HashSet<u32> = filter.iter().copied().collect();
-                types.retain(|t| allowed.contains(t));
-            }
-            types.into_iter().collect()
+        let resolved_edge_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let edge_label_filter = match resolved_edge_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => Some(Vec::new()),
         };
-
-        // Collect all visible node IDs per type, then build the set with
-        // known capacity to avoid repeated re-hashing.
-        let mut per_type_ids: Vec<Vec<u64>> = Vec::with_capacity(node_types.len());
-        let mut total_count: usize = 0;
-        for &tid in &node_types {
-            let ids = self.nodes_by_type(tid)?;
-            total_count += ids.len();
-            per_type_ids.push(ids);
-        }
-        if total_count == 0 {
+        let node_label_filter =
+            self.resolve_node_label_filter_request_for_graph(options.node_label_filter.as_ref())?;
+        if node_label_filter.is_empty_constraint() {
             return Ok(NodeIdMap::default());
         }
-
-        let mut node_set: IdSet =
-            IdSet::with_capacity_and_hasher(total_count, IdBuildHasher::default());
-        for ids in &per_type_ids {
-            for &id in ids {
-                node_set.insert(id);
-            }
+        let at_epoch = options.at_epoch;
+        let policy_cutoffs = self.query_policy_cutoffs();
+        // 1. Collect all visible node IDs (policy-filtered, label-filtered).
+        let node_ids = self.collect_node_ids_for_resolved_label_filter(
+            &node_label_filter,
+            policy_cutoffs.as_ref(),
+        )?;
+        if node_ids.is_empty() {
+            return Ok(NodeIdMap::default());
         }
-        drop(per_type_ids);
-
-        let mut node_ids: Vec<u64> = node_set.iter().copied().collect();
-        node_ids.sort_unstable();
+        let node_set: IdSet = node_ids.iter().copied().collect();
+        if edge_label_filter.as_deref().is_some_and(|label_ids| label_ids.is_empty()) {
+            let mut result =
+                NodeIdMap::with_capacity_and_hasher(node_ids.len(), IdBuildHasher::default());
+            for id in node_ids {
+                result.insert(id, id);
+            }
+            return Ok(result);
+        }
 
         // 2. Initialize union-find with one set per visible node.
         let mut uf = UnionFind::with_capacity(node_ids.len());
@@ -5587,7 +6026,7 @@ impl ReadView {
         // 3. Global outgoing adjacency scan: streaming union.
         //    Each directed edge appears exactly once; union(from, to)
         //    captures undirected connectivity. Unlike neighbors_batch(),
-        //    this never materializes Vec<NeighborEntry>. The callback
+        //    this never materializes Vec<NeighborRecord>. The callback
         //    unions endpoints inline during the cursor walk.
         let reference_time = at_epoch.unwrap_or_else(now_millis);
 
@@ -5600,7 +6039,7 @@ impl ReadView {
             let _ = self.memtable.for_each_adj_entry_at(
                 nid,
                 Direction::Outgoing,
-                edge_type_filter,
+                edge_label_filter.as_deref(),
                 self.snapshot_seq,
                 &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                     seen_edges.insert((nid, edge_id));
@@ -5621,7 +6060,7 @@ impl ReadView {
                 let _ = epoch.memtable.for_each_adj_entry_at(
                     nid,
                     Direction::Outgoing,
-                    edge_type_filter,
+                    edge_label_filter.as_deref(),
                     self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((nid, edge_id)) {
@@ -5650,7 +6089,7 @@ impl ReadView {
             let _ = seg.for_each_adj_posting_batch(
                 &node_ids,
                 Direction::Outgoing,
-                edge_type_filter,
+                edge_label_filter.as_deref(),
                 &mut |queried_nid, edge_id, neighbor_id, _weight, valid_from, valid_to| {
                     if !seen_edges.insert((queried_nid, edge_id)) {
                         return ControlFlow::Continue(());
@@ -5708,7 +6147,7 @@ impl ReadView {
     ///
     /// Returns an empty `Vec` if the node doesn't exist, is deleted, or is
     /// hidden by prune policy. Returns an empty `Vec` if the node exists but
-    /// is excluded by `node_type_filter`.
+    /// is excluded by `node_label_filter`.
     ///
     /// # Examples
     ///
@@ -5724,24 +6163,33 @@ impl ReadView {
         node_id: u64,
         options: &ComponentOptions,
     ) -> Result<Vec<u64>, EngineError> {
-        let edge_type_filter = options.edge_type_filter.as_deref();
-        let node_type_filter = options.node_type_filter.as_deref();
+        let resolved_edge_filter =
+            self.resolve_edge_label_filter_for_graph(options.edge_label_filter.as_deref())?;
+        let edge_label_filter = match resolved_edge_filter {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => Some(Vec::new()),
+        };
+        let node_label_filter =
+            self.resolve_node_label_filter_request_for_graph(options.node_label_filter.as_ref())?;
+        if node_label_filter.is_empty_constraint() {
+            return Ok(Vec::new());
+        }
         let at_epoch = options.at_epoch;
+        let policy_cutoffs = self.query_policy_cutoffs();
         // Check if the start node exists and is visible (tombstones + policies).
         let start_node = match self.get_node(node_id)? {
             Some(n) => n,
             None => return Ok(Vec::new()),
         };
 
-        // If node_type_filter is set, the start node must pass it.
-        if let Some(filter) = node_type_filter {
-            if !filter.contains(&start_node.type_id) {
-                return Ok(Vec::new());
-            }
+        // If node_label_filter is set, the start node must pass it.
+        if !node_label_filter_matches(&node_label_filter, &start_node.label_ids) {
+            return Ok(Vec::new());
         }
-
-        let type_filter_set: Option<HashSet<u32>> =
-            node_type_filter.map(|f| f.iter().copied().collect());
+        if edge_label_filter.as_deref().is_some_and(|label_ids| label_ids.is_empty()) {
+            return Ok(vec![node_id]);
+        }
 
         let mut processed: IdSet = IdSet::with_hasher(IdBuildHasher::default());
         processed.insert(node_id);
@@ -5753,14 +6201,13 @@ impl ReadView {
 
         while !frontier.is_empty() {
             // Batch-fetch neighbors for all frontier nodes (undirected).
-            let batch_opts = NeighborOptions {
-                    direction: Direction::Both,
-                    type_filter: edge_type_filter.map(|s| s.to_vec()),
-                    limit: None,
-                    at_epoch,
-                    decay_lambda: None,
-                };
-            let all_neighbors = self.neighbors_batch(&frontier, &batch_opts)?;
+            let all_neighbors = self.neighbors_batch_resolved(
+                &frontier,
+                Direction::Both,
+                edge_label_filter.as_deref(),
+                at_epoch,
+                None,
+            )?;
 
             // Collect newly discovered neighbor IDs.
             candidate_ids.clear();
@@ -5776,23 +6223,21 @@ impl ReadView {
                 break;
             }
 
-            // If node_type_filter is set, check types of discovered nodes.
-            // Only nodes passing the filter join the component and frontier.
             next_frontier.clear();
-            if let Some(ref type_set) = type_filter_set {
-                candidate_ids.sort_unstable();
-                let nodes = self.get_nodes_raw(&candidate_ids)?;
-                for (&cid, slot) in candidate_ids.iter().zip(nodes.iter()) {
-                    if let Some(node) = slot {
-                        if type_set.contains(&node.type_id) {
-                            component.push(cid);
-                            next_frontier.push(cid);
-                        }
-                    }
-                }
-            } else {
+            if Self::node_label_filter_is_unconstrained(&node_label_filter)
+                && policy_cutoffs.is_none()
+            {
                 component.extend(&candidate_ids);
                 next_frontier.extend(&candidate_ids);
+            } else {
+                // Only nodes passing the filter join the component and frontier.
+                let filtered_ids = self.filter_node_ids_by_resolved_label_filter(
+                    &candidate_ids,
+                    &node_label_filter,
+                    policy_cutoffs.as_ref(),
+                )?;
+                component.extend(&filtered_ids);
+                next_frontier.extend(&filtered_ids);
             }
 
             std::mem::swap(&mut frontier, &mut next_frontier);

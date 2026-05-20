@@ -68,32 +68,32 @@ class TestClose:
         db = OverGraph.open(db_path)
         db.close()
         with pytest.raises(OverGraphError):
-            db.upsert_node(1, "k")
+            db.upsert_node("Person", "k")
 
 
 class TestContextManager:
     def test_context_manager_basic(self, db_path):
         with OverGraph.open(db_path) as db:
-            nid = db.upsert_node(1, "hello")
+            nid = db.upsert_node("Person", "hello")
             assert nid > 0
 
     def test_context_manager_closes_on_exit(self, db_path):
         db = OverGraph.open(db_path)
         with db:
-            db.upsert_node(1, "hello")
+            db.upsert_node("Person", "hello")
         with pytest.raises(OverGraphError):
-            db.upsert_node(1, "world")
+            db.upsert_node("Person", "world")
 
     def test_context_manager_closes_on_exception(self, db_path):
         db = OverGraph.open(db_path)
         try:
             with db:
-                db.upsert_node(1, "hello")
+                db.upsert_node("Person", "hello")
                 raise ValueError("boom")
         except ValueError:
             pass
         with pytest.raises(OverGraphError):
-            db.upsert_node(1, "world")
+            db.upsert_node("Person", "world")
 
 
 class TestStats:
@@ -110,7 +110,7 @@ class TestStats:
         assert "DbStats" in r
 
     def test_stats_after_writes(self, db):
-        db.upsert_node(1, "a")
-        db.upsert_node(1, "b")
+        db.upsert_node("Person", "a")
+        db.upsert_node("Person", "b")
         s = db.stats()
         assert s.pending_wal_bytes > 0

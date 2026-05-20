@@ -6,26 +6,26 @@ from overgraph import OverGraph
 
 class TestPrune:
     def test_prune_by_weight(self, db):
-        db.upsert_node(1, "low", weight=0.1)
-        db.upsert_node(1, "high", weight=5.0)
+        db.upsert_node("Person", "low", weight=0.1)
+        db.upsert_node("Person", "high", weight=5.0)
         result = db.prune(max_weight=0.5)
         assert result.nodes_pruned == 1
         assert result.edges_pruned == 0
-        assert db.get_node_by_key(1, "low") is None
-        assert db.get_node_by_key(1, "high") is not None
+        assert db.get_node_by_key("Person", "low") is None
+        assert db.get_node_by_key("Person", "high") is not None
 
     def test_prune_by_type(self, db):
-        db.upsert_node(1, "a", weight=0.1)
-        db.upsert_node(2, "b", weight=0.1)
-        result = db.prune(max_weight=0.5, type_id=1)
+        db.upsert_node("Person", "a", weight=0.1)
+        db.upsert_node("Company", "b", weight=0.1)
+        result = db.prune(max_weight=0.5, label="Person")
         assert result.nodes_pruned == 1
         # Type 2 should survive
-        assert db.get_node_by_key(2, "b") is not None
+        assert db.get_node_by_key("Company", "b") is not None
 
     def test_prune_cascades_edges(self, db):
-        n1 = db.upsert_node(1, "a", weight=0.1)
-        n2 = db.upsert_node(1, "b", weight=5.0)
-        eid = db.upsert_edge(n1, n2, 10)
+        n1 = db.upsert_node("Person", "a", weight=0.1)
+        n2 = db.upsert_node("Person", "b", weight=5.0)
+        eid = db.upsert_edge(n1, n2, "RELATES_TO")
         result = db.prune(max_weight=0.5)
         assert result.nodes_pruned == 1
         assert result.edges_pruned >= 1
@@ -33,19 +33,19 @@ class TestPrune:
 
     def test_prune_no_match(self, db):
         # weight 5.0 > threshold 0.1, so node survives
-        db.upsert_node(1, "a", weight=5.0)
+        db.upsert_node("Person", "a", weight=5.0)
         result = db.prune(max_weight=0.1)
         assert result.nodes_pruned == 0
 
     def test_prune_no_criteria_rejects(self, db):
-        db.upsert_node(1, "a")
+        db.upsert_node("Person", "a")
         with pytest.raises(Exception, match="at least max_age_ms or max_weight"):
             db.prune()  # no criteria = error
 
     def test_prune_by_age(self, db):
-        db.upsert_node(1, "old", weight=5.0)
+        db.upsert_node("Person", "old", weight=5.0)
         time.sleep(0.05)  # 50ms
-        db.upsert_node(1, "new", weight=5.0)
+        db.upsert_node("Person", "new", weight=5.0)
         result = db.prune(max_age_ms=10)  # Prune anything older than 10ms
         # The "old" node should be pruned (50ms old > 10ms threshold)
         assert result.nodes_pruned >= 1
@@ -81,15 +81,15 @@ class TestPrunePolicies:
         removed = db.remove_prune_policy("nope")
         assert removed is False
 
-    def test_policy_with_type_id(self, db):
-        db.set_prune_policy("typed", max_weight=0.5, type_id=1)
+    def test_policy_with_label(self, db):
+        db.set_prune_policy("typed", max_weight=0.5, label="Person")
         policies = db.list_prune_policies()
-        assert policies[0].type_id == 1
+        assert policies[0].label == "Person"
 
     def test_policy_filtering_reads(self, db):
         """Registered policies should filter reads immediately."""
-        n1 = db.upsert_node(1, "low", weight=0.1)
-        n2 = db.upsert_node(1, "high", weight=5.0)
+        n1 = db.upsert_node("Person", "low", weight=0.1)
+        n2 = db.upsert_node("Person", "high", weight=5.0)
         # Before policy: both visible
         assert db.get_node(n1) is not None
         assert db.get_node(n2) is not None

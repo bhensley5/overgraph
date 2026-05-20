@@ -1,7 +1,410 @@
 use crate::error::EngineError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
+
+pub(crate) const LABEL_TOKEN_SCHEMA_VERSION: u32 = 1;
+#[allow(dead_code)]
+pub(crate) const MAX_NODE_LABELS_PER_NODE: usize = 10;
+
+pub(crate) fn validate_label_token_name(name: &str) -> Result<(), EngineError> {
+    if name.is_empty() {
+        return Err(EngineError::InvalidOperation(
+            "label token name must not be empty".to_string(),
+        ));
+    }
+    if name.len() > 255 {
+        return Err(EngineError::InvalidOperation(format!(
+            "label token name must be at most 255 UTF-8 bytes, got {}",
+            name.len()
+        )));
+    }
+    if name.trim_matches(char::is_whitespace).len() != name.len() {
+        return Err(EngineError::InvalidOperation(
+            "label token name must not contain leading or trailing whitespace".to_string(),
+        ));
+    }
+    if name
+        .chars()
+        .any(|ch| ch == '\0' || (ch.is_ascii() && ch.is_control()))
+    {
+        return Err(EngineError::InvalidOperation(
+            "label token name must not contain ASCII control characters or NUL".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn validate_public_node_label_list<'a, I>(labels: I) -> Result<(), EngineError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    ValidatedNodeLabelList::new(labels).map(|_| ())
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedNodeLabelList<'a> {
+    count: u8,
+    labels: [&'a str; MAX_NODE_LABELS_PER_NODE],
+}
+
+#[allow(dead_code)]
+impl<'a> ValidatedNodeLabelList<'a> {
+    pub(crate) fn new<I>(labels: I) -> Result<Self, EngineError>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut stored: [&'a str; MAX_NODE_LABELS_PER_NODE] = [""; MAX_NODE_LABELS_PER_NODE];
+        let mut count = 0usize;
+        let mut total_count = 0usize;
+        for label in labels {
+            validate_label_token_name(label)?;
+            total_count += 1;
+            if count < MAX_NODE_LABELS_PER_NODE {
+                stored[count] = label;
+                count += 1;
+            }
+        }
+        if total_count == 0 {
+            return Err(EngineError::InvalidOperation(
+                "node label set must contain at least one label".to_string(),
+            ));
+        }
+        if total_count > MAX_NODE_LABELS_PER_NODE {
+            return Err(EngineError::InvalidOperation(format!(
+                "node label set must contain at most {} labels",
+                MAX_NODE_LABELS_PER_NODE
+            )));
+        }
+        for idx in 0..count {
+            if stored[..idx].iter().any(|&seen| seen == stored[idx]) {
+                return Err(EngineError::InvalidOperation(format!(
+                    "node label set contains duplicate label '{}'",
+                    stored[idx]
+                )));
+            }
+        }
+        Ok(Self {
+            count: count as u8,
+            labels: stored,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[&'a str] {
+        &self.labels[..self.len()]
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn validate_node_label_filter(filter: &NodeLabelFilter) -> Result<(), EngineError> {
+    validate_public_node_label_list(filter.labels.iter().map(String::as_str))
+}
+
+mod node_label_input_seal {
+    pub trait Sealed {}
+}
+
+/// Converts accepted public Rust node-label inputs into the owned label payload
+/// used by queued write requests.
+pub trait IntoNodeLabels: node_label_input_seal::Sealed {
+    fn into_node_labels(self) -> Vec<String>;
+}
+
+impl node_label_input_seal::Sealed for &str {}
+
+impl IntoNodeLabels for &str {
+    fn into_node_labels(self) -> Vec<String> {
+        vec![self.to_string()]
+    }
+}
+
+impl node_label_input_seal::Sealed for String {}
+
+impl IntoNodeLabels for String {
+    fn into_node_labels(self) -> Vec<String> {
+        vec![self]
+    }
+}
+
+impl node_label_input_seal::Sealed for &String {}
+
+impl IntoNodeLabels for &String {
+    fn into_node_labels(self) -> Vec<String> {
+        vec![self.clone()]
+    }
+}
+
+impl node_label_input_seal::Sealed for &[&str] {}
+
+impl IntoNodeLabels for &[&str] {
+    fn into_node_labels(self) -> Vec<String> {
+        self.iter().map(|label| (*label).to_string()).collect()
+    }
+}
+
+impl node_label_input_seal::Sealed for &[String] {}
+
+impl IntoNodeLabels for &[String] {
+    fn into_node_labels(self) -> Vec<String> {
+        self.to_vec()
+    }
+}
+
+impl node_label_input_seal::Sealed for Vec<String> {}
+
+impl IntoNodeLabels for Vec<String> {
+    fn into_node_labels(self) -> Vec<String> {
+        self
+    }
+}
+
+impl<const N: usize> node_label_input_seal::Sealed for &[&str; N] {}
+
+impl<const N: usize> IntoNodeLabels for &[&str; N] {
+    fn into_node_labels(self) -> Vec<String> {
+        self.as_slice().into_node_labels()
+    }
+}
+
+impl<const N: usize> node_label_input_seal::Sealed for &[String; N] {}
+
+impl<const N: usize> IntoNodeLabels for &[String; N] {
+    fn into_node_labels(self) -> Vec<String> {
+        self.as_slice().into_node_labels()
+    }
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct NodeLabelSet {
+    count: u8,
+    label_ids: [u32; MAX_NODE_LABELS_PER_NODE],
+}
+
+#[allow(dead_code)]
+impl NodeLabelSet {
+    pub(crate) fn single(label_id: u32) -> Result<Self, EngineError> {
+        Self::from_canonical_ids(&[label_id])
+    }
+
+    pub(crate) fn from_label_ids<I>(label_ids: I) -> Result<Self, EngineError>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut ids = [0u32; MAX_NODE_LABELS_PER_NODE];
+        let mut count = 0usize;
+        for label_id in label_ids {
+            if count == MAX_NODE_LABELS_PER_NODE {
+                return Err(EngineError::InvalidOperation(format!(
+                    "node label set must contain at most {} labels",
+                    MAX_NODE_LABELS_PER_NODE
+                )));
+            }
+            ids[count] = label_id;
+            count += 1;
+        }
+        if count == 0 {
+            return Err(EngineError::InvalidOperation(
+                "node label set must contain at least one label".to_string(),
+            ));
+        }
+        ids[..count].sort_unstable();
+        Self::from_sorted_prefix(ids, count)
+    }
+
+    pub(crate) fn from_canonical_ids(label_ids: &[u32]) -> Result<Self, EngineError> {
+        if label_ids.is_empty() {
+            return Err(EngineError::InvalidOperation(
+                "node label set must contain at least one label".to_string(),
+            ));
+        }
+        if label_ids.len() > MAX_NODE_LABELS_PER_NODE {
+            return Err(EngineError::InvalidOperation(format!(
+                "node label set must contain at most {} labels",
+                MAX_NODE_LABELS_PER_NODE
+            )));
+        }
+        let mut ids = [0u32; MAX_NODE_LABELS_PER_NODE];
+        for (idx, &label_id) in label_ids.iter().enumerate() {
+            ids[idx] = label_id;
+            if label_id == 0 {
+                return Err(EngineError::InvalidOperation(
+                    "node label token ID 0 is reserved".to_string(),
+                ));
+            }
+            if idx > 0 && label_ids[idx - 1] >= label_id {
+                return Err(EngineError::InvalidOperation(
+                    "node label IDs must be sorted ascending and unique".to_string(),
+                ));
+            }
+        }
+        Ok(Self {
+            count: label_ids.len() as u8,
+            label_ids: ids,
+        })
+    }
+
+    fn from_sorted_prefix(
+        label_ids: [u32; MAX_NODE_LABELS_PER_NODE],
+        count: usize,
+    ) -> Result<Self, EngineError> {
+        for idx in 0..count {
+            if label_ids[idx] == 0 {
+                return Err(EngineError::InvalidOperation(
+                    "node label token ID 0 is reserved".to_string(),
+                ));
+            }
+            if idx > 0 && label_ids[idx - 1] == label_ids[idx] {
+                return Err(EngineError::InvalidOperation(format!(
+                    "node label set contains duplicate label ID {}",
+                    label_ids[idx]
+                )));
+            }
+        }
+        Ok(Self {
+            count: count as u8,
+            label_ids,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        &self.label_ids[..self.len()]
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, label_id: u32) -> bool {
+        self.as_slice().binary_search(&label_id).is_ok()
+    }
+
+    #[inline]
+    pub(crate) fn contains_all(&self, required: &NodeLabelSet) -> bool {
+        required
+            .as_slice()
+            .iter()
+            .all(|&label_id| self.contains(label_id))
+    }
+
+    #[inline]
+    pub(crate) fn contains_any(&self, candidates: &NodeLabelSet) -> bool {
+        candidates
+            .as_slice()
+            .iter()
+            .any(|&label_id| self.contains(label_id))
+    }
+
+    #[inline]
+    pub(crate) fn single_label_id(&self) -> u32 {
+        debug_assert_eq!(self.len(), 1);
+        self.as_slice()[0]
+    }
+
+    pub(crate) fn require_single_label_id(&self, context: &str) -> Result<u32, EngineError> {
+        if self.len() == 1 {
+            Ok(self.single_label_id())
+        } else {
+            Err(EngineError::InvalidOperation(format!(
+                "{context} currently supports exactly one node label, got {}",
+                self.len()
+            )))
+        }
+    }
+}
+
+impl fmt::Debug for NodeLabelSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("NodeLabelSet")
+            .field(&self.as_slice())
+            .finish()
+    }
+}
+
+/// Match mode for public node-label filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LabelMatchMode {
+    Any,
+    All,
+}
+
+/// Public node-label filter used by multi-label-capable APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLabelFilter {
+    pub labels: Vec<String>,
+    pub mode: LabelMatchMode,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedNodeLabelFilter {
+    Unconstrained,
+    Empty {
+        mode: LabelMatchMode,
+        unknown_label_count: usize,
+    },
+    LabelSet {
+        mode: LabelMatchMode,
+        label_ids: NodeLabelSet,
+        unknown_label_count: usize,
+    },
+}
+
+#[allow(dead_code)]
+impl ResolvedNodeLabelFilter {
+    pub(crate) fn known(
+        mode: LabelMatchMode,
+        label_ids: NodeLabelSet,
+        unknown_label_count: usize,
+    ) -> Self {
+        Self::LabelSet {
+            mode,
+            label_ids,
+            unknown_label_count,
+        }
+    }
+
+    pub(crate) fn empty(mode: LabelMatchMode, unknown_label_count: usize) -> Self {
+        Self::Empty {
+            mode,
+            unknown_label_count,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn mode(&self) -> Option<LabelMatchMode> {
+        match self {
+            Self::Unconstrained => None,
+            Self::Empty { mode, .. } | Self::LabelSet { mode, .. } => Some(*mode),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn label_ids(&self) -> Option<NodeLabelSet> {
+        match self {
+            Self::LabelSet { label_ids, .. } => Some(*label_ids),
+            Self::Unconstrained | Self::Empty { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty_constraint(&self) -> bool {
+        matches!(self, Self::Empty { .. })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Identity hasher for engine-generated u64 IDs (node IDs, edge IDs).
@@ -67,6 +470,27 @@ pub type NodeIdMap<V> = HashMap<u64, V, NodeIdBuildHasher>;
 
 /// A `HashSet` of node or edge IDs with identity hashing.
 pub type NodeIdSet = HashSet<u64, NodeIdBuildHasher>;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NodeVisibilityMeta {
+    pub(crate) label_ids: NodeLabelSet,
+    pub(crate) updated_at: i64,
+    pub(crate) weight: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum NodeVisibilityState {
+    Live(NodeVisibilityMeta),
+    Deleted,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeVisibilityState {
+    Live,
+    Deleted,
+    Missing,
+}
 
 /// Property value types supported in node/edge properties.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,7 +562,7 @@ impl Default for HnswConfig {
     }
 }
 
-/// Configuration for the single DB-scoped dense vector space in Phase 19.
+/// Configuration for the single DB-scoped dense vector space.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DenseVectorConfig {
     pub dimension: u32,
@@ -176,7 +600,7 @@ pub struct VectorSearchScope {
     pub start_node_id: u64,
     pub max_depth: u32,
     pub direction: Direction,
-    pub edge_type_filter: Option<Vec<u32>>,
+    pub edge_label_filter: Option<Vec<String>>,
     pub at_epoch: Option<i64>,
 }
 
@@ -187,7 +611,7 @@ pub struct VectorSearchRequest {
     pub dense_query: Option<DenseVector>,
     pub sparse_query: Option<SparseVector>,
     pub k: usize,
-    pub type_filter: Option<Vec<u32>>,
+    pub label_filter: Option<NodeLabelFilter>,
     pub ef_search: Option<usize>,
     pub scope: Option<VectorSearchScope>,
     pub dense_weight: Option<f32>,
@@ -318,11 +742,12 @@ pub struct TombstoneEntry {
     pub last_write_seq: u64,
 }
 
-/// A node record in the graph.
+/// Internal numeric node record used by storage, WAL, indexes, and planners.
+#[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeRecord {
+pub(crate) struct NodeRecord {
     pub id: u64,
-    pub type_id: u32,
+    pub label_ids: NodeLabelSet,
     pub key: String,
     pub props: BTreeMap<String, PropValue>,
     pub created_at: i64,
@@ -336,13 +761,14 @@ pub struct NodeRecord {
     pub last_write_seq: u64,
 }
 
-/// An edge record in the graph.
+/// Internal numeric edge record used by storage, WAL, indexes, and planners.
+#[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EdgeRecord {
+pub(crate) struct EdgeRecord {
     pub id: u64,
     pub from: u64,
     pub to: u64,
-    pub type_id: u32,
+    pub label_id: u32,
     pub props: BTreeMap<String, PropValue>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -353,6 +779,42 @@ pub struct EdgeRecord {
     pub valid_to: i64,
     #[serde(default)]
     pub last_write_seq: u64,
+}
+
+/// Public, fully hydrated node record returned by core point-read APIs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeView {
+    pub id: u64,
+    pub labels: Vec<String>,
+    pub key: String,
+    pub props: BTreeMap<String, PropValue>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub weight: f32,
+    pub dense_vector: Option<DenseVector>,
+    pub sparse_vector: Option<SparseVector>,
+}
+
+/// Public, fully hydrated edge record returned by core point-read APIs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeView {
+    pub id: u64,
+    pub from: u64,
+    pub to: u64,
+    pub label: String,
+    pub props: BTreeMap<String, PropValue>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub weight: f32,
+    pub valid_from: i64,
+    pub valid_to: i64,
+}
+
+/// Public key lookup request for `get_nodes_by_keys`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeKeyQuery {
+    pub label: String,
+    pub key: String,
 }
 
 /// Request parameters for cursor-based pagination.
@@ -384,7 +846,8 @@ pub struct PageResult<T> {
 /// Request for planner-backed node queries.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeQuery {
-    pub type_id: Option<u32>,
+    /// Optional node-label membership filter.
+    pub label_filter: Option<NodeLabelFilter>,
     pub ids: Vec<u64>,
     pub keys: Vec<String>,
     pub filter: Option<NodeFilterExpr>,
@@ -396,7 +859,7 @@ pub struct NodeQuery {
 impl Default for NodeQuery {
     fn default() -> Self {
         Self {
-            type_id: None,
+            label_filter: None,
             ids: Vec::new(),
             keys: Vec::new(),
             filter: None,
@@ -454,7 +917,103 @@ pub struct QueryNodeIdsResult {
 /// Hydrated result for planner-backed node queries.
 #[derive(Debug, Clone)]
 pub struct QueryNodesResult {
-    pub items: Vec<NodeRecord>,
+    pub items: Vec<NodeView>,
+    pub next_cursor: Option<u64>,
+}
+
+/// Request for planner-backed edge queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeQuery {
+    pub label: Option<String>,
+    pub ids: Vec<u64>,
+    pub from_ids: Vec<u64>,
+    pub to_ids: Vec<u64>,
+    pub endpoint_ids: Vec<u64>,
+    pub filter: Option<EdgeFilterExpr>,
+    pub page: PageRequest,
+    pub order: EdgeQueryOrder,
+    pub allow_full_scan: bool,
+}
+
+impl Default for EdgeQuery {
+    fn default() -> Self {
+        Self {
+            label: None,
+            ids: Vec::new(),
+            from_ids: Vec::new(),
+            to_ids: Vec::new(),
+            endpoint_ids: Vec::new(),
+            filter: None,
+            page: PageRequest::default(),
+            order: EdgeQueryOrder::EdgeIdAsc,
+            allow_full_scan: false,
+        }
+    }
+}
+
+/// Recursive boolean filter supported by planner-backed edge queries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EdgeFilterExpr {
+    PropertyEquals {
+        key: String,
+        value: PropValue,
+    },
+    PropertyIn {
+        key: String,
+        values: Vec<PropValue>,
+    },
+    PropertyRange {
+        key: String,
+        lower: Option<PropertyRangeBound>,
+        upper: Option<PropertyRangeBound>,
+    },
+    PropertyExists {
+        key: String,
+    },
+    PropertyMissing {
+        key: String,
+    },
+    WeightRange {
+        lower: Option<f32>,
+        upper: Option<f32>,
+    },
+    UpdatedAtRange {
+        lower_ms: Option<i64>,
+        upper_ms: Option<i64>,
+    },
+    ValidAt {
+        epoch_ms: i64,
+    },
+    ValidFromRange {
+        lower_ms: Option<i64>,
+        upper_ms: Option<i64>,
+    },
+    ValidToRange {
+        lower_ms: Option<i64>,
+        upper_ms: Option<i64>,
+    },
+    And(Vec<EdgeFilterExpr>),
+    Or(Vec<EdgeFilterExpr>),
+    Not(Box<EdgeFilterExpr>),
+}
+
+/// Result ordering for planner-backed edge queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeQueryOrder {
+    EdgeIdAsc,
+}
+
+/// ID-only result for planner-backed edge queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryEdgeIdsResult {
+    pub edge_ids: Vec<u64>,
+    pub next_cursor: Option<u64>,
+}
+
+/// Hydrated result for planner-backed edge queries.
+#[derive(Debug, Clone)]
+pub struct QueryEdgesResult {
+    pub edges: Vec<EdgeView>,
     pub next_cursor: Option<u64>,
 }
 
@@ -472,7 +1031,8 @@ pub struct GraphPatternQuery {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodePattern {
     pub alias: String,
-    pub type_id: Option<u32>,
+    /// Optional node-label membership filter.
+    pub label_filter: Option<NodeLabelFilter>,
     pub ids: Vec<u64>,
     pub keys: Vec<String>,
     pub filter: Option<NodeFilterExpr>,
@@ -485,22 +1045,8 @@ pub struct EdgePattern {
     pub from_alias: String,
     pub to_alias: String,
     pub direction: Direction,
-    pub type_filter: Option<Vec<u32>>,
-    pub property_predicates: Vec<EdgePostFilterPredicate>,
-}
-
-/// Predicate supported as a bounded post-filter on expanded edges.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EdgePostFilterPredicate {
-    PropertyEquals {
-        key: String,
-        value: PropValue,
-    },
-    PropertyRange {
-        key: String,
-        lower: Option<PropertyRangeBound>,
-        upper: Option<PropertyRangeBound>,
-    },
+    pub label_filter: Vec<String>,
+    pub filter: Option<EdgeFilterExpr>,
 }
 
 /// Result ordering for planner-backed graph pattern queries.
@@ -531,6 +1077,7 @@ pub struct QueryMatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPlanKind {
     NodeQuery,
+    EdgeQuery,
     PatternQuery,
 }
 
@@ -541,6 +1088,34 @@ pub struct QueryPlan {
     pub root: QueryPlanNode,
     pub estimated_candidates: Option<u64>,
     pub warnings: Vec<QueryPlanWarning>,
+    pub notes: Vec<QueryPlanNote>,
+    pub public_inputs: QueryPlanPublicInputs,
+}
+
+/// Public names referenced by planner explain input normalization.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryPlanPublicInputs {
+    pub node_labels: Vec<QueryPlanPublicName>,
+    pub edge_labels: Vec<QueryPlanPublicName>,
+}
+
+/// One public node-label or edge-label name surfaced in explain output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryPlanPublicName {
+    pub alias: Option<String>,
+    pub name: String,
+    pub known: bool,
+    pub mode: Option<LabelMatchMode>,
+}
+
+/// Non-warning explain notes for planner behavior that is expected and
+/// correctness-relevant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryPlanNote {
+    NodeLabelAnyDedupeBeforePagination,
+    NodeLabelAnyFinalVerification,
+    NodeLabelAllSupersetVerification,
+    StaleNodeLabelMembershipVerification,
 }
 
 /// Explain tree node for planner-backed queries.
@@ -548,11 +1123,22 @@ pub struct QueryPlan {
 pub enum QueryPlanNode {
     ExplicitIds,
     KeyLookup,
-    NodeTypeIndex,
+    NodeLabelIndex,
+    NodeLabelAnyIndex,
     PropertyEqualityIndex,
     PropertyRangeIndex,
     TimestampIndex,
     AdjacencyExpansion,
+    ExplicitEdgeIds,
+    EdgeLabelIndex,
+    EdgeTripleIndex,
+    EdgeEndpointAdjacency,
+    EdgeWeightIndex,
+    EdgeUpdatedAtIndex,
+    EdgeValidityIndex,
+    EdgeMetadataScan,
+    EdgePropertyEqualityIndex,
+    EdgePropertyRangeIndex,
     Intersect {
         inputs: Vec<QueryPlanNode>,
     },
@@ -562,6 +1148,9 @@ pub enum QueryPlanNode {
     VerifyNodeFilter {
         input: Box<QueryPlanNode>,
     },
+    VerifyEdgeFilter {
+        input: Box<QueryPlanNode>,
+    },
     VerifyEdgePredicates {
         input: Box<QueryPlanNode>,
     },
@@ -569,8 +1158,14 @@ pub enum QueryPlanNode {
         anchor_alias: String,
         input: Box<QueryPlanNode>,
     },
-    FallbackTypeScan,
+    PatternEdgeAnchor {
+        edge_alias: Option<String>,
+        input: Box<QueryPlanNode>,
+    },
+    FallbackNodeLabelScan,
     FallbackFullNodeScan,
+    FallbackEdgeLabelScan,
+    FallbackFullEdgeScan,
     EmptyResult,
 }
 
@@ -590,6 +1185,8 @@ pub enum QueryPlanWarning {
     VerifyOnlyFilter,
     BooleanBranchFallback,
     PlanningProbeBudgetExceeded,
+    UnknownNodeLabel,
+    UnknownEdgeLabel,
 }
 
 /// Range domain for an optional secondary index declaration.
@@ -607,10 +1204,15 @@ pub enum SecondaryIndexKind {
     Range { domain: SecondaryIndexRangeDomain },
 }
 
-/// Target for an optional secondary index declaration.
+/// Diagnostic/internal target for an optional secondary index declaration.
+///
+/// This is exposed only because raw manifest inspection is a diagnostic surface.
+/// Ordinary property-index APIs use `NodePropertyIndexInfo` and
+/// `EdgePropertyIndexInfo`, which expose labels and edge labels instead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SecondaryIndexTarget {
-    NodeProperty { type_id: u32, prop_key: String },
+    NodeProperty { label_id: u32, prop_key: String },
+    EdgeProperty { label_id: u32, prop_key: String },
 }
 
 /// Lifecycle state for an optional secondary index declaration.
@@ -622,6 +1224,9 @@ pub enum SecondaryIndexState {
 }
 
 /// Persisted manifest entry for an optional secondary index declaration.
+///
+/// This raw manifest shape is diagnostic introspection. Ordinary public APIs
+/// return nameful index info DTOs instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecondaryIndexManifestEntry {
     pub index_id: u64,
@@ -636,7 +1241,32 @@ pub struct SecondaryIndexManifestEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePropertyIndexInfo {
     pub index_id: u64,
-    pub type_id: u32,
+    pub label: String,
+    pub prop_key: String,
+    pub kind: SecondaryIndexKind,
+    pub state: SecondaryIndexState,
+    pub last_error: Option<String>,
+}
+
+/// User-facing diagnostic information about a node-label token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLabelInfo {
+    pub label: String,
+    pub label_id: u32,
+}
+
+/// User-facing diagnostic information about an edge-label token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeLabelInfo {
+    pub label: String,
+    pub label_id: u32,
+}
+
+/// User-facing information about an edge-property optional secondary index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgePropertyIndexInfo {
+    pub index_id: u64,
+    pub label: String,
     pub prop_key: String,
     pub kind: SecondaryIndexKind,
     pub state: SecondaryIndexState,
@@ -690,6 +1320,10 @@ pub(crate) enum WalOp {
     UpsertEdge(EdgeRecord),
     DeleteNode { id: u64, deleted_at: i64 },
     DeleteEdge { id: u64, deleted_at: i64 },
+    EnsureNodeLabel { label: String, label_id: u32 },
+    EnsureEdgeLabel { label: String, label_id: u32 },
+    BeginAtomicBatch { first_seq: u64, op_count: u32 },
+    CommitAtomicBatch { first_seq: u64, op_count: u32 },
 }
 
 /// Operation type tags for binary encoding.
@@ -700,6 +1334,10 @@ pub(crate) enum OpTag {
     UpsertEdge = 2,
     DeleteNode = 3,
     DeleteEdge = 4,
+    EnsureNodeLabel = 5,
+    EnsureEdgeLabel = 6,
+    BeginAtomicBatch = 7,
+    CommitAtomicBatch = 8,
 }
 
 impl OpTag {
@@ -709,6 +1347,10 @@ impl OpTag {
             2 => Some(OpTag::UpsertEdge),
             3 => Some(OpTag::DeleteNode),
             4 => Some(OpTag::DeleteEdge),
+            5 => Some(OpTag::EnsureNodeLabel),
+            6 => Some(OpTag::EnsureEdgeLabel),
+            7 => Some(OpTag::BeginAtomicBatch),
+            8 => Some(OpTag::CommitAtomicBatch),
             _ => None,
         }
     }
@@ -720,16 +1362,40 @@ pub struct SegmentInfo {
     pub id: u64,
     pub node_count: u64,
     pub edge_count: u64,
+    #[serde(default)]
+    pub segment_format_version: u32,
+    #[serde(default)]
+    pub segment_data_id: [u8; 32],
 }
 
 /// Manifest state: the atomic checkpoint of the database.
+///
+/// This raw structure is exposed for explicit diagnostic introspection through
+/// `DatabaseEngine::manifest()` and `manifest::load_manifest_readonly()`.
+/// Ordinary graph APIs use named labels and edge labels and do not accept these
+/// internal numeric token IDs as inputs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestState {
     pub version: u32,
+    /// Named node-label / edge-label token schema marker.
+    #[serde(default)]
+    pub label_token_schema_version: u32,
+    /// DB-scoped node-label catalog: public label -> internal label_id.
+    #[serde(default)]
+    pub node_label_tokens: BTreeMap<String, u32>,
+    /// DB-scoped edge-label catalog: public edge label -> internal label_id.
+    #[serde(default)]
+    pub edge_label_tokens: BTreeMap<String, u32>,
+    /// Next node-label token ID to allocate.
+    #[serde(default)]
+    pub next_node_label_id: u32,
+    /// Next edge-label token ID to allocate.
+    #[serde(default)]
+    pub next_edge_label_id: u32,
     pub segments: Vec<SegmentInfo>,
     pub next_node_id: u64,
     pub next_edge_id: u64,
-    /// DB-scoped dense vector configuration for Phase 19.
+    /// DB-scoped dense vector configuration.
     #[serde(default)]
     pub dense_vector: Option<DenseVectorConfig>,
     /// Named prune policies applied automatically during compaction.
@@ -829,7 +1495,7 @@ pub struct CompactionStats {
 /// Input for batch node upsert (user-facing, no ID or timestamps).
 #[derive(Debug, Clone)]
 pub struct NodeInput {
-    pub type_id: u32,
+    pub labels: Vec<String>,
     pub key: String,
     pub props: BTreeMap<String, PropValue>,
     pub weight: f32,
@@ -910,7 +1576,7 @@ pub enum TxnLocalRef {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TxnNodeRef {
     Id(u64),
-    Key { type_id: u32, key: String },
+    Key { label: String, key: String },
     Local(TxnLocalRef),
 }
 
@@ -921,7 +1587,7 @@ pub enum TxnEdgeRef {
     Triple {
         from: TxnNodeRef,
         to: TxnNodeRef,
-        type_id: u32,
+        label: String,
     },
     Local(TxnLocalRef),
 }
@@ -931,7 +1597,7 @@ pub enum TxnEdgeRef {
 pub enum TxnIntent {
     UpsertNode {
         alias: Option<String>,
-        type_id: u32,
+        labels: Vec<String>,
         key: String,
         options: UpsertNodeOptions,
     },
@@ -939,7 +1605,7 @@ pub enum TxnIntent {
         alias: Option<String>,
         from: TxnNodeRef,
         to: TxnNodeRef,
-        type_id: u32,
+        label: String,
         options: UpsertEdgeOptions,
     },
     DeleteNode {
@@ -959,7 +1625,7 @@ pub enum TxnIntent {
 pub struct TxnNodeView {
     pub id: Option<u64>,
     pub local: Option<TxnLocalRef>,
-    pub type_id: u32,
+    pub labels: Vec<String>,
     pub key: String,
     pub props: BTreeMap<String, PropValue>,
     pub created_at: Option<i64>,
@@ -976,7 +1642,7 @@ pub struct TxnEdgeView {
     pub local: Option<TxnLocalRef>,
     pub from: TxnNodeRef,
     pub to: TxnNodeRef,
-    pub type_id: u32,
+    pub label: String,
     pub props: BTreeMap<String, PropValue>,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
@@ -1025,8 +1691,8 @@ impl TxnCommitResult {
 pub struct NeighborOptions {
     /// Edge direction. Default: Outgoing.
     pub direction: Direction,
-    /// Only include edges of these types. Default: None (all types).
-    pub type_filter: Option<Vec<u32>>,
+    /// Only include edges with these labels. Default: None (all labels).
+    pub edge_label_filter: Option<Vec<String>>,
     /// Maximum number of results. Default: None (unlimited).
     pub limit: Option<usize>,
     /// Point-in-time epoch for temporal filtering. Default: None (current time).
@@ -1039,7 +1705,7 @@ impl Default for NeighborOptions {
     fn default() -> Self {
         Self {
             direction: Direction::Outgoing,
-            type_filter: None,
+            edge_label_filter: None,
             limit: None,
             at_epoch: None,
             decay_lambda: None,
@@ -1057,8 +1723,8 @@ impl Default for NeighborOptions {
 pub struct DegreeOptions {
     /// Edge direction. Default: Outgoing.
     pub direction: Direction,
-    /// Only include edges of these types. Default: None (all types).
-    pub type_filter: Option<Vec<u32>>,
+    /// Only include edges with these labels. Default: None (all labels).
+    pub edge_label_filter: Option<Vec<String>>,
     /// Point-in-time epoch for temporal filtering. Default: None (current time).
     pub at_epoch: Option<i64>,
 }
@@ -1067,7 +1733,7 @@ impl Default for DegreeOptions {
     fn default() -> Self {
         Self {
             direction: Direction::Outgoing,
-            type_filter: None,
+            edge_label_filter: None,
             at_epoch: None,
         }
     }
@@ -1083,8 +1749,8 @@ impl Default for DegreeOptions {
 pub struct TopKOptions {
     /// Edge direction. Default: Outgoing.
     pub direction: Direction,
-    /// Only include edges of these types. Default: None (all types).
-    pub type_filter: Option<Vec<u32>>,
+    /// Only include edges with these labels. Default: None (all labels).
+    pub edge_label_filter: Option<Vec<String>>,
     /// Scoring mode for ranking. Default: Weight.
     pub scoring: ScoringMode,
     /// Point-in-time epoch for temporal filtering. Default: None (current time).
@@ -1095,7 +1761,7 @@ impl Default for TopKOptions {
     fn default() -> Self {
         Self {
             direction: Direction::Outgoing,
-            type_filter: None,
+            edge_label_filter: None,
             scoring: ScoringMode::Weight,
             at_epoch: None,
         }
@@ -1114,10 +1780,10 @@ pub struct TraverseOptions {
     pub min_depth: u32,
     /// Edge direction. Default: Outgoing.
     pub direction: Direction,
-    /// Only traverse edges of these types. Default: None (all types).
-    pub edge_type_filter: Option<Vec<u32>>,
-    /// Only emit nodes of these types. Default: None (all types).
-    pub node_type_filter: Option<Vec<u32>>,
+    /// Only traverse edges with these labels. Default: None (all labels).
+    pub edge_label_filter: Option<Vec<String>>,
+    /// Only emit nodes matching this label filter. Default: None (all labels).
+    pub emit_node_label_filter: Option<NodeLabelFilter>,
     /// Point-in-time epoch for temporal filtering. Default: None (current time).
     pub at_epoch: Option<i64>,
     /// Exponential decay lambda for depth-based scoring. Default: None.
@@ -1133,8 +1799,8 @@ impl Default for TraverseOptions {
         Self {
             min_depth: 1,
             direction: Direction::Outgoing,
-            edge_type_filter: None,
-            node_type_filter: None,
+            edge_label_filter: None,
+            emit_node_label_filter: None,
             at_epoch: None,
             decay_lambda: None,
             limit: None,
@@ -1153,8 +1819,10 @@ impl Default for TraverseOptions {
 pub struct SubgraphOptions {
     /// Edge direction. Default: Outgoing.
     pub direction: Direction,
-    /// Only traverse edges of these types. Default: None (all types).
-    pub edge_type_filter: Option<Vec<u32>>,
+    /// Only traverse edges with these labels. Default: None (all labels).
+    pub edge_label_filter: Option<Vec<String>>,
+    /// Only include and expand through nodes matching this label filter. Default: None (all labels).
+    pub node_label_filter: Option<NodeLabelFilter>,
     /// Point-in-time epoch for temporal filtering. Default: None (current time).
     pub at_epoch: Option<i64>,
 }
@@ -1163,7 +1831,8 @@ impl Default for SubgraphOptions {
     fn default() -> Self {
         Self {
             direction: Direction::Outgoing,
-            edge_type_filter: None,
+            edge_label_filter: None,
+            node_label_filter: None,
             at_epoch: None,
         }
     }
@@ -1179,8 +1848,8 @@ impl Default for SubgraphOptions {
 pub struct ShortestPathOptions {
     /// Edge direction. Default: Outgoing.
     pub direction: Direction,
-    /// Only traverse edges of these types. Default: None (all types).
-    pub type_filter: Option<Vec<u32>>,
+    /// Only traverse edges with these labels. Default: None (all labels).
+    pub edge_label_filter: Option<Vec<String>>,
     /// Property key to use as edge weight (Dijkstra). Default: None (BFS hop count).
     pub weight_field: Option<String>,
     /// Point-in-time epoch for temporal filtering. Default: None (current time).
@@ -1195,7 +1864,7 @@ impl Default for ShortestPathOptions {
     fn default() -> Self {
         Self {
             direction: Direction::Outgoing,
-            type_filter: None,
+            edge_label_filter: None,
             weight_field: None,
             at_epoch: None,
             max_depth: None,
@@ -1214,8 +1883,8 @@ impl Default for ShortestPathOptions {
 pub struct AllShortestPathsOptions {
     /// Edge direction. Default: Outgoing.
     pub direction: Direction,
-    /// Only traverse edges of these types. Default: None (all types).
-    pub type_filter: Option<Vec<u32>>,
+    /// Only traverse edges with these labels. Default: None (all labels).
+    pub edge_label_filter: Option<Vec<String>>,
     /// Property key to use as edge weight (Dijkstra). Default: None (BFS hop count).
     pub weight_field: Option<String>,
     /// Point-in-time epoch for temporal filtering. Default: None (current time).
@@ -1232,7 +1901,7 @@ impl Default for AllShortestPathsOptions {
     fn default() -> Self {
         Self {
             direction: Direction::Outgoing,
-            type_filter: None,
+            edge_label_filter: None,
             weight_field: None,
             at_epoch: None,
             max_depth: None,
@@ -1252,8 +1921,8 @@ impl Default for AllShortestPathsOptions {
 pub struct IsConnectedOptions {
     /// Edge direction. Default: Outgoing.
     pub direction: Direction,
-    /// Only traverse edges of these types. Default: None (all types).
-    pub type_filter: Option<Vec<u32>>,
+    /// Only traverse edges with these labels. Default: None (all labels).
+    pub edge_label_filter: Option<Vec<String>>,
     /// Point-in-time epoch for temporal filtering. Default: None (current time).
     pub at_epoch: Option<i64>,
     /// Maximum search depth in hops. Default: None (unlimited).
@@ -1264,7 +1933,7 @@ impl Default for IsConnectedOptions {
     fn default() -> Self {
         Self {
             direction: Direction::Outgoing,
-            type_filter: None,
+            edge_label_filter: None,
             at_epoch: None,
             max_depth: None,
         }
@@ -1279,10 +1948,10 @@ impl Default for IsConnectedOptions {
 /// ```
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ComponentOptions {
-    /// Only traverse edges of these types. Default: None (all types).
-    pub edge_type_filter: Option<Vec<u32>>,
-    /// Only include nodes of these types. Default: None (all types).
-    pub node_type_filter: Option<Vec<u32>>,
+    /// Only traverse edges with these labels. Default: None (all labels).
+    pub edge_label_filter: Option<Vec<String>>,
+    /// Only include nodes matching this label filter. Default: None (all labels).
+    pub node_label_filter: Option<NodeLabelFilter>,
     /// Point-in-time epoch for temporal filtering. Default: None (current time).
     pub at_epoch: Option<i64>,
 }
@@ -1292,7 +1961,7 @@ pub struct ComponentOptions {
 pub struct EdgeInput {
     pub from: u64,
     pub to: u64,
-    pub type_id: u32,
+    pub label: String,
     pub props: BTreeMap<String, PropValue>,
     pub weight: f32,
     /// Optional start of validity window. If None, defaults to created_at.
@@ -1321,18 +1990,25 @@ pub struct PatchResult {
     pub edge_ids: Vec<u64>,
 }
 
+/// User-facing information about a named prune policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrunePolicyInfo {
+    pub name: String,
+    pub policy: PrunePolicy,
+}
+
 /// Policy for pruning (deleting) nodes that match all specified criteria.
 /// All fields are optional; when multiple are set, they combine with AND logic.
 /// At least one of `max_age_ms` or `max_weight` must be set. An empty policy
-/// (or one with only `type_id`) is rejected to prevent accidental mass deletion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// (or one with only `label`) is rejected to prevent accidental mass deletion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrunePolicy {
     /// Prune nodes whose `updated_at` is older than `now - max_age_ms`.
     pub max_age_ms: Option<i64>,
     /// Prune nodes whose `weight <= max_weight`.
     pub max_weight: Option<f32>,
-    /// Scope pruning to a single node type. If None, all types are eligible.
-    pub type_id: Option<u32>,
+    /// Scope pruning to a single node label. If None, all labels are eligible.
+    pub label: Option<String>,
 }
 
 /// Result of a prune operation.
@@ -1375,6 +2051,50 @@ pub struct DbStats {
     pub oldest_retained_wal_generation_id: u64,
 }
 
+/// Result of an offline integrity scrub of all segments in the database.
+#[derive(Debug, Clone)]
+pub struct ScrubReport {
+    pub segments: Vec<SegmentScrubResult>,
+    pub total_components_checked: u64,
+    pub total_components_ok: u64,
+    pub total_components_failed: u64,
+    pub total_bytes_digested: u64,
+    pub duration_ms: u64,
+}
+
+/// Scrub result for a single segment.
+#[derive(Debug, Clone)]
+pub struct SegmentScrubResult {
+    pub segment_id: u64,
+    pub findings: Vec<ComponentScrubFinding>,
+    pub components_ok: u64,
+    pub bytes_digested: u64,
+}
+
+/// A single problem detected during offline scrub.
+#[derive(Debug, Clone)]
+pub struct ComponentScrubFinding {
+    pub component_kind: String,
+    pub finding_type: ScrubFindingType,
+    pub detail: String,
+}
+
+/// Classification of a scrub finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubFindingType {
+    PayloadDigestMismatch,
+    ComponentIdMismatch,
+    DependencyDigestMismatch,
+    IdentityHeaderMismatch,
+    ContainerIdMismatch,
+    SegmentIdentityMismatch,
+    SemanticMismatch,
+    RangeOverflow,
+    RangeOverlap,
+    FileMissing,
+    IoError,
+}
+
 /// Direction for neighbor queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
@@ -1393,13 +2113,24 @@ pub struct NeighborEntry {
     pub node_id: u64,
     /// The edge connecting to this neighbor.
     pub edge_id: u64,
-    /// The edge's type_id.
-    pub edge_type_id: u32,
+    /// The edge label.
+    pub label: String,
     /// The edge weight.
     pub weight: f32,
     /// Start of validity window (epoch ms). 0 means always-valid.
     pub valid_from: i64,
     /// End of validity window (epoch ms). i64::MAX means open-ended.
+    pub valid_to: i64,
+}
+
+/// Internal numeric adjacency entry used by graph traversal/storage paths.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NeighborRecord {
+    pub node_id: u64,
+    pub edge_id: u64,
+    pub edge_label_id: u32,
+    pub weight: f32,
+    pub valid_from: i64,
     pub valid_to: i64,
 }
 
@@ -1461,12 +2192,12 @@ pub struct ShortestPath {
 }
 
 /// An extracted subgraph: all nodes and edges reachable within N hops of a starting node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Subgraph {
     /// All nodes in the subgraph (including the starting node).
-    pub nodes: Vec<NodeRecord>,
+    pub nodes: Vec<NodeView>,
     /// All edges connecting nodes in the subgraph discovered during traversal.
-    pub edges: Vec<EdgeRecord>,
+    pub edges: Vec<EdgeView>,
 }
 
 /// Options for Personalized PageRank computation.
@@ -1484,8 +2215,8 @@ pub struct PprOptions {
     /// Residual stopping tolerance for approximate forward-push PPR.
     /// Default: 1e-5. Used only when `algorithm` is `ApproxForwardPush`.
     pub approx_residual_tolerance: f64,
-    /// Optional edge type filter. Only walk edges of these types.
-    pub edge_type_filter: Option<Vec<u32>>,
+    /// Optional edge label filter. Only walk edges with these labels.
+    pub edge_label_filter: Option<Vec<String>>,
     /// Optional top-k cutoff on returned results.
     pub max_results: Option<usize>,
 }
@@ -1505,7 +2236,7 @@ impl Default for PprOptions {
             max_iterations: 20,
             epsilon: 1e-6,
             approx_residual_tolerance: 1e-5,
-            edge_type_filter: None,
+            edge_label_filter: None,
             max_results: None,
         }
     }
@@ -1540,10 +2271,10 @@ pub struct PprResult {
 /// Options for graph adjacency export.
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
-    /// Only include nodes of these types. None means all types.
-    pub node_type_filter: Option<Vec<u32>>,
-    /// Only include edges of these types. None means all types.
-    pub edge_type_filter: Option<Vec<u32>>,
+    /// Only include nodes matching this label filter. None means all labels.
+    pub node_label_filter: Option<NodeLabelFilter>,
+    /// Only include edges with these labels. None means all labels.
+    pub edge_label_filter: Option<Vec<String>>,
     /// Include edge weights in the output. Default: true.
     pub include_weights: bool,
 }
@@ -1551,22 +2282,36 @@ pub struct ExportOptions {
 impl Default for ExportOptions {
     fn default() -> Self {
         Self {
-            node_type_filter: None,
-            edge_type_filter: None,
+            node_label_filter: None,
+            edge_label_filter: None,
             include_weights: true,
         }
     }
 }
 
-/// An exported edge: (from_node_id, to_node_id, edge_type_id, weight).
-pub type ExportEdge = (u64, u64, u32, f32);
+/// An exported edge. `edge_label_index` is local to the export's `edge_labels` table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportEdge {
+    pub from: u64,
+    pub to: u64,
+    pub edge_label_index: u32,
+    pub weight: Option<f32>,
+}
 
 /// Result of a graph adjacency export.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdjacencyExport {
     /// All live node IDs in the exported subgraph.
     pub node_ids: Vec<u64>,
-    /// All live edges: (from, to, type_id, weight).
+    /// Export-local node-label side table.
+    #[serde(default)]
+    pub node_labels: Vec<String>,
+    /// Per-node label side-table indexes, aligned with `node_ids`.
+    #[serde(default)]
+    pub node_label_indexes: Vec<Vec<u32>>,
+    /// Export-local edge-label side table.
+    pub edge_labels: Vec<String>,
+    /// All live edges, referencing `edge_labels` by export-local index.
     pub edges: Vec<ExportEdge>,
 }
 
@@ -1714,8 +2459,77 @@ mod tests {
             assert_eq!(tag as u8, tag_val);
         }
         assert!(OpTag::from_u8(0).is_none());
-        assert!(OpTag::from_u8(5).is_none());
+        assert_eq!(OpTag::from_u8(5), Some(OpTag::EnsureNodeLabel));
+        assert_eq!(OpTag::from_u8(6), Some(OpTag::EnsureEdgeLabel));
+        assert_eq!(OpTag::from_u8(7), Some(OpTag::BeginAtomicBatch));
+        assert_eq!(OpTag::from_u8(8), Some(OpTag::CommitAtomicBatch));
         assert!(OpTag::from_u8(255).is_none());
+    }
+
+    #[test]
+    fn test_node_label_set_canonicalizes_distinct_ids() {
+        let set = NodeLabelSet::from_label_ids([7, 3, 5]).unwrap();
+        assert_eq!(set.len(), 3);
+        assert_eq!(set.as_slice(), &[3, 5, 7]);
+        assert!(set.contains(5));
+        assert!(!set.contains(4));
+        assert!(set.contains_all(&NodeLabelSet::from_label_ids([3, 7]).unwrap()));
+        assert!(set.contains_any(&NodeLabelSet::from_label_ids([2, 7]).unwrap()));
+        assert!(!set.contains_any(&NodeLabelSet::from_label_ids([1, 2]).unwrap()));
+        assert_eq!(NodeLabelSet::single(9).unwrap().as_slice(), &[9]);
+    }
+
+    #[test]
+    fn test_node_label_set_rejects_empty_duplicate_zero_and_too_many_ids() {
+        assert!(NodeLabelSet::from_label_ids([]).is_err());
+        assert!(NodeLabelSet::from_label_ids([3, 3]).is_err());
+        assert!(NodeLabelSet::from_label_ids([0]).is_err());
+        assert!(NodeLabelSet::from_label_ids(1..=11).is_err());
+    }
+
+    #[test]
+    fn test_node_label_set_canonical_decoder_rejects_unsorted_and_duplicates() {
+        assert_eq!(
+            NodeLabelSet::from_canonical_ids(&[1, 3, 5])
+                .unwrap()
+                .as_slice(),
+            &[1, 3, 5]
+        );
+        assert!(NodeLabelSet::from_canonical_ids(&[]).is_err());
+        assert!(NodeLabelSet::from_canonical_ids(&[2, 1]).is_err());
+        assert!(NodeLabelSet::from_canonical_ids(&[2, 2]).is_err());
+        assert!(NodeLabelSet::from_canonical_ids(&(1..=11).collect::<Vec<_>>()).is_err());
+    }
+
+    #[test]
+    fn test_public_node_label_list_validation() {
+        validate_public_node_label_list(["Person", "Employee"]).unwrap();
+        assert!(validate_public_node_label_list(std::iter::empty::<&str>()).is_err());
+        assert!(validate_public_node_label_list(["Person", "Person"]).is_err());
+        assert!(validate_public_node_label_list([" Person"]).is_err());
+        assert!(validate_public_node_label_list([
+            "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9", "L10", "L11"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn test_node_label_filter_validation_rejects_empty_and_duplicate_labels() {
+        validate_node_label_filter(&NodeLabelFilter {
+            labels: vec!["Person".to_string(), "Employee".to_string()],
+            mode: LabelMatchMode::All,
+        })
+        .unwrap();
+        assert!(validate_node_label_filter(&NodeLabelFilter {
+            labels: Vec::new(),
+            mode: LabelMatchMode::Any,
+        })
+        .is_err());
+        assert!(validate_node_label_filter(&NodeLabelFilter {
+            labels: vec!["Person".to_string(), "Person".to_string()],
+            mode: LabelMatchMode::Any,
+        })
+        .is_err());
     }
 
     #[test]
@@ -1732,7 +2546,7 @@ mod tests {
         let entry = NeighborEntry {
             node_id: 42,
             edge_id: 99,
-            edge_type_id: 7,
+            label: "FRIENDS_WITH".to_string(),
             weight: 0.75,
             valid_from: 1000,
             valid_to: i64::MAX,
@@ -1746,16 +2560,25 @@ mod tests {
     fn test_manifest_state_serde() {
         let state = ManifestState {
             version: 1,
+            label_token_schema_version: LABEL_TOKEN_SCHEMA_VERSION,
+            node_label_tokens: BTreeMap::new(),
+            edge_label_tokens: BTreeMap::new(),
+            next_node_label_id: 1,
+            next_edge_label_id: 1,
             segments: vec![
                 SegmentInfo {
                     id: 1,
                     node_count: 100,
                     edge_count: 200,
+                    segment_format_version: 10,
+                    segment_data_id: [1; 32],
                 },
                 SegmentInfo {
                     id: 2,
                     node_count: 50,
                     edge_count: 75,
+                    segment_format_version: 10,
+                    segment_data_id: [2; 32],
                 },
             ],
             next_node_id: 151,
@@ -1873,7 +2696,7 @@ mod tests {
     fn test_neighbor_options_default() {
         let opts = NeighborOptions::default();
         assert_eq!(opts.direction, Direction::Outgoing);
-        assert!(opts.type_filter.is_none());
+        assert!(opts.edge_label_filter.is_none());
         assert!(opts.limit.is_none());
         assert!(opts.at_epoch.is_none());
         assert!(opts.decay_lambda.is_none());
@@ -1883,7 +2706,7 @@ mod tests {
     fn test_degree_options_default() {
         let opts = DegreeOptions::default();
         assert_eq!(opts.direction, Direction::Outgoing);
-        assert!(opts.type_filter.is_none());
+        assert!(opts.edge_label_filter.is_none());
         assert!(opts.at_epoch.is_none());
     }
 
@@ -1892,8 +2715,8 @@ mod tests {
         let opts = TraverseOptions::default();
         assert_eq!(opts.min_depth, 1);
         assert_eq!(opts.direction, Direction::Outgoing);
-        assert!(opts.edge_type_filter.is_none());
-        assert!(opts.node_type_filter.is_none());
+        assert!(opts.edge_label_filter.is_none());
+        assert!(opts.emit_node_label_filter.is_none());
         assert!(opts.at_epoch.is_none());
         assert!(opts.decay_lambda.is_none());
         assert!(opts.limit.is_none());
@@ -1901,10 +2724,19 @@ mod tests {
     }
 
     #[test]
+    fn test_subgraph_options_default() {
+        let opts = SubgraphOptions::default();
+        assert_eq!(opts.direction, Direction::Outgoing);
+        assert!(opts.edge_label_filter.is_none());
+        assert!(opts.node_label_filter.is_none());
+        assert!(opts.at_epoch.is_none());
+    }
+
+    #[test]
     fn test_shortest_path_options_default() {
         let opts = ShortestPathOptions::default();
         assert_eq!(opts.direction, Direction::Outgoing);
-        assert!(opts.type_filter.is_none());
+        assert!(opts.edge_label_filter.is_none());
         assert!(opts.weight_field.is_none());
         assert!(opts.at_epoch.is_none());
         assert!(opts.max_depth.is_none());
@@ -1914,8 +2746,8 @@ mod tests {
     #[test]
     fn test_component_options_default() {
         let opts = ComponentOptions::default();
-        assert!(opts.edge_type_filter.is_none());
-        assert!(opts.node_type_filter.is_none());
+        assert!(opts.edge_label_filter.is_none());
+        assert!(opts.node_label_filter.is_none());
         assert!(opts.at_epoch.is_none());
     }
 

@@ -13,8 +13,23 @@ function planHasKind(node, kind) {
   return Array.isArray(node.inputs) && node.inputs.some(input => planHasKind(input, kind));
 }
 
+function nodeLabels(label) {
+  return { labels: [label], mode: 'all' };
+}
+
 function sortedIds(page) {
   return Array.from(page.items).sort((a, b) => a - b);
+}
+
+async function rejectsOrThrows(fn, pattern) {
+  let result;
+  try {
+    result = fn();
+  } catch (err) {
+    assert.match(String(err?.message ?? err), pattern);
+    return;
+  }
+  await assert.rejects(result, pattern);
 }
 
 async function waitForIndexState(db, predicate, expectedState = 'ready', timeoutMs = 5000) {
@@ -49,30 +64,30 @@ describe('query API parity', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-query-node-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
 
-    activeHigh = db.upsertNode(1, 'active-high', {
+    activeHigh = db.upsertNode('Person', 'active-high', {
       props: { status: 'active', score: 90, team: 'core' },
     });
-    activeLow = db.upsertNode(1, 'active-low', {
+    activeLow = db.upsertNode('Person', 'active-low', {
       props: { status: 'active', score: 40, team: 'core' },
     });
-    inactive = db.upsertNode(1, 'inactive', {
+    inactive = db.upsertNode('Person', 'inactive', {
       props: { status: 'inactive', score: 95, team: 'core' },
     });
-    literalUpdatedAt = db.upsertNode(1, 'literal-updated-at', {
+    literalUpdatedAt = db.upsertNode('Person', 'literal-updated-at', {
       props: { updatedAt: 'literal-property-value', status: 'active', score: 70 },
     });
-    nullTag = db.upsertNode(1, 'null-tag', {
+    nullTag = db.upsertNode('Person', 'null-tag', {
       props: { status: 'nullish', tag: null, score: 10 },
     });
-    nested = db.upsertNode(1, 'nested', {
+    nested = db.upsertNode('Person', 'nested', {
       props: { status: 'nested', payload: { items: [1, '1', null] }, score: 15 },
     });
-    acme = db.upsertNode(2, 'acme', { props: { status: 'customer' } });
-    beta = db.upsertNode(2, 'beta', { props: { status: 'prospect' } });
-    worksAt = db.upsertEdge(activeHigh, acme, 10, {
+    acme = db.upsertNode('Company', 'acme', { props: { status: 'customer' } });
+    beta = db.upsertNode('Company', 'beta', { props: { status: 'prospect' } });
+    worksAt = db.upsertEdge(activeHigh, acme, 'WORKS_AT', {
       props: { role: 'engineer', since: 2020, updatedAt: 'edge-literal' },
     });
-    inactiveWorksAt = db.upsertEdge(inactive, beta, 10, {
+    inactiveWorksAt = db.upsertEdge(inactive, beta, 'WORKS_AT', {
       props: { role: 'engineer', since: 2022, updatedAt: 'edge-literal' },
     });
   });
@@ -84,7 +99,7 @@ describe('query API parity', () => {
 
   it('runs ID-only and hydrated compound node queries', () => {
     const request = {
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: {
         and: [
           { property: 'status', eq: 'active' },
@@ -102,9 +117,25 @@ describe('query API parity', () => {
     assert.equal(nodes.items[0].props.status, 'active');
   });
 
+  it('honors NodeLabelFilter Any versus All semantics', () => {
+    const alpha = db.upsertNode('AnyAlpha', 'any-alpha');
+    const beta = db.upsertNode('AnyBeta', 'any-beta');
+    const both = db.upsertNode(['AnyAlpha', 'AnyBeta'], 'any-both');
+
+    const any = sortedIds(db.queryNodeIds({
+      labelFilter: { labels: ['AnyAlpha', 'AnyBeta'], mode: 'any' },
+    }));
+    assert.deepEqual(any, [alpha, beta, both].sort((a, b) => a - b));
+
+    const all = sortedIds(db.queryNodeIds({
+      labelFilter: { labels: ['AnyAlpha', 'AnyBeta'], mode: 'all' },
+    }));
+    assert.deepEqual(all, [both]);
+  });
+
   it('ANDs filters while preserving literal built-in property names', () => {
     const result = db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: {
         and: [
           { property: 'status', eq: 'active' },
@@ -116,7 +147,7 @@ describe('query API parity', () => {
     assert.deepEqual(Array.from(result.items), [literalUpdatedAt]);
 
     const timestampResult = db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: {
         and: [
           { updatedAt: { gte: db.getNode(activeHigh).updatedAt - 1000 } },
@@ -168,8 +199,8 @@ describe('query API parity', () => {
   it('matches graph patterns and treats edge updatedAt as a literal property', () => {
     const result = db.queryPattern({
       nodes: [
-        { alias: 'person', typeId: 1, filter: { property: 'status', eq: 'active' } },
-        { alias: 'company', typeId: 2, keys: ['acme'] },
+        { alias: 'person', labelFilter: nodeLabels('Person'), filter: { property: 'status', eq: 'active' } },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
       ],
       edges: [
         {
@@ -177,12 +208,14 @@ describe('query API parity', () => {
           fromAlias: 'person',
           toAlias: 'company',
           direction: 'outgoing',
-          typeFilter: [10],
-          where: {
-            role: { op: 'eq', value: 'engineer' },
-            updatedAt: { op: 'eq', value: 'edge-literal' },
+          labelFilter: ['WORKS_AT'],
+          filter: {
+            and: [
+              { property: 'role', eq: 'engineer' },
+              { property: 'updatedAt', eq: 'edge-literal' },
+              { property: 'since', lte: 2021 },
+            ],
           },
-          predicates: [{ property: { key: 'since', op: 'range', lte: 2021 } }],
         },
       ],
       limit: 10,
@@ -198,20 +231,40 @@ describe('query API parity', () => {
     assert.notEqual(inactiveWorksAt, worksAt);
   });
 
-  it('serializes explain output with recursive lower_snake kinds and warnings', () => {
-    const nodePlan = db.explainNodeQuery({
-      typeId: 1,
-      filter: { property: 'status', eq: 'active' },
-    });
-    assert.equal(nodePlan.kind, 'node_query');
-    assert.ok(planHasKind(nodePlan.root, 'fallback_type_scan'));
-    assert.ok(nodePlan.warnings.every(warning => /^[a-z_]+$/.test(warning)));
-    assert.ok(nodePlan.warnings.includes('using_fallback_scan'));
+  it('runs direct edge ID and hydrated edge queries', () => {
+    const edge = db.getEdge(worksAt);
+    const request = {
+      label: 'WORKS_AT',
+      fromIds: [activeHigh],
+      filter: {
+        and: [
+          { weight: { gte: 1.0 } },
+          { validAt: Date.now() },
+          { updatedAt: { gte: edge.updatedAt - 1000 } },
+          { property: 'role', eq: 'engineer' },
+        ],
+      },
+      limit: 0,
+    };
 
-    const patternPlan = db.explainPatternQuery({
+    assert.deepEqual(Array.from(db.queryEdgeIds(request).items), [worksAt]);
+
+    const edges = db.queryEdges({ ...request, limit: 1 });
+    assert.deepEqual(edges.items.map(item => item.id), [worksAt]);
+    assert.equal(edges.nextCursor, null);
+    assert.equal(edges.items[0].props.role, 'engineer');
+
+    const plan = db.explainEdgeQuery(request);
+    assert.equal(plan.kind, 'edge_query');
+    assert.ok(planHasKind(plan.root, 'verify_edge_filter'));
+    assert.ok(plan.warnings.includes('edge_property_post_filter'));
+  });
+
+  it('accepts canonical graph edge filters', () => {
+    const result = db.queryPattern({
       nodes: [
-        { alias: 'person', typeId: 1, filter: { property: 'status', eq: 'active' } },
-        { alias: 'company', typeId: 2, keys: ['acme'] },
+        { alias: 'person', ids: [activeHigh] },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
       ],
       edges: [
         {
@@ -219,8 +272,49 @@ describe('query API parity', () => {
           fromAlias: 'person',
           toAlias: 'company',
           direction: 'outgoing',
-          typeFilter: [10],
-          where: { role: { op: 'eq', value: 'engineer' } },
+          labelFilter: ['WORKS_AT'],
+          filter: {
+            and: [
+              { validAt: Date.now() },
+              { property: 'role', eq: 'engineer' },
+            ],
+          },
+        },
+      ],
+      limit: 10,
+    });
+
+    assert.deepEqual(result.matches, [
+      {
+        nodes: { company: acme, person: activeHigh },
+        edges: { employment: worksAt },
+      },
+    ]);
+  });
+
+  it('serializes explain output with recursive lower_snake kinds and warnings', () => {
+    const nodePlan = db.explainNodeQuery({
+      labelFilter: nodeLabels('Person'),
+      filter: { property: 'status', eq: 'active' },
+    });
+    assert.equal(nodePlan.kind, 'node_query');
+    assert.ok(planHasKind(nodePlan.root, 'fallback_node_label_scan'));
+    assert.ok(nodePlan.warnings.every(warning => /^[a-z_]+$/.test(warning)));
+    assert.ok(nodePlan.warnings.includes('using_fallback_scan'));
+
+    const patternPlan = db.explainPatternQuery({
+      nodes: [
+        { alias: 'person', labelFilter: nodeLabels('Person'), filter: { property: 'status', eq: 'active' } },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
+      ],
+      edges: [
+        {
+          alias: 'employment',
+          fromAlias: 'person',
+          toAlias: 'company',
+          direction: 'outgoing',
+          labelFilter: ['WORKS_AT'],
+          filter: { property: 'role', eq: 'engineer' },
         },
       ],
       limit: 10,
@@ -233,15 +327,15 @@ describe('query API parity', () => {
 
   it('rejects invalid predicate and pattern shapes at the binding boundary', () => {
     assert.throws(
-      () => db.queryNodeIds({ typeId: 1, predicates: [{ property: { key: 'status', op: 'eq' } }] }),
+      () => db.queryNodeIds({ labelFilter: nodeLabels('Person'), predicates: [{ property: { key: 'status', op: 'eq' } }] }),
       /use filter/i
     );
     assert.throws(
-      () => db.queryNodeIds({ typeId: 1, filter: { property: 'score', gt: 1, gte: 2 } }),
+      () => db.queryNodeIds({ labelFilter: nodeLabels('Person'), filter: { property: 'score', gt: 1, gte: 2 } }),
       /both gt and gte/i
     );
     assert.throws(
-      () => db.queryNodeIds({ typeId: 1, where: { status: { eq: 'active' } } }),
+      () => db.queryNodeIds({ labelFilter: nodeLabels('Person'), where: { status: { eq: 'active' } } }),
       /use filter/i
     );
     assert.throws(
@@ -249,8 +343,39 @@ describe('query API parity', () => {
       /use filter/i
     );
     assert.throws(
-      () => db.queryPattern({ nodes: [{ alias: 'a' }], edges: [{ fromAlias: 'a', toAlias: 'b', filter: { property: 'role', eq: 'engineer' } }], limit: 1 }),
-      /edge pattern filter is not supported/i
+      () => db.queryEdgeIds({ filter: { weight: { gte: 1 } } }),
+      /full scan|anchor|allow_full_scan/i
+    );
+    assert.throws(
+      () => db.queryEdgeIds({ label: 'WORKS_AT', filter: { weight: { gt: 1, gte: 2 } } }),
+      /both gt and gte/i
+    );
+    for (const field of ['where', 'predicates']) {
+      assert.throws(
+        () => db.queryEdgeIds({ label: 'WORKS_AT', [field]: { role: { eq: 'engineer' } } }),
+        /use filter/i
+      );
+      assert.throws(
+        () => db.queryEdges({ label: 'WORKS_AT', [field]: { role: { eq: 'engineer' } } }),
+        /use filter/i
+      );
+      assert.throws(
+        () => db.explainEdgeQuery({ label: 'WORKS_AT', [field]: { role: { eq: 'engineer' } } }),
+        /use filter/i
+      );
+    }
+    assert.throws(
+      () => db.queryPattern({
+        nodes: [{ alias: 'a' }],
+        edges: [{
+          fromAlias: 'a',
+          toAlias: 'b',
+          filter: { property: 'role', eq: 'engineer' },
+          where: { role: { eq: 'engineer' } },
+        }],
+        limit: 1,
+      }),
+      /use filter/i
     );
     assert.throws(
       () => db.queryPattern({ nodes: [], edges: [], limit: 0 }),
@@ -260,30 +385,58 @@ describe('query API parity', () => {
 
   it('supports async query and explain parity', async () => {
     const ids = await db.queryNodeIdsAsync({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'status', eq: 'active' },
     });
     assert.ok(Array.from(ids.items).includes(activeHigh));
 
     const nodes = await db.queryNodesAsync({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'score', gte: 80 },
     });
     assert.deepEqual(nodes.items.map(node => node.id), [activeHigh, inactive]);
 
     const plan = await db.explainNodeQueryAsync({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'status', eq: 'active' },
     });
     assert.equal(plan.kind, 'node_query');
 
+    const edgeIds = await db.queryEdgeIdsAsync({
+      fromIds: [activeHigh],
+      filter: { property: 'role', eq: 'engineer' },
+    });
+    assert.deepEqual(Array.from(edgeIds.items), [worksAt]);
+
+    const edges = await db.queryEdgesAsync({
+      ids: [worksAt],
+      filter: { validAt: Date.now() },
+    });
+    assert.deepEqual(edges.items.map(edge => edge.id), [worksAt]);
+
+    const edgePlan = await db.explainEdgeQueryAsync({ ids: [worksAt] });
+    assert.equal(edgePlan.kind, 'edge_query');
+
+    await rejectsOrThrows(
+      () => db.queryEdgeIdsAsync({ label: 'WORKS_AT', where: { role: { eq: 'engineer' } } }),
+      /use filter/i
+    );
+    await rejectsOrThrows(
+      () => db.queryEdgesAsync({ label: 'WORKS_AT', predicates: { role: { eq: 'engineer' } } }),
+      /use filter/i
+    );
+    await rejectsOrThrows(
+      () => db.explainEdgeQueryAsync({ label: 'WORKS_AT', where: { role: { eq: 'engineer' } } }),
+      /use filter/i
+    );
+
     const pattern = await db.queryPatternAsync({
       nodes: [
         { alias: 'person', ids: [activeHigh], filter: { property: 'status', eq: 'active' } },
-        { alias: 'company', typeId: 2, keys: ['acme'] },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
       ],
       edges: [
-        { alias: 'employment', fromAlias: 'person', toAlias: 'company', typeFilter: [10] },
+        { alias: 'employment', fromAlias: 'person', toAlias: 'company', labelFilter: ['WORKS_AT'] },
       ],
       limit: 10,
     });
@@ -292,10 +445,10 @@ describe('query API parity', () => {
     const patternPlan = await db.explainPatternQueryAsync({
       nodes: [
         { alias: 'person', ids: [activeHigh], filter: { property: 'status', eq: 'active' } },
-        { alias: 'company', typeId: 2, keys: ['acme'] },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
       ],
       edges: [
-        { alias: 'employment', fromAlias: 'person', toAlias: 'company', typeFilter: [10] },
+        { alias: 'employment', fromAlias: 'person', toAlias: 'company', labelFilter: ['WORKS_AT'] },
       ],
       limit: 10,
     });
@@ -305,38 +458,38 @@ describe('query API parity', () => {
 
   it('supports boolean filters, null presence semantics, and nested values', () => {
     assert.deepEqual(sortedIds(db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { or: [{ property: 'status', eq: 'active' }, { property: 'status', eq: 'nullish' }] },
     })), [activeHigh, activeLow, literalUpdatedAt, nullTag]);
 
     assert.deepEqual(Array.from(db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'status', in: ['nested'] },
     }).items), [nested]);
 
     assert.deepEqual(Array.from(db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'tag', eq: null },
     }).items), [nullTag]);
     assert.deepEqual(Array.from(db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'tag', in: [null] },
     }).items), [nullTag]);
     assert.deepEqual(Array.from(db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'tag', exists: true },
     }).items), [nullTag]);
     assert.ok(!Array.from(db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'tag', missing: true },
     }).items).includes(nullTag));
 
     assert.deepEqual(Array.from(db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'payload', eq: { items: [1, '1', null] } },
     }).items), [nested]);
     assert.deepEqual(Array.from(db.queryNodeIds({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'status', eq: '1' },
     }).items), []);
   });
@@ -358,33 +511,33 @@ describe('query API parity', () => {
       [{ property: 'x' }, /exactly one operator family/i],
     ];
     for (const [filter, pattern] of invalid) {
-      assert.throws(() => db.queryNodeIds({ typeId: 1, filter }), pattern);
+      assert.throws(() => db.queryNodeIds({ labelFilter: nodeLabels('Person'), filter }), pattern);
     }
   });
 
   it('serializes boolean explain plans with lower_snake physical nodes and warnings', async () => {
-    db.ensureNodePropertyIndex(1, 'status', { kind: 'equality' });
+    db.ensureNodePropertyIndex('Person', 'status', { kind: 'equality' });
     await waitForIndexState(
       db,
-      infos => infos.find(info => info.typeId === 1 && info.propKey === 'status' && info.kind === 'equality')
+      infos => infos.find(info => info.label === 'Person' && info.propKey === 'status' && info.kind === 'equality')
     );
 
     const indexedOr = db.explainNodeQuery({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { or: [{ property: 'status', eq: 'active' }, { property: 'status', eq: 'nullish' }] },
     });
     assert.ok(planHasKind(indexedOr.root, 'union'));
     assert.ok(planHasKind(indexedOr.root, 'verify_node_filter'));
 
     const fallbackOr = db.explainNodeQuery({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { or: [{ property: 'status', eq: 'active' }, { property: 'tag', missing: true }] },
     });
     assert.ok(fallbackOr.warnings.includes('boolean_branch_fallback'));
     assert.ok(fallbackOr.warnings.includes('verify_only_filter'));
 
     const empty = db.explainNodeQuery({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: {
         and: [
           { property: 'status', eq: 'active' },
@@ -395,7 +548,7 @@ describe('query API parity', () => {
     assert.ok(planHasKind(empty.root, 'empty_result'));
 
     const asyncPlan = await db.explainNodeQueryAsync({
-      typeId: 1,
+      labelFilter: nodeLabels('Person'),
       filter: { property: 'status', eq: 'active' },
     });
     assert.equal(asyncPlan.kind, 'node_query');

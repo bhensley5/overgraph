@@ -11,6 +11,87 @@ function freshDb(tmpDir, name) {
   return OverGraph.open(join(tmpDir, name));
 }
 
+function legacyNodeBinaryBuffer() {
+  const key = Buffer.from('legacy-node', 'utf8');
+  const buf = Buffer.alloc(4 + 4 + 4 + 2 + key.length + 4);
+  let off = 0;
+  buf.writeUInt32LE(1, off); off += 4;
+  buf.writeUInt32LE(0x4e500002, off); off += 4; // was accepted as label "PN" without a magic header
+  buf.writeFloatLE(1.0, off); off += 4;
+  buf.writeUInt16LE(key.length, off); off += 2;
+  key.copy(buf, off); off += key.length;
+  buf.writeUInt32LE(0, off);
+  return buf;
+}
+
+function legacyNodeBinaryV1Buffer() {
+  const buf = Buffer.alloc(10);
+  let off = 0;
+  Buffer.from('OGNB').copy(buf, off); off += 4;
+  buf.writeUInt16LE(1, off); off += 2;
+  buf.writeUInt32LE(0, off);
+  return buf;
+}
+
+function legacyEdgeBinaryBuffer(from, to) {
+  const buf = Buffer.alloc(4 + 8 + 8 + 4 + 4 + 8 + 8 + 4);
+  let off = 0;
+  buf.writeUInt32LE(1, off); off += 4;
+  buf.writeBigUInt64LE(BigInt(from), off); off += 8;
+  buf.writeBigUInt64LE(BigInt(to), off); off += 8;
+  buf.writeUInt32LE(0x544c0002, off); off += 4; // was accepted as edge label "LT" without a magic header
+  buf.writeFloatLE(1.0, off); off += 4;
+  buf.writeBigInt64LE(0n, off); off += 8;
+  buf.writeBigInt64LE(0n, off); off += 8;
+  buf.writeUInt32LE(0, off);
+  return buf;
+}
+
+describe('catalog diagnostics', () => {
+  let tmpDir, db;
+  before(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-catalog-'));
+    db = freshDb(tmpDir, 'catalog');
+  });
+  after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('ensures, gets, and lists node labels and edge labels', () => {
+    assert.deepEqual(db.listNodeLabels(), []);
+    assert.deepEqual(db.listEdgeLabels(), []);
+
+    const personId = db.ensureNodeLabel('Person');
+    const companyId = db.ensureNodeLabel('Company');
+    const worksAtId = db.ensureEdgeLabel('WORKS_AT');
+    const knowsId = db.ensureEdgeLabel('KNOWS');
+
+    assert.equal(db.ensureNodeLabel('Person'), personId);
+    assert.equal(db.ensureEdgeLabel('WORKS_AT'), worksAtId);
+    assert.equal(db.getNodeLabelId('Person'), personId);
+    assert.equal(db.getNodeLabelId('MissingLabel'), null);
+    assert.equal(db.getEdgeLabelId('WORKS_AT'), worksAtId);
+    assert.equal(db.getEdgeLabelId('MISSING_EDGE'), null);
+    assert.equal(db.getNodeLabel(personId), 'Person');
+    assert.equal(db.getNodeLabel(999_999), null);
+    assert.equal(db.getEdgeLabel(worksAtId), 'WORKS_AT');
+    assert.equal(db.getEdgeLabel(999_999), null);
+
+    assert.deepEqual(
+      db.listNodeLabels().sort((a, b) => a.labelId - b.labelId),
+      [
+        { label: 'Person', labelId: personId },
+        { label: 'Company', labelId: companyId },
+      ],
+    );
+    assert.deepEqual(
+      db.listEdgeLabels().sort((a, b) => a.labelId - b.labelId),
+      [
+        { label: 'WORKS_AT', labelId: worksAtId },
+        { label: 'KNOWS', labelId: knowsId },
+      ],
+    );
+  });
+});
+
 describe('upsert_node / upsert_edge', () => {
   let tmpDir, db;
   before(() => {
@@ -20,36 +101,109 @@ describe('upsert_node / upsert_edge', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('upsertNode returns a number id', () => {
-    const id = db.upsertNode(1, 'alice');
+    const id = db.upsertNode('Person', 'alice');
     assert.equal(typeof id, 'number');
     assert.ok(id > 0);
   });
 
   it('upsertNode with props and weight', () => {
-    const id = db.upsertNode(1, 'bob', { props: { age: 30, name: 'Bob' }, weight: 0.8 });
+    const id = db.upsertNode('Person', 'bob', { props: { age: 30, name: 'Bob' }, weight: 0.8 });
     assert.equal(typeof id, 'number');
     assert.ok(id > 0);
   });
 
-  it('upsertNode deduplicates by (type_id, key)', () => {
-    const id1 = db.upsertNode(2, 'same-key');
-    const id2 = db.upsertNode(2, 'same-key');
+  it('upsertNode deduplicates by (label, key)', () => {
+    const id1 = db.upsertNode('Company', 'same-key');
+    const id2 = db.upsertNode('Company', 'same-key');
     assert.equal(id1, id2);
   });
 
   it('upsertEdge returns a number id', () => {
-    const a = db.upsertNode(1, 'src');
-    const b = db.upsertNode(1, 'dst');
-    const eid = db.upsertEdge(a, b, 10);
+    const a = db.upsertNode('Person', 'src');
+    const b = db.upsertNode('Person', 'dst');
+    const eid = db.upsertEdge(a, b, 'WORKS_AT');
     assert.equal(typeof eid, 'number');
     assert.ok(eid > 0);
   });
 
   it('upsertEdge with props and weight', () => {
-    const a = db.upsertNode(1, 'e-src');
-    const b = db.upsertNode(1, 'e-dst');
-    const eid = db.upsertEdge(a, b, 10, { props: { strength: 0.9 }, weight: 2.5 });
+    const a = db.upsertNode('Person', 'e-src');
+    const b = db.upsertNode('Person', 'e-dst');
+    const eid = db.upsertEdge(a, b, 'WORKS_AT', { props: { strength: 0.9 }, weight: 2.5 });
     assert.ok(eid > 0);
+  });
+});
+
+describe('node label mutations', () => {
+  let tmpDir, db;
+  before(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-node-label-mutate-'));
+    db = freshDb(tmpDir, 'labels');
+  });
+  after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('adds and removes node labels with changed flags', () => {
+    const id = db.upsertNode(['Person'], 'multi-label');
+    assert.equal(db.addNodeLabel(id, 'Admin'), true);
+    assert.equal(db.addNodeLabel(id, 'Admin'), false);
+    assert.deepEqual([...db.getNode(id).labels].sort(), ['Admin', 'Person']);
+    assert.deepEqual(Array.from(db.nodesByLabels(['Person', 'Admin'])), [id]);
+
+    assert.equal(db.removeNodeLabel(id, 'Admin'), true);
+    assert.equal(db.removeNodeLabel(id, 'Admin'), false);
+    assert.deepEqual(db.getNode(id).labels, ['Person']);
+    assert.throws(
+      () => db.removeNodeLabel(id, 'Person'),
+      /cannot remove the last node label/,
+    );
+  });
+});
+
+describe('multi-label node APIs', () => {
+  let tmpDir, db;
+  let both, personOnly, adminOnly;
+  before(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-node-multi-label-'));
+    db = freshDb(tmpDir, 'multi-labels');
+    both = db.upsertNode(['Person', 'Admin'], 'both');
+    personOnly = db.upsertNode('Person', 'person-only');
+    adminOnly = db.upsertNode('Admin', 'admin-only');
+  });
+  after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('upsertNode accepts a label array and hydrates labels', () => {
+    assert.deepEqual([...db.getNode(both).labels].sort(), ['Admin', 'Person']);
+  });
+
+  it('plural convenience APIs treat arrays as All', () => {
+    assert.deepEqual(Array.from(db.nodesByLabels(['Person', 'Admin'])), [both]);
+    assert.deepEqual(db.getNodesByLabels(['Person', 'Admin']).map(node => node.id), [both]);
+    assert.equal(db.countNodesByLabels(['Person', 'Admin']), 1);
+    assert.equal(db.countNodesByLabels('Person'), 2);
+    assert.equal(db.countNodesByLabels('Admin'), 2);
+  });
+
+  it('paged plural convenience APIs treat arrays as All', () => {
+    const idPage = db.nodesByLabelsPaged(['Person', 'Admin'], 10);
+    assert.deepEqual(Array.from(idPage.items), [both]);
+    assert.equal(idPage.nextCursor ?? null, null);
+
+    const nodePage = db.getNodesByLabelsPaged(['Person', 'Admin'], 10);
+    assert.deepEqual(nodePage.items.map(node => node.id), [both]);
+    assert.equal(nodePage.nextCursor ?? null, null);
+  });
+
+  it('async plural convenience APIs preserve All semantics', async () => {
+    assert.deepEqual(Array.from(await db.nodesByLabelsAsync(['Person', 'Admin'])), [both]);
+    assert.deepEqual((await db.getNodesByLabelsAsync(['Person', 'Admin'])).map(node => node.id), [both]);
+    assert.equal(await db.countNodesByLabelsAsync(['Person', 'Admin']), 1);
+    assert.deepEqual(Array.from((await db.nodesByLabelsPagedAsync(['Person', 'Admin'], 10)).items), [both]);
+    assert.deepEqual((await db.getNodesByLabelsPagedAsync(['Person', 'Admin'], 10)).items.map(node => node.id), [both]);
+  });
+
+  it('single-label queries still include multi-label nodes', () => {
+    assert.deepEqual(new Set(Array.from(db.nodesByLabels('Person'))), new Set([both, personOnly]));
+    assert.deepEqual(new Set(Array.from(db.nodesByLabels('Admin'))), new Set([both, adminOnly]));
   });
 });
 
@@ -63,9 +217,9 @@ describe('batch_upsert_nodes / batch_upsert_edges', () => {
 
   it('batchUpsertNodes returns Float64Array of ids', () => {
     const ids = db.batchUpsertNodes([
-      { typeId: 1, key: 'n1' },
-      { typeId: 1, key: 'n2', props: { x: 1 }, weight: 0.5 },
-      { typeId: 2, key: 'n3' },
+      { labels: ['Person'], key: 'n1' },
+      { labels: ['Person'], key: 'n2', props: { x: 1 }, weight: 0.5 },
+      { labels: ['Company'], key: 'n3' },
     ]);
     assert.ok(ids instanceof Float64Array);
     assert.equal(ids.length, 3);
@@ -75,17 +229,54 @@ describe('batch_upsert_nodes / batch_upsert_edges', () => {
 
   it('batchUpsertEdges returns Float64Array of ids', () => {
     const [a, b, c] = db.batchUpsertNodes([
-      { typeId: 1, key: 'ba' },
-      { typeId: 1, key: 'bb' },
-      { typeId: 1, key: 'bc' },
+      { labels: 'Person', key: 'ba' },
+      { labels: 'Person', key: 'bb' },
+      { labels: 'Person', key: 'bc' },
     ]);
     const eids = db.batchUpsertEdges([
-      { from: a, to: b, typeId: 5 },
-      { from: b, to: c, typeId: 5, props: { label: 'knows' }, weight: 1.2 },
+      { from: a, to: b, label: 'DEPENDS_ON'},
+      { from: b, to: c, label: 'DEPENDS_ON', props: { label: 'knows' }, weight: 1.2 },
     ]);
     assert.ok(eids instanceof Float64Array);
     assert.equal(eids.length, 2);
     for (const id of eids) assert.ok(id > 0);
+  });
+});
+
+describe('vector hydration', () => {
+  let tmpDir, db;
+  before(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-vector-hydration-'));
+    db = OverGraph.open(join(tmpDir, 'db'), {
+      denseVector: { dimension: 2, metric: 'cosine' },
+    });
+  });
+  after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('hydrates node vectors on full record paths', () => {
+    const id = db.upsertNode('VectorDoc', 'full-record-vector', {
+      denseVector: [1, 0],
+      sparseVector: [{ dimension: 0, value: 2.5 }, { dimension: 3, value: 1.25 }],
+    });
+
+    const node = db.getNode(id);
+    assert.deepEqual(node.denseVector, [1, 0]);
+    assert.deepEqual(node.sparseVector, [
+      { dimension: 0, value: 2.5 },
+      { dimension: 3, value: 1.25 },
+    ]);
+
+    const page = db.queryNodes({
+      labelFilter: { labels: ['VectorDoc'], mode: 'all' },
+      allowFullScan: true,
+    });
+    const hydrated = page.items.find((candidate) => candidate.id === id);
+    assert.ok(hydrated);
+    assert.deepEqual(hydrated.denseVector, [1, 0]);
+    assert.deepEqual(hydrated.sparseVector, [
+      { dimension: 0, value: 2.5 },
+      { dimension: 3, value: 1.25 },
+    ]);
   });
 });
 
@@ -99,9 +290,9 @@ describe('batch_upsert_nodes_binary / batch_upsert_edges_binary', () => {
 
   it('batchUpsertNodesBinary returns Float64Array of ids', () => {
     const buf = packNodeBatch([
-      { typeId: 1, key: 'bn1' },
-      { typeId: 1, key: 'bn2', props: { x: 1 }, weight: 0.5 },
-      { typeId: 2, key: 'bn3' },
+      { labels: ['Person'], key: 'bn1' },
+      { labels: ['Person'], key: 'bn2', props: { x: 1 }, weight: 0.5 },
+      { labels: ['Company'], key: 'bn3' },
     ]);
     const ids = db.batchUpsertNodesBinary(buf);
     assert.ok(ids instanceof Float64Array);
@@ -111,22 +302,32 @@ describe('batch_upsert_nodes_binary / batch_upsert_edges_binary', () => {
 
   it('binary node upsert data matches getNode', () => {
     const buf = packNodeBatch([
-      { typeId: 3, key: 'check-me', props: { color: 'red', score: 42 }, weight: 0.8 },
+      { labels: ['Document'], key: 'check-me', props: { color: 'red', score: 42 }, weight: 0.8 },
     ]);
     const [id] = db.batchUpsertNodesBinary(buf);
     const n = db.getNode(id);
     assert.ok(n);
-    assert.equal(n.typeId, 3);
+    assert.deepEqual(n.labels, ['Document']);
     assert.equal(n.key, 'check-me');
     assert.equal(n.props.color, 'red');
     assert.equal(n.props.score, 42);
     assert.ok(Math.abs(n.weight - 0.8) < 0.01);
   });
 
-  it('binary node upsert deduplicates by (type_id, key)', () => {
+  it('binary node upsert preserves multiple labels', () => {
+    const [id] = db.batchUpsertNodesBinary(packNodeBatch([
+      { labels: ['Person', 'Admin'], key: 'multi-bin', props: { role: 'owner' } },
+    ]));
+    const node = db.getNode(id);
+    assert.deepEqual([...node.labels].sort(), ['Admin', 'Person']);
+    assert.equal(node.props.role, 'owner');
+    assert.deepEqual(Array.from(db.nodesByLabels(['Person', 'Admin'])), [id]);
+  });
+
+  it('binary node upsert deduplicates by (label, key)', () => {
     const buf = packNodeBatch([
-      { typeId: 4, key: 'dedup-bin', props: { v: 1 } },
-      { typeId: 4, key: 'dedup-bin', props: { v: 2 } },
+      { labels: ['Post'], key: 'dedup-bin', props: { v: 1 } },
+      { labels: ['Post'], key: 'dedup-bin', props: { v: 2 } },
     ]);
     const ids = db.batchUpsertNodesBinary(buf);
     assert.equal(ids[0], ids[1]);
@@ -136,13 +337,13 @@ describe('batch_upsert_nodes_binary / batch_upsert_edges_binary', () => {
 
   it('batchUpsertEdgesBinary returns Float64Array of ids', () => {
     const nodeIds = db.batchUpsertNodesBinary(packNodeBatch([
-      { typeId: 1, key: 'be-a' },
-      { typeId: 1, key: 'be-b' },
-      { typeId: 1, key: 'be-c' },
+      { labels: ['Person'], key: 'be-a' },
+      { labels: ['Person'], key: 'be-b' },
+      { labels: ['Person'], key: 'be-c' },
     ]));
     const buf = packEdgeBatch([
-      { from: nodeIds[0], to: nodeIds[1], typeId: 5 },
-      { from: nodeIds[1], to: nodeIds[2], typeId: 5, props: { label: 'knows' }, weight: 1.2 },
+      { from: nodeIds[0], to: nodeIds[1], label: 'DEPENDS_ON'},
+      { from: nodeIds[1], to: nodeIds[2], label: 'DEPENDS_ON', props: { label: 'knows' }, weight: 1.2 },
     ]);
     const eids = db.batchUpsertEdgesBinary(buf);
     assert.ok(eids instanceof Float64Array);
@@ -152,18 +353,18 @@ describe('batch_upsert_nodes_binary / batch_upsert_edges_binary', () => {
 
   it('binary edge upsert data matches getEdge', () => {
     const nodeIds = db.batchUpsertNodesBinary(packNodeBatch([
-      { typeId: 1, key: 'edge-src' },
-      { typeId: 1, key: 'edge-dst' },
+      { labels: ['Person'], key: 'edge-src' },
+      { labels: ['Person'], key: 'edge-dst' },
     ]));
     const buf = packEdgeBatch([
-      { from: nodeIds[0], to: nodeIds[1], typeId: 7, props: { kind: 'test' }, weight: 2.5 },
+      { from: nodeIds[0], to: nodeIds[1], label: 'KNOWS', props: { kind: 'test' }, weight: 2.5 },
     ]);
     const [eid] = db.batchUpsertEdgesBinary(buf);
     const e = db.getEdge(eid);
     assert.ok(e);
     assert.equal(e.from, nodeIds[0]);
     assert.equal(e.to, nodeIds[1]);
-    assert.equal(e.typeId, 7);
+    assert.equal(e.label, 'KNOWS');
     assert.equal(e.props.kind, 'test');
     assert.ok(Math.abs(e.weight - 2.5) < 0.01);
   });
@@ -175,15 +376,38 @@ describe('batch_upsert_nodes_binary / batch_upsert_edges_binary', () => {
     assert.equal(edgeIds.length, 0);
   });
 
+  it('rejects old count-first numeric node and edge binary buffers', () => {
+    assert.throws(
+      () => db.batchUpsertNodesBinary(legacyNodeBinaryBuffer()),
+      /missing magic header/,
+    );
+
+    const [from, to] = db.batchUpsertNodes([
+      { labels: ['Person'], key: 'legacy-edge-from' },
+      { labels: ['Person'], key: 'legacy-edge-to' },
+    ]);
+    assert.throws(
+      () => db.batchUpsertEdgesBinary(legacyEdgeBinaryBuffer(from, to)),
+      /missing magic header/,
+    );
+  });
+
+  it('rejects OGNB v1 single-label binary buffers clearly', () => {
+    assert.throws(
+      () => db.batchUpsertNodesBinary(legacyNodeBinaryV1Buffer()),
+      /OGNB v1 single-label buffers are no longer supported/,
+    );
+  });
+
   it('neighbors work with binary-inserted edges', () => {
     const nodeIds = db.batchUpsertNodesBinary(packNodeBatch([
-      { typeId: 1, key: 'nbr-hub' },
-      { typeId: 1, key: 'nbr-leaf1' },
-      { typeId: 1, key: 'nbr-leaf2' },
+      { labels: ['Person'], key: 'nbr-hub' },
+      { labels: ['Person'], key: 'nbr-leaf1' },
+      { labels: ['Person'], key: 'nbr-leaf2' },
     ]));
     db.batchUpsertEdgesBinary(packEdgeBatch([
-      { from: nodeIds[0], to: nodeIds[1], typeId: 10 },
-      { from: nodeIds[0], to: nodeIds[2], typeId: 10 },
+      { from: nodeIds[0], to: nodeIds[1], label: 'WORKS_AT'},
+      { from: nodeIds[0], to: nodeIds[2], label: 'WORKS_AT'},
     ]));
     const result = db.neighbors(nodeIds[0], { direction: 'outgoing' });
     assert.equal(result.length, 2);
@@ -195,9 +419,9 @@ describe('get_node / get_edge', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-get-'));
     db = freshDb(tmpDir, 'get');
-    nodeId = db.upsertNode(3, 'getme', { props: { color: 'blue', score: 42 }, weight: 0.7 });
-    const dst = db.upsertNode(3, 'dst');
-    edgeId = db.upsertEdge(nodeId, dst, 8, { props: { rel: 'parent' }, weight: 1.5 });
+    nodeId = db.upsertNode('Document', 'getme', { props: { color: 'blue', score: 42 }, weight: 0.7 });
+    const dst = db.upsertNode('Document', 'dst');
+    edgeId = db.upsertEdge(nodeId, dst, 'PARENT_OF', { props: { rel: 'parent' }, weight: 1.5 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -205,7 +429,7 @@ describe('get_node / get_edge', () => {
     const n = db.getNode(nodeId);
     assert.ok(n);
     assert.equal(n.id, nodeId);
-    assert.equal(n.typeId, 3);
+    assert.deepEqual(n.labels, ['Document']);
     assert.equal(n.key, 'getme');
     assert.equal(n.props.color, 'blue');
     assert.equal(n.props.score, 42);
@@ -223,7 +447,7 @@ describe('get_node / get_edge', () => {
     assert.ok(e);
     assert.equal(e.id, edgeId);
     assert.equal(e.from, nodeId);
-    assert.equal(e.typeId, 8);
+    assert.equal(e.label, 'PARENT_OF');
     assert.equal(e.props.rel, 'parent');
     assert.ok(Math.abs(e.weight - 1.5) < 0.01);
   });
@@ -242,16 +466,16 @@ describe('delete_node / delete_edge', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('deleteNode removes a node', () => {
-    const id = db.upsertNode(1, 'todelete');
+    const id = db.upsertNode('Person', 'todelete');
     assert.ok(db.getNode(id));
     db.deleteNode(id);
     assert.equal(db.getNode(id), null);
   });
 
   it('deleteEdge removes an edge', () => {
-    const a = db.upsertNode(1, 'da');
-    const b = db.upsertNode(1, 'db');
-    const eid = db.upsertEdge(a, b, 1);
+    const a = db.upsertNode('Person', 'da');
+    const b = db.upsertNode('Person', 'db');
+    const eid = db.upsertEdge(a, b, 'LINKS_TO');
     assert.ok(db.getEdge(eid));
     db.deleteEdge(eid);
     assert.equal(db.getEdge(eid), null);
@@ -263,14 +487,14 @@ describe('neighbors / traverse', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-nbr-'));
     db = freshDb(tmpDir, 'nbr');
-    center = db.upsertNode(1, 'center');
-    n1 = db.upsertNode(1, 'n1');
-    n2 = db.upsertNode(1, 'n2');
-    n3 = db.upsertNode(1, 'n3');
+    center = db.upsertNode('Person', 'center');
+    n1 = db.upsertNode('Person', 'n1');
+    n2 = db.upsertNode('Person', 'n2');
+    n3 = db.upsertNode('Person', 'n3');
     // center -> n1 (type 10), center -> n2 (type 20), n1 -> n3 (type 10)
-    db.upsertEdge(center, n1, 10, { weight: 1.0 });
-    db.upsertEdge(center, n2, 20, { weight: 2.0 });
-    db.upsertEdge(n1, n3, 10, { weight: 3.0 });
+    db.upsertEdge(center, n1, 'WORKS_AT', { weight: 1.0 });
+    db.upsertEdge(center, n2, 'MENTIONS', { weight: 2.0 });
+    db.upsertEdge(n1, n3, 'WORKS_AT', { weight: 3.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -284,7 +508,7 @@ describe('neighbors / traverse', () => {
   });
 
   it('neighbors with type filter', () => {
-    const result = db.neighbors(center, { direction: 'outgoing', typeFilter: [10] });
+    const result = db.neighbors(center, { direction: 'outgoing', edgeLabelFilter: ['WORKS_AT'] });
     assert.equal(result.length, 1);
     assert.equal(result[0].nodeId, n1);
   });
@@ -327,7 +551,7 @@ describe('neighbors / traverse', () => {
   });
 
   it('traverse supports edge filters and deterministic hit fields', () => {
-    const page = db.traverse(center, 2, { minDepth: 2, direction: 'outgoing', edgeTypeFilter: [10] });
+    const page = db.traverse(center, 2, { minDepth: 2, direction: 'outgoing', edgeLabelFilter: ['WORKS_AT'] });
     const nodeSet = new Set(page.items.map(hit => hit.nodeId));
     assert.ok(nodeSet.has(n3));
     assert.equal(page.items.length, 1);
@@ -359,32 +583,32 @@ describe('find_nodes', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-find-'));
     db = freshDb(tmpDir, 'find');
-    db.upsertNode(5, 'alice', { props: { city: 'NYC', active: true } });
-    db.upsertNode(5, 'bob', { props: { city: 'NYC', active: false } });
-    db.upsertNode(5, 'carol', { props: { city: 'LA', active: true } });
-    db.upsertNode(6, 'dave', { props: { city: 'NYC' } });
+    db.upsertNode('User', 'alice', { props: { city: 'NYC', active: true } });
+    db.upsertNode('User', 'bob', { props: { city: 'NYC', active: false } });
+    db.upsertNode('User', 'carol', { props: { city: 'LA', active: true } });
+    db.upsertNode('Location', 'dave', { props: { city: 'NYC' } });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('findNodes by string property', () => {
-    const ids = db.findNodes(5, 'city', 'NYC');
+    const ids = db.findNodes('User', 'city', 'NYC');
     assert.ok(ids instanceof Float64Array);
     assert.equal(ids.length, 2);
   });
 
   it('findNodes by boolean property', () => {
-    const ids = db.findNodes(5, 'active', true);
+    const ids = db.findNodes('User', 'active', true);
     assert.equal(ids.length, 2);
   });
 
-  it('findNodes respects type_id', () => {
+  it('findNodes respects label', () => {
     // type 6 has one NYC node
-    const ids = db.findNodes(6, 'city', 'NYC');
+    const ids = db.findNodes('Location', 'city', 'NYC');
     assert.equal(ids.length, 1);
   });
 
   it('findNodes returns empty for no match', () => {
-    const ids = db.findNodes(5, 'city', 'Chicago');
+    const ids = db.findNodes('User', 'city', 'Chicago');
     assert.equal(ids.length, 0);
   });
 });
@@ -398,7 +622,7 @@ describe('flush / compact', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('flush does not throw', () => {
-    db.upsertNode(1, 'flushed');
+    db.upsertNode('Person', 'flushed');
     db.flush();
   });
 
@@ -416,11 +640,11 @@ describe('flush / compact', () => {
 
     try {
       for (let i = 0; i < 50; i++) {
-        testDb.upsertNode(1, `node-${i}`, { props: { idx: i } });
+        testDb.upsertNode('Person', `node-${i}`, { props: { idx: i } });
       }
       testDb.flush();
       for (let i = 50; i < 100; i++) {
-        testDb.upsertNode(1, `node-${i}`, { props: { idx: i } });
+        testDb.upsertNode('Person', `node-${i}`, { props: { idx: i } });
       }
       testDb.flush();
 
@@ -447,23 +671,23 @@ describe('edge cases', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('upsertNode with empty props object', () => {
-    const id = db.upsertNode(1, 'empty-props', { props: {} });
+    const id = db.upsertNode('Person', 'empty-props', { props: {} });
     const n = db.getNode(id);
     assert.ok(n);
     assert.deepEqual(n.props, {});
   });
 
   it('upsertNode with null/undefined props', () => {
-    const id1 = db.upsertNode(1, 'null-props');
-    const id2 = db.upsertNode(1, 'undef-props');
+    const id1 = db.upsertNode('Person', 'null-props');
+    const id2 = db.upsertNode('Person', 'undef-props');
     assert.ok(db.getNode(id1));
     assert.ok(db.getNode(id2));
   });
 
   it('findNodes with integer property value', () => {
-    db.upsertNode(9, 'scored', { props: { score: 100 } });
-    db.upsertNode(9, 'scored2', { props: { score: 200 } });
-    const ids = db.findNodes(9, 'score', 100);
+    db.upsertNode('ScoredNode', 'scored', { props: { score: 100 } });
+    db.upsertNode('ScoredNode', 'scored2', { props: { score: 200 } });
+    const ids = db.findNodes('ScoredNode', 'score', 100);
     assert.equal(ids.length, 1);
   });
 
@@ -480,7 +704,7 @@ describe('edge cases', () => {
   });
 
   it('neighbors on node with no edges returns empty', () => {
-    const id = db.upsertNode(1, 'loner');
+    const id = db.upsertNode('Person', 'loner');
     const result = db.neighbors(id, { direction: 'outgoing' });
     assert.equal(result.length, 0);
   });
@@ -495,7 +719,7 @@ describe('error handling', () => {
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('throws on invalid direction string', () => {
-    const id = db.upsertNode(1, 'x');
+    const id = db.upsertNode('Person', 'x');
     assert.throws(() => db.neighbors(id, { direction: 'sideways' }), /Invalid direction/);
   });
 
@@ -524,7 +748,7 @@ describe('error handling', () => {
     const dbPath = join(tmpDir, 'closed');
     const closedDb = OverGraph.open(dbPath);
     closedDb.close();
-    assert.throws(() => closedDb.upsertNode(1, 'fail'), /closed/i);
+    assert.throws(() => closedDb.upsertNode('Person', 'fail'), /closed/i);
   });
 });
 
@@ -540,9 +764,9 @@ describe('persistence round-trip', () => {
 
     // Write phase
     const db1 = OverGraph.open(dbPath);
-    const nid = db1.upsertNode(1, 'persist-me', { props: { val: 'hello' } });
-    const dst = db1.upsertNode(1, 'persist-dst');
-    const eid = db1.upsertEdge(nid, dst, 5, { props: { kind: 'test' } });
+    const nid = db1.upsertNode('Person', 'persist-me', { props: { val: 'hello' } });
+    const dst = db1.upsertNode('Person', 'persist-dst');
+    const eid = db1.upsertEdge(nid, dst, 'DEPENDS_ON', { props: { kind: 'test' } });
     db1.close();
 
     // Read phase
@@ -554,29 +778,29 @@ describe('persistence round-trip', () => {
 
     const e = db2.getEdge(eid);
     assert.ok(e);
-    assert.equal(e.typeId, 5);
+    assert.equal(e.label, 'DEPENDS_ON');
     assert.equal(e.props.kind, 'test');
 
     db2.close();
   });
 });
 
-describe('nodesByType / edgesByType (ID-only)', () => {
+describe('nodesByLabels / edgesByLabel (ID-only)', () => {
   let tmpDir, db;
   let n1, n2, n3, e1, e2;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-bytype-'));
     db = freshDb(tmpDir, 'bytype');
-    n1 = db.upsertNode(1, 'a');
-    n2 = db.upsertNode(1, 'b');
-    n3 = db.upsertNode(2, 'c');
-    e1 = db.upsertEdge(n1, n2, 10);
-    e2 = db.upsertEdge(n1, n3, 20);
+    n1 = db.upsertNode('Person', 'a');
+    n2 = db.upsertNode('Person', 'b');
+    n3 = db.upsertNode('Company', 'c');
+    e1 = db.upsertEdge(n1, n2, 'WORKS_AT');
+    e2 = db.upsertEdge(n1, n3, 'MENTIONS');
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('nodesByType returns Float64Array of node IDs', () => {
-    const ids = db.nodesByType(1);
+  it('nodesByLabels returns Float64Array of node IDs', () => {
+    const ids = db.nodesByLabels('Person');
     assert.ok(ids instanceof Float64Array);
     assert.equal(ids.length, 2);
     const idSet = new Set(Array.from(ids));
@@ -584,34 +808,51 @@ describe('nodesByType / edgesByType (ID-only)', () => {
     assert.ok(idSet.has(n2));
   });
 
-  it('nodesByType returns empty for unused type', () => {
-    const ids = db.nodesByType(999);
+  it('nodesByLabels returns empty for unused type', () => {
+    const ids = db.nodesByLabels('UnusedLabel');
     assert.equal(ids.length, 0);
   });
 
-  it('edgesByType returns Float64Array of edge IDs', () => {
-    const ids = db.edgesByType(10);
+  it('edgesByLabel returns Float64Array of edge IDs', () => {
+    const ids = db.edgesByLabel('WORKS_AT');
     assert.ok(ids instanceof Float64Array);
     assert.equal(ids.length, 1);
     assert.equal(ids[0], e1);
   });
 
-  it('edgesByType returns empty for unused type', () => {
-    const ids = db.edgesByType(999);
+  it('edgesByLabel returns empty for unused type', () => {
+    const ids = db.edgesByLabel('UNUSED_EDGE_TYPE');
     assert.equal(ids.length, 0);
   });
 
-  it('nodesByType distinguishes types', () => {
-    const type1Ids = db.nodesByType(1);
-    const type2Ids = db.nodesByType(2);
+  it('nodesByLabels distinguishes types', () => {
+    const type1Ids = db.nodesByLabels('Person');
+    const type2Ids = db.nodesByLabels('Company');
     assert.equal(type1Ids.length, 2);
     assert.equal(type2Ids.length, 1);
     assert.equal(type2Ids[0], n3);
   });
 
-  it('edgesByType covers both types', () => {
-    const type10Ids = db.edgesByType(10);
-    const type20Ids = db.edgesByType(20);
+  it('does not expose singular node-label convenience aliases', () => {
+    for (const name of [
+      'nodesByLabel',
+      'getNodesByLabel',
+      'countNodesByLabel',
+      'nodesByLabelPaged',
+      'getNodesByLabelPaged',
+      'nodesByLabelAsync',
+      'getNodesByLabelAsync',
+      'countNodesByLabelAsync',
+      'nodesByLabelPagedAsync',
+      'getNodesByLabelPagedAsync',
+    ]) {
+      assert.equal(db[name], undefined, `${name} should not be exported`);
+    }
+  });
+
+  it('edgesByLabel covers both types', () => {
+    const type10Ids = db.edgesByLabel('WORKS_AT');
+    const type20Ids = db.edgesByLabel('MENTIONS');
     assert.equal(type10Ids.length, 1);
     assert.equal(type10Ids[0], e1);
     assert.equal(type20Ids.length, 1);
@@ -619,27 +860,27 @@ describe('nodesByType / edgesByType (ID-only)', () => {
   });
 });
 
-describe('nodesByTypeAsync / edgesByTypeAsync', () => {
+describe('nodesByLabelsAsync / edgesByLabelAsync', () => {
   let tmpDir, db;
   let n1, n2, e1;
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-bytype-async-'));
     db = freshDb(tmpDir, 'bytype-async');
-    n1 = db.upsertNode(1, 'a');
-    n2 = db.upsertNode(1, 'b');
-    e1 = db.upsertEdge(n1, n2, 10);
+    n1 = db.upsertNode('Person', 'a');
+    n2 = db.upsertNode('Person', 'b');
+    e1 = db.upsertEdge(n1, n2, 'WORKS_AT');
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
-  it('nodesByTypeAsync returns same IDs as sync', async () => {
-    const syncIds = db.nodesByType(1);
-    const asyncIds = await db.nodesByTypeAsync(1);
+  it('nodesByLabelsAsync returns same IDs as sync', async () => {
+    const syncIds = db.nodesByLabels('Person');
+    const asyncIds = await db.nodesByLabelsAsync('Person');
     assert.deepEqual([...asyncIds].sort(), [...syncIds].sort());
   });
 
-  it('edgesByTypeAsync returns same IDs as sync', async () => {
-    const syncIds = db.edgesByType(10);
-    const asyncIds = await db.edgesByTypeAsync(10);
+  it('edgesByLabelAsync returns same IDs as sync', async () => {
+    const syncIds = db.edgesByLabel('WORKS_AT');
+    const asyncIds = await db.edgesByLabelAsync('WORKS_AT');
     assert.deepEqual([...asyncIds].sort(), [...syncIds].sort());
   });
 });

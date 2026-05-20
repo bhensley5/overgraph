@@ -38,25 +38,25 @@ async def async_db(tmp_dir):
     await database.close()
 
 
-def make_chain(db, n=5, edge_type=10):
+def make_chain(db, n=5, label="RELATES_TO"):
     """Create a chain: n0 -> n1 -> n2 -> ... -> n(n-1)"""
     nodes = []
     for i in range(n):
-        nid = db.upsert_node(1, f"node_{i}")
+        nid = db.upsert_node("Person", f"node_{i}")
         nodes.append(nid)
     edges = []
     for i in range(len(nodes) - 1):
-        eid = db.upsert_edge(nodes[i], nodes[i + 1], edge_type)
+        eid = db.upsert_edge(nodes[i], nodes[i + 1], label)
         edges.append(eid)
     return nodes, edges
 
 
-def make_star(db, center_key="center", spokes=5, edge_type=10):
+def make_star(db, center_key="center", spokes=5, label="RELATES_TO"):
     """Create a star: center -> spoke_0, center -> spoke_1, ..."""
-    center = db.upsert_node(1, center_key)
+    center = db.upsert_node("Person", center_key)
     spoke_ids = []
     for i in range(spokes):
-        sid = db.upsert_node(1, f"spoke_{i}")
-        db.upsert_edge(center, sid, edge_type)
+        sid = db.upsert_node("Person", f"spoke_{i}")
+        db.upsert_edge(center, sid, label)
         spoke_ids.append(sid)
     return center, spoke_ids

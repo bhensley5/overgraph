@@ -93,8 +93,8 @@ Graph shapes for each profile:
 | `S-TRAV-006` | `is_connected` | required | required | required |
 | `S-TRAV-007` | `traverse` depth 1..3 layered (memtable, no filter) | required | required | required |
 | `S-TRAV-008` | `traverse` depth 1..3 layered (segmented, no filter) | required | required | required |
-| `S-TRAV-009` | `traverse` depth 1..3 layered (memtable, emission-only `node_type_filter`) | required | required | required |
-| `S-TRAV-010` | `traverse` depth 1..3 layered (segmented, emission-only `node_type_filter`) | required | required | required |
+| `S-TRAV-009` | `traverse` depth 1..3 layered (memtable, emission-only `emit_node_label_filter`) | required | required | required |
+| `S-TRAV-010` | `traverse` depth 1..3 layered (segmented, emission-only `emit_node_label_filter`) | required | required | required |
 | `S-ADV-001` | `top_k_neighbors` | required | required | required |
 | `S-ADV-003` | `find_nodes_by_time_range(_paged)` | required | required | required |
 | `S-ADV-004` | `personalized_pagerank` | required | required | required |

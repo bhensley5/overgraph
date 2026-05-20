@@ -1,11 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use overgraph::{
     AllShortestPathsOptions, DatabaseEngine, DbOptions, DegreeOptions, Direction, EdgeInput,
-    ExportOptions, GraphPatch, IsConnectedOptions, NeighborOptions, NodeInput, PageRequest,
-    PprAlgorithm, PprOptions, PropValue, PropertyRangeBound, PrunePolicy, SecondaryIndexKind,
-    SecondaryIndexRangeDomain, SecondaryIndexState, ShortestPathOptions, TopKOptions,
-    TraverseOptions, TxnIntent, TxnLocalRef, TxnNodeRef, UpsertEdgeOptions, UpsertNodeOptions,
-    WalSyncMode,
+    ExportOptions, GraphPatch, IsConnectedOptions, LabelMatchMode, NeighborOptions, NodeInput,
+    NodeKeyQuery, NodeLabelFilter, PageRequest, PprAlgorithm, PprOptions, PropValue,
+    PropertyRangeBound, PrunePolicy, SecondaryIndexKind, SecondaryIndexRangeDomain,
+    SecondaryIndexState, ShortestPathOptions, TopKOptions, TraverseOptions, TxnIntent, TxnLocalRef,
+    TxnNodeRef, UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,7 +18,29 @@ fn temp_db() -> (tempfile::TempDir, DatabaseEngine) {
         ..DbOptions::default()
     };
     let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    seed_bench_label_tokens(&engine);
     (dir, engine)
+}
+
+fn seed_bench_label_tokens(engine: &DatabaseEngine) {
+    for label_token_id in 1..=64 {
+        assert_eq!(
+            engine
+                .ensure_node_label(&bench_node_label(label_token_id))
+                .unwrap(),
+            label_token_id
+        );
+        assert_eq!(
+            engine
+                .ensure_edge_label(&format!("BenchEdge{label_token_id}"))
+                .unwrap(),
+            label_token_id
+        );
+    }
+}
+
+fn bench_node_label(label_token_id: u32) -> String {
+    format!("BenchNode{label_token_id}")
 }
 
 fn bench_upsert_node(c: &mut Criterion) {
@@ -28,7 +50,7 @@ fn bench_upsert_node(c: &mut Criterion) {
         b.iter(|| {
             let key = format!("node_{}", i);
             engine
-                .upsert_node(1, &key, UpsertNodeOptions::default())
+                .upsert_node("BenchNode", &key, UpsertNodeOptions::default())
                 .unwrap();
             i += 1;
         });
@@ -46,7 +68,7 @@ fn bench_upsert_node_with_props(c: &mut Criterion) {
             props.insert("score".to_string(), PropValue::Float(0.95));
             engine
                 .upsert_node(
-                    1,
+                    "BenchNode",
                     &key,
                     UpsertNodeOptions {
                         props,
@@ -65,7 +87,7 @@ fn bench_upsert_edge(c: &mut Criterion) {
         // Pre-create nodes
         let inputs: Vec<NodeInput> = (0..1000)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("n{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -73,13 +95,13 @@ fn bench_upsert_edge(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        engine.batch_upsert_nodes(&inputs).unwrap();
+        engine.batch_upsert_nodes(inputs.clone()).unwrap();
         let mut i = 0u64;
         b.iter(|| {
             let from = (i % 1000) + 1;
             let to = ((i + 1) % 1000) + 1;
             engine
-                .upsert_edge(from, to, 1, UpsertEdgeOptions::default())
+                .upsert_edge(from, to, "BenchEdge", UpsertEdgeOptions::default())
                 .unwrap();
             i += 1;
         });
@@ -91,7 +113,7 @@ fn bench_get_node(c: &mut Criterion) {
         let (_dir, engine) = temp_db();
         let inputs: Vec<NodeInput> = (0..1000)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("n{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -99,7 +121,7 @@ fn bench_get_node(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+        let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
         let mut i = 0usize;
         b.iter(|| {
             let id = ids[i % ids.len()];
@@ -112,7 +134,7 @@ fn bench_get_node(c: &mut Criterion) {
         let (_dir, engine) = temp_db();
         let inputs: Vec<NodeInput> = (0..1000)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("n{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -120,7 +142,7 @@ fn bench_get_node(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+        let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
         engine.flush().unwrap();
         let mut i = 0usize;
         b.iter(|| {
@@ -134,7 +156,7 @@ fn bench_get_node(c: &mut Criterion) {
 /// Build a hub-and-spokes graph: one hub node with `n` outgoing edges to target nodes.
 fn build_hub_graph(engine: &mut DatabaseEngine, n: usize) -> u64 {
     let mut inputs: Vec<NodeInput> = vec![NodeInput {
-        type_id: 1,
+        labels: vec![bench_node_label(1)],
         key: "hub".to_string(),
         props: BTreeMap::new(),
         weight: 1.0,
@@ -143,7 +165,7 @@ fn build_hub_graph(engine: &mut DatabaseEngine, n: usize) -> u64 {
     }];
     for i in 0..n {
         inputs.push(NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("t{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -151,34 +173,34 @@ fn build_hub_graph(engine: &mut DatabaseEngine, n: usize) -> u64 {
             sparse_vector: None,
         });
     }
-    let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+    let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
     let hub = ids[0];
     let edges: Vec<EdgeInput> = ids[1..]
         .iter()
         .map(|&target| EdgeInput {
             from: hub,
             to: target,
-            type_id: 1,
+            label: "BenchEdge1".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         })
         .collect();
-    engine.batch_upsert_edges(&edges).unwrap();
+    engine.batch_upsert_edges(edges.clone()).unwrap();
     hub
 }
 
 /// Build a hub graph that stresses Direction::Both self-loop dedup:
 /// - bidirectional hub <-> spoke edges
-/// - many hub self-loops (distinct type IDs to satisfy uniqueness)
+/// - many hub self-loops (distinct label IDs to satisfy uniqueness)
 fn build_hub_both_selfloop_graph(
     engine: &mut DatabaseEngine,
     spoke_count: usize,
     self_loop_count: usize,
 ) -> u64 {
     let mut inputs: Vec<NodeInput> = vec![NodeInput {
-        type_id: 1,
+        labels: vec![bench_node_label(1)],
         key: "hub_both".to_string(),
         props: BTreeMap::new(),
         weight: 1.0,
@@ -187,7 +209,7 @@ fn build_hub_both_selfloop_graph(
     }];
     for i in 0..spoke_count {
         inputs.push(NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("both_t{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -195,7 +217,7 @@ fn build_hub_both_selfloop_graph(
             sparse_vector: None,
         });
     }
-    let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+    let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
     let hub = ids[0];
 
     let mut edges: Vec<EdgeInput> = Vec::with_capacity(spoke_count * 2 + self_loop_count);
@@ -203,7 +225,7 @@ fn build_hub_both_selfloop_graph(
         edges.push(EdgeInput {
             from: hub,
             to: target,
-            type_id: 1,
+            label: "BenchEdge1".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
@@ -212,7 +234,7 @@ fn build_hub_both_selfloop_graph(
         edges.push(EdgeInput {
             from: target,
             to: hub,
-            type_id: 1,
+            label: "BenchEdge1".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
@@ -223,14 +245,14 @@ fn build_hub_both_selfloop_graph(
         edges.push(EdgeInput {
             from: hub,
             to: hub,
-            type_id: 10_000 + i as u32,
+            label: format!("BenchEdge{}", 10_000 + i as u32),
             props: BTreeMap::new(),
             weight: 1.0,
             valid_from: None,
             valid_to: None,
         });
     }
-    engine.batch_upsert_edges(&edges).unwrap();
+    engine.batch_upsert_edges(edges.clone()).unwrap();
     hub
 }
 
@@ -327,7 +349,7 @@ fn bench_neighbors_with_pit(c: &mut Criterion) {
 
     let build_pit_graph = |engine: &mut DatabaseEngine| -> u64 {
         let mut inputs: Vec<NodeInput> = vec![NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -336,7 +358,7 @@ fn bench_neighbors_with_pit(c: &mut Criterion) {
         }];
         for i in 0..100 {
             inputs.push(NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("t{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -344,21 +366,21 @@ fn bench_neighbors_with_pit(c: &mut Criterion) {
                 sparse_vector: None,
             });
         }
-        let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+        let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
         let hub = ids[0];
         let edges: Vec<EdgeInput> = ids[1..]
             .iter()
             .map(|&target| EdgeInput {
                 from: hub,
                 to: target,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: Some(now - 10000),
                 valid_to: None,
             })
             .collect();
-        engine.batch_upsert_edges(&edges).unwrap();
+        engine.batch_upsert_edges(edges.clone()).unwrap();
         hub
     };
 
@@ -404,7 +426,7 @@ fn bench_find_nodes(c: &mut Criterion) {
                 let mut props = BTreeMap::new();
                 props.insert("color".to_string(), PropValue::String(color.to_string()));
                 NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("n{}", i),
                     props,
                     weight: 1.0,
@@ -413,28 +435,30 @@ fn bench_find_nodes(c: &mut Criterion) {
                 }
             })
             .collect();
-        engine.batch_upsert_nodes(&inputs).unwrap();
+        engine.batch_upsert_nodes(inputs.clone()).unwrap();
     };
 
     c.bench_function("find_nodes_1000", |b| {
         let (_dir, mut engine) = temp_db();
         build_find_graph(&mut engine);
         let val = PropValue::String("red".to_string());
+        let label = bench_node_label(1);
         b.iter(|| {
-            engine.find_nodes(1, "color", &val).unwrap();
+            engine.find_nodes(&label, "color", &val).unwrap();
         });
     });
 
     c.bench_function("find_nodes_1000_declared", |b| {
         let (_dir, mut engine) = temp_db();
+        let label = bench_node_label(1);
         let eq = engine
-            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index(&label, "color", SecondaryIndexKind::Equality)
             .unwrap();
         wait_for_property_index_state(&engine, eq.index_id, SecondaryIndexState::Ready);
         build_find_graph(&mut engine);
         let val = PropValue::String("red".to_string());
         b.iter(|| {
-            engine.find_nodes(1, "color", &val).unwrap();
+            engine.find_nodes(&label, "color", &val).unwrap();
         });
     });
 
@@ -443,22 +467,24 @@ fn bench_find_nodes(c: &mut Criterion) {
         build_find_graph(&mut engine);
         engine.flush().unwrap();
         let val = PropValue::String("red".to_string());
+        let label = bench_node_label(1);
         b.iter(|| {
-            engine.find_nodes(1, "color", &val).unwrap();
+            engine.find_nodes(&label, "color", &val).unwrap();
         });
     });
 
     c.bench_function("find_nodes_1000_segment_declared", |b| {
         let (_dir, mut engine) = temp_db();
+        let label = bench_node_label(1);
         let eq = engine
-            .ensure_node_property_index(1, "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index(&label, "color", SecondaryIndexKind::Equality)
             .unwrap();
         wait_for_property_index_state(&engine, eq.index_id, SecondaryIndexState::Ready);
         build_find_graph(&mut engine);
         engine.flush().unwrap();
         let val = PropValue::String("red".to_string());
         b.iter(|| {
-            engine.find_nodes(1, "color", &val).unwrap();
+            engine.find_nodes(&label, "color", &val).unwrap();
         });
     });
 }
@@ -472,7 +498,7 @@ fn bench_flush(c: &mut Criterion) {
                 let (dir, engine) = temp_db();
                 let node_inputs: Vec<NodeInput> = (0..100)
                     .map(|i| NodeInput {
-                        type_id: 1,
+                        labels: vec![bench_node_label(1)],
                         key: format!("n{}", i),
                         props: BTreeMap::new(),
                         weight: 1.0,
@@ -480,19 +506,19 @@ fn bench_flush(c: &mut Criterion) {
                         sparse_vector: None,
                     })
                     .collect();
-                let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+                let ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
                 let edge_inputs: Vec<EdgeInput> = (0..20)
                     .map(|i| EdgeInput {
                         from: ids[i % 100],
                         to: ids[(i + 1) % 100],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
                         valid_to: None,
                     })
                     .collect();
-                engine.batch_upsert_edges(&edge_inputs).unwrap();
+                engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
                 (dir, engine)
             },
             |(_dir, engine)| {
@@ -511,7 +537,7 @@ fn bench_batch_upsert_nodes(c: &mut Criterion) {
         b.iter(|| {
             let inputs: Vec<NodeInput> = (0..100)
                 .map(|i| NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("batch{}_{}", batch_num, i),
                     props: BTreeMap::new(),
                     weight: 1.0,
@@ -519,7 +545,7 @@ fn bench_batch_upsert_nodes(c: &mut Criterion) {
                     sparse_vector: None,
                 })
                 .collect();
-            engine.batch_upsert_nodes(&inputs).unwrap();
+            engine.batch_upsert_nodes(inputs).unwrap();
             batch_num += 1;
         });
     });
@@ -534,7 +560,7 @@ fn bench_batch_upsert_nodes(c: &mut Criterion) {
                 batch_num * 100,
                 100,
             );
-            engine.batch_upsert_nodes(&inputs).unwrap();
+            engine.batch_upsert_nodes(inputs).unwrap();
             batch_num += 1;
         });
     });
@@ -599,14 +625,19 @@ fn wait_for_property_index_state(
 }
 
 fn ensure_property_query_declarations(engine: &mut DatabaseEngine) {
+    let label = bench_node_label(1);
     let eq = engine
-        .ensure_node_property_index(1, PROPERTY_EQ_DECLARED_KEY, SecondaryIndexKind::Equality)
+        .ensure_node_property_index(
+            &label,
+            PROPERTY_EQ_DECLARED_KEY,
+            SecondaryIndexKind::Equality,
+        )
         .unwrap();
     wait_for_property_index_state(engine, eq.index_id, SecondaryIndexState::Ready);
 
     let range = engine
         .ensure_node_property_index(
-            1,
+            &label,
             PROPERTY_RANGE_DECLARED_KEY,
             SecondaryIndexKind::Range {
                 domain: SecondaryIndexRangeDomain::Int,
@@ -647,7 +678,7 @@ fn make_property_query_nodes(prefix: &str, start: u64, count: usize) -> Vec<Node
         .map(|offset| {
             let i = start + offset;
             NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("{}_{}", prefix, i),
                 props: make_property_index_bench_props(i),
                 weight: 1.0,
@@ -670,7 +701,7 @@ fn make_property_budget_nodes(prefix: &str, start: u64, count: usize) -> Vec<Nod
                 );
             }
             NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("{}_{}", prefix, i),
                 props,
                 weight: 1.0,
@@ -697,7 +728,7 @@ fn build_property_query_engine() -> (tempfile::TempDir, DatabaseEngine) {
     let (dir, mut engine) = property_bench_db();
     ensure_property_query_declarations(&mut engine);
     let nodes = make_property_query_nodes("query", 0, PROPERTY_QUERY_NODE_COUNT);
-    engine.batch_upsert_nodes(&nodes).unwrap();
+    engine.batch_upsert_nodes(nodes.clone()).unwrap();
     engine.flush().unwrap();
     (dir, engine)
 }
@@ -708,7 +739,7 @@ fn build_property_flush_engine(with_declarations: bool) -> (tempfile::TempDir, D
         ensure_property_query_declarations(&mut engine);
     }
     let nodes = make_property_query_nodes("flush", 0, PROPERTY_FLUSH_NODE_COUNT);
-    engine.batch_upsert_nodes(&nodes).unwrap();
+    engine.batch_upsert_nodes(nodes.clone()).unwrap();
     (dir, engine)
 }
 
@@ -726,7 +757,7 @@ fn build_property_compaction_engine(
             start,
             PROPERTY_COMPACTION_NODES_PER_SEGMENT as usize,
         );
-        engine.batch_upsert_nodes(&nodes).unwrap();
+        engine.batch_upsert_nodes(nodes.clone()).unwrap();
         engine.flush().unwrap();
     }
     (dir, engine)
@@ -742,7 +773,7 @@ fn build_property_compaction_general_budget_engine() -> (tempfile::TempDir, Data
             start,
             PROPERTY_COMPACTION_NODES_PER_SEGMENT as usize,
         );
-        engine.batch_upsert_nodes(&nodes).unwrap();
+        engine.batch_upsert_nodes(nodes.clone()).unwrap();
         engine.flush().unwrap();
     }
     (dir, engine)
@@ -754,7 +785,7 @@ fn build_many_stats_sidecars_db() -> tempfile::TempDir {
     for segment in 0..8u64 {
         let start = segment * 1_000;
         let nodes = make_property_query_nodes(&format!("open{}", segment), start, 1_000);
-        engine.batch_upsert_nodes(&nodes).unwrap();
+        engine.batch_upsert_nodes(nodes.clone()).unwrap();
         engine.flush().unwrap();
     }
     engine.close().unwrap();
@@ -774,10 +805,11 @@ fn bench_property_indexes(c: &mut Criterion) {
 
     query_group.bench_function("equality_declared", |b| {
         let (_dir, engine) = build_property_query_engine();
+        let label = bench_node_label(1);
         b.iter(|| {
             black_box(
                 engine
-                    .find_nodes(1, PROPERTY_EQ_DECLARED_KEY, &declared_eq_value)
+                    .find_nodes(&label, PROPERTY_EQ_DECLARED_KEY, &declared_eq_value)
                     .unwrap(),
             );
         });
@@ -785,10 +817,11 @@ fn bench_property_indexes(c: &mut Criterion) {
 
     query_group.bench_function("equality_fallback_scan", |b| {
         let (_dir, engine) = build_property_query_engine();
+        let label = bench_node_label(1);
         b.iter(|| {
             black_box(
                 engine
-                    .find_nodes(1, PROPERTY_EQ_FALLBACK_KEY, &fallback_eq_value)
+                    .find_nodes(&label, PROPERTY_EQ_FALLBACK_KEY, &fallback_eq_value)
                     .unwrap(),
             );
         });
@@ -796,11 +829,12 @@ fn bench_property_indexes(c: &mut Criterion) {
 
     query_group.bench_function("range_declared", |b| {
         let (_dir, engine) = build_property_query_engine();
+        let label = bench_node_label(1);
         b.iter(|| {
             black_box(
                 engine
                     .find_nodes_range(
-                        1,
+                        &label,
                         PROPERTY_RANGE_DECLARED_KEY,
                         Some(&declared_range_lower),
                         Some(&declared_range_upper),
@@ -812,11 +846,12 @@ fn bench_property_indexes(c: &mut Criterion) {
 
     query_group.bench_function("range_fallback_scan", |b| {
         let (_dir, engine) = build_property_query_engine();
+        let label = bench_node_label(1);
         b.iter(|| {
             black_box(
                 engine
                     .find_nodes_range(
-                        1,
+                        &label,
                         PROPERTY_RANGE_FALLBACK_KEY,
                         Some(&fallback_range_lower),
                         Some(&fallback_range_upper),
@@ -828,21 +863,22 @@ fn bench_property_indexes(c: &mut Criterion) {
 
     query_group.bench_function("mixed_declared_and_fallback", |b| {
         let (_dir, engine) = build_property_query_engine();
+        let label = bench_node_label(1);
         b.iter(|| {
             black_box(
                 engine
-                    .find_nodes(1, PROPERTY_EQ_DECLARED_KEY, &declared_eq_value)
+                    .find_nodes(&label, PROPERTY_EQ_DECLARED_KEY, &declared_eq_value)
                     .unwrap(),
             );
             black_box(
                 engine
-                    .find_nodes(1, PROPERTY_EQ_FALLBACK_KEY, &fallback_eq_value)
+                    .find_nodes(&label, PROPERTY_EQ_FALLBACK_KEY, &fallback_eq_value)
                     .unwrap(),
             );
             black_box(
                 engine
                     .find_nodes_range(
-                        1,
+                        &label,
                         PROPERTY_RANGE_DECLARED_KEY,
                         Some(&declared_range_lower),
                         Some(&declared_range_upper),
@@ -852,7 +888,7 @@ fn bench_property_indexes(c: &mut Criterion) {
             black_box(
                 engine
                     .find_nodes_range(
-                        1,
+                        &label,
                         PROPERTY_RANGE_FALLBACK_KEY,
                         Some(&fallback_range_lower),
                         Some(&fallback_range_upper),
@@ -982,7 +1018,7 @@ fn bench_compact(c: &mut Criterion) {
                 for seg in 0..5u64 {
                     let node_inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
-                            type_id: 1,
+                            labels: vec![bench_node_label(1)],
                             key: format!("s{}_n{}", seg, i),
                             props: make_bench_props(seg * 2000 + i),
                             weight: 1.0,
@@ -990,19 +1026,19 @@ fn bench_compact(c: &mut Criterion) {
                             sparse_vector: None,
                         })
                         .collect();
-                    let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+                    let ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
                     let edge_inputs: Vec<EdgeInput> = (0..400)
                         .map(|i| EdgeInput {
                             from: ids[i % 2000],
                             to: ids[(i + 1) % 2000],
-                            type_id: 1,
+                            label: "BenchEdge1".to_string(),
                             props: BTreeMap::new(),
                             weight: 1.0,
                             valid_from: None,
                             valid_to: None,
                         })
                         .collect();
-                    engine.batch_upsert_edges(&edge_inputs).unwrap();
+                    engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
                     engine.flush().unwrap();
                 }
                 (dir, engine)
@@ -1030,7 +1066,7 @@ fn bench_compact(c: &mut Criterion) {
                 for seg in 0..5u64 {
                     let node_inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
-                            type_id: 1,
+                            labels: vec![bench_node_label(1)],
                             key: format!("s{}_n{}", seg, i),
                             props: make_bench_props(seg * 2000 + i),
                             weight: 1.0,
@@ -1038,19 +1074,19 @@ fn bench_compact(c: &mut Criterion) {
                             sparse_vector: None,
                         })
                         .collect();
-                    let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+                    let ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
                     let edge_inputs: Vec<EdgeInput> = (0..400)
                         .map(|i| EdgeInput {
                             from: ids[i % 2000],
                             to: ids[(i + 1) % 2000],
-                            type_id: 1,
+                            label: "BenchEdge1".to_string(),
                             props: BTreeMap::new(),
                             weight: 1.0,
                             valid_from: None,
                             valid_to: None,
                         })
                         .collect();
-                    engine.batch_upsert_edges(&edge_inputs).unwrap();
+                    engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
                     engine.flush().unwrap();
                 }
                 engine
@@ -1059,7 +1095,7 @@ fn bench_compact(c: &mut Criterion) {
                         PrunePolicy {
                             max_age_ms: None,
                             max_weight: Some(0.0),
-                            type_id: Some(u32::MAX),
+                            label: Some("NoopFastMergeBlocker".to_string()),
                         },
                     )
                     .unwrap();
@@ -1088,7 +1124,7 @@ fn bench_compact(c: &mut Criterion) {
                 for seg in 0..5u64 {
                     let node_inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
-                            type_id: 1,
+                            labels: vec![bench_node_label(1)],
                             key: format!("n{}", i),
                             props: make_bench_props(seg * 2000 + i),
                             weight: 1.0,
@@ -1096,19 +1132,19 @@ fn bench_compact(c: &mut Criterion) {
                             sparse_vector: None,
                         })
                         .collect();
-                    let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+                    let ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
                     let edge_inputs: Vec<EdgeInput> = (0..400)
                         .map(|i| EdgeInput {
                             from: ids[i % 2000],
                             to: ids[(i + 1) % 2000],
-                            type_id: 1,
+                            label: "BenchEdge1".to_string(),
                             props: BTreeMap::new(),
                             weight: 1.0,
                             valid_from: None,
                             valid_to: None,
                         })
                         .collect();
-                    engine.batch_upsert_edges(&edge_inputs).unwrap();
+                    engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
                     engine.flush().unwrap();
                 }
                 (dir, engine)
@@ -1135,7 +1171,7 @@ fn bench_compact(c: &mut Criterion) {
                 for seg in 0..5u64 {
                     let node_inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
-                            type_id: 1,
+                            labels: vec![bench_node_label(1)],
                             key: format!("s{}_n{}", seg, i),
                             props: make_bench_props(seg * 2000 + i),
                             weight: 1.0,
@@ -1143,19 +1179,19 @@ fn bench_compact(c: &mut Criterion) {
                             sparse_vector: None,
                         })
                         .collect();
-                    let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+                    let ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
                     let edge_inputs: Vec<EdgeInput> = (0..400)
                         .map(|i| EdgeInput {
                             from: ids[i % 2000],
                             to: ids[(i + 1) % 2000],
-                            type_id: 1,
+                            label: "BenchEdge1".to_string(),
                             props: BTreeMap::new(),
                             weight: 1.0,
                             valid_from: None,
                             valid_to: None,
                         })
                         .collect();
-                    engine.batch_upsert_edges(&edge_inputs).unwrap();
+                    engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
                     engine.flush().unwrap();
                 }
                 // Delete ~20% of nodes → creates tombstones
@@ -1193,7 +1229,11 @@ fn bench_group_commit(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             engine
-                .upsert_node(1, &format!("imm_{}", i), UpsertNodeOptions::default())
+                .upsert_node(
+                    "BenchNode",
+                    &format!("imm_{}", i),
+                    UpsertNodeOptions::default(),
+                )
                 .unwrap();
             i += 1;
         });
@@ -1214,7 +1254,11 @@ fn bench_group_commit(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             engine
-                .upsert_node(1, &format!("gc_{}", i), UpsertNodeOptions::default())
+                .upsert_node(
+                    "BenchNode",
+                    &format!("gc_{}", i),
+                    UpsertNodeOptions::default(),
+                )
                 .unwrap();
             i += 1;
         });
@@ -1235,7 +1279,7 @@ fn bench_group_commit(c: &mut Criterion) {
         b.iter(|| {
             let inputs: Vec<NodeInput> = (0..100)
                 .map(|i| NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("imm_b{}_{}", batch_num, i),
                     props: BTreeMap::new(),
                     weight: 1.0,
@@ -1243,7 +1287,7 @@ fn bench_group_commit(c: &mut Criterion) {
                     sparse_vector: None,
                 })
                 .collect();
-            engine.batch_upsert_nodes(&inputs).unwrap();
+            engine.batch_upsert_nodes(inputs.clone()).unwrap();
             batch_num += 1;
         });
         engine.close().unwrap();
@@ -1263,7 +1307,7 @@ fn bench_group_commit(c: &mut Criterion) {
         b.iter(|| {
             let inputs: Vec<NodeInput> = (0..100)
                 .map(|i| NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("gc_b{}_{}", batch_num, i),
                     props: BTreeMap::new(),
                     weight: 1.0,
@@ -1271,7 +1315,7 @@ fn bench_group_commit(c: &mut Criterion) {
                     sparse_vector: None,
                 })
                 .collect();
-            engine.batch_upsert_nodes(&inputs).unwrap();
+            engine.batch_upsert_nodes(inputs.clone()).unwrap();
             batch_num += 1;
         });
         engine.close().unwrap();
@@ -1284,7 +1328,7 @@ fn bench_group_commit(c: &mut Criterion) {
 fn build_multi_hub_graph(engine: &mut DatabaseEngine) -> Vec<u64> {
     let node_inputs: Vec<NodeInput> = (0..1100)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: if i < 100 {
                 format!("hub{}", i)
             } else {
@@ -1296,7 +1340,7 @@ fn build_multi_hub_graph(engine: &mut DatabaseEngine) -> Vec<u64> {
             sparse_vector: None,
         })
         .collect();
-    let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+    let ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
     let hub_ids: Vec<u64> = ids[..100].to_vec();
     let mut edge_inputs = Vec::with_capacity(1000);
     for h in 0..100 {
@@ -1304,7 +1348,7 @@ fn build_multi_hub_graph(engine: &mut DatabaseEngine) -> Vec<u64> {
             edge_inputs.push(EdgeInput {
                 from: ids[h],
                 to: ids[100 + h * 10 + i],
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -1312,7 +1356,7 @@ fn build_multi_hub_graph(engine: &mut DatabaseEngine) -> Vec<u64> {
             });
         }
     }
-    engine.batch_upsert_edges(&edge_inputs).unwrap();
+    engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
     hub_ids
 }
 
@@ -1334,7 +1378,7 @@ fn bench_degree(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("degree_fanout_100_type_filtered", |b| {
+    c.bench_function("degree_fanout_100_edge_label_filtered", |b| {
         let (_dir, mut engine) = temp_db();
         let hub = build_hub_graph(&mut engine, 100);
         b.iter(|| {
@@ -1342,7 +1386,7 @@ fn bench_degree(c: &mut Criterion) {
                 .degree(
                     hub,
                     &DegreeOptions {
-                        type_filter: Some(vec![1]),
+                        edge_label_filter: Some(vec!["BenchEdge1".to_string()]),
                         ..Default::default()
                     },
                 )
@@ -1350,7 +1394,7 @@ fn bench_degree(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("degree_fanout_100_segment_type_filtered", |b| {
+    c.bench_function("degree_fanout_100_segment_edge_label_filtered", |b| {
         let (_dir, mut engine) = temp_db();
         let hub = build_hub_graph(&mut engine, 100);
         engine.flush().unwrap();
@@ -1359,7 +1403,7 @@ fn bench_degree(c: &mut Criterion) {
                 .degree(
                     hub,
                     &DegreeOptions {
-                        type_filter: Some(vec![1]),
+                        edge_label_filter: Some(vec!["BenchEdge1".to_string()]),
                         ..Default::default()
                     },
                 )
@@ -1435,7 +1479,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
 
     let build_2hop_graph = |engine: &mut DatabaseEngine| -> u64 {
         let mut node_inputs = vec![NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: "root".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1444,7 +1488,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
         }];
         for i in 0..100u64 {
             node_inputs.push(NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("mid_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1453,7 +1497,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
             });
             for j in 0..10u64 {
                 node_inputs.push(NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("leaf_{}_{}", i, j),
                     props: BTreeMap::new(),
                     weight: 1.0,
@@ -1462,7 +1506,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 });
             }
         }
-        let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+        let ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
         let root = ids[0];
         let mut edge_inputs = Vec::new();
         for i in 0..100usize {
@@ -1470,7 +1514,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
             edge_inputs.push(EdgeInput {
                 from: root,
                 to: mid,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -1481,7 +1525,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 edge_inputs.push(EdgeInput {
                     from: mid,
                     to: leaf,
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0,
                     valid_from: None,
@@ -1489,7 +1533,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 });
             }
         }
-        engine.batch_upsert_edges(&edge_inputs).unwrap();
+        engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
         root
     };
 
@@ -1535,7 +1579,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
             let level3 = 4usize;
 
             let mut node_inputs = vec![NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: "root".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1544,7 +1588,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
             }];
             for i in 0..level1 {
                 node_inputs.push(NodeInput {
-                    type_id: 11,
+                    labels: vec![bench_node_label(11)],
                     key: format!("lvl1_{}", i),
                     props: BTreeMap::new(),
                     weight: 1.0,
@@ -1555,7 +1599,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
             for i in 0..level1 {
                 for j in 0..level2 {
                     node_inputs.push(NodeInput {
-                        type_id: if (i + j) % 2 == 0 { 2 } else { 3 },
+                        labels: vec![bench_node_label(if (i + j) % 2 == 0 { 2 } else { 3 })],
                         key: format!("lvl2_{}_{}", i, j),
                         props: BTreeMap::new(),
                         weight: 1.0,
@@ -1568,7 +1612,11 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 for j in 0..level2 {
                     for k in 0..level3 {
                         node_inputs.push(NodeInput {
-                            type_id: if (i + j + k) % 2 == 0 { 2 } else { 3 },
+                            labels: vec![bench_node_label(if (i + j + k) % 2 == 0 {
+                                2
+                            } else {
+                                3
+                            })],
                             key: format!("lvl3_{}_{}_{}", i, j, k),
                             props: BTreeMap::new(),
                             weight: 1.0,
@@ -1579,7 +1627,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 }
             }
 
-            let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+            let ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
             let root = ids[0];
             let level1_offset = 1usize;
             let level2_offset = level1_offset + level1;
@@ -1590,7 +1638,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 edge_inputs.push(EdgeInput {
                     from: root,
                     to: lvl1,
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0,
                     valid_from: None,
@@ -1602,7 +1650,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     edge_inputs.push(EdgeInput {
                         from: lvl1,
                         to: lvl2,
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -1613,7 +1661,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                         edge_inputs.push(EdgeInput {
                             from: lvl2,
                             to: ids[level3_offset + lvl3_idx],
-                            type_id: 1,
+                            label: "BenchEdge1".to_string(),
                             props: BTreeMap::new(),
                             weight: 1.0,
                             valid_from: None,
@@ -1622,7 +1670,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     }
                 }
             }
-            engine.batch_upsert_edges(&edge_inputs).unwrap();
+            engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
             (root, level1, level2, level3)
         };
 
@@ -1647,9 +1695,17 @@ fn bench_advanced_queries(c: &mut Criterion) {
         });
     });
 
-    let filtered_types = [2u32];
+    let filtered_label_ids = [2u32];
+    let filtered_node_label_filter = || NodeLabelFilter {
+        labels: filtered_label_ids
+            .iter()
+            .copied()
+            .map(bench_node_label)
+            .collect(),
+        mode: LabelMatchMode::Any,
+    };
 
-    group.bench_function("traverse_depth_1_to_3_filtered_type2_24x4x4", |b| {
+    group.bench_function("traverse_depth_1_to_3_filtered_label2_24x4x4", |b| {
         let (_dir, mut engine) = temp_db();
         let (root, _, _, _) = build_layered_traversal_graph(&mut engine);
         b.iter(|| {
@@ -1658,7 +1714,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     root,
                     3,
                     &TraverseOptions {
-                        node_type_filter: Some(filtered_types.to_vec()),
+                        emit_node_label_filter: Some(filtered_node_label_filter()),
                         ..Default::default()
                     },
                 )
@@ -1666,27 +1722,30 @@ fn bench_advanced_queries(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("traverse_depth_1_to_3_filtered_type2_24x4x4_segment", |b| {
-        let (_dir, mut engine) = temp_db();
-        let (root, _, _, _) = build_layered_traversal_graph(&mut engine);
-        engine.flush().unwrap();
-        b.iter(|| {
-            engine
-                .traverse(
-                    root,
-                    3,
-                    &TraverseOptions {
-                        node_type_filter: Some(filtered_types.to_vec()),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-        });
-    });
+    group.bench_function(
+        "traverse_depth_1_to_3_filtered_label2_24x4x4_segment",
+        |b| {
+            let (_dir, mut engine) = temp_db();
+            let (root, _, _, _) = build_layered_traversal_graph(&mut engine);
+            engine.flush().unwrap();
+            b.iter(|| {
+                engine
+                    .traverse(
+                        root,
+                        3,
+                        &TraverseOptions {
+                            emit_node_label_filter: Some(filtered_node_label_filter()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            });
+        },
+    );
 
     let build_topk_graph = |engine: &mut DatabaseEngine| -> u64 {
         let mut node_inputs = vec![NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: "hub".to_string(),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -1695,7 +1754,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
         }];
         for i in 0..1000u64 {
             node_inputs.push(NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("tk_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1703,20 +1762,20 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 sparse_vector: None,
             });
         }
-        let ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+        let ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
         let hub = ids[0];
         let edge_inputs: Vec<EdgeInput> = (0..1000)
             .map(|i| EdgeInput {
                 from: hub,
                 to: ids[1 + i],
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0 + (i as u64 % 100) as f32 / 10.0,
                 valid_from: None,
                 valid_to: None,
             })
             .collect();
-        engine.batch_upsert_edges(&edge_inputs).unwrap();
+        engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
         hub
     };
 
@@ -1749,7 +1808,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
             - 10_000;
         let inputs: Vec<NodeInput> = (0..10_000u64)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("{}_{}", prefix, i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1757,7 +1816,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        engine.batch_upsert_nodes(&inputs).unwrap();
+        engine.batch_upsert_nodes(inputs.clone()).unwrap();
         let to_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1769,8 +1828,11 @@ fn bench_advanced_queries(c: &mut Criterion) {
     group.bench_function("find_nodes_by_time_range_10000", |b| {
         let (_dir, mut engine) = temp_db();
         let (from_ms, to_ms) = build_time_range_graph(&mut engine, "ts");
+        let label = bench_node_label(1);
         b.iter(|| {
-            engine.find_nodes_by_time_range(1, from_ms, to_ms).unwrap();
+            engine
+                .find_nodes_by_time_range(&label, from_ms, to_ms)
+                .unwrap();
         });
     });
 
@@ -1778,8 +1840,11 @@ fn bench_advanced_queries(c: &mut Criterion) {
         let (_dir, mut engine) = temp_db();
         let (from_ms, to_ms) = build_time_range_graph(&mut engine, "ts");
         engine.flush().unwrap();
+        let label = bench_node_label(1);
         b.iter(|| {
-            engine.find_nodes_by_time_range(1, from_ms, to_ms).unwrap();
+            engine
+                .find_nodes_by_time_range(&label, from_ms, to_ms)
+                .unwrap();
         });
     });
 
@@ -1790,9 +1855,10 @@ fn bench_advanced_queries(c: &mut Criterion) {
             limit: Some(100),
             after: None,
         };
+        let label = bench_node_label(1);
         b.iter(|| {
             engine
-                .find_nodes_by_time_range_paged(1, from_ms, to_ms, &page)
+                .find_nodes_by_time_range_paged(&label, from_ms, to_ms, &page)
                 .unwrap();
         });
     });
@@ -1807,9 +1873,10 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 limit: Some(100),
                 after: None,
             };
+            let label = bench_node_label(1);
             b.iter(|| {
                 engine
-                    .find_nodes_by_time_range_paged(1, from_ms, to_ms, &page)
+                    .find_nodes_by_time_range_paged(&label, from_ms, to_ms, &page)
                     .unwrap();
             });
         },
@@ -1818,7 +1885,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
     let build_ppr_graph = |engine: &mut DatabaseEngine| -> Vec<u64> {
         let node_inputs: Vec<NodeInput> = (0..2000u64)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("ppr_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1826,14 +1893,14 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let node_ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+        let node_ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
         let edge_inputs: Vec<EdgeInput> = (0..2000usize)
             .flat_map(|i| {
                 [
                     EdgeInput {
                         from: node_ids[i],
                         to: node_ids[(i + 1) % 2000],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -1842,7 +1909,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     EdgeInput {
                         from: node_ids[i],
                         to: node_ids[(i + 7) % 2000],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.7,
                         valid_from: None,
@@ -1851,7 +1918,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 ]
             })
             .collect();
-        engine.batch_upsert_edges(&edge_inputs).unwrap();
+        engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
         node_ids
     };
 
@@ -1885,7 +1952,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
     let build_ppr_graph_50k = |engine: &mut DatabaseEngine| -> Vec<u64> {
         let node_inputs: Vec<NodeInput> = (0..50_000u64)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("ppr50k_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1893,14 +1960,14 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let node_ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+        let node_ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
         let edge_inputs: Vec<EdgeInput> = (0..50_000usize)
             .flat_map(|i| {
                 [
                     EdgeInput {
                         from: node_ids[i],
                         to: node_ids[(i + 1) % 50_000],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -1909,7 +1976,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     EdgeInput {
                         from: node_ids[i],
                         to: node_ids[(i + 7) % 50_000],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.7,
                         valid_from: None,
@@ -1918,7 +1985,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 ]
             })
             .collect();
-        engine.batch_upsert_edges(&edge_inputs).unwrap();
+        engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
         node_ids
     };
 
@@ -1956,7 +2023,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
 
         let node_inputs: Vec<NodeInput> = (0..TOTAL_NODES as u64)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("pprch20k_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -1964,7 +2031,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let node_ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+        let node_ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
 
         let global_hubs: Vec<usize> = (0..8usize)
             .map(|community| community * COMMUNITY_SIZE)
@@ -1984,7 +2051,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     EdgeInput {
                         from: node_ids[i],
                         to: node_ids[community_base + ((local + 1) % COMMUNITY_SIZE)],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -1993,7 +2060,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     EdgeInput {
                         from: node_ids[i],
                         to: node_ids[community_base + ((local + 7) % COMMUNITY_SIZE)],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.9,
                         valid_from: None,
@@ -2002,7 +2069,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     EdgeInput {
                         from: node_ids[i],
                         to: node_ids[community_base + ((local + 31) % COMMUNITY_SIZE)],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.8,
                         valid_from: None,
@@ -2011,7 +2078,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     EdgeInput {
                         from: node_ids[i],
                         to: node_ids[community_base + ((local * 73 + 19) % COMMUNITY_SIZE)],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.7,
                         valid_from: None,
@@ -2023,7 +2090,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     edges.push(EdgeInput {
                         from: node_ids[i],
                         to: node_ids[community_hub],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.1,
                         valid_from: None,
@@ -2035,7 +2102,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     edges.push(EdgeInput {
                         from: node_ids[i],
                         to: node_ids[next_community_base + ((local * 17 + 11) % COMMUNITY_SIZE)],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.35,
                         valid_from: None,
@@ -2047,7 +2114,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     edges.push(EdgeInput {
                         from: node_ids[i],
                         to: node_ids[prev_community_base + ((local * 29 + 5) % COMMUNITY_SIZE)],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.3,
                         valid_from: None,
@@ -2059,7 +2126,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     edges.push(EdgeInput {
                         from: node_ids[i],
                         to: node_ids[global_hub],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.25,
                         valid_from: None,
@@ -2068,7 +2135,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     edges.push(EdgeInput {
                         from: node_ids[i],
                         to: node_ids[next_community_base],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.45,
                         valid_from: None,
@@ -2082,7 +2149,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     edges.push(EdgeInput {
                         from: node_ids[i],
                         to: node_ids[next_global_hub],
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 0.6,
                         valid_from: None,
@@ -2093,7 +2160,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 edges
             })
             .collect();
-        engine.batch_upsert_edges(&edge_inputs).unwrap();
+        engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
         node_ids
     };
 
@@ -2244,7 +2311,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
     let build_export_graph = |engine: &mut DatabaseEngine| -> Vec<u64> {
         let node_inputs: Vec<NodeInput> = (0..5000u64)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("ex_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -2252,7 +2319,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let node_ids = engine.batch_upsert_nodes(&node_inputs).unwrap();
+        let node_ids = engine.batch_upsert_nodes(node_inputs.clone()).unwrap();
         let edge_inputs: Vec<EdgeInput> = (0..20_000usize)
             .filter_map(|i| {
                 let from = node_ids[i % 5000];
@@ -2261,7 +2328,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                     Some(EdgeInput {
                         from,
                         to,
-                        type_id: 1,
+                        label: "BenchEdge1".to_string(),
                         props: BTreeMap::new(),
                         weight: 1.0,
                         valid_from: None,
@@ -2272,7 +2339,7 @@ fn bench_advanced_queries(c: &mut Criterion) {
                 }
             })
             .collect();
-        engine.batch_upsert_edges(&edge_inputs).unwrap();
+        engine.batch_upsert_edges(edge_inputs.clone()).unwrap();
         node_ids
     };
 
@@ -2310,7 +2377,7 @@ fn bench_recovery(c: &mut Criterion) {
                 for batch in 0..10u64 {
                     let inputs: Vec<NodeInput> = (0..500u64)
                         .map(|i| NodeInput {
-                            type_id: 1,
+                            labels: vec![bench_node_label(1)],
                             key: format!("wal_{}", batch * 500 + i),
                             props: BTreeMap::new(),
                             weight: 1.0,
@@ -2318,7 +2385,7 @@ fn bench_recovery(c: &mut Criterion) {
                             sparse_vector: None,
                         })
                         .collect();
-                    engine.batch_upsert_nodes(&inputs).unwrap();
+                    engine.batch_upsert_nodes(inputs.clone()).unwrap();
                 }
                 engine.close().unwrap();
                 dir
@@ -2339,7 +2406,7 @@ fn bench_recovery(c: &mut Criterion) {
                 for seg in 0..3u64 {
                     let inputs: Vec<NodeInput> = (0..2000u64)
                         .map(|i| NodeInput {
-                            type_id: 1,
+                            labels: vec![bench_node_label(1)],
                             key: format!("seg{}_{}", seg, i),
                             props: BTreeMap::new(),
                             weight: 1.0,
@@ -2347,7 +2414,7 @@ fn bench_recovery(c: &mut Criterion) {
                             sparse_vector: None,
                         })
                         .collect();
-                    engine.batch_upsert_nodes(&inputs).unwrap();
+                    engine.batch_upsert_nodes(inputs.clone()).unwrap();
                     engine.flush().unwrap();
                 }
                 engine.close().unwrap();
@@ -2378,7 +2445,7 @@ fn build_ring_graph(n: usize) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
 
     let inputs: Vec<NodeInput> = (0..n)
         .map(|i| NodeInput {
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("sp_{}", i),
             props: BTreeMap::new(),
             weight: 1.0,
@@ -2386,7 +2453,7 @@ fn build_ring_graph(n: usize) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
             sparse_vector: None,
         })
         .collect();
-    let node_ids = engine.batch_upsert_nodes(&inputs).unwrap();
+    let node_ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
 
     let edges: Vec<EdgeInput> = (0..n)
         .flat_map(|i| {
@@ -2396,7 +2463,7 @@ fn build_ring_graph(n: usize) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
                 EdgeInput {
                     from,
                     to: node_ids[(i + 1) % n],
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight,
                     valid_from: None,
@@ -2405,7 +2472,7 @@ fn build_ring_graph(n: usize) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
                 EdgeInput {
                     from,
                     to: node_ids[(i + 7) % n],
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight,
                     valid_from: None,
@@ -2414,7 +2481,7 @@ fn build_ring_graph(n: usize) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
             ]
         })
         .collect();
-    engine.batch_upsert_edges(&edges).unwrap();
+    engine.batch_upsert_edges(edges.clone()).unwrap();
 
     (dir, engine, node_ids)
 }
@@ -2627,7 +2694,7 @@ fn bench_shortest_path(c: &mut Criterion) {
 
         let inputs: Vec<NodeInput> = (0..100)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("d_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -2635,14 +2702,14 @@ fn bench_shortest_path(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+        let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
 
         let mut diamond_edges = Vec::new();
         for &l1 in &ids[1..20] {
             diamond_edges.push(EdgeInput {
                 from: ids[0],
                 to: l1,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -2652,7 +2719,7 @@ fn bench_shortest_path(c: &mut Criterion) {
                 diamond_edges.push(EdgeInput {
                     from: l1,
                     to: l2,
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0,
                     valid_from: None,
@@ -2664,14 +2731,14 @@ fn bench_shortest_path(c: &mut Criterion) {
             diamond_edges.push(EdgeInput {
                 from: l2,
                 to: ids[99],
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
                 valid_to: None,
             });
         }
-        engine.batch_upsert_edges(&diamond_edges).unwrap();
+        engine.batch_upsert_edges(diamond_edges.clone()).unwrap();
 
         let from = ids[0];
         let to = ids[99];
@@ -2700,7 +2767,7 @@ fn bench_shortest_path(c: &mut Criterion) {
 
         let inputs: Vec<NodeInput> = (0..100)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("d_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -2708,14 +2775,14 @@ fn bench_shortest_path(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+        let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
 
         let mut diamond_edges = Vec::new();
         for &l1 in &ids[1..20] {
             diamond_edges.push(EdgeInput {
                 from: ids[0],
                 to: l1,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -2725,7 +2792,7 @@ fn bench_shortest_path(c: &mut Criterion) {
                 diamond_edges.push(EdgeInput {
                     from: l1,
                     to: l2,
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0,
                     valid_from: None,
@@ -2737,14 +2804,14 @@ fn bench_shortest_path(c: &mut Criterion) {
             diamond_edges.push(EdgeInput {
                 from: l2,
                 to: ids[99],
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
                 valid_to: None,
             });
         }
-        engine.batch_upsert_edges(&diamond_edges).unwrap();
+        engine.batch_upsert_edges(diamond_edges.clone()).unwrap();
         engine.flush().unwrap();
 
         let from = ids[0];
@@ -2774,7 +2841,7 @@ fn bench_shortest_path(c: &mut Criterion) {
 
         let inputs: Vec<NodeInput> = (0..100)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("wd_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -2782,14 +2849,14 @@ fn bench_shortest_path(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+        let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
 
         let mut diamond_edges = Vec::new();
         for &l1 in &ids[1..20] {
             diamond_edges.push(EdgeInput {
                 from: ids[0],
                 to: l1,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -2799,7 +2866,7 @@ fn bench_shortest_path(c: &mut Criterion) {
                 diamond_edges.push(EdgeInput {
                     from: l1,
                     to: l2,
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0,
                     valid_from: None,
@@ -2811,14 +2878,14 @@ fn bench_shortest_path(c: &mut Criterion) {
             diamond_edges.push(EdgeInput {
                 from: l2,
                 to: ids[99],
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
                 valid_to: None,
             });
         }
-        engine.batch_upsert_edges(&diamond_edges).unwrap();
+        engine.batch_upsert_edges(diamond_edges.clone()).unwrap();
 
         let from = ids[0];
         let to = ids[99];
@@ -2848,7 +2915,7 @@ fn bench_shortest_path(c: &mut Criterion) {
 
         let inputs: Vec<NodeInput> = (0..100)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("wd_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -2856,14 +2923,14 @@ fn bench_shortest_path(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let ids = engine.batch_upsert_nodes(&inputs).unwrap();
+        let ids = engine.batch_upsert_nodes(inputs.clone()).unwrap();
 
         let mut diamond_edges = Vec::new();
         for &l1 in &ids[1..20] {
             diamond_edges.push(EdgeInput {
                 from: ids[0],
                 to: l1,
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
@@ -2873,7 +2940,7 @@ fn bench_shortest_path(c: &mut Criterion) {
                 diamond_edges.push(EdgeInput {
                     from: l1,
                     to: l2,
-                    type_id: 1,
+                    label: "BenchEdge1".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0,
                     valid_from: None,
@@ -2885,14 +2952,14 @@ fn bench_shortest_path(c: &mut Criterion) {
             diamond_edges.push(EdgeInput {
                 from: l2,
                 to: ids[99],
-                type_id: 1,
+                label: "BenchEdge1".to_string(),
                 props: BTreeMap::new(),
                 weight: 1.0,
                 valid_from: None,
                 valid_to: None,
             });
         }
-        engine.batch_upsert_edges(&diamond_edges).unwrap();
+        engine.batch_upsert_edges(diamond_edges.clone()).unwrap();
         engine.flush().unwrap();
 
         let from = ids[0];
@@ -2930,15 +2997,33 @@ fn bench_batch_get_by_keys(c: &mut Criterion) {
     let keys: Vec<(u32, String)> = (0..1000).map(|i| (1u32, format!("key_{:04}", i))).collect();
     for (tid, k) in &keys {
         engine
-            .upsert_node(*tid, k, UpsertNodeOptions::default())
+            .upsert_node(&bench_node_label(*tid), k, UpsertNodeOptions::default())
             .unwrap();
     }
     engine.flush().unwrap();
 
     // Prepare query slices
-    let keys_10: Vec<(u32, &str)> = keys[..10].iter().map(|(t, k)| (*t, k.as_str())).collect();
-    let keys_100: Vec<(u32, &str)> = keys[..100].iter().map(|(t, k)| (*t, k.as_str())).collect();
-    let keys_1000: Vec<(u32, &str)> = keys.iter().map(|(t, k)| (*t, k.as_str())).collect();
+    let keys_10: Vec<NodeKeyQuery> = keys[..10]
+        .iter()
+        .map(|(t, k)| NodeKeyQuery {
+            label: bench_node_label(*t),
+            key: k.clone(),
+        })
+        .collect();
+    let keys_100: Vec<NodeKeyQuery> = keys[..100]
+        .iter()
+        .map(|(t, k)| NodeKeyQuery {
+            label: bench_node_label(*t),
+            key: k.clone(),
+        })
+        .collect();
+    let keys_1000: Vec<NodeKeyQuery> = keys
+        .iter()
+        .map(|(t, k)| NodeKeyQuery {
+            label: bench_node_label(*t),
+            key: k.clone(),
+        })
+        .collect();
 
     group.bench_function("batch_10", |b| {
         b.iter(|| engine.get_nodes_by_keys(&keys_10).unwrap());
@@ -2951,8 +3036,8 @@ fn bench_batch_get_by_keys(c: &mut Criterion) {
     });
     group.bench_function("loop_100_single", |b| {
         b.iter(|| {
-            for &(tid, key) in &keys_100 {
-                engine.get_node_by_key(tid, key).unwrap();
+            for query in &keys_100 {
+                engine.get_node_by_key(&query.label, &query.key).unwrap();
             }
         });
     });
@@ -2966,7 +3051,7 @@ fn txn_intents(batch_num: u64, node_count: usize, edge_count: usize) -> Vec<TxnI
     for i in 0..node_count {
         intents.push(TxnIntent::UpsertNode {
             alias: None,
-            type_id: 1,
+            labels: vec![bench_node_label(1)],
             key: format!("txn_{}_n_{}", batch_num, i),
             options: UpsertNodeOptions::default(),
         });
@@ -2976,7 +3061,7 @@ fn txn_intents(batch_num: u64, node_count: usize, edge_count: usize) -> Vec<TxnI
             alias: None,
             from: TxnNodeRef::Local(TxnLocalRef::Slot((i % node_count) as u32)),
             to: TxnNodeRef::Local(TxnLocalRef::Slot(((i + 1) % node_count) as u32)),
-            type_id: 7,
+            label: "BenchEdge7".to_string(),
             options: UpsertEdgeOptions::default(),
         });
     }
@@ -3009,7 +3094,7 @@ fn bench_write_txn(c: &mut Criterion) {
         let (_dir, engine) = temp_db();
         let existing_nodes: Vec<NodeInput> = (0..8)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("txn_existing_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -3017,14 +3102,14 @@ fn bench_write_txn(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let existing_ids = engine.batch_upsert_nodes(&existing_nodes).unwrap();
+        let existing_ids = engine.batch_upsert_nodes(existing_nodes.clone()).unwrap();
         let mut batch_num = 0u64;
         b.iter(|| {
             let mut intents = Vec::with_capacity(16);
             for i in 0..8 {
                 intents.push(TxnIntent::UpsertNode {
                     alias: None,
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("txn_existing_{}", i),
                     options: UpsertNodeOptions {
                         weight: 1.0 + (batch_num % 100) as f32,
@@ -3037,7 +3122,7 @@ fn bench_write_txn(c: &mut Criterion) {
                     alias: None,
                     from: TxnNodeRef::Id(existing_ids[i]),
                     to: TxnNodeRef::Id(existing_ids[(i + 1) % 8]),
-                    type_id: 7,
+                    label: "BenchEdge7".to_string(),
                     options: UpsertEdgeOptions {
                         weight: 1.0 + (batch_num % 100) as f32,
                         ..Default::default()
@@ -3055,7 +3140,7 @@ fn bench_write_txn(c: &mut Criterion) {
         let (_dir, engine) = temp_db();
         let existing_nodes: Vec<NodeInput> = (0..8)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("patch_existing_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -3063,12 +3148,12 @@ fn bench_write_txn(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let existing_ids = engine.batch_upsert_nodes(&existing_nodes).unwrap();
+        let existing_ids = engine.batch_upsert_nodes(existing_nodes.clone()).unwrap();
         let mut batch_num = 0u64;
         b.iter(|| {
             let nodes: Vec<NodeInput> = (0..8)
                 .map(|i| NodeInput {
-                    type_id: 1,
+                    labels: vec![bench_node_label(1)],
                     key: format!("patch_existing_{}", i),
                     props: BTreeMap::new(),
                     weight: 1.0 + (batch_num % 100) as f32,
@@ -3080,7 +3165,7 @@ fn bench_write_txn(c: &mut Criterion) {
                 .map(|i| EdgeInput {
                     from: existing_ids[i % existing_ids.len()],
                     to: existing_ids[(i + 1) % existing_ids.len()],
-                    type_id: 7,
+                    label: "BenchEdge7".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0 + (batch_num % 100) as f32,
                     valid_from: None,
@@ -3089,7 +3174,7 @@ fn bench_write_txn(c: &mut Criterion) {
                 .collect();
             black_box(
                 engine
-                    .graph_patch(&GraphPatch {
+                    .graph_patch(GraphPatch {
                         upsert_nodes: nodes,
                         upsert_edges: edges,
                         invalidate_edges: Vec::new(),
@@ -3106,7 +3191,7 @@ fn bench_write_txn(c: &mut Criterion) {
         let (_dir, engine) = temp_db();
         let nodes: Vec<NodeInput> = (0..17)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("edge_existing_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -3114,7 +3199,7 @@ fn bench_write_txn(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let ids = engine.batch_upsert_nodes(&nodes).unwrap();
+        let ids = engine.batch_upsert_nodes(nodes.clone()).unwrap();
         let mut batch_num = 0u64;
         b.iter(|| {
             let intents: Vec<TxnIntent> = (0..16)
@@ -3122,7 +3207,7 @@ fn bench_write_txn(c: &mut Criterion) {
                     alias: None,
                     from: TxnNodeRef::Id(ids[i]),
                     to: TxnNodeRef::Id(ids[i + 1]),
-                    type_id: 11,
+                    label: "BenchEdge11".to_string(),
                     options: UpsertEdgeOptions {
                         weight: 1.0 + (batch_num % 100) as f32,
                         ..Default::default()
@@ -3140,7 +3225,7 @@ fn bench_write_txn(c: &mut Criterion) {
         let (_dir, engine) = temp_db();
         let nodes: Vec<NodeInput> = (0..17)
             .map(|i| NodeInput {
-                type_id: 1,
+                labels: vec![bench_node_label(1)],
                 key: format!("patch_edge_existing_{}", i),
                 props: BTreeMap::new(),
                 weight: 1.0,
@@ -3148,14 +3233,14 @@ fn bench_write_txn(c: &mut Criterion) {
                 sparse_vector: None,
             })
             .collect();
-        let ids = engine.batch_upsert_nodes(&nodes).unwrap();
+        let ids = engine.batch_upsert_nodes(nodes.clone()).unwrap();
         let mut batch_num = 0u64;
         b.iter(|| {
             let edges: Vec<EdgeInput> = (0..16)
                 .map(|i| EdgeInput {
                     from: ids[i],
                     to: ids[i + 1],
-                    type_id: 11,
+                    label: "BenchEdge11".to_string(),
                     props: BTreeMap::new(),
                     weight: 1.0 + (batch_num % 100) as f32,
                     valid_from: None,
@@ -3164,7 +3249,7 @@ fn bench_write_txn(c: &mut Criterion) {
                 .collect();
             black_box(
                 engine
-                    .graph_patch(&GraphPatch {
+                    .graph_patch(GraphPatch {
                         upsert_nodes: Vec::new(),
                         upsert_edges: edges,
                         invalidate_edges: Vec::new(),
@@ -3180,13 +3265,13 @@ fn bench_write_txn(c: &mut Criterion) {
     group.bench_function("conflict_update_same_key", |b| {
         let (_dir, engine) = temp_db();
         engine
-            .upsert_node(1, "conflict", UpsertNodeOptions::default())
+            .upsert_node("BenchNode", "conflict", UpsertNodeOptions::default())
             .unwrap();
         let mut i = 0u64;
         b.iter(|| {
             let mut txn = engine.begin_write_txn().unwrap();
             txn.upsert_node(
-                1,
+                "BenchNode",
                 "conflict",
                 UpsertNodeOptions {
                     weight: 2.0,
@@ -3196,7 +3281,7 @@ fn bench_write_txn(c: &mut Criterion) {
             .unwrap();
             engine
                 .upsert_node(
-                    1,
+                    "BenchNode",
                     "conflict",
                     UpsertNodeOptions {
                         weight: 3.0 + i as f32,

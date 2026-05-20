@@ -23,11 +23,11 @@ describe('degree (sync)', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-degree-'));
     db = freshDb(tmpDir, 'deg');
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10, { weight: 2.0 });
-    db.upsertEdge(a, c, 20, { weight: 3.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'WORKS_AT', { weight: 2.0 });
+    db.upsertEdge(a, c, 'MENTIONS', { weight: 3.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -47,10 +47,10 @@ describe('degree (sync)', () => {
   });
 
   it('filters by type', () => {
-    assert.equal(db.degree(a, { direction: 'outgoing', typeFilter: [10] }), 1);
-    assert.equal(db.degree(a, { direction: 'outgoing', typeFilter: [20] }), 1);
-    assert.equal(db.degree(a, { direction: 'outgoing', typeFilter: [10, 20] }), 2);
-    assert.equal(db.degree(a, { direction: 'outgoing', typeFilter: [99] }), 0);
+    assert.equal(db.degree(a, { direction: 'outgoing', edgeLabelFilter: ['WORKS_AT'] }), 1);
+    assert.equal(db.degree(a, { direction: 'outgoing', edgeLabelFilter: ['MENTIONS'] }), 1);
+    assert.equal(db.degree(a, { direction: 'outgoing', edgeLabelFilter: ['WORKS_AT', 'MENTIONS'] }), 2);
+    assert.equal(db.degree(a, { direction: 'outgoing', edgeLabelFilter: ['MISSING_EDGE_TYPE'] }), 0);
   });
 
   it('returns 0 for nonexistent node', () => {
@@ -65,11 +65,11 @@ describe('sumEdgeWeights (sync)', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-sum-'));
     db = freshDb(tmpDir, 'sum');
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10, { weight: 2.0 });
-    db.upsertEdge(a, c, 10, { weight: 3.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'WORKS_AT', { weight: 2.0 });
+    db.upsertEdge(a, c, 'WORKS_AT', { weight: 3.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -83,21 +83,21 @@ describe('sumEdgeWeights (sync)', () => {
 
   it('filters by type', () => {
     const db2 = freshDb(tmpDir, 'sum-tf');
-    const x = db2.upsertNode(1, 'x');
-    const y = db2.upsertNode(1, 'y');
-    const z = db2.upsertNode(1, 'z');
-    db2.upsertEdge(x, y, 10, { weight: 2.0 });
-    db2.upsertEdge(x, z, 20, { weight: 5.0 });
-    assert.ok(Math.abs(db2.sumEdgeWeights(x, { direction: 'outgoing', typeFilter: [10] }) - 2.0) < 1e-6);
-    assert.ok(Math.abs(db2.sumEdgeWeights(x, { direction: 'outgoing', typeFilter: [20] }) - 5.0) < 1e-6);
+    const x = db2.upsertNode('Person', 'x');
+    const y = db2.upsertNode('Person', 'y');
+    const z = db2.upsertNode('Person', 'z');
+    db2.upsertEdge(x, y, 'WORKS_AT', { weight: 2.0 });
+    db2.upsertEdge(x, z, 'MENTIONS', { weight: 5.0 });
+    assert.ok(Math.abs(db2.sumEdgeWeights(x, { direction: 'outgoing', edgeLabelFilter: ['WORKS_AT'] }) - 2.0) < 1e-6);
+    assert.ok(Math.abs(db2.sumEdgeWeights(x, { direction: 'outgoing', edgeLabelFilter: ['MENTIONS'] }) - 5.0) < 1e-6);
     db2.close();
   });
 
   it('respects at_epoch', () => {
     const db2 = freshDb(tmpDir, 'sum-ep');
-    const x = db2.upsertNode(1, 'x');
-    const y = db2.upsertNode(1, 'y');
-    db2.upsertEdge(x, y, 10, { weight: 3.0, validFrom: 100, validTo: 200 });
+    const x = db2.upsertNode('Person', 'x');
+    const y = db2.upsertNode('Person', 'y');
+    db2.upsertEdge(x, y, 'WORKS_AT', { weight: 3.0, validFrom: 100, validTo: 200 });
     assert.ok(Math.abs(db2.sumEdgeWeights(x, { direction: 'outgoing', atEpoch: 150 }) - 3.0) < 1e-6);
     assert.equal(db2.sumEdgeWeights(x, { direction: 'outgoing', atEpoch: 250 }), 0.0);
     db2.close();
@@ -111,11 +111,11 @@ describe('avgEdgeWeight (sync)', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-avg-'));
     db = freshDb(tmpDir, 'avg');
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10, { weight: 2.0 });
-    db.upsertEdge(a, c, 10, { weight: 4.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'WORKS_AT', { weight: 2.0 });
+    db.upsertEdge(a, c, 'WORKS_AT', { weight: 4.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -131,12 +131,12 @@ describe('avgEdgeWeight (sync)', () => {
 
   it('filters by type', () => {
     const db2 = freshDb(tmpDir, 'avg-tf');
-    const x = db2.upsertNode(1, 'x');
-    const y = db2.upsertNode(1, 'y');
-    const z = db2.upsertNode(1, 'z');
-    db2.upsertEdge(x, y, 10, { weight: 2.0 });
-    db2.upsertEdge(x, z, 20, { weight: 6.0 });
-    const avg = db2.avgEdgeWeight(x, { direction: 'outgoing', typeFilter: [10] });
+    const x = db2.upsertNode('Person', 'x');
+    const y = db2.upsertNode('Person', 'y');
+    const z = db2.upsertNode('Person', 'z');
+    db2.upsertEdge(x, y, 'WORKS_AT', { weight: 2.0 });
+    db2.upsertEdge(x, z, 'MENTIONS', { weight: 6.0 });
+    const avg = db2.avgEdgeWeight(x, { direction: 'outgoing', edgeLabelFilter: ['WORKS_AT'] });
     assert.ok(avg !== null);
     assert.ok(Math.abs(avg - 2.0) < 1e-6);
     db2.close();
@@ -144,9 +144,9 @@ describe('avgEdgeWeight (sync)', () => {
 
   it('respects at_epoch', () => {
     const db2 = freshDb(tmpDir, 'avg-ep');
-    const x = db2.upsertNode(1, 'x');
-    const y = db2.upsertNode(1, 'y');
-    db2.upsertEdge(x, y, 10, { weight: 4.0, validFrom: 100, validTo: 200 });
+    const x = db2.upsertNode('Person', 'x');
+    const y = db2.upsertNode('Person', 'y');
+    db2.upsertEdge(x, y, 'WORKS_AT', { weight: 4.0, validFrom: 100, validTo: 200 });
     const avg = db2.avgEdgeWeight(x, { direction: 'outgoing', atEpoch: 150 });
     assert.ok(avg !== null);
     assert.ok(Math.abs(avg - 4.0) < 1e-6);
@@ -162,12 +162,12 @@ describe('degrees batch (sync)', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-degs-'));
     db = freshDb(tmpDir, 'degs');
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10);
-    db.upsertEdge(a, c, 10);
-    db.upsertEdge(b, c, 10);
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'WORKS_AT');
+    db.upsertEdge(a, c, 'WORKS_AT');
+    db.upsertEdge(b, c, 'WORKS_AT');
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -190,12 +190,12 @@ describe('degrees batch (sync)', () => {
 
   it('filters by type', () => {
     const db2 = freshDb(tmpDir, 'degs-tf');
-    const x = db2.upsertNode(1, 'x');
-    const y = db2.upsertNode(1, 'y');
-    const z = db2.upsertNode(1, 'z');
-    db2.upsertEdge(x, y, 10);
-    db2.upsertEdge(x, z, 20);
-    const results = db2.degrees([x], { direction: 'outgoing', typeFilter: [10] });
+    const x = db2.upsertNode('Person', 'x');
+    const y = db2.upsertNode('Person', 'y');
+    const z = db2.upsertNode('Person', 'z');
+    db2.upsertEdge(x, y, 'WORKS_AT');
+    db2.upsertEdge(x, z, 'MENTIONS');
+    const results = db2.degrees([x], { direction: 'outgoing', edgeLabelFilter: ['WORKS_AT'] });
     const degX = results.find(r => r.nodeId === x);
     assert.ok(degX);
     assert.equal(degX.degree, 1);
@@ -204,9 +204,9 @@ describe('degrees batch (sync)', () => {
 
   it('respects at_epoch', () => {
     const db2 = freshDb(tmpDir, 'degs-ep');
-    const x = db2.upsertNode(1, 'x');
-    const y = db2.upsertNode(1, 'y');
-    db2.upsertEdge(x, y, 10, { weight: 1.0, validFrom: 100, validTo: 200 });
+    const x = db2.upsertNode('Person', 'x');
+    const y = db2.upsertNode('Person', 'y');
+    db2.upsertEdge(x, y, 'WORKS_AT', { weight: 1.0, validFrom: 100, validTo: 200 });
     const at150 = db2.degrees([x], { direction: 'outgoing', atEpoch: 150 });
     const degAt150 = at150.find(r => r.nodeId === x);
     assert.ok(degAt150);
@@ -223,12 +223,12 @@ describe('degree sidecar persistence (sync)', () => {
     const dbPath = join(tmpDir, 'sidecar');
     let db = OverGraph.open(dbPath);
 
-    const a = db.upsertNode(1, 'a');
-    const b = db.upsertNode(1, 'b');
-    const c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10, { weight: 2.0 });
+    const a = db.upsertNode('Person', 'a');
+    const b = db.upsertNode('Person', 'b');
+    const c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'WORKS_AT', { weight: 2.0 });
     db.flush();
-    db.upsertEdge(a, c, 10, { weight: 4.0 });
+    db.upsertEdge(a, c, 'WORKS_AT', { weight: 4.0 });
     db.flush();
     db.compact();
 
@@ -252,9 +252,9 @@ describe('degree sidecar persistence (sync)', () => {
     const dbPath = join(tmpDir, 'corrupt');
     let db = OverGraph.open(dbPath);
 
-    const a = db.upsertNode(1, 'a');
-    const b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 10, { weight: 5.0 });
+    const a = db.upsertNode('Person', 'a');
+    const b = db.upsertNode('Person', 'b');
+    db.upsertEdge(a, b, 'WORKS_AT', { weight: 5.0 });
     db.flush();
     db.close();
 
@@ -280,12 +280,12 @@ describe('degree matches neighbors length', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-dparity-'));
     db = freshDb(tmpDir, 'dparity');
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, b, 10, { weight: 2.0 });
-    db.upsertEdge(a, c, 20, { weight: 3.0 });
-    db.upsertEdge(b, c, 10, { weight: 1.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, b, 'WORKS_AT', { weight: 2.0 });
+    db.upsertEdge(a, c, 'MENTIONS', { weight: 3.0 });
+    db.upsertEdge(b, c, 'WORKS_AT', { weight: 1.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -308,9 +308,9 @@ describe('degree async', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-degasync-'));
     db = freshDb(tmpDir, 'degasync');
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
-    db.upsertEdge(a, b, 10, { weight: 5.0 });
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
+    db.upsertEdge(a, b, 'WORKS_AT', { weight: 5.0 });
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
@@ -351,20 +351,20 @@ describe('degree temporal', () => {
   before(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-degtemporal-'));
     db = freshDb(tmpDir, 'degtemporal');
-    a = db.upsertNode(1, 'a');
-    b = db.upsertNode(1, 'b');
+    a = db.upsertNode('Person', 'a');
+    b = db.upsertNode('Person', 'b');
   });
   after(() => { db.close(); rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('ignores expired edge', () => {
     const now = Date.now();
-    db.upsertEdge(a, b, 10, { weight: 1.0, validFrom: now - 2000, validTo: now - 1000 });
+    db.upsertEdge(a, b, 'WORKS_AT', { weight: 1.0, validFrom: now - 2000, validTo: now - 1000 });
     assert.equal(db.degree(a), 0);
   });
 
   it('at_epoch selects valid window', () => {
-    const c = db.upsertNode(1, 'c');
-    db.upsertEdge(a, c, 20, { weight: 1.0, validFrom: 100, validTo: 200 });
+    const c = db.upsertNode('Person', 'c');
+    db.upsertEdge(a, c, 'MENTIONS', { weight: 1.0, validFrom: 100, validTo: 200 });
     assert.equal(db.degree(a, { direction: 'outgoing', atEpoch: 150 }), 1);
     assert.equal(db.degree(a, { direction: 'outgoing', atEpoch: 250 }), 0);
     assert.equal(db.degree(a, { direction: 'outgoing', atEpoch: 50 }), 0);

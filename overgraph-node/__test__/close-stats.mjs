@@ -22,24 +22,24 @@ describe('close({ force: true })', () => {
 
   it('should close normally without options (backwards compat)', () => {
     const db = OverGraph.open(join(tmpDir, 'normal'));
-    db.upsertNode(1, 'n1');
+    db.upsertNode('Person', 'n1');
     db.close();
   });
 
   it('should close with force: false (same as default)', () => {
     const db = OverGraph.open(join(tmpDir, 'force-false'));
-    db.upsertNode(1, 'n1');
+    db.upsertNode('Person', 'n1');
     db.close({ force: false });
   });
 
   it('should close with force: true', () => {
     const db = OverGraph.open(join(tmpDir, 'force-true'));
-    db.upsertNode(1, 'n1');
+    db.upsertNode('Person', 'n1');
     db.close({ force: true });
 
     // Reopen to verify data is intact
     const db2 = OverGraph.open(join(tmpDir, 'force-true'));
-    const node = db2.getNodeByKey(1, 'n1');
+    const node = db2.getNodeByKey('Person', 'n1');
     assert.ok(node, 'node should survive close_fast');
     db2.close();
   });
@@ -47,31 +47,31 @@ describe('close({ force: true })', () => {
   it('should close_fast after flush', () => {
     const db = OverGraph.open(join(tmpDir, 'force-flushed'));
     for (let i = 0; i < 10; i++) {
-      db.upsertNode(1, `n${i}`);
+      db.upsertNode('Person', `n${i}`);
     }
     db.flush();
     db.close({ force: true });
 
     const db2 = OverGraph.open(join(tmpDir, 'force-flushed'));
-    const node = db2.getNodeByKey(1, 'n5');
+    const node = db2.getNodeByKey('Person', 'n5');
     assert.ok(node, 'flushed nodes should survive close_fast');
     db2.close();
   });
 
   it('should work with closeAsync({ force: true })', async () => {
     const db = OverGraph.open(join(tmpDir, 'async-force'));
-    db.upsertNode(1, 'async_node');
+    db.upsertNode('Person', 'async_node');
     await db.closeAsync({ force: true });
 
     const db2 = OverGraph.open(join(tmpDir, 'async-force'));
-    const node = db2.getNodeByKey(1, 'async_node');
+    const node = db2.getNodeByKey('Person', 'async_node');
     assert.ok(node, 'node should survive async close_fast');
     db2.close();
   });
 
   it('should work with closeAsync() no options', async () => {
     const db = OverGraph.open(join(tmpDir, 'async-normal'));
-    db.upsertNode(1, 'n1');
+    db.upsertNode('Person', 'n1');
     await db.closeAsync();
   });
 });
@@ -126,11 +126,11 @@ describe('stats()', () => {
 
     assert.equal(db.stats().segmentCount, 0);
 
-    db.upsertNode(1, 'a');
+    db.upsertNode('Person', 'a');
     db.flush();
     assert.equal(db.stats().segmentCount, 1);
 
-    db.upsertNode(1, 'b');
+    db.upsertNode('Person', 'b');
     db.flush();
     assert.equal(db.stats().segmentCount, 2);
 
@@ -139,9 +139,9 @@ describe('stats()', () => {
 
   it('should count tombstones after deletes', () => {
     const db = OverGraph.open(join(tmpDir, 'tombstones'), { walSyncMode: 'immediate' });
-    const n1 = db.upsertNode(1, 'a');
-    const n2 = db.upsertNode(1, 'b');
-    db.upsertEdge(n1, n2, 1);
+    const n1 = db.upsertNode('Person', 'a');
+    const n2 = db.upsertNode('Person', 'b');
+    db.upsertEdge(n1, n2, 'LINKS_TO');
 
     assert.equal(db.stats().nodeTombstoneCount, 0);
     assert.equal(db.stats().edgeTombstoneCount, 0);
@@ -164,9 +164,9 @@ describe('stats()', () => {
       db.stats().lastCompactionMs === null || db.stats().lastCompactionMs === undefined,
     );
 
-    db.upsertNode(1, 'a');
+    db.upsertNode('Person', 'a');
     db.flush();
-    db.upsertNode(1, 'b');
+    db.upsertNode('Person', 'b');
     db.flush();
 
     const before = Date.now();
@@ -183,7 +183,7 @@ describe('stats()', () => {
 
   it('should work with statsAsync()', async () => {
     const db = OverGraph.open(join(tmpDir, 'async-stats'));
-    db.upsertNode(1, 'x');
+    db.upsertNode('Person', 'x');
 
     const s = await db.statsAsync();
     assert.equal(typeof s.segmentCount, 'number');
