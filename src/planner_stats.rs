@@ -22,13 +22,13 @@ use std::fs;
 use std::fs::File;
 #[cfg(test)]
 use std::io::Read;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) const PLANNER_STATS_FILENAME: &str = "planner_stats.dat";
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const PLANNER_STATS_TMP_FILENAME: &str = "planner_stats.tmp";
 const PLANNER_STATS_MAGIC: [u8; 8] = *b"OGPST01\0";
 pub(crate) const PLANNER_STATS_FORMAT_VERSION: u32 = 1;
@@ -3025,7 +3025,7 @@ fn build_minimal_targeted_refresh_stats(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn write_planner_stats_sidecar_atomic(
     seg_dir: &Path,
     stats: SegmentPlannerStatsV1,
@@ -3046,7 +3046,7 @@ pub(crate) fn write_planner_stats_sidecar_atomic(
     Ok(PlannerStatsWriteOutcome::Written)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn write_planner_stats_sidecar_atomic_cleanup_on_error(
     seg_dir: &Path,
     stats: SegmentPlannerStatsV1,
@@ -4594,20 +4594,15 @@ fn read_optional_component_payload(path: &Path) -> Result<Option<Vec<u8>>, Engin
     Ok(Some(data))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn cleanup_stats_tmp(seg_dir: &Path) {
     let _ = fs::remove_file(seg_dir.join(PLANNER_STATS_TMP_FILENAME));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        let d = File::open(dir)?;
-        d.sync_all()?;
-    }
-    #[cfg(target_os = "windows")]
-    let _ = dir;
+    let d = File::open(dir)?;
+    d.sync_all()?;
     Ok(())
 }
 

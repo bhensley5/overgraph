@@ -1,5 +1,6 @@
 use overgraph::{DatabaseEngine, DbOptions, NodeInput, ScrubFindingType, UpsertEdgeOptions};
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use tempfile::TempDir;
 
 fn open_test_db(dir: &std::path::Path) -> DatabaseEngine {
@@ -34,6 +35,21 @@ fn populate_and_flush(db: &DatabaseEngine) {
     }
 
     db.flush().unwrap();
+}
+
+fn flip_file_byte(path: &std::path::Path, offset: u64) {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0xFF;
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&byte).unwrap();
+    file.sync_all().unwrap();
 }
 
 #[test]
@@ -100,10 +116,8 @@ fn test_scrub_detects_packed_range_corruption() {
 
     let seg_dir = db_path.join("segments").join("seg_0001");
     let core_path = seg_dir.join("segment.core");
-    let mut data = std::fs::read(&core_path).unwrap();
-    let corrupt_offset = data.len() / 2;
-    data[corrupt_offset] ^= 0xFF;
-    std::fs::write(&core_path, &data).unwrap();
+    let corrupt_offset = std::fs::metadata(&core_path).unwrap().len() / 2;
+    flip_file_byte(&core_path, corrupt_offset);
 
     let db = open_test_db(&db_path);
     let report = db.scrub().unwrap();
@@ -132,13 +146,12 @@ fn test_scrub_detects_external_payload_corruption() {
     let seg_dir = db_path.join("segments").join("seg_0001");
     let sidecar_path = find_external_sidecar(&seg_dir)
         .expect("test precondition: expected at least one external sidecar after flush with edges");
-    let mut data = std::fs::read(&sidecar_path).unwrap();
+    let len = std::fs::metadata(&sidecar_path).unwrap().len();
     assert!(
-        data.len() > 192,
+        len > 192,
         "test precondition: external sidecar must have identity header + payload"
     );
-    data[193] ^= 0xFF;
-    std::fs::write(&sidecar_path, &data).unwrap();
+    flip_file_byte(&sidecar_path, 193);
 
     let db = open_test_db(&db_path);
     let report = db.scrub().unwrap();
@@ -164,13 +177,12 @@ fn test_scrub_detects_identity_header_tamper() {
     let seg_dir = db_path.join("segments").join("seg_0001");
     let sidecar_path = find_external_sidecar(&seg_dir)
         .expect("test precondition: expected at least one external sidecar after flush with edges");
-    let mut data = std::fs::read(&sidecar_path).unwrap();
+    let len = std::fs::metadata(&sidecar_path).unwrap().len();
     assert!(
-        data.len() >= 192,
+        len >= 192,
         "test precondition: external sidecar must have identity header"
     );
-    data[16] ^= 0xFF;
-    std::fs::write(&sidecar_path, &data).unwrap();
+    flip_file_byte(&sidecar_path, 16);
 
     let db = open_test_db(&db_path);
     let report = db.scrub().unwrap();
