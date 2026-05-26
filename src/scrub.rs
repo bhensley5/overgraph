@@ -1,6 +1,8 @@
 use crate::error::EngineError;
-use crate::memtable::encode_range_prop_value;
 use crate::parallel::engine_cpu_install;
+use crate::property_value_semantics::{
+    hash_prop_equality_key, numeric_range_sort_key_for_value, NumericRangeSortKey,
+};
 use crate::segment_components::{
     component_id, decode_identity_header, decode_manifest_envelope, dependency_digest,
     ComponentHandleV1, ComponentIdentityHeaderV1, SegmentComponentKind, SegmentComponentManifestV1,
@@ -10,9 +12,9 @@ use crate::segment_components::{
 use crate::segment_reader::{validate_segment_manifest_identity, SegmentReader};
 use crate::segment_writer::segment_dir;
 use crate::types::{
-    hash_prop_value, ComponentScrubFinding, ManifestState, ScrubFindingType, ScrubReport,
-    SecondaryIndexKind, SecondaryIndexManifestEntry, SecondaryIndexState, SecondaryIndexTarget,
-    SegmentInfo, SegmentScrubResult,
+    ComponentScrubFinding, ManifestState, ScrubFindingType, ScrubReport, SecondaryIndexKind,
+    SecondaryIndexManifestEntry, SecondaryIndexState, SecondaryIndexTarget, SegmentInfo,
+    SegmentScrubResult,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -231,7 +233,8 @@ fn scrub_segment_node_semantics(
         })
         .collect();
     let mut expected_secondary_eq_groups: BTreeMap<u64, BTreeMap<u64, Vec<u64>>> = BTreeMap::new();
-    let mut expected_secondary_range_entries: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut expected_secondary_range_entries: BTreeMap<u64, Vec<(NumericRangeSortKey, u64)>> =
+        BTreeMap::new();
     for entry in &node_property_indexes {
         match entry.kind {
             SecondaryIndexKind::Equality => {
@@ -239,7 +242,7 @@ fn scrub_segment_node_semantics(
                     .entry(entry.index_id)
                     .or_default();
             }
-            SecondaryIndexKind::Range { .. } => {
+            SecondaryIndexKind::Range => {
                 expected_secondary_range_entries
                     .entry(entry.index_id)
                     .or_default();
@@ -352,12 +355,12 @@ fn scrub_segment_node_semantics(
                     expected_secondary_eq_groups
                         .entry(entry.index_id)
                         .or_default()
-                        .entry(hash_prop_value(value))
+                        .entry(hash_prop_equality_key(value))
                         .or_default()
                         .push(meta.node_id);
                 }
-                SecondaryIndexKind::Range { domain } => {
-                    if let Some(encoded_value) = encode_range_prop_value(domain, value) {
+                SecondaryIndexKind::Range => {
+                    if let Some(encoded_value) = numeric_range_sort_key_for_value(value) {
                         expected_secondary_range_entries
                             .entry(entry.index_id)
                             .or_default()
@@ -430,7 +433,7 @@ fn scrub_declared_node_property_indexes(
     reader: &SegmentReader,
     node_property_indexes: &[&SecondaryIndexManifestEntry],
     expected_secondary_eq_groups: &BTreeMap<u64, BTreeMap<u64, Vec<u64>>>,
-    expected_secondary_range_entries: &BTreeMap<u64, Vec<(u64, u64)>>,
+    expected_secondary_range_entries: &BTreeMap<u64, Vec<(NumericRangeSortKey, u64)>>,
     findings: &mut Vec<ComponentScrubFinding>,
 ) {
     for entry in node_property_indexes {
@@ -472,7 +475,7 @@ fn scrub_declared_node_property_indexes(
                     ))),
                 }
             }
-            SecondaryIndexKind::Range { .. } => {
+            SecondaryIndexKind::Range => {
                 let expected = expected_secondary_range_entries
                     .get(&entry.index_id)
                     .cloned()
@@ -1313,7 +1316,7 @@ mod tests {
     };
     use crate::{
         DatabaseEngine, DbOptions, NodeInput, PropValue, ScrubFindingType, SecondaryIndexKind,
-        SecondaryIndexRangeDomain, UpsertEdgeOptions, UpsertNodeOptions,
+        UpsertEdgeOptions, UpsertNodeOptions,
     };
     use std::collections::BTreeMap;
     use std::fs::OpenOptions;
@@ -1505,13 +1508,7 @@ mod tests {
             .ensure_node_property_index("Researcher", "status", SecondaryIndexKind::Equality)
             .unwrap();
         let range = db
-            .ensure_node_property_index(
-                "Researcher",
-                "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
-            )
+            .ensure_node_property_index("Researcher", "score", SecondaryIndexKind::Range)
             .unwrap();
         db.shutdown_secondary_index_worker();
 

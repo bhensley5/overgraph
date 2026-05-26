@@ -1,7 +1,9 @@
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, EdgePattern, EdgeQuery, GraphPatternQuery,
-    LabelMatchMode, NodeFilterExpr, NodeLabelFilter, NodePattern, NodeQuery, PatternOrder,
-    PropValue, QueryPlanPublicName, QueryPlanWarning, UpsertEdgeOptions, UpsertNodeOptions,
+    DatabaseEngine, DbOptions, Direction, EdgeQuery, GraphEdgePattern, GraphExpr, GraphNodePattern,
+    GraphOutputOptions, GraphPageRequest, GraphPatternPiece, GraphQueryOptions, GraphReturnItem,
+    GraphReturnProjection, GraphRowQuery, GraphValue, LabelMatchMode, NodeFilterExpr,
+    NodeLabelFilter, NodeQuery, PropValue, QueryPlanPublicName, QueryPlanWarning,
+    UpsertEdgeOptions, UpsertNodeOptions,
 };
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -81,82 +83,7 @@ fn explain_plans_surface_public_names_without_token_ids() {
         }]
     );
 
-    let pattern_plan = engine
-        .explain_pattern_query(&GraphPatternQuery {
-            nodes: vec![
-                NodePattern {
-                    alias: "p".to_string(),
-                    label_filter: Some(NodeLabelFilter {
-                        labels: vec!["Person".to_string()],
-                        mode: LabelMatchMode::All,
-                    }),
-                    ids: Vec::new(),
-                    keys: Vec::new(),
-                    filter: None,
-                },
-                NodePattern {
-                    alias: "c".to_string(),
-                    label_filter: Some(NodeLabelFilter {
-                        labels: vec!["Company".to_string()],
-                        mode: LabelMatchMode::All,
-                    }),
-                    ids: Vec::new(),
-                    keys: Vec::new(),
-                    filter: None,
-                },
-            ],
-            edges: vec![EdgePattern {
-                alias: Some("e".to_string()),
-                from_alias: "p".to_string(),
-                to_alias: "c".to_string(),
-                direction: Direction::Outgoing,
-                label_filter: vec!["WORKS_AT".to_string(), "MISSING".to_string()],
-                filter: None,
-            }],
-            at_epoch: None,
-            limit: 10,
-            order: PatternOrder::AnchorThenAliasesAsc,
-        })
-        .unwrap();
-    assert_eq!(
-        pattern_plan.public_inputs.node_labels,
-        vec![
-            QueryPlanPublicName {
-                alias: Some("p".to_string()),
-                name: "Person".to_string(),
-                known: true,
-                mode: Some(LabelMatchMode::All),
-            },
-            QueryPlanPublicName {
-                alias: Some("c".to_string()),
-                name: "Company".to_string(),
-                known: true,
-                mode: Some(LabelMatchMode::All),
-            },
-        ]
-    );
-    assert_eq!(
-        pattern_plan.public_inputs.edge_labels,
-        vec![
-            QueryPlanPublicName {
-                alias: Some("e".to_string()),
-                name: "WORKS_AT".to_string(),
-                known: true,
-                mode: None,
-            },
-            QueryPlanPublicName {
-                alias: Some("e".to_string()),
-                name: "MISSING".to_string(),
-                known: false,
-                mode: None,
-            },
-        ]
-    );
-    assert!(pattern_plan
-        .warnings
-        .contains(&QueryPlanWarning::UnknownEdgeLabel));
-
-    let debug = format!("{:?}", pattern_plan.public_inputs);
+    let debug = format!("{:?}", edge_plan.public_inputs);
     assert!(!debug.contains(concat!("type", "_id")));
     assert!(!debug.contains(concat!("type", "Id")));
 }
@@ -289,7 +216,7 @@ fn planner_unknown_names_are_read_only_empty_constraints() {
 }
 
 #[test]
-fn graph_pattern_resolves_named_filters_without_changing_bindings() {
+fn graph_rows_resolve_named_filters_without_changing_bindings() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
@@ -303,9 +230,9 @@ fn graph_pattern_resolves_named_filters_without_changing_bindings() {
         .upsert_edge(alice, acme, "WORKS_AT", UpsertEdgeOptions::default())
         .unwrap();
 
-    let base = GraphPatternQuery {
+    let mut base = GraphRowQuery {
         nodes: vec![
-            NodePattern {
+            GraphNodePattern {
                 alias: "p".to_string(),
                 label_filter: Some(NodeLabelFilter {
                     labels: vec!["Person".to_string()],
@@ -315,7 +242,7 @@ fn graph_pattern_resolves_named_filters_without_changing_bindings() {
                 keys: Vec::new(),
                 filter: None,
             },
-            NodePattern {
+            GraphNodePattern {
                 alias: "c".to_string(),
                 label_filter: Some(NodeLabelFilter {
                     labels: vec!["Company".to_string()],
@@ -326,51 +253,79 @@ fn graph_pattern_resolves_named_filters_without_changing_bindings() {
                 filter: None,
             },
         ],
-        edges: vec![EdgePattern {
+        pieces: vec![GraphPatternPiece::Edge(GraphEdgePattern {
             alias: Some("e".to_string()),
             from_alias: "p".to_string(),
             to_alias: "c".to_string(),
             direction: Direction::Outgoing,
             label_filter: vec!["WORKS_AT".to_string(), "MISSING".to_string()],
             filter: None,
-        }],
+        })],
+        where_: None,
+        return_items: Some(vec![
+            GraphReturnItem {
+                expr: GraphExpr::Binding("p".to_string()),
+                projection: GraphReturnProjection::IdOnly,
+                alias: Some("p".to_string()),
+            },
+            GraphReturnItem {
+                expr: GraphExpr::Binding("e".to_string()),
+                projection: GraphReturnProjection::IdOnly,
+                alias: Some("e".to_string()),
+            },
+            GraphReturnItem {
+                expr: GraphExpr::Binding("c".to_string()),
+                projection: GraphReturnProjection::IdOnly,
+                alias: Some("c".to_string()),
+            },
+        ]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
         at_epoch: None,
-        limit: 10,
-        order: PatternOrder::AnchorThenAliasesAsc,
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions::default(),
     };
+    base.options.allow_full_scan = true;
 
-    let result = engine.query_pattern(&base).unwrap();
-    assert_eq!(result.matches.len(), 1);
-    assert_eq!(result.matches[0].nodes["p"], alice);
-    assert_eq!(result.matches[0].nodes["c"], acme);
-    assert_eq!(result.matches[0].edges["e"], works_at);
+    let result = engine.query_graph_rows(&base).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        result.rows[0].values,
+        vec![
+            GraphValue::NodeId(alice),
+            GraphValue::EdgeId(works_at),
+            GraphValue::NodeId(acme),
+        ]
+    );
 
     let mut all_unknown = base.clone();
-    all_unknown.edges[0].label_filter = vec!["MISSING".to_string()];
-    assert!(engine
-        .query_pattern(&all_unknown)
-        .unwrap()
-        .matches
-        .is_empty());
-    assert!(engine
-        .explain_pattern_query(&all_unknown)
-        .unwrap()
+    let GraphPatternPiece::Edge(edge) = &mut all_unknown.pieces[0] else {
+        unreachable!("test query has one edge piece");
+    };
+    edge.label_filter = vec!["MISSING".to_string()];
+    let result = engine.query_graph_rows(&all_unknown).unwrap();
+    assert!(result.rows.is_empty());
+    assert!(result
+        .stats
         .warnings
-        .contains(&QueryPlanWarning::UnknownEdgeLabel));
+        .iter()
+        .any(|warning| warning.contains("UnknownEdgeLabel")));
 
     let mut unknown_node = base;
     unknown_node.nodes[0].label_filter = Some(NodeLabelFilter {
         labels: vec!["Missing".to_string()],
         mode: LabelMatchMode::All,
     });
-    assert!(engine
-        .query_pattern(&unknown_node)
-        .unwrap()
-        .matches
-        .is_empty());
-    assert!(engine
-        .explain_pattern_query(&unknown_node)
-        .unwrap()
+    let result = engine.query_graph_rows(&unknown_node).unwrap();
+    assert!(result.rows.is_empty());
+    assert!(result
+        .stats
         .warnings
-        .contains(&QueryPlanWarning::UnknownNodeLabel));
+        .iter()
+        .any(|warning| warning.contains("UnknownNodeLabel")));
 }

@@ -177,8 +177,14 @@ def load_profiles(path: Path) -> dict[str, Any]:
 
 
 def build_command(
-    lang: str, profile: str, warmup: int, iters: int, scenario_set: str
+    lang: str,
+    profile: str,
+    warmup: int,
+    iters: int,
+    scenario_set: str,
+    scenario_ids: list[str],
 ) -> tuple[list[str], str]:
+    scenario_args = [arg for scenario_id in scenario_ids for arg in ("--scenario-id", scenario_id)]
     if lang == "rust":
         return (
             [
@@ -198,7 +204,8 @@ def build_command(
                 str(iters),
                 "--scenario-set",
                 scenario_set,
-            ],
+            ]
+            + scenario_args,
             "core-benchmark-v1-parity",
         )
     if lang == "node":
@@ -214,7 +221,8 @@ def build_command(
                 str(iters),
                 "--scenario-set",
                 scenario_set,
-            ],
+            ]
+            + scenario_args,
             "connector-benchmark-v3-parity",
         )
     if lang == "python":
@@ -230,7 +238,8 @@ def build_command(
                 str(iters),
                 "--scenario-set",
                 scenario_set,
-            ],
+            ]
+            + scenario_args,
             "connector-benchmark-v2-parity",
         )
     raise ValueError(f"unsupported language: {lang}")
@@ -392,6 +401,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=80)
     parser.add_argument("--scenario-set", default="all", choices=["all", "query"])
+    parser.add_argument("--scenario-id", action="append", default=[])
     parser.add_argument(
         "--allow-legacy-rust-criterion-parse",
         action="store_true",
@@ -415,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
 
     metadata = collect_metadata(args.profile, profile)
     command, harness_stage = build_command(
-        args.lang, args.profile, args.warmup, args.iters, args.scenario_set
+        args.lang, args.profile, args.warmup, args.iters, args.scenario_set, args.scenario_id
     )
     command_display = " ".join(command)
 

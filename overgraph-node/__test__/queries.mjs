@@ -196,14 +196,15 @@ describe('query API parity', () => {
     assert.ok(planHasKind(db.explainNodeQuery(ltRequest).root, 'empty_result'));
   });
 
-  it('matches graph patterns and treats edge updatedAt as a literal property', () => {
-    const result = db.queryPattern({
+  it('matches graph rows and treats edge updatedAt as a literal property', () => {
+    const result = db.queryGraphRows({
       nodes: [
         { alias: 'person', labelFilter: nodeLabels('Person'), filter: { property: 'status', eq: 'active' } },
-        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: [{ label: 'Company', key: 'acme' }] },
       ],
-      edges: [
+      pieces: [
         {
+          kind: 'edge',
           alias: 'employment',
           fromAlias: 'person',
           toAlias: 'company',
@@ -218,16 +219,16 @@ describe('query API parity', () => {
           },
         },
       ],
+      return: [
+        { expr: { binding: 'company' }, as: 'company' },
+        { expr: { binding: 'person' }, as: 'person' },
+        { expr: { binding: 'employment' }, as: 'employment' },
+      ],
       limit: 10,
     });
 
-    assert.equal(result.truncated, false);
-    assert.deepEqual(result.matches, [
-      {
-        nodes: { company: acme, person: activeHigh },
-        edges: { employment: worksAt },
-      },
-    ]);
+    assert.equal(result.nextCursor, null);
+    assert.deepEqual(result.rows, [{ company: acme, person: activeHigh, employment: worksAt }]);
     assert.notEqual(inactiveWorksAt, worksAt);
   });
 
@@ -261,13 +262,14 @@ describe('query API parity', () => {
   });
 
   it('accepts canonical graph edge filters', () => {
-    const result = db.queryPattern({
+    const result = db.queryGraphRows({
       nodes: [
         { alias: 'person', ids: [activeHigh] },
-        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: [{ label: 'Company', key: 'acme' }] },
       ],
-      edges: [
+      pieces: [
         {
+          kind: 'edge',
           alias: 'employment',
           fromAlias: 'person',
           toAlias: 'company',
@@ -281,15 +283,15 @@ describe('query API parity', () => {
           },
         },
       ],
+      return: [
+        { expr: { binding: 'company' }, as: 'company' },
+        { expr: { binding: 'person' }, as: 'person' },
+        { expr: { binding: 'employment' }, as: 'employment' },
+      ],
       limit: 10,
     });
 
-    assert.deepEqual(result.matches, [
-      {
-        nodes: { company: acme, person: activeHigh },
-        edges: { employment: worksAt },
-      },
-    ]);
+    assert.deepEqual(result.rows, [{ company: acme, person: activeHigh, employment: worksAt }]);
   });
 
   it('serializes explain output with recursive lower_snake kinds and warnings', () => {
@@ -302,13 +304,14 @@ describe('query API parity', () => {
     assert.ok(nodePlan.warnings.every(warning => /^[a-z_]+$/.test(warning)));
     assert.ok(nodePlan.warnings.includes('using_fallback_scan'));
 
-    const patternPlan = db.explainPatternQuery({
+    const graphPlan = db.explainGraphRows({
       nodes: [
         { alias: 'person', labelFilter: nodeLabels('Person'), filter: { property: 'status', eq: 'active' } },
-        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: [{ label: 'Company', key: 'acme' }] },
       ],
-      edges: [
+      pieces: [
         {
+          kind: 'edge',
           alias: 'employment',
           fromAlias: 'person',
           toAlias: 'company',
@@ -317,12 +320,12 @@ describe('query API parity', () => {
           filter: { property: 'role', eq: 'engineer' },
         },
       ],
+      return: [{ expr: { binding: 'employment' }, as: 'employment' }],
       limit: 10,
     });
-    assert.equal(patternPlan.kind, 'pattern_query');
-    assert.ok(planHasKind(patternPlan.root, 'pattern_expand'));
-    assert.ok(planHasKind(patternPlan.root, 'verify_edge_predicates'));
-    assert.ok(patternPlan.warnings.includes('edge_property_post_filter'));
+    assert.deepEqual(graphPlan.columns, ['employment']);
+    assert.equal(graphPlan.projection.outputMode, 'ids');
+    assert.ok(graphPlan.plan.length > 0);
   });
 
   it('rejects invalid predicate and pattern shapes at the binding boundary', () => {
@@ -339,11 +342,11 @@ describe('query API parity', () => {
       /use filter/i
     );
     assert.throws(
-      () => db.queryPattern({ nodes: [{ alias: 'a', where: { status: { eq: 'active' } } }], edges: [], limit: 1 }),
+      () => db.queryGraphRows({ nodes: [{ alias: 'a', where: { status: { eq: 'active' } } }], pieces: [], limit: 1 }),
       /use filter/i
     );
     assert.throws(
-      () => db.queryEdgeIds({ filter: { weight: { gte: 1 } } }),
+      () => db.queryEdgeIds({ filter: { property: 'role', eq: 'engineer' } }),
       /full scan|anchor|allow_full_scan/i
     );
     assert.throws(
@@ -365,9 +368,10 @@ describe('query API parity', () => {
       );
     }
     assert.throws(
-      () => db.queryPattern({
+      () => db.queryGraphRows({
         nodes: [{ alias: 'a' }],
-        edges: [{
+        pieces: [{
+          kind: 'edge',
           fromAlias: 'a',
           toAlias: 'b',
           filter: { property: 'role', eq: 'engineer' },
@@ -375,10 +379,10 @@ describe('query API parity', () => {
         }],
         limit: 1,
       }),
-      /use filter/i
+      /where|does not accept field/i
     );
     assert.throws(
-      () => db.queryPattern({ nodes: [], edges: [], limit: 0 }),
+      () => db.queryGraphRows({ nodes: [], pieces: [], limit: 0 }),
       /positive limit|limit must be > 0/i
     );
   });
@@ -430,30 +434,35 @@ describe('query API parity', () => {
       /use filter/i
     );
 
-    const pattern = await db.queryPatternAsync({
+    const pattern = await db.queryGraphRowsAsync({
       nodes: [
         { alias: 'person', ids: [activeHigh], filter: { property: 'status', eq: 'active' } },
-        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: [{ label: 'Company', key: 'acme' }] },
       ],
-      edges: [
-        { alias: 'employment', fromAlias: 'person', toAlias: 'company', labelFilter: ['WORKS_AT'] },
+      pieces: [
+        { kind: 'edge', alias: 'employment', fromAlias: 'person', toAlias: 'company', labelFilter: ['WORKS_AT'] },
+      ],
+      return: [
+        { expr: { binding: 'company' }, as: 'company' },
+        { expr: { binding: 'person' }, as: 'person' },
       ],
       limit: 10,
     });
-    assert.deepEqual(pattern.matches[0].nodes, { company: acme, person: activeHigh });
+    assert.deepEqual(pattern.rows[0], { company: acme, person: activeHigh });
 
-    const patternPlan = await db.explainPatternQueryAsync({
+    const patternPlan = await db.explainGraphRowsAsync({
       nodes: [
         { alias: 'person', ids: [activeHigh], filter: { property: 'status', eq: 'active' } },
-        { alias: 'company', labelFilter: nodeLabels('Company'), keys: ['acme'] },
+        { alias: 'company', labelFilter: nodeLabels('Company'), keys: [{ label: 'Company', key: 'acme' }] },
       ],
-      edges: [
-        { alias: 'employment', fromAlias: 'person', toAlias: 'company', labelFilter: ['WORKS_AT'] },
+      pieces: [
+        { kind: 'edge', alias: 'employment', fromAlias: 'person', toAlias: 'company', labelFilter: ['WORKS_AT'] },
       ],
+      return: [{ expr: { binding: 'employment' }, as: 'employment' }],
       limit: 10,
     });
-    assert.equal(patternPlan.kind, 'pattern_query');
-    assert.ok(planHasKind(patternPlan.root, 'verify_node_filter'));
+    assert.deepEqual(patternPlan.columns, ['employment']);
+    assert.ok(patternPlan.plan.length > 0);
   });
 
   it('supports boolean filters, null presence semantics, and nested values', () => {
@@ -516,7 +525,7 @@ describe('query API parity', () => {
   });
 
   it('serializes boolean explain plans with lower_snake physical nodes and warnings', async () => {
-    db.ensureNodePropertyIndex('Person', 'status', { kind: 'equality' });
+    db.ensureNodePropertyIndex('Person', 'status', 'equality');
     await waitForIndexState(
       db,
       infos => infos.find(info => info.label === 'Person' && info.propKey === 'status' && info.kind === 'equality')

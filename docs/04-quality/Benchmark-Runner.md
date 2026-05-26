@@ -36,20 +36,33 @@ Files:
 - Python: `connector-benchmark-v2-parity` (shared-profile + shared scenario-contract harness)
 - Phase 20b adds Criterion `write_txn/*` microbenches for explicit 4/16/64-intent commits, a 16-intent implicit batch comparator, and a same-key conflict-heavy workload. Connector benchmark harnesses should mirror this with ordered `stage(operations)` arrays for Node.js and Python.
 - Phase 23 adds `query_ops` Criterion microbenchmarks and shared query-only parity scenarios.
-  Phase 26 extends the same query set with direct edge query parity:
+  Phase 26 extends the same query set with direct edge query parity, and Phase 32 extends it with graph-row/GQL substrate parity:
   - `S-QUERY-001` / `query_node_ids_intersected_predicates`
   - `S-QUERY-002` / `query_nodes_intersected_predicates_hydrated`
   - `S-QUERY-003` / `query_edge_ids_endpoint_metadata`
   - `S-QUERY-004` / `query_edges_endpoint_property_hydrated`
+  - `S-QUERY-005` / `query_edge_ids_property_indexed_equality`
+  - `S-QUERY-006` / `query_edge_ids_property_indexed_range`
+  - `S-QUERY-007` / `query_graph_rows_optional_edge_traversal`
+  - `S-GQL-006` / `execute_gql_optional_edge_traversal_graph_rows`
+  Connector-only GQL baselines `S-GQL-001` through `S-GQL-005` are emitted by Node.js/Python for local connector tracking and are marked non-comparable in the shared contract.
   Run only the cross-language query matrix with:
   `scripts/bench/run-rust.sh --scenario-set query --profile small --warmup 20 --iters 80`
   plus the matching Node.js and Python wrapper commands.
+  For focused final-proof runs, pass repeated scenario filters through the harnesses or runner, for example:
+  `python3 tools/bench/run_suite.py --lang rust --scenario-set query --scenario-id S-QUERY-007 --scenario-id S-GQL-006 --profile small --warmup 1 --iters 1 --output-root /tmp/overgraph-cp32-bench`
 
 Shared parity contract:
 - `docs/04-quality/workloads/scenario-contract.json`
 
 Cross-language parity validator:
 - `python3 tools/bench/validate_parity.py --rust <rust.json> --node <node.json> --python <python.json>`
+
+Rust Criterion graph-row/GQL microbenches live in `benches/query_ops.rs`:
+- `graph_row_query/graph_row_fixed_connected_query`
+- `graph_row_query/graph_row_optional_edge_traversal_query`
+- `execute_gql/gql_graph_row_fixed_connected_query`
+- `execute_gql/gql_graph_row_optional_edge_traversal_query`
 
 ## Baseline Comparison Command
 

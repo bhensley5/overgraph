@@ -2,29 +2,44 @@
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
+use napi::JsString;
 use napi_derive::napi;
+use overgraph::types::GqlPath;
 use overgraph::{
-    AdjacencyExport as CoreAdjacencyExport, AllShortestPathsOptions as CoreAllShortestPathsOptions,
-    CompactionPhase, CompactionStats as CoreCompactionStats, ComponentOptions, DatabaseEngine,
+    gql_referenced_param_names, AdjacencyExport as CoreAdjacencyExport,
+    AllShortestPathsOptions as CoreAllShortestPathsOptions, CompactionPhase,
+    CompactionStats as CoreCompactionStats, ComponentOptions, DatabaseEngine,
     DbOptions as CoreDbOptions, DbStats as CoreDbStats, DegreeOptions as CoreDegreeOptions,
     DenseMetric, DenseVectorConfig as CoreDenseVectorConfig, Direction, EdgeFilterExpr,
-    EdgeInput as CoreEdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo, EdgePattern,
+    EdgeInput as CoreEdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
     EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
     EdgeView as CoreEdgeView, EngineError, ExportOptions as CoreExportOptions, FusionMode,
-    GraphPatch as CoreGraphPatch, GraphPatternQuery, HnswConfig,
-    IsConnectedOptions as CoreIsConnectedOptions, LabelMatchMode as CoreLabelMatchMode,
-    NeighborEntry as CoreNeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap,
-    NodeInput as CoreNodeInput, NodeKeyQuery, NodeLabelFilter as CoreNodeLabelFilter,
-    NodeLabelInfo as CoreNodeLabelInfo, NodePattern,
+    GqlCapSummary, GqlEdge, GqlExecutionStats, GqlExplain, GqlLoweringTarget, GqlNode,
+    GqlParamValue, GqlParams, GqlQueryOptions, GqlResult, GqlRow, GqlRowOperation, GqlValue,
+    GraphBinaryOp, GraphCapExplain, GraphCursorExplain, GraphEdgeField,
+    GraphEdgePattern as CoreGraphEdgePattern, GraphEdgeValue, GraphElementProjection,
+    GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
+    GraphNodePattern as CoreGraphNodePattern, GraphNodeValue, GraphOptionalGroup,
+    GraphOrderDirection, GraphOrderExplain, GraphOrderItem, GraphOutputMode, GraphOutputOptions,
+    GraphPageRequest, GraphParamValue, GraphPatch as CoreGraphPatch, GraphPathField,
+    GraphPathValue, GraphPatternPiece, GraphProjectionExplain, GraphPropertySelection,
+    GraphQueryOptions, GraphReturnItem, GraphReturnProjection, GraphRow, GraphRowExplain,
+    GraphRowOperationExplain, GraphRowQuery, GraphRowResult, GraphRowStats,
+    GraphSelectedEdgeProjection, GraphSelectedNodeProjection, GraphSelectedPathProjection,
+    GraphSelectedProjection, GraphUnaryOp, GraphValue, GraphVariableLengthPattern,
+    GraphVectorSelection, HnswConfig, IsConnectedOptions as CoreIsConnectedOptions,
+    LabelMatchMode as CoreLabelMatchMode, NeighborEntry as CoreNeighborEntry, NeighborOptions,
+    NodeFilterExpr, NodeIdMap, NodeInput as CoreNodeInput, NodeKeyQuery,
+    NodeLabelFilter as CoreNodeLabelFilter, NodeLabelInfo as CoreNodeLabelInfo,
     NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
-    NodeView as CoreNodeView, PageRequest, PageResult, PatternOrder, PprAlgorithm, PprOptions,
+    NodeView as CoreNodeView, PageRequest, PageResult, PprAlgorithm, PprOptions,
     PprResult as CorePprResult, PropValue, PropertyRangeBound as CorePropertyRangeBound,
     PropertyRangeCursor as CorePropertyRangeCursor, PropertyRangePageRequest,
     PropertyRangePageResult as CorePropertyRangePageResult, PrunePolicy as CorePrunePolicy,
     PrunePolicyInfo, PruneResult as CorePruneResult, QueryEdgeIdsResult, QueryEdgesResult,
-    QueryMatch, QueryNodeIdsResult, QueryNodesResult, QueryPatternResult, QueryPlan, QueryPlanKind,
-    QueryPlanNode, QueryPlanWarning, ScoringMode, ScrubReport as CoreScrubReport,
-    SecondaryIndexKind as CoreSecondaryIndexKind, SecondaryIndexRangeDomain, SecondaryIndexState,
+    QueryNodeIdsResult, QueryNodesResult, QueryPlan, QueryPlanKind, QueryPlanNode,
+    QueryPlanWarning, ScoringMode, ScrubReport as CoreScrubReport,
+    SecondaryIndexKind as CoreSecondaryIndexKind, SecondaryIndexState,
     ShortestPath as CoreShortestPath, ShortestPathOptions as CoreShortestPathOptions, Subgraph,
     SubgraphOptions, TopKOptions, TraversalCursor as CoreTraversalCursor,
     TraversalHit as CoreTraversalHit, TraversalPageResult as CoreTraversalPageResult,
@@ -61,6 +76,160 @@ impl TypeName for JsonPayload {
 impl ToNapiValue for JsonPayload {
     unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
         unsafe { serde_json::Value::to_napi_value(env, val.0) }
+    }
+}
+
+pub struct GqlJsPayload(GqlJsPayloadKind);
+
+enum GqlJsPayloadKind {
+    Result(GqlResultPayload),
+    Explain(GqlExplain),
+}
+
+pub struct GqlResultPayload {
+    result: GqlResult,
+    compact_rows: bool,
+}
+
+struct GqlJsValue(GqlValue);
+
+struct GqlJsExplain(GqlExplain);
+
+pub struct GraphRowResultPayload {
+    result: GraphRowResult,
+    compact_rows: bool,
+}
+
+struct GraphJsValue(GraphValue);
+
+pub struct GraphJsExplain(GraphRowExplain);
+
+impl TypeName for GqlJsPayload {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for GqlJsPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        match val.0 {
+            GqlJsPayloadKind::Result(payload) => unsafe {
+                GqlResultPayload::to_napi_value(env, payload)
+            },
+            GqlJsPayloadKind::Explain(explain) => unsafe {
+                GqlJsExplain::to_napi_value(env, GqlJsExplain(explain))
+            },
+        }
+    }
+}
+
+impl ToNapiValue for GqlResultPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let mut object = Object::new(&env)?;
+        object.set("columns", val.result.columns.clone())?;
+        let rows =
+            gql_rows_to_js_array(&env, &val.result.columns, val.result.rows, val.compact_rows)?;
+        object.set("rows", rows)?;
+        object.set("nextCursor", val.result.next_cursor)?;
+        object.set("stats", GqlJsValue(gql_stats_to_value(val.result.stats)))?;
+        match val.result.plan {
+            Some(plan) => object.set("plan", GqlJsExplain(plan))?,
+            None => object.set("plan", Option::<serde_json::Value>::None)?,
+        }
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
+impl ToNapiValue for GqlJsExplain {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let mut object = Object::new(&env)?;
+        object.set("columns", val.0.columns)?;
+        object.set("target", gql_lowering_target_to_js(val.0.target))?;
+        match val.0.native_plan {
+            Some(plan) => object.set("nativePlan", query_plan_to_json(plan))?,
+            None => object.set("nativePlan", Option::<serde_json::Value>::None)?,
+        }
+        object.set("pushedDown", val.0.pushed_down)?;
+        object.set("residual", val.0.residual)?;
+        object.set("projection", val.0.projection)?;
+        object.set(
+            "rowOps",
+            val.0
+                .row_ops
+                .into_iter()
+                .map(gql_row_operation_to_js)
+                .collect::<Vec<_>>(),
+        )?;
+        object.set("caps", GqlJsValue(gql_caps_to_value(val.0.caps)))?;
+        object.set("warnings", val.0.warnings)?;
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
+impl ToNapiValue for GqlJsValue {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        gql_value_to_napi(env, val.0)
+    }
+}
+
+impl TypeName for GraphRowResultPayload {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for GraphRowResultPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let mut object = Object::new(&env)?;
+        object.set("columns", val.result.columns.clone())?;
+        let rows =
+            graph_rows_to_js_array(&env, &val.result.columns, val.result.rows, val.compact_rows)?;
+        object.set("rows", rows)?;
+        object.set("nextCursor", val.result.next_cursor)?;
+        object.set(
+            "stats",
+            GraphJsValue(graph_stats_to_value(val.result.stats)),
+        )?;
+        match val.result.plan {
+            Some(plan) => object.set("plan", GraphJsExplain(plan))?,
+            None => object.set("plan", Option::<serde_json::Value>::None)?,
+        }
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
+impl TypeName for GraphJsExplain {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for GraphJsExplain {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let json = graph_explain_to_json(val.0)?;
+        unsafe { serde_json::Value::to_napi_value(env.raw(), json) }
+    }
+}
+
+impl ToNapiValue for GraphJsValue {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        graph_value_to_napi(env, val.0)
     }
 }
 use std::collections::{BTreeMap, HashMap};
@@ -923,13 +1092,17 @@ impl OverGraph {
     }
 
     #[napi(
-        ts_args_type = "request: import('./query-types').GraphPatternRequest",
-        ts_return_type = "import('./query-types').QueryPatternResult"
+        ts_args_type = "request: import('./query-types').GraphRowRequest",
+        ts_return_type = "import('./query-types').GraphRowResult"
     )]
-    pub fn query_pattern(&self, request: serde_json::Value) -> Result<JsonPayload> {
-        let query = parse_js_graph_pattern_query(&request)?;
-        let result = with_engine_ref(self, |eng| eng.query_pattern(&query))?;
-        query_pattern_result_to_js(result)
+    pub fn query_graph_rows(&self, request: serde_json::Value) -> Result<GraphRowResultPayload> {
+        let query = parse_js_graph_row_query(&request)?;
+        let compact_rows = query.output.compact_rows;
+        let result = with_engine_ref(self, |eng| eng.query_graph_rows(&query))?;
+        Ok(GraphRowResultPayload {
+            result,
+            compact_rows,
+        })
     }
 
     #[napi(
@@ -953,13 +1126,52 @@ impl OverGraph {
     }
 
     #[napi(
-        ts_args_type = "request: import('./query-types').GraphPatternRequest",
-        ts_return_type = "import('./query-types').QueryPlan"
+        ts_args_type = "request: import('./query-types').GraphRowRequest",
+        ts_return_type = "import('./query-types').GraphRowExplain"
     )]
-    pub fn explain_pattern_query(&self, request: serde_json::Value) -> Result<JsonPayload> {
-        let query = parse_js_graph_pattern_query(&request)?;
-        let plan = with_engine_ref(self, |eng| eng.explain_pattern_query(&query))?;
-        query_plan_to_js(plan)
+    pub fn explain_graph_rows(&self, request: serde_json::Value) -> Result<GraphJsExplain> {
+        let query = parse_js_graph_row_query(&request)?;
+        let explain = with_engine_ref(self, |eng| eng.explain_graph_rows(&query))?;
+        Ok(GraphJsExplain(explain))
+    }
+
+    #[napi(
+        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null",
+        ts_return_type = "import('./query-types').GqlResult"
+    )]
+    pub fn execute_gql(
+        &self,
+        query: String,
+        params: Option<Unknown<'_>>,
+        options: Option<GqlQueryOptionsInput>,
+    ) -> Result<GqlJsPayload> {
+        let (options, compact_rows) = parse_js_gql_options(options)?;
+        let referenced_params = gql_referenced_param_names(&query, &options)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let params = parse_js_gql_params(params, &referenced_params, &options)?;
+        let result = with_engine_ref(self, |eng| eng.execute_gql(&query, &params, &options))?;
+        Ok(GqlJsPayload(GqlJsPayloadKind::Result(GqlResultPayload {
+            result,
+            compact_rows,
+        })))
+    }
+
+    #[napi(
+        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null",
+        ts_return_type = "import('./query-types').GqlExplain"
+    )]
+    pub fn explain_gql(
+        &self,
+        query: String,
+        params: Option<Unknown<'_>>,
+        options: Option<GqlQueryOptionsInput>,
+    ) -> Result<GqlJsPayload> {
+        let (options, _) = parse_js_gql_options(options)?;
+        let referenced_params = gql_referenced_param_names(&query, &options)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let params = parse_js_gql_params(params, &referenced_params, &options)?;
+        let explain = with_engine_ref(self, |eng| eng.explain_gql(&query, &params, &options))?;
+        Ok(GqlJsPayload(GqlJsPayloadKind::Explain(explain)))
     }
 
     #[napi]
@@ -967,9 +1179,9 @@ impl OverGraph {
         &self,
         label: String,
         prop_key: String,
-        kind: SecondaryIndexKind,
+        kind: String,
     ) -> Result<NodePropertyIndexInfo> {
-        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let kind = js_secondary_index_kind_to_rust(&kind)?;
         let info = with_engine(self, |eng| {
             eng.ensure_node_property_index(&label, &prop_key, kind.clone())
         })?;
@@ -981,9 +1193,9 @@ impl OverGraph {
         &self,
         label: String,
         prop_key: String,
-        kind: SecondaryIndexKind,
+        kind: String,
     ) -> Result<bool> {
-        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let kind = js_secondary_index_kind_to_rust(&kind)?;
         with_engine(self, |eng| {
             eng.drop_node_property_index(&label, &prop_key, kind.clone())
         })
@@ -1003,9 +1215,9 @@ impl OverGraph {
         &self,
         label: String,
         prop_key: String,
-        kind: SecondaryIndexKind,
+        kind: String,
     ) -> Result<EdgePropertyIndexInfo> {
-        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let kind = js_secondary_index_kind_to_rust(&kind)?;
         let info = with_engine(self, |eng| {
             eng.ensure_edge_property_index(&label, &prop_key, kind.clone())
         })?;
@@ -1017,9 +1229,9 @@ impl OverGraph {
         &self,
         label: String,
         prop_key: String,
-        kind: SecondaryIndexKind,
+        kind: String,
     ) -> Result<bool> {
-        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let kind = js_secondary_index_kind_to_rust(&kind)?;
         with_engine(self, |eng| {
             eng.drop_edge_property_index(&label, &prop_key, kind.clone())
         })
@@ -2210,18 +2422,25 @@ impl OverGraph {
     }
 
     #[napi(
-        ts_args_type = "request: import('./query-types').GraphPatternRequest",
-        ts_return_type = "Promise<import('./query-types').QueryPatternResult>"
+        ts_args_type = "request: import('./query-types').GraphRowRequest",
+        ts_return_type = "Promise<import('./query-types').GraphRowResult>"
     )]
-    pub fn query_pattern_async(
+    pub fn query_graph_rows_async(
         &self,
         request: serde_json::Value,
-    ) -> Result<AsyncTask<EngineReadOp<QueryPatternResult, JsonPayload>>> {
-        let query = parse_js_graph_pattern_query(&request)?;
+    ) -> Result<AsyncTask<EngineReadOp<GraphRowResultPayload, GraphRowResultPayload>>> {
+        let query = parse_js_graph_row_query(&request)?;
+        let compact_rows = query.output.compact_rows;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.query_pattern(&query),
-            query_pattern_result_to_js,
+            move |eng| {
+                let result = eng.query_graph_rows(&query)?;
+                Ok(GraphRowResultPayload {
+                    result,
+                    compact_rows,
+                })
+            },
+            napi_identity,
         )))
     }
 
@@ -2258,18 +2477,66 @@ impl OverGraph {
     }
 
     #[napi(
-        ts_args_type = "request: import('./query-types').GraphPatternRequest",
-        ts_return_type = "Promise<import('./query-types').QueryPlan>"
+        ts_args_type = "request: import('./query-types').GraphRowRequest",
+        ts_return_type = "Promise<import('./query-types').GraphRowExplain>"
     )]
-    pub fn explain_pattern_query_async(
+    pub fn explain_graph_rows_async(
         &self,
         request: serde_json::Value,
-    ) -> Result<AsyncTask<EngineReadOp<QueryPlan, JsonPayload>>> {
-        let query = parse_js_graph_pattern_query(&request)?;
+    ) -> Result<AsyncTask<EngineReadOp<GraphRowExplain, GraphJsExplain>>> {
+        let query = parse_js_graph_row_query(&request)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
-            move |eng| eng.explain_pattern_query(&query),
-            query_plan_to_js,
+            move |eng| eng.explain_graph_rows(&query),
+            |explain| Ok(GraphJsExplain(explain)),
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null",
+        ts_return_type = "Promise<import('./query-types').GqlResult>"
+    )]
+    pub fn execute_gql_async(
+        &self,
+        query: String,
+        params: Option<Unknown<'_>>,
+        options: Option<GqlQueryOptionsInput>,
+    ) -> Result<AsyncTask<EngineReadOp<GqlResultPayload, GqlJsPayload>>> {
+        let (options, compact_rows) = parse_js_gql_options(options)?;
+        let referenced_params = gql_referenced_param_names(&query, &options)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let params = parse_js_gql_params(params, &referenced_params, &options)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| {
+                let result = eng.execute_gql(&query, &params, &options)?;
+                Ok(GqlResultPayload {
+                    result,
+                    compact_rows,
+                })
+            },
+            |payload| Ok(GqlJsPayload(GqlJsPayloadKind::Result(payload))),
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null",
+        ts_return_type = "Promise<import('./query-types').GqlExplain>"
+    )]
+    pub fn explain_gql_async(
+        &self,
+        query: String,
+        params: Option<Unknown<'_>>,
+        options: Option<GqlQueryOptionsInput>,
+    ) -> Result<AsyncTask<EngineReadOp<GqlExplain, GqlJsPayload>>> {
+        let (options, _) = parse_js_gql_options(options)?;
+        let referenced_params = gql_referenced_param_names(&query, &options)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let params = parse_js_gql_params(params, &referenced_params, &options)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.explain_gql(&query, &params, &options),
+            |explain| Ok(GqlJsPayload(GqlJsPayloadKind::Explain(explain))),
         )))
     }
 
@@ -2278,9 +2545,9 @@ impl OverGraph {
         &self,
         label: String,
         prop_key: String,
-        kind: SecondaryIndexKind,
+        kind: String,
     ) -> Result<AsyncTask<EngineOp<CoreNodePropertyIndexInfo, NodePropertyIndexInfo>>> {
-        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let kind = js_secondary_index_kind_to_rust(&kind)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             move |eng| eng.ensure_node_property_index(&label, &prop_key, kind.clone()),
@@ -2293,9 +2560,9 @@ impl OverGraph {
         &self,
         label: String,
         prop_key: String,
-        kind: SecondaryIndexKind,
+        kind: String,
     ) -> Result<AsyncTask<EngineOp<bool, bool>>> {
-        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let kind = js_secondary_index_kind_to_rust(&kind)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             move |eng| eng.drop_node_property_index(&label, &prop_key, kind.clone()),
@@ -2319,9 +2586,9 @@ impl OverGraph {
         &self,
         label: String,
         prop_key: String,
-        kind: SecondaryIndexKind,
+        kind: String,
     ) -> Result<AsyncTask<EngineOp<CoreEdgePropertyIndexInfo, EdgePropertyIndexInfo>>> {
-        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let kind = js_secondary_index_kind_to_rust(&kind)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             move |eng| eng.ensure_edge_property_index(&label, &prop_key, kind.clone()),
@@ -2334,9 +2601,9 @@ impl OverGraph {
         &self,
         label: String,
         prop_key: String,
-        kind: SecondaryIndexKind,
+        kind: String,
     ) -> Result<AsyncTask<EngineOp<bool, bool>>> {
-        let kind = js_secondary_index_kind_to_rust(kind)?;
+        let kind = js_secondary_index_kind_to_rust(&kind)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             move |eng| eng.drop_edge_property_index(&label, &prop_key, kind.clone()),
@@ -3690,6 +3957,24 @@ pub struct CloseOptions {
     pub force: Option<bool>,
 }
 
+#[napi(object)]
+pub struct GqlQueryOptionsInput {
+    pub allow_full_scan: Option<bool>,
+    pub max_rows: Option<f64>,
+    pub cursor: Option<String>,
+    pub max_cursor_bytes: Option<f64>,
+    pub max_intermediate_bindings: Option<f64>,
+    pub max_skip: Option<f64>,
+    pub max_query_bytes: Option<f64>,
+    pub max_param_bytes: Option<f64>,
+    pub max_ast_depth: Option<f64>,
+    pub max_literal_items: Option<f64>,
+    pub include_plan: Option<bool>,
+    pub profile: Option<bool>,
+    pub compact_rows: Option<bool>,
+    pub include_vectors: Option<bool>,
+}
+
 // ============================================================
 // Method options structs (positional required + options bag)
 // ============================================================
@@ -3865,19 +4150,11 @@ pub struct FindNodesPagedOptions {
 }
 
 #[napi(object)]
-#[derive(Clone)]
-pub struct SecondaryIndexKind {
-    pub kind: String,
-    pub domain: Option<String>,
-}
-
-#[napi(object)]
 pub struct NodePropertyIndexInfo {
     pub index_id: f64,
     pub label: String,
     pub prop_key: String,
     pub kind: String,
-    pub domain: Option<String>,
     pub state: String,
     pub last_error: Option<String>,
 }
@@ -3888,7 +4165,6 @@ pub struct EdgePropertyIndexInfo {
     pub label: String,
     pub prop_key: String,
     pub kind: String,
-    pub domain: Option<String>,
     pub state: String,
     pub last_error: Option<String>,
 }
@@ -4786,13 +5062,12 @@ pub struct PropertyRangePageResult {
 fn node_property_index_info_to_js(
     info: CoreNodePropertyIndexInfo,
 ) -> Result<NodePropertyIndexInfo> {
-    let (kind, domain) = secondary_index_kind_to_js(&info.kind);
+    let kind = secondary_index_kind_to_js(&info.kind);
     Ok(NodePropertyIndexInfo {
         index_id: u64_to_f64(info.index_id)?,
         label: info.label,
         prop_key: info.prop_key,
         kind,
-        domain,
         state: secondary_index_state_to_js(info.state).to_string(),
         last_error: info.last_error,
     })
@@ -4810,13 +5085,12 @@ fn node_property_index_infos_to_js(
 fn edge_property_index_info_to_js(
     info: CoreEdgePropertyIndexInfo,
 ) -> Result<EdgePropertyIndexInfo> {
-    let (kind, domain) = secondary_index_kind_to_js(&info.kind);
+    let kind = secondary_index_kind_to_js(&info.kind);
     Ok(EdgePropertyIndexInfo {
         index_id: u64_to_f64(info.index_id)?,
         label: info.label,
         prop_key: info.prop_key,
         kind,
-        domain,
         state: secondary_index_state_to_js(info.state).to_string(),
         last_error: info.last_error,
     })
@@ -4843,7 +5117,7 @@ fn property_range_cursor_to_js(cursor: CorePropertyRangeCursor) -> Result<Proper
 fn js_property_range_cursor_to_rust(
     cursor: PropertyRangeCursor,
 ) -> Result<CorePropertyRangeCursor> {
-    let domain = parse_secondary_index_range_domain(Some(cursor.domain.as_str()))?;
+    let domain = parse_range_value_domain(cursor.domain.as_str())?;
     Ok(CorePropertyRangeCursor {
         value: js_numeric_to_prop_value(cursor.value, domain)?,
         node_id: f64_to_u64(cursor.node_id)?,
@@ -4906,34 +5180,599 @@ fn query_edges_to_js(result: QueryEdgesResult) -> Result<EdgePageResult> {
     })
 }
 
-fn query_pattern_result_to_js(result: QueryPatternResult) -> Result<JsonPayload> {
-    Ok(JsonPayload(serde_json::json!({
-        "matches": result
-            .matches
-            .into_iter()
-            .map(query_match_to_js)
-            .collect::<Result<Vec<_>>>()?,
-        "truncated": result.truncated,
-    })))
+fn gql_rows_to_js_array<'env>(
+    env: &'env Env,
+    columns: &[String],
+    rows: Vec<GqlRow>,
+    compact_rows: bool,
+) -> Result<Array<'env>> {
+    let mut array = env.create_array(rows.len() as u32)?;
+    for (row_index, row) in rows.into_iter().enumerate() {
+        if compact_rows {
+            let mut values = env.create_array(row.values.len() as u32)?;
+            for (value_index, value) in row.values.into_iter().enumerate() {
+                values.set(value_index as u32, GqlJsValue(value))?;
+            }
+            array.set(row_index as u32, values)?;
+        } else {
+            let mut object = Object::new(env)?;
+            for (column, value) in columns.iter().zip(row.values) {
+                object.set(column, GqlJsValue(value))?;
+            }
+            array.set(row_index as u32, &object)?;
+        }
+    }
+    Ok(array)
 }
 
-fn query_match_to_js(match_: QueryMatch) -> Result<serde_json::Value> {
-    let mut nodes = serde_json::Map::new();
-    for (alias, id) in match_.nodes {
-        nodes.insert(alias, serde_json::json!(u64_to_f64(id)?));
+fn gql_value_to_napi(env: napi::sys::napi_env, value: GqlValue) -> Result<napi::sys::napi_value> {
+    match value {
+        GqlValue::Null => unsafe {
+            <Option<serde_json::Value> as ToNapiValue>::to_napi_value(
+                env,
+                None::<serde_json::Value>,
+            )
+        },
+        GqlValue::Bool(value) => unsafe { bool::to_napi_value(env, value) },
+        GqlValue::Int(value) => unsafe { f64::to_napi_value(env, i64_to_safe_f64(value)?) },
+        GqlValue::UInt(value) => unsafe { f64::to_napi_value(env, u64_to_f64(value)?) },
+        GqlValue::Float(value) => unsafe { f64::to_napi_value(env, value) },
+        GqlValue::String(value) => unsafe { String::to_napi_value(env, value) },
+        GqlValue::Bytes(value) => unsafe { Buffer::to_napi_value(env, Buffer::from(value)) },
+        GqlValue::List(values) => {
+            let env_ref = Env::from_raw(env);
+            let mut array = env_ref.create_array(values.len() as u32)?;
+            for (index, value) in values.into_iter().enumerate() {
+                array.set(index as u32, GqlJsValue(value))?;
+            }
+            unsafe { Array::to_napi_value(env, array) }
+        }
+        GqlValue::Map(values) => {
+            let env_ref = Env::from_raw(env);
+            let mut object = Object::new(&env_ref)?;
+            for (key, value) in values {
+                object.set(key, GqlJsValue(value))?;
+            }
+            unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env, &object) }
+        }
+        GqlValue::Node(node) => gql_node_to_napi(env, node),
+        GqlValue::Edge(edge) => gql_edge_to_napi(env, edge),
+        GqlValue::Path(path) => gql_path_to_napi(env, path),
     }
-    let mut edges = serde_json::Map::new();
-    for (alias, id) in match_.edges {
-        edges.insert(alias, serde_json::json!(u64_to_f64(id)?));
+}
+
+fn gql_node_to_napi(env: napi::sys::napi_env, node: GqlNode) -> Result<napi::sys::napi_value> {
+    let env_ref = Env::from_raw(env);
+    let mut object = Object::new(&env_ref)?;
+    if let Some(id) = node.id {
+        object.set("id", u64_to_f64(id)?)?;
     }
+    if let Some(labels) = node.labels {
+        object.set("labels", labels)?;
+    }
+    if let Some(key) = node.key {
+        object.set("key", key)?;
+    }
+    if let Some(props) = node.props {
+        object.set("props", GqlJsValue(GqlValue::Map(props)))?;
+    }
+    if let Some(weight) = node.weight {
+        object.set("weight", weight as f64)?;
+    }
+    if let Some(created_at) = node.created_at {
+        object.set("createdAt", created_at)?;
+    }
+    if let Some(updated_at) = node.updated_at {
+        object.set("updatedAt", updated_at)?;
+    }
+    if let Some(dense_vector) = node.dense_vector {
+        object.set(
+            "denseVector",
+            dense_vector
+                .into_iter()
+                .map(|value| value as f64)
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    if let Some(sparse_vector) = node.sparse_vector {
+        object.set(
+            "sparseVector",
+            sparse_vector
+                .into_iter()
+                .map(|(dimension, value)| SparseEntry {
+                    dimension,
+                    value: value as f64,
+                })
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env, &object) }
+}
+
+fn gql_path_to_napi(env: napi::sys::napi_env, path: GqlPath) -> Result<napi::sys::napi_value> {
+    let env_ref = Env::from_raw(env);
+    let mut object = Object::new(&env_ref)?;
+    object.set(
+        "nodeIds",
+        path.node_ids
+            .into_iter()
+            .map(u64_to_f64)
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    object.set(
+        "edgeIds",
+        path.edge_ids
+            .into_iter()
+            .map(u64_to_f64)
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    if let Some(nodes) = path.nodes {
+        let mut array = env_ref.create_array(nodes.len() as u32)?;
+        for (index, node) in nodes.into_iter().enumerate() {
+            array.set(index as u32, GqlJsValue(GqlValue::Node(node)))?;
+        }
+        object.set("nodes", array)?;
+    }
+    if let Some(edges) = path.edges {
+        let mut array = env_ref.create_array(edges.len() as u32)?;
+        for (index, edge) in edges.into_iter().enumerate() {
+            array.set(index as u32, GqlJsValue(GqlValue::Edge(edge)))?;
+        }
+        object.set("edges", array)?;
+    }
+    unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env, &object) }
+}
+
+fn graph_rows_to_js_array<'env>(
+    env: &'env Env,
+    columns: &[String],
+    rows: Vec<GraphRow>,
+    compact_rows: bool,
+) -> Result<Array<'env>> {
+    let mut array = env.create_array(rows.len() as u32)?;
+    for (row_index, row) in rows.into_iter().enumerate() {
+        if compact_rows {
+            let mut values = env.create_array(row.values.len() as u32)?;
+            for (value_index, value) in row.values.into_iter().enumerate() {
+                values.set(value_index as u32, GraphJsValue(value))?;
+            }
+            array.set(row_index as u32, values)?;
+        } else {
+            let mut object = Object::new(env)?;
+            for (column, value) in columns.iter().zip(row.values) {
+                object.set(column, GraphJsValue(value))?;
+            }
+            array.set(row_index as u32, &object)?;
+        }
+    }
+    Ok(array)
+}
+
+fn graph_value_to_napi(
+    env: napi::sys::napi_env,
+    value: GraphValue,
+) -> Result<napi::sys::napi_value> {
+    match value {
+        GraphValue::Null => unsafe {
+            <Option<serde_json::Value> as ToNapiValue>::to_napi_value(
+                env,
+                None::<serde_json::Value>,
+            )
+        },
+        GraphValue::Bool(value) => unsafe { bool::to_napi_value(env, value) },
+        GraphValue::Int(value) => unsafe { f64::to_napi_value(env, i64_to_safe_f64(value)?) },
+        GraphValue::UInt(value) | GraphValue::NodeId(value) | GraphValue::EdgeId(value) => unsafe {
+            f64::to_napi_value(env, u64_to_f64(value)?)
+        },
+        GraphValue::Float(value) => unsafe { f64::to_napi_value(env, value) },
+        GraphValue::String(value) => unsafe { String::to_napi_value(env, value) },
+        GraphValue::Bytes(value) => unsafe { Buffer::to_napi_value(env, Buffer::from(value)) },
+        GraphValue::List(values) => {
+            let env_ref = Env::from_raw(env);
+            let mut array = env_ref.create_array(values.len() as u32)?;
+            for (index, value) in values.into_iter().enumerate() {
+                array.set(index as u32, GraphJsValue(value))?;
+            }
+            unsafe { Array::to_napi_value(env, array) }
+        }
+        GraphValue::Map(values) => {
+            let env_ref = Env::from_raw(env);
+            let mut object = Object::new(&env_ref)?;
+            for (key, value) in values {
+                object.set(key, GraphJsValue(value))?;
+            }
+            unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env, &object) }
+        }
+        GraphValue::Node(node) => graph_node_to_napi(env, node),
+        GraphValue::Edge(edge) => graph_edge_to_napi(env, edge),
+        GraphValue::Path(path) => graph_path_to_napi(env, path),
+    }
+}
+
+fn graph_node_to_napi(
+    env: napi::sys::napi_env,
+    node: GraphNodeValue,
+) -> Result<napi::sys::napi_value> {
+    let env_ref = Env::from_raw(env);
+    let mut object = Object::new(&env_ref)?;
+    if let Some(id) = node.id {
+        object.set("id", u64_to_f64(id)?)?;
+    }
+    if let Some(labels) = node.labels {
+        object.set("labels", labels)?;
+    }
+    if let Some(key) = node.key {
+        object.set("key", key)?;
+    }
+    if let Some(props) = node.props {
+        object.set("props", GraphJsValue(GraphValue::Map(props)))?;
+    }
+    if let Some(weight) = node.weight {
+        object.set("weight", weight as f64)?;
+    }
+    if let Some(created_at) = node.created_at {
+        object.set("createdAt", created_at)?;
+    }
+    if let Some(updated_at) = node.updated_at {
+        object.set("updatedAt", updated_at)?;
+    }
+    if let Some(dense_vector) = node.dense_vector {
+        object.set(
+            "denseVector",
+            dense_vector
+                .into_iter()
+                .map(|value| value as f64)
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    if let Some(sparse_vector) = node.sparse_vector {
+        object.set(
+            "sparseVector",
+            sparse_vector
+                .into_iter()
+                .map(|(dimension, value)| SparseEntry {
+                    dimension,
+                    value: value as f64,
+                })
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env, &object) }
+}
+
+fn graph_edge_to_napi(
+    env: napi::sys::napi_env,
+    edge: GraphEdgeValue,
+) -> Result<napi::sys::napi_value> {
+    let env_ref = Env::from_raw(env);
+    let mut object = Object::new(&env_ref)?;
+    if let Some(id) = edge.id {
+        object.set("id", u64_to_f64(id)?)?;
+    }
+    if let Some(from) = edge.from {
+        object.set("from", u64_to_f64(from)?)?;
+    }
+    if let Some(to) = edge.to {
+        object.set("to", u64_to_f64(to)?)?;
+    }
+    if let Some(label) = edge.label {
+        object.set("label", label)?;
+    }
+    if let Some(props) = edge.props {
+        object.set("props", GraphJsValue(GraphValue::Map(props)))?;
+    }
+    if let Some(weight) = edge.weight {
+        object.set("weight", weight as f64)?;
+    }
+    if let Some(created_at) = edge.created_at {
+        object.set("createdAt", created_at)?;
+    }
+    if let Some(updated_at) = edge.updated_at {
+        object.set("updatedAt", updated_at)?;
+    }
+    if let Some(valid_from) = edge.valid_from {
+        object.set("validFrom", valid_from)?;
+    }
+    if let Some(valid_to) = edge.valid_to {
+        object.set("validTo", valid_to)?;
+    }
+    unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env, &object) }
+}
+
+fn graph_path_to_napi(
+    env: napi::sys::napi_env,
+    path: GraphPathValue,
+) -> Result<napi::sys::napi_value> {
+    let env_ref = Env::from_raw(env);
+    let mut object = Object::new(&env_ref)?;
+    object.set(
+        "nodeIds",
+        path.node_ids
+            .into_iter()
+            .map(u64_to_f64)
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    object.set(
+        "edgeIds",
+        path.edge_ids
+            .into_iter()
+            .map(u64_to_f64)
+            .collect::<Result<Vec<_>>>()?,
+    )?;
+    if let Some(nodes) = path.nodes {
+        let mut array = env_ref.create_array(nodes.len() as u32)?;
+        for (index, node) in nodes.into_iter().enumerate() {
+            array.set(index as u32, GraphJsValue(GraphValue::Node(node)))?;
+        }
+        object.set("nodes", array)?;
+    }
+    if let Some(edges) = path.edges {
+        let mut array = env_ref.create_array(edges.len() as u32)?;
+        for (index, edge) in edges.into_iter().enumerate() {
+            array.set(index as u32, GraphJsValue(GraphValue::Edge(edge)))?;
+        }
+        object.set("edges", array)?;
+    }
+    unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env, &object) }
+}
+
+fn graph_stats_to_value(stats: GraphRowStats) -> GraphValue {
+    GraphValue::Map(BTreeMap::from([
+        (
+            "rowsReturned".to_string(),
+            GraphValue::UInt(stats.rows_returned as u64),
+        ),
+        (
+            "rowsAfterFilter".to_string(),
+            GraphValue::UInt(stats.rows_after_filter as u64),
+        ),
+        (
+            "rowsSeenForPage".to_string(),
+            GraphValue::UInt(stats.rows_seen_for_page as u64),
+        ),
+        (
+            "intermediateBindingsPeak".to_string(),
+            GraphValue::UInt(stats.intermediate_bindings_peak as u64),
+        ),
+        (
+            "frontierPeak".to_string(),
+            GraphValue::UInt(stats.frontier_peak as u64),
+        ),
+        (
+            "pathsEnumerated".to_string(),
+            GraphValue::UInt(stats.paths_enumerated as u64),
+        ),
+        ("dbHits".to_string(), GraphValue::UInt(stats.db_hits as u64)),
+        (
+            "elapsedUs".to_string(),
+            stats
+                .elapsed_us
+                .map(GraphValue::UInt)
+                .unwrap_or(GraphValue::Null),
+        ),
+        (
+            "effectiveAtEpoch".to_string(),
+            GraphValue::Int(stats.effective_at_epoch),
+        ),
+        (
+            "warnings".to_string(),
+            GraphValue::List(stats.warnings.into_iter().map(GraphValue::String).collect()),
+        ),
+    ]))
+}
+
+fn graph_explain_to_json(explain: GraphRowExplain) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
-        "nodes": nodes,
-        "edges": edges,
+        "columns": explain.columns,
+        "effectiveAtEpoch": explain.effective_at_epoch,
+        "fingerprint": explain.fingerprint,
+        "plan": explain.plan.into_iter().map(graph_explain_node_to_json).collect::<Vec<_>>(),
+        "rowOps": explain.row_ops.into_iter().map(graph_row_op_to_json).collect::<Vec<_>>(),
+        "order": graph_order_explain_to_json(explain.order),
+        "cursor": graph_cursor_explain_to_json(explain.cursor),
+        "projection": graph_projection_explain_to_json(explain.projection),
+        "caps": graph_caps_to_json(explain.caps),
+        "summaries": graph_summaries_to_json(explain.summaries),
+        "warnings": explain.warnings,
+        "notes": explain.notes,
     }))
 }
 
+fn graph_explain_node_to_json(node: GraphExplainNode) -> serde_json::Value {
+    serde_json::json!({
+        "kind": node.kind,
+        "detail": node.detail,
+        "children": node.children.into_iter().map(graph_explain_node_to_json).collect::<Vec<_>>(),
+    })
+}
+
+fn graph_row_op_to_json(op: GraphRowOperationExplain) -> serde_json::Value {
+    serde_json::json!({
+        "kind": op.kind,
+        "detail": op.detail,
+    })
+}
+
+fn graph_order_explain_to_json(order: GraphOrderExplain) -> serde_json::Value {
+    serde_json::json!({
+        "explicit": order.explicit,
+        "items": order.items,
+        "stableLogicalRowKey": order.stable_logical_row_key,
+    })
+}
+
+fn graph_cursor_explain_to_json(cursor: GraphCursorExplain) -> serde_json::Value {
+    serde_json::json!({
+        "supplied": cursor.supplied,
+        "codecImplemented": cursor.codec_implemented,
+        "message": cursor.message,
+    })
+}
+
+fn graph_projection_explain_to_json(projection: GraphProjectionExplain) -> serde_json::Value {
+    serde_json::json!({
+        "columns": projection.columns,
+        "outputMode": graph_output_mode_to_js(&projection.output_mode),
+        "includeVectors": projection.include_vectors,
+        "compactRows": projection.compact_rows,
+    })
+}
+
+fn graph_caps_to_json(caps: GraphCapExplain) -> serde_json::Value {
+    serde_json::json!({
+        "allowFullScan": caps.allow_full_scan,
+        "maxIntermediateBindings": caps.max_intermediate_bindings,
+        "maxFrontier": caps.max_frontier,
+        "maxPathHops": caps.max_path_hops,
+        "maxPathsPerStart": caps.max_paths_per_start,
+        "maxPageLimit": caps.max_page_limit,
+        "maxOrderMaterialization": caps.max_order_materialization,
+        "maxCursorBytes": caps.max_cursor_bytes,
+        "maxQueryBytes": caps.max_query_bytes,
+    })
+}
+
+fn graph_summaries_to_json(summaries: overgraph::GraphExecutionSummaries) -> serde_json::Value {
+    serde_json::json!({
+        "validationOnly": summaries.validation_only,
+        "rowsPlanned": summaries.rows_planned,
+        "warnings": summaries.warnings,
+    })
+}
+
+fn graph_output_mode_to_js(mode: &GraphOutputMode) -> &'static str {
+    match mode {
+        GraphOutputMode::Ids => "ids",
+        GraphOutputMode::Elements => "elements",
+        GraphOutputMode::Projected => "projected",
+    }
+}
+
+fn gql_edge_to_napi(env: napi::sys::napi_env, edge: GqlEdge) -> Result<napi::sys::napi_value> {
+    let env_ref = Env::from_raw(env);
+    let mut object = Object::new(&env_ref)?;
+    if let Some(id) = edge.id {
+        object.set("id", u64_to_f64(id)?)?;
+    }
+    if let Some(from) = edge.from {
+        object.set("from", u64_to_f64(from)?)?;
+    }
+    if let Some(to) = edge.to {
+        object.set("to", u64_to_f64(to)?)?;
+    }
+    if let Some(label) = edge.label {
+        object.set("label", label)?;
+    }
+    if let Some(props) = edge.props {
+        object.set("props", GqlJsValue(GqlValue::Map(props)))?;
+    }
+    if let Some(weight) = edge.weight {
+        object.set("weight", weight as f64)?;
+    }
+    if let Some(created_at) = edge.created_at {
+        object.set("createdAt", created_at)?;
+    }
+    if let Some(updated_at) = edge.updated_at {
+        object.set("updatedAt", updated_at)?;
+    }
+    if let Some(valid_from) = edge.valid_from {
+        object.set("validFrom", valid_from)?;
+    }
+    if let Some(valid_to) = edge.valid_to {
+        object.set("validTo", valid_to)?;
+    }
+    unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env, &object) }
+}
+
+fn gql_stats_to_value(stats: GqlExecutionStats) -> GqlValue {
+    GqlValue::Map(BTreeMap::from([
+        (
+            "rowsReturned".to_string(),
+            GqlValue::UInt(stats.rows_returned as u64),
+        ),
+        (
+            "rowsMatched".to_string(),
+            GqlValue::UInt(stats.rows_matched as u64),
+        ),
+        (
+            "rowsAfterFilter".to_string(),
+            GqlValue::UInt(stats.rows_after_filter as u64),
+        ),
+        (
+            "intermediateBindings".to_string(),
+            GqlValue::UInt(stats.intermediate_bindings as u64),
+        ),
+        ("dbHits".to_string(), GqlValue::UInt(stats.db_hits as u64)),
+        (
+            "elapsedUs".to_string(),
+            stats
+                .elapsed_us
+                .map(GqlValue::UInt)
+                .unwrap_or(GqlValue::Null),
+        ),
+        ("truncated".to_string(), GqlValue::Bool(stats.truncated)),
+        (
+            "warnings".to_string(),
+            GqlValue::List(stats.warnings.into_iter().map(GqlValue::String).collect()),
+        ),
+    ]))
+}
+
+fn gql_caps_to_value(caps: GqlCapSummary) -> GqlValue {
+    GqlValue::Map(BTreeMap::from([
+        (
+            "allowFullScan".to_string(),
+            GqlValue::Bool(caps.allow_full_scan),
+        ),
+        ("maxRows".to_string(), GqlValue::UInt(caps.max_rows as u64)),
+        (
+            "maxIntermediateBindings".to_string(),
+            GqlValue::UInt(caps.max_intermediate_bindings as u64),
+        ),
+        ("maxSkip".to_string(), GqlValue::UInt(caps.max_skip as u64)),
+        (
+            "maxQueryBytes".to_string(),
+            GqlValue::UInt(caps.max_query_bytes as u64),
+        ),
+        (
+            "maxParamBytes".to_string(),
+            GqlValue::UInt(caps.max_param_bytes as u64),
+        ),
+        (
+            "maxAstDepth".to_string(),
+            GqlValue::UInt(caps.max_ast_depth as u64),
+        ),
+        (
+            "maxLiteralItems".to_string(),
+            GqlValue::UInt(caps.max_literal_items as u64),
+        ),
+    ]))
+}
+
+fn gql_lowering_target_to_js(target: GqlLoweringTarget) -> &'static str {
+    match target {
+        GqlLoweringTarget::NodeQuery => "node_query",
+        GqlLoweringTarget::EdgeQuery => "edge_query",
+        GqlLoweringTarget::GraphRowQuery => "graph_row_query",
+    }
+}
+
+fn gql_row_operation_to_js(op: GqlRowOperation) -> &'static str {
+    match op {
+        GqlRowOperation::ResidualFilter => "residual_filter",
+        GqlRowOperation::Projection => "projection",
+        GqlRowOperation::Sort => "sort",
+        GqlRowOperation::Skip => "skip",
+        GqlRowOperation::Limit => "limit",
+    }
+}
+
 fn query_plan_to_js(plan: QueryPlan) -> Result<JsonPayload> {
-    Ok(JsonPayload(serde_json::json!({
+    Ok(JsonPayload(query_plan_to_json(plan)))
+}
+
+fn query_plan_to_json(plan: QueryPlan) -> serde_json::Value {
+    serde_json::json!({
         "kind": query_plan_kind_to_js(&plan.kind),
         "root": query_plan_node_to_js(plan.root),
         "estimatedCandidates": plan.estimated_candidates.map(|count| count as f64),
@@ -4948,14 +5787,13 @@ fn query_plan_to_js(plan: QueryPlan) -> Result<JsonPayload> {
             .map(query_plan_note_to_js)
             .collect::<Vec<_>>(),
         "publicInputs": query_plan_public_inputs_to_js(plan.public_inputs),
-    })))
+    })
 }
 
 fn query_plan_kind_to_js(kind: &QueryPlanKind) -> &'static str {
     match kind {
         QueryPlanKind::NodeQuery => "node_query",
         QueryPlanKind::EdgeQuery => "edge_query",
-        QueryPlanKind::PatternQuery => "pattern_query",
     }
 }
 
@@ -5009,19 +5847,6 @@ fn query_plan_node_to_js(node: QueryPlanNode) -> serde_json::Value {
         }),
         QueryPlanNode::VerifyEdgePredicates { input } => serde_json::json!({
             "kind": "verify_edge_predicates",
-            "input": query_plan_node_to_js(*input),
-        }),
-        QueryPlanNode::PatternExpand {
-            anchor_alias,
-            input,
-        } => serde_json::json!({
-            "kind": "pattern_expand",
-            "anchorAlias": anchor_alias,
-            "input": query_plan_node_to_js(*input),
-        }),
-        QueryPlanNode::PatternEdgeAnchor { edge_alias, input } => serde_json::json!({
-            "kind": "pattern_edge_anchor",
-            "edgeAlias": edge_alias,
             "input": query_plan_node_to_js(*input),
         }),
         QueryPlanNode::FallbackNodeLabelScan => {
@@ -5090,7 +5915,6 @@ fn query_plan_warning_to_js(warning: &QueryPlanWarning) -> &'static str {
         QueryPlanWarning::UsingFallbackScan => "using_fallback_scan",
         QueryPlanWarning::FullScanRequiresOptIn => "full_scan_requires_opt_in",
         QueryPlanWarning::FullScanExplicitlyAllowed => "full_scan_explicitly_allowed",
-        QueryPlanWarning::UnboundedPatternRejected => "unbounded_pattern_rejected",
         QueryPlanWarning::EdgePropertyPostFilter => "edge_property_post_filter",
         QueryPlanWarning::IndexSkippedAsBroad => "index_skipped_as_broad",
         QueryPlanWarning::CandidateCapExceeded => "candidate_cap_exceeded",
@@ -5102,6 +5926,256 @@ fn query_plan_warning_to_js(warning: &QueryPlanWarning) -> &'static str {
         QueryPlanWarning::UnknownNodeLabel => "unknown_node_label",
         QueryPlanWarning::UnknownEdgeLabel => "unknown_edge_label",
     }
+}
+
+fn parse_js_gql_options(options: Option<GqlQueryOptionsInput>) -> Result<(GqlQueryOptions, bool)> {
+    let mut parsed = GqlQueryOptions::default();
+    let mut compact_rows = false;
+    if let Some(options) = options {
+        if let Some(value) = options.allow_full_scan {
+            parsed.allow_full_scan = value;
+        }
+        if let Some(value) = options.max_rows {
+            parsed.max_rows = f64_to_usize(value, "GQL maxRows")?;
+        }
+        if let Some(value) = options.cursor {
+            parsed.cursor = Some(value);
+        }
+        if let Some(value) = options.max_cursor_bytes {
+            parsed.max_cursor_bytes = f64_to_usize(value, "GQL maxCursorBytes")?;
+        }
+        if let Some(value) = options.max_intermediate_bindings {
+            parsed.max_intermediate_bindings = f64_to_usize(value, "GQL maxIntermediateBindings")?;
+        }
+        if let Some(value) = options.max_skip {
+            parsed.max_skip = f64_to_usize(value, "GQL maxSkip")?;
+        }
+        if let Some(value) = options.max_query_bytes {
+            parsed.max_query_bytes = f64_to_usize(value, "GQL maxQueryBytes")?;
+        }
+        if let Some(value) = options.max_param_bytes {
+            parsed.max_param_bytes = f64_to_usize(value, "GQL maxParamBytes")?;
+        }
+        if let Some(value) = options.max_ast_depth {
+            parsed.max_ast_depth = f64_to_usize(value, "GQL maxAstDepth")?;
+        }
+        if let Some(value) = options.max_literal_items {
+            parsed.max_literal_items = f64_to_usize(value, "GQL maxLiteralItems")?;
+        }
+        if let Some(value) = options.include_plan {
+            parsed.include_plan = value;
+        }
+        if let Some(value) = options.profile {
+            parsed.profile = value;
+        }
+        if let Some(value) = options.compact_rows {
+            compact_rows = value;
+        }
+        if let Some(value) = options.include_vectors {
+            parsed.include_vectors = value;
+        }
+    }
+    Ok((parsed, compact_rows))
+}
+
+struct GqlParamConversionBudget {
+    total_items: usize,
+    total_bytes: usize,
+}
+
+fn parse_js_gql_params(
+    params: Option<Unknown<'_>>,
+    referenced_params: &[String],
+    options: &GqlQueryOptions,
+) -> Result<GqlParams> {
+    if referenced_params.is_empty() {
+        return Ok(GqlParams::new());
+    }
+    let Some(params) = params else {
+        return Ok(GqlParams::new());
+    };
+    match params.get_type()? {
+        napi::ValueType::Null | napi::ValueType::Undefined => Ok(GqlParams::new()),
+        napi::ValueType::Object if !params.is_array()? && !params.is_buffer()? => {
+            let object = unsafe { params.cast::<Object<'_>>()? };
+            let mut parsed = GqlParams::new();
+            let mut budget = GqlParamConversionBudget {
+                total_items: 0,
+                total_bytes: 0,
+            };
+            for key in referenced_params {
+                if !object.has_own_property(key)? {
+                    continue;
+                }
+                let value = match object.get::<Unknown<'_>>(key)? {
+                    Some(value) => parse_js_gql_param_value(key, value, 0, options, &mut budget)?,
+                    None => GqlParamValue::Null,
+                };
+                parsed.insert(key.clone(), value);
+            }
+            Ok(parsed)
+        }
+        _ => Err(napi::Error::from_reason(
+            "GQL params must be a plain object, null, or undefined".to_string(),
+        )),
+    }
+}
+
+fn parse_js_gql_param_value(
+    name: &str,
+    value: Unknown<'_>,
+    container_depth: usize,
+    options: &GqlQueryOptions,
+    budget: &mut GqlParamConversionBudget,
+) -> Result<GqlParamValue> {
+    match value.get_type()? {
+        napi::ValueType::Null | napi::ValueType::Undefined => Ok(GqlParamValue::Null),
+        napi::ValueType::Boolean => Ok(GqlParamValue::Bool(unsafe { value.cast::<bool>()? })),
+        napi::ValueType::Number => {
+            let number = unsafe { value.cast::<f64>()? };
+            if !number.is_finite() {
+                return Err(napi::Error::from_reason(
+                    "GQL numeric params must be finite".to_string(),
+                ));
+            }
+            if number.fract() == 0.0 && number.abs() <= MAX_SAFE_INTEGER {
+                if number < 0.0 {
+                    Ok(GqlParamValue::Int(number as i64))
+                } else {
+                    Ok(GqlParamValue::UInt(number as u64))
+                }
+            } else {
+                Ok(GqlParamValue::Float(number))
+            }
+        }
+        napi::ValueType::String => {
+            let string = unsafe { value.cast::<JsString<'_>>()? };
+            add_js_param_bytes(name, string.utf8_len()?, "string", budget, options)?;
+            Ok(GqlParamValue::String(string.into_utf8()?.into_owned()?))
+        }
+        napi::ValueType::Object if value.is_buffer()? => {
+            let buffer = unsafe { value.cast::<BufferSlice<'_>>()? };
+            add_js_param_bytes(name, buffer.as_ref().len(), "bytes", budget, options)?;
+            Ok(GqlParamValue::Bytes(buffer.as_ref().to_vec()))
+        }
+        napi::ValueType::Object if value.is_arraybuffer()? => {
+            let buffer = unsafe { value.cast::<ArrayBuffer<'_>>()? };
+            add_js_param_bytes(name, buffer.len(), "bytes", budget, options)?;
+            Ok(GqlParamValue::Bytes(buffer.to_vec()))
+        }
+        napi::ValueType::Object if value.is_array()? => {
+            let array = unsafe { value.cast::<Array<'_>>()? };
+            let depth = container_depth.saturating_add(1);
+            check_js_param_depth(name, depth, options)?;
+            add_js_param_items(name, array.len() as usize, "list", budget, options)?;
+            let mut items = Vec::with_capacity(array.len() as usize);
+            for index in 0..array.len() {
+                let item = array.get::<Unknown<'_>>(index)?;
+                items.push(match item {
+                    Some(item) => parse_js_gql_param_value(name, item, depth, options, budget)?,
+                    None => GqlParamValue::Null,
+                });
+            }
+            Ok(GqlParamValue::List(items))
+        }
+        napi::ValueType::Object => {
+            let object = unsafe { value.cast::<Object<'_>>()? };
+            let depth = container_depth.saturating_add(1);
+            check_js_param_depth(name, depth, options)?;
+            let keys = js_object_property_names_array(&object)?;
+            add_js_param_items(name, keys.len() as usize, "map", budget, options)?;
+            let mut map = BTreeMap::new();
+            for index in 0..keys.len() {
+                let key = keys.get::<JsString<'_>>(index)?.ok_or_else(|| {
+                    napi::Error::from_reason(format!(
+                        "GQL parameter '${name}' map key at index {index} is missing"
+                    ))
+                })?;
+                add_js_param_bytes(name, key.utf8_len()?, "map key", budget, options)?;
+                let key = key.into_utf8()?.into_owned()?;
+                let item = object.get::<Unknown<'_>>(&key)?;
+                map.insert(
+                    key,
+                    match item {
+                        Some(item) => parse_js_gql_param_value(name, item, depth, options, budget)?,
+                        None => GqlParamValue::Null,
+                    },
+                );
+            }
+            Ok(GqlParamValue::Map(map))
+        }
+        other => Err(napi::Error::from_reason(format!(
+            "Unsupported GQL param value type: {other}"
+        ))),
+    }
+}
+
+fn js_object_property_names_array<'env>(object: &Object<'env>) -> Result<Array<'env>> {
+    let names = object.get_property_names()?;
+    let value = names.value();
+    unsafe { Array::from_napi_value(value.env, value.value) }
+}
+
+fn check_js_param_depth(name: &str, depth: usize, options: &GqlQueryOptions) -> Result<()> {
+    if depth > options.max_ast_depth {
+        return Err(napi::Error::from_reason(format!(
+            "GQL parameter '${name}' nested list/map depth exceeds maxAstDepth of {}",
+            options.max_ast_depth
+        )));
+    }
+    Ok(())
+}
+
+fn add_js_param_items(
+    name: &str,
+    count: usize,
+    container_kind: &str,
+    budget: &mut GqlParamConversionBudget,
+    options: &GqlQueryOptions,
+) -> Result<()> {
+    if count > options.max_literal_items {
+        return Err(napi::Error::from_reason(format!(
+            "GQL parameter '${name}' {container_kind} contains {count} items, exceeding maxLiteralItems of {}",
+            options.max_literal_items
+        )));
+    }
+    budget.total_items = budget
+        .total_items
+        .checked_add(count)
+        .filter(|total| *total <= options.max_literal_items)
+        .ok_or_else(|| {
+            napi::Error::from_reason(format!(
+                "Referenced GQL parameters contain more than maxLiteralItems={} total list/map items",
+                options.max_literal_items
+            ))
+        })?;
+    Ok(())
+}
+
+fn add_js_param_bytes(
+    name: &str,
+    bytes: usize,
+    value_kind: &str,
+    budget: &mut GqlParamConversionBudget,
+    options: &GqlQueryOptions,
+) -> Result<()> {
+    if bytes > options.max_param_bytes {
+        return Err(napi::Error::from_reason(format!(
+            "GQL parameter '${name}' {value_kind} is {bytes} bytes, exceeding maxParamBytes of {}",
+            options.max_param_bytes
+        )));
+    }
+    budget.total_bytes = budget
+        .total_bytes
+        .checked_add(bytes)
+        .filter(|total| *total <= options.max_param_bytes)
+        .ok_or_else(|| {
+            napi::Error::from_reason(format!(
+                "Referenced GQL parameters contain more than maxParamBytes={} total string/bytes/map-key bytes",
+                options.max_param_bytes
+            ))
+        })?;
+    Ok(())
 }
 
 fn parse_js_node_query(value: &serde_json::Value) -> Result<NodeQuery> {
@@ -5199,59 +6273,101 @@ fn parse_js_edge_query(value: &serde_json::Value) -> Result<EdgeQuery> {
     })
 }
 
-fn parse_js_graph_pattern_query(value: &serde_json::Value) -> Result<GraphPatternQuery> {
-    let object = js_object(value, "graph pattern request")?;
-    let nodes = match js_non_null_field(object, "nodes") {
-        Some(value) => js_array(value, "graph pattern nodes")?
-            .iter()
-            .map(parse_js_node_pattern)
-            .collect::<Result<Vec<_>>>()?,
-        None => {
-            return Err(napi::Error::from_reason(
-                "graph pattern request requires nodes".to_string(),
-            ));
-        }
-    };
-    let edges = match js_non_null_field(object, "edges") {
-        Some(value) => js_array(value, "graph pattern edges")?
-            .iter()
-            .map(parse_js_edge_pattern)
-            .collect::<Result<Vec<_>>>()?,
-        None => {
-            return Err(napi::Error::from_reason(
-                "graph pattern request requires edges".to_string(),
-            ));
-        }
-    };
-    let limit = match object.get("limit") {
-        Some(serde_json::Value::Null) | None => {
-            return Err(napi::Error::from_reason(
-                "graph pattern request requires positive limit".to_string(),
-            ));
-        }
+fn parse_js_graph_row_query(value: &serde_json::Value) -> Result<GraphRowQuery> {
+    let object = js_object(value, "graph row request")?;
+    ensure_only_js_fields(
+        object,
+        &[
+            "nodes", "pieces", "where", "return", "orderBy", "skip", "limit", "cursor", "atEpoch",
+            "params", "output", "options",
+        ],
+        "graph row request",
+    )?;
+    let options = parse_js_graph_query_options(js_non_null_field(object, "options"))?;
+    let output = parse_js_graph_output_options(js_non_null_field(object, "output"))?;
+    let limit = match js_non_null_field(object, "limit") {
         Some(value) => {
-            let parsed = js_number_to_u64(value, "graph pattern limit")?;
+            let parsed = js_number_to_u64(value, "graph row limit")?;
             if parsed == 0 {
                 return Err(napi::Error::from_reason(
-                    "graph pattern limit must be > 0".to_string(),
+                    "graph row limit must be > 0".to_string(),
                 ));
             }
-            usize::try_from(parsed).map_err(|_| {
-                napi::Error::from_reason("graph pattern limit is too large".to_string())
-            })?
+            usize::try_from(parsed)
+                .map_err(|_| napi::Error::from_reason("graph row limit is too large".to_string()))?
         }
+        None => 1000.min(options.max_page_limit),
     };
-    Ok(GraphPatternQuery {
+    let nodes = match js_non_null_field(object, "nodes") {
+        Some(value) => js_array(value, "graph row nodes")?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_js_graph_node_pattern(value, &format!("graph row nodes[{index}]"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    let pieces = match js_non_null_field(object, "pieces") {
+        Some(value) => js_array(value, "graph row pieces")?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_js_graph_piece(value, &format!("graph row pieces[{index}]"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    let return_items = match js_non_null_field(object, "return") {
+        Some(value) => Some(
+            js_array(value, "graph row return")?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    parse_js_graph_return_item(value, &format!("graph row return[{index}]"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        None => None,
+    };
+    let order_by = match js_non_null_field(object, "orderBy") {
+        Some(value) => js_array(value, "graph row orderBy")?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_js_graph_order_item(value, &format!("graph row orderBy[{index}]"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    Ok(GraphRowQuery {
         nodes,
-        edges,
-        at_epoch: parse_js_optional_i64_field(object, "atEpoch", "graph pattern atEpoch")?,
-        limit,
-        order: PatternOrder::AnchorThenAliasesAsc,
+        pieces,
+        where_: js_non_null_field(object, "where")
+            .map(|value| parse_js_graph_expr(value, "graph row where"))
+            .transpose()?,
+        return_items,
+        order_by,
+        page: GraphPageRequest {
+            skip: js_non_null_field(object, "skip")
+                .map(|value| js_number_to_usize(value, "graph row skip"))
+                .transpose()?
+                .unwrap_or(0),
+            limit,
+            cursor: parse_js_optional_string_field(object, "cursor", "graph row cursor")?,
+        },
+        at_epoch: parse_js_optional_i64_field(object, "atEpoch", "graph row atEpoch")?,
+        params: parse_js_graph_params(js_non_null_field(object, "params"))?,
+        output,
+        options,
     })
 }
 
-fn parse_js_node_pattern(value: &serde_json::Value) -> Result<NodePattern> {
-    let object = js_object(value, "node pattern")?;
+fn parse_js_graph_node_pattern(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<CoreGraphNodePattern> {
+    let object = js_object(value, context)?;
     ensure_only_js_fields(
         object,
         &[
@@ -5263,39 +6379,77 @@ fn parse_js_node_pattern(value: &serde_json::Value) -> Result<NodePattern> {
             "where",
             "predicates",
         ],
-        "node pattern",
+        context,
     )?;
-    Ok(NodePattern {
-        alias: parse_js_required_string_field(object, "alias", "node pattern alias")?,
-        label_filter: parse_js_node_label_filter_field(
-            object,
-            "labelFilter",
-            "node pattern labelFilter",
-        )?,
-        ids: parse_js_optional_u64_array_field(object, "ids", "node pattern ids")?,
-        keys: parse_js_optional_string_array_field(object, "keys", "node pattern keys")?,
-        filter: parse_js_node_filter(object, "updatedAt", "node pattern")?,
+    let label_filter =
+        parse_js_node_label_filter_field(object, "labelFilter", &format!("{context} labelFilter"))?;
+    let keys = parse_js_optional_node_keys_field(
+        object,
+        "keys",
+        &format!("{context} keys"),
+        label_filter.as_ref(),
+    )?;
+    Ok(CoreGraphNodePattern {
+        alias: parse_js_required_string_field(object, "alias", &format!("{context} alias"))?,
+        label_filter,
+        ids: parse_js_optional_u64_array_field(object, "ids", &format!("{context} ids"))?,
+        keys,
+        filter: parse_js_node_filter(object, "updatedAt", context)?,
     })
 }
 
-fn parse_js_edge_pattern(value: &serde_json::Value) -> Result<EdgePattern> {
-    let object = js_object(value, "edge pattern")?;
-    reject_js_legacy_node_predicate_fields(object, "edge pattern")?;
+fn parse_js_graph_piece(value: &serde_json::Value, context: &str) -> Result<GraphPatternPiece> {
+    let object = js_object(value, context)?;
+    let kind = parse_js_required_string_field(object, "kind", &format!("{context} kind"))?;
+    match kind.as_str() {
+        "edge" => parse_js_graph_edge_pattern(object, context).map(GraphPatternPiece::Edge),
+        "optional" => {
+            parse_js_graph_optional_group(object, context).map(GraphPatternPiece::Optional)
+        }
+        "variableLength" => parse_js_graph_variable_length_pattern(object, context)
+            .map(GraphPatternPiece::VariableLength),
+        other => Err(napi::Error::from_reason(format!(
+            "{context} kind must be 'edge', 'optional', or 'variableLength', got '{other}'"
+        ))),
+    }
+}
+
+fn parse_js_graph_edge_pattern(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<CoreGraphEdgePattern> {
+    ensure_only_js_fields(
+        object,
+        &[
+            "kind",
+            "alias",
+            "fromAlias",
+            "toAlias",
+            "direction",
+            "labelFilter",
+            "filter",
+        ],
+        context,
+    )?;
     let direction = match js_non_null_field(object, "direction") {
         None => Direction::Outgoing,
         Some(value) => parse_direction(Some(value.as_str().ok_or_else(|| {
-            napi::Error::from_reason("edge pattern direction must be a string".to_string())
+            napi::Error::from_reason(format!("{context} direction must be a string"))
         })?))?,
     };
-    Ok(EdgePattern {
-        alias: parse_js_optional_string_field(object, "alias", "edge pattern alias")?,
-        from_alias: parse_js_required_string_field(object, "fromAlias", "edge pattern fromAlias")?,
-        to_alias: parse_js_required_string_field(object, "toAlias", "edge pattern toAlias")?,
+    Ok(CoreGraphEdgePattern {
+        alias: parse_js_optional_string_field(object, "alias", &format!("{context} alias"))?,
+        from_alias: parse_js_required_string_field(
+            object,
+            "fromAlias",
+            &format!("{context} fromAlias"),
+        )?,
+        to_alias: parse_js_required_string_field(object, "toAlias", &format!("{context} toAlias"))?,
         direction,
         label_filter: parse_js_optional_string_array_field(
             object,
             "labelFilter",
-            "edge pattern labelFilter",
+            &format!("{context} labelFilter"),
         )?,
         filter: parse_js_edge_filter(
             object,
@@ -5303,9 +6457,995 @@ fn parse_js_edge_pattern(value: &serde_json::Value) -> Result<EdgePattern> {
             "validAt",
             "validFrom",
             "validTo",
-            "edge pattern",
+            context,
         )?,
     })
+}
+
+fn parse_js_graph_optional_group(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<GraphOptionalGroup> {
+    ensure_only_js_fields(object, &["kind", "pieces", "where"], context)?;
+    let pieces = match js_non_null_field(object, "pieces") {
+        Some(value) => js_array(value, &format!("{context} pieces"))?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_js_graph_piece(value, &format!("{context} pieces[{index}]"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => {
+            return Err(napi::Error::from_reason(format!(
+                "{context} requires pieces"
+            )));
+        }
+    };
+    Ok(GraphOptionalGroup {
+        pieces,
+        where_: js_non_null_field(object, "where")
+            .map(|value| parse_js_graph_expr(value, &format!("{context} where")))
+            .transpose()?,
+    })
+}
+
+fn parse_js_graph_variable_length_pattern(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<GraphVariableLengthPattern> {
+    ensure_only_js_fields(
+        object,
+        &[
+            "kind",
+            "pathAlias",
+            "edgeAlias",
+            "fromAlias",
+            "toAlias",
+            "direction",
+            "labelFilter",
+            "filter",
+            "minHops",
+            "maxHops",
+        ],
+        context,
+    )?;
+    let direction = match js_non_null_field(object, "direction") {
+        None => Direction::Outgoing,
+        Some(value) => parse_direction(Some(value.as_str().ok_or_else(|| {
+            napi::Error::from_reason(format!("{context} direction must be a string"))
+        })?))?,
+    };
+    Ok(GraphVariableLengthPattern {
+        path_alias: parse_js_optional_string_field(
+            object,
+            "pathAlias",
+            &format!("{context} pathAlias"),
+        )?,
+        edge_alias: parse_js_optional_string_field(
+            object,
+            "edgeAlias",
+            &format!("{context} edgeAlias"),
+        )?,
+        from_alias: parse_js_required_string_field(
+            object,
+            "fromAlias",
+            &format!("{context} fromAlias"),
+        )?,
+        to_alias: parse_js_required_string_field(object, "toAlias", &format!("{context} toAlias"))?,
+        direction,
+        label_filter: parse_js_optional_string_array_field(
+            object,
+            "labelFilter",
+            &format!("{context} labelFilter"),
+        )?,
+        filter: parse_js_edge_filter(
+            object,
+            "updatedAt",
+            "validAt",
+            "validFrom",
+            "validTo",
+            context,
+        )?,
+        min_hops: parse_js_required_u8_field(object, "minHops", &format!("{context} minHops"))?,
+        max_hops: parse_js_required_u8_field(object, "maxHops", &format!("{context} maxHops"))?,
+    })
+}
+
+fn parse_js_graph_return_item(value: &serde_json::Value, context: &str) -> Result<GraphReturnItem> {
+    let object = js_object(value, context)?;
+    ensure_only_js_fields(object, &["expr", "as", "projection"], context)?;
+    let expr_value = js_non_null_field(object, "expr")
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} expr is required")))?;
+    Ok(GraphReturnItem {
+        expr: parse_js_graph_expr(expr_value, &format!("{context} expr"))?,
+        alias: parse_js_optional_string_field(object, "as", &format!("{context} as"))?,
+        projection: parse_js_graph_return_projection(
+            js_non_null_field(object, "projection"),
+            context,
+        )?,
+    })
+}
+
+fn parse_js_graph_order_item(value: &serde_json::Value, context: &str) -> Result<GraphOrderItem> {
+    let object = js_object(value, context)?;
+    ensure_only_js_fields(object, &["expr", "direction"], context)?;
+    let expr_value = js_non_null_field(object, "expr")
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} expr is required")))?;
+    let direction =
+        match parse_js_optional_string_field(object, "direction", &format!("{context} direction"))?
+            .as_deref()
+        {
+            None | Some("asc") => GraphOrderDirection::Asc,
+            Some("desc") => GraphOrderDirection::Desc,
+            Some(other) => {
+                return Err(napi::Error::from_reason(format!(
+                    "{context} direction must be 'asc' or 'desc', got '{other}'"
+                )));
+            }
+        };
+    Ok(GraphOrderItem {
+        expr: parse_js_graph_expr(expr_value, &format!("{context} expr"))?,
+        direction,
+    })
+}
+
+fn parse_js_graph_return_projection(
+    value: Option<&serde_json::Value>,
+    context: &str,
+) -> Result<GraphReturnProjection> {
+    let Some(value) = value else {
+        return Ok(GraphReturnProjection::Auto);
+    };
+    if let Some(name) = value.as_str() {
+        return match name {
+            "auto" => Ok(GraphReturnProjection::Auto),
+            "id" | "idOnly" => Ok(GraphReturnProjection::IdOnly),
+            "element" | "full" => Ok(GraphReturnProjection::Element(GraphElementProjection::Full)),
+            "compact" => Ok(GraphReturnProjection::Element(GraphElementProjection::Compact)),
+            other => Err(napi::Error::from_reason(format!(
+                "{context} projection must be 'auto', 'idOnly', 'element', 'full', or 'compact', got '{other}'"
+            ))),
+        };
+    }
+    let object = js_object(value, &format!("{context} projection"))?;
+    let selectors = ["element", "selected"]
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .count();
+    if selectors != 1 {
+        return Err(napi::Error::from_reason(format!(
+            "{context} projection must contain exactly one of 'element' or 'selected'"
+        )));
+    }
+    ensure_only_js_fields(
+        object,
+        &["element", "selected"],
+        &format!("{context} projection"),
+    )?;
+    if let Some(element) = js_non_null_field(object, "element") {
+        let mode = element.as_str().ok_or_else(|| {
+            napi::Error::from_reason(format!("{context} projection element must be a string"))
+        })?;
+        return Ok(GraphReturnProjection::Element(match mode {
+            "id" | "idOnly" => GraphElementProjection::IdOnly,
+            "compact" => GraphElementProjection::Compact,
+            "full" => GraphElementProjection::Full,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "{context} projection element must be 'idOnly', 'compact', or 'full', got '{other}'"
+                )));
+            }
+        }));
+    }
+    let selected = js_non_null_field(object, "selected").ok_or_else(|| {
+        napi::Error::from_reason(format!("{context} selected projection is required"))
+    })?;
+    Ok(GraphReturnProjection::Selected(
+        parse_js_selected_projection(selected, &format!("{context} selected"))?,
+    ))
+}
+
+fn parse_js_selected_projection(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<GraphSelectedProjection> {
+    let object = js_object(value, context)?;
+    let selectors = ["node", "edge", "path"]
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .count();
+    if selectors != 1 {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must contain exactly one of 'node', 'edge', or 'path'"
+        )));
+    }
+    ensure_only_js_fields(object, &["node", "edge", "path"], context)?;
+    if let Some(value) = js_non_null_field(object, "node") {
+        return Ok(GraphSelectedProjection::Node(
+            parse_js_selected_node_projection(value, &format!("{context} node"))?,
+        ));
+    }
+    if let Some(value) = js_non_null_field(object, "edge") {
+        return Ok(GraphSelectedProjection::Edge(
+            parse_js_selected_edge_projection(value, &format!("{context} edge"))?,
+        ));
+    }
+    let value = js_non_null_field(object, "path").ok_or_else(|| {
+        napi::Error::from_reason(format!("{context} path projection is required"))
+    })?;
+    Ok(GraphSelectedProjection::Path(
+        parse_js_selected_path_projection(value, &format!("{context} path"))?,
+    ))
+}
+
+fn parse_js_selected_node_projection(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<GraphSelectedNodeProjection> {
+    let object = js_object(value, context)?;
+    ensure_only_js_fields(
+        object,
+        &[
+            "id",
+            "labels",
+            "key",
+            "props",
+            "weight",
+            "createdAt",
+            "updatedAt",
+            "vectors",
+        ],
+        context,
+    )?;
+    Ok(GraphSelectedNodeProjection {
+        id: parse_js_optional_bool_field(object, "id", &format!("{context} id"))?.unwrap_or(false),
+        labels: parse_js_optional_bool_field(object, "labels", &format!("{context} labels"))?
+            .unwrap_or(false),
+        key: parse_js_optional_bool_field(object, "key", &format!("{context} key"))?
+            .unwrap_or(false),
+        props: parse_js_property_selection(js_non_null_field(object, "props"), context)?,
+        weight: parse_js_optional_bool_field(object, "weight", &format!("{context} weight"))?
+            .unwrap_or(false),
+        created_at: parse_js_optional_bool_field(
+            object,
+            "createdAt",
+            &format!("{context} createdAt"),
+        )?
+        .unwrap_or(false),
+        updated_at: parse_js_optional_bool_field(
+            object,
+            "updatedAt",
+            &format!("{context} updatedAt"),
+        )?
+        .unwrap_or(false),
+        vectors: parse_js_vector_selection(js_non_null_field(object, "vectors"), context)?,
+    })
+}
+
+fn parse_js_selected_edge_projection(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<GraphSelectedEdgeProjection> {
+    let object = js_object(value, context)?;
+    ensure_only_js_fields(
+        object,
+        &[
+            "id",
+            "from",
+            "to",
+            "label",
+            "props",
+            "weight",
+            "createdAt",
+            "updatedAt",
+            "validFrom",
+            "validTo",
+        ],
+        context,
+    )?;
+    Ok(GraphSelectedEdgeProjection {
+        id: parse_js_optional_bool_field(object, "id", &format!("{context} id"))?.unwrap_or(false),
+        from: parse_js_optional_bool_field(object, "from", &format!("{context} from"))?
+            .unwrap_or(false),
+        to: parse_js_optional_bool_field(object, "to", &format!("{context} to"))?.unwrap_or(false),
+        label: parse_js_optional_bool_field(object, "label", &format!("{context} label"))?
+            .unwrap_or(false),
+        props: parse_js_property_selection(js_non_null_field(object, "props"), context)?,
+        weight: parse_js_optional_bool_field(object, "weight", &format!("{context} weight"))?
+            .unwrap_or(false),
+        created_at: parse_js_optional_bool_field(
+            object,
+            "createdAt",
+            &format!("{context} createdAt"),
+        )?
+        .unwrap_or(false),
+        updated_at: parse_js_optional_bool_field(
+            object,
+            "updatedAt",
+            &format!("{context} updatedAt"),
+        )?
+        .unwrap_or(false),
+        valid_from: parse_js_optional_bool_field(
+            object,
+            "validFrom",
+            &format!("{context} validFrom"),
+        )?
+        .unwrap_or(false),
+        valid_to: parse_js_optional_bool_field(object, "validTo", &format!("{context} validTo"))?
+            .unwrap_or(false),
+    })
+}
+
+fn parse_js_selected_path_projection(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<GraphSelectedPathProjection> {
+    let object = js_object(value, context)?;
+    ensure_only_js_fields(object, &["nodeIds", "edgeIds", "nodes", "edges"], context)?;
+    Ok(GraphSelectedPathProjection {
+        node_ids: parse_js_optional_bool_field(object, "nodeIds", &format!("{context} nodeIds"))?
+            .unwrap_or(false),
+        edge_ids: parse_js_optional_bool_field(object, "edgeIds", &format!("{context} edgeIds"))?
+            .unwrap_or(false),
+        nodes: js_non_null_field(object, "nodes")
+            .map(|value| parse_js_selected_node_projection(value, &format!("{context} nodes")))
+            .transpose()?,
+        edges: js_non_null_field(object, "edges")
+            .map(|value| parse_js_selected_edge_projection(value, &format!("{context} edges")))
+            .transpose()?,
+    })
+}
+
+fn parse_js_property_selection(
+    value: Option<&serde_json::Value>,
+    context: &str,
+) -> Result<GraphPropertySelection> {
+    let Some(value) = value else {
+        return Ok(GraphPropertySelection::None);
+    };
+    if let Some(value) = value.as_bool() {
+        return Ok(if value {
+            GraphPropertySelection::All
+        } else {
+            GraphPropertySelection::None
+        });
+    }
+    if let Some(mode) = value.as_str() {
+        return match mode {
+            "all" => Ok(GraphPropertySelection::All),
+            "none" => Ok(GraphPropertySelection::None),
+            other => Err(napi::Error::from_reason(format!(
+                "{context} props must be true, false, 'all', 'none', or string[]; got '{other}'"
+            ))),
+        };
+    }
+    Ok(GraphPropertySelection::Keys(
+        js_array(value, &format!("{context} props"))?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.as_str().map(ToString::to_string).ok_or_else(|| {
+                    napi::Error::from_reason(format!("{context} props[{index}] must be a string"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+fn parse_js_vector_selection(
+    value: Option<&serde_json::Value>,
+    context: &str,
+) -> Result<GraphVectorSelection> {
+    let Some(value) = value else {
+        return Ok(GraphVectorSelection::None);
+    };
+    if let Some(value) = value.as_bool() {
+        return Ok(if value {
+            GraphVectorSelection::Both
+        } else {
+            GraphVectorSelection::None
+        });
+    }
+    let mode = value.as_str().ok_or_else(|| {
+        napi::Error::from_reason(format!("{context} vectors must be a boolean or string"))
+    })?;
+    match mode {
+        "none" => Ok(GraphVectorSelection::None),
+        "dense" => Ok(GraphVectorSelection::Dense),
+        "sparse" => Ok(GraphVectorSelection::Sparse),
+        "both" => Ok(GraphVectorSelection::Both),
+        other => Err(napi::Error::from_reason(format!(
+            "{context} vectors must be 'none', 'dense', 'sparse', or 'both', got '{other}'"
+        ))),
+    }
+}
+
+fn parse_js_graph_expr(value: &serde_json::Value, context: &str) -> Result<GraphExpr> {
+    match value {
+        serde_json::Value::Null => Ok(GraphExpr::Null),
+        serde_json::Value::Bool(value) => Ok(GraphExpr::Bool(*value)),
+        serde_json::Value::Number(_) => parse_js_graph_number_expr(value, context),
+        serde_json::Value::String(value) => Ok(GraphExpr::String(value.clone())),
+        serde_json::Value::Array(_) => Err(napi::Error::from_reason(format!(
+            "{context} array literals must use {{ list: [...] }}"
+        ))),
+        serde_json::Value::Object(object) => parse_js_graph_expr_object(object, context),
+    }
+}
+
+fn parse_js_graph_number_expr(value: &serde_json::Value, context: &str) -> Result<GraphExpr> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} must be a finite number")))?;
+    if !number.is_finite() {
+        return Err(napi::Error::from_reason(format!(
+            "{context} numeric literals must be finite"
+        )));
+    }
+    if number.fract() == 0.0 && number.abs() <= MAX_SAFE_INTEGER {
+        if number < 0.0 {
+            Ok(GraphExpr::Int(number as i64))
+        } else {
+            Ok(GraphExpr::UInt(number as u64))
+        }
+    } else {
+        Ok(GraphExpr::Float(number))
+    }
+}
+
+fn parse_js_graph_expr_object(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<GraphExpr> {
+    let tags = [
+        "bytes",
+        "list",
+        "map",
+        "param",
+        "binding",
+        "property",
+        "nodeField",
+        "edgeField",
+        "pathField",
+        "fn",
+        "op",
+        "isNull",
+        "isNotNull",
+    ];
+    let tag_count = tags.iter().filter(|tag| object.contains_key(**tag)).count();
+    if tag_count != 1 {
+        return Err(napi::Error::from_reason(format!(
+            "{context} expression object must contain exactly one known expression tag"
+        )));
+    }
+    if let Some(value) = object.get("bytes") {
+        ensure_only_js_fields(object, &["bytes"], context)?;
+        return Ok(GraphExpr::Bytes(parse_js_byte_array(
+            value,
+            &format!("{context} bytes"),
+        )?));
+    }
+    if let Some(value) = object.get("list") {
+        ensure_only_js_fields(object, &["list"], context)?;
+        return Ok(GraphExpr::List(
+            js_array(value, &format!("{context} list"))?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    parse_js_graph_expr(value, &format!("{context} list[{index}]"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ));
+    }
+    if let Some(value) = object.get("map") {
+        ensure_only_js_fields(object, &["map"], context)?;
+        let map = js_object(value, &format!("{context} map"))?;
+        return Ok(GraphExpr::Map(
+            map.iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.clone(),
+                        parse_js_graph_expr(value, &format!("{context} map.{key}"))?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        ));
+    }
+    if let Some(value) = object.get("param") {
+        ensure_only_js_fields(object, &["param"], context)?;
+        return Ok(GraphExpr::Param(
+            value.as_str().map(ToString::to_string).ok_or_else(|| {
+                napi::Error::from_reason(format!("{context} param must be a string"))
+            })?,
+        ));
+    }
+    if let Some(value) = object.get("binding") {
+        ensure_only_js_fields(object, &["binding"], context)?;
+        return Ok(GraphExpr::Binding(
+            value.as_str().map(ToString::to_string).ok_or_else(|| {
+                napi::Error::from_reason(format!("{context} binding must be a string"))
+            })?,
+        ));
+    }
+    if let Some(value) = object.get("property") {
+        ensure_only_js_fields(object, &["property"], context)?;
+        let payload = js_object(value, &format!("{context} property"))?;
+        ensure_only_js_fields(payload, &["alias", "key"], &format!("{context} property"))?;
+        return Ok(GraphExpr::Property {
+            alias: parse_js_required_string_field(
+                payload,
+                "alias",
+                &format!("{context} property alias"),
+            )?,
+            key: parse_js_required_string_field(
+                payload,
+                "key",
+                &format!("{context} property key"),
+            )?,
+        });
+    }
+    if let Some(value) = object.get("nodeField") {
+        ensure_only_js_fields(object, &["nodeField"], context)?;
+        let (alias, field) = parse_js_field_payload(value, "nodeField", context)?;
+        return Ok(GraphExpr::NodeField {
+            alias,
+            field: parse_js_graph_node_field(&field, context)?,
+        });
+    }
+    if let Some(value) = object.get("edgeField") {
+        ensure_only_js_fields(object, &["edgeField"], context)?;
+        let (alias, field) = parse_js_field_payload(value, "edgeField", context)?;
+        return Ok(GraphExpr::EdgeField {
+            alias,
+            field: parse_js_graph_edge_field(&field, context)?,
+        });
+    }
+    if let Some(value) = object.get("pathField") {
+        ensure_only_js_fields(object, &["pathField"], context)?;
+        let (alias, field) = parse_js_field_payload(value, "pathField", context)?;
+        return Ok(GraphExpr::PathField {
+            alias,
+            field: parse_js_graph_path_field(&field, context)?,
+        });
+    }
+    if object.contains_key("fn") {
+        ensure_only_js_fields(object, &["fn", "args"], context)?;
+        return parse_js_graph_function_expr(object, context);
+    }
+    if object.contains_key("op") {
+        ensure_only_js_fields(object, &["op", "left", "right", "expr"], context)?;
+        return parse_js_graph_op_expr(object, context);
+    }
+    if let Some(value) = object.get("isNull") {
+        ensure_only_js_fields(object, &["isNull"], context)?;
+        return Ok(GraphExpr::IsNull(Box::new(parse_js_graph_expr(
+            value,
+            &format!("{context} isNull"),
+        )?)));
+    }
+    if let Some(value) = object.get("isNotNull") {
+        ensure_only_js_fields(object, &["isNotNull"], context)?;
+        return Ok(GraphExpr::IsNotNull(Box::new(parse_js_graph_expr(
+            value,
+            &format!("{context} isNotNull"),
+        )?)));
+    }
+    unreachable!("tag count was checked above")
+}
+
+fn parse_js_field_payload(
+    value: &serde_json::Value,
+    tag: &str,
+    context: &str,
+) -> Result<(String, String)> {
+    let payload = js_object(value, &format!("{context} {tag}"))?;
+    ensure_only_js_fields(payload, &["alias", "field"], &format!("{context} {tag}"))?;
+    Ok((
+        parse_js_required_string_field(payload, "alias", &format!("{context} {tag} alias"))?,
+        parse_js_required_string_field(payload, "field", &format!("{context} {tag} field"))?,
+    ))
+}
+
+fn parse_js_graph_function_expr(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<GraphExpr> {
+    let name = object
+        .get("fn")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} fn must be a string")))?;
+    let args_value = object
+        .get("args")
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} fn args are required")))?;
+    let args = js_array(args_value, &format!("{context} args"))?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| parse_js_graph_expr(value, &format!("{context} args[{index}]")))
+        .collect::<Result<Vec<_>>>()?;
+    if matches!(name, "nodeIds" | "node_ids" | "edgeIds" | "edge_ids") {
+        if args.len() != 1 {
+            return Err(napi::Error::from_reason(format!(
+                "{context} {name}() requires exactly one path binding argument"
+            )));
+        }
+        let GraphExpr::Binding(alias) = args.into_iter().next().unwrap() else {
+            return Err(napi::Error::from_reason(format!(
+                "{context} {name}() currently requires a direct path binding argument"
+            )));
+        };
+        return Ok(GraphExpr::PathField {
+            alias,
+            field: if matches!(name, "nodeIds" | "node_ids") {
+                GraphPathField::NodeIds
+            } else {
+                GraphPathField::EdgeIds
+            },
+        });
+    }
+    Ok(GraphExpr::Function {
+        name: match name {
+            "id" => GraphFunction::Id,
+            "labels" => GraphFunction::Labels,
+            "type" => GraphFunction::Type,
+            "length" => GraphFunction::Length,
+            "startNode" | "start_node" => GraphFunction::StartNode,
+            "endNode" | "end_node" => GraphFunction::EndNode,
+            "nodes" => GraphFunction::Nodes,
+            "relationships" => GraphFunction::Relationships,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "{context} unsupported graph function '{other}'"
+                )));
+            }
+        },
+        args,
+    })
+}
+
+fn parse_js_graph_op_expr(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<GraphExpr> {
+    let op = object
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} op must be a string")))?;
+    if op == "not" {
+        let expr = object
+            .get("expr")
+            .ok_or_else(|| napi::Error::from_reason(format!("{context} not expr is required")))?;
+        if object.contains_key("left") || object.contains_key("right") {
+            return Err(napi::Error::from_reason(format!(
+                "{context} not expression must not contain left or right"
+            )));
+        }
+        return Ok(GraphExpr::Unary {
+            op: GraphUnaryOp::Not,
+            expr: Box::new(parse_js_graph_expr(expr, &format!("{context} expr"))?),
+        });
+    }
+    if object.contains_key("expr") {
+        return Err(napi::Error::from_reason(format!(
+            "{context} binary expression must not contain expr"
+        )));
+    }
+    let left = object
+        .get("left")
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} left is required")))?;
+    let right = object
+        .get("right")
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} right is required")))?;
+    Ok(GraphExpr::Binary {
+        left: Box::new(parse_js_graph_expr(left, &format!("{context} left"))?),
+        op: match op {
+            "or" => GraphBinaryOp::Or,
+            "and" => GraphBinaryOp::And,
+            "=" | "==" | "eq" => GraphBinaryOp::Eq,
+            "<>" | "!=" | "neq" => GraphBinaryOp::Neq,
+            "<" | "lt" => GraphBinaryOp::Lt,
+            "<=" | "lte" => GraphBinaryOp::Le,
+            ">" | "gt" => GraphBinaryOp::Gt,
+            ">=" | "gte" => GraphBinaryOp::Ge,
+            "in" => GraphBinaryOp::In,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "{context} unsupported graph binary op '{other}'"
+                )));
+            }
+        },
+        right: Box::new(parse_js_graph_expr(right, &format!("{context} right"))?),
+    })
+}
+
+fn parse_js_graph_node_field(field: &str, context: &str) -> Result<GraphNodeField> {
+    match field {
+        "id" => Ok(GraphNodeField::Id),
+        "labels" => Ok(GraphNodeField::Labels),
+        "key" => Ok(GraphNodeField::Key),
+        "weight" => Ok(GraphNodeField::Weight),
+        "createdAt" => Ok(GraphNodeField::CreatedAt),
+        "updatedAt" => Ok(GraphNodeField::UpdatedAt),
+        other => Err(napi::Error::from_reason(format!(
+            "{context} unsupported node field '{other}'"
+        ))),
+    }
+}
+
+fn parse_js_graph_edge_field(field: &str, context: &str) -> Result<GraphEdgeField> {
+    match field {
+        "id" => Ok(GraphEdgeField::Id),
+        "from" => Ok(GraphEdgeField::From),
+        "to" => Ok(GraphEdgeField::To),
+        "label" => Ok(GraphEdgeField::Label),
+        "weight" => Ok(GraphEdgeField::Weight),
+        "createdAt" => Ok(GraphEdgeField::CreatedAt),
+        "updatedAt" => Ok(GraphEdgeField::UpdatedAt),
+        "validFrom" => Ok(GraphEdgeField::ValidFrom),
+        "validTo" => Ok(GraphEdgeField::ValidTo),
+        other => Err(napi::Error::from_reason(format!(
+            "{context} unsupported edge field '{other}'"
+        ))),
+    }
+}
+
+fn parse_js_graph_path_field(field: &str, context: &str) -> Result<GraphPathField> {
+    match field {
+        "nodeIds" => Ok(GraphPathField::NodeIds),
+        "edgeIds" => Ok(GraphPathField::EdgeIds),
+        "length" => Ok(GraphPathField::Length),
+        other => Err(napi::Error::from_reason(format!(
+            "{context} unsupported path field '{other}'"
+        ))),
+    }
+}
+
+fn parse_js_graph_params(
+    value: Option<&serde_json::Value>,
+) -> Result<BTreeMap<String, GraphParamValue>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let object = js_object(value, "graph row params")?;
+    object
+        .iter()
+        .map(|(key, value)| {
+            Ok((
+                key.clone(),
+                parse_js_graph_param_value(value, &format!("graph row params.{key}"))?,
+            ))
+        })
+        .collect()
+}
+
+fn parse_js_graph_param_value(value: &serde_json::Value, context: &str) -> Result<GraphParamValue> {
+    match value {
+        serde_json::Value::Null => Ok(GraphParamValue::Null),
+        serde_json::Value::Bool(value) => Ok(GraphParamValue::Bool(*value)),
+        serde_json::Value::Number(_) => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| napi::Error::from_reason(format!("{context} must be a number")))?;
+            if !number.is_finite() {
+                return Err(napi::Error::from_reason(format!(
+                    "{context} numeric params must be finite"
+                )));
+            }
+            if number.fract() == 0.0 && number.abs() <= MAX_SAFE_INTEGER {
+                if number < 0.0 {
+                    Ok(GraphParamValue::Int(number as i64))
+                } else {
+                    Ok(GraphParamValue::UInt(number as u64))
+                }
+            } else {
+                Ok(GraphParamValue::Float(number))
+            }
+        }
+        serde_json::Value::String(value) => Ok(GraphParamValue::String(value.clone())),
+        serde_json::Value::Array(_) => Err(napi::Error::from_reason(format!(
+            "{context} list params must use {{ list: [...] }}"
+        ))),
+        serde_json::Value::Object(object) => {
+            let tags = ["bytes", "list", "map"]
+                .iter()
+                .filter(|tag| object.contains_key(**tag))
+                .count();
+            if tags != 1 {
+                return Err(napi::Error::from_reason(format!(
+                    "{context} object params must contain exactly one of bytes, list, or map"
+                )));
+            }
+            if let Some(value) = object.get("bytes") {
+                ensure_only_js_fields(object, &["bytes"], context)?;
+                return Ok(GraphParamValue::Bytes(parse_js_byte_array(
+                    value,
+                    &format!("{context} bytes"),
+                )?));
+            }
+            if let Some(value) = object.get("list") {
+                ensure_only_js_fields(object, &["list"], context)?;
+                return Ok(GraphParamValue::List(
+                    js_array(value, &format!("{context} list"))?
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            parse_js_graph_param_value(value, &format!("{context} list[{index}]"))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ));
+            }
+            let value = object.get("map").unwrap();
+            ensure_only_js_fields(object, &["map"], context)?;
+            Ok(GraphParamValue::Map(
+                js_object(value, &format!("{context} map"))?
+                    .iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            key.clone(),
+                            parse_js_graph_param_value(value, &format!("{context} map.{key}"))?,
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            ))
+        }
+    }
+}
+
+fn parse_js_graph_output_options(value: Option<&serde_json::Value>) -> Result<GraphOutputOptions> {
+    let Some(value) = value else {
+        return Ok(GraphOutputOptions::default());
+    };
+    let object = js_object(value, "graph row output")?;
+    ensure_only_js_fields(
+        object,
+        &["mode", "compactRows", "includeVectors"],
+        "graph row output",
+    )?;
+    let mut output = GraphOutputOptions::default();
+    if let Some(mode) = parse_js_optional_string_field(object, "mode", "graph row output mode")? {
+        output.mode = match mode.as_str() {
+            "ids" => GraphOutputMode::Ids,
+            "elements" => GraphOutputMode::Elements,
+            "projected" => GraphOutputMode::Projected,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "graph row output mode must be 'ids', 'elements', or 'projected', got '{other}'"
+                )));
+            }
+        };
+    }
+    if let Some(value) =
+        parse_js_optional_bool_field(object, "compactRows", "graph row output compactRows")?
+    {
+        output.compact_rows = value;
+    }
+    if let Some(value) =
+        parse_js_optional_bool_field(object, "includeVectors", "graph row output includeVectors")?
+    {
+        output.include_vectors = value;
+    }
+    Ok(output)
+}
+
+fn parse_js_graph_query_options(value: Option<&serde_json::Value>) -> Result<GraphQueryOptions> {
+    let Some(value) = value else {
+        return Ok(GraphQueryOptions::default());
+    };
+    let object = js_object(value, "graph row options")?;
+    ensure_only_js_fields(
+        object,
+        &[
+            "allowFullScan",
+            "maxIntermediateBindings",
+            "maxFrontier",
+            "maxPathHops",
+            "maxPathsPerStart",
+            "maxPageLimit",
+            "maxOrderMaterialization",
+            "maxCursorBytes",
+            "maxQueryBytes",
+            "includePlan",
+            "profile",
+        ],
+        "graph row options",
+    )?;
+    let mut options = GraphQueryOptions::default();
+    if let Some(value) =
+        parse_js_optional_bool_field(object, "allowFullScan", "graph row options allowFullScan")?
+    {
+        options.allow_full_scan = value;
+    }
+    if let Some(value) = js_non_null_field(object, "maxIntermediateBindings") {
+        options.max_intermediate_bindings =
+            js_number_to_usize(value, "graph row options maxIntermediateBindings")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxFrontier") {
+        options.max_frontier = js_number_to_usize(value, "graph row options maxFrontier")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxPathHops") {
+        options.max_path_hops = parse_js_u8_number(value, "graph row options maxPathHops")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxPathsPerStart") {
+        options.max_paths_per_start =
+            js_number_to_usize(value, "graph row options maxPathsPerStart")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxPageLimit") {
+        options.max_page_limit = js_number_to_usize(value, "graph row options maxPageLimit")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxOrderMaterialization") {
+        options.max_order_materialization =
+            js_number_to_usize(value, "graph row options maxOrderMaterialization")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxCursorBytes") {
+        options.max_cursor_bytes = js_number_to_usize(value, "graph row options maxCursorBytes")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxQueryBytes") {
+        options.max_query_bytes = js_number_to_usize(value, "graph row options maxQueryBytes")?;
+    }
+    if let Some(value) =
+        parse_js_optional_bool_field(object, "includePlan", "graph row options includePlan")?
+    {
+        options.include_plan = value;
+    }
+    if let Some(value) =
+        parse_js_optional_bool_field(object, "profile", "graph row options profile")?
+    {
+        options.profile = value;
+    }
+    Ok(options)
+}
+
+fn parse_js_optional_node_keys_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+    label_filter: Option<&CoreNodeLabelFilter>,
+) -> Result<Vec<NodeKeyQuery>> {
+    let Some(value) = js_non_null_field(object, key) else {
+        return Ok(Vec::new());
+    };
+    js_array(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| match value {
+            serde_json::Value::String(key) => {
+                let label = label_filter
+                    .and_then(|filter| {
+                        if filter.labels.len() == 1 {
+                            Some(filter.labels[0].clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| {
+                        napi::Error::from_reason(format!(
+                            "{context}[{index}] string key requires a single-label labelFilter; use {{ label, key }} otherwise"
+                        ))
+                    })?;
+                Ok(NodeKeyQuery {
+                    label,
+                    key: key.clone(),
+                })
+            }
+            serde_json::Value::Object(object) => {
+                ensure_only_js_fields(object, &["label", "key"], &format!("{context}[{index}]"))?;
+                Ok(NodeKeyQuery {
+                    label: parse_js_required_string_field(
+                        object,
+                        "label",
+                        &format!("{context}[{index}] label"),
+                    )?,
+                    key: parse_js_required_string_field(
+                        object,
+                        "key",
+                        &format!("{context}[{index}] key"),
+                    )?,
+                })
+            }
+            _ => Err(napi::Error::from_reason(format!(
+                "{context}[{index}] must be a string or {{ label, key }}"
+            ))),
+        })
+        .collect()
 }
 
 fn parse_js_node_labels_arg(value: &serde_json::Value, context: &str) -> Result<Vec<String>> {
@@ -6090,6 +8230,16 @@ fn parse_js_optional_string_array_field(
     }
 }
 
+fn parse_js_required_u8_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<u8> {
+    let value = js_non_null_field(object, key)
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} is required")))?;
+    parse_js_u8_number(value, context)
+}
+
 fn parse_js_required_string_array_field(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -6130,6 +8280,32 @@ fn js_number_to_i64(value: &serde_json::Value, context: &str) -> Result<i64> {
         )));
     }
     Ok(number as i64)
+}
+
+fn js_number_to_usize(value: &serde_json::Value, context: &str) -> Result<usize> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} must be a number")))?;
+    f64_to_usize(number, context)
+}
+
+fn parse_js_u8_number(value: &serde_json::Value, context: &str) -> Result<u8> {
+    let parsed = js_number_to_u64(value, context)?;
+    u8::try_from(parsed)
+        .map_err(|_| napi::Error::from_reason(format!("{context} must be between 0 and 255")))
+}
+
+fn parse_js_byte_array(value: &serde_json::Value, context: &str) -> Result<Vec<u8>> {
+    js_array(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let parsed = js_number_to_u64(value, &format!("{context}[{index}]"))?;
+            u8::try_from(parsed).map_err(|_| {
+                napi::Error::from_reason(format!("{context}[{index}] must be between 0 and 255"))
+            })
+        })
+        .collect()
 }
 
 fn js_number_to_f32(value: &serde_json::Value, context: &str) -> Result<f32> {
@@ -7353,6 +9529,16 @@ fn f64_to_u64(v: f64) -> Result<u64> {
     Ok(v as u64)
 }
 
+fn f64_to_usize(v: f64, context: &str) -> Result<usize> {
+    if !(0.0..=MAX_SAFE_INTEGER).contains(&v) || v.fract() != 0.0 {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be a safe non-negative integer"
+        )));
+    }
+    usize::try_from(v as u64)
+        .map_err(|_| napi::Error::from_reason(format!("{context} is too large")))
+}
+
 const MAX_SAFE_U64: u64 = 9_007_199_254_740_991; // 2^53 - 1
 
 fn u64_to_safe_i64(v: u64) -> Result<i64> {
@@ -7362,6 +9548,16 @@ fn u64_to_safe_i64(v: u64) -> Result<i64> {
         ));
     }
     Ok(v as i64)
+}
+
+fn i64_to_safe_f64(v: i64) -> Result<f64> {
+    let value = v as f64;
+    if !value.is_finite() || value.abs() > MAX_SAFE_INTEGER {
+        return Err(napi::Error::from_reason(
+            "Value exceeds JavaScript safe integer range".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
 fn parse_direction(s: Option<&str>) -> Result<Direction> {
@@ -7442,26 +9638,22 @@ fn ppr_algorithm_to_js(algorithm: PprAlgorithm) -> &'static str {
     }
 }
 
-fn parse_secondary_index_range_domain(s: Option<&str>) -> Result<SecondaryIndexRangeDomain> {
-    match s {
-        Some("int") => Ok(SecondaryIndexRangeDomain::Int),
-        Some("uint") => Ok(SecondaryIndexRangeDomain::UInt),
-        Some("float") => Ok(SecondaryIndexRangeDomain::Float),
-        Some(other) => Err(napi::Error::from_reason(format!(
-            "Invalid range domain '{}'. Must be 'int', 'uint', or 'float'.",
-            other
-        ))),
-        None => Err(napi::Error::from_reason(
-            "Range indexes require domain 'int', 'uint', or 'float'.".to_string(),
-        )),
-    }
+#[derive(Clone, Copy)]
+enum RangeValueDomain {
+    Int,
+    UInt,
+    Float,
 }
 
-fn secondary_index_domain_to_js(domain: SecondaryIndexRangeDomain) -> &'static str {
-    match domain {
-        SecondaryIndexRangeDomain::Int => "int",
-        SecondaryIndexRangeDomain::UInt => "uint",
-        SecondaryIndexRangeDomain::Float => "float",
+fn parse_range_value_domain(s: &str) -> Result<RangeValueDomain> {
+    match s {
+        "int" => Ok(RangeValueDomain::Int),
+        "uint" => Ok(RangeValueDomain::UInt),
+        "float" => Ok(RangeValueDomain::Float),
+        other => Err(napi::Error::from_reason(format!(
+            "Invalid range value type annotation '{}'. Must be 'int', 'uint', or 'float'.",
+            other
+        ))),
     }
 }
 
@@ -7473,29 +9665,17 @@ fn secondary_index_state_to_js(state: SecondaryIndexState) -> &'static str {
     }
 }
 
-fn secondary_index_kind_to_js(kind: &CoreSecondaryIndexKind) -> (String, Option<String>) {
+fn secondary_index_kind_to_js(kind: &CoreSecondaryIndexKind) -> String {
     match kind {
-        CoreSecondaryIndexKind::Equality => ("equality".to_string(), None),
-        CoreSecondaryIndexKind::Range { domain } => (
-            "range".to_string(),
-            Some(secondary_index_domain_to_js(*domain).to_string()),
-        ),
+        CoreSecondaryIndexKind::Equality => "equality".to_string(),
+        CoreSecondaryIndexKind::Range => "range".to_string(),
     }
 }
 
-fn js_secondary_index_kind_to_rust(kind: SecondaryIndexKind) -> Result<CoreSecondaryIndexKind> {
-    match kind.kind.as_str() {
-        "equality" => {
-            if kind.domain.is_some() {
-                return Err(napi::Error::from_reason(
-                    "Equality indexes do not accept a range domain.".to_string(),
-                ));
-            }
-            Ok(CoreSecondaryIndexKind::Equality)
-        }
-        "range" => Ok(CoreSecondaryIndexKind::Range {
-            domain: parse_secondary_index_range_domain(kind.domain.as_deref())?,
-        }),
+fn js_secondary_index_kind_to_rust(kind: &str) -> Result<CoreSecondaryIndexKind> {
+    match kind {
+        "equality" => Ok(CoreSecondaryIndexKind::Equality),
+        "range" => Ok(CoreSecondaryIndexKind::Range),
         other => Err(napi::Error::from_reason(format!(
             "Invalid index kind '{}'. Must be 'equality' or 'range'.",
             other
@@ -7503,9 +9683,9 @@ fn js_secondary_index_kind_to_rust(kind: SecondaryIndexKind) -> Result<CoreSecon
     }
 }
 
-fn js_numeric_to_prop_value(value: f64, domain: SecondaryIndexRangeDomain) -> Result<PropValue> {
+fn js_numeric_to_prop_value(value: f64, domain: RangeValueDomain) -> Result<PropValue> {
     match domain {
-        SecondaryIndexRangeDomain::Int => {
+        RangeValueDomain::Int => {
             if !value.is_finite() || value.fract() != 0.0 || value.abs() > MAX_SAFE_INTEGER {
                 return Err(napi::Error::from_reason(
                     "Int range values must be finite safe integers.".to_string(),
@@ -7513,7 +9693,7 @@ fn js_numeric_to_prop_value(value: f64, domain: SecondaryIndexRangeDomain) -> Re
             }
             Ok(PropValue::Int(value as i64))
         }
-        SecondaryIndexRangeDomain::UInt => {
+        RangeValueDomain::UInt => {
             if !(0.0..=MAX_SAFE_INTEGER).contains(&value) || value.fract() != 0.0 {
                 return Err(napi::Error::from_reason(
                     "UInt range values must be finite non-negative safe integers.".to_string(),
@@ -7521,7 +9701,7 @@ fn js_numeric_to_prop_value(value: f64, domain: SecondaryIndexRangeDomain) -> Re
             }
             Ok(PropValue::UInt(value as u64))
         }
-        SecondaryIndexRangeDomain::Float => {
+        RangeValueDomain::Float => {
             if !value.is_finite() {
                 return Err(napi::Error::from_reason(
                     "Float range values must be finite numbers.".to_string(),
@@ -7552,7 +9732,7 @@ fn prop_value_to_js_numeric_parts(value: &PropValue) -> Result<(f64, String)> {
 }
 
 fn js_property_range_bound_to_rust(bound: &PropertyRangeBound) -> Result<CorePropertyRangeBound> {
-    let domain = parse_secondary_index_range_domain(Some(bound.domain.as_str()))?;
+    let domain = parse_range_value_domain(bound.domain.as_str())?;
     let value = js_numeric_to_prop_value(bound.value, domain)?;
     if bound.inclusive.unwrap_or(true) {
         Ok(CorePropertyRangeBound::Included(value))

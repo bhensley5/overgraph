@@ -89,15 +89,26 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
     - [query_edge_ids](#query_edge_ids)
     - [query_edges](#query_edges)
     - [explain_edge_query](#explain_edge_query)
-  - [Graph Pattern Queries](#graph-pattern-queries)
-    - [query_pattern](#query_pattern)
-    - [explain_pattern_query](#explain_pattern_query)
+  - [Graph Row Queries](#graph-row-queries)
+    - [query_graph_rows](#query_graph_rows)
+    - [explain_graph_rows](#explain_graph_rows)
+  - [GQL Beta](#gql-beta)
+    - [Overview](#overview)
+    - [Supported Syntax](#supported-syntax)
+    - [Method Reference](#method-reference)
+    - [Parameters and Options](#parameters-and-options)
+    - [Results and Row Formats](#results-and-row-formats)
+    - [Nodes, Edges, Values, and Vectors](#nodes-edges-values-and-vectors)
+    - [Params](#params)
+    - [Explain, Profile, and Stats](#explain-profile-and-stats)
+    - [Examples](#examples)
+    - [Not Yet Supported In GQL Beta](#not-yet-supported-in-gql-beta)
   - [Query Request Types and Plans](#query-request-types-and-plans)
     - [NodeQuery](#nodequery)
     - [NodeFilter / QueryNodeFilter](#nodefilter--querynodefilter)
     - [EdgeQuery](#edgequery)
     - [EdgeFilter / QueryEdgeFilter](#edgefilter--queryedgefilter)
-    - [GraphPatternQuery](#graphpatternquery)
+    - [GraphRowQuery](#graphrowquery)
     - [QueryPlan](#queryplan)
     - [Validation notes](#validation-notes)
 - [Pagination](#pagination)
@@ -516,6 +527,8 @@ Property values are strongly typed in the Rust core. Connector inputs use their 
 Properties are encoded with [MessagePack](https://msgpack.org) internally and converted lazily when accessed from Node.js or Python.
 
 Connector property conversion is intentionally host-language shaped. Node.js writes JSON-like values (`null`, booleans, numbers, strings, arrays, and objects); it does not currently use `Buffer` as a bytes marker or expose a separate unsigned-integer marker. Python writes the same common values plus `bytes`; normal Python `int` inputs write signed integers. Rust callers can construct every `PropValue` variant directly.
+
+Property storage keeps these variants intact. Predicate semantics are numeric-aware only for finite scalar numbers: signed integers, unsigned integers, and finite floats compare by exact numeric value for equality and range filters. Strings, bytes, booleans, nulls, arrays, maps, and non-finite floats keep exact non-numeric equality behavior and are excluded from numeric range indexes.
 
 ### IntoNodeLabels (Rust only)
 
@@ -1812,10 +1825,10 @@ Property indexes are optional declarations on node or edge properties. Public qu
 Lifecycle rules:
 - `ensure_node_property_index` registers an equality or numeric range declaration and starts background build work when needed.
 - `ensure_edge_property_index` does the same for edge properties, scoped by edge label.
-- `list_node_property_indexes` exposes declaration kind, range domain, lifecycle state, and any last error from the published read snapshot, so `Ready` means new public reads can use the same ready catalog.
+- `list_node_property_indexes` exposes declaration kind, lifecycle state, and any last error from the published read snapshot, so `Ready` means new public reads can use the same ready catalog.
 - `list_edge_property_indexes` exposes the same state for edge declarations.
 - `find_nodes`, `find_nodes_paged`, `find_nodes_range`, and `find_nodes_range_paged` use declaration-backed execution only when a matching declaration is `Ready`.
-- `query_edge_ids`, `query_edges`, and `query_pattern` may use ready edge-property declarations as candidate sources while still verifying final edge filters.
+- `query_edge_ids`, `query_edges`, and `query_graph_rows` may use ready edge-property declarations as candidate sources while still verifying final edge filters.
 - If a declaration is absent, `Building`, `Failed`, or cannot be used for a specific lookup, OverGraph falls back to the same public query API for that call.
 
 ### ensure_node_property_index
@@ -1833,20 +1846,15 @@ let eq = db.ensure_node_property_index(
 let range = db.ensure_node_property_index(
     "User",
     "score",
-    SecondaryIndexKind::Range {
-        domain: SecondaryIndexRangeDomain::Int,
-    },
+    SecondaryIndexKind::Range,
 )?;
 ```
 
 **Node.js**
 ```javascript
-const eq = db.ensureNodePropertyIndex('User', 'role', { kind: 'equality' });
+const eq = db.ensureNodePropertyIndex('User', 'role', 'equality');
 
-const range = db.ensureNodePropertyIndex('User', 'score', {
-  kind: 'range',
-  domain: 'int',
-});
+const range = db.ensureNodePropertyIndex('User', 'score', 'range');
 ```
 
 **Python**
@@ -1857,7 +1865,6 @@ range_info = db.ensure_node_property_index(
     "User",
     "score",
     "range",
-    domain="int",
 )
 ```
 
@@ -1867,7 +1874,7 @@ range_info = db.ensure_node_property_index(
 |-----------|------|---------|--------|----------|-------------|
 | label | `&str` | `string` | `str` | Yes | Restrict the declaration to this node label. |
 | prop_key | `&str` | `string` | `str` | Yes | Property key to declare. |
-| kind | `SecondaryIndexKind` | `{ kind: string, domain?: string }` | `str` plus optional `domain=` | Yes | Equality declaration or numeric range declaration. |
+| kind | `SecondaryIndexKind` | `string` | `str` | Yes | Equality declaration or domainless numeric range declaration. |
 
 #### Returns
 
@@ -1879,12 +1886,14 @@ The current declaration info.
 
 #### Behavior
 
-- Equality declarations use `SecondaryIndexKind::Equality`, `{ kind: 'equality' }`, or `"equality"`.
-- Range declarations use `SecondaryIndexKind::Range { domain: ... }`, `{ kind: 'range', domain: 'int' | 'uint' | 'float' }`, or `"range"` plus `domain="int" | "uint" | "float"`.
+- Equality declarations use `SecondaryIndexKind::Equality` or `"equality"`. Finite scalar numeric equality is semantic across signed integers, unsigned integers, and finite floats; string equality and other non-numeric equality remain exact.
+- Range declarations use `SecondaryIndexKind::Range` or `"range"`. Range indexes are domainless numeric indexes over finite scalar numeric values across signed integers, unsigned integers, and finite floats.
+- Range indexes exclude non-finite floats, non-numeric values, arrays, and maps.
 - Re-ensuring an existing declaration returns the existing declaration info.
 - Re-ensuring a `Failed` declaration retries it by moving it back to `Building`.
-- A `(label, prop_key)` pair may have at most one range declaration domain. Trying to ensure the same property with a different range domain returns an error.
+- A `(label, prop_key)` pair has one range declaration shape; callers do not choose `int`, `uint`, or `float` variants.
 - A declaration becoming `Ready` is what enables declaration-backed routing. Callers do not switch to a different query method.
+- Ready equality and range index candidates are still verified against the latest visible records before results are returned.
 
 ---
 
@@ -1903,7 +1912,7 @@ let removed = db.drop_node_property_index(
 
 **Node.js**
 ```javascript
-const removed = db.dropNodePropertyIndex('User', 'role', { kind: 'equality' });
+const removed = db.dropNodePropertyIndex('User', 'role', 'equality');
 ```
 
 **Python**
@@ -1969,7 +1978,6 @@ User-facing declaration information returned by [`ensure_node_property_index`](#
 | label | `String` | `label: string` | `label: str` | Declared node label. |
 | prop_key | `String` | `propKey: string` | `prop_key: str` | Declared property key. |
 | kind | `SecondaryIndexKind` | `kind: string` | `kind: str` | `equality` or `range`. |
-| domain | Encoded in `SecondaryIndexKind::Range` | `domain?: string` | `domain: str \| None` | Range domain for range declarations. Omitted / `None` for equality. |
 | state | `SecondaryIndexState` | `state: string` | `state: str` | `building`, `ready`, or `failed`. |
 | last_error | `Option<String>` | `lastError?: string` | `last_error: str \| None` | Most recent build or validation failure, if any. |
 
@@ -1995,20 +2003,15 @@ let eq = db.ensure_edge_property_index(
 let range = db.ensure_edge_property_index(
     "WORKS_AT",
     "score",
-    SecondaryIndexKind::Range {
-        domain: SecondaryIndexRangeDomain::Int,
-    },
+    SecondaryIndexKind::Range,
 )?;
 ```
 
 **Node.js**
 ```javascript
-const eq = db.ensureEdgePropertyIndex('WORKS_AT', 'role', { kind: 'equality' });
+const eq = db.ensureEdgePropertyIndex('WORKS_AT', 'role', 'equality');
 
-const range = db.ensureEdgePropertyIndex('WORKS_AT', 'score', {
-  kind: 'range',
-  domain: 'int',
-});
+const range = db.ensureEdgePropertyIndex('WORKS_AT', 'score', 'range');
 ```
 
 **Python**
@@ -2019,11 +2022,10 @@ range_info = db.ensure_edge_property_index(
     "WORKS_AT",
     "score",
     "range",
-    domain="int",
 )
 ```
 
-Parameters, kind values, lifecycle states, and domain validation match [`ensure_node_property_index`](#ensure_node_property_index), except `label` is the edge label.
+Parameters, kind values, and lifecycle states match [`ensure_node_property_index`](#ensure_node_property_index), except `label` is the edge label.
 
 #### Returns
 
@@ -2034,9 +2036,9 @@ Parameters, kind values, lifecycle states, and domain validation match [`ensure_
 #### Behavior
 
 - Edge property declarations are edge-label-scoped. A property filter without an edge label cannot use an edge-label-scoped edge-property declaration as a direct-query anchor.
-- Ready edge declarations are candidate sources only. `query_edge_ids`, `query_edges`, and graph pattern execution still verify edge metadata and edge property predicates before returning results.
+- Ready edge declarations are candidate sources only. `query_edge_ids`, `query_edges`, and graph-row execution still verify edge metadata and edge property predicates before returning results.
 - Direct `EdgeQuery` anchor legality is unchanged: edge property indexes improve planning inside legal direct edge queries, but do not make filter-only direct edge queries legal by themselves.
-- Graph patterns may choose a ready edge-property equality or range source as an edge anchor when it is cheaper than node-anchor expansion.
+- Graph-row plans may choose a ready edge-property equality or range source as an edge anchor when it is cheaper than node-anchor expansion.
 
 ---
 
@@ -2055,7 +2057,7 @@ let removed = db.drop_edge_property_index(
 
 **Node.js**
 ```javascript
-const removed = db.dropEdgePropertyIndex('WORKS_AT', 'role', { kind: 'equality' });
+const removed = db.dropEdgePropertyIndex('WORKS_AT', 'role', 'equality');
 ```
 
 **Python**
@@ -2100,7 +2102,7 @@ One entry per edge declaration.
 
 User-facing declaration information returned by [`ensure_edge_property_index`](#ensure_edge_property_index) and [`list_edge_property_indexes`](#list_edge_property_indexes).
 
-Fields match [`NodePropertyIndexInfo`](#nodepropertyindexinfo), with the edge-label scope exposed as `label`: `index_id` / `indexId`, `label`, `prop_key` / `propKey`, `kind`, `domain`, `state`, and `last_error` / `lastError`.
+Fields match [`NodePropertyIndexInfo`](#nodepropertyindexinfo), with the edge-label scope exposed as `label`: `index_id` / `indexId`, `label`, `prop_key` / `propKey`, `kind`, `state`, and `last_error` / `lastError`.
 
 ---
 
@@ -2111,30 +2113,32 @@ Bound object for [`find_nodes_range`](#find_nodes_range) and [`find_nodes_range_
 **Rust**
 ```rust
 let lower = PropertyRangeBound::Included(PropValue::Int(10));
-let upper = PropertyRangeBound::Excluded(PropValue::Int(20));
+let upper = PropertyRangeBound::Excluded(PropValue::Float(20.0));
 ```
 
 **Node.js**
 ```javascript
 const lower = { value: 10, inclusive: true, domain: 'int' };
-const upper = { value: 20, inclusive: false, domain: 'int' };
+const upper = { value: 20, inclusive: false, domain: 'float' };
 ```
 
 **Python**
 ```python
 lower = PropertyRangeBound(10, domain="int")
-upper = PropertyRangeBound(20, inclusive=False, domain="int")
+upper = PropertyRangeBound(20.0, inclusive=False, domain="float")
 ```
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
 | value | `PropValue` | `value: number` | `value: int \| float` | Numeric bound value. |
 | inclusive | Encoded by enum variant | `inclusive?: boolean` | `inclusive: bool` | Inclusive when `true`, exclusive when `false`. |
-| domain | Inferred from `PropValue` | `domain: string` | `domain: str` | Required in Node.js and Python. One of `int`, `uint`, or `float`. |
+| domain | Inferred from `PropValue` | `domain: string` | `domain: str` | Node.js and Python value-conversion hint. One of `int`, `uint`, or `float`. |
 
 Notes:
-- Range queries are domain-specific. There is no implicit coercion between `int`, `uint`, and `float`.
-- Both bounds must agree on domain. Paged range cursors must use the same domain too.
+- Range bounds must be finite scalar numeric values. Non-finite floats, non-numeric values, arrays, and maps are invalid bounds.
+- Node.js and Python `domain` fields construct the exact host value variant for a bound or cursor. They are not range index declaration domains.
+- Bounds may mix `int`, `uint`, and `float` conversion hints. OverGraph compares finite numeric values by exact numeric value.
+- Empty finite numeric intervals return empty results.
 
 ---
 
@@ -2164,7 +2168,7 @@ PropertyRangeCursor(20, 42, domain="int")
 |-------|------|---------|--------|-------------|
 | value | `PropValue` | `value: number` | `value: int \| float` | Last value returned on the previous page. |
 | node_id | `u64` | `nodeId: number` | `node_id: int` | Last node ID returned at that value. |
-| domain | Inferred from `value` | `domain: string` | `domain: str` | Required in Node.js and Python so numeric domains stay explicit. |
+| domain | Inferred from `value` | `domain: string` | `domain: str` | Node.js and Python value-conversion hint for the cursor value. |
 
 ---
 
@@ -2203,7 +2207,7 @@ Equality and numeric range queries are index-transparent. Callers do not choose 
 
 ### find_nodes
 
-Finds all nodes with a given label where a specific property matches a given value (exact match).
+Finds all nodes with a given label where a specific property matches a given value.
 
 **Rust**
 ```rust
@@ -2230,7 +2234,7 @@ ids = db.find_nodes("User", "role", "admin")  # IdArray
 |-----------|------|---------|--------|----------|-------------|
 | label | `&str` | `string` | `str` | Yes | Restrict search to this node label. |
 | prop_key | `&str` | `string` | `str` | Yes | Property key to match on. |
-| prop_value | `PropValue` | `any` | `Any` | Yes | Exact value to match. Type must match (string "1" does not match integer 1). |
+| prop_value | `PropValue` | `any` | `Any` | Yes | Value to match. Finite numeric scalars use semantic equality across signed integers, unsigned integers, and finite floats. Strings and other non-numeric values remain exact, so string `"1"` does not match integer `1`. |
 
 #### Returns
 
@@ -2254,7 +2258,7 @@ let ids = db.find_nodes_range(
     "User",
     "score",
     Some(&PropertyRangeBound::Included(PropValue::Int(10))),
-    Some(&PropertyRangeBound::Excluded(PropValue::Int(20))),
+    Some(&PropertyRangeBound::Excluded(PropValue::Float(20.0))),
 )?;
 ```
 
@@ -2264,7 +2268,7 @@ const ids = db.findNodesRange(
   'User',
   'score',
   { value: 10, inclusive: true, domain: 'int' },
-  { value: 20, inclusive: false, domain: 'int' },
+  { value: 20, inclusive: false, domain: 'float' },
 );
 ```
 
@@ -2274,7 +2278,7 @@ ids = db.find_nodes_range(
     "User",
     "score",
     PropertyRangeBound(10, domain="int"),
-    PropertyRangeBound(20, inclusive=False, domain="int"),
+    PropertyRangeBound(20.0, inclusive=False, domain="float"),
 )
 ```
 
@@ -2297,11 +2301,13 @@ Matching node IDs in range order.
 
 #### Behavior
 
-- At least one bound is required.
-- Numeric domains are exact. `int`, `uint`, and `float` are separate query domains.
-- If both bounds are present, they must use the same domain.
+- At least one finite numeric bound is required.
+- Bounds may mix signed integer, unsigned integer, and finite float values.
+- Empty finite numeric intervals return an empty result.
+- Non-finite floats, non-numeric values, arrays, and maps are invalid bounds.
 - If a matching range declaration is `Ready`, OverGraph uses the declaration-backed range path.
 - If no matching `Ready` declaration exists, OverGraph falls back to a scan of nodes of the requested label.
+- Index-backed results remain verified against the latest visible records.
 - Invalid bound combinations return an error.
 
 ---
@@ -2338,12 +2344,12 @@ Node IDs matching the time range. Uses the timestamp index.
 
 ## Queries
 
-Query APIs combine explicit IDs, label-scoped keys, label/edge-label constraints, property filters, timestamp filters, and
-bounded graph patterns through normal function-call and object APIs. OverGraph still has no query
-string parser.
+Native query APIs combine explicit IDs, label-scoped keys, label/edge-label constraints, property filters, timestamp filters, and
+row-producing graph patterns through normal function-call and object APIs. GQL Beta, documented below, adds a
+read-only query-string API over the same graph-row substrate.
 
-Query APIs return matching IDs, hydrated records, or bounded pattern ID bindings only.
-Projection/query-row result APIs are not part of this surface.
+Native query APIs return matching IDs, hydrated records, or graph-row results with explicit columns,
+rows, optional path values, cursors, stats, and explain output.
 
 Node queries use a recursive `filter` tree.
 
@@ -2360,7 +2366,7 @@ bounded adjacency expansion. Candidate indexes are verified after candidate plan
 never trusted as final truth.
 
 OverGraph may also use private durable planner statistics when they are available. These stats can
-improve cost estimates, adaptive caps, OR/IN costing, and graph-pattern fanout ordering, but they do
+improve cost estimates, adaptive caps, OR/IN costing, and graph-row fanout planning, but they do
 not change request shapes or result semantics. Missing, corrupt, or stale stats only degrade
 planning quality; every returned result is still verified against the visible record.
 
@@ -2370,7 +2376,7 @@ Node queries are the API-first query surface for combining top-level constraints
 node `filter` tree. They are useful when a request needs more than one constraint, when an index may
 help but should remain optional, or when the same filter should be explained.
 
-Direct edge queries and graph pattern edge constraints use the canonical edge `filter` tree for
+Direct edge queries and graph-row edge constraints use the canonical edge `filter` tree for
 edge metadata and property predicates. Maintained edge-property indexes are used when available;
 otherwise predicates are verified over the planned edge universe.
 
@@ -2399,8 +2405,9 @@ Use direct property and time queries such as [`find_nodes`](#find_nodes),
 [`find_nodes_by_time_range`](#find_nodes_by_time_range) when you already know you need one direct
 indexed lookup or range lookup. Those APIs keep their existing shapes.
 
-Use [`query_pattern`](#query_pattern) when the result is a bounded graph pattern binding across
-nodes and edges.
+Use [`query_graph_rows`](#query_graph_rows) when the result is a row set over node, edge, and path
+bindings, or when you need optional matches, bounded variable-length paths, final-row cursors, or
+compact/projection output without writing a GQL string.
 
 ### Node Queries
 
@@ -2707,133 +2714,125 @@ Rust `QueryEdgeIdsResult` contains `edge_ids: Vec<u64>` and `next_cursor: Option
 
 ---
 
-### Graph Pattern Queries
+### Graph Row Queries
 
-#### query_pattern
+Graph-row queries are the structured public API for row-producing graph reads. They replace the
+old graph-pattern API surface. Rust no longer exports `GraphPatternQuery`, `PatternOrder`,
+`QueryMatch`, `query_pattern`, or `explain_pattern_query`. Node.js no longer exposes
+`queryPattern` / `explainPatternQuery`. Python keeps legacy runtime methods only to return an
+unsupported error that points callers to `query_graph_rows` / `explain_graph_rows`.
 
-Runs a bounded, connected graph pattern query and returns ID bindings for node and named edge
-aliases. Pattern v1 returns IDs only. Hydrate bound IDs with [`get_nodes`](#get_nodes) and
-[`get_edges`](#get_edges) when needed.
+Use graph-row queries when you need row bindings across nodes and edges, optional groups,
+bounded variable-length paths, path values, explicit return columns, final-row cursors, compact rows,
+or the same substrate used by GQL Beta.
 
-Node patterns use the same recursive `filter` tree as node queries. Edge patterns use canonical
-`filter` with the same shape as direct edge queries. Edge pattern `label_filter` is a simple
-edge-label list, not a `NodeLabelFilter`.
+#### query_graph_rows
+
+Runs a graph-row request and returns explicit columns plus rows. Native graph-row execution uses the
+same node/edge planners, indexes, adjacency readers, visibility rules, tombstone/shadow handling,
+temporal edge checks, prune policy checks, and final verification as the direct query APIs. Row
+assembly, optional semantics, path values, ordering, cursors, and projection are handled by the
+graph-row executor.
 
 **Rust**
 ```rust
-let result = db.query_pattern(&GraphPatternQuery {
+let result = db.query_graph_rows(&GraphRowQuery {
     nodes: vec![
-        NodePattern {
+        GraphNodePattern {
             alias: "person".into(),
             label_filter: Some(NodeLabelFilter {
-                labels: vec!["User".into(), "Admin".into()],
+                labels: vec!["Person".into()],
                 mode: LabelMatchMode::All,
             }),
             ids: vec![],
             keys: vec![],
-            filter: Some(NodeFilterExpr::Or(vec![
-                NodeFilterExpr::PropertyEquals {
-                    key: "status".into(),
-                    value: PropValue::String("active".into()),
-                },
-                NodeFilterExpr::PropertyEquals {
-                    key: "status".into(),
-                    value: PropValue::String("trial".into()),
-                },
-            ])),
+            filter: Some(NodeFilterExpr::PropertyEquals {
+                key: "status".into(),
+                value: PropValue::String("active".into()),
+            }),
         },
-        NodePattern {
+        GraphNodePattern {
             alias: "company".into(),
             label_filter: Some(NodeLabelFilter {
                 labels: vec!["Company".into()],
                 mode: LabelMatchMode::All,
             }),
             ids: vec![],
-            keys: vec!["acme".into()],
+            keys: vec![],
             filter: None,
         },
     ],
-    edges: vec![EdgePattern {
-        alias: Some("employment".into()),
+    pieces: vec![GraphPatternPiece::Edge(GraphEdgePattern {
+        alias: Some("works".into()),
         from_alias: "person".into(),
         to_alias: "company".into(),
         direction: Direction::Outgoing,
         label_filter: vec!["WORKS_AT".into()],
-        filter: Some(EdgeFilterExpr::PropertyEquals {
-            key: "role".into(),
-            value: PropValue::String("engineer".into()),
-        }),
+        filter: None,
+    })],
+    where_: None,
+    return_items: Some(vec![
+        GraphReturnItem {
+            expr: GraphExpr::Property { alias: "person".into(), key: "name".into() },
+            alias: Some("person".into()),
+            projection: GraphReturnProjection::Auto,
+        },
+        GraphReturnItem {
+            expr: GraphExpr::Property { alias: "company".into(), key: "name".into() },
+            alias: Some("company".into()),
+            projection: GraphReturnProjection::Auto,
+        },
+    ]),
+    order_by: vec![GraphOrderItem {
+        expr: GraphExpr::Property { alias: "person".into(), key: "name".into() },
+        direction: GraphOrderDirection::Asc,
     }],
+    page: GraphPageRequest { skip: 0, limit: 100, cursor: None },
     at_epoch: None,
-    limit: 100,
-    order: PatternOrder::AnchorThenAliasesAsc,
+    params: BTreeMap::new(),
+    output: GraphOutputOptions::default(),
+    options: GraphQueryOptions::default(),
 })?;
 ```
 
 **Node.js**
 ```javascript
-const result = db.queryPattern({
+const result = db.queryGraphRows({
   nodes: [
-    {
-      alias: 'person',
-      labelFilter: { labels: ['User'], mode: 'all' },
-      filter: {
-        or: [
-          { property: 'status', eq: 'active' },
-          { property: 'status', eq: 'trial' },
-        ],
-      },
-    },
-    {
-      alias: 'company',
-      labelFilter: { labels: ['Company'], mode: 'all' },
-      keys: ['acme'],
-    },
+    { alias: 'person', labelFilter: { labels: ['Person'], mode: 'all' } },
+    { alias: 'company', labelFilter: { labels: ['Company'], mode: 'all' } },
   ],
-  edges: [
-    {
-      alias: 'employment',
-      fromAlias: 'person',
-      toAlias: 'company',
-      direction: 'outgoing',
-      labelFilter: ['WORKS_AT'],
-      filter: { property: 'role', eq: 'engineer' },
-    },
+  pieces: [
+    { kind: 'edge', alias: 'works', fromAlias: 'person', toAlias: 'company', labelFilter: ['WORKS_AT'] },
   ],
+  where: { op: '=', left: { property: { alias: 'person', key: 'status' } }, right: { param: 'status' } },
+  return: [
+    { expr: { property: { alias: 'person', key: 'name' } }, as: 'person' },
+    { expr: { property: { alias: 'company', key: 'name' } }, as: 'company' },
+  ],
+  orderBy: [{ expr: { property: { alias: 'person', key: 'name' } }, direction: 'asc' }],
+  params: { status: 'active' },
   limit: 100,
 });
 ```
 
 **Python**
 ```python
-result = db.query_pattern({
+result = db.query_graph_rows({
     "nodes": [
-        {
-            "alias": "person",
-            "label_filter": {"labels": ["User"], "mode": "all"},
-            "filter": {
-                "or": [
-                    {"property": "status", "eq": "active"},
-                    {"property": "status", "eq": "trial"},
-                ],
-            },
-        },
-        {
-            "alias": "company",
-            "label_filter": {"labels": ["Company"], "mode": "all"},
-            "keys": ["acme"],
-        },
+        {"alias": "person", "label_filter": {"labels": ["Person"], "mode": "all"}},
+        {"alias": "company", "label_filter": {"labels": ["Company"], "mode": "all"}},
     ],
-    "edges": [
-        {
-            "alias": "employment",
-            "from_alias": "person",
-            "to_alias": "company",
-            "direction": "outgoing",
-            "label_filter": ["WORKS_AT"],
-            "filter": {"property": "role", "eq": "engineer"},
-        },
+    "pieces": [
+        {"kind": "edge", "alias": "works", "from": "person", "to": "company", "labels": ["WORKS_AT"]},
     ],
+    "where": {"op": "=", "left": {"property": {"alias": "person", "key": "status"}}, "right": {"param": "status"}},
+    "return": [
+        {"expr": {"property": {"alias": "person", "key": "name"}}, "as": "person"},
+        {"expr": {"property": {"alias": "company", "key": "name"}}, "as": "company"},
+    ],
+    "order_by": [{"expr": {"property": {"alias": "person", "key": "name"}}, "direction": "asc"}],
+    "params": {"status": "active"},
     "limit": 100,
 })
 ```
@@ -2842,54 +2841,748 @@ result = db.query_pattern({
 
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
-| request | `&GraphPatternQuery` | `GraphPatternRequest` | `dict \| GraphPatternRequest` | Yes | Pattern request. See [GraphPatternQuery](#graphpatternquery). |
+| request | `&GraphRowQuery` | `GraphRowRequest` | `dict \| GraphRowRequest` | Yes | Graph-row request. See [GraphRowQuery](#graphrowquery). |
 
 ##### Returns
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<QueryPatternResult, EngineError>` | `object` | `dict` |
+| `Result<GraphRowResult, EngineError>` | `GraphRowResult` | `GraphRowResult` |
 
 Result fields:
 
-| Field | Description |
-|-------|-------------|
-| matches | List of bindings. Each binding has `nodes` and `edges` maps keyed by alias. |
-| truncated | `true` when more matches existed than the requested `limit`. |
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| columns | `columns` | `columns` | `columns` | Output column names in row order. |
+| rows | `rows: Vec<GraphRow>` | `rows: object[]` or `rows: any[][]` | `rows: list[dict]` or `list[list]` | Rust rows are positional `values`. Connectors return objects by default and arrays when compact rows are enabled. |
+| next cursor | `next_cursor` | `nextCursor` | `next_cursor` | Final logical row cursor for the next page, or null/None on the last page. |
+| stats | `stats` | `stats` | `stats` | Row counts, peak intermediate/frontier counts, path count, db-hit counter, effective epoch, elapsed time, and warnings. |
+| plan | `plan` | `plan` | `plan` | `GraphRowExplain` when `options.include_plan` / `includePlan` / `include_plan` is true; otherwise null/None. |
 
----
+Optional misses produce null values. In Rust that is `GraphValue::Null`; Node.js serializes it as
+`null`; Python serializes it as `None`.
 
-#### explain_pattern_query
+Path values contain identity arrays plus optional hydrated elements:
 
-Returns the plan for a graph pattern query without executing the match. Pattern explain reports
-the selected anchor alias and the actual node-query physical plan used for that anchor.
+| Path field | Rust | Node.js | Python |
+|------------|------|---------|--------|
+| Node IDs | `node_ids` | `nodeIds` | `node_ids` |
+| Edge IDs | `edge_ids` | `edgeIds` | `edge_ids` |
+| Hydrated nodes | `nodes: Option<Vec<GraphNodeValue>>` | `nodes?: GraphNodeValue[]` | `nodes?: list[dict]` |
+| Hydrated edges | `edges: Option<Vec<GraphEdgeValue>>` | `edges?: GraphEdgeValue[]` | `edges?: list[dict]` |
+
+Default graph-row output mode is ID-oriented. Returning a path binding in default mode returns
+`node_ids` / `edge_ids` only. `output.mode = elements` / `mode: 'elements'` / `"mode": "elements"`
+hydrates returned node, edge, and path element values. Full node element hydration omits dense and
+sparse vectors unless `include_vectors` / `includeVectors` is true. Selected projections can request
+specific fields, including vector fields for selected node values.
+
+#### explain_graph_rows
+
+Returns graph-row validation and plan/explain output without returning rows.
 
 **Rust**
 ```rust
-let plan = db.explain_pattern_query(&pattern)?;
+let explain = db.explain_graph_rows(&query)?;
 ```
 
 **Node.js**
 ```javascript
-const plan = db.explainPatternQuery(pattern);
+const explain = db.explainGraphRows(request);
+const asyncExplain = await db.explainGraphRowsAsync(request);
 ```
 
 **Python**
 ```python
-plan = db.explain_pattern_query(pattern)
+explain = db.explain_graph_rows(request)
+async_explain = await async_db.explain_graph_rows(request)
 ```
 
 ##### Returns
 
 | Rust | Node.js | Python |
 |------|---------|--------|
-| `Result<QueryPlan, EngineError>` | `object` | `dict` |
+| `Result<GraphRowExplain, EngineError>` | `GraphRowExplain` | `dict` |
 
-See [QueryPlan](#queryplan).
+`GraphRowExplain` fields are:
 
-Node.js and Python async APIs expose the same query and explain request shapes through
-`queryNodeIdsAsync`, `queryNodesAsync`, `queryPatternAsync`, `explainNodeQueryAsync`,
-`explainPatternQueryAsync`, and the Python `AsyncOverGraph` methods.
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| columns | `columns` | `columns` | `columns` | Output columns after return expansion. |
+| effective epoch | `effective_at_epoch` | `effectiveAtEpoch` | `effective_at_epoch` | Temporal epoch used by planning when known. |
+| fingerprint | `fingerprint` | `fingerprint` | `fingerprint` | Normalized query fingerprint used by cursors. |
+| plan | `plan` | `plan` | `plan` | Graph-row explain nodes, including optional/path/runtime details. |
+| row ops | `row_ops` | `rowOps` | `row_ops` | Sort, skip, limit, projection, and related row-operation notes. |
+| order | `order` | `order` | `order` | Whether explicit ordering is present and whether stable logical row keys are used. |
+| cursor | `cursor` | `cursor` | `cursor` | Cursor supplied/codec status and message. |
+| projection | `projection` | `projection` | `projection` | Columns, output mode, vector policy, and compact-row policy. |
+| caps | `caps` | `caps` | `caps` | Effective graph-row safety caps. |
+| summaries | `summaries` | `summaries` | `summaries` | Validation/runtime summary counters and warnings. |
+| warnings / notes | `warnings`, `notes` | `warnings`, `notes` | `warnings`, `notes` | Planner warnings and explanatory notes. |
+
+Node.js and Python async APIs expose graph-row query and explain methods through
+`queryGraphRowsAsync`, `explainGraphRowsAsync`, and `AsyncOverGraph.query_graph_rows` /
+`AsyncOverGraph.explain_graph_rows`.
+
+---
+
+### GQL Beta
+
+#### Overview
+
+**GQL Beta** is OverGraph's read-only GQL/Cypher-style query-string interface. It is for application
+code that is easier to read as a query string than as a native request object, while still staying
+inside OverGraph's embedded Rust engine.
+
+GQL Beta is not a second execution engine. The Rust API parses, binds, lowers, plans, and executes
+each query through the same graph-row substrate as [`query_graph_rows`](#query_graph_rows). Node.js
+and Python connectors call that Rust API directly; they do not reimplement parser, lowering,
+planning, execution, cursor handling, optional semantics, or path value conversion.
+
+What GQL Beta gives you:
+
+- familiar `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `ORDER BY`, `SKIP` / `OFFSET`, and `LIMIT` query strings
+- row-shaped graph reads over required patterns, optional groups, and bounded variable-length paths
+- scalar values, node values, edge values, path values, lists, maps, bytes, and nulls
+- params, full-scan opt-in, caps, explain/profile, warnings, and stats
+- final-row continuation cursors
+- vector omission by default, with explicit opt-in when returning node values
+- Rust, Node.js, and Python parity over the same Rust parser, binder, lowerer, planner, and executor
+
+The GQL Beta supported subset is intentionally bounded. It is read-only and not full ISO GQL or
+full Cypher. Unsupported features are listed in
+[Not Yet Supported In GQL Beta](#not-yet-supported-in-gql-beta). A compact syntax companion is also
+available in [GQL Beta](gql-subset.md).
+
+#### Supported Syntax
+
+Supported clause order:
+
+```gql
+MATCH <pattern> [, <pattern>...] [WHERE <predicate>]
+OPTIONAL MATCH <pattern> [, <pattern>...] [WHERE <predicate>]
+RETURN <items>
+ORDER BY <order-expression> [ASC|DESC], ...
+SKIP <integer-or-param>
+OFFSET <integer-or-param>
+LIMIT <integer-or-param>
+```
+
+`WHERE`, `ORDER BY`, `SKIP` / `OFFSET`, and `LIMIT` are optional. Each required or optional match
+clause can have its own `WHERE`. `OPTIONAL MATCH` clauses follow an initial required `MATCH`.
+`SKIP` and `OFFSET` are synonyms in this beta subset; using both in one
+query is rejected. `LIMIT 0` validates the query and returns an empty result without running
+graph-row execution.
+
+Supported pattern shapes:
+
+| Shape | Example |
+|-------|---------|
+| Node pattern | `MATCH (n:Person)` |
+| Fixed edge pattern | `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)` |
+| Multiple fixed hops | `MATCH (a)-[r:KNOWS]->(b)-[s:LIKES]->(c)` |
+| Undirected fixed edge | `MATCH (a)-[r:KNOWS]-(b)` |
+| Optional group | `MATCH (p:Person) OPTIONAL MATCH (p)-[r:REPORTS_TO]->(m:Person)` |
+| Bounded variable-length path | `MATCH p = (a)-[:KNOWS*1..3]->(b)` |
+| Zero-to-N bounded path | `MATCH p = (a)-[:KNOWS*0..2]->(b)` or `MATCH p = (a)-[:KNOWS*..2]->(b)` |
+| Exact-length path | `MATCH p = (a)-[:KNOWS*2]->(b)` |
+| One-hop path plus edge alias | `MATCH p = (a)-[r:KNOWS*1..1]->(b)` |
+| Property map predicates | `MATCH (n:Person {name: $name})` |
+
+Relationship quantifiers must have a finite upper bound. The upper bound must fit the engine's path
+hop cap. Variable-length paths are relationship-simple: one path cannot reuse the same edge ID.
+Multi-hop relationship-list aliases are not supported; return the path alias and inspect
+`edge_ids`.
+
+Supported expressions:
+
+| Expression | Example |
+|------------|---------|
+| Variables | `n`, `r`, `company` |
+| Node ID | `id(n)` |
+| Edge ID | `id(r)` |
+| Node labels | `labels(n)` |
+| Edge label/type | `type(r)` |
+| Node metadata | `n.id`, `n.labels`, `n.key`, `n.weight`, `n.created_at`, `n.updated_at` |
+| Edge metadata | `r.from`, `r.to`, `r.weight`, `r.created_at`, `r.updated_at`, `r.valid_from`, `r.valid_to` |
+| Path fields | `p.node_ids`, `p.edge_ids`, `p.length` |
+| Property access | `n.name`, `n.rank`, `r.since`, `r.role`, `r.id`, `r.label` |
+| Literals | `null`, booleans, integers, floats, strings, lists, maps |
+| Params | `$name`, `$ids`, `$minSince`, `$payload` |
+| Boolean predicates | `AND`, `OR`, `NOT` |
+| Comparisons | `=`, `<>`, `<`, `<=`, `>`, `>=` |
+| Null checks | `IS NULL`, `IS NOT NULL` |
+| Membership | `IN` |
+| Return all bound aliases | `RETURN *` |
+
+Supported functions:
+
+| Function | Valid argument |
+|----------|----------------|
+| `id(n)` | node or edge alias |
+| `labels(n)` | node alias |
+| `type(r)` | edge alias |
+| `length(p)` | path alias |
+| `start_node(p)` | path alias |
+| `end_node(p)` | path alias |
+| `nodes(p)` | path alias |
+| `relationships(p)` | path alias |
+| `node_ids(p)` | path alias |
+| `edge_ids(p)` | path alias |
+
+`ORDER BY` uses graph-row order atoms. Null, bool, finite numeric, string, bytes, node, edge, and
+path values are orderable. Nulls sort last. Lists, maps, and non-finite floats are rejected.
+
+Edge ID and edge-label metadata use `id(r)` and `type(r)`. Dot access such as `r.id` and
+`r.label` reads ordinary edge properties with those names when present.
+
+#### Method Reference
+
+| Language | Query | Explain |
+|----------|-------|---------|
+| Rust | `DatabaseEngine::execute_gql(query, params, options)` | `DatabaseEngine::explain_gql(query, params, options)` |
+| Node.js | `db.executeGql(query, params?, options?)` | `db.explainGql(query, params?, options?)` |
+| Node.js async | `db.executeGqlAsync(query, params?, options?)` | `db.explainGqlAsync(query, params?, options?)` |
+| Python | `db.execute_gql(query, params=None, **options)` | `db.explain_gql(query, params=None, **options)` |
+| Python async | `await db.execute_gql(query, params=None, **options)` | `await db.explain_gql(query, params=None, **options)` |
+
+**Rust**
+```rust
+let result = db.execute_gql(
+    "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10",
+    &GqlParams::new(),
+    &GqlQueryOptions::default(),
+)?;
+
+let explain = db.explain_gql(
+    "MATCH (n:Person) RETURN n.name AS name",
+    &GqlParams::new(),
+    &GqlQueryOptions::default(),
+)?;
+```
+
+**Node.js**
+```javascript
+const result = db.executeGql(
+  'MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10'
+);
+
+const asyncResult = await db.executeGqlAsync(
+  'MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10'
+);
+
+const explain = db.explainGql(
+  'MATCH (n:Person) RETURN n.name AS name'
+);
+```
+
+**Python**
+```python
+result = db.execute_gql(
+    "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10"
+)
+
+async_result = await async_db.execute_gql(
+    "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10"
+)
+
+explain = db.explain_gql(
+    "MATCH (n:Person) RETURN n.name AS name"
+)
+```
+
+#### Parameters and Options
+
+| Parameter | Rust | Node.js | Python | Required | Default | Description |
+|-----------|------|---------|--------|----------|---------|-------------|
+| query | `&str` | `string` | `str` | Yes | - | GQL query text. Must be one supported read-only statement. |
+| params | `&GqlParams` | `GqlParams \| null` | `GqlParams \| None` | No | empty | Named params referenced as `$name` in the query. |
+| options | `&GqlQueryOptions` | `GqlQueryOptions` | keyword options | No | default options | Execution, cap, explain/profile, row-format, and vector options. |
+
+Option fields:
+
+| Option | Rust | Node.js | Python | Default | Description |
+|--------|------|---------|--------|---------|-------------|
+| Full-scan opt-in | `allow_full_scan` | `allowFullScan` | `allow_full_scan` | `false` | Allows legal broad node/edge scans when no bounded native anchor exists. |
+| Result row cap | `max_rows` | `maxRows` | `max_rows` | `10000` | Maximum returned rows after row operations. Also protects unbounded result materialization. |
+| Cursor | `cursor` | `cursor` | `cursor` | `None` / `null` | Continuation token from `next_cursor` / `nextCursor`. |
+| Cursor byte cap | `max_cursor_bytes` | `maxCursorBytes` | `max_cursor_bytes` | `16384` | Maximum accepted or emitted cursor token size. |
+| Intermediate cap | `max_intermediate_bindings` | `maxIntermediateBindings` | `max_intermediate_bindings` | `65536` | Maximum native/intermediate row bindings held while executing the query. |
+| Skip cap | `max_skip` | `maxSkip` | `max_skip` | `100000` | Maximum allowed `SKIP` / `OFFSET` value. |
+| Include plan | `include_plan` | `includePlan` | `include_plan` | `false` | Attaches the same explain payload to `GqlResult.plan`. |
+| Profile | `profile` | `profile` | `profile` | `false` | Adds elapsed time and best-effort work counters to stats. |
+| Compact rows | `compact_rows` | `compactRows` | `compact_rows` | `false` | Rust rows are already positional. In connectors, returns row arrays instead of row objects. Does not change execution. |
+| Include vectors | `include_vectors` | `includeVectors` | `include_vectors` | `false` | Includes dense/sparse vectors when returning node element values. |
+| Query byte cap | `max_query_bytes` | `maxQueryBytes` | `max_query_bytes` | `1048576` | Maximum GQL source text bytes accepted by the parser. |
+| Param byte cap | `max_param_bytes` | `maxParamBytes` | `max_param_bytes` | `1048576` | Maximum referenced param string/bytes/map-key bytes, both per value/key and total across referenced params. |
+| AST/param depth cap | `max_ast_depth` | `maxAstDepth` | `max_ast_depth` | `256` | Maximum parser AST depth and referenced runtime list/map nesting depth. |
+| Literal/param item cap | `max_literal_items` | `maxLiteralItems` | `max_literal_items` | `10000` | Maximum list/map literal items, per referenced list/map container, and total referenced list/map items. |
+
+`compactRows` / `compact_rows` is connector serialization only. It does not change parsing, lowering,
+planning, selected fields, vector policy, ordering, stats, caps, warnings, or plan truth.
+
+#### Results and Row Formats
+
+Rust returns positional rows:
+
+```rust
+GqlResult {
+    columns: Vec<String>,
+    rows: Vec<GqlRow>,          // each GqlRow has values: Vec<GqlValue>
+    next_cursor: Option<String>,
+    stats: GqlExecutionStats,
+    plan: Option<GqlExplain>,
+}
+```
+
+Node.js and Python return object rows by default:
+
+```javascript
+{
+  columns: ['name', 'rank'],
+  rows: [
+    { name: 'Ada', rank: 2 },
+    { name: 'Ben', rank: 4 },
+  ],
+  nextCursor: null,
+  stats: {
+    rowsReturned: 2,
+    rowsMatched: 2,
+    rowsAfterFilter: 2,
+    intermediateBindings: 2,
+    dbHits: 2,
+    elapsedUs: null,
+    truncated: false,
+    warnings: [],
+  },
+  plan: null,
+}
+```
+
+With compact rows enabled, connectors keep the same `columns` array and return positional row arrays:
+
+```javascript
+const result = db.executeGql(
+  'MATCH (n:Person) RETURN n.name AS name, n.rank AS rank ORDER BY n.rank',
+  null,
+  { compactRows: true }
+);
+
+// result.columns: ['name', 'rank']
+// result.rows: [['Ben', 1], ['Ada', 2]]
+```
+
+Duplicate output names are allowed. Object-row connectors use the duplicate column name as the object
+key, so prefer aliases that are unique when using object rows. Use compact rows when duplicate column
+names must be preserved positionally. Row-operation references to return aliases must be
+unambiguous: if multiple `RETURN` items use the same alias, clauses such as `ORDER BY x` or
+`LIMIT x` reject `x` instead of choosing one of the duplicate columns.
+
+When a result has another page, it includes `next_cursor` / `nextCursor`. Pass that value as the
+next call's `cursor` option with the same logical query and params. GQL cursors are continuation
+tokens over final logical result rows and validate the normalized graph-row fingerprint. They are
+not pinned storage snapshots across pages.
+
+#### Nodes, Edges, Values, and Vectors
+
+GQL values can be:
+
+- `null`
+- booleans
+- signed integers, unsigned integers, and finite floats
+- strings
+- bytes
+- lists
+- maps with string keys
+- node values
+- edge values
+- path values
+
+Node.js bytes are returned as `Buffer`. Python bytes are returned as `bytes`. Rust uses
+`GqlValue::Bytes(Vec<u8>)`.
+
+Node values expose only requested fields:
+
+| Field | Rust | Node.js | Python |
+|-------|------|---------|--------|
+| ID | `id` | `id` | `id` |
+| Labels | `labels` | `labels` | `labels` |
+| Key | `key` | `key` | `key` |
+| Properties | `props` | `props` | `props` |
+| Weight | `weight` | `weight` | `weight` |
+| Created timestamp | `created_at` | `createdAt` | `created_at` |
+| Updated timestamp | `updated_at` | `updatedAt` | `updated_at` |
+| Dense vector | `dense_vector` | `denseVector` | `dense_vector` |
+| Sparse vector | `sparse_vector` | `sparseVector` | `sparse_vector` |
+
+Edge values expose only requested fields:
+
+| Field | Rust | Node.js | Python |
+|-------|------|---------|--------|
+| ID | `id` | `id` | `id` |
+| Source node ID | `from` | `from` | `from_id` |
+| Target node ID | `to` | `to` | `to_id` |
+| Label | `label` | `label` | `label` |
+| Properties | `props` | `props` | `props` |
+| Weight | `weight` | `weight` | `weight` |
+| Created timestamp | `created_at` | `createdAt` | `created_at` |
+| Updated timestamp | `updated_at` | `updatedAt` | `updated_at` |
+| Valid-from timestamp | `valid_from` | `validFrom` | `valid_from` |
+| Valid-to timestamp | `valid_to` | `validTo` | `valid_to` |
+
+Returning a node element omits dense and sparse vectors by default:
+
+```javascript
+const withoutVectors = db.executeGql(
+  "MATCH (n:Person {name: 'Ada'}) RETURN n"
+);
+
+// withoutVectors.rows[0].n.denseVector is undefined
+```
+
+Opt in when the query result needs vectors:
+
+```javascript
+const withVectors = db.executeGql(
+  "MATCH (n:Person {name: 'Ada'}) RETURN n",
+  null,
+  { includeVectors: true }
+);
+```
+
+Path values expose identity arrays and, when a path alias is returned as a value, hydrated node and
+edge elements:
+
+| Field | Rust | Node.js | Python |
+|-------|------|---------|--------|
+| Node IDs | `node_ids` | `nodeIds` | `node_ids` |
+| Edge IDs | `edge_ids` | `edgeIds` | `edge_ids` |
+| Nodes | `nodes` | `nodes` | `nodes` |
+| Edges | `edges` | `edges` | `edges` |
+
+Hydrated nodes inside path values follow the same vector policy as returned node values.
+
+#### Params
+
+Params are named and referenced with `$name` syntax. They are converted into Rust `GqlParamValue`
+before planning and execution.
+
+Only params referenced by the query are resource-validated. Referenced list/map params are bounded
+by `max_ast_depth` and `max_literal_items`; referenced string, bytes, and map-key payload bytes are
+bounded by `max_param_bytes`. Extra unused params are ignored by the GQL engine.
+
+Supported param values:
+
+| Shape | Node.js | Python | Rust |
+|-------|---------|--------|------|
+| Null | `null` / `undefined` value | `None` | `GqlParamValue::Null` |
+| Boolean | `true` / `false` | `True` / `False` | `GqlParamValue::Bool` |
+| Signed integer | negative safe integer | negative `int` | `GqlParamValue::Int` |
+| Unsigned integer | non-negative safe integer | non-negative `int` / `u64` extraction | `GqlParamValue::UInt` |
+| Float | finite non-integer `number` | finite `float` | `GqlParamValue::Float` |
+| String | `string` | `str` | `GqlParamValue::String` |
+| Bytes | `Buffer` / `ArrayBuffer` | `bytes` | `GqlParamValue::Bytes` |
+| List | `Array` | `list` / `tuple` | `GqlParamValue::List` |
+| Map | plain object | `dict` with string keys | `GqlParamValue::Map` |
+
+Node.js example:
+
+```javascript
+const result = db.executeGql(
+  `MATCH (p:Person {name: $name})-[r:WORKS_AT]->(c:Company)
+   WHERE r.since >= $minSince AND p.status IN $statuses
+   RETURN id(p) AS personId, p.name AS person, c.name AS company, $payload AS payload`,
+  {
+    name: 'Ada',
+    minSince: 2020,
+    statuses: ['active', 'trial'],
+    payload: { source: 'api', bytes: Buffer.from('trace-id') },
+  }
+);
+```
+
+Rust typed params and options:
+
+```rust
+let params = GqlParams::from([
+    ("name".to_string(), GqlParamValue::String("Ada".to_string())),
+    ("minRank".to_string(), GqlParamValue::Int(2)),
+]);
+
+let options = GqlQueryOptions {
+    include_plan: true,
+    profile: true,
+    ..GqlQueryOptions::default()
+};
+
+let result = db.execute_gql(
+    "MATCH (n:Person {name: $name}) WHERE n.rank >= $minRank RETURN id(n) AS id",
+    &params,
+    &options,
+)?;
+```
+
+#### Explain, Profile, and Stats
+
+`explain_gql` / `explainGql` validates, binds, lowers, and plans the query without
+executing rows.
+
+Explain result fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Columns | `columns` | `columns` | `columns` | Output column names after `RETURN` expansion and aliases. |
+| Target | `target` | `target` | `target` | Current Phase 32 GQL lowering returns `graph_row_query`. |
+| Native plan | `native_plan` | `nativePlan` | `native_plan` | Currently null for the graph-row target. Graph-row plan details are summarized in `projection` and warnings. |
+| Pushed down | `pushed_down` | `pushedDown` | `pushed_down` | Predicates represented in the native target. |
+| Residual | `residual` | `residual` | `residual` | Predicates evaluated after native execution. |
+| Projection | `projection` | `projection` | `projection` | Output/runtime projection needs plus graph-row plan, row-op, order, cursor, cap, and note summaries. |
+| Row ops | `row_ops` | `rowOps` | `row_ops` | `residual_filter`, `sort`, `skip`, `limit`, `projection`. |
+| Caps | `caps` | `caps` | `caps` | Effective cap settings for the query. |
+| Warnings | `warnings` | `warnings` | `warnings` | GQL/native planning warnings. |
+
+`includePlan` / `include_plan` attaches that same explain payload to executed results:
+
+```javascript
+const result = db.executeGql(
+  `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
+   RETURN p.name AS person, r.since AS since, c.name AS company
+   ORDER BY r.since DESC
+   LIMIT 10`,
+  null,
+  { includePlan: true, profile: true }
+);
+
+console.log(result.plan.target);       // 'graph_row_query'
+console.log(result.plan.rowOps);       // e.g. ['sort', 'limit', 'projection']
+console.log(result.stats.elapsedUs);   // populated when profile is true
+```
+
+Stats fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Rows returned | `rows_returned` | `rowsReturned` | `rows_returned` | Final result row count. |
+| Native rows matched | `rows_matched` | `rowsMatched` | `rows_matched` | Rows produced/observed by graph-row execution before final projection. |
+| Rows after filter | `rows_after_filter` | `rowsAfterFilter` | `rows_after_filter` | Rows remaining after residual filtering before final row ops. |
+| Intermediate bindings | `intermediate_bindings` | `intermediateBindings` | `intermediate_bindings` | Maximum/representative intermediate row count held by execution. |
+| Work counter | `db_hits` | `dbHits` | `db_hits` | Best-effort profile work units, not a storage IO contract. |
+| Elapsed time | `elapsed_us` | `elapsedUs` | `elapsed_us` | Populated only when profile is true. |
+| Truncated | `truncated` | `truncated` | `truncated` | True when a safety cap or native cap truncated execution. |
+| Warnings | `warnings` | `warnings` | `warnings` | Cap, ordering, full-scan, and planning warnings. |
+
+Full scans are rejected unless explicitly allowed:
+
+```javascript
+db.executeGql('MATCH (n) RETURN id(n) AS id');
+// throws: full scan / allowFullScan required
+
+const broad = db.executeGql(
+  'MATCH (n) RETURN id(n) AS id LIMIT 100',
+  null,
+  { allowFullScan: true }
+);
+```
+
+#### Examples
+
+Basic node rows:
+
+```javascript
+const people = db.executeGql(
+  'MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10'
+);
+```
+
+Parameterized property lookup with a property map:
+
+```javascript
+const person = db.executeGql(
+  'MATCH (n:Person {name: $name}) RETURN id(n) AS id, n.name AS name',
+  { name: 'Ada' }
+);
+```
+
+One-hop relationship pattern:
+
+```javascript
+const jobs = db.executeGql(
+  `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
+   RETURN p.name AS person, r.since AS since, c.name AS company
+   ORDER BY r.since DESC
+   LIMIT 20`
+);
+```
+
+Residual `WHERE` with params:
+
+```javascript
+const filtered = db.executeGql(
+  `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
+   WHERE p.status = $status AND r.since >= $minSince
+   RETURN p.name AS person, r.role AS role, c.name AS company`,
+  { status: 'active', minSince: 2020 }
+);
+```
+
+Direct edge query:
+
+```javascript
+const likes = db.executeGql(
+  'MATCH ()-[r:LIKES]->() RETURN id(r) AS id, type(r) AS label, r.weight AS weight LIMIT 25'
+);
+```
+
+Multi-hop fixed pattern:
+
+```javascript
+const paths = db.executeGql(
+  `MATCH (a:Person)-[r:KNOWS]->(b:Person)-[s:WORKS_AT]->(c:Company)
+   RETURN a.name AS source, b.name AS friend, c.name AS company
+   LIMIT 50`
+);
+```
+
+Optional match:
+
+```javascript
+const rows = db.executeGql(
+  `MATCH (p:Person)
+   OPTIONAL MATCH (p)-[:REPORTS_TO]->(m:Person)
+   RETURN p.name AS person, m.name AS manager
+   ORDER BY p.name`,
+  null,
+  { allowFullScan: true }
+);
+```
+
+Bounded path value and path functions:
+
+```javascript
+const rows = db.executeGql(
+  `MATCH p = (a:Person)-[:KNOWS*1..3]->(b:Person)
+   WHERE a.name = $name
+   RETURN p, length(p) AS hops, node_ids(p) AS nodeIds, edge_ids(p) AS edgeIds
+   ORDER BY hops ASC
+   LIMIT 10`,
+  { name: 'Ada' }
+);
+
+console.log(rows.rows[0].p.nodeIds);
+console.log(rows.rows[0].p.edgeIds);
+```
+
+Continuation cursor:
+
+```javascript
+const first = db.executeGql(
+  'MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10'
+);
+
+const second = db.executeGql(
+  'MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10',
+  null,
+  { cursor: first.nextCursor }
+);
+```
+
+`RETURN *` expands user-visible bound aliases in deterministic binding order:
+
+```javascript
+const bindings = db.executeGql(
+  'MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN * LIMIT 10'
+);
+```
+
+Element projection returns node and edge objects:
+
+```javascript
+const rows = db.executeGql(
+  'MATCH (p:Person)-[r:WORKS_AT]->(c:Company) RETURN p, r, c LIMIT 5'
+);
+
+console.log(rows.rows[0].p.labels);
+console.log(rows.rows[0].r.from, rows.rows[0].r.to);
+```
+
+`SKIP` / `OFFSET` and `LIMIT`:
+
+```javascript
+const page = db.executeGql(
+  'MATCH (n:Person) RETURN n.name AS name ORDER BY n.rank DESC SKIP 20 LIMIT 10'
+);
+```
+
+Python result shape:
+
+```python
+result = db.execute_gql(
+    "MATCH (n:Person) RETURN n.name AS name, n.rank AS rank ORDER BY n.rank",
+    compact_rows=True,
+)
+
+print(result["columns"])  # ["name", "rank"]
+print(result["rows"])     # [["Ben", 1], ["Ada", 2]]
+print(result["stats"]["rows_returned"])
+```
+
+Explain without execution:
+
+```javascript
+const explain = db.explainGql(
+  `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
+   WHERE p.status = $status
+   RETURN p.name AS person, c.name AS company`,
+  { status: 'active' }
+);
+
+console.log(explain.target);
+console.log(explain.nativePlan?.warnings);
+```
+
+Async connector calls:
+
+```javascript
+const result = await db.executeGqlAsync(
+  'MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10'
+);
+```
+
+```python
+result = await async_db.execute_gql(
+    "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10"
+)
+```
+
+#### Not Yet Supported In GQL Beta
+
+GQL Beta intentionally rejects features outside the supported read-only subset:
+
+- Full ISO GQL
+- Full Cypher compatibility
+- Writes and mutations: `CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `FOREACH`, `LOAD`
+- Schema operations: `CREATE INDEX`, constraints, `DROP`, `ALTER`, `SHOW`
+- Aggregation
+- `DISTINCT`
+- `WITH`
+- `UNION`
+- `CALL`
+- Subqueries
+- Procedures
+- Dynamic labels and dynamic relationship types
+- Unbounded variable-length paths
+- Shortest path pattern/function syntax
+- Advanced path functions beyond `length`, `start_node`, `end_node`, `nodes`, `relationships`, `node_ids`, and `edge_ids`
+- Multi-hop relationship-list aliases separate from path aliases
+- Path assignment over multiple relationship segments
+- Pattern-local predicates inside node or relationship patterns
+- Plan cache
+- Native multi-label edge OR in direct edge lowering
+- List/map and non-finite-float `ORDER BY` domains
+
+Use native query APIs when you need request-object construction, strongly bounded pagination by ID,
+or APIs outside the GQL Beta subset. Use GQL Beta when a read-only graph query string is the
+clearest way to express the read.
 
 ---
 
@@ -2935,8 +3628,10 @@ object shape.
 | Updated-at range | `{ updatedAt: { gte: ms } }` | `{"updated_at": {"gte": ms}}` | Built-in node `updated_at` timestamp range |
 
 Property values use OverGraph's normal `PropValue` conversion rules. There is no query-only
-coercion. For example, string `"1"` does not match integer `1`, and integer `1` does not
-automatically match float `1.0`.
+coercion for non-numeric values. For example, string `"1"` does not match integer `1`.
+Finite scalar numeric values do use semantic numeric equality and ordering, so integer `1`,
+unsigned integer `1`, and float `1.0` compare equal while range comparisons can mix numeric
+bound variants.
 
 `in` is equivalent to equality OR for matching semantics. When a ready equality index exists, the
 query engine may evaluate it as an indexed union, but final visible-record verification still decides
@@ -3040,49 +3735,123 @@ final verification for correctness.
 
 ---
 
-#### GraphPatternQuery
+#### GraphRowQuery
 
-Pattern request fields:
+`GraphRowQuery` is the public structured row-query request. It is exported by Rust and accepted by
+the Node.js and Python connectors as host-language objects/dicts.
+
+Top-level request fields:
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
-| nodes | `Vec<NodePattern>` | `nodes` | `nodes` | Node aliases and constraints. At least one required. |
-| edges | `Vec<EdgePattern>` | `edges` | `edges` | Edge constraints between node aliases. At least one required for pattern v1. |
-| at_epoch | `Option<i64>` | `atEpoch?: number` | `at_epoch?: int` | Optional temporal edge visibility timestamp. |
-| limit | `usize` | `limit: number` | `limit: int` | Required positive match limit. |
-| order | `PatternOrder` | implicit | implicit | `AnchorThenAliasesAsc` in v1. |
+| nodes | `nodes: Vec<GraphNodePattern>` | `nodes?: GraphRowNodePattern[]` | `"nodes": list[dict]` | Node aliases and node constraints. |
+| pieces | `pieces: Vec<GraphPatternPiece>` | `pieces?: GraphRowPatternPiece[]` | `"pieces": list[dict]` | Fixed edge pieces, optional groups, and bounded variable-length path pieces. |
+| where | `where_: Option<GraphExpr>` | `where?: GraphExpr` | `"where": GraphExpr` | Row-level residual predicate with null semantics. |
+| returns | `return_items: Option<Vec<GraphReturnItem>>` | `return?: GraphReturnItem[]` | `"return": list[dict]` | Output columns. Omitted means `RETURN *` over visible aliases. |
+| order | `order_by: Vec<GraphOrderItem>` | `orderBy?: GraphOrderItem[]` | `"order_by": list[dict]` | Final-row ordering. Omitted uses stable logical row-key order. |
+| page | `page: GraphPageRequest` | `skip`, `limit`, `cursor` | `skip`, `limit`, `cursor` | Final-row skip/limit/cursor. Native graph-row `limit` must be greater than zero. |
+| at epoch | `at_epoch: Option<i64>` | `atEpoch?: number` | `at_epoch?: int` | Temporal edge visibility timestamp. Omitted resolves an effective epoch for the operation. |
+| params | `params: BTreeMap<String, GraphParamValue>` | `params?: Record<string, GraphParamValue>` | `"params": dict` | Named values referenced by `GraphExpr::Param`. |
+| output | `output: GraphOutputOptions` | `output?: GraphOutputOptions` | `"output": dict` | Output mode, compact rows, and vector inclusion. |
+| options | `options: GraphQueryOptions` | `options?: GraphQueryOptions` | `"options": dict` | Validation, safety caps, plan/profile options. |
 
 Node pattern fields:
 
-| Field | Description |
-|-------|-------------|
-| alias | Non-empty unique node alias. |
-| label_filter | `NodeLabelFilter` with explicit `Any` / `All` semantics. A one-label `All` filter uses the single-label fast path. |
-| ids | Explicit node IDs. |
-| keys | Label-scoped keys. Requires exactly one resolved node label from `label_filter`. |
-| filter | Recursive node filter tree. Omit/null/None means no node filter. |
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| alias | `alias` | `alias` | `alias` | Unique node alias. |
+| label filter | `label_filter` | `labelFilter` | `label_filter` | Optional `NodeLabelFilter` with `Any` / `All` semantics. |
+| IDs | `ids` | `ids` | `ids` | Explicit node ID candidates. |
+| Keys | `keys` | `keys` | `keys` | Label-scoped key candidates. Node.js accepts strings or `{ label, key }`; Python accepts strings or dicts. Node.js string shorthand requires a single-label `labelFilter`; Python string shorthand requires `label_filter` with exactly one `all`-mode label. Use explicit label/key objects or dicts otherwise. |
+| filter | `filter` | `filter` | `filter` | Recursive node filter tree. |
 
-Edge pattern fields:
+Pattern pieces:
 
-| Field | Description |
-|-------|-------------|
-| alias | Optional unique edge alias. Unnamed edges are constraints only. |
-| from_alias / fromAlias | Source alias in the pattern direction. |
-| to_alias / toAlias | Target alias in the pattern direction. |
-| direction | `outgoing`, `incoming`, or `both`, relative to `from_alias`. |
-| label_filter / labelFilter | Optional edge-label list. |
-| filter | Canonical recursive edge filter tree. |
+| Piece | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Fixed edge | `GraphPatternPiece::Edge(GraphEdgePattern)` | `{ kind: 'edge', ... }` | `{"kind": "edge", ...}` | Binds or constrains one edge between two node aliases. |
+| Optional group | `GraphPatternPiece::Optional(GraphOptionalGroup)` | `{ kind: 'optional', pieces, where? }` | `{"kind": "optional", "pieces": [...], "where": ...}` | Left-outer optional group. On miss, aliases introduced by the group are null. |
+| Variable-length path | `GraphPatternPiece::VariableLength(GraphVariableLengthPattern)` | `{ kind: 'variableLength', ... }` | `{"kind": "variable_length", ...}` | Bounded path with `minHops`/`maxHops` or `min_hops`/`max_hops`. |
 
-Pattern validation:
+Fixed edge and variable-length pieces share these fields:
 
-- Aliases must be unique and non-empty.
-- Every edge endpoint must reference a declared node alias.
-- Pattern v1 must be one connected component with at least one edge.
-- Distinct node aliases bind distinct node IDs.
-- Reusing the same alias in multiple edges means the same node binding.
-- Unbounded initial nodes without a legal bounded universe are rejected. A label-less verify-only
-  target filter is legal only after bounded edge expansion has produced target IDs.
-- Edge `filter` is canonical.
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| edge alias | `alias` / `edge_alias` | `alias` / `edgeAlias` | `alias` / `edge_alias` | Fixed edge alias, or one-hop VLP edge alias. Multi-hop VLP edge aliases are rejected. |
+| path alias | `path_alias` | `pathAlias` | `path_alias` | Optional path alias for variable-length pieces. |
+| endpoints | `from_alias`, `to_alias` | `fromAlias`, `toAlias` | `from`/`from_alias`, `to`/`to_alias` | Node aliases at each end of the piece. |
+| direction | `direction` | `direction` | `direction` | `outgoing`, `incoming`, or `both`; defaults to outgoing in connectors. |
+| labels | `label_filter` | `labelFilter` | `labels` or `label_filter` | Edge-label list. |
+| filter | `filter` | `filter` | `filter` | Recursive edge filter tree. |
+| hops | `min_hops`, `max_hops` | `minHops`, `maxHops` | `min_hops`, `max_hops` | Required for variable-length pieces. Must be finite and within caps. |
+
+Graph expressions:
+
+| Expression | Rust | Node.js | Python |
+|------------|------|---------|--------|
+| Literal null/bool/number/string | `GraphExpr::Null`, etc. | `null`, booleans, numbers, strings | `None`, booleans, numbers, strings |
+| Bytes | `GraphExpr::Bytes` | `{ bytes: number[] }` | `{"bytes": [0, 1]}` or Python `bytes` for params |
+| List | `GraphExpr::List` | `{ list: [...] }` | `{"list": [...]}` |
+| Map | `GraphExpr::Map` | `{ map: { key: expr } }` | `{"map": {"key": expr}}` |
+| Param | `GraphExpr::Param("name")` | `{ param: 'name' }` | `{"param": "name"}` |
+| Binding | `GraphExpr::Binding("alias")` | `{ binding: 'alias' }` | `{"binding": "alias"}` |
+| Property | `GraphExpr::Property { alias, key }` | `{ property: { alias, key } }` | `{"property": {"alias": alias, "key": key}}` |
+| Node field | `GraphExpr::NodeField` | `{ nodeField: { alias, field } }` | `{"node_field": {"alias": alias, "field": field}}` |
+| Edge field | `GraphExpr::EdgeField` | `{ edgeField: { alias, field } }` | `{"edge_field": {"alias": alias, "field": field}}` |
+| Path field | `GraphExpr::PathField` | `{ pathField: { alias, field } }` | `{"path_field": {"alias": alias, "field": field}}` |
+| Function | `GraphExpr::Function` | `{ fn: 'id', args: [...] }` | `{"fn": "id", "args": [...]}` |
+| Binary op | `GraphExpr::Binary` | `{ op: '=', left, right }` | `{"op": "=", "left": ..., "right": ...}` |
+| Not | `GraphExpr::Unary` | `{ op: 'not', expr }` | `{"op": "not", "expr": ...}` |
+| Null tests | `GraphExpr::IsNull` / `IsNotNull` | `{ isNull: expr }` / `{ isNotNull: expr }` | `{"is_null": expr}` / `{"is_not_null": expr}` |
+
+Supported node fields are `id`, `labels`, `key`, `weight`, `created_at`/`createdAt`, and
+`updated_at`/`updatedAt`. Supported edge fields are `id`, `from`, `to`, `label`/`type`, `weight`,
+`created_at`/`createdAt`, `updated_at`/`updatedAt`, `valid_from`/`validFrom`, and
+`valid_to`/`validTo`. Supported path fields are `node_ids`/`nodeIds`, `edge_ids`/`edgeIds`, and
+`length`.
+
+Supported native function names are `id`, `labels`, `type`, `length`, `nodes`, and
+`relationships`; Rust names the path endpoint functions `start_node` and `end_node`. Node.js accepts
+`startNode`/`endNode` and also accepts snake_case `start_node`/`end_node`. Python accepts
+`start_node`/`end_node`.
+
+Rust uses `GraphExpr::PathField` for `node_ids` and `edge_ids`. Node.js accepts `nodeIds`,
+`node_ids`, `edgeIds`, and `edge_ids` in the `fn` tag as connector conveniences. Python accepts
+`node_ids` and `edge_ids` in the `fn` tag. These conveniences parse into path-field expressions and
+require a direct path binding argument.
+
+Binary ops are `or`, `and`, equality (`=`, `==`, `eq`), inequality (`<>`, `!=`, `neq`), comparisons
+(`<`, `<=`, `>`, `>=`), and `in`. Node.js also accepts comparison aliases `lt`, `lte`, `gt`, and
+`gte`.
+
+Output options:
+
+| Field | Rust | Node.js | Python | Default | Description |
+|-------|------|---------|--------|---------|-------------|
+| mode | `GraphOutputMode` | `mode: 'ids' \| 'elements' \| 'projected'` | `"mode": "ids" \| "elements" \| "projected"` | `ids` | Default projection mode for `auto` return items. |
+| compact rows | `compact_rows` | `compactRows` | `compact_rows` | `false` | Connector rows become arrays instead of objects. |
+| include vectors | `include_vectors` | `includeVectors` | `include_vectors` | `false` | Include dense/sparse vectors in full hydrated node values. |
+
+Graph-row caps:
+
+| Field | Rust | Node.js | Python | Default |
+|-------|------|---------|--------|---------|
+| allow full scan | `allow_full_scan` | `allowFullScan` | `allow_full_scan` | `false` |
+| max intermediate bindings | `max_intermediate_bindings` | `maxIntermediateBindings` | `max_intermediate_bindings` | `65536` |
+| max frontier | `max_frontier` | `maxFrontier` | `max_frontier` | `65536` |
+| max path hops | `max_path_hops` | `maxPathHops` | `max_path_hops` | `16` |
+| max paths per start | `max_paths_per_start` | `maxPathsPerStart` | `max_paths_per_start` | `4096` |
+| max page limit | `max_page_limit` | `maxPageLimit` | `max_page_limit` | `10000` |
+| max order materialization | `max_order_materialization` | `maxOrderMaterialization` | `max_order_materialization` | `65536` |
+| max cursor bytes | `max_cursor_bytes` | `maxCursorBytes` | `max_cursor_bytes` | `16384` |
+| max query bytes | `max_query_bytes` | `maxQueryBytes` | `max_query_bytes` | `1048576` |
+| include plan | `include_plan` | `includePlan` | `include_plan` | `false` |
+| profile | `profile` | `profile` | `profile` | `false` |
+
+Native graph-row cursors are final-row cursors over `(order atoms, logical row key)`. They validate
+the normalized query fingerprint and are not physical frontier cursors or pinned storage snapshots.
+When `at_epoch` is omitted, the engine resolves an effective epoch for the first page and stores it
+in the cursor.
 
 ---
 
@@ -3092,7 +3861,7 @@ Explain APIs return:
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
-| kind | `kind` | `kind` | `kind` | `node_query`, `edge_query`, or `pattern_query`. |
+| kind | `kind` | `kind` | `kind` | `node_query` or `edge_query`. Graph-row explain uses `GraphRowExplain`, not `QueryPlan`. |
 | root | `root` | `root` | `root` | Recursive plan node. |
 | estimated candidates | `estimated_candidates` | `estimatedCandidates` | `estimated_candidates` | Optional candidate count estimate. |
 | warnings | `warnings` | `warnings` | `warnings` | Stable lower_snake warning strings. |
@@ -3125,9 +3894,7 @@ Plan node kinds include:
 | `union` | Sorted union of bounded OR/IN candidate sources. |
 | `verify_node_filter` | Final visible-record verification of the full node filter. |
 | `verify_edge_filter` | Final visible-edge metadata/property verification. |
-| `adjacency_expansion` | Bounded graph-pattern edge expansion. |
-| `pattern_expand` | Pattern execution expansion step. |
-| `pattern_edge_anchor` | Pattern execution started from a planned edge source. |
+| `adjacency_expansion` | Bounded adjacency expansion used by planner-backed edge candidates. |
 | `verify_edge_predicates` | Edge post-filter verification. |
 | `fallback_node_label_scan` | Label-scoped scan universe. |
 | `fallback_full_node_scan` | Explicit full node scan universe. |
@@ -3142,7 +3909,6 @@ Warning strings include:
 | `using_fallback_scan` | Query used a scan universe. |
 | `full_scan_requires_opt_in` | Query would need a full scan but the caller did not opt in. |
 | `full_scan_explicitly_allowed` | Full scan ran because caller opted in. |
-| `unbounded_pattern_rejected` | Pattern was not safely bounded. |
 | `edge_property_post_filter` | Edge properties were checked after bounded expansion. |
 | `index_skipped_as_broad` | Ready index existed but was skipped as too broad. |
 | `candidate_cap_exceeded` | Candidate cap prevented materializing a source. |
@@ -3400,7 +4166,7 @@ let page = db.find_nodes_range_paged(
     "User",
     "score",
     Some(&PropertyRangeBound::Included(PropValue::Int(10))),
-    Some(&PropertyRangeBound::Excluded(PropValue::Int(20))),
+    Some(&PropertyRangeBound::Excluded(PropValue::Float(20.0))),
     &PropertyRangePageRequest {
         limit: Some(50),
         after: None,
@@ -3414,7 +4180,7 @@ const page = db.findNodesRangePaged(
   'User',
   'score',
   { value: 10, inclusive: true, domain: 'int' },
-  { value: 20, inclusive: false, domain: 'int' },
+  { value: 20, inclusive: false, domain: 'float' },
   { limit: 50 },
 );
 ```
@@ -3425,7 +4191,7 @@ page = db.find_nodes_range_paged(
     "User",
     "score",
     PropertyRangeBound(10, domain="int"),
-    PropertyRangeBound(20, inclusive=False, domain="int"),
+    PropertyRangeBound(20.0, inclusive=False, domain="float"),
     limit=50,
 )
 ```
@@ -3450,10 +4216,11 @@ page = db.find_nodes_range_paged(
 
 #### Behavior
 
-- At least one bound is required.
-- Numeric domains are exact. `int`, `uint`, and `float` are separate query domains.
-- If both bounds are present, they must use the same domain.
-- When resuming with `after`, keep the same `label`, `prop_key`, bounds, and domain.
+- At least one finite numeric bound is required.
+- Bounds and cursors may mix signed integer, unsigned integer, and finite float values.
+- Empty finite numeric intervals return an empty page.
+- Non-finite floats, non-numeric values, arrays, and maps are invalid bounds or cursors.
+- When resuming with `after`, keep the same `label`, `prop_key`, and bounds.
 - Invalid bound or cursor combinations return an error.
 
 ---
@@ -5137,7 +5904,7 @@ const node = await db.getNodeAsync(42);
 
 Async methods run on the libuv thread pool. Write operations acquire an exclusive lock; read operations acquire a shared lock (allowing concurrent reads).
 
-**Available async methods:** `closeAsync`, `ensureNodeLabelAsync`, `ensureEdgeLabelAsync`, `getNodeLabelIdAsync`, `getEdgeLabelIdAsync`, `getNodeLabelAsync`, `getEdgeLabelAsync`, `listNodeLabelsAsync`, `listEdgeLabelsAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `addNodeLabelAsync`, `removeNodeLabelAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `batchUpsertNodesBinaryAsync`, `batchUpsertEdgesBinaryAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `beginWriteTxnAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `ensureNodePropertyIndexAsync`, `dropNodePropertyIndexAsync`, `listNodePropertyIndexesAsync`, `ensureEdgePropertyIndexAsync`, `dropEdgePropertyIndexAsync`, `listEdgePropertyIndexesAsync`, `findNodesRangeAsync`, `findNodesRangePagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByLabelsAsync`, `edgesByLabelAsync`, `getNodesByLabelsAsync`, `getEdgesByLabelAsync`, `countNodesByLabelsAsync`, `countEdgesByLabelAsync`, `nodesByLabelsPagedAsync`, `edgesByLabelPagedAsync`, `getNodesByLabelsPagedAsync`, `getEdgesByLabelPagedAsync`, `queryNodeIdsAsync`, `queryNodesAsync`, `queryEdgeIdsAsync`, `queryEdgesAsync`, `queryPatternAsync`, `explainNodeQueryAsync`, `explainEdgeQueryAsync`, `explainPatternQueryAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
+**Available async methods:** `closeAsync`, `ensureNodeLabelAsync`, `ensureEdgeLabelAsync`, `getNodeLabelIdAsync`, `getEdgeLabelIdAsync`, `getNodeLabelAsync`, `getEdgeLabelAsync`, `listNodeLabelsAsync`, `listEdgeLabelsAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `addNodeLabelAsync`, `removeNodeLabelAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `batchUpsertNodesBinaryAsync`, `batchUpsertEdgesBinaryAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `beginWriteTxnAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `ensureNodePropertyIndexAsync`, `dropNodePropertyIndexAsync`, `listNodePropertyIndexesAsync`, `ensureEdgePropertyIndexAsync`, `dropEdgePropertyIndexAsync`, `listEdgePropertyIndexesAsync`, `findNodesRangeAsync`, `findNodesRangePagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByLabelsAsync`, `edgesByLabelAsync`, `getNodesByLabelsAsync`, `getEdgesByLabelAsync`, `countNodesByLabelsAsync`, `countEdgesByLabelAsync`, `nodesByLabelsPagedAsync`, `edgesByLabelPagedAsync`, `getNodesByLabelsPagedAsync`, `getEdgesByLabelPagedAsync`, `queryNodeIdsAsync`, `queryNodesAsync`, `queryEdgeIdsAsync`, `queryEdgesAsync`, `queryGraphRowsAsync`, `explainNodeQueryAsync`, `explainEdgeQueryAsync`, `explainGraphRowsAsync`, `executeGqlAsync`, `explainGqlAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
 
 `WriteTxn` handles expose async counterparts for the full transaction surface: `upsertNodeAsync`, `upsertNodeAsAsync`, `upsertEdgeAsync`, `upsertEdgeAsAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `stageAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `commitAsync`, and `rollbackAsync`. Async transaction operations on one handle execute in call order.
 
@@ -5221,8 +5988,10 @@ asyncio.run(main())
 | | `query_edge_ids` | Edge query returning IDs |
 | | `query_edges` | Edge query returning hydrated edges |
 | | `explain_edge_query` | Explain an edge query plan |
-| | `query_pattern` | Bounded graph pattern query |
-| | `explain_pattern_query` | Explain a graph pattern plan |
+| | `query_graph_rows` | Structured graph-row query |
+| | `explain_graph_rows` | Explain a graph-row query |
+| | `execute_gql` | GQL Beta read-only query-string rows |
+| | `explain_gql` | Explain a GQL Beta query |
 | **Pagination** | `*_paged` | Paginated variants |
 | **Traversal** | `neighbors` | Immediate neighbors |
 | | `neighbors_paged` | Paginated neighbors |

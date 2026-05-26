@@ -1,9 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, EdgeFilterExpr, EdgeInput, EdgePattern, EdgeQuery,
-    GraphPatternQuery, LabelMatchMode, NodeFilterExpr, NodeInput, NodeLabelFilter, NodePattern,
-    NodeQuery, PageRequest, PatternOrder, PropValue, PropertyRangeBound, SecondaryIndexKind,
-    SecondaryIndexRangeDomain, SecondaryIndexState,
+    DatabaseEngine, DbOptions, Direction, EdgeFilterExpr, EdgeInput, EdgeQuery, GqlParamValue,
+    GqlParams, GqlQueryOptions, GraphBinaryOp, GraphEdgePattern, GraphExpr, GraphNodeField,
+    GraphNodePattern, GraphOrderDirection, GraphOrderItem, GraphOutputOptions, GraphPageRequest,
+    GraphParamValue, GraphPatternPiece, GraphQueryOptions, GraphReturnItem, GraphReturnProjection,
+    LabelMatchMode, NodeFilterExpr, NodeInput, NodeLabelFilter, NodeQuery, PageRequest, PropValue,
+    PropertyRangeBound, SecondaryIndexKind, SecondaryIndexState,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -200,13 +202,7 @@ fn ensure_query_indexes(engine: &mut DatabaseEngine) {
     wait_for_property_index_state(engine, tenant.index_id, SecondaryIndexState::Ready);
 
     let score = engine
-        .ensure_node_property_index(
-            &label,
-            "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
-        )
+        .ensure_node_property_index(&label, "score", SecondaryIndexKind::Range)
         .unwrap();
     wait_for_property_index_state(engine, score.index_id, SecondaryIndexState::Ready);
 }
@@ -273,6 +269,21 @@ fn two_equality_query(limit: Option<usize>) -> NodeQuery {
                 value: PropValue::String("gold".to_string()),
             },
         ],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn status_active_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("active".to_string()),
+        }],
         page: PageRequest { limit, after: None },
         ..Default::default()
     }
@@ -1030,13 +1041,7 @@ fn build_edge_query_indexed_engine() -> (tempfile::TempDir, DatabaseEngine, u64,
         .unwrap();
     wait_for_edge_property_index_state(&engine, role.index_id, SecondaryIndexState::Ready);
     let score = engine
-        .ensure_edge_property_index(
-            &label,
-            "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
-        )
+        .ensure_edge_property_index(&label, "score", SecondaryIndexKind::Range)
         .unwrap();
     wait_for_edge_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
     (dir, engine, source_id, edge_ids, valid_epoch)
@@ -1052,85 +1057,6 @@ fn edge_query_with_filter(source_id: u64, filter: Option<EdgeFilterExpr>) -> Edg
             after: None,
         },
         ..Default::default()
-    }
-}
-
-fn edge_pattern_filter_query(source_id: u64, filter: Option<EdgeFilterExpr>) -> GraphPatternQuery {
-    GraphPatternQuery {
-        nodes: vec![
-            NodePattern {
-                alias: "source".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(1)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: vec![source_id],
-                keys: Vec::new(),
-                filter: None,
-            },
-            NodePattern {
-                alias: "target".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(2)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: None,
-            },
-        ],
-        edges: vec![EdgePattern {
-            alias: Some("edge".to_string()),
-            from_alias: "source".to_string(),
-            to_alias: "target".to_string(),
-            direction: Direction::Outgoing,
-            label_filter: vec!["BenchEdge10".to_string()],
-            filter,
-        }],
-        at_epoch: None,
-        limit: QUERY_LIMIT,
-        order: PatternOrder::AnchorThenAliasesAsc,
-    }
-}
-
-fn edge_property_anchor_pattern_query() -> GraphPatternQuery {
-    GraphPatternQuery {
-        nodes: vec![
-            NodePattern {
-                alias: "source".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(1)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: None,
-            },
-            NodePattern {
-                alias: "target".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(2)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: None,
-            },
-        ],
-        edges: vec![EdgePattern {
-            alias: Some("edge".to_string()),
-            from_alias: "source".to_string(),
-            to_alias: "target".to_string(),
-            direction: Direction::Outgoing,
-            label_filter: vec!["BenchEdge10".to_string()],
-            filter: Some(EdgeFilterExpr::PropertyEquals {
-                key: "role".to_string(),
-                value: PropValue::String("lead".to_string()),
-            }),
-        }],
-        at_epoch: None,
-        limit: QUERY_LIMIT,
-        order: PatternOrder::AnchorThenAliasesAsc,
     }
 }
 
@@ -1272,36 +1198,6 @@ fn bench_edge_queries(c: &mut Criterion) {
         b.iter(|| black_box(engine.query_edges(black_box(&query)).unwrap()));
     });
 
-    group.bench_function("query_pattern_edge_metadata_filter", |b| {
-        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
-        let query = edge_pattern_filter_query(
-            source_id,
-            Some(EdgeFilterExpr::WeightRange {
-                lower: Some(1.0),
-                upper: None,
-            }),
-        );
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
-    });
-
-    group.bench_function("query_pattern_edge_property_filter", |b| {
-        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
-        let query = edge_pattern_filter_query(
-            source_id,
-            Some(EdgeFilterExpr::PropertyEquals {
-                key: "role".to_string(),
-                value: PropValue::String("lead".to_string()),
-            }),
-        );
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
-    });
-
-    group.bench_function("query_pattern_edge_property_anchor_indexed", |b| {
-        let (_dir, engine, _source_id, _edge_ids, _valid_epoch) = build_edge_query_indexed_engine();
-        let query = edge_property_anchor_pattern_query();
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
-    });
-
     group.finish();
 
     let mut property_group = c.benchmark_group("edge_property_index_queries");
@@ -1394,83 +1290,6 @@ fn build_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
     engine.batch_upsert_edges(edges.clone()).unwrap();
     engine.flush().unwrap();
     (dir, engine, company_ids[0])
-}
-
-fn linear_pattern_query() -> GraphPatternQuery {
-    GraphPatternQuery {
-        nodes: vec![
-            NodePattern {
-                alias: "person".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(1)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: filter_and![NodeFilterExpr::PropertyEquals {
-                    key: "status".to_string(),
-                    value: PropValue::String("active".to_string()),
-                }],
-            },
-            NodePattern {
-                alias: "company".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(2)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: None,
-            },
-        ],
-        edges: vec![EdgePattern {
-            alias: Some("works_at".to_string()),
-            from_alias: "person".to_string(),
-            to_alias: "company".to_string(),
-            direction: Direction::Outgoing,
-            label_filter: vec!["BenchEdge10".to_string()],
-            filter: None,
-        }],
-        at_epoch: None,
-        limit: QUERY_LIMIT,
-        order: PatternOrder::AnchorThenAliasesAsc,
-    }
-}
-
-fn boolean_pattern_anchor_query() -> GraphPatternQuery {
-    let mut query = linear_pattern_query();
-    query.nodes[0].filter = Some(NodeFilterExpr::Or(vec![
-        tenant_eq_filter("t07"),
-        tenant_eq_filter("t11"),
-    ]));
-    query
-}
-
-fn branching_pattern_query(company_id: u64) -> GraphPatternQuery {
-    let mut query = linear_pattern_query();
-    query.nodes.push(NodePattern {
-        alias: "peer".to_string(),
-        label_filter: Some(NodeLabelFilter {
-            labels: vec![bench_node_label(1)],
-            mode: LabelMatchMode::All,
-        }),
-        ids: Vec::new(),
-        keys: Vec::new(),
-        filter: filter_and![NodeFilterExpr::PropertyEquals {
-            key: "tier".to_string(),
-            value: PropValue::String("gold".to_string()),
-        }],
-    });
-    query.edges.push(EdgePattern {
-        alias: None,
-        from_alias: "peer".to_string(),
-        to_alias: "company".to_string(),
-        direction: Direction::Outgoing,
-        label_filter: vec!["BenchEdge10".to_string()],
-        filter: None,
-    });
-    query.nodes[1].ids = vec![company_id];
-    query
 }
 
 fn build_high_fanout_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
@@ -1575,64 +1394,6 @@ fn build_fanout_anchor_choice_engine() -> (tempfile::TempDir, DatabaseEngine) {
     (dir, engine)
 }
 
-fn fanout_anchor_choice_query() -> GraphPatternQuery {
-    GraphPatternQuery {
-        nodes: vec![
-            NodePattern {
-                alias: "small_hub".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(1)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: None,
-            },
-            NodePattern {
-                alias: "larger_anchor".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(2)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: None,
-            },
-            NodePattern {
-                alias: "middle".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(3)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: None,
-            },
-        ],
-        edges: vec![
-            EdgePattern {
-                alias: Some("hub_to_middle".to_string()),
-                from_alias: "small_hub".to_string(),
-                to_alias: "middle".to_string(),
-                direction: Direction::Outgoing,
-                label_filter: vec!["BenchEdge10".to_string()],
-                filter: None,
-            },
-            EdgePattern {
-                alias: Some("middle_to_anchor".to_string()),
-                from_alias: "middle".to_string(),
-                to_alias: "larger_anchor".to_string(),
-                direction: Direction::Outgoing,
-                label_filter: vec!["BenchEdge20".to_string()],
-                filter: None,
-            },
-        ],
-        at_epoch: None,
-        limit: QUERY_LIMIT,
-        order: PatternOrder::AnchorThenAliasesAsc,
-    }
-}
-
 fn build_high_hub_delay_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
     let (dir, engine) = temp_db();
     let root = engine
@@ -1691,64 +1452,6 @@ fn build_high_hub_delay_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
     (dir, engine, root)
 }
 
-fn high_hub_delay_query(root: u64) -> GraphPatternQuery {
-    GraphPatternQuery {
-        nodes: vec![
-            NodePattern {
-                alias: "root".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(1)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: vec![root],
-                keys: Vec::new(),
-                filter: None,
-            },
-            NodePattern {
-                alias: "hub_target".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(2)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: None,
-            },
-            NodePattern {
-                alias: "low_target".to_string(),
-                label_filter: Some(NodeLabelFilter {
-                    labels: vec![bench_node_label(3)],
-                    mode: LabelMatchMode::All,
-                }),
-                ids: Vec::new(),
-                keys: Vec::new(),
-                filter: None,
-            },
-        ],
-        edges: vec![
-            EdgePattern {
-                alias: Some("aaa_hub".to_string()),
-                from_alias: "root".to_string(),
-                to_alias: "hub_target".to_string(),
-                direction: Direction::Outgoing,
-                label_filter: vec!["BenchEdge10".to_string()],
-                filter: None,
-            },
-            EdgePattern {
-                alias: Some("zzz_low".to_string()),
-                from_alias: "root".to_string(),
-                to_alias: "low_target".to_string(),
-                direction: Direction::Outgoing,
-                label_filter: vec!["BenchEdge20".to_string()],
-                filter: None,
-            },
-        ],
-        at_epoch: None,
-        limit: QUERY_LIMIT,
-        order: PatternOrder::AnchorThenAliasesAsc,
-    }
-}
-
 fn build_parallel_edge_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
     let (dir, engine) = temp_db_with_edge_uniqueness(false);
     let source = engine
@@ -1787,10 +1490,95 @@ fn build_parallel_edge_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u
     (dir, engine, source)
 }
 
-fn unnamed_edge_constraint_query(source_id: u64) -> GraphPatternQuery {
-    GraphPatternQuery {
+const GRAPH_ROW_BENCH_EDGES: usize = 1_000;
+
+fn build_graph_row_optional_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
+    let (dir, engine) = temp_db();
+    let source = engine
+        .batch_upsert_nodes(vec![NodeInput {
+            labels: vec![bench_node_label(1)],
+            key: "graph-row-source".to_string(),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        }])
+        .unwrap()[0];
+    let targets: Vec<NodeInput> = (0..GRAPH_ROW_BENCH_EDGES)
+        .map(|index| NodeInput {
+            labels: vec![bench_node_label(2)],
+            key: format!("graph-row-target-{index:04}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect();
+    let target_ids = engine.batch_upsert_nodes(targets.clone()).unwrap();
+    let work_edges: Vec<EdgeInput> = target_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &target)| {
+            let mut props = BTreeMap::new();
+            props.insert(
+                "role".to_string(),
+                PropValue::String(if index % 10 == 0 { "lead" } else { "member" }.to_string()),
+            );
+            props.insert("score".to_string(), PropValue::Int((index % 100) as i64));
+            EdgeInput {
+                from: source,
+                to: target,
+                label: "BenchEdge10".to_string(),
+                props,
+                weight: if index % 2 == 0 { 2.0 } else { 0.5 },
+                valid_from: None,
+                valid_to: None,
+            }
+        })
+        .collect();
+    engine.batch_upsert_edges(work_edges).unwrap();
+    let docs: Vec<NodeInput> = (0..GRAPH_ROW_BENCH_EDGES)
+        .step_by(8)
+        .map(|index| NodeInput {
+            labels: vec![bench_node_label(3)],
+            key: format!("graph-row-doc-{index:04}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect();
+    let doc_ids = engine.batch_upsert_nodes(docs.clone()).unwrap();
+    let mention_edges: Vec<EdgeInput> = doc_ids
+        .iter()
+        .enumerate()
+        .map(|(doc_index, &doc_id)| EdgeInput {
+            from: target_ids[doc_index * 8],
+            to: doc_id,
+            label: "BenchEdge20".to_string(),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        })
+        .collect();
+    engine.batch_upsert_edges(mention_edges).unwrap();
+    engine.flush().unwrap();
+    (dir, engine, source)
+}
+
+fn graph_row_return_binding(alias: &str) -> GraphReturnItem {
+    GraphReturnItem {
+        expr: GraphExpr::Binding(alias.to_string()),
+        alias: Some(alias.to_string()),
+        projection: GraphReturnProjection::IdOnly,
+    }
+}
+
+fn graph_row_fixed_query(source_id: u64, limit: usize) -> overgraph::GraphRowQuery {
+    overgraph::GraphRowQuery {
         nodes: vec![
-            NodePattern {
+            GraphNodePattern {
                 alias: "source".to_string(),
                 label_filter: Some(NodeLabelFilter {
                     labels: vec![bench_node_label(1)],
@@ -1800,7 +1588,7 @@ fn unnamed_edge_constraint_query(source_id: u64) -> GraphPatternQuery {
                 keys: Vec::new(),
                 filter: None,
             },
-            NodePattern {
+            GraphNodePattern {
                 alias: "target".to_string(),
                 label_filter: Some(NodeLabelFilter {
                     labels: vec![bench_node_label(2)],
@@ -1811,64 +1599,343 @@ fn unnamed_edge_constraint_query(source_id: u64) -> GraphPatternQuery {
                 filter: None,
             },
         ],
-        edges: vec![EdgePattern {
-            alias: None,
+        pieces: vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
             from_alias: "source".to_string(),
             to_alias: "target".to_string(),
             direction: Direction::Outgoing,
             label_filter: vec!["BenchEdge10".to_string()],
-            filter: None,
-        }],
+            filter: Some(EdgeFilterExpr::PropertyEquals {
+                key: "role".to_string(),
+                value: PropValue::String("lead".to_string()),
+            }),
+        })],
+        where_: Some(GraphExpr::Binary {
+            left: Box::new(GraphExpr::Property {
+                alias: "edge".to_string(),
+                key: "role".to_string(),
+            }),
+            op: GraphBinaryOp::Eq,
+            right: Box::new(GraphExpr::Param("role".to_string())),
+        }),
+        return_items: Some(vec![
+            graph_row_return_binding("source"),
+            graph_row_return_binding("edge"),
+            graph_row_return_binding("target"),
+        ]),
+        order_by: graph_row_order_by_score_then_target(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit,
+            cursor: None,
+        },
         at_epoch: None,
-        limit: QUERY_LIMIT,
-        order: PatternOrder::AnchorThenAliasesAsc,
+        params: BTreeMap::from([(
+            "role".to_string(),
+            GraphParamValue::String("lead".to_string()),
+        )]),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions::default(),
     }
 }
 
-fn bench_pattern_queries(c: &mut Criterion) {
-    let mut group = c.benchmark_group("query_pattern_planner");
+fn graph_row_optional_query(source_id: u64, limit: usize) -> overgraph::GraphRowQuery {
+    let mut query = graph_row_fixed_query(source_id, limit);
+    query.nodes.push(GraphNodePattern {
+        alias: "doc".to_string(),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(3)],
+            mode: LabelMatchMode::All,
+        }),
+        ids: Vec::new(),
+        keys: Vec::new(),
+        filter: None,
+    });
+    query
+        .pieces
+        .push(GraphPatternPiece::Optional(overgraph::GraphOptionalGroup {
+            pieces: vec![GraphPatternPiece::Edge(GraphEdgePattern {
+                alias: Some("ref".to_string()),
+                from_alias: "target".to_string(),
+                to_alias: "doc".to_string(),
+                direction: Direction::Outgoing,
+                label_filter: vec!["BenchEdge20".to_string()],
+                filter: None,
+            })],
+            where_: None,
+        }));
+    query.return_items = Some(vec![
+        graph_row_return_binding("source"),
+        graph_row_return_binding("edge"),
+        graph_row_return_binding("target"),
+        graph_row_return_binding("ref"),
+        graph_row_return_binding("doc"),
+    ]);
+    query
+}
+
+fn graph_row_order_by_score_then_target() -> Vec<GraphOrderItem> {
+    vec![
+        GraphOrderItem {
+            expr: GraphExpr::Property {
+                alias: "edge".to_string(),
+                key: "score".to_string(),
+            },
+            direction: GraphOrderDirection::Desc,
+        },
+        GraphOrderItem {
+            expr: GraphExpr::NodeField {
+                alias: "target".to_string(),
+                field: GraphNodeField::Id,
+            },
+            direction: GraphOrderDirection::Asc,
+        },
+    ]
+}
+
+fn assert_graph_row_result_count(
+    result: overgraph::GraphRowResult,
+    expected: usize,
+) -> overgraph::GraphRowResult {
+    assert_eq!(result.rows.len(), expected);
+    assert_eq!(result.stats.rows_returned, expected);
+    result
+}
+
+fn bench_gql_queries(c: &mut Criterion) {
+    let mut graph_group = c.benchmark_group("graph_row_query");
+    graph_group.sample_size(20);
+
+    graph_group.bench_function("graph_row_fixed_connected_query", |b| {
+        let (_dir, engine, source_id) = build_graph_row_optional_engine();
+        let query = graph_row_fixed_query(source_id, QUERY_LIMIT);
+        b.iter(|| {
+            let result = engine.query_graph_rows(black_box(&query)).unwrap();
+            black_box(assert_graph_row_result_count(result, QUERY_LIMIT))
+        });
+    });
+
+    graph_group.bench_function("graph_row_optional_edge_traversal_query", |b| {
+        let (_dir, engine, source_id) = build_graph_row_optional_engine();
+        let query = graph_row_optional_query(source_id, QUERY_LIMIT);
+        b.iter(|| {
+            let result = engine.query_graph_rows(black_box(&query)).unwrap();
+            black_box(assert_graph_row_result_count(result, QUERY_LIMIT))
+        });
+    });
+
+    graph_group.finish();
+
+    let mut group = c.benchmark_group("execute_gql");
     group.sample_size(20);
 
-    group.bench_function("query_pattern_selective_anchor_linear", |b| {
+    group.bench_function("native_query_node_ids_indexed_property_baseline", |b| {
+        let (_dir, engine) = build_indexed_query_engine();
+        let query = status_active_query(Some(GqlQueryOptions::default().max_rows));
+        b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("gql_explain_parse_lower_plan_ordered", |b| {
+        let (_dir, engine) = build_indexed_query_engine();
+        let params = GqlParams::new();
+        let options = GqlQueryOptions::default();
+        let query =
+            "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n.tenant ORDER BY n.score LIMIT 25";
+        b.iter(|| {
+            black_box(
+                engine
+                    .explain_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("gql_return_id_indexed_property", |b| {
+        let (_dir, engine) = build_indexed_query_engine();
+        let params = GqlParams::new();
+        let options = GqlQueryOptions::default();
+        let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN id(n)";
+        b.iter(|| {
+            black_box(
+                engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("gql_return_property_no_hydration", |b| {
+        let (_dir, engine) = build_indexed_query_engine();
+        let params = GqlParams::new();
+        let options = GqlQueryOptions::default();
+        let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n.tenant";
+        b.iter(|| {
+            black_box(
+                engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("gql_return_node_element_without_vectors", |b| {
+        let (_dir, engine) = build_indexed_query_engine();
+        let params = GqlParams::new();
+        let options = GqlQueryOptions::default();
+        let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n LIMIT 25";
+        b.iter(|| {
+            black_box(
+                engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("gql_order_by_limit", |b| {
+        let (_dir, engine) = build_indexed_query_engine();
+        let params = GqlParams::new();
+        let options = GqlQueryOptions::default();
+        let query =
+            "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n.tenant ORDER BY n.score LIMIT 25";
+        b.iter(|| {
+            black_box(
+                engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("gql_full_scan_opt_in", |b| {
+        let (_dir, engine) = build_fallback_query_engine();
+        let params = GqlParams::new();
+        let options = GqlQueryOptions {
+            allow_full_scan: true,
+            ..GqlQueryOptions::default()
+        };
+        let query = "MATCH (n) WHERE n.region = 'r03' RETURN id(n) LIMIT 100";
+        b.iter(|| {
+            black_box(
+                engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("gql_direct_edge_property_indexed_row_ops", |b| {
+        let (_dir, engine, _source_id, _edge_ids, _valid_epoch) = build_edge_query_indexed_engine();
+        let params = GqlParams::from([(
+            "role".to_string(),
+            GqlParamValue::String("lead".to_string()),
+        )]);
+        let options = GqlQueryOptions::default();
+        let query = "MATCH ()-[r:BenchEdge10]->() WHERE r.role = $role RETURN id(r), r.score ORDER BY r.score DESC LIMIT 100";
+        b.iter(|| {
+            black_box(
+                engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("gql_include_plan_profile", |b| {
+        let (_dir, engine) = build_indexed_query_engine();
+        let params = GqlParams::new();
+        let options = GqlQueryOptions {
+            include_plan: true,
+            profile: true,
+            ..GqlQueryOptions::default()
+        };
+        let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n.tenant ORDER BY n.score LIMIT 25";
+        b.iter(|| {
+            black_box(
+                engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("gql_fixed_one_hop_pattern", |b| {
         let (_dir, engine, _company_id) = build_pattern_engine();
-        let query = linear_pattern_query();
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
+        let params = GqlParams::new();
+        let options = GqlQueryOptions::default();
+        let query =
+            "MATCH (p:BenchNode1)-[r:BenchEdge10]->(c:BenchNode2) RETURN id(p), id(r), id(c)";
+        b.iter(|| {
+            black_box(
+                engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
     });
 
-    group.bench_function("query_pattern_boolean_or_union_anchor", |b| {
+    group.bench_function("gql_fixed_branching_pattern", |b| {
         let (_dir, engine, _company_id) = build_pattern_engine();
-        let query = boolean_pattern_anchor_query();
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
+        let params = GqlParams::new();
+        let options = GqlQueryOptions::default();
+        let query = "MATCH (p:BenchNode1)-[:BenchEdge10]->(c:BenchNode2)<-[:BenchEdge10]-(peer:BenchNode1) RETURN id(p), id(c), id(peer) LIMIT 100";
+        b.iter(|| {
+            black_box(
+                engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap(),
+            )
+        });
     });
 
-    group.bench_function("query_pattern_branching_small", |b| {
-        let (_dir, engine, company_id) = build_pattern_engine();
-        let query = branching_pattern_query(company_id);
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
+    group.bench_function("gql_graph_row_fixed_connected_query", |b| {
+        let (_dir, engine, source_id) = build_graph_row_optional_engine();
+        let params = GqlParams::from([
+            (
+                "role".to_string(),
+                GqlParamValue::String("lead".to_string()),
+            ),
+            ("source".to_string(), GqlParamValue::UInt(source_id)),
+        ]);
+        let options = GqlQueryOptions::default();
+        let query =
+            "MATCH (source:BenchNode1)-[edge:BenchEdge10 {role: $role}]->(target:BenchNode2) \
+                     WHERE id(source) = $source \
+                     RETURN id(source) AS source, id(edge) AS edge, id(target) AS target \
+                     ORDER BY edge.score DESC, id(target) LIMIT 100";
+        b.iter(|| {
+            let result = engine
+                .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                .unwrap();
+            assert_eq!(result.rows.len(), QUERY_LIMIT);
+            black_box(result)
+        });
     });
 
-    group.bench_function("query_pattern_high_fanout_unnamed_edge", |b| {
-        let (_dir, engine, source_id) = build_high_fanout_pattern_engine();
-        let query = unnamed_edge_constraint_query(source_id);
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
-    });
-
-    group.bench_function("query_pattern_parallel_unnamed_edge_constraint", |b| {
-        let (_dir, engine, source_id) = build_parallel_edge_pattern_engine();
-        let query = unnamed_edge_constraint_query(source_id);
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
-    });
-
-    group.bench_function("query_pattern_fanout_chooses_lower_expansion_anchor", |b| {
-        let (_dir, engine) = build_fanout_anchor_choice_engine();
-        let query = fanout_anchor_choice_query();
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
-    });
-
-    group.bench_function("query_pattern_high_hub_edge_delayed", |b| {
-        let (_dir, engine, root) = build_high_hub_delay_engine();
-        let query = high_hub_delay_query(root);
-        b.iter(|| black_box(engine.query_pattern(black_box(&query)).unwrap()));
+    group.bench_function("gql_graph_row_optional_edge_traversal_query", |b| {
+        let (_dir, engine, source_id) = build_graph_row_optional_engine();
+        let params = GqlParams::from([
+            (
+                "role".to_string(),
+                GqlParamValue::String("lead".to_string()),
+            ),
+            ("source".to_string(), GqlParamValue::UInt(source_id)),
+        ]);
+        let options = GqlQueryOptions::default();
+        let query =
+            "MATCH (source:BenchNode1)-[edge:BenchEdge10 {role: $role}]->(target:BenchNode2) \
+                     WHERE id(source) = $source \
+                     OPTIONAL MATCH (target)-[ref:BenchEdge20]->(doc:BenchNode3) \
+                     RETURN id(source) AS source, id(edge) AS edge, id(target) AS target, \
+                            id(ref) AS ref, id(doc) AS doc \
+                     ORDER BY edge.score DESC, id(target) LIMIT 100";
+        b.iter(|| {
+            let result = engine
+                .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                .unwrap();
+            assert_eq!(result.rows.len(), QUERY_LIMIT);
+            black_box(result)
+        });
     });
 
     group.finish();
@@ -1877,7 +1944,7 @@ fn bench_pattern_queries(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_node_queries,
-    bench_pattern_queries,
-    bench_edge_queries
+    bench_edge_queries,
+    bench_gql_queries
 );
 criterion_main!(benches);

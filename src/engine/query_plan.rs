@@ -5,62 +5,17 @@ const MAX_BOOLEAN_PLANNING_PROBE_IDS: usize = 16_384;
 const MAX_BOOLEAN_UNION_INPUTS: usize = 256;
 const TINY_EXPLICIT_ANCHOR_MAX: u64 = 16;
 const PLAN_COST_UNKNOWN_WORK: u64 = u64::MAX;
-const FANOUT_COST_UNKNOWN_WORK: u64 = u64::MAX / 4;
-const FANOUT_HUB_HIGH_RATIO: u64 = 8;
-const FANOUT_HUB_MEDIUM_RATIO: u64 = 4;
-const FANOUT_CONFIDENCE_DOWNGRADE_STEP: u8 = 1;
+const GRAPH_ROW_FANOUT_UNKNOWN_WORK: u64 = u64::MAX / 4;
+const GRAPH_ROW_FRONTIER_BUDGET: usize = crate::planner_stats::PLANNER_STATS_HARD_CANDIDATE_CAP;
+const GRAPH_ROW_HUB_HIGH_RATIO: u64 = 8;
+const GRAPH_ROW_HUB_MEDIUM_RATIO: u64 = 4;
+const GRAPH_ROW_CONFIDENCE_DOWNGRADE_STEP: u8 = 1;
 
-#[derive(Clone)]
 struct PlannedNodeQuery {
     driver: NodePhysicalPlan,
     cap_context: QueryCapContext,
     warnings: Vec<QueryPlanWarning>,
-}
-
-struct PlannedPatternQuery {
-    anchor: PatternAnchorPlan,
-    fallback_anchors: Vec<PatternAnchorPlan>,
-    warnings: Vec<QueryPlanWarning>,
-}
-
-struct PlannedPatternEdgeAnchorSource {
-    edge_plan: PlannedEdgeQuery,
-    edge_fallback_plans: Vec<PlannedEdgeQuery>,
-}
-
-type PatternEdgeLabeledBranchPlan = (
-    EdgePhysicalPlan,
-    Vec<QueryPlanWarning>,
-    Vec<SecondaryIndexReadFollowup>,
-);
-
-enum PatternAnchorPlan {
-    Node {
-        node_index: usize,
-        anchor_alias: String,
-        sort_anchor_alias: String,
-        anchor_plan: PlannedNodeQuery,
-        expansion_order: Vec<usize>,
-    },
-    Edge {
-        edge_index: usize,
-        edge_alias: Option<String>,
-        from_index: usize,
-        to_index: usize,
-        sort_anchor_alias: String,
-        edge_query: Box<NormalizedEdgeQuery>,
-        edge_plan: PlannedEdgeQuery,
-        edge_fallback_plans: Vec<PlannedEdgeQuery>,
-        expansion_order: Vec<usize>,
-        orientation_policy: EdgeAnchorOrientationPolicy,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EdgeAnchorOrientationPolicy {
-    Outgoing,
-    Incoming,
-    Both,
+    followups: Vec<SecondaryIndexReadFollowup>,
 }
 
 #[derive(Clone)]
@@ -105,6 +60,78 @@ struct PlannedEdgeQuery {
     cap_context: EdgeQueryCapContext,
     warnings: Vec<QueryPlanWarning>,
     followups: Vec<SecondaryIndexReadFollowup>,
+}
+
+#[derive(Clone, Debug)]
+struct GraphRowPhysicalPlan {
+    initial_driver: GraphRowInitialDriver,
+    edge_order: Vec<usize>,
+    segments: Vec<GraphRowPhysicalSegment>,
+    edge_source_choices: Vec<Option<GraphRowEdgeCandidateSourceChoice>>,
+    alternatives: Vec<GraphRowPlanAlternative>,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+enum GraphRowInitialDriver {
+    Empty {
+        reason: String,
+    },
+    Node {
+        node_index: usize,
+        alias: String,
+    },
+    Edge {
+        edge_index: usize,
+        edge_name: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct GraphRowPlanAlternative {
+    chosen: bool,
+    kind: String,
+    detail: String,
+    decision: Option<String>,
+    cost: Option<GraphRowPlanCost>,
+}
+
+type GraphRowEdgeSourcePlanCost = Option<(PlanCost, String, Vec<QueryPlanWarning>)>;
+type GraphRowFrontierPlan = (
+    Vec<usize>,
+    Vec<(usize, GraphRowEdgeCandidateSourceChoice)>,
+    GraphRowPlanCost,
+);
+
+const GRAPH_ROW_EDGE_INTERSECTION_TINY_SET: u64 = 64;
+
+#[derive(Clone, Debug)]
+struct GraphRowPhysicalSegment {
+    segment_index: usize,
+    barriers_before: Vec<GraphRowPlanBarrier>,
+    initial_driver: GraphRowInitialDriver,
+    edge_order: Vec<usize>,
+}
+
+struct GraphRowPhysicalSegmentPlan {
+    segment: GraphRowPhysicalSegment,
+    source_choices: Vec<(usize, GraphRowEdgeCandidateSourceChoice)>,
+    alternatives: Vec<GraphRowPlanAlternative>,
+}
+
+struct GraphRowExpansionChoice {
+    bound_rank: u8,
+    complete: bool,
+    estimated_expansion: u64,
+    next_frontier: u64,
+    confidence_rank: u8,
+    hub_risk_rank: u8,
+    coverage_rank: u8,
+    source_rank: usize,
+    canonical_key: String,
+    edge_index: usize,
+    source_choice: GraphRowEdgeCandidateSourceChoice,
+    fanout: Option<GraphRowFanoutEstimate>,
 }
 
 #[derive(Clone, Copy)]
@@ -237,7 +264,6 @@ enum EdgeCandidateMaterialization {
         index_id: u64,
         label_id: u32,
         prop_key: String,
-        domain: SecondaryIndexRangeDomain,
         lower: Option<PropertyRangeBound>,
         upper: Option<PropertyRangeBound>,
     },
@@ -291,6 +317,71 @@ struct PlanCost {
     canonical_key: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GraphRowPlanCost {
+    anchor_cost: PlanCost,
+    estimated_work: u64,
+    simulated_frontier: u64,
+    fanout_complete: bool,
+    confidence_rank: u8,
+    stale_risk_rank: u8,
+    hub_risk_rank: u8,
+    frontier_capped: bool,
+    source_rank: usize,
+    canonical_key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphRowFanoutCoverage {
+    Complete,
+    GlobalFallback,
+    Missing,
+}
+
+impl GraphRowFanoutCoverage {
+    fn complete(self) -> bool {
+        matches!(self, GraphRowFanoutCoverage::Complete)
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            GraphRowFanoutCoverage::Complete => 0,
+            GraphRowFanoutCoverage::GlobalFallback => 1,
+            GraphRowFanoutCoverage::Missing => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphRowHubRisk {
+    Low,
+    Medium,
+    High,
+    Unknown,
+}
+
+impl GraphRowHubRisk {
+    fn rank(self) -> u8 {
+        match self {
+            GraphRowHubRisk::Low => 0,
+            GraphRowHubRisk::Medium => 1,
+            GraphRowHubRisk::High => 2,
+            GraphRowHubRisk::Unknown => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GraphRowFanoutEstimate {
+    avg_upper_fanout: u64,
+    p99_fanout: u64,
+    max_fanout: u64,
+    hub_risk: GraphRowHubRisk,
+    confidence: EstimateConfidence,
+    coverage: GraphRowFanoutCoverage,
+    canonical_key: String,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct QueryCapContext {
     cheapest_legal_universe: Option<PlannerEstimate>,
@@ -299,91 +390,6 @@ struct QueryCapContext {
 #[derive(Clone, Copy, Debug, Default)]
 struct EdgeQueryCapContext {
     cheapest_legal_universe: Option<PlannerEstimate>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FanoutCoverage {
-    Complete,
-    GlobalFallback,
-    Missing,
-}
-
-impl FanoutCoverage {
-    fn complete(self) -> bool {
-        matches!(self, FanoutCoverage::Complete)
-    }
-
-    fn rank(self) -> u8 {
-        match self {
-            FanoutCoverage::Complete => 0,
-            FanoutCoverage::GlobalFallback => 1,
-            FanoutCoverage::Missing => 2,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FanoutHubRisk {
-    Low,
-    Medium,
-    High,
-    Unknown,
-}
-
-impl FanoutHubRisk {
-    fn rank(self) -> u8 {
-        match self {
-            FanoutHubRisk::Low => 0,
-            FanoutHubRisk::Medium => 1,
-            FanoutHubRisk::High => 2,
-            FanoutHubRisk::Unknown => 3,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FanoutEstimate {
-    avg_upper_fanout: u64,
-    p99_fanout: u64,
-    max_fanout: u64,
-    hub_risk: FanoutHubRisk,
-    confidence: EstimateConfidence,
-    coverage: FanoutCoverage,
-    canonical_key: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PatternPlanCost {
-    anchor_cost: PlanCost,
-    estimated_work: u64,
-    simulated_frontier: u64,
-    fanout_complete: bool,
-    confidence_rank: u8,
-    stale_risk_rank: u8,
-    frontier_capped: bool,
-    canonical_key: String,
-}
-
-impl Ord for PatternPlanCost {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let primary = if self.fanout_complete && other.fanout_complete {
-            self.estimated_work
-                .cmp(&other.estimated_work)
-                .then_with(|| self.simulated_frontier.cmp(&other.simulated_frontier))
-                .then_with(|| self.confidence_rank.cmp(&other.confidence_rank))
-                .then_with(|| self.stale_risk_rank.cmp(&other.stale_risk_rank))
-                .then_with(|| self.frontier_capped.cmp(&other.frontier_capped))
-        } else {
-            self.anchor_cost.cmp(&other.anchor_cost)
-        };
-        primary.then_with(|| self.canonical_key.cmp(&other.canonical_key))
-    }
-}
-
-impl PartialOrd for PatternPlanCost {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,7 +436,6 @@ enum NodeCandidateMaterialization {
     },
     PropertyRangeIndex {
         index_id: u64,
-        domain: SecondaryIndexRangeDomain,
         lower: Option<PropertyRangeBound>,
         upper: Option<PropertyRangeBound>,
     },
@@ -451,6 +456,14 @@ fn normalize_candidate_ids(mut ids: Vec<u64>) -> Vec<u64> {
     ids
 }
 
+fn reverse_graph_row_direction(direction: Direction) -> Direction {
+    match direction {
+        Direction::Outgoing => Direction::Incoming,
+        Direction::Incoming => Direction::Outgoing,
+        Direction::Both => Direction::Both,
+    }
+}
+
 fn add_plan_warning(warnings: &mut Vec<QueryPlanWarning>, warning: QueryPlanWarning) {
     if !warnings.contains(&warning) {
         warnings.push(warning);
@@ -463,17 +476,16 @@ fn plan_warning_rank(warning: QueryPlanWarning) -> usize {
         QueryPlanWarning::UsingFallbackScan => 1,
         QueryPlanWarning::FullScanRequiresOptIn => 2,
         QueryPlanWarning::FullScanExplicitlyAllowed => 3,
-        QueryPlanWarning::UnboundedPatternRejected => 4,
-        QueryPlanWarning::EdgePropertyPostFilter => 5,
-        QueryPlanWarning::IndexSkippedAsBroad => 6,
-        QueryPlanWarning::CandidateCapExceeded => 7,
-        QueryPlanWarning::RangeCandidateCapExceeded => 8,
-        QueryPlanWarning::TimestampCandidateCapExceeded => 9,
-        QueryPlanWarning::VerifyOnlyFilter => 10,
-        QueryPlanWarning::BooleanBranchFallback => 11,
-        QueryPlanWarning::PlanningProbeBudgetExceeded => 12,
-        QueryPlanWarning::UnknownNodeLabel => 13,
-        QueryPlanWarning::UnknownEdgeLabel => 14,
+        QueryPlanWarning::EdgePropertyPostFilter => 4,
+        QueryPlanWarning::IndexSkippedAsBroad => 5,
+        QueryPlanWarning::CandidateCapExceeded => 6,
+        QueryPlanWarning::RangeCandidateCapExceeded => 7,
+        QueryPlanWarning::TimestampCandidateCapExceeded => 8,
+        QueryPlanWarning::VerifyOnlyFilter => 9,
+        QueryPlanWarning::BooleanBranchFallback => 10,
+        QueryPlanWarning::PlanningProbeBudgetExceeded => 11,
+        QueryPlanWarning::UnknownNodeLabel => 12,
+        QueryPlanWarning::UnknownEdgeLabel => 13,
     }
 }
 
@@ -539,45 +551,28 @@ fn filter_has_intrinsic_verify_only(filter: &NormalizedNodeFilter) -> bool {
 }
 
 fn equality_probe_value_hashes(value: &PropValue) -> Vec<u64> {
-    let mut hashes = Vec::new();
-    for probe_value in equality_probe_values(value) {
-        let hash = hash_prop_value(&probe_value);
-        if !hashes.contains(&hash) {
-            hashes.push(hash);
-        }
-    }
-    hashes
-}
-
-fn equality_probe_values(value: &PropValue) -> Vec<PropValue> {
-    if let Some(probe_values) = signed_zero_equality_probe_values(value) {
-        probe_values.into_iter().collect()
-    } else {
-        vec![value.clone()]
-    }
+    vec![hash_prop_equality_key(value)]
 }
 
 fn unique_in_probe_values(values: &[PropValue]) -> Vec<InProbeValue> {
-    unique_in_probe_values_with_hash(values, hash_prop_value)
+    unique_in_probe_values_with_hash(values, hash_semantic_equality_key_bytes)
 }
 
 fn unique_in_probe_values_with_hash(
     values: &[PropValue],
-    mut hash_fn: impl FnMut(&PropValue) -> u64,
+    mut hash_fn: impl FnMut(&[u8]) -> u64,
 ) -> Vec<InProbeValue> {
     let mut by_canonical: BTreeMap<Vec<u8>, InProbeValue> = BTreeMap::new();
     for value in values {
-        for probe_value in equality_probe_values(value) {
-            let canonical_key = prop_value_canonical_bytes(&probe_value);
-            match by_canonical.entry(canonical_key) {
-                std::collections::btree_map::Entry::Occupied(_) => {}
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    let value_hash = hash_fn(&probe_value);
-                    entry.insert(InProbeValue {
-                        value: probe_value,
-                        value_hash,
-                    });
-                }
+        let canonical_key = semantic_equality_key_bytes(value);
+        match by_canonical.entry(canonical_key) {
+            std::collections::btree_map::Entry::Occupied(_) => {}
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let value_hash = hash_fn(entry.key());
+                entry.insert(InProbeValue {
+                    value: value.clone(),
+                    value_hash,
+                });
             }
         }
     }
@@ -614,7 +609,7 @@ fn higher_stale_posting_risk(left: StalePostingRisk, right: StalePostingRisk) ->
     }
 }
 
-fn higher_hub_risk(left: FanoutHubRisk, right: FanoutHubRisk) -> FanoutHubRisk {
+fn higher_graph_row_hub_risk(left: GraphRowHubRisk, right: GraphRowHubRisk) -> GraphRowHubRisk {
     if left.rank() >= right.rank() {
         left
     } else {
@@ -622,121 +617,14 @@ fn higher_hub_risk(left: FanoutHubRisk, right: FanoutHubRisk) -> FanoutHubRisk {
     }
 }
 
-fn worse_fanout_coverage(left: FanoutCoverage, right: FanoutCoverage) -> FanoutCoverage {
+fn worse_graph_row_fanout_coverage(
+    left: GraphRowFanoutCoverage,
+    right: GraphRowFanoutCoverage,
+) -> GraphRowFanoutCoverage {
     if left.rank() >= right.rank() {
         left
     } else {
         right
-    }
-}
-
-impl FanoutEstimate {
-    fn zero(canonical_key: String) -> Self {
-        Self {
-            avg_upper_fanout: 0,
-            p99_fanout: 0,
-            max_fanout: 0,
-            hub_risk: FanoutHubRisk::Low,
-            confidence: EstimateConfidence::Exact,
-            coverage: FanoutCoverage::Complete,
-            canonical_key,
-        }
-    }
-
-    fn unknown(canonical_key: String) -> Self {
-        Self {
-            avg_upper_fanout: 0,
-            p99_fanout: 0,
-            max_fanout: 0,
-            hub_risk: FanoutHubRisk::Unknown,
-            confidence: EstimateConfidence::Unknown,
-            coverage: FanoutCoverage::Missing,
-            canonical_key,
-        }
-    }
-
-    fn from_rollup(
-        rollup: &crate::planner_stats::AdjacencyRollupStats,
-        canonical_key: String,
-        coverage: FanoutCoverage,
-        confidence: EstimateConfidence,
-        known_source_ids: Option<&[u64]>,
-    ) -> Self {
-        let avg_upper_fanout = if rollup.source_node_count == 0 {
-            0
-        } else {
-            rollup.total_edges.div_ceil(rollup.source_node_count)
-        };
-        let known_hub_fanout = known_source_ids.and_then(|ids| {
-            rollup
-                .top_hubs
-                .iter()
-                .filter(|hub| ids.binary_search(&hub.node_id).is_ok())
-                .map(|hub| hub.count as u64)
-                .max()
-        });
-        let hub_risk = if known_hub_fanout.is_some() {
-            FanoutHubRisk::High
-        } else {
-            let baseline = avg_upper_fanout.max(1);
-            if (rollup.max_fanout as u64) >= baseline.saturating_mul(FANOUT_HUB_HIGH_RATIO) {
-                FanoutHubRisk::High
-            } else if (rollup.p99_fanout as u64)
-                >= baseline.saturating_mul(FANOUT_HUB_MEDIUM_RATIO)
-            {
-                FanoutHubRisk::Medium
-            } else {
-                FanoutHubRisk::Low
-            }
-        };
-        let max_fanout = known_hub_fanout
-            .unwrap_or(rollup.max_fanout as u64)
-            .max(rollup.max_fanout as u64);
-        Self {
-            avg_upper_fanout,
-            p99_fanout: rollup.p99_fanout as u64,
-            max_fanout,
-            hub_risk,
-            confidence,
-            coverage,
-            canonical_key,
-        }
-    }
-
-    fn combine_sum(self, other: Self, canonical_key: String) -> Self {
-        Self {
-            avg_upper_fanout: self
-                .avg_upper_fanout
-                .saturating_add(other.avg_upper_fanout),
-            p99_fanout: self.p99_fanout.saturating_add(other.p99_fanout),
-            max_fanout: self.max_fanout.saturating_add(other.max_fanout),
-            hub_risk: higher_hub_risk(self.hub_risk, other.hub_risk),
-            confidence: weaker_confidence(self.confidence, other.confidence),
-            coverage: worse_fanout_coverage(self.coverage, other.coverage),
-            canonical_key,
-        }
-    }
-
-    fn cost_fanout(&self) -> u64 {
-        if self.avg_upper_fanout == 0 && self.p99_fanout == 0 && self.max_fanout == 0 {
-            return 0;
-        }
-        match self.hub_risk {
-            FanoutHubRisk::High => self
-                .avg_upper_fanout
-                .max(self.p99_fanout)
-                .saturating_add(self.max_fanout / 2),
-            FanoutHubRisk::Medium => self
-                .avg_upper_fanout
-                .max(self.p99_fanout)
-                .saturating_add(self.max_fanout / 4),
-            FanoutHubRisk::Low => self.avg_upper_fanout.max(1),
-            FanoutHubRisk::Unknown => FANOUT_COST_UNKNOWN_WORK,
-        }
-    }
-
-    fn complete(&self) -> bool {
-        self.coverage.complete()
     }
 }
 
@@ -993,16 +881,7 @@ fn memtable_secondary_eq_edge_count_for_filter(
     prop_value: &PropValue,
     snapshot_seq: u64,
 ) -> usize {
-    let Some(probe_values) = signed_zero_equality_probe_values(prop_value) else {
-        return memtable.secondary_eq_edge_count_at(index_id, prop_key, prop_value, snapshot_seq);
-    };
-
-    probe_values
-        .iter()
-        .map(|probe_value| {
-            memtable.secondary_eq_edge_count_at(index_id, prop_key, probe_value, snapshot_seq)
-        })
-        .sum()
+    memtable.secondary_eq_edge_count_at(index_id, prop_key, prop_value, snapshot_seq)
 }
 
 fn segment_edge_secondary_eq_posting_count_for_filter(
@@ -1121,7 +1000,7 @@ impl PlannedNodeCandidateSource {
             index_id,
             key,
             value,
-            hash_prop_value(value),
+            hash_prop_equality_key(value),
             estimate,
         )
     }
@@ -1149,7 +1028,6 @@ impl PlannedNodeCandidateSource {
     fn property_range_index(
         index_id: u64,
         key: &str,
-        domain: SecondaryIndexRangeDomain,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         estimate: PlannerEstimate,
@@ -1160,7 +1038,6 @@ impl PlannedNodeCandidateSource {
             estimate,
             materialization: NodeCandidateMaterialization::PropertyRangeIndex {
                 index_id,
-                domain,
                 lower: lower.cloned(),
                 upper: upper.cloned(),
             },
@@ -1388,7 +1265,6 @@ impl PlannedEdgeCandidateSource {
         label_id: u32,
         index_id: u64,
         prop_key: &str,
-        domain: SecondaryIndexRangeDomain,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         estimate: PlannerEstimate,
@@ -1401,7 +1277,6 @@ impl PlannedEdgeCandidateSource {
                 index_id,
                 label_id,
                 prop_key: prop_key.to_string(),
-                domain,
                 lower: lower.cloned(),
                 upper: upper.cloned(),
             },
@@ -1759,6 +1634,7 @@ impl EdgePhysicalPlan {
         }
     }
 
+    #[cfg(test)]
     fn estimate_exceeds_cap(
         &self,
         cap_context: EdgeQueryCapContext,
@@ -1879,6 +1755,182 @@ impl Ord for PlanCost {
 impl PartialOrd for PlanCost {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl Ord for GraphRowPlanCost {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let primary = if self.fanout_complete && other.fanout_complete {
+            self.estimated_work
+                .cmp(&other.estimated_work)
+                .then_with(|| self.simulated_frontier.cmp(&other.simulated_frontier))
+                .then_with(|| self.confidence_rank.cmp(&other.confidence_rank))
+                .then_with(|| self.stale_risk_rank.cmp(&other.stale_risk_rank))
+                .then_with(|| self.hub_risk_rank.cmp(&other.hub_risk_rank))
+                .then_with(|| self.frontier_capped.cmp(&other.frontier_capped))
+                .then_with(|| self.source_rank.cmp(&other.source_rank))
+        } else {
+            self.anchor_cost
+                .cmp(&other.anchor_cost)
+                .then_with(|| self.source_rank.cmp(&other.source_rank))
+        };
+        primary.then_with(|| self.canonical_key.cmp(&other.canonical_key))
+    }
+}
+
+impl PartialOrd for GraphRowPlanCost {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn graph_row_initial_edge_source_choice(
+    edge: &GraphRowRuntimeEdge,
+) -> GraphRowEdgeCandidateSourceChoice {
+    if !edge.candidate_edge_ids.is_empty() {
+        GraphRowEdgeCandidateSourceChoice::ExplicitIds
+    } else if edge.filter.is_always_false()
+        || edge
+            .label_filter_ids
+            .as_ref()
+            .is_some_and(|label_ids| label_ids.is_empty())
+    {
+        GraphRowEdgeCandidateSourceChoice::EmptyResult
+    } else {
+        GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource
+    }
+}
+
+fn graph_row_deterministic_fallback_edge_source_choice(
+    edge: &GraphRowRuntimeEdge,
+    edge_source_cost: Option<&(PlanCost, String, Vec<QueryPlanWarning>)>,
+) -> GraphRowEdgeCandidateSourceChoice {
+    if !edge.candidate_edge_ids.is_empty() {
+        GraphRowEdgeCandidateSourceChoice::ExplicitIds
+    } else if edge.filter.is_always_false()
+        || edge
+            .label_filter_ids
+            .as_ref()
+            .is_some_and(|label_ids| label_ids.is_empty())
+    {
+        GraphRowEdgeCandidateSourceChoice::EmptyResult
+    } else if edge_source_cost.is_some() {
+        GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource
+    } else {
+        GraphRowEdgeCandidateSourceChoice::EndpointAdjacency
+    }
+}
+
+fn graph_row_plan_cost_rejection_reason(
+    rejected: &GraphRowPlanCost,
+    winner: &GraphRowPlanCost,
+) -> &'static str {
+    if rejected.fanout_complete && winner.fanout_complete {
+        if rejected.estimated_work != winner.estimated_work {
+            "estimated_work"
+        } else if rejected.simulated_frontier != winner.simulated_frontier {
+            "simulated_frontier"
+        } else if rejected.confidence_rank != winner.confidence_rank {
+            "confidence"
+        } else if rejected.stale_risk_rank != winner.stale_risk_rank {
+            "staleness"
+        } else if rejected.hub_risk_rank != winner.hub_risk_rank {
+            "hub_risk"
+        } else if rejected.frontier_capped != winner.frontier_capped {
+            "frontier_cap"
+        } else if rejected.source_rank != winner.source_rank {
+            "source_rank"
+        } else {
+            "canonical_key_tie_breaker"
+        }
+    } else if rejected.anchor_cost != winner.anchor_cost {
+        graph_row_anchor_cost_rejection_reason(&rejected.anchor_cost, &winner.anchor_cost)
+    } else if rejected.source_rank != winner.source_rank {
+        "source_rank"
+    } else {
+        "canonical_key_tie_breaker"
+    }
+}
+
+fn graph_row_anchor_cost_rejection_reason(
+    rejected: &PlanCost,
+    winner: &PlanCost,
+) -> &'static str {
+    if rejected.estimated_work != winner.estimated_work {
+        "anchor_estimated_work"
+    } else if rejected.estimated_candidates != winner.estimated_candidates {
+        "anchor_estimated_candidates"
+    } else if rejected.estimate_kind_rank != winner.estimate_kind_rank {
+        "anchor_estimate_kind"
+    } else if rejected.confidence_rank != winner.confidence_rank {
+        "anchor_confidence"
+    } else if rejected.stale_risk_rank != winner.stale_risk_rank {
+        "anchor_staleness"
+    } else if rejected.materialization_rank != winner.materialization_rank {
+        "anchor_materialization"
+    } else if rejected.source_rank != winner.source_rank {
+        "anchor_source_rank"
+    } else {
+        "canonical_key_tie_breaker"
+    }
+}
+
+fn graph_row_edge_plan_is_filter_source(plan: &EdgePhysicalPlan) -> bool {
+    match plan {
+        EdgePhysicalPlan::Source(source) => matches!(
+            source.kind,
+            EdgeQueryCandidateSourceKind::EdgeLabelIndex
+                | EdgeQueryCandidateSourceKind::EdgeTripleIndex
+                | EdgeQueryCandidateSourceKind::FromEndpointAdjacency
+                | EdgeQueryCandidateSourceKind::ToEndpointAdjacency
+                | EdgeQueryCandidateSourceKind::AnyEndpointAdjacency
+                | EdgeQueryCandidateSourceKind::EdgeWeightIndex
+                | EdgeQueryCandidateSourceKind::EdgeUpdatedAtIndex
+                | EdgeQueryCandidateSourceKind::EdgeValidFromIndex
+                | EdgeQueryCandidateSourceKind::EdgeValidToIndex
+                | EdgeQueryCandidateSourceKind::EdgePropertyEqualityIndex
+                | EdgeQueryCandidateSourceKind::EdgePropertyRangeIndex
+                | EdgeQueryCandidateSourceKind::EdgeMetadataScan
+        ),
+        EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
+            inputs.iter().all(graph_row_edge_plan_is_filter_source)
+        }
+        EdgePhysicalPlan::Empty => false,
+    }
+}
+
+fn graph_row_edge_source_materialization_work(plan: &EdgePhysicalPlan) -> u64 {
+    match plan {
+        EdgePhysicalPlan::Empty | EdgePhysicalPlan::Source(_) | EdgePhysicalPlan::Union(_) => {
+            plan.plan_cost().estimated_work
+        }
+        EdgePhysicalPlan::Intersect(inputs) => {
+            let mut work = 16u64;
+            let mut smallest_ready_set: Option<u64> = None;
+            let mut materialized_any = false;
+            for input in inputs {
+                if smallest_ready_set
+                    .is_some_and(|len| len <= GRAPH_ROW_EDGE_INTERSECTION_TINY_SET)
+                    && graph_row_edge_plan_is_filter_source(input)
+                {
+                    continue;
+                }
+                materialized_any = true;
+                work = work.saturating_add(graph_row_edge_source_materialization_work(input));
+                if let Some(count) = input.estimate().known_upper_bound() {
+                    smallest_ready_set = Some(
+                        smallest_ready_set
+                            .map(|current| current.min(count))
+                            .unwrap_or(count),
+                    );
+                }
+            }
+            if materialized_any {
+                work.min(plan.plan_cost().estimated_work)
+            } else {
+                plan.plan_cost().estimated_work
+            }
+        }
     }
 }
 
@@ -2104,106 +2156,113 @@ impl PlannedEdgeQuery {
     }
 }
 
-impl EdgeAnchorOrientationPolicy {
-    fn from_direction(direction: Direction) -> Self {
-        match direction {
-            Direction::Outgoing => Self::Outgoing,
-            Direction::Incoming => Self::Incoming,
-            Direction::Both => Self::Both,
-        }
-    }
-}
-
-impl PatternAnchorPlan {
-    #[cfg(test)]
-    fn sort_anchor_alias(&self) -> &str {
-        match self {
-            PatternAnchorPlan::Node {
-                sort_anchor_alias, ..
-            }
-            | PatternAnchorPlan::Edge {
-                sort_anchor_alias, ..
-            } => sort_anchor_alias,
+impl GraphRowFanoutEstimate {
+    fn zero(canonical_key: String) -> Self {
+        Self {
+            avg_upper_fanout: 0,
+            p99_fanout: 0,
+            max_fanout: 0,
+            hub_risk: GraphRowHubRisk::Low,
+            confidence: EstimateConfidence::Exact,
+            coverage: GraphRowFanoutCoverage::Complete,
+            canonical_key,
         }
     }
 
-    fn expansion_order(&self) -> &[usize] {
-        match self {
-            PatternAnchorPlan::Node {
-                expansion_order, ..
-            }
-            | PatternAnchorPlan::Edge {
-                expansion_order, ..
-            } => expansion_order,
+    fn unknown(canonical_key: String) -> Self {
+        Self {
+            avg_upper_fanout: 0,
+            p99_fanout: 0,
+            max_fanout: 0,
+            hub_risk: GraphRowHubRisk::Unknown,
+            confidence: EstimateConfidence::Unknown,
+            coverage: GraphRowFanoutCoverage::Missing,
+            canonical_key,
         }
     }
 
-    fn estimated_candidate_count(&self) -> Option<u64> {
-        match self {
-            PatternAnchorPlan::Node { anchor_plan, .. } => {
-                anchor_plan.estimated_candidate_count()
-            }
-            PatternAnchorPlan::Edge { edge_plan, .. } => edge_plan.estimated_candidate_count(),
-        }
-    }
-
-    fn explain_anchor_input(&self) -> QueryPlanNode {
-        match self {
-            PatternAnchorPlan::Node {
-                anchor_alias,
-                anchor_plan,
-                ..
-            } => {
-                let anchor_input = QueryPlanNode::VerifyNodeFilter {
-                    input: Box::new(anchor_plan.driver.plan_node()),
-                };
-                QueryPlanNode::PatternExpand {
-                    anchor_alias: anchor_alias.clone(),
-                    input: Box::new(anchor_input),
-                }
-            }
-            PatternAnchorPlan::Edge {
-                edge_alias,
-                edge_plan,
-                sort_anchor_alias,
-                ..
-            } => {
-                let edge_anchor = QueryPlanNode::PatternEdgeAnchor {
-                    edge_alias: edge_alias.clone(),
-                    input: Box::new(QueryPlanNode::VerifyEdgeFilter {
-                        input: Box::new(edge_plan.driver.plan_node()),
-                    }),
-                };
-                QueryPlanNode::PatternExpand {
-                    anchor_alias: sort_anchor_alias.clone(),
-                    input: Box::new(edge_anchor),
-                }
-            }
-        }
-    }
-}
-
-impl PlannedPatternQuery {
-    fn explain_plan(&self, public_inputs: QueryPlanPublicInputs) -> QueryPlan {
-        let pattern = self.anchor.explain_anchor_input();
-        let root = if self
-            .warnings
-            .contains(&QueryPlanWarning::EdgePropertyPostFilter)
-        {
-            QueryPlanNode::VerifyEdgePredicates {
-                input: Box::new(pattern),
-            }
+    fn from_rollup(
+        rollup: &crate::planner_stats::AdjacencyRollupStats,
+        canonical_key: String,
+        coverage: GraphRowFanoutCoverage,
+        confidence: EstimateConfidence,
+        known_source_ids: Option<&[u64]>,
+    ) -> Self {
+        let avg_upper_fanout = if rollup.source_node_count == 0 {
+            0
         } else {
-            pattern
+            rollup.total_edges.div_ceil(rollup.source_node_count)
         };
-        QueryPlan {
-            kind: QueryPlanKind::PatternQuery,
-            root,
-            estimated_candidates: self.anchor.estimated_candidate_count(),
-            warnings: self.warnings.clone(),
-            notes: Vec::new(),
-            public_inputs,
+        let known_hub_fanout = known_source_ids.and_then(|ids| {
+            rollup
+                .top_hubs
+                .iter()
+                .filter(|hub| ids.binary_search(&hub.node_id).is_ok())
+                .map(|hub| hub.count as u64)
+                .max()
+        });
+        let hub_risk = if known_hub_fanout.is_some() {
+            GraphRowHubRisk::High
+        } else {
+            let baseline = avg_upper_fanout.max(1);
+            if (rollup.max_fanout as u64) >= baseline.saturating_mul(GRAPH_ROW_HUB_HIGH_RATIO) {
+                GraphRowHubRisk::High
+            } else if (rollup.p99_fanout as u64)
+                >= baseline.saturating_mul(GRAPH_ROW_HUB_MEDIUM_RATIO)
+            {
+                GraphRowHubRisk::Medium
+            } else {
+                GraphRowHubRisk::Low
+            }
+        };
+        let max_fanout = known_hub_fanout
+            .unwrap_or(rollup.max_fanout as u64)
+            .max(rollup.max_fanout as u64);
+        Self {
+            avg_upper_fanout,
+            p99_fanout: rollup.p99_fanout as u64,
+            max_fanout,
+            hub_risk,
+            confidence,
+            coverage,
+            canonical_key,
         }
+    }
+
+    fn combine_sum(self, other: Self, canonical_key: String) -> Self {
+        Self {
+            avg_upper_fanout: self
+                .avg_upper_fanout
+                .saturating_add(other.avg_upper_fanout),
+            p99_fanout: self.p99_fanout.saturating_add(other.p99_fanout),
+            max_fanout: self.max_fanout.saturating_add(other.max_fanout),
+            hub_risk: higher_graph_row_hub_risk(self.hub_risk, other.hub_risk),
+            confidence: weaker_confidence(self.confidence, other.confidence),
+            coverage: worse_graph_row_fanout_coverage(self.coverage, other.coverage),
+            canonical_key,
+        }
+    }
+
+    fn cost_fanout(&self) -> u64 {
+        if self.avg_upper_fanout == 0 && self.p99_fanout == 0 && self.max_fanout == 0 {
+            return 0;
+        }
+        match self.hub_risk {
+            GraphRowHubRisk::High => self
+                .avg_upper_fanout
+                .max(self.p99_fanout)
+                .saturating_add(self.max_fanout / 2),
+            GraphRowHubRisk::Medium => self
+                .avg_upper_fanout
+                .max(self.p99_fanout)
+                .saturating_add(self.max_fanout / 4),
+            GraphRowHubRisk::Low => self.avg_upper_fanout.max(1),
+            GraphRowHubRisk::Unknown => GRAPH_ROW_FANOUT_UNKNOWN_WORK,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.coverage.complete()
     }
 }
 
@@ -2247,47 +2306,6 @@ impl ReadView {
                 mode: None,
             });
         }
-        Ok(public_inputs)
-    }
-
-    fn public_inputs_for_pattern_query(
-        &self,
-        query: &GraphPatternQuery,
-    ) -> Result<QueryPlanPublicInputs, EngineError> {
-        let mut public_inputs = QueryPlanPublicInputs::default();
-
-        for pattern in &query.nodes {
-            if let Some(filter) = pattern.label_filter.as_ref() {
-                for label in &filter.labels {
-                    let known = self
-                        .label_catalog
-                        .resolve_node_label_for_read(label)?
-                        .is_some();
-                    public_inputs.node_labels.push(QueryPlanPublicName {
-                        alias: Some(pattern.alias.clone()),
-                        name: label.clone(),
-                        known,
-                        mode: Some(filter.mode),
-                    });
-                }
-            }
-        }
-
-        for pattern in &query.edges {
-            for label in &pattern.label_filter {
-                let known = self
-                    .label_catalog
-                    .resolve_edge_label_for_read(label)?
-                    .is_some();
-                public_inputs.edge_labels.push(QueryPlanPublicName {
-                    alias: pattern.alias.clone(),
-                    name: label.clone(),
-                    known,
-                    mode: None,
-                });
-            }
-        }
-
         Ok(public_inputs)
     }
 
@@ -2344,43 +2362,6 @@ impl ReadView {
         notes
     }
 
-    fn pattern_anchor_source_plan_for_node(
-        anchor: &PatternAnchorPlan,
-        target_node_index: usize,
-    ) -> Option<&NodePhysicalPlan> {
-        match anchor {
-            PatternAnchorPlan::Node {
-                node_index,
-                anchor_plan,
-                ..
-            } if *node_index == target_node_index => Some(&anchor_plan.driver),
-            _ => None,
-        }
-    }
-
-    fn pattern_query_explain_notes(
-        query: &NormalizedGraphPatternQuery,
-        planned: &PlannedPatternQuery,
-    ) -> Vec<QueryPlanNote> {
-        let mut notes = Vec::new();
-        for (node_index, node) in query.nodes.iter().enumerate() {
-            let source_plan = Self::pattern_anchor_source_plan_for_node(&planned.anchor, node_index);
-            Self::add_node_label_filter_notes(
-                &mut notes,
-                &node.query.label_filter,
-                source_plan,
-            );
-        }
-        notes.sort_by_key(|note| match note {
-            QueryPlanNote::NodeLabelAnyDedupeBeforePagination => 0,
-            QueryPlanNote::NodeLabelAnyFinalVerification => 1,
-            QueryPlanNote::NodeLabelAllSupersetVerification => 2,
-            QueryPlanNote::StaleNodeLabelMembershipVerification => 3,
-        });
-        notes.dedup();
-        notes
-    }
-
     fn key_lookup_candidate_ids(
         &self,
         query: &NormalizedNodeQuery,
@@ -2394,10 +2375,10 @@ impl ReadView {
             .map(|key| (label_id, key.as_str()))
             .collect();
         let ids = self
-            .get_nodes_by_label_keys_raw(&key_refs)?
+            .sources()
+            .find_node_ids_by_label_keys(&key_refs)?
             .into_iter()
             .flatten()
-            .map(|node| node.id)
             .collect();
         Ok(normalize_candidate_ids(ids))
     }
@@ -2461,6 +2442,88 @@ impl ReadView {
         })
     }
 
+    fn range_candidate_estimate(
+        &self,
+        index_id: u64,
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+    ) -> Result<(Option<PlannerEstimate>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        let lower_key = Self::encode_property_range_bound(lower);
+        let upper_key = Self::encode_property_range_bound(upper);
+        let mut count = self
+            .memtable
+            .visible_secondary_range_entry_count(
+                index_id,
+                lower_key,
+                upper_key,
+                None,
+                self.snapshot_seq,
+            ) as u64;
+        if self.active_memtable_only_exact_estimates() {
+            return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
+        }
+        for epoch in &self.immutable_epochs {
+            count = count.saturating_add(
+                epoch
+                    .memtable
+                    .visible_secondary_range_entry_count(
+                        index_id,
+                        lower_key,
+                        upper_key,
+                        None,
+                        self.snapshot_seq,
+                    ) as u64,
+            );
+        }
+
+        let mut used_stats = false;
+        let mut used_fallback = false;
+        let mut stats_values_exact = true;
+        for segment in &self.segments {
+            if let Some(segment_estimate) = self.planner_stats.range_segment_estimate(
+                index_id,
+                segment.segment_id,
+                lower_key,
+                upper_key,
+            ) {
+                used_stats = true;
+                stats_values_exact &= segment_estimate.exact;
+                count = count.saturating_add(segment_estimate.count);
+                continue;
+            }
+            used_fallback = true;
+            match segment.count_nodes_by_secondary_range_index_if_present(
+                index_id,
+                lower_key,
+                upper_key,
+            ) {
+                Ok(Some(entries)) => count = count.saturating_add(entries as u64),
+                Ok(None) => return Ok((None, self.range_sidecar_failure_followup(index_id, None))),
+                Err(error) => {
+                    return Ok((
+                        None,
+                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                    ));
+                }
+            }
+        }
+        #[cfg(test)]
+        if used_fallback {
+            self.note_range_planning_probe();
+        }
+
+        let mut estimate = self.planner_stats_estimate_from_rollup(
+            count,
+            used_stats,
+            used_fallback,
+            stats_values_exact,
+        );
+        if !used_stats {
+            estimate = estimate.with_current_posting_bound();
+        }
+        Ok((Some(estimate), None))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn range_candidate_probe(
         &self,
@@ -2472,12 +2535,21 @@ impl ReadView {
         upper: Option<&PropertyRangeBound>,
         budget: &mut BooleanPlanningBudget,
     ) -> Result<CandidateProbe, EngineError> {
-        let domain = Self::validate_property_range_bounds(lower, upper, None)?;
-        let Some(entry) = self.node_property_index_entry(
-            label_id,
-            key,
-            &SecondaryIndexKind::Range { domain },
-        ) else {
+        let validated = Self::validate_property_range_bounds(lower, upper, None)?;
+        if validated.is_empty {
+            return Ok(CandidateProbe {
+                source: Some(PlannedNodeCandidateSource::with_ids(
+                    NodeQueryCandidateSourceKind::PropertyRangeIndex,
+                    format!("range_empty:{label_id}:{key}"),
+                    Vec::new(),
+                )),
+                warning: None,
+                followup: None,
+            });
+        }
+        let Some(entry) =
+            self.node_property_index_entry(label_id, key, &SecondaryIndexKind::Range)
+        else {
             return Ok(CandidateProbe {
                 source: None,
                 warning: Some(QueryPlanWarning::MissingReadyIndex),
@@ -2492,204 +2564,71 @@ impl ReadView {
             });
         }
 
-        let lower_encoded = Self::encode_property_range_bound(domain, lower);
-        let upper_encoded = Self::encode_property_range_bound(domain, upper);
-        if let Some(stats_estimate) =
-            self.planner_stats
-                .range_index_estimate(entry.index_id, lower_encoded, upper_encoded)
-        {
-            let mut count = self
-                .memtable
-                .visible_secondary_range_entries(
-                    entry.index_id,
-                    lower_encoded,
-                    upper_encoded,
-                    None,
-                    self.snapshot_seq,
-                )
-                .len() as u64;
-            for epoch in &self.immutable_epochs {
-                count = count.saturating_add(
-                    epoch
-                        .memtable
-                        .visible_secondary_range_entries(
-                            entry.index_id,
-                            lower_encoded,
-                            upper_encoded,
-                            None,
-                            self.snapshot_seq,
-                        )
-                        .len() as u64,
-                );
-            }
-            count = count.saturating_add(stats_estimate.count);
-
-            let mut used_fallback = false;
-            let coverage = &self
-                .planner_stats
-                .range_index_rollups
-                .get(&entry.index_id)
-                .expect("range estimate must have matching rollup")
-                .coverage;
-            let uncovered_segments: Vec<&SegmentReader> = self
-                .segments
-                .iter()
-                .filter(|segment| !coverage.covers(segment.segment_id))
-                .map(|segment| segment.as_ref())
-                .collect();
-            if !uncovered_segments.is_empty() {
-                used_fallback = true;
-                let probe_limit = budget.probe_limit();
-                if probe_limit == 0 {
-                    return Ok(CandidateProbe {
-                        source: None,
-                        warning: Some(QueryPlanWarning::PlanningProbeBudgetExceeded),
-                        followup: None,
-                    });
-                }
-
-                #[cfg(test)]
-                self.note_range_planning_probe();
-
-                let mut fallback_ids = 0usize;
-                let total_read_limit = probe_limit.saturating_add(1);
-                for segment in uncovered_segments {
-                    let remaining_read_limit = total_read_limit.saturating_sub(fallback_ids);
-                    if remaining_read_limit == 0 {
-                        break;
-                    }
-                    match segment.find_nodes_by_secondary_range_index_if_present_limited(
-                        entry.index_id,
-                        lower_encoded,
-                        upper_encoded,
-                        None,
-                        Some(remaining_read_limit),
-                    ) {
-                        Ok(Some(ids)) => {
-                            fallback_ids = fallback_ids.saturating_add(ids.len());
-                            if fallback_ids > probe_limit {
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            return Ok(CandidateProbe {
-                                source: None,
-                                warning: Some(QueryPlanWarning::MissingReadyIndex),
-                                followup: self.range_sidecar_failure_followup(entry.index_id, None),
-                            });
-                        }
-                        Err(error) => {
-                            return Ok(CandidateProbe {
-                                source: None,
-                                warning: Some(QueryPlanWarning::MissingReadyIndex),
-                                followup: self
-                                    .range_sidecar_failure_followup(entry.index_id, Some(error)),
-                            });
-                        }
-                    }
-                }
-                budget.consume_probe_ids(fallback_ids);
-                if fallback_ids > probe_limit {
-                    return Ok(CandidateProbe {
-                        source: None,
-                        warning: Some(if probe_limit < QUERY_RANGE_CANDIDATE_CAP {
-                            QueryPlanWarning::PlanningProbeBudgetExceeded
-                        } else {
-                            QueryPlanWarning::RangeCandidateCapExceeded
-                        }),
-                        followup: None,
-                    });
-                }
-                count = count.saturating_add(fallback_ids as u64);
-            }
-
-            let estimate = if self.active_memtable_only_exact_estimates() {
-                PlannerEstimate::exact_cheap(count)
-            } else {
-                self.planner_stats_estimate_from_rollup(
-                    count,
-                    true,
-                    used_fallback,
-                    stats_estimate.exact,
-                )
-            };
-            if cap_context.source_estimate_exceeds_cap(
-                NodeQueryCandidateSourceKind::PropertyRangeIndex,
-                query.page.limit,
-                estimate,
-            ) {
-                return Ok(CandidateProbe {
-                    source: None,
-                    warning: Some(QueryPlanWarning::RangeCandidateCapExceeded),
-                    followup: None,
-                });
-            }
-
+        let (estimate, followup) = self.range_candidate_estimate(entry.index_id, lower, upper)?;
+        let Some(estimate) = estimate else {
             return Ok(CandidateProbe {
-                source: Some(PlannedNodeCandidateSource::property_range_index(
-                    entry.index_id,
-                    key,
-                    domain,
-                    lower,
-                    upper,
-                    estimate,
-                )),
-                warning: None,
-                followup: None,
-            });
-        }
-
-        #[cfg(test)]
-        self.note_range_planning_probe();
-        let probe_limit = budget.probe_limit();
-        if probe_limit == 0 {
-            return Ok(CandidateProbe {
-                source: None,
-                warning: Some(QueryPlanWarning::PlanningProbeBudgetExceeded),
-                followup: None,
-            });
-        }
-
-        let (ids, followup) = self.ready_range_candidate_ids(
-            entry.index_id,
-            domain,
-            lower,
-            upper,
-            probe_limit + 1,
-        )?;
-        Ok(match ids {
-            Some(ids) if ids.len() <= probe_limit => {
-                budget.consume_probe_ids(ids.len());
-                CandidateProbe {
-                    source: Some(PlannedNodeCandidateSource::property_range_index(
-                        entry.index_id,
-                        key,
-                        domain,
-                        lower,
-                        upper,
-                        PlannerEstimate::exact_cheap(ids.len() as u64),
-                    )),
-                    warning: None,
-                    followup,
-                }
-            }
-            Some(ids) => {
-                budget.consume_probe_ids(ids.len().min(probe_limit + 1));
-                CandidateProbe {
-                    source: None,
-                    warning: Some(if probe_limit < QUERY_RANGE_CANDIDATE_CAP {
-                        QueryPlanWarning::PlanningProbeBudgetExceeded
-                    } else {
-                        QueryPlanWarning::RangeCandidateCapExceeded
-                    }),
-                    followup,
-                }
-            }
-            None => CandidateProbe {
                 source: None,
                 warning: Some(QueryPlanWarning::MissingReadyIndex),
                 followup,
-            },
+            });
+        };
+        if cap_context.source_estimate_exceeds_cap(
+            NodeQueryCandidateSourceKind::PropertyRangeIndex,
+            query.page.limit,
+            estimate,
+        ) {
+            let probe_limit = budget.probe_limit();
+            if probe_limit == 0 {
+                return Ok(CandidateProbe {
+                    source: None,
+                    warning: Some(QueryPlanWarning::PlanningProbeBudgetExceeded),
+                    followup: None,
+                });
+            }
+            let (candidate_ids, followup) = self.ready_range_candidate_ids(
+                entry.index_id,
+                lower,
+                upper,
+                probe_limit.saturating_add(1),
+            )?;
+            let Some(candidate_ids) = candidate_ids else {
+                return Ok(CandidateProbe {
+                    source: None,
+                    warning: Some(QueryPlanWarning::MissingReadyIndex),
+                    followup,
+                });
+            };
+            budget.consume_probe_ids(candidate_ids.len().min(probe_limit));
+            if candidate_ids.len() <= probe_limit {
+                let estimate = PlannerEstimate::exact_cheap(candidate_ids.len() as u64);
+                return Ok(CandidateProbe {
+                    source: Some(PlannedNodeCandidateSource::property_range_index(
+                        entry.index_id,
+                        key,
+                        lower,
+                        upper,
+                        estimate,
+                    )),
+                    warning: None,
+                    followup,
+                });
+            }
+            return Ok(CandidateProbe {
+                source: None,
+                warning: Some(QueryPlanWarning::RangeCandidateCapExceeded),
+                followup,
+            });
+        }
+        Ok(CandidateProbe {
+            source: Some(PlannedNodeCandidateSource::property_range_index(
+                entry.index_id,
+                key,
+                lower,
+                upper,
+                estimate,
+            )),
+            warning: None,
+            followup,
         })
     }
 
@@ -3289,6 +3228,917 @@ impl ReadView {
         }
     }
 
+    fn graph_row_known_node_ids_for_fanout(
+        &self,
+        node: &GraphRowRuntimeNode,
+    ) -> Option<Vec<u64>> {
+        if node.query.ids.is_empty() {
+            None
+        } else {
+            Some(node.query.ids.clone())
+        }
+    }
+
+    fn graph_row_has_unrolled_memtable_edges(&self) -> bool {
+        self.memtable.edge_count() > 0
+            || self
+                .immutable_epochs
+                .iter()
+                .any(|epoch| epoch.memtable.edge_count() > 0)
+    }
+
+    fn graph_row_planner_directions(direction: Direction) -> &'static [PlannerStatsDirection] {
+        match direction {
+            Direction::Outgoing => &[PlannerStatsDirection::Outgoing],
+            Direction::Incoming => &[PlannerStatsDirection::Incoming],
+            Direction::Both => &[
+                PlannerStatsDirection::Outgoing,
+                PlannerStatsDirection::Incoming,
+            ],
+        }
+    }
+
+    fn graph_row_fanout_rollup_estimate(
+        &self,
+        direction: PlannerStatsDirection,
+        edge_label_id: Option<u32>,
+        coverage: GraphRowFanoutCoverage,
+        confidence: EstimateConfidence,
+        canonical_key: String,
+        known_source_ids: Option<&[u64]>,
+    ) -> Option<GraphRowFanoutEstimate> {
+        let rollup = self
+            .planner_stats
+            .adjacency_rollups
+            .get(&(direction, edge_label_id))?;
+        let coverage = if self.graph_row_has_unrolled_memtable_edges()
+            || rollup.coverage.has_uncovered()
+        {
+            GraphRowFanoutCoverage::GlobalFallback
+        } else {
+            coverage
+        };
+        let mut confidence = confidence;
+        if self.graph_row_has_unrolled_memtable_edges() {
+            confidence = downgrade_confidence(confidence, GRAPH_ROW_CONFIDENCE_DOWNGRADE_STEP);
+        }
+        Some(GraphRowFanoutEstimate::from_rollup(
+            rollup,
+            canonical_key,
+            coverage,
+            confidence,
+            known_source_ids,
+        ))
+    }
+
+    fn graph_row_single_direction_fanout_estimate(
+        &self,
+        direction: PlannerStatsDirection,
+        label_filter_ids: Option<&[u32]>,
+        known_source_ids: Option<&[u64]>,
+    ) -> GraphRowFanoutEstimate {
+        let direction_key = match direction {
+            PlannerStatsDirection::Outgoing => "out",
+            PlannerStatsDirection::Incoming => "in",
+        };
+        let Some(label_ids) = label_filter_ids else {
+            return self
+                .graph_row_fanout_rollup_estimate(
+                    direction,
+                    None,
+                    GraphRowFanoutCoverage::Complete,
+                    EstimateConfidence::High,
+                    format!("{direction_key}:global"),
+                    known_source_ids,
+                )
+                .unwrap_or_else(|| {
+                    GraphRowFanoutEstimate::unknown(format!("{direction_key}:global"))
+                });
+        };
+
+        if label_ids.is_empty() {
+            return GraphRowFanoutEstimate::zero(format!("{direction_key}:empty-label-filter"));
+        }
+
+        if label_ids.len() == 1 {
+            let label_id = label_ids[0];
+            if let Some(estimate) = self.graph_row_fanout_rollup_estimate(
+                direction,
+                Some(label_id),
+                GraphRowFanoutCoverage::Complete,
+                EstimateConfidence::High,
+                format!("{direction_key}:label:{label_id}"),
+                known_source_ids,
+            ) {
+                return estimate;
+            }
+            if !self.graph_row_has_unrolled_memtable_edges()
+                && self
+                    .planner_stats
+                    .adjacency_rollups
+                    .get(&(direction, None))
+                    .is_some_and(|rollup| !rollup.coverage.has_uncovered())
+            {
+                return GraphRowFanoutEstimate::zero(format!(
+                    "{direction_key}:label:{label_id}:absent"
+                ));
+            }
+            return self
+                .graph_row_fanout_rollup_estimate(
+                    direction,
+                    None,
+                    GraphRowFanoutCoverage::GlobalFallback,
+                    EstimateConfidence::Low,
+                    format!("{direction_key}:global_fallback:{label_id}"),
+                    known_source_ids,
+                )
+                .unwrap_or_else(|| {
+                    GraphRowFanoutEstimate::unknown(format!("{direction_key}:missing:{label_id}"))
+                });
+        }
+
+        let mut combined: Option<GraphRowFanoutEstimate> = None;
+        for label_id in label_ids {
+            let Some(estimate) = self.graph_row_fanout_rollup_estimate(
+                direction,
+                Some(*label_id),
+                GraphRowFanoutCoverage::Complete,
+                EstimateConfidence::High,
+                format!("{direction_key}:label:{label_id}"),
+                known_source_ids,
+            ) else {
+                return self
+                    .graph_row_fanout_rollup_estimate(
+                        direction,
+                        None,
+                        GraphRowFanoutCoverage::GlobalFallback,
+                        EstimateConfidence::Low,
+                        format!("{direction_key}:global_fallback:{label_ids:?}"),
+                        known_source_ids,
+                    )
+                    .unwrap_or_else(|| {
+                        GraphRowFanoutEstimate::unknown(format!(
+                            "{direction_key}:missing:{label_ids:?}"
+                        ))
+                    });
+            };
+            combined = Some(match combined {
+                Some(current) => current.combine_sum(
+                    estimate,
+                    format!("{direction_key}:labels:{label_ids:?}"),
+                ),
+                None => estimate,
+            });
+        }
+
+        combined.unwrap_or_else(|| {
+            GraphRowFanoutEstimate::unknown(format!("{direction_key}:empty"))
+        })
+    }
+
+    fn graph_row_edge_fanout_estimate(
+        &self,
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+        known_source_ids: Option<&[u64]>,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+    ) -> GraphRowFanoutEstimate {
+        let mut combined: Option<GraphRowFanoutEstimate> = None;
+        for planner_direction in Self::graph_row_planner_directions(direction) {
+            let estimate = self.graph_row_single_direction_fanout_estimate(
+                *planner_direction,
+                label_filter_ids,
+                known_source_ids,
+            );
+            combined = Some(match combined {
+                Some(current) => current.combine_sum(
+                    estimate,
+                    format!("{direction:?}:{:?}", label_filter_ids.unwrap_or(&[])),
+                ),
+                None => estimate,
+            });
+        }
+        let mut estimate = combined
+            .unwrap_or_else(|| GraphRowFanoutEstimate::unknown(format!("{direction:?}:missing")));
+        let mut downgrade_steps = 0u8;
+        if query.at_epoch.is_some() {
+            downgrade_steps = downgrade_steps.saturating_add(1);
+        }
+        if !self.manifest.prune_policies.is_empty() {
+            downgrade_steps = downgrade_steps.saturating_add(1);
+        }
+        if edge_filter_requires_hydration(&edge.filter) {
+            downgrade_steps = downgrade_steps.saturating_add(1);
+        }
+        if downgrade_steps > 0 {
+            estimate.confidence = downgrade_confidence(estimate.confidence, downgrade_steps);
+        }
+        estimate
+    }
+
+    fn graph_row_target_selectivity(
+        &self,
+        node: &GraphRowRuntimeNode,
+    ) -> Option<(u64, u64)> {
+        if !graph_row_node_query_has_anchor(&node.query) || node.query.filter.is_always_false() {
+            return None;
+        }
+        let planned = self.plan_normalized_node_query(&node.query).ok()?;
+        let target_count = planned.estimated_candidate_count()?;
+        let universe_count = self.full_scan_estimate().known_upper_bound()?;
+        if universe_count == 0 || target_count >= universe_count {
+            None
+        } else {
+            Some((target_count, universe_count))
+        }
+    }
+
+    fn apply_graph_row_target_selectivity(
+        raw_expansion: u64,
+        target_selectivity: Option<(u64, u64)>,
+    ) -> u64 {
+        let Some((target_count, universe_count)) = target_selectivity else {
+            return raw_expansion;
+        };
+        if universe_count == 0 {
+            return raw_expansion;
+        }
+        raw_expansion
+            .saturating_mul(target_count)
+            .div_ceil(universe_count)
+            .max(1)
+            .min(raw_expansion)
+    }
+
+    fn graph_row_edge_source_plan_cost(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+    ) -> Result<Option<(PlanCost, String, Vec<QueryPlanWarning>)>, EngineError> {
+        if edge.filter.is_always_false()
+            || edge
+                .label_filter_ids
+                .as_ref()
+                .is_some_and(|label_ids| label_ids.is_empty())
+        {
+            let cost = EdgePhysicalPlan::Empty.plan_cost();
+            return Ok(Some((
+                cost,
+                "source=EmptyResult; reason=always_false_or_empty_label_filter".to_string(),
+                Vec::new(),
+            )));
+        }
+
+        let label_branches: Vec<Option<u32>> = match edge.label_filter_ids.as_deref() {
+            Some(label_ids) => label_ids.iter().copied().map(Some).collect(),
+            None => vec![None],
+        };
+        let mut drivers = Vec::new();
+        let mut warnings = Vec::new();
+        let mut details = Vec::new();
+        for label_id in label_branches {
+            let normalized = NormalizedEdgeQuery {
+                label_id,
+                ids: edge.candidate_edge_ids.clone(),
+                from_ids: Vec::new(),
+                to_ids: Vec::new(),
+                endpoint_ids: Vec::new(),
+                filter: edge.filter.clone(),
+                allow_full_scan: query.options.allow_full_scan,
+                page: PageRequest {
+                    limit: Some(query.options.max_frontier.saturating_add(1)),
+                    after: None,
+                },
+                warnings: Vec::new(),
+            };
+            let planned = match self.plan_normalized_edge_query(&normalized) {
+                Ok(planned) => planned,
+                Err(EngineError::InvalidOperation(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            for warning in &planned.warnings {
+                push_query_warning(&mut warnings, *warning);
+            }
+            details.push(format!(
+                "label_id={label_id:?}; source={:?}; estimated_candidates={:?}",
+                planned.driver.plan_node(),
+                planned.estimated_candidate_count()
+            ));
+            drivers.push(planned.driver);
+        }
+
+        if drivers.is_empty() {
+            return Ok(None);
+        }
+        let driver = EdgePhysicalPlan::union(drivers);
+        let mut cost = driver.plan_cost();
+        cost.estimated_work = graph_row_edge_source_materialization_work(&driver);
+        finalize_plan_warnings(&mut warnings);
+        Ok(Some((
+            cost,
+            format!("source=EdgeCandidateSource; {}", details.join(" | ")),
+            warnings,
+        )))
+    }
+
+    fn plan_graph_row_physical(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+    ) -> Result<GraphRowPhysicalPlan, EngineError> {
+        let known_node_ids = runtime
+            .nodes
+            .iter()
+            .map(|node| self.graph_row_known_node_ids_for_fanout(node))
+            .collect::<Vec<_>>();
+        let target_selectivities = runtime
+            .nodes
+            .iter()
+            .map(|node| self.graph_row_target_selectivity(node))
+            .collect::<Vec<_>>();
+        let edge_source_costs = runtime
+            .edges
+            .iter()
+            .map(|edge| self.graph_row_edge_source_plan_cost(query, edge))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if runtime.edges.is_empty() {
+            let initial_driver = if runtime.nodes.len() == 1 {
+                GraphRowInitialDriver::Node {
+                    node_index: 0,
+                    alias: runtime.nodes[0].alias.clone(),
+                }
+            } else {
+                GraphRowInitialDriver::Empty {
+                    reason: "no required fixed edge segment".to_string(),
+                }
+            };
+            return Ok(GraphRowPhysicalPlan {
+                initial_driver,
+                edge_order: Vec::new(),
+                segments: Vec::new(),
+                edge_source_choices: Vec::new(),
+                alternatives: Vec::new(),
+                notes: self.graph_row_physical_plan_notes(query),
+            });
+        }
+
+        let fallback_segment;
+        let required_segments = if runtime.required_segments.is_empty() {
+            fallback_segment = GraphRowRequiredSegment {
+                edge_indices: (0..runtime.edges.len()).collect(),
+                barriers_before: Vec::new(),
+            };
+            std::slice::from_ref(&fallback_segment)
+        } else {
+            runtime.required_segments.as_slice()
+        };
+
+        let mut initial_driver = GraphRowInitialDriver::Empty {
+            reason: "no required fixed edge segment".to_string(),
+        };
+        let mut edge_order = Vec::with_capacity(runtime.edges.len());
+        let mut segments = Vec::with_capacity(required_segments.len());
+        let mut edge_source_choices = vec![None; runtime.edges.len()];
+        let mut alternatives = Vec::new();
+
+        for (segment_index, segment) in required_segments.iter().enumerate() {
+            let planned = self.plan_graph_row_physical_segment(
+                query,
+                runtime,
+                segment,
+                segment_index,
+                &edge_source_costs,
+                &known_node_ids,
+                &target_selectivities,
+            )?;
+            if segment_index == 0 {
+                initial_driver = planned.segment.initial_driver.clone();
+            }
+            for (edge_index, choice) in &planned.source_choices {
+                if let Some(slot) = edge_source_choices.get_mut(*edge_index) {
+                    *slot = Some(*choice);
+                }
+            }
+            edge_order.extend(planned.segment.edge_order.iter().copied());
+            alternatives.extend(planned.alternatives);
+            segments.push(planned.segment);
+        }
+
+        Ok(GraphRowPhysicalPlan {
+            initial_driver,
+            edge_order,
+            segments,
+            edge_source_choices,
+            alternatives,
+            notes: self.graph_row_physical_plan_notes(query),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_graph_row_physical_segment(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        segment: &GraphRowRequiredSegment,
+        segment_index: usize,
+        edge_source_costs: &[GraphRowEdgeSourcePlanCost],
+        known_node_ids: &[Option<Vec<u64>>],
+        target_selectivities: &[Option<(u64, u64)>],
+    ) -> Result<GraphRowPhysicalSegmentPlan, EngineError> {
+        let mut alternatives = Vec::new();
+        let mut candidates = Vec::new();
+        let mut segment_node_aliases = BTreeSet::new();
+        for &edge_index in &segment.edge_indices {
+            let edge = &runtime.edges[edge_index];
+            segment_node_aliases.insert(edge.from_alias.as_str());
+            segment_node_aliases.insert(edge.to_alias.as_str());
+        }
+
+        for (node_index, node) in runtime.nodes.iter().enumerate() {
+            if !segment_node_aliases.contains(node.alias.as_str()) {
+                continue;
+            }
+            if !graph_row_node_query_has_anchor(&node.query) {
+                alternatives.push(GraphRowPlanAlternative {
+                    chosen: false,
+                    kind: "RejectedNodeAnchor".to_string(),
+                    detail: format!(
+                        "segment={segment_index}; alias={}; reason=no legal initial candidate source",
+                        node.alias
+                    ),
+                    decision: None,
+                    cost: None,
+                });
+                continue;
+            }
+            let mut anchor_query = node.query.clone();
+            anchor_query.page.limit =
+                Some(query.options.max_intermediate_bindings.saturating_add(1));
+            match self.plan_normalized_node_query(&anchor_query) {
+                Ok(planned) => {
+                    let mut bound = BTreeSet::new();
+                    bound.insert(node.alias.clone());
+                    let visited = vec![false; runtime.edges.len()];
+                    let anchor_cost = planned.driver.plan_cost();
+                    let initial_frontier = planned.estimated_candidate_count().unwrap_or(1).max(1);
+                    let (edge_order, source_choices, cost) = self.graph_row_plan_from_frontier(
+                        query,
+                        runtime,
+                        &segment.edge_indices,
+                        bound,
+                        visited,
+                        anchor_cost,
+                        initial_frontier,
+                        edge_source_costs,
+                        known_node_ids,
+                        target_selectivities,
+                        format!("node:{}:{node_index}", node.alias),
+                    )?;
+                    candidates.push((
+                        GraphRowInitialDriver::Node {
+                            node_index,
+                            alias: node.alias.clone(),
+                        },
+                        edge_order,
+                        source_choices,
+                        cost,
+                        "NodeAnchor".to_string(),
+                        format!(
+                            "segment={segment_index}; alias={}; source={:?}; estimated_candidates={:?}; warnings={:?}",
+                            node.alias,
+                            planned.driver.plan_node(),
+                            planned.estimated_candidate_count(),
+                            planned.warnings
+                        ),
+                    ));
+                }
+                Err(error) => alternatives.push(GraphRowPlanAlternative {
+                    chosen: false,
+                    kind: "RejectedNodeAnchor".to_string(),
+                    detail: format!("segment={segment_index}; alias={}; reason={error}", node.alias),
+                    decision: None,
+                    cost: None,
+                }),
+            }
+        }
+
+        for &edge_index in &segment.edge_indices {
+            let edge = &runtime.edges[edge_index];
+            let Some((anchor_cost, source_detail, warnings)) =
+                edge_source_costs[edge_index].clone()
+            else {
+                alternatives.push(GraphRowPlanAlternative {
+                    chosen: false,
+                    kind: "RejectedEdgeAnchor".to_string(),
+                    detail: format!(
+                        "segment={segment_index}; edge={}; reason=no legal unbound edge candidate source without full scan opt-in",
+                        edge.explain_name()
+                    ),
+                    decision: None,
+                    cost: None,
+                });
+                continue;
+            };
+            let mut bound = BTreeSet::new();
+            bound.insert(edge.from_alias.clone());
+            bound.insert(edge.to_alias.clone());
+            let mut visited = vec![false; runtime.edges.len()];
+            visited[edge_index] = true;
+            let initial_frontier = anchor_cost.estimated_candidates.unwrap_or(1).max(1);
+            let (mut edge_order, mut source_choices, cost) = self.graph_row_plan_from_frontier(
+                query,
+                runtime,
+                &segment.edge_indices,
+                bound,
+                visited,
+                anchor_cost,
+                initial_frontier,
+                edge_source_costs,
+                known_node_ids,
+                target_selectivities,
+                format!("edge:{}:{edge_index}", edge.explain_name()),
+            )?;
+            edge_order.insert(0, edge_index);
+            source_choices.insert(0, (edge_index, graph_row_initial_edge_source_choice(edge)));
+            candidates.push((
+                GraphRowInitialDriver::Edge {
+                    edge_index,
+                    edge_name: edge.explain_name(),
+                },
+                edge_order,
+                source_choices,
+                cost,
+                "EdgeAnchor".to_string(),
+                format!(
+                    "segment={segment_index}; edge={}; {source_detail}; warnings={warnings:?}",
+                    edge.explain_name()
+                ),
+            ));
+        }
+
+        if candidates.is_empty() {
+            let edge_order = segment.edge_indices.clone();
+            let source_choices = edge_order
+                .iter()
+                .map(|edge_index| {
+                    (
+                        *edge_index,
+                        graph_row_deterministic_fallback_edge_source_choice(
+                            &runtime.edges[*edge_index],
+                            edge_source_costs[*edge_index].as_ref(),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            alternatives.push(GraphRowPlanAlternative {
+                chosen: true,
+                kind: "DeterministicFallback".to_string(),
+                detail: format!("segment={segment_index}; no legal early node or edge anchor; execution keeps query-order required edges and will enforce normal full-scan/cap rules"),
+                decision: Some("decision=chosen_deterministic_fallback".to_string()),
+                cost: None,
+            });
+            return Ok(GraphRowPhysicalSegmentPlan {
+                segment: GraphRowPhysicalSegment {
+                    segment_index,
+                    barriers_before: segment.barriers_before.clone(),
+                    initial_driver: GraphRowInitialDriver::Empty {
+                        reason: "deterministic query-order fallback".to_string(),
+                    },
+                    edge_order,
+                },
+                source_choices,
+                alternatives,
+            });
+        }
+
+        candidates.sort_by(|left, right| left.3.cmp(&right.3));
+        let chosen_cost = candidates
+            .first()
+            .map(|candidate| candidate.3.clone())
+            .expect("candidates must be non-empty");
+        let (initial_driver, edge_order, source_choices, _, _, _) =
+            candidates.first().cloned().expect("candidates must be non-empty");
+        for (candidate_index, (_, _, _, cost, kind, detail)) in candidates.into_iter().enumerate() {
+            let chosen = candidate_index == 0 && cost == chosen_cost;
+            let decision = if chosen {
+                "decision=chosen_lowest_cost_or_deterministic_tie_breaker".to_string()
+            } else {
+                format!(
+                    "decision=rejected_by={}",
+                    graph_row_plan_cost_rejection_reason(&cost, &chosen_cost)
+                )
+            };
+            alternatives.push(GraphRowPlanAlternative {
+                chosen,
+                kind,
+                detail,
+                decision: Some(decision),
+                cost: Some(cost),
+            });
+        }
+
+        Ok(GraphRowPhysicalSegmentPlan {
+            segment: GraphRowPhysicalSegment {
+                segment_index,
+                barriers_before: segment.barriers_before.clone(),
+                initial_driver,
+                edge_order,
+            },
+            source_choices,
+            alternatives,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_plan_from_frontier(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        segment_edge_indices: &[usize],
+        mut bound: BTreeSet<String>,
+        mut visited_edges: Vec<bool>,
+        anchor_cost: PlanCost,
+        initial_frontier: u64,
+        edge_source_costs: &[GraphRowEdgeSourcePlanCost],
+        known_node_ids: &[Option<Vec<u64>>],
+        target_selectivities: &[Option<(u64, u64)>],
+        canonical_key: String,
+    ) -> Result<GraphRowFrontierPlan, EngineError> {
+        let target_order_len = segment_edge_indices
+            .iter()
+            .filter(|edge_index| !visited_edges[**edge_index])
+            .count();
+        let mut order = Vec::with_capacity(target_order_len);
+        let mut source_choices = Vec::with_capacity(target_order_len);
+        let mut total_work = anchor_cost.estimated_work;
+        let mut frontier = initial_frontier.max(1);
+        let mut fanout_complete = true;
+        let mut confidence = EstimateConfidence::Exact;
+        let mut stale_risk = StalePostingRisk::Low;
+        let mut hub_risk = GraphRowHubRisk::Low;
+        let mut frontier_capped = frontier > GRAPH_ROW_FRONTIER_BUDGET as u64;
+        frontier = frontier.min(GRAPH_ROW_FRONTIER_BUDGET as u64 + 1);
+
+        while order.len() < target_order_len {
+            let mut choices = Vec::new();
+            for &edge_index in segment_edge_indices {
+                let edge = &runtime.edges[edge_index];
+                if visited_edges[edge_index] {
+                    continue;
+                }
+                let from_bound = bound.contains(&edge.from_alias);
+                let to_bound = bound.contains(&edge.to_alias);
+                if !from_bound && !to_bound {
+                    if bound.is_empty() {
+                        if let Some((cost, detail, _)) = edge_source_costs[edge_index].as_ref() {
+                            let estimated_expansion = cost
+                                .estimated_candidates
+                                .unwrap_or(GRAPH_ROW_FANOUT_UNKNOWN_WORK)
+                                .max(1);
+                            choices.push(GraphRowExpansionChoice {
+                                bound_rank: 2,
+                                complete: cost.estimated_candidates.is_some(),
+                                estimated_expansion,
+                                next_frontier: estimated_expansion
+                                    .min(GRAPH_ROW_FRONTIER_BUDGET as u64 + 1),
+                                confidence_rank: cost.confidence_rank,
+                                hub_risk_rank: GraphRowHubRisk::Unknown.rank(),
+                                coverage_rank: GraphRowFanoutCoverage::Missing.rank(),
+                                source_rank: cost.source_rank,
+                                canonical_key: format!(
+                                    "edge-source:{}:{edge_index}:{detail}",
+                                    edge.explain_name()
+                                ),
+                                edge_index,
+                                source_choice: GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource,
+                                fanout: None,
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                let from_index = *runtime.node_by_alias.get(&edge.from_alias).ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "graph row edge references missing node alias '{}'",
+                        edge.from_alias
+                    ))
+                })?;
+                let to_index = *runtime.node_by_alias.get(&edge.to_alias).ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "graph row edge references missing node alias '{}'",
+                        edge.to_alias
+                    ))
+                })?;
+                let bound_rank = if from_bound && to_bound { 0 } else { 1 };
+                let (source_index, target_index, direction, source_alias, target_alias) =
+                    if from_bound {
+                        (
+                            from_index,
+                            to_index,
+                            edge.direction,
+                            edge.from_alias.as_str(),
+                            edge.to_alias.as_str(),
+                        )
+                    } else {
+                        (
+                            to_index,
+                            from_index,
+                            reverse_graph_row_direction(edge.direction),
+                            edge.to_alias.as_str(),
+                            edge.from_alias.as_str(),
+                        )
+                    };
+                let fanout = self.graph_row_edge_fanout_estimate(
+                    direction,
+                    edge.label_filter_ids.as_deref(),
+                    known_node_ids[source_index].as_deref(),
+                    query,
+                    edge,
+                );
+                let raw_expansion = frontier.saturating_mul(fanout.cost_fanout());
+                let target_selectivity = if bound.contains(target_alias) {
+                    None
+                } else {
+                    target_selectivities[target_index]
+                };
+                let mut estimated_expansion =
+                    Self::apply_graph_row_target_selectivity(raw_expansion, target_selectivity);
+                if edge_filter_requires_hydration(&edge.filter) {
+                    estimated_expansion = estimated_expansion.saturating_add(raw_expansion);
+                }
+                let next_frontier = if bound.contains(target_alias) {
+                    frontier
+                } else {
+                    estimated_expansion.min(GRAPH_ROW_FRONTIER_BUDGET as u64 + 1)
+                };
+                choices.push(GraphRowExpansionChoice {
+                    bound_rank,
+                    complete: fanout.complete(),
+                    estimated_expansion,
+                    next_frontier,
+                    confidence_rank: fanout.confidence.rank(),
+                    hub_risk_rank: fanout.hub_risk.rank(),
+                    coverage_rank: fanout.coverage.rank(),
+                    source_rank: 2,
+                    canonical_key: format!(
+                        "adjacency:{}:{}:{}:{}:{edge_index}",
+                        edge.explain_name(),
+                        source_alias,
+                        target_alias,
+                        fanout.canonical_key
+                    ),
+                    edge_index,
+                    source_choice: GraphRowEdgeCandidateSourceChoice::EndpointAdjacency,
+                    fanout: Some(fanout),
+                });
+                if let Some((edge_source_cost, edge_source_detail, _)) =
+                    edge_source_costs[edge_index].as_ref()
+                {
+                    let edge_candidates = edge_source_cost
+                        .estimated_candidates
+                        .unwrap_or(GRAPH_ROW_FANOUT_UNKNOWN_WORK)
+                        .max(1);
+                    let edge_source_work = edge_source_cost
+                        .estimated_work
+                        .saturating_add(edge_candidates.saturating_mul(2));
+                    let edge_source_next_frontier = if bound.contains(target_alias) {
+                        frontier
+                    } else {
+                        edge_candidates.min(GRAPH_ROW_FRONTIER_BUDGET as u64 + 1)
+                    };
+                    choices.push(GraphRowExpansionChoice {
+                        bound_rank,
+                        complete: edge_source_cost.estimated_candidates.is_some(),
+                        estimated_expansion: edge_source_work,
+                        next_frontier: edge_source_next_frontier,
+                        confidence_rank: edge_source_cost.confidence_rank,
+                        hub_risk_rank: GraphRowHubRisk::Low.rank(),
+                        coverage_rank: GraphRowFanoutCoverage::Missing.rank(),
+                        source_rank: edge_source_cost.source_rank,
+                        canonical_key: format!(
+                            "bound-edge-source:{}:{edge_index}:{edge_source_detail}",
+                            edge.explain_name()
+                        ),
+                        edge_index,
+                        source_choice: GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource,
+                        fanout: None,
+                    });
+                }
+            }
+
+            choices.sort_by(|left, right| {
+                left.bound_rank.cmp(&right.bound_rank).then_with(|| {
+                    if left.complete && right.complete {
+                        left.estimated_expansion
+                            .cmp(&right.estimated_expansion)
+                            .then_with(|| left.next_frontier.cmp(&right.next_frontier))
+                            .then_with(|| left.confidence_rank.cmp(&right.confidence_rank))
+                            .then_with(|| left.hub_risk_rank.cmp(&right.hub_risk_rank))
+                            .then_with(|| left.coverage_rank.cmp(&right.coverage_rank))
+                            .then_with(|| left.source_rank.cmp(&right.source_rank))
+                            .then_with(|| left.canonical_key.cmp(&right.canonical_key))
+                            .then_with(|| left.edge_index.cmp(&right.edge_index))
+                    } else {
+                        left.edge_index
+                            .cmp(&right.edge_index)
+                            .then_with(|| left.canonical_key.cmp(&right.canonical_key))
+                            .then_with(|| left.source_rank.cmp(&right.source_rank))
+                    }
+                })
+            });
+
+            let Some(choice) = choices.into_iter().next() else {
+                break;
+            };
+            let edge = &runtime.edges[choice.edge_index];
+            visited_edges[choice.edge_index] = true;
+            bound.insert(edge.from_alias.clone());
+            bound.insert(edge.to_alias.clone());
+            order.push(choice.edge_index);
+            source_choices.push((choice.edge_index, choice.source_choice));
+            fanout_complete &= choice.complete;
+            total_work = total_work.saturating_add(choice.estimated_expansion);
+            frontier_capped |= choice.next_frontier > GRAPH_ROW_FRONTIER_BUDGET as u64;
+            frontier = choice
+                .next_frontier
+                .min(GRAPH_ROW_FRONTIER_BUDGET as u64 + 1);
+            if let Some(fanout) = choice.fanout {
+                confidence = weaker_confidence(confidence, fanout.confidence);
+                hub_risk = higher_graph_row_hub_risk(hub_risk, fanout.hub_risk);
+                if matches!(fanout.hub_risk, GraphRowHubRisk::High) {
+                    stale_risk = StalePostingRisk::Medium;
+                }
+            }
+        }
+
+        if order.len() != target_order_len {
+            fanout_complete = false;
+            total_work = anchor_cost.estimated_work;
+            for &edge_index in segment_edge_indices {
+                if !visited_edges[edge_index] {
+                    order.push(edge_index);
+                    source_choices.push((
+                        edge_index,
+                        graph_row_deterministic_fallback_edge_source_choice(
+                            &runtime.edges[edge_index],
+                            edge_source_costs[edge_index].as_ref(),
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok((
+            order,
+            source_choices,
+            GraphRowPlanCost {
+                anchor_cost: anchor_cost.clone(),
+                estimated_work: total_work,
+                simulated_frontier: frontier,
+                fanout_complete,
+                confidence_rank: confidence.rank(),
+                stale_risk_rank: stale_risk.rank(),
+                hub_risk_rank: hub_risk.rank(),
+                frontier_capped,
+                source_rank: anchor_cost.source_rank,
+                canonical_key,
+            },
+        ))
+    }
+
+    fn graph_row_physical_plan_notes(&self, query: &NormalizedGraphRowQuery) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.graph_row_has_unrolled_memtable_edges() {
+            notes.push(
+                "fanout confidence downgraded because active/immutable memtables are not represented by immutable adjacency rollups".to_string(),
+            );
+        }
+        if self.planner_stats.adjacency_rollups.is_empty() {
+            notes.push(
+                "missing fanout stats; deterministic legal-source tie-breakers preserve query correctness and logical order".to_string(),
+            );
+        }
+        if self
+            .planner_stats
+            .adjacency_rollups
+            .values()
+            .any(|rollup| rollup.coverage.has_uncovered())
+        {
+            notes.push(
+                "stale or partial adjacency stats coverage; fanout estimates are advisory and downgraded".to_string(),
+            );
+        }
+        if query.at_epoch.is_some() || !self.manifest.prune_policies.is_empty() {
+            notes.push(
+                "temporal/prune active state downgrades fanout confidence; final visibility verification remains authoritative".to_string(),
+            );
+        }
+        notes
+    }
+
     fn edge_metadata_filter_candidate_plan(
         &self,
         filter: &NormalizedEdgeFilter,
@@ -3487,6 +4337,69 @@ impl ReadView {
         Ok((Some(estimate), None))
     }
 
+    fn edge_equality_candidate_estimate_for_hash(
+        &self,
+        index_id: u64,
+        key: &str,
+        value: &PropValue,
+        value_hash: u64,
+    ) -> Result<(Option<PlannerEstimate>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        let mut count = self.memtable.secondary_eq_edge_count_at(
+            index_id,
+            key,
+            value,
+            self.snapshot_seq,
+        ) as u64;
+        if self.active_memtable_only_exact_estimates() {
+            return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
+        }
+        for epoch in &self.immutable_epochs {
+            count = count.saturating_add(epoch.memtable.secondary_eq_edge_count_at(
+                index_id,
+                key,
+                value,
+                self.snapshot_seq,
+            ) as u64);
+        }
+
+        let value_hashes = [value_hash];
+        let mut used_stats = false;
+        let mut used_fallback = false;
+        let mut stats_values_exact = true;
+        for segment in &self.segments {
+            if let Some(segment_estimate) = self.planner_stats.equality_segment_estimate(
+                index_id,
+                segment.segment_id,
+                &value_hashes,
+            ) {
+                used_stats = true;
+                stats_values_exact &= segment_estimate.exact;
+                count = count.saturating_add(segment_estimate.count);
+                continue;
+            }
+            used_fallback = true;
+            match segment.edge_secondary_eq_posting_count_if_present(index_id, value_hash) {
+                Ok(Some(posting_count)) => count = count.saturating_add(posting_count as u64),
+                Ok(None) => {
+                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                }
+                Err(error) => {
+                    return Ok((
+                        None,
+                        self.equality_sidecar_failure_followup(index_id, Some(error)),
+                    ));
+                }
+            }
+        }
+
+        let mut estimate =
+            self.planner_stats_estimate_from_rollup(count, used_stats, used_fallback, stats_values_exact);
+        if !used_stats {
+            estimate = estimate.with_current_posting_bound();
+        }
+        Ok((Some(estimate), None))
+    }
+
     fn edge_equality_candidate_probe(
         &self,
         query: &NormalizedEdgeQuery,
@@ -3549,23 +4462,104 @@ impl ReadView {
     fn ready_edge_range_candidate_ids(
         &self,
         index_id: u64,
-        domain: SecondaryIndexRangeDomain,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         max_ids: usize,
     ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
-        let lower_encoded = Self::encode_property_range_bound(domain, lower);
-        let upper_encoded = Self::encode_property_range_bound(domain, upper);
+        let lower_key = Self::encode_property_range_bound(lower);
+        let upper_key = Self::encode_property_range_bound(upper);
         match self.sources().edge_ids_by_secondary_range_index_limited(
             index_id,
-            lower_encoded,
-            upper_encoded,
+            lower_key,
+            upper_key,
             max_ids,
         ) {
             Ok(Some(ids)) => Ok((Some(ids), None)),
             Ok(None) => Ok((None, self.range_sidecar_failure_followup(index_id, None))),
             Err(error) => Ok((None, self.range_sidecar_failure_followup(index_id, Some(error)))),
         }
+    }
+
+    fn edge_range_candidate_estimate(
+        &self,
+        index_id: u64,
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+    ) -> Result<(Option<PlannerEstimate>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        let lower_key = Self::encode_property_range_bound(lower);
+        let upper_key = Self::encode_property_range_bound(upper);
+        let mut count = self
+            .memtable
+            .visible_secondary_range_entry_count(
+                index_id,
+                lower_key,
+                upper_key,
+                None,
+                self.snapshot_seq,
+            ) as u64;
+        if self.active_memtable_only_exact_estimates() {
+            return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
+        }
+        for epoch in &self.immutable_epochs {
+            count = count.saturating_add(
+                epoch
+                    .memtable
+                    .visible_secondary_range_entry_count(
+                        index_id,
+                        lower_key,
+                        upper_key,
+                        None,
+                        self.snapshot_seq,
+                    ) as u64,
+            );
+        }
+
+        let mut used_stats = false;
+        let mut used_fallback = false;
+        let mut stats_values_exact = true;
+        for segment in &self.segments {
+            if let Some(segment_estimate) = self.planner_stats.range_segment_estimate(
+                index_id,
+                segment.segment_id,
+                lower_key,
+                upper_key,
+            ) {
+                used_stats = true;
+                stats_values_exact &= segment_estimate.exact;
+                count = count.saturating_add(segment_estimate.count);
+                continue;
+            }
+            used_fallback = true;
+            match segment.count_edges_by_secondary_range_index_if_present(
+                index_id,
+                lower_key,
+                upper_key,
+            ) {
+                Ok(Some(entries)) => count = count.saturating_add(entries as u64),
+                Ok(None) => return Ok((None, self.range_sidecar_failure_followup(index_id, None))),
+                Err(error) => {
+                    return Ok((
+                        None,
+                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                    ));
+                }
+            }
+        }
+        #[cfg(test)]
+        if used_fallback {
+            self.note_range_planning_probe();
+        }
+
+        let mut estimate = self.planner_stats_estimate_from_rollup(
+            count,
+            used_stats,
+            used_fallback,
+            stats_values_exact,
+        );
+        if !used_stats {
+            estimate = estimate.with_current_posting_bound();
+        }
+        Ok((Some(estimate), None))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3579,12 +4573,21 @@ impl ReadView {
         upper: Option<&PropertyRangeBound>,
         budget: &mut BooleanPlanningBudget,
     ) -> Result<EdgeCandidateProbe, EngineError> {
-        let domain = Self::validate_property_range_bounds(lower, upper, None)?;
-        let Some(entry) = self.edge_property_index_entry(
-            label_id,
-            key,
-            &SecondaryIndexKind::Range { domain },
-        ) else {
+        let validated = Self::validate_property_range_bounds(lower, upper, None)?;
+        if validated.is_empty {
+            return Ok(EdgeCandidateProbe {
+                source: Some(PlannedEdgeCandidateSource::with_ids(
+                    EdgeQueryCandidateSourceKind::EdgePropertyRangeIndex,
+                    format!("edge_range_empty:{label_id}:{key}"),
+                    Vec::new(),
+                )),
+                warning: None,
+                followup: None,
+            });
+        }
+        let Some(entry) =
+            self.edge_property_index_entry(label_id, key, &SecondaryIndexKind::Range)
+        else {
             return Ok(EdgeCandidateProbe {
                 source: None,
                 warning: Some(QueryPlanWarning::MissingReadyIndex),
@@ -3599,221 +4602,73 @@ impl ReadView {
             });
         }
 
-        let lower_encoded = Self::encode_property_range_bound(domain, lower);
-        let upper_encoded = Self::encode_property_range_bound(domain, upper);
-        if let Some(stats_estimate) =
-            self.planner_stats
-                .range_index_estimate(entry.index_id, lower_encoded, upper_encoded)
-        {
-            let mut count = self
-                .memtable
-                .visible_secondary_range_entries(
-                    entry.index_id,
-                    lower_encoded,
-                    upper_encoded,
-                    None,
-                    self.snapshot_seq,
-                )
-                .len() as u64;
-            for epoch in &self.immutable_epochs {
-                count = count.saturating_add(
-                    epoch
-                        .memtable
-                        .visible_secondary_range_entries(
-                            entry.index_id,
-                            lower_encoded,
-                            upper_encoded,
-                            None,
-                            self.snapshot_seq,
-                        )
-                        .len() as u64,
-                );
-            }
-            count = count.saturating_add(stats_estimate.count);
-
-            let mut used_fallback = false;
-            let coverage = &self
-                .planner_stats
-                .range_index_rollups
-                .get(&entry.index_id)
-                .expect("range estimate must have matching rollup")
-                .coverage;
-            let uncovered_segments: Vec<&SegmentReader> = self
-                .segments
-                .iter()
-                .filter(|segment| !coverage.covers(segment.segment_id))
-                .map(|segment| segment.as_ref())
-                .collect();
-            if !uncovered_segments.is_empty() {
-                used_fallback = true;
-                let probe_limit = budget.probe_limit();
-                if probe_limit == 0 {
-                    return Ok(EdgeCandidateProbe {
-                        source: None,
-                        warning: Some(QueryPlanWarning::PlanningProbeBudgetExceeded),
-                        followup: None,
-                    });
-                }
-
-                #[cfg(test)]
-                self.note_range_planning_probe();
-
-                let mut fallback_ids = 0usize;
-                let total_read_limit = probe_limit.saturating_add(1);
-                for segment in uncovered_segments {
-                    let remaining_read_limit = total_read_limit.saturating_sub(fallback_ids);
-                    if remaining_read_limit == 0 {
-                        break;
-                    }
-                    match segment.find_edges_by_secondary_range_index_if_present_limited(
-                        entry.index_id,
-                        lower_encoded,
-                        upper_encoded,
-                        None,
-                        Some(remaining_read_limit),
-                    ) {
-                        Ok(Some(ids)) => {
-                            fallback_ids = fallback_ids.saturating_add(ids.len());
-                            if fallback_ids > probe_limit {
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            return Ok(EdgeCandidateProbe {
-                                source: None,
-                                warning: Some(QueryPlanWarning::MissingReadyIndex),
-                                followup: self.range_sidecar_failure_followup(entry.index_id, None),
-                            });
-                        }
-                        Err(error) => {
-                            return Ok(EdgeCandidateProbe {
-                                source: None,
-                                warning: Some(QueryPlanWarning::MissingReadyIndex),
-                                followup: self
-                                    .range_sidecar_failure_followup(entry.index_id, Some(error)),
-                            });
-                        }
-                    }
-                }
-                budget.consume_probe_ids(fallback_ids);
-                if fallback_ids > probe_limit {
-                    return Ok(EdgeCandidateProbe {
-                        source: None,
-                        warning: Some(if probe_limit < QUERY_RANGE_CANDIDATE_CAP {
-                            QueryPlanWarning::PlanningProbeBudgetExceeded
-                        } else {
-                            QueryPlanWarning::RangeCandidateCapExceeded
-                        }),
-                        followup: None,
-                    });
-                }
-                count = count.saturating_add(fallback_ids as u64);
-            }
-
-            let estimate = if self.active_memtable_only_exact_estimates() {
-                PlannerEstimate::exact_cheap(count)
-            } else {
-                self.planner_stats_estimate_from_rollup(
-                    count,
-                    true,
-                    used_fallback,
-                    stats_estimate.exact,
-                )
-            };
-            if cap_context.source_estimate_exceeds_cap(
-                EdgeQueryCandidateSourceKind::EdgePropertyRangeIndex,
-                query.page.limit,
-                estimate,
-            ) {
-                return Ok(EdgeCandidateProbe {
-                    source: None,
-                    warning: Some(QueryPlanWarning::RangeCandidateCapExceeded),
-                    followup: None,
-                });
-            }
-
-            return Ok(EdgeCandidateProbe {
-                source: Some(PlannedEdgeCandidateSource::edge_property_range_index(
-                    label_id,
-                    entry.index_id,
-                    key,
-                    domain,
-                    lower,
-                    upper,
-                    estimate,
-                )),
-                warning: None,
-                followup: None,
-            });
-        }
-
-        #[cfg(test)]
-        self.note_range_planning_probe();
-        let probe_limit = budget.probe_limit();
-        if probe_limit == 0 {
+        let (estimate, followup) = self.edge_range_candidate_estimate(entry.index_id, lower, upper)?;
+        let Some(estimate) = estimate else {
             return Ok(EdgeCandidateProbe {
                 source: None,
-                warning: Some(QueryPlanWarning::PlanningProbeBudgetExceeded),
-                followup: None,
+                warning: Some(QueryPlanWarning::MissingReadyIndex),
+                followup,
             });
-        }
-        let (ids, followup) = self.ready_edge_range_candidate_ids(
-            entry.index_id,
-            domain,
-            lower,
-            upper,
-            probe_limit + 1,
-        )?;
-        let estimate = match ids {
-            Some(ids) if ids.len() <= probe_limit => {
-                budget.consume_probe_ids(ids.len());
-                PlannerEstimate::exact_cheap(ids.len() as u64)
-            }
-            Some(ids) => {
-                budget.consume_probe_ids(ids.len().min(probe_limit + 1));
-                return Ok(EdgeCandidateProbe {
-                    source: None,
-                    warning: Some(if probe_limit < QUERY_RANGE_CANDIDATE_CAP {
-                        QueryPlanWarning::PlanningProbeBudgetExceeded
-                    } else {
-                        QueryPlanWarning::RangeCandidateCapExceeded
-                    }),
-                    followup,
-                });
-            }
-            None => {
-                return Ok(EdgeCandidateProbe {
-                    source: None,
-                    warning: Some(QueryPlanWarning::MissingReadyIndex),
-                    followup,
-                });
-            }
         };
-
         if cap_context.source_estimate_exceeds_cap(
             EdgeQueryCandidateSourceKind::EdgePropertyRangeIndex,
             query.page.limit,
             estimate,
         ) {
+            let probe_limit = budget.probe_limit();
+            if probe_limit == 0 {
+                return Ok(EdgeCandidateProbe {
+                    source: None,
+                    warning: Some(QueryPlanWarning::PlanningProbeBudgetExceeded),
+                    followup: None,
+                });
+            }
+            let (candidate_ids, followup) = self.ready_edge_range_candidate_ids(
+                entry.index_id,
+                lower,
+                upper,
+                probe_limit.saturating_add(1),
+            )?;
+            let Some(candidate_ids) = candidate_ids else {
+                return Ok(EdgeCandidateProbe {
+                    source: None,
+                    warning: Some(QueryPlanWarning::MissingReadyIndex),
+                    followup,
+                });
+            };
+            budget.consume_probe_ids(candidate_ids.len().min(probe_limit));
+            if candidate_ids.len() <= probe_limit {
+                let estimate = PlannerEstimate::exact_cheap(candidate_ids.len() as u64);
+                return Ok(EdgeCandidateProbe {
+                    source: Some(PlannedEdgeCandidateSource::edge_property_range_index(
+                        label_id,
+                        entry.index_id,
+                        key,
+                        lower,
+                        upper,
+                        estimate,
+                    )),
+                    warning: None,
+                    followup,
+                });
+            }
             return Ok(EdgeCandidateProbe {
                 source: None,
                 warning: Some(QueryPlanWarning::RangeCandidateCapExceeded),
-                followup: None,
+                followup,
             });
         }
-
         Ok(EdgeCandidateProbe {
             source: Some(PlannedEdgeCandidateSource::edge_property_range_index(
                 label_id,
                 entry.index_id,
                 key,
-                domain,
                 lower,
                 upper,
                 estimate,
             )),
             warning: None,
-            followup: None,
+            followup,
         })
     }
 
@@ -3957,8 +4812,12 @@ impl ReadView {
         let mut plans = Vec::new();
         let mut estimated_total = 0u64;
         for probe in &unique_values {
-            let (estimate, followup) =
-                self.edge_equality_candidate_estimate(entry.index_id, key, &probe.value)?;
+            let (estimate, followup) = self.edge_equality_candidate_estimate_for_hash(
+                entry.index_id,
+                key,
+                &probe.value,
+                probe.value_hash,
+            )?;
             if let Some(followup) = followup {
                 followups.push(followup);
             }
@@ -4380,6 +5239,70 @@ impl ReadView {
         Ok((Some(estimate), None))
     }
 
+    fn equality_candidate_estimate_for_hash(
+        &self,
+        index_id: u64,
+        key: &str,
+        value: &PropValue,
+        value_hash: u64,
+    ) -> Result<(Option<PlannerEstimate>, Option<SecondaryIndexReadFollowup>), EngineError> {
+        let mut count =
+            self.memtable.secondary_eq_node_count_at(
+                index_id,
+                key,
+                value,
+                self.snapshot_seq,
+            ) as u64;
+        if self.active_memtable_only_exact_estimates() {
+            return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
+        }
+        for epoch in &self.immutable_epochs {
+            count = count.saturating_add(epoch.memtable.secondary_eq_node_count_at(
+                index_id,
+                key,
+                value,
+                self.snapshot_seq,
+            ) as u64);
+        }
+
+        let value_hashes = [value_hash];
+        let mut used_stats = false;
+        let mut used_fallback = false;
+        let mut stats_values_exact = true;
+        for segment in &self.segments {
+            if let Some(segment_estimate) = self.planner_stats.equality_segment_estimate(
+                index_id,
+                segment.segment_id,
+                &value_hashes,
+            ) {
+                used_stats = true;
+                stats_values_exact &= segment_estimate.exact;
+                count = count.saturating_add(segment_estimate.count);
+                continue;
+            }
+            used_fallback = true;
+            match segment.secondary_eq_posting_count_if_present(index_id, value_hash) {
+                Ok(Some(posting_count)) => count = count.saturating_add(posting_count as u64),
+                Ok(None) => {
+                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                }
+                Err(error) => {
+                    return Ok((
+                        None,
+                        self.equality_sidecar_failure_followup(index_id, Some(error)),
+                    ));
+                }
+            }
+        }
+
+        let mut estimate =
+            self.planner_stats_estimate_from_rollup(count, used_stats, used_fallback, stats_values_exact);
+        if !used_stats {
+            estimate = estimate.with_current_posting_bound();
+        }
+        Ok((Some(estimate), None))
+    }
+
     fn sort_physical_plans_by_selectivity(&self, plans: &mut [NodePhysicalPlan]) {
         plans.sort_by(|left, right| {
             left.plan_cost().cmp(&right.plan_cost())
@@ -4683,8 +5606,12 @@ impl ReadView {
         let mut plans = Vec::new();
         let mut estimated_total = 0u64;
         for probe in &unique_values {
-            let (estimate, followup) =
-                self.equality_candidate_estimate(entry.index_id, key, &probe.value)?;
+            let (estimate, followup) = self.equality_candidate_estimate_for_hash(
+                entry.index_id,
+                key,
+                &probe.value,
+                probe.value_hash,
+            )?;
             if let Some(followup) = followup {
                 followups.push(followup);
             }
@@ -5133,6 +6060,7 @@ impl ReadView {
                 driver: NodePhysicalPlan::Empty,
                 cap_context: QueryCapContext::default(),
                 warnings,
+                followups: Vec::new(),
             });
         }
 
@@ -5174,6 +6102,7 @@ impl ReadView {
                 driver: NodePhysicalPlan::Empty,
                 cap_context,
                 warnings,
+                followups: filter_followups,
             });
         }
 
@@ -5230,6 +6159,7 @@ impl ReadView {
             driver,
             cap_context,
             warnings,
+            followups: filter_followups,
         })
     }
 
@@ -5519,1105 +6449,7 @@ impl ReadView {
         Ok(planned.explain_plan(public_inputs))
     }
 
-    fn normalized_node_pattern_has_initial_universe(pattern: &NormalizedNodePattern) -> bool {
-        !pattern.query.ids.is_empty()
-            || !pattern.query.keys.is_empty()
-            || normalized_query_has_label_anchor(&pattern.query)
-            || pattern.query.filter.is_always_false()
-    }
 
-    fn pattern_known_node_ids_for_fanout(
-        &self,
-        pattern: &NormalizedNodePattern,
-    ) -> Option<Vec<u64>> {
-        if !pattern.query.ids.is_empty() {
-            return Some(pattern.query.ids.clone());
-        }
-        if pattern.query.keys.is_empty()
-            || pattern.query.single_label_id.is_none()
-            || pattern.query.keys.len() as u64 > TINY_EXPLICIT_ANCHOR_MAX
-        {
-            return None;
-        }
-        self.key_lookup_candidate_ids(&pattern.query)
-            .ok()
-            .map(normalize_candidate_ids)
-    }
-
-    fn has_unrolled_memtable_edges(&self) -> bool {
-        self.memtable.edge_count() > 0
-            || self
-                .immutable_epochs
-                .iter()
-                .any(|epoch| epoch.memtable.edge_count() > 0)
-    }
-
-    fn planner_direction(direction: Direction) -> &'static [PlannerStatsDirection] {
-        match direction {
-            Direction::Outgoing => &[PlannerStatsDirection::Outgoing],
-            Direction::Incoming => &[PlannerStatsDirection::Incoming],
-            Direction::Both => &[
-                PlannerStatsDirection::Outgoing,
-                PlannerStatsDirection::Incoming,
-            ],
-        }
-    }
-
-    fn fanout_rollup_estimate(
-        &self,
-        direction: PlannerStatsDirection,
-        edge_label_id: Option<u32>,
-        coverage: FanoutCoverage,
-        confidence: EstimateConfidence,
-        canonical_key: String,
-        known_source_ids: Option<&[u64]>,
-    ) -> Option<FanoutEstimate> {
-        let rollup = self
-            .planner_stats
-            .adjacency_rollups
-            .get(&(direction, edge_label_id))?;
-        let coverage = if self.has_unrolled_memtable_edges() || rollup.coverage.has_uncovered() {
-            FanoutCoverage::GlobalFallback
-        } else {
-            coverage
-        };
-        let mut confidence = confidence;
-        if self.has_unrolled_memtable_edges() {
-            confidence = downgrade_confidence(confidence, FANOUT_CONFIDENCE_DOWNGRADE_STEP);
-        }
-        Some(FanoutEstimate::from_rollup(
-            rollup,
-            canonical_key,
-            coverage,
-            confidence,
-            known_source_ids,
-        ))
-    }
-
-    fn single_direction_fanout_estimate(
-        &self,
-        direction: PlannerStatsDirection,
-        label_filter_ids: Option<&[u32]>,
-        known_source_ids: Option<&[u64]>,
-    ) -> FanoutEstimate {
-        let direction_key = match direction {
-            PlannerStatsDirection::Outgoing => "out",
-            PlannerStatsDirection::Incoming => "in",
-        };
-        let Some(label_ids) = label_filter_ids else {
-            return self
-                .fanout_rollup_estimate(
-                    direction,
-                    None,
-                    FanoutCoverage::Complete,
-                    EstimateConfidence::High,
-                    format!("{direction_key}:global"),
-                    known_source_ids,
-                )
-                .unwrap_or_else(|| FanoutEstimate::unknown(format!("{direction_key}:global")));
-        };
-
-        if label_ids.len() == 1 {
-            let label_id = label_ids[0];
-            if let Some(estimate) = self.fanout_rollup_estimate(
-                direction,
-                Some(label_id),
-                FanoutCoverage::Complete,
-                EstimateConfidence::High,
-                format!("{direction_key}:label:{label_id}"),
-                known_source_ids,
-            ) {
-                return estimate;
-            }
-            if !self.has_unrolled_memtable_edges()
-                && self
-                    .planner_stats
-                    .adjacency_rollups
-                    .get(&(direction, None))
-                    .is_some_and(|rollup| !rollup.coverage.has_uncovered())
-            {
-                return FanoutEstimate::zero(format!("{direction_key}:label:{label_id}:absent"));
-            }
-            return self
-                .fanout_rollup_estimate(
-                    direction,
-                    None,
-                    FanoutCoverage::GlobalFallback,
-                    EstimateConfidence::Low,
-                    format!("{direction_key}:global_fallback:{label_id}"),
-                    known_source_ids,
-                )
-                .unwrap_or_else(|| {
-                    FanoutEstimate::unknown(format!("{direction_key}:missing:{label_id}"))
-                });
-        }
-
-        let mut combined: Option<FanoutEstimate> = None;
-        for label_id in label_ids {
-            let Some(estimate) = self.fanout_rollup_estimate(
-                direction,
-                Some(*label_id),
-                FanoutCoverage::Complete,
-                EstimateConfidence::High,
-                format!("{direction_key}:label:{label_id}"),
-                known_source_ids,
-            ) else {
-                return self
-                    .fanout_rollup_estimate(
-                        direction,
-                        None,
-                        FanoutCoverage::GlobalFallback,
-                        EstimateConfidence::Low,
-                        format!("{direction_key}:global_fallback:{label_ids:?}"),
-                        known_source_ids,
-                    )
-                    .unwrap_or_else(|| {
-                        FanoutEstimate::unknown(format!("{direction_key}:missing:{label_ids:?}"))
-                    });
-            };
-            combined = Some(match combined {
-                Some(current) => current.combine_sum(
-                    estimate,
-                    format!("{direction_key}:labels:{label_ids:?}"),
-                ),
-                None => estimate,
-            });
-        }
-
-        combined.unwrap_or_else(|| FanoutEstimate::unknown(format!("{direction_key}:empty")))
-    }
-
-    fn pattern_edge_fanout_estimate(
-        &self,
-        direction: Direction,
-        label_filter_ids: Option<&[u32]>,
-        known_source_ids: Option<&[u64]>,
-        query: &NormalizedGraphPatternQuery,
-        edge: &NormalizedEdgePattern,
-    ) -> FanoutEstimate {
-        let mut combined: Option<FanoutEstimate> = None;
-        for planner_direction in Self::planner_direction(direction) {
-            let estimate = self.single_direction_fanout_estimate(
-                *planner_direction,
-                label_filter_ids,
-                known_source_ids,
-            );
-            combined = Some(match combined {
-                Some(current) => current.combine_sum(
-                    estimate,
-                    format!("{direction:?}:{:?}", label_filter_ids.unwrap_or(&[])),
-                ),
-                None => estimate,
-            });
-        }
-        let mut estimate =
-            combined.unwrap_or_else(|| FanoutEstimate::unknown(format!("{direction:?}:missing")));
-        let mut downgrade_steps = 0u8;
-        if query.at_epoch.is_some() {
-            downgrade_steps = downgrade_steps.saturating_add(1);
-        }
-        if !self.manifest.prune_policies.is_empty() {
-            downgrade_steps = downgrade_steps.saturating_add(1);
-        }
-        if edge_filter_requires_hydration(&edge.filter) {
-            downgrade_steps = downgrade_steps.saturating_add(1);
-        }
-        if downgrade_steps > 0 {
-            estimate.confidence = downgrade_confidence(estimate.confidence, downgrade_steps);
-        }
-        estimate
-    }
-
-    fn pattern_target_selectivity(
-        &self,
-        pattern: &NormalizedNodePattern,
-    ) -> Option<(u64, u64)> {
-        if !Self::normalized_node_pattern_has_initial_universe(pattern)
-            || pattern.query.filter.is_always_false()
-        {
-            return None;
-        }
-        let planned = self.plan_normalized_node_query(&pattern.query).ok()?;
-        let target_count = planned.estimated_candidate_count()?;
-        let universe_count = self.full_scan_estimate().known_upper_bound()?;
-        if universe_count == 0 || target_count >= universe_count {
-            None
-        } else {
-            Some((target_count, universe_count))
-        }
-    }
-
-    fn apply_pattern_target_selectivity(
-        raw_expansion: u64,
-        target_selectivity: Option<(u64, u64)>,
-    ) -> u64 {
-        let Some((target_count, universe_count)) = target_selectivity else {
-            return raw_expansion;
-        };
-        if universe_count == 0 {
-            return raw_expansion;
-        }
-        raw_expansion
-            .saturating_mul(target_count)
-            .div_ceil(universe_count)
-            .max(1)
-            .min(raw_expansion)
-    }
-
-    fn plan_normalized_node_pattern_anchor(
-        &self,
-        pattern: &NormalizedNodePattern,
-    ) -> Result<Option<PlannedNodeQuery>, EngineError> {
-        if !Self::normalized_node_pattern_has_initial_universe(pattern) {
-            return Ok(None);
-        }
-
-        let mut anchor_query = pattern.query.clone();
-        anchor_query.allow_full_scan = false;
-        let planned = self.plan_normalized_node_query(&anchor_query)?;
-        if matches!(
-            &planned.driver,
-            NodePhysicalPlan::Source(source)
-                if source.kind == NodeQueryCandidateSourceKind::FallbackFullNodeScan
-        ) {
-            return Err(EngineError::InvalidOperation(
-                "pattern query cannot use a full node scan anchor".into(),
-            ));
-        }
-        Ok(Some(planned))
-    }
-
-    #[allow(dead_code)]
-    fn planned_pattern_expansion_order_legacy(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        anchor_index: usize,
-    ) -> Vec<usize> {
-        let mut bound = vec![false; query.nodes.len()];
-        bound[anchor_index] = true;
-        let mut visited_edges = vec![false; query.edges.len()];
-        let mut order = Vec::with_capacity(query.edges.len());
-
-        while order.len() < query.edges.len() {
-            let mut candidates = Vec::new();
-            for (edge_index, edge) in query.edges.iter().enumerate() {
-                if visited_edges[edge_index] {
-                    continue;
-                }
-                let from_bound = bound[edge.from_index];
-                let to_bound = bound[edge.to_index];
-                if !from_bound && !to_bound {
-                    continue;
-                }
-                let both_bound_rank = if from_bound && to_bound { 0 } else { 1 };
-                let alias_key = edge.alias.as_deref().unwrap_or("");
-                candidates.push((
-                    both_bound_rank,
-                    alias_key,
-                    query.nodes[edge.from_index].alias.as_str(),
-                    query.nodes[edge.to_index].alias.as_str(),
-                    edge_index,
-                ));
-            }
-            candidates.sort_unstable();
-            let Some((_, _, _, _, edge_index)) = candidates.first().copied() else {
-                break;
-            };
-            visited_edges[edge_index] = true;
-            let edge = &query.edges[edge_index];
-            bound[edge.from_index] = true;
-            bound[edge.to_index] = true;
-            order.push(edge_index);
-        }
-
-        order
-    }
-
-    fn planned_pattern_expansion_order(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        anchor_index: usize,
-        anchor_plan: &PlannedNodeQuery,
-        known_node_ids: &[Option<Vec<u64>>],
-        target_selectivities: &[Option<(u64, u64)>],
-    ) -> (Vec<usize>, PatternPlanCost) {
-        let mut bound = vec![false; query.nodes.len()];
-        bound[anchor_index] = true;
-        let visited_edges = vec![false; query.edges.len()];
-        self.planned_pattern_expansion_order_from_frontier(
-            query,
-            bound,
-            visited_edges,
-            anchor_plan.driver.plan_cost(),
-            anchor_plan.estimated_candidate_count().unwrap_or(1).max(1),
-            known_node_ids,
-            target_selectivities,
-            format!("{}:{anchor_index}", query.nodes[anchor_index].alias),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn planned_pattern_expansion_order_from_frontier(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        mut bound: Vec<bool>,
-        mut visited_edges: Vec<bool>,
-        anchor_cost: PlanCost,
-        initial_frontier: u64,
-        known_node_ids: &[Option<Vec<u64>>],
-        target_selectivities: &[Option<(u64, u64)>],
-        canonical_key: String,
-    ) -> (Vec<usize>, PatternPlanCost) {
-        let target_order_len = visited_edges.iter().filter(|visited| !**visited).count();
-        let mut order = Vec::with_capacity(target_order_len);
-        let mut total_work = anchor_cost.estimated_work;
-        let mut frontier = initial_frontier.max(1);
-        let mut fanout_complete = true;
-        let mut confidence = EstimateConfidence::Exact;
-        let mut stale_risk = StalePostingRisk::Low;
-        let mut frontier_capped = frontier > PATTERN_FRONTIER_BUDGET as u64;
-        frontier = frontier.min(PATTERN_FRONTIER_BUDGET as u64 + 1);
-
-        while order.len() < target_order_len {
-            let mut choices = Vec::new();
-            for (edge_index, edge) in query.edges.iter().enumerate() {
-                if visited_edges[edge_index] {
-                    continue;
-                }
-                let from_bound = bound[edge.from_index];
-                let to_bound = bound[edge.to_index];
-                if !from_bound && !to_bound {
-                    continue;
-                }
-                let both_bound_rank = if from_bound && to_bound { 0 } else { 1 };
-                let (source_index, target_index, direction) = if from_bound {
-                    (edge.from_index, edge.to_index, edge.direction)
-                } else {
-                    (
-                        edge.to_index,
-                        edge.from_index,
-                        reverse_pattern_direction(edge.direction),
-                    )
-                };
-                let fanout = self.pattern_edge_fanout_estimate(
-                    direction,
-                    edge.label_filter_ids.as_deref(),
-                    known_node_ids[source_index].as_deref(),
-                    query,
-                    edge,
-                );
-                let raw_expansion = frontier.saturating_mul(fanout.cost_fanout());
-                let target_selectivity = if bound[target_index] {
-                    None
-                } else {
-                    target_selectivities[target_index]
-                };
-                let mut estimated_expansion =
-                    Self::apply_pattern_target_selectivity(raw_expansion, target_selectivity);
-                if edge_filter_requires_hydration(&edge.filter) {
-                    estimated_expansion = estimated_expansion.saturating_add(raw_expansion);
-                }
-                let next_frontier = if bound[target_index] {
-                    frontier
-                } else {
-                    estimated_expansion.min(PATTERN_FRONTIER_BUDGET as u64 + 1)
-                };
-                let alias_key = edge.alias.as_deref().unwrap_or("");
-                choices.push((
-                    both_bound_rank,
-                    fanout.complete(),
-                    estimated_expansion,
-                    next_frontier,
-                    fanout.confidence.rank(),
-                    fanout.hub_risk.rank(),
-                    fanout.coverage.rank(),
-                    alias_key,
-                    query.nodes[edge.from_index].alias.as_str(),
-                    query.nodes[edge.to_index].alias.as_str(),
-                    edge_index,
-                    fanout,
-                ));
-            }
-            choices.sort_by(|left, right| {
-                left.0.cmp(&right.0).then_with(|| {
-                    if left.1 && right.1 {
-                        left.2
-                            .cmp(&right.2)
-                            .then_with(|| left.3.cmp(&right.3))
-                            .then_with(|| left.4.cmp(&right.4))
-                            .then_with(|| left.5.cmp(&right.5))
-                            .then_with(|| left.6.cmp(&right.6))
-                            .then_with(|| left.7.cmp(right.7))
-                            .then_with(|| left.8.cmp(right.8))
-                            .then_with(|| left.9.cmp(right.9))
-                            .then_with(|| left.10.cmp(&right.10))
-                    } else {
-                        left.7
-                            .cmp(right.7)
-                            .then_with(|| left.8.cmp(right.8))
-                            .then_with(|| left.9.cmp(right.9))
-                            .then_with(|| left.10.cmp(&right.10))
-                    }
-                })
-            });
-            let Some((
-                _,
-                complete,
-                estimated_expansion,
-                next_frontier,
-                _,
-                _,
-                _,
-                _,
-                _,
-                _,
-                edge_index,
-                fanout,
-            )) = choices.into_iter().next()
-            else {
-                break;
-            };
-            visited_edges[edge_index] = true;
-            let edge = &query.edges[edge_index];
-            bound[edge.from_index] = true;
-            bound[edge.to_index] = true;
-            order.push(edge_index);
-            fanout_complete &= complete;
-            confidence = weaker_confidence(confidence, fanout.confidence);
-            if fanout.hub_risk == FanoutHubRisk::High {
-                stale_risk = StalePostingRisk::Medium;
-            }
-            total_work = total_work.saturating_add(estimated_expansion);
-            frontier_capped |= next_frontier > PATTERN_FRONTIER_BUDGET as u64;
-            frontier = next_frontier.min(PATTERN_FRONTIER_BUDGET as u64 + 1);
-        }
-
-        if order.len() != target_order_len {
-            fanout_complete = false;
-            total_work = anchor_cost.estimated_work;
-        }
-
-        let cost = PatternPlanCost {
-            anchor_cost,
-            estimated_work: total_work,
-            simulated_frontier: frontier,
-            fanout_complete,
-            confidence_rank: confidence.rank(),
-            stale_risk_rank: stale_risk.rank(),
-            frontier_capped,
-            canonical_key,
-        };
-        (order, cost)
-    }
-
-    fn pattern_edge_anchor_query(
-        label_id: Option<u32>,
-        filter: NormalizedEdgeFilter,
-    ) -> NormalizedEdgeQuery {
-        NormalizedEdgeQuery {
-            label_id,
-            ids: Vec::new(),
-            from_ids: Vec::new(),
-            to_ids: Vec::new(),
-            endpoint_ids: Vec::new(),
-            filter,
-            allow_full_scan: false,
-            page: PageRequest {
-                limit: Some(PATTERN_FRONTIER_BUDGET),
-                after: None,
-            },
-            warnings: Vec::new(),
-        }
-    }
-
-    fn pattern_edge_anchor_cap_context(&self, label_id: Option<u32>) -> EdgeQueryCapContext {
-        EdgeQueryCapContext {
-            cheapest_legal_universe: Some(
-                label_id
-                    .map(|label_id| self.edge_label_estimate(label_id))
-                    .unwrap_or_else(|| self.edge_full_scan_estimate()),
-            ),
-        }
-    }
-
-    fn edge_plan_exceeds_pattern_anchor_cap(
-        &self,
-        edge_query: &NormalizedEdgeQuery,
-        cap_context: EdgeQueryCapContext,
-        plan: &EdgePhysicalPlan,
-    ) -> bool {
-        if matches!(plan, EdgePhysicalPlan::Empty) {
-            return false;
-        }
-        plan.estimate_exceeds_cap(cap_context, edge_query.page.limit)
-    }
-
-    fn bounded_edge_label_anchor_plan(
-        &self,
-        edge_query: &NormalizedEdgeQuery,
-        cap_context: EdgeQueryCapContext,
-        label_id: u32,
-    ) -> Option<EdgePhysicalPlan> {
-        let source = PlannedEdgeCandidateSource::edge_label_index(
-            label_id,
-            self.edge_label_estimate(label_id),
-        );
-        if cap_context.source_estimate_exceeds_cap(
-            source.kind,
-            edge_query.page.limit,
-            source.estimate,
-        ) {
-            return None;
-        }
-        Some(EdgePhysicalPlan::source(source))
-    }
-
-    fn pattern_edge_anchor_cap_context_for_label_filter(
-        &self,
-        label_filter_ids: Option<&[u32]>,
-    ) -> EdgeQueryCapContext {
-        match label_filter_ids {
-            Some([label_id]) => self.pattern_edge_anchor_cap_context(Some(*label_id)),
-            Some(label_ids) => {
-                let count = label_ids.iter().fold(0u64, |total, label_id| {
-                    total.saturating_add(
-                        self.edge_label_estimate(*label_id)
-                            .known_upper_bound()
-                            .unwrap_or(u64::MAX / 4),
-                    )
-                });
-                EdgeQueryCapContext {
-                    cheapest_legal_universe: Some(PlannerEstimate::upper_bound(count)),
-                }
-            }
-            None => self.pattern_edge_anchor_cap_context(None),
-        }
-    }
-
-    fn pattern_edge_bounded_label_fallback_plan(
-        &self,
-        edge: &NormalizedEdgePattern,
-    ) -> Option<PlannedEdgeQuery> {
-        let label_ids = edge.label_filter_ids.as_deref()?;
-        let edge_query = Self::pattern_edge_anchor_query(None, edge.filter.clone());
-        let cap_context =
-            self.pattern_edge_anchor_cap_context_for_label_filter(edge.label_filter_ids.as_deref());
-        let driver = match label_ids {
-            [label_id] => {
-                let branch_query = Self::pattern_edge_anchor_query(Some(*label_id), edge.filter.clone());
-                let branch_cap_context = self.pattern_edge_anchor_cap_context(Some(*label_id));
-                self.bounded_edge_label_anchor_plan(&branch_query, branch_cap_context, *label_id)?
-            }
-            [] => return None,
-            label_ids => {
-                let mut branches = Vec::with_capacity(label_ids.len());
-                for &label_id in label_ids {
-                    let branch_query =
-                        Self::pattern_edge_anchor_query(Some(label_id), edge.filter.clone());
-                    let branch_cap_context = self.pattern_edge_anchor_cap_context(Some(label_id));
-                    branches.push(self.bounded_edge_label_anchor_plan(
-                        &branch_query,
-                        branch_cap_context,
-                        label_id,
-                    )?);
-                }
-                EdgePhysicalPlan::union(branches)
-            }
-        };
-        if self.edge_plan_exceeds_pattern_anchor_cap(&edge_query, cap_context, &driver) {
-            return None;
-        }
-        Some(PlannedEdgeQuery {
-            driver,
-            cap_context,
-            warnings: Vec::new(),
-            followups: Vec::new(),
-        })
-    }
-
-    fn pattern_edge_bounded_metadata_fallback_plan(
-        &self,
-        edge: &NormalizedEdgePattern,
-        availability: EdgeMetadataSidecarAvailability,
-    ) -> Option<PlannedEdgeQuery> {
-        let edge_query = Self::pattern_edge_anchor_query(None, edge.filter.clone());
-        let cap_context =
-            self.pattern_edge_anchor_cap_context_for_label_filter(edge.label_filter_ids.as_deref());
-        let driver = match edge.label_filter_ids.as_deref() {
-            Some([label_id]) => {
-                self.edge_metadata_filter_candidate_plan(&edge.filter, Some(*label_id), availability)?
-            }
-            Some([]) => return None,
-            Some(label_ids) => {
-                let mut branches = Vec::with_capacity(label_ids.len());
-                for &label_id in label_ids {
-                    branches.push(self.edge_metadata_filter_candidate_plan(
-                        &edge.filter,
-                        Some(label_id),
-                        availability,
-                    )?);
-                }
-                EdgePhysicalPlan::union(branches)
-            }
-            None => self.edge_metadata_filter_candidate_plan(&edge.filter, None, availability)?,
-        };
-        if self.edge_plan_exceeds_pattern_anchor_cap(&edge_query, cap_context, &driver) {
-            return None;
-        }
-        Some(PlannedEdgeQuery {
-            driver,
-            cap_context,
-            warnings: Vec::new(),
-            followups: Vec::new(),
-        })
-    }
-
-    fn pattern_edge_anchor_local_fallback_plans(
-        &self,
-        edge: &NormalizedEdgePattern,
-        availability: EdgeMetadataSidecarAvailability,
-        primary: &EdgePhysicalPlan,
-    ) -> Vec<PlannedEdgeQuery> {
-        let primary_key = primary.canonical_key();
-        let mut keys = vec![primary_key];
-        let mut fallbacks = Vec::new();
-        for candidate in [
-            self.pattern_edge_bounded_metadata_fallback_plan(edge, availability),
-            self.pattern_edge_bounded_label_fallback_plan(edge),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let key = candidate.driver.canonical_key();
-            if !keys.iter().any(|existing| existing == &key) {
-                keys.push(key);
-                fallbacks.push(candidate);
-            }
-        }
-        fallbacks.sort_by(|left, right| left.driver.plan_cost().cmp(&right.driver.plan_cost()));
-        fallbacks
-    }
-
-    fn plan_pattern_edge_anchor_for_labeled_branch(
-        &self,
-        edge: &NormalizedEdgePattern,
-        label_id: u32,
-        availability: EdgeMetadataSidecarAvailability,
-    ) -> Result<Option<PatternEdgeLabeledBranchPlan>, EngineError>
-    {
-        let edge_query = Self::pattern_edge_anchor_query(Some(label_id), edge.filter.clone());
-        let cap_context = self.pattern_edge_anchor_cap_context(Some(label_id));
-        let mut warnings = Vec::new();
-        let mut followups = Vec::new();
-
-        let plan = if edge.filter.is_always_false() {
-            Some(EdgePhysicalPlan::Empty)
-        } else if edge.filter.is_always_true() {
-            self.bounded_edge_label_anchor_plan(&edge_query, cap_context, label_id)
-        } else {
-            let mut budget = BooleanPlanningBudget::new();
-            let planned = self.plan_edge_filter_subtree(
-                &edge_query,
-                cap_context,
-                &edge.filter,
-                availability,
-                &mut budget,
-                &mut warnings,
-                &mut followups,
-            )?;
-            match planned.classification {
-                EdgeBooleanPlanClassification::AlwaysFalse => Some(EdgePhysicalPlan::Empty),
-                EdgeBooleanPlanClassification::Bounded { plan, complete, .. } if complete => {
-                    if planned.has_verify_only {
-                        add_plan_warning(&mut warnings, QueryPlanWarning::VerifyOnlyFilter);
-                        if edge_filter_requires_hydration(&edge.filter) {
-                            add_plan_warning(&mut warnings, QueryPlanWarning::EdgePropertyPostFilter);
-                        }
-                    }
-                    Some(plan)
-                }
-                _ => {
-                    add_plan_warning(&mut warnings, QueryPlanWarning::VerifyOnlyFilter);
-                    if edge_filter_requires_hydration(&edge.filter) {
-                        add_plan_warning(&mut warnings, QueryPlanWarning::EdgePropertyPostFilter);
-                    }
-                    self.bounded_edge_label_anchor_plan(&edge_query, cap_context, label_id)
-                }
-            }
-        };
-
-        let Some(plan) = plan else {
-            add_plan_warning(&mut warnings, QueryPlanWarning::IndexSkippedAsBroad);
-            finalize_plan_warnings(&mut warnings);
-            return Ok(None);
-        };
-        if self.edge_plan_exceeds_pattern_anchor_cap(&edge_query, cap_context, &plan) {
-            add_plan_warning(&mut warnings, QueryPlanWarning::IndexSkippedAsBroad);
-            finalize_plan_warnings(&mut warnings);
-            return Ok(None);
-        }
-
-        finalize_plan_warnings(&mut warnings);
-        Ok(Some((plan, warnings, followups)))
-    }
-
-    fn plan_pattern_edge_anchor_labelless(
-        &self,
-        edge: &NormalizedEdgePattern,
-        availability: EdgeMetadataSidecarAvailability,
-    ) -> Option<(EdgePhysicalPlan, Vec<QueryPlanWarning>)> {
-        let edge_query = Self::pattern_edge_anchor_query(None, edge.filter.clone());
-        let cap_context = self.pattern_edge_anchor_cap_context(None);
-        let plan = self.edge_metadata_filter_candidate_plan(&edge.filter, None, availability)?;
-        if self.edge_plan_exceeds_pattern_anchor_cap(&edge_query, cap_context, &plan) {
-            return None;
-        }
-        let mut warnings = Vec::new();
-        if edge_filter_requires_hydration(&edge.filter) {
-            add_plan_warning(&mut warnings, QueryPlanWarning::EdgePropertyPostFilter);
-            add_plan_warning(&mut warnings, QueryPlanWarning::VerifyOnlyFilter);
-        }
-        finalize_plan_warnings(&mut warnings);
-        Some((plan, warnings))
-    }
-
-    fn plan_pattern_edge_anchor_source(
-        &self,
-        edge: &NormalizedEdgePattern,
-    ) -> Result<Option<PlannedPatternEdgeAnchorSource>, EngineError> {
-        let availability = self.edge_metadata_sidecar_availability();
-        let mut warnings = Vec::new();
-        let mut followups = Vec::new();
-        let edge_query = Self::pattern_edge_anchor_query(None, edge.filter.clone());
-        let cap_context =
-            self.pattern_edge_anchor_cap_context_for_label_filter(edge.label_filter_ids.as_deref());
-
-        let driver = match edge.label_filter_ids.as_deref() {
-            Some([]) => EdgePhysicalPlan::Empty,
-            Some([label_id]) => {
-                let Some((plan, mut branch_warnings, mut branch_followups)) =
-                    self.plan_pattern_edge_anchor_for_labeled_branch(edge, *label_id, availability)?
-                else {
-                    return Ok(None);
-                };
-                warnings.append(&mut branch_warnings);
-                followups.append(&mut branch_followups);
-                plan
-            }
-            Some(label_ids) => {
-                let mut branches = Vec::with_capacity(label_ids.len());
-                for &label_id in label_ids {
-                    let Some((plan, mut branch_warnings, mut branch_followups)) =
-                        self.plan_pattern_edge_anchor_for_labeled_branch(edge, label_id, availability)?
-                    else {
-                        return Ok(None);
-                    };
-                    warnings.append(&mut branch_warnings);
-                    followups.append(&mut branch_followups);
-                    branches.push(plan);
-                }
-                EdgePhysicalPlan::union(branches)
-            }
-            None => {
-                let Some((plan, mut plan_warnings)) =
-                    self.plan_pattern_edge_anchor_labelless(edge, availability)
-                else {
-                    return Ok(None);
-                };
-                warnings.append(&mut plan_warnings);
-                plan
-            }
-        };
-
-        if matches!(driver, EdgePhysicalPlan::Source(ref source)
-            if source.kind == EdgeQueryCandidateSourceKind::FallbackFullEdgeScan)
-        {
-            return Ok(None);
-        }
-        if self.edge_plan_exceeds_pattern_anchor_cap(&edge_query, cap_context, &driver) {
-            return Ok(None);
-        }
-
-        finalize_plan_warnings(&mut warnings);
-        let edge_plan = PlannedEdgeQuery {
-            driver,
-            cap_context,
-            warnings,
-            followups,
-        };
-        let edge_fallback_plans =
-            self.pattern_edge_anchor_local_fallback_plans(edge, availability, &edge_plan.driver);
-        Ok(Some(PlannedPatternEdgeAnchorSource {
-            edge_plan,
-            edge_fallback_plans,
-        }))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn planned_pattern_edge_anchor(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        edge_plan: PlannedEdgeQuery,
-        edge_fallback_plans: Vec<PlannedEdgeQuery>,
-        known_node_ids: &[Option<Vec<u64>>],
-        target_selectivities: &[Option<(u64, u64)>],
-        sort_anchor_alias: String,
-    ) -> (PatternAnchorPlan, PatternPlanCost) {
-        let edge = &query.edges[edge_index];
-        let mut bound = vec![false; query.nodes.len()];
-        bound[edge.from_index] = true;
-        bound[edge.to_index] = true;
-        let mut visited_edges = vec![false; query.edges.len()];
-        visited_edges[edge_index] = true;
-
-        let mut anchor_cost = edge_plan.driver.plan_cost();
-        let candidate_count = edge_plan.estimated_candidate_count().unwrap_or(1).max(1);
-        let endpoint_verify_count = if edge.from_index == edge.to_index { 1 } else { 2 };
-        anchor_cost.estimated_work = anchor_cost
-            .estimated_work
-            .saturating_add(candidate_count.saturating_mul(endpoint_verify_count));
-        let orientation_multiplier = match edge.direction {
-            Direction::Both if edge.from_index != edge.to_index => 2,
-            _ => 1,
-        };
-        let initial_frontier = candidate_count.saturating_mul(orientation_multiplier);
-        let (expansion_order, cost) = self.planned_pattern_expansion_order_from_frontier(
-            query,
-            bound,
-            visited_edges,
-            anchor_cost,
-            initial_frontier,
-            known_node_ids,
-            target_selectivities,
-            format!(
-                "edge:{}:{}:{}",
-                edge.alias.as_deref().unwrap_or(""),
-                query.nodes[edge.from_index].alias,
-                query.nodes[edge.to_index].alias
-            ),
-        );
-        let anchor = PatternAnchorPlan::Edge {
-            edge_index,
-            edge_alias: edge.alias.clone(),
-            from_index: edge.from_index,
-            to_index: edge.to_index,
-            sort_anchor_alias,
-            edge_query: Box::new(Self::pattern_edge_anchor_query(None, edge.filter.clone())),
-            edge_plan,
-            edge_fallback_plans,
-            expansion_order,
-            orientation_policy: EdgeAnchorOrientationPolicy::from_direction(edge.direction),
-        };
-        (anchor, cost)
-    }
-
-    fn plan_normalized_pattern_query(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-    ) -> Result<PlannedPatternQuery, EngineError> {
-        if let Some((node_index, pattern)) = query
-            .nodes
-            .iter()
-            .enumerate()
-            .find(|(_, pattern)| pattern.query.filter.is_always_false())
-        {
-            let anchor_plan = self
-                .plan_normalized_node_pattern_anchor(pattern)?
-                .expect("AlwaysFalse pattern must be an anchorable empty universe");
-            let mut warnings = anchor_plan.warnings.clone();
-            for warning in &query.warnings {
-                add_plan_warning(&mut warnings, *warning);
-            }
-            finalize_plan_warnings(&mut warnings);
-            return Ok(PlannedPatternQuery {
-                anchor: PatternAnchorPlan::Node {
-                    node_index,
-                    anchor_alias: pattern.alias.clone(),
-                    sort_anchor_alias: pattern.alias.clone(),
-                    expansion_order: Vec::new(),
-                    anchor_plan,
-                },
-                fallback_anchors: Vec::new(),
-                warnings,
-            });
-        }
-
-        let mut node_candidates = Vec::new();
-        let known_node_ids: Vec<_> = query
-            .nodes
-            .iter()
-            .map(|pattern| self.pattern_known_node_ids_for_fanout(pattern))
-            .collect();
-        let target_selectivities: Vec<_> = query
-            .nodes
-            .iter()
-            .map(|pattern| self.pattern_target_selectivity(pattern))
-            .collect();
-        for (node_index, pattern) in query.nodes.iter().enumerate() {
-            let Some(planned) = self.plan_normalized_node_pattern_anchor(pattern)? else {
-                continue;
-            };
-            let sort_count = planned.estimated_candidate_count().unwrap_or(u64::MAX);
-            let sort_rank = planned.driver.selectivity_rank();
-            let (expansion_order, pattern_cost) = self.planned_pattern_expansion_order(
-                query,
-                node_index,
-                &planned,
-                &known_node_ids,
-                &target_selectivities,
-            );
-            node_candidates.push((
-                pattern_cost,
-                pattern.alias.as_str(),
-                sort_count,
-                sort_rank,
-                node_index,
-                expansion_order,
-                planned,
-            ));
-        }
-
-        let sort_anchor_alias = node_candidates
-            .iter()
-            .min_by(|left, right| {
-                left.2
-                    .cmp(&right.2)
-                    .then_with(|| left.3.cmp(&right.3))
-                    .then_with(|| left.1.cmp(right.1))
-            })
-            .map(|candidate| candidate.1.to_string())
-            .unwrap_or_else(|| {
-                query
-                    .nodes
-                    .iter()
-                    .map(|node| node.alias.as_str())
-                    .min()
-                    .unwrap_or("")
-                    .to_string()
-            });
-
-        let mut anchor_candidates = Vec::new();
-        for (pattern_cost, alias, _, _, node_index, expansion_order, anchor_plan) in node_candidates
-        {
-            anchor_candidates.push((
-                pattern_cost,
-                alias.to_string(),
-                PatternAnchorPlan::Node {
-                    node_index,
-                    anchor_alias: query.nodes[node_index].alias.clone(),
-                    sort_anchor_alias: sort_anchor_alias.clone(),
-                    anchor_plan,
-                    expansion_order,
-                },
-            ));
-        }
-
-        let mut edge_planning_warnings = Vec::new();
-        for (edge_index, edge) in query.edges.iter().enumerate() {
-            let Some(edge_anchor_source) = self.plan_pattern_edge_anchor_source(edge)? else {
-                if edge_filter_requires_hydration(&edge.filter) {
-                    add_plan_warning(
-                        &mut edge_planning_warnings,
-                        QueryPlanWarning::EdgePropertyPostFilter,
-                    );
-                    add_plan_warning(
-                        &mut edge_planning_warnings,
-                        QueryPlanWarning::VerifyOnlyFilter,
-                    );
-                }
-                continue;
-            };
-            for warning in &edge_anchor_source.edge_plan.warnings {
-                add_plan_warning(&mut edge_planning_warnings, *warning);
-            }
-            let (anchor, pattern_cost) = self.planned_pattern_edge_anchor(
-                query,
-                edge_index,
-                edge_anchor_source.edge_plan,
-                edge_anchor_source.edge_fallback_plans,
-                &known_node_ids,
-                &target_selectivities,
-                sort_anchor_alias.clone(),
-            );
-            anchor_candidates.push((
-                pattern_cost,
-                format!(
-                    "edge:{}:{}:{}",
-                    edge.alias.as_deref().unwrap_or(""),
-                    query.nodes[edge.from_index].alias,
-                    query.nodes[edge.to_index].alias
-                ),
-                anchor,
-            ));
-        }
-
-        anchor_candidates.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-        });
-
-        let mut anchor_candidates = anchor_candidates.into_iter();
-        let Some((_, _, anchor)) = anchor_candidates.next() else {
-            return Err(EngineError::InvalidOperation(
-                "pattern query requires an anchorable node pattern or edge pattern".into(),
-            ));
-        };
-        let fallback_anchors = anchor_candidates
-            .map(|(_, _, anchor)| anchor)
-            .collect::<Vec<_>>();
-
-        let expected_expansions = match &anchor {
-            PatternAnchorPlan::Node { .. } => query.edges.len(),
-            PatternAnchorPlan::Edge { .. } => query.edges.len().saturating_sub(1),
-        };
-        if anchor.expansion_order().len() != expected_expansions {
-            return Err(EngineError::InvalidOperation(
-                "pattern query must be one connected component".into(),
-            ));
-        }
-
-        let anchored_edge_index = match &anchor {
-            PatternAnchorPlan::Edge { edge_index, .. } => Some(*edge_index),
-            PatternAnchorPlan::Node { .. } => None,
-        };
-        let mut warnings = match &anchor {
-            PatternAnchorPlan::Node { anchor_plan, .. } => anchor_plan.warnings.clone(),
-            PatternAnchorPlan::Edge { edge_plan, .. } => edge_plan.warnings.clone(),
-        };
-        for warning in &query.warnings {
-            add_plan_warning(&mut warnings, *warning);
-        }
-        for warning in edge_planning_warnings {
-            add_plan_warning(&mut warnings, warning);
-        }
-        for (edge_index, edge) in query.edges.iter().enumerate() {
-            if Some(edge_index) == anchored_edge_index {
-                continue;
-            }
-            if edge_filter_requires_hydration(&edge.filter) {
-                add_plan_warning(&mut warnings, QueryPlanWarning::EdgePropertyPostFilter);
-                add_plan_warning(&mut warnings, QueryPlanWarning::VerifyOnlyFilter);
-            }
-        }
-        finalize_plan_warnings(&mut warnings);
-
-        Ok(PlannedPatternQuery {
-            anchor,
-            fallback_anchors,
-            warnings,
-        })
-    }
-
-    fn explain_pattern_query(&self, query: &GraphPatternQuery) -> Result<QueryPlan, EngineError> {
-        let normalized = self.normalize_pattern_query(query)?;
-        let public_inputs = self.public_inputs_for_pattern_query(query)?;
-        let planned = self.plan_normalized_pattern_query(&normalized)?;
-        let mut plan = planned.explain_plan(public_inputs);
-        plan.notes = Self::pattern_query_explain_notes(&normalized, &planned);
-        Ok(plan)
-    }
 }
 
 #[cfg(test)]
@@ -6834,39 +6666,41 @@ mod query_plan_unit_tests {
 
         let canonical_keys: Vec<Vec<u8>> = probes
             .iter()
-            .map(|probe| prop_value_canonical_bytes(&probe.value))
+            .map(|probe| semantic_equality_key_bytes(&probe.value))
             .collect();
         assert_ne!(canonical_keys[0], canonical_keys[1]);
     }
 
     #[test]
-    fn unique_in_probe_values_dedupes_exact_duplicates_by_canonical_value() {
+    fn unique_in_probe_values_dedupes_exact_duplicates_by_semantic_value() {
         let values = vec![
             PropValue::String("a".to_string()),
             PropValue::String("a".to_string()),
         ];
-        let probes = unique_in_probe_values_with_hash(&values, hash_prop_value);
+        let probes = unique_in_probe_values_with_hash(&values, hash_semantic_equality_key_bytes);
 
         assert_eq!(probes.len(), 1);
         assert_eq!(probes[0].value, PropValue::String("a".to_string()));
-        assert_eq!(probes[0].value_hash, hash_prop_value(&probes[0].value));
+        assert_eq!(probes[0].value_hash, hash_prop_equality_key(&probes[0].value));
     }
 
     #[test]
-    fn unique_in_probe_values_keeps_signed_zero_probe_expansion() {
+    fn unique_in_probe_values_dedupes_semantic_zero_to_one_probe() {
         let probes = unique_in_probe_values(&[PropValue::Float(0.0)]);
 
-        let mut actual_bits: Vec<u64> = probes
-            .iter()
-            .filter_map(|probe| match probe.value {
-                PropValue::Float(value) => Some(value.to_bits()),
-                _ => None,
-            })
-            .collect();
-        actual_bits.sort_unstable();
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].value_hash, hash_prop_equality_key(&PropValue::Int(0)));
+    }
 
-        let mut expected_bits = vec![0.0f64.to_bits(), (-0.0f64).to_bits()];
-        expected_bits.sort_unstable();
-        assert_eq!(actual_bits, expected_bits);
+    #[test]
+    fn unique_in_probe_values_dedupes_one_across_numeric_variants() {
+        let probes = unique_in_probe_values(&[
+            PropValue::Int(1),
+            PropValue::UInt(1),
+            PropValue::Float(1.0),
+        ]);
+
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].value_hash, hash_prop_equality_key(&PropValue::UInt(1)));
     }
 }

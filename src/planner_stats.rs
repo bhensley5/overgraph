@@ -1,5 +1,8 @@
 use crate::error::EngineError;
-use crate::memtable::encode_range_prop_value;
+use crate::property_value_semantics::{
+    hash_prop_equality_key, numeric_range_sort_key_for_value, NumericRangeSortKey,
+    NUMERIC_RANGE_KEY_BYTES,
+};
 #[cfg(test)]
 use crate::segment_components::{
     decode_identity_header, COMPONENT_IDENTITY_HEADER_LEN, COMPONENT_IDENTITY_HEADER_MAGIC,
@@ -9,9 +12,8 @@ use crate::segment_writer::{
     publish_planner_stats_component_payload_from_latest, CompactEdgeMeta, CompactNodeMeta,
 };
 use crate::types::{
-    hash_prop_value, EdgeRecord, NodeIdMap, NodeRecord, PropValue, SecondaryIndexKind,
-    SecondaryIndexManifestEntry, SecondaryIndexRangeDomain, SecondaryIndexState,
-    SecondaryIndexTarget, MAX_NODE_LABELS_PER_NODE,
+    EdgeRecord, NodeIdMap, NodeRecord, PropValue, SecondaryIndexKind, SecondaryIndexManifestEntry,
+    SecondaryIndexState, SecondaryIndexTarget, MAX_NODE_LABELS_PER_NODE,
 };
 use crc32fast::Hasher as Crc32Hasher;
 use serde::{Deserialize, Serialize};
@@ -31,7 +33,7 @@ pub(crate) const PLANNER_STATS_FILENAME: &str = "planner_stats.dat";
 #[cfg(all(test, unix))]
 const PLANNER_STATS_TMP_FILENAME: &str = "planner_stats.tmp";
 const PLANNER_STATS_MAGIC: [u8; 8] = *b"OGPST01\0";
-pub(crate) const PLANNER_STATS_FORMAT_VERSION: u32 = 1;
+pub(crate) const PLANNER_STATS_FORMAT_VERSION: u32 = 2;
 const PLANNER_STATS_ENVELOPE_LEN: usize = 8 + 4 + 8 + 4 + 4;
 
 pub(crate) const PLANNER_STATS_MAX_PROPERTY_KEYS_PER_LABEL: usize = 256;
@@ -49,6 +51,7 @@ pub(crate) const PLANNER_STATS_DEFAULT_SELECTED_SOURCE_CAP: usize = 4096;
 pub(crate) const PLANNER_STATS_COMPACTION_GENERAL_PROP_DECODE_BUDGET_NODES: usize = 1024;
 pub(crate) const PLANNER_STATS_COMPACTION_GENERAL_PROP_DECODE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const PLANNER_STATS_REFRESH_GENERAL_PROP_DECODE_BUDGET_NODES: usize = 0;
+type RangeStatsKey = [u8; NUMERIC_RANGE_KEY_BYTES];
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PlannerStatsAvailability {
@@ -181,7 +184,7 @@ impl DeclaredIndexRuntimeCoverage {
             let target = planner_stats_declared_index_target(entry);
             let kind = match entry.kind {
                 SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
-                SecondaryIndexKind::Range { .. } => PlannerStatsDeclaredIndexKind::Range,
+                SecondaryIndexKind::Range => PlannerStatsDeclaredIndexKind::Range,
             };
             for segment in segments {
                 coverage.insert(
@@ -261,7 +264,6 @@ pub(crate) struct DeclaredIndexStatsFingerprint {
     pub kind: PlannerStatsDeclaredIndexKind,
     pub target_label_id: u32,
     pub prop_key: String,
-    pub range_domain: Option<SecondaryIndexRangeDomain>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -394,10 +396,9 @@ pub(crate) struct ValueKindCounts {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RangeValueSummary {
-    pub domain: SecondaryIndexRangeDomain,
     pub count: u64,
-    pub min_encoded: Option<u64>,
-    pub max_encoded: Option<u64>,
+    pub min_key: Option<RangeStatsKey>,
+    pub max_key: Option<RangeStatsKey>,
     pub buckets: Vec<RangeBucket>,
 }
 
@@ -418,17 +419,16 @@ pub(crate) struct RangeIndexPlannerStats {
     pub index_id: u64,
     pub target_label_id: u32,
     pub prop_key: String,
-    pub domain: SecondaryIndexRangeDomain,
     pub total_entries: u64,
-    pub min_encoded: Option<u64>,
-    pub max_encoded: Option<u64>,
+    pub min_key: Option<RangeStatsKey>,
+    pub max_key: Option<RangeStatsKey>,
     pub buckets: Vec<RangeBucket>,
     pub sidecar_present_at_build: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RangeBucket {
-    pub upper_encoded: u64,
+    pub upper_key: RangeStatsKey,
     pub count: u64,
 }
 
@@ -638,41 +638,25 @@ struct EqualitySegmentRollupStats {
     top_value_total: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RangeIndexRollupStats {
     pub index_id: u64,
     pub target_label_id: u32,
     pub prop_key: String,
-    pub domain: SecondaryIndexRangeDomain,
     pub total_entries: u64,
-    pub min_encoded: Option<u64>,
-    pub max_encoded: Option<u64>,
+    pub min_key: Option<RangeStatsKey>,
+    pub max_key: Option<RangeStatsKey>,
     pub coverage: PlannerStatsFamilyCoverage,
     segment_rollups: BTreeMap<u64, RangeIndexSegmentRollupStats>,
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
 struct RangeIndexSegmentRollupStats {
     total_entries: u64,
-    min_encoded: Option<u64>,
-    max_encoded: Option<u64>,
+    min_key: Option<RangeStatsKey>,
+    max_key: Option<RangeStatsKey>,
     buckets: Vec<RangeBucket>,
-}
-
-impl Default for RangeIndexRollupStats {
-    fn default() -> Self {
-        Self {
-            index_id: 0,
-            target_label_id: 0,
-            prop_key: String::new(),
-            domain: SecondaryIndexRangeDomain::Int,
-            total_entries: 0,
-            min_encoded: None,
-            max_encoded: None,
-            coverage: PlannerStatsFamilyCoverage::default(),
-            segment_rollups: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -731,27 +715,30 @@ impl PlannerStatsView {
             .estimate_segment_hashes(segment_id, value_hashes)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn range_index_estimate(
         &self,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
     ) -> Option<PlannerStatsValueEstimate> {
         let rollup = self.range_index_rollups.get(&index_id)?;
         if rollup.segment_rollups.is_empty() {
             return None;
         }
+        let lower = lower.map(|(key, inclusive)| (range_stats_key(key), inclusive));
+        let upper = upper.map(|(key, inclusive)| (range_stats_key(key), inclusive));
         let mut count = 0u64;
         let mut exact = !rollup.coverage.has_uncovered();
         for segment in rollup.segment_rollups.values() {
-            let estimate = estimate_u64_histogram(
+            let estimate = estimate_range_key_histogram(
                 segment.total_entries,
-                segment.min_encoded,
-                segment.max_encoded,
+                segment.min_key,
+                segment.max_key,
                 segment
                     .buckets
                     .iter()
-                    .map(|bucket| (bucket.upper_encoded, bucket.count)),
+                    .map(|bucket| (bucket.upper_key, bucket.count)),
                 lower,
                 upper,
             );
@@ -759,6 +746,30 @@ impl PlannerStatsView {
             exact &= estimate.exact;
         }
         Some(PlannerStatsValueEstimate { count, exact })
+    }
+
+    pub(crate) fn range_segment_estimate(
+        &self,
+        index_id: u64,
+        segment_id: u64,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+    ) -> Option<PlannerStatsValueEstimate> {
+        let rollup = self.range_index_rollups.get(&index_id)?;
+        let segment = rollup.segment_rollups.get(&segment_id)?;
+        let lower = lower.map(|(key, inclusive)| (range_stats_key(key), inclusive));
+        let upper = upper.map(|(key, inclusive)| (range_stats_key(key), inclusive));
+        Some(estimate_range_key_histogram(
+            segment.total_entries,
+            segment.min_key,
+            segment.max_key,
+            segment
+                .buckets
+                .iter()
+                .map(|bucket| (bucket.upper_key, bucket.count)),
+            lower,
+            upper,
+        ))
     }
 
     pub(crate) fn timestamp_estimate(
@@ -860,11 +871,6 @@ impl PlannerStatsView {
                 "range rollup for target label {} must have property key",
                 rollup.target_label_id
             );
-            match rollup.domain {
-                SecondaryIndexRangeDomain::Int
-                | SecondaryIndexRangeDomain::UInt
-                | SecondaryIndexRangeDomain::Float => {}
-            }
         }
         for ((direction, edge_label_id), rollup) in &self.adjacency_rollups {
             debug_assert_eq!(*direction, rollup.direction);
@@ -1038,10 +1044,9 @@ struct RangeIndexDeclaration {
     target: PlannerStatsDeclaredIndexTarget,
     target_label_id: u32,
     prop_key: String,
-    domain: SecondaryIndexRangeDomain,
 }
 
-type DeclaredIndexFingerprintSet = BTreeSet<(u64, u8, u8, u32, String, u8)>;
+type DeclaredIndexFingerprintSet = BTreeSet<(u64, u8, u8, u32, String)>;
 
 #[cfg(test)]
 fn build_planner_stats_view_from_snapshots(
@@ -1072,7 +1077,7 @@ fn all_available_runtime_coverage_for_snapshots(
         let target = planner_stats_declared_index_target(entry);
         let kind = match entry.kind {
             SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
-            SecondaryIndexKind::Range { .. } => PlannerStatsDeclaredIndexKind::Range,
+            SecondaryIndexKind::Range => PlannerStatsDeclaredIndexKind::Range,
         };
         for segment in segments {
             coverage.insert(
@@ -1415,16 +1420,15 @@ fn ready_range_declarations(
         let Some((target, target_label_id, prop_key)) = ready_property_target(entry) else {
             continue;
         };
-        let SecondaryIndexKind::Range { domain } = entry.kind else {
+        if !matches!(&entry.kind, SecondaryIndexKind::Range) {
             continue;
-        };
+        }
         declarations.insert(
             entry.index_id,
             RangeIndexDeclaration {
                 target,
                 target_label_id,
                 prop_key,
-                domain,
             },
         );
     }
@@ -1466,7 +1470,6 @@ fn range_rollup_builders(
                     index_id: *index_id,
                     target_label_id: declaration.target_label_id,
                     prop_key: declaration.prop_key.clone(),
-                    domain: declaration.domain,
                     ..Default::default()
                 },
                 coverage: CoverageBuilder::new(all_segment_ids.clone()),
@@ -1717,14 +1720,14 @@ fn add_range_rollups(
             .stats
             .total_entries
             .saturating_add(index_stats.total_entries);
-        builder.stats.min_encoded = min_option(builder.stats.min_encoded, index_stats.min_encoded);
-        builder.stats.max_encoded = max_option(builder.stats.max_encoded, index_stats.max_encoded);
+        builder.stats.min_key = min_option(builder.stats.min_key, index_stats.min_key);
+        builder.stats.max_key = max_option(builder.stats.max_key, index_stats.max_key);
         builder.stats.segment_rollups.insert(
             segment_id,
             RangeIndexSegmentRollupStats {
                 total_entries: index_stats.total_entries,
-                min_encoded: index_stats.min_encoded,
-                max_encoded: index_stats.max_encoded,
+                min_key: index_stats.min_key,
+                max_key: index_stats.max_key,
                 buckets: index_stats.buckets.clone(),
             },
         );
@@ -1805,7 +1808,6 @@ fn declared_equality_block_matches(
         PlannerStatsDeclaredIndexKind::Equality,
         declaration.target_label_id,
         &declaration.prop_key,
-        None,
     ))
 }
 
@@ -1816,7 +1818,6 @@ fn declared_range_block_matches(
 ) -> bool {
     if block.target_label_id != declaration.target_label_id
         || block.prop_key != declaration.prop_key
-        || block.domain != declaration.domain
     {
         return false;
     }
@@ -1826,7 +1827,6 @@ fn declared_range_block_matches(
         PlannerStatsDeclaredIndexKind::Range,
         declaration.target_label_id,
         &declaration.prop_key,
-        Some(declaration.domain),
     ))
 }
 
@@ -1841,7 +1841,6 @@ fn declared_index_fingerprint_set(stats: &SegmentPlannerStatsV1) -> DeclaredInde
                 declared.kind,
                 declared.target_label_id,
                 &declared.prop_key,
-                declared.range_domain,
             )
         })
         .collect()
@@ -1853,15 +1852,13 @@ fn declared_index_key(
     kind: PlannerStatsDeclaredIndexKind,
     target_label_id: u32,
     prop_key: &str,
-    range_domain: Option<SecondaryIndexRangeDomain>,
-) -> (u64, u8, u8, u32, String, u8) {
+) -> (u64, u8, u8, u32, String) {
     (
         index_id,
         declared_index_target_rank(target),
         declared_index_kind_rank(kind),
         target_label_id,
         prop_key.to_string(),
-        range_domain_rank(range_domain),
     )
 }
 
@@ -1887,6 +1884,7 @@ fn saturating_add_map_value(map: &mut BTreeMap<u64, u64>, key: u64, value: u64) 
         .or_insert(value);
 }
 
+#[allow(dead_code)]
 fn invalid_u64_bounds(lower: Option<(u64, bool)>, upper: Option<(u64, bool)>) -> bool {
     let (Some((lower_value, lower_inclusive)), Some((upper_value, upper_inclusive))) =
         (lower, upper)
@@ -1897,12 +1895,14 @@ fn invalid_u64_bounds(lower: Option<(u64, bool)>, upper: Option<(u64, bool)>) ->
         || (lower_value == upper_value && (!lower_inclusive || !upper_inclusive))
 }
 
+#[allow(dead_code)]
 fn u64_bucket_below_lower(bucket_upper: u64, lower: Option<(u64, bool)>) -> bool {
     lower.is_some_and(|(lower_value, inclusive)| {
         bucket_upper < lower_value || (!inclusive && bucket_upper <= lower_value)
     })
 }
 
+#[allow(dead_code)]
 fn u64_bucket_above_upper(bucket_lower_floor: Option<u64>, upper: Option<(u64, bool)>) -> bool {
     let (Some(bucket_lower_floor), Some((upper_value, inclusive))) = (bucket_lower_floor, upper)
     else {
@@ -1911,6 +1911,7 @@ fn u64_bucket_above_upper(bucket_lower_floor: Option<u64>, upper: Option<(u64, b
     bucket_lower_floor > upper_value || (!inclusive && bucket_lower_floor >= upper_value)
 }
 
+#[allow(dead_code)]
 fn u64_bucket_fully_inside(
     bucket_lower_floor: Option<u64>,
     bucket_upper: Option<u64>,
@@ -1934,6 +1935,127 @@ fn u64_bucket_fully_inside(
     lower_inside && upper_inside
 }
 
+fn invalid_range_key_bounds(
+    lower: Option<(RangeStatsKey, bool)>,
+    upper: Option<(RangeStatsKey, bool)>,
+) -> bool {
+    match (lower, upper) {
+        (Some((lower, lower_inclusive)), Some((upper, upper_inclusive))) => {
+            lower > upper || (lower == upper && !(lower_inclusive && upper_inclusive))
+        }
+        _ => false,
+    }
+}
+
+fn range_key_bucket_below_lower(
+    value: RangeStatsKey,
+    lower: Option<(RangeStatsKey, bool)>,
+) -> bool {
+    match lower {
+        Some((lower, inclusive)) if inclusive => value < lower,
+        Some((lower, _)) => value <= lower,
+        None => false,
+    }
+}
+
+fn range_key_bucket_above_upper(
+    value: Option<RangeStatsKey>,
+    upper: Option<(RangeStatsKey, bool)>,
+) -> bool {
+    match (value, upper) {
+        (Some(value), Some((upper, inclusive))) if inclusive => value > upper,
+        (Some(value), Some((upper, _))) => value >= upper,
+        (None, Some(_)) => false,
+        (_, None) => false,
+    }
+}
+
+fn range_key_bucket_fully_inside(
+    min_value: Option<RangeStatsKey>,
+    max_value: Option<RangeStatsKey>,
+    lower: Option<(RangeStatsKey, bool)>,
+    upper: Option<(RangeStatsKey, bool)>,
+) -> bool {
+    let lower_inside = match (min_value, lower) {
+        (Some(min_value), Some((lower, inclusive))) if inclusive => min_value >= lower,
+        (Some(min_value), Some((lower, _))) => min_value > lower,
+        (_, None) => true,
+        (None, Some(_)) => false,
+    };
+    let upper_inside = match (max_value, upper) {
+        (Some(max_value), Some((upper, inclusive))) if inclusive => max_value <= upper,
+        (Some(max_value), Some((upper, _))) => max_value < upper,
+        (_, None) => true,
+        (None, Some(_)) => false,
+    };
+    lower_inside && upper_inside
+}
+
+fn estimate_range_key_histogram(
+    total_count: u64,
+    min_value: Option<RangeStatsKey>,
+    max_value: Option<RangeStatsKey>,
+    buckets: impl Iterator<Item = (RangeStatsKey, u64)>,
+    lower: Option<(RangeStatsKey, bool)>,
+    upper: Option<(RangeStatsKey, bool)>,
+) -> PlannerStatsValueEstimate {
+    if total_count == 0 || invalid_range_key_bounds(lower, upper) {
+        return PlannerStatsValueEstimate {
+            count: 0,
+            exact: true,
+        };
+    }
+    if max_value.is_some_and(|max_value| range_key_bucket_below_lower(max_value, lower))
+        || min_value.is_some_and(|min_value| range_key_bucket_above_upper(Some(min_value), upper))
+    {
+        return PlannerStatsValueEstimate {
+            count: 0,
+            exact: true,
+        };
+    }
+    if min_value.is_some()
+        && max_value.is_some()
+        && range_key_bucket_fully_inside(min_value, max_value, lower, upper)
+    {
+        return PlannerStatsValueEstimate {
+            count: total_count,
+            exact: true,
+        };
+    }
+
+    let mut estimated = 0u64;
+    let mut exact = true;
+    let mut previous_upper = min_value;
+    let mut saw_bucket = false;
+    for (bucket_upper, bucket_count) in buckets {
+        saw_bucket = true;
+        if range_key_bucket_below_lower(bucket_upper, lower)
+            || range_key_bucket_above_upper(previous_upper, upper)
+        {
+            previous_upper = Some(bucket_upper);
+            continue;
+        }
+        estimated = estimated.saturating_add(bucket_count);
+        if !range_key_bucket_fully_inside(previous_upper, Some(bucket_upper), lower, upper) {
+            exact = false;
+        }
+        previous_upper = Some(bucket_upper);
+    }
+
+    if !saw_bucket {
+        return PlannerStatsValueEstimate {
+            count: total_count,
+            exact: false,
+        };
+    }
+
+    PlannerStatsValueEstimate {
+        count: estimated.min(total_count),
+        exact,
+    }
+}
+
+#[allow(dead_code)]
 fn estimate_u64_histogram(
     total_count: u64,
     min_value: Option<u64>,
@@ -2083,9 +2205,7 @@ struct PropertyAccumulator {
     value_kind_counts: ValueKindCounts,
     value_counts: BTreeMap<u64, u64>,
     distinct_overflow: bool,
-    int_values: Vec<u64>,
-    uint_values: Vec<u64>,
-    float_values: Vec<u64>,
+    numeric_values: Vec<RangeStatsKey>,
 }
 
 impl PropertyAccumulator {
@@ -2099,9 +2219,7 @@ impl PropertyAccumulator {
             value_kind_counts: ValueKindCounts::default(),
             value_counts: BTreeMap::new(),
             distinct_overflow: false,
-            int_values: Vec::new(),
-            uint_values: Vec::new(),
-            float_values: Vec::new(),
+            numeric_values: Vec::new(),
         }
     }
 
@@ -2112,7 +2230,7 @@ impl PropertyAccumulator {
             self.null_count += 1;
         }
 
-        let value_hash = hash_prop_value(value);
+        let value_hash = hash_prop_equality_key(value);
         if let Some(count) = self.value_counts.get_mut(&value_hash) {
             *count += 1;
         } else if self.value_counts.len() < PLANNER_STATS_MAX_DISTINCT_TRACKED_VALUES {
@@ -2121,59 +2239,16 @@ impl PropertyAccumulator {
             self.distinct_overflow = true;
         }
 
-        match value {
-            PropValue::Int(_) => {
-                if let Some(encoded) =
-                    encode_range_prop_value(SecondaryIndexRangeDomain::Int, value)
-                {
-                    push_capped_numeric(&mut self.int_values, encoded);
-                }
-            }
-            PropValue::UInt(_) => {
-                if let Some(encoded) =
-                    encode_range_prop_value(SecondaryIndexRangeDomain::UInt, value)
-                {
-                    push_capped_numeric(&mut self.uint_values, encoded);
-                }
-            }
-            PropValue::Float(_) => {
-                if let Some(encoded) =
-                    encode_range_prop_value(SecondaryIndexRangeDomain::Float, value)
-                {
-                    push_capped_numeric(&mut self.float_values, encoded);
-                }
-            }
-            PropValue::Null
-            | PropValue::Bool(_)
-            | PropValue::String(_)
-            | PropValue::Bytes(_)
-            | PropValue::Array(_)
-            | PropValue::Map(_) => {}
+        if let Some(encoded) = numeric_range_sort_key_for_value(value) {
+            push_capped_numeric(&mut self.numeric_values, encoded);
         }
     }
 
     fn into_stats(mut self) -> PropertyPlannerStats {
-        self.int_values.sort_unstable();
-        self.uint_values.sort_unstable();
-        self.float_values.sort_unstable();
+        self.numeric_values.sort_unstable();
         let mut numeric_summaries = Vec::new();
-        if !self.int_values.is_empty() {
-            numeric_summaries.push(range_summary_from_values(
-                SecondaryIndexRangeDomain::Int,
-                &self.int_values,
-            ));
-        }
-        if !self.uint_values.is_empty() {
-            numeric_summaries.push(range_summary_from_values(
-                SecondaryIndexRangeDomain::UInt,
-                &self.uint_values,
-            ));
-        }
-        if !self.float_values.is_empty() {
-            numeric_summaries.push(range_summary_from_values(
-                SecondaryIndexRangeDomain::Float,
-                &self.float_values,
-            ));
+        if !self.numeric_values.is_empty() {
+            numeric_summaries.push(range_summary_from_values(&self.numeric_values));
         }
 
         let exact_distinct_count =
@@ -2355,7 +2430,7 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
     } else {
         None
     };
-    let target_range_stats = if matches!(target_index.kind, SecondaryIndexKind::Range { .. }) {
+    let target_range_stats = if matches!(target_index.kind, SecondaryIndexKind::Range) {
         let mut stats =
             build_range_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
         let Some(stats) = stats.pop() else {
@@ -2772,9 +2847,9 @@ fn build_range_index_stats_from_sidecars(
         if entry.state != SecondaryIndexState::Ready {
             continue;
         }
-        let SecondaryIndexKind::Range { .. } = entry.kind else {
+        if !matches!(&entry.kind, SecondaryIndexKind::Range) {
             continue;
-        };
+        }
         let file_name = match &entry.target {
             SecondaryIndexTarget::NodeProperty { .. } => {
                 format!("node_prop_range_{}.dat", entry.index_id)
@@ -2805,14 +2880,14 @@ fn build_range_index_stats_from_segment(
         if entry.state != SecondaryIndexState::Ready {
             continue;
         }
-        let SecondaryIndexKind::Range { .. } = entry.kind else {
+        if !matches!(&entry.kind, SecondaryIndexKind::Range) {
             continue;
-        };
+        }
         let mut encoded_values = Vec::new();
         let sidecar_present_at_build = segment.for_each_declared_secondary_range_entry(
             entry,
             |encoded_value, _record_id| {
-                encoded_values.push(encoded_value);
+                encoded_values.push(range_stats_key(encoded_value));
                 Ok(())
             },
         )?;
@@ -2828,23 +2903,23 @@ fn build_range_index_stats_from_segment(
 
 pub(crate) fn range_index_stats_from_written_entries(
     entry: &SecondaryIndexManifestEntry,
-    entries: &[(u64, u64)],
+    entries: &[(NumericRangeSortKey, u64)],
 ) -> RangeIndexPlannerStats {
-    let encoded_values: Vec<u64> = entries
+    let encoded_values: Vec<RangeStatsKey> = entries
         .iter()
-        .map(|(encoded_value, _node_id)| *encoded_value)
+        .map(|(encoded_value, _node_id)| range_stats_key(*encoded_value))
         .collect();
     range_index_stats_from_encoded_values(entry, &encoded_values, true)
 }
 
 pub(crate) fn range_index_stats_from_encoded_values(
     entry: &SecondaryIndexManifestEntry,
-    encoded_values: &[u64],
+    encoded_values: &[RangeStatsKey],
     sidecar_present_at_build: bool,
 ) -> RangeIndexPlannerStats {
-    let SecondaryIndexKind::Range { domain } = entry.kind else {
+    if !matches!(&entry.kind, SecondaryIndexKind::Range) {
         unreachable!("range stats require a range secondary index")
-    };
+    }
     let (target_label_id, prop_key) = match &entry.target {
         SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (*label_id, prop_key),
         SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (*label_id, prop_key),
@@ -2855,10 +2930,9 @@ pub(crate) fn range_index_stats_from_encoded_values(
         index_id: entry.index_id,
         target_label_id,
         prop_key: prop_key.clone(),
-        domain,
         total_entries: encoded_values.len() as u64,
-        min_encoded: encoded_values.first().copied(),
-        max_encoded: encoded_values.last().copied(),
+        min_key: encoded_values.first().copied(),
+        max_key: encoded_values.last().copied(),
         buckets: range_buckets(&encoded_values, PLANNER_STATS_RANGE_BUCKETS),
         sidecar_present_at_build,
     }
@@ -2909,7 +2983,7 @@ fn retain_current_declared_index_stats(
         block.index_id != target_index_id
             && block.sidecar_present_at_build
             && ready_indexes.iter().any(|entry| {
-                matches!(entry.kind, SecondaryIndexKind::Range { domain } if domain == block.domain)
+                matches!(entry.kind, SecondaryIndexKind::Range)
                     && entry.index_id == block.index_id
                     && secondary_index_target_matches_stats(
                         &entry.target,
@@ -3530,8 +3604,8 @@ fn validate_property_stats(
                 ));
             }
             validate_ordered_option_pair(
-                summary.min_encoded,
-                summary.max_encoded,
+                summary.min_key,
+                summary.max_key,
                 "property numeric bounds",
             )?;
             validate_range_buckets(summary.count, &summary.buckets)?;
@@ -3607,7 +3681,6 @@ fn validate_declared_index_stats(
         if declared_index.kind != PlannerStatsDeclaredIndexKind::Range
             || declared_index.target_label_id != range.target_label_id
             || declared_index.prop_key != range.prop_key
-            || declared_index.range_domain != Some(range.domain)
         {
             return Err(format!(
                 "planner stats range index {} declaration mismatch",
@@ -3628,7 +3701,7 @@ fn validate_declared_index_stats(
                 range.index_id
             ));
         }
-        validate_ordered_option_pair(range.min_encoded, range.max_encoded, "range index bounds")?;
+        validate_ordered_option_pair(range.min_key, range.max_key, "range index bounds")?;
         validate_range_buckets(range.total_entries, &range.buckets)?;
     }
     Ok(())
@@ -3762,7 +3835,7 @@ fn validate_range_buckets(expected_count: u64, buckets: &[RangeBucket]) -> Resul
     }
     if !buckets
         .windows(2)
-        .all(|pair| pair[0].upper_encoded <= pair[1].upper_encoded)
+        .all(|pair| pair[0].upper_key <= pair[1].upper_key)
     {
         return Err("planner stats range buckets are not sorted".to_string());
     }
@@ -3924,7 +3997,7 @@ fn declared_property_reasons(
         };
         let new_reason = match entry.kind {
             SecondaryIndexKind::Equality => PropertyStatsTrackedReason::DeclaredEquality,
-            SecondaryIndexKind::Range { .. } => PropertyStatsTrackedReason::DeclaredRange,
+            SecondaryIndexKind::Range => PropertyStatsTrackedReason::DeclaredRange,
         };
         reasons
             .entry((*label_id, prop_key.clone()))
@@ -4071,11 +4144,9 @@ fn declared_index_fingerprints(
                 SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (*label_id, prop_key),
                 SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (*label_id, prop_key),
             };
-            let (kind, range_domain) = match entry.kind {
-                SecondaryIndexKind::Equality => (PlannerStatsDeclaredIndexKind::Equality, None),
-                SecondaryIndexKind::Range { domain } => {
-                    (PlannerStatsDeclaredIndexKind::Range, Some(domain))
-                }
+            let kind = match entry.kind {
+                SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
+                SecondaryIndexKind::Range => PlannerStatsDeclaredIndexKind::Range,
             };
             DeclaredIndexStatsFingerprint {
                 index_id: entry.index_id,
@@ -4083,7 +4154,6 @@ fn declared_index_fingerprints(
                 kind,
                 target_label_id,
                 prop_key: prop_key.clone(),
-                range_domain,
             }
         })
         .collect();
@@ -4096,7 +4166,6 @@ fn declared_index_fingerprints(
             .then_with(|| declared_index_kind_rank(a.kind).cmp(&declared_index_kind_rank(b.kind)))
             .then_with(|| a.target_label_id.cmp(&b.target_label_id))
             .then_with(|| a.prop_key.cmp(&b.prop_key))
-            .then_with(|| range_domain_rank(a.range_domain).cmp(&range_domain_rank(b.range_domain)))
     });
     declared
 }
@@ -4124,15 +4193,6 @@ fn declaration_fingerprint(declared: &[DeclaredIndexStatsFingerprint]) -> u64 {
         );
         hash = fnv_update_u32(hash, entry.target_label_id);
         hash = fnv_update_bytes(hash, entry.prop_key.as_bytes());
-        hash = fnv_update_u8(
-            hash,
-            match entry.range_domain {
-                None => 0,
-                Some(SecondaryIndexRangeDomain::Int) => 1,
-                Some(SecondaryIndexRangeDomain::UInt) => 2,
-                Some(SecondaryIndexRangeDomain::Float) => 3,
-            },
-        );
     }
     hash
 }
@@ -4174,30 +4234,21 @@ fn declared_index_kind_rank(kind: PlannerStatsDeclaredIndexKind) -> u8 {
     }
 }
 
-fn range_domain_rank(domain: Option<SecondaryIndexRangeDomain>) -> u8 {
-    match domain {
-        None => 0,
-        Some(SecondaryIndexRangeDomain::Int) => 1,
-        Some(SecondaryIndexRangeDomain::UInt) => 2,
-        Some(SecondaryIndexRangeDomain::Float) => 3,
-    }
+fn range_stats_key(key: NumericRangeSortKey) -> RangeStatsKey {
+    key.as_bytes()
 }
 
-fn push_capped_numeric(values: &mut Vec<u64>, encoded: u64) {
+fn push_capped_numeric(values: &mut Vec<RangeStatsKey>, encoded: NumericRangeSortKey) {
     if values.len() < PLANNER_STATS_MAX_DISTINCT_TRACKED_VALUES {
-        values.push(encoded);
+        values.push(range_stats_key(encoded));
     }
 }
 
-fn range_summary_from_values(
-    domain: SecondaryIndexRangeDomain,
-    values: &[u64],
-) -> RangeValueSummary {
+fn range_summary_from_values(values: &[RangeStatsKey]) -> RangeValueSummary {
     RangeValueSummary {
-        domain,
         count: values.len() as u64,
-        min_encoded: values.first().copied(),
-        max_encoded: values.last().copied(),
+        min_key: values.first().copied(),
+        max_key: values.last().copied(),
         buckets: range_buckets(values, PLANNER_STATS_RANGE_BUCKETS),
     }
 }
@@ -4236,7 +4287,7 @@ fn timestamp_buckets(values: &[i64], cap: usize) -> Vec<TimestampBucket> {
     buckets
 }
 
-fn range_buckets(values: &[u64], cap: usize) -> Vec<RangeBucket> {
+fn range_buckets(values: &[RangeStatsKey], cap: usize) -> Vec<RangeBucket> {
     if values.is_empty() || cap == 0 {
         return Vec::new();
     }
@@ -4247,7 +4298,7 @@ fn range_buckets(values: &[u64], cap: usize) -> Vec<RangeBucket> {
         let end = ((bucket_idx + 1) * values.len()).div_ceil(bucket_count);
         if end > start {
             buckets.push(RangeBucket {
-                upper_encoded: values[end - 1],
+                upper_key: values[end - 1],
                 count: (end - start) as u64,
             });
         }
@@ -4527,7 +4578,9 @@ fn read_secondary_eq_group_counts(path: &Path) -> Result<Option<BTreeMap<u64, u6
 }
 
 #[cfg(test)]
-fn read_secondary_range_encoded_values(path: &Path) -> Result<Option<Vec<u64>>, EngineError> {
+fn read_secondary_range_encoded_values(
+    path: &Path,
+) -> Result<Option<Vec<RangeStatsKey>>, EngineError> {
     let data = match read_optional_component_payload(path)? {
         Some(data) => data,
         None => return Ok(None),
@@ -4540,7 +4593,7 @@ fn read_secondary_range_encoded_values(path: &Path) -> Result<Option<Vec<u64>>, 
     }
     let count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
     let expected_len = count
-        .checked_mul(16)
+        .checked_mul(NUMERIC_RANGE_KEY_BYTES + 8)
         .and_then(|len| len.checked_add(8))
         .ok_or_else(|| EngineError::CorruptRecord("secondary range length overflow".into()))?;
     if expected_len != data.len() {
@@ -4551,8 +4604,11 @@ fn read_secondary_range_encoded_values(path: &Path) -> Result<Option<Vec<u64>>, 
     }
     let mut encoded_values = Vec::with_capacity(count);
     for i in 0..count {
-        let off = 8 + i * 16;
-        let encoded = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        let off = 8 + i * (NUMERIC_RANGE_KEY_BYTES + 8);
+        let encoded: RangeStatsKey = data[off..off + NUMERIC_RANGE_KEY_BYTES]
+            .try_into()
+            .expect("fixed numeric range key length");
+        NumericRangeSortKey::from_sidecar_bytes(encoded)?;
         encoded_values.push(encoded);
     }
     Ok(Some(encoded_values))
@@ -4610,9 +4666,27 @@ fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
 mod tests {
     use super::*;
     use crate::types::{
-        SecondaryIndexKind, SecondaryIndexManifestEntry, SecondaryIndexRangeDomain,
-        SecondaryIndexState, SecondaryIndexTarget,
+        SecondaryIndexKind, SecondaryIndexManifestEntry, SecondaryIndexState, SecondaryIndexTarget,
     };
+
+    fn test_range_key(value: PropValue) -> NumericRangeSortKey {
+        numeric_range_sort_key_for_value(&value).expect("test value must encode as numeric key")
+    }
+
+    fn test_range_key_i64(value: i64) -> NumericRangeSortKey {
+        test_range_key(PropValue::Int(value))
+    }
+
+    fn test_range_stats_key_i64(value: i64) -> RangeStatsKey {
+        range_stats_key(test_range_key_i64(value))
+    }
+
+    fn test_range_bucket_i64(value: i64, count: u64) -> RangeBucket {
+        RangeBucket {
+            upper_key: test_range_stats_key_i64(value),
+            count,
+        }
+    }
 
     fn minimal_stats(segment_id: u64) -> SegmentPlannerStatsV1 {
         SegmentPlannerStatsV1 {
@@ -4666,9 +4740,7 @@ mod tests {
                 label_id: 7,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         }
@@ -4704,7 +4776,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(crate::segment_writer::secondary_indexes_dir(dir.path())).unwrap();
         let entry = range_entry(42);
-        let entries = vec![(30, 3), (10, 1), (20, 2), (20, 4)];
+        let entries = vec![
+            (test_range_key_i64(30), 3),
+            (test_range_key_i64(10), 1),
+            (test_range_key_i64(20), 2),
+            (test_range_key_i64(20), 4),
+        ];
 
         crate::segment_writer::write_node_prop_range_sidecar_to_path(
             &crate::segment_writer::node_prop_range_sidecar_path(dir.path(), entry.index_id),
@@ -4803,7 +4880,7 @@ mod tests {
 
     #[test]
     fn validate_declared_index_stats_uses_edge_label_counts_for_edge_targets() {
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let mut stats = minimal_stats(1);
         stats.node_count = 1;
         stats.edge_count = 3;
@@ -4825,7 +4902,6 @@ mod tests {
             kind: PlannerStatsDeclaredIndexKind::Equality,
             target_label_id: 7,
             prop_key: "color".to_string(),
-            range_domain: None,
         });
         stats.equality_index_stats.push(EqualityIndexPlannerStats {
             index_id: 31,
@@ -4846,20 +4922,15 @@ mod tests {
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id: 7,
             prop_key: "score".to_string(),
-            range_domain: Some(SecondaryIndexRangeDomain::Float),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
             index_id: 32,
             target_label_id: 7,
             prop_key: "score".to_string(),
-            domain: SecondaryIndexRangeDomain::Float,
             total_entries: 3,
-            min_encoded: Some(10),
-            max_encoded: Some(30),
-            buckets: vec![RangeBucket {
-                upper_encoded: 30,
-                count: 3,
-            }],
+            min_key: Some(test_range_stats_key_i64(10)),
+            max_key: Some(test_range_stats_key_i64(30)),
+            buckets: vec![test_range_bucket_i64(30, 3)],
             sidecar_present_at_build: true,
         });
         let mut node_label_counts = BTreeMap::new();
@@ -4902,7 +4973,6 @@ mod tests {
         index_id: u64,
         label_id: u32,
         prop_key: &str,
-        domain: SecondaryIndexRangeDomain,
     ) -> SecondaryIndexManifestEntry {
         SecondaryIndexManifestEntry {
             index_id,
@@ -4910,7 +4980,7 @@ mod tests {
                 label_id,
                 prop_key: prop_key.to_string(),
             },
-            kind: SecondaryIndexKind::Range { domain },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         }
@@ -4931,7 +5001,6 @@ mod tests {
             kind: PlannerStatsDeclaredIndexKind::Equality,
             target_label_id,
             prop_key: prop_key.to_string(),
-            range_domain: None,
         });
         stats.equality_index_stats.push(EqualityIndexPlannerStats {
             index_id,
@@ -4954,7 +5023,6 @@ mod tests {
         index_id: u64,
         target_label_id: u32,
         prop_key: &str,
-        domain: SecondaryIndexRangeDomain,
         total_entries: u64,
     ) {
         stats.declared_indexes.push(DeclaredIndexStatsFingerprint {
@@ -4963,20 +5031,15 @@ mod tests {
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id,
             prop_key: prop_key.to_string(),
-            range_domain: Some(domain),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
             index_id,
             target_label_id,
             prop_key: prop_key.to_string(),
-            domain,
             total_entries,
-            min_encoded: Some(10),
-            max_encoded: Some(20),
-            buckets: vec![RangeBucket {
-                upper_encoded: 20,
-                count: total_entries,
-            }],
+            min_key: Some(test_range_stats_key_i64(10)),
+            max_key: Some(test_range_stats_key_i64(20)),
+            buckets: vec![test_range_bucket_i64(20, total_entries)],
             sidecar_present_at_build: true,
         });
     }
@@ -4996,30 +5059,19 @@ mod tests {
                 count: 2,
             }],
         );
-        add_range_stats(
-            &mut stats,
-            12,
-            7,
-            "score",
-            SecondaryIndexRangeDomain::Int,
-            1,
-        );
+        add_range_stats(&mut stats, 12, 7, "score", 1);
         let ready_indexes = vec![
-            ready_range_entry(12, 7, "score", SecondaryIndexRangeDomain::Int),
+            ready_range_entry(12, 7, "score"),
             ready_eq_entry(11, 7, "color"),
         ];
         let replacement_range = RangeIndexPlannerStats {
             index_id: 12,
             target_label_id: 7,
             prop_key: "score".to_string(),
-            domain: SecondaryIndexRangeDomain::Int,
             total_entries: 3,
-            min_encoded: Some(10),
-            max_encoded: Some(30),
-            buckets: vec![RangeBucket {
-                upper_encoded: 30,
-                count: 3,
-            }],
+            min_key: Some(test_range_stats_key_i64(10)),
+            max_key: Some(test_range_stats_key_i64(30)),
+            buckets: vec![test_range_bucket_i64(30, 3)],
             sidecar_present_at_build: true,
         };
 
@@ -5095,10 +5147,9 @@ mod tests {
         index_id: u64,
         label_id: u32,
         prop_key: &'static str,
-        domain: SecondaryIndexRangeDomain,
         count: u64,
-        min_encoded: u64,
-        max_encoded: u64,
+        min_value: i64,
+        max_value: i64,
     }
 
     fn add_range_histogram_stats(stats: &mut SegmentPlannerStatsV1, input: RangeHistogramInput) {
@@ -5108,20 +5159,15 @@ mod tests {
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id: input.label_id,
             prop_key: input.prop_key.to_string(),
-            range_domain: Some(input.domain),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
             index_id: input.index_id,
             target_label_id: input.label_id,
             prop_key: input.prop_key.to_string(),
-            domain: input.domain,
             total_entries: input.count,
-            min_encoded: Some(input.min_encoded),
-            max_encoded: Some(input.max_encoded),
-            buckets: vec![RangeBucket {
-                upper_encoded: input.max_encoded,
-                count: input.count,
-            }],
+            min_key: Some(test_range_stats_key_i64(input.min_value)),
+            max_key: Some(test_range_stats_key_i64(input.max_value)),
+            buckets: vec![test_range_bucket_i64(input.max_value, input.count)],
             sidecar_present_at_build: true,
         });
     }
@@ -5443,7 +5489,6 @@ mod tests {
             kind: PlannerStatsDeclaredIndexKind::Equality,
             target_label_id: 7,
             prop_key: "color".to_string(),
-            range_domain: None,
         };
         let mut bad_equality_count = minimal_stats(9);
         bad_equality_count.declared_indexes.push(declared_eq);
@@ -5467,7 +5512,6 @@ mod tests {
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id: 7,
             prop_key: "score".to_string(),
-            range_domain: Some(SecondaryIndexRangeDomain::Int),
         };
         let mut bad_range_bucket = minimal_stats(9);
         bad_range_bucket.declared_indexes.push(declared_range);
@@ -5477,14 +5521,10 @@ mod tests {
                 index_id: 12,
                 target_label_id: 7,
                 prop_key: "score".to_string(),
-                domain: SecondaryIndexRangeDomain::Int,
                 total_entries: 1,
-                min_encoded: Some(1),
-                max_encoded: Some(1),
-                buckets: vec![RangeBucket {
-                    upper_encoded: 1,
-                    count: 2,
-                }],
+                min_key: Some(test_range_stats_key_i64(1)),
+                max_key: Some(test_range_stats_key_i64(1)),
+                buckets: vec![test_range_bucket_i64(1, 2)],
                 sidecar_present_at_build: true,
             });
         assert_decode_err_contains(bad_range_bucket, 1, 0, "range buckets sum");
@@ -5545,7 +5585,7 @@ mod tests {
 
     #[test]
     fn rollup_tracks_family_coverage_and_declared_equality() {
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let mut stats = minimal_stats(1);
         stats.timestamp_stats.push(TimestampPlannerStats {
             label_id: 7,
@@ -5587,14 +5627,7 @@ mod tests {
                 count: 1,
             }],
         );
-        add_range_stats(
-            &mut stats,
-            12,
-            7,
-            "score",
-            SecondaryIndexRangeDomain::Int,
-            1,
-        );
+        add_range_stats(&mut stats, 12, 7, "score", 1);
         stats.edge_count = 1;
         stats.adjacency_stats.push(AdjacencyPlannerStats {
             direction: PlannerStatsDirection::Outgoing,
@@ -5639,7 +5672,7 @@ mod tests {
             &segments,
             &[
                 ready_eq_entry(11, 7, "color"),
-                ready_range_entry(12, 7, "score", SecondaryIndexRangeDomain::Int),
+                ready_range_entry(12, 7, "score"),
             ],
         );
 
@@ -5677,7 +5710,6 @@ mod tests {
         let range = view.range_index_rollups.get(&12).unwrap();
         assert_eq!(range.target_label_id, 7);
         assert_eq!(range.prop_key, "score");
-        assert_eq!(range.domain, SecondaryIndexRangeDomain::Int);
         assert_eq!(range.total_entries, 1);
         let adjacency = view
             .adjacency_rollups
@@ -5690,7 +5722,7 @@ mod tests {
 
     #[test]
     fn rollup_declared_index_mismatch_drops_only_index_block() {
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let mut stats = minimal_stats(1);
         add_eq_stats(
             &mut stats,
@@ -5727,7 +5759,7 @@ mod tests {
 
     #[test]
     fn rollup_declared_index_stats_require_runtime_sidecar_coverage() {
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         for state in [
             DeclaredIndexRuntimeCoverageState::Available,
             DeclaredIndexRuntimeCoverageState::Missing,
@@ -5746,14 +5778,7 @@ mod tests {
                     count: 1,
                 }],
             );
-            add_range_stats(
-                &mut stats,
-                12,
-                7,
-                "score",
-                SecondaryIndexRangeDomain::Int,
-                1,
-            );
+            add_range_stats(&mut stats, 12, 7, "score", 1);
             let available = PlannerStatsAvailability::Available(Box::new(stats));
             let segments = vec![PlannerStatsSegmentSnapshot {
                 segment_id: 1,
@@ -5763,7 +5788,7 @@ mod tests {
             }];
             let indexes = [
                 ready_eq_entry(11, 7, "color"),
-                ready_range_entry(12, 7, "score", SecondaryIndexRangeDomain::Int),
+                ready_range_entry(12, 7, "score"),
             ];
             let mut runtime_coverage = DeclaredIndexRuntimeCoverage::default();
             runtime_coverage.insert(
@@ -5811,7 +5836,7 @@ mod tests {
 
     #[test]
     fn rollup_declared_index_stats_treat_unknown_runtime_coverage_as_unavailable() {
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let mut stats = minimal_stats(1);
         add_eq_stats(
             &mut stats,
@@ -5848,7 +5873,7 @@ mod tests {
 
     #[test]
     fn rollup_declared_index_stats_require_matching_target_coverage() {
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let mut stats = minimal_stats(1);
         stats.declared_indexes.push(DeclaredIndexStatsFingerprint {
             target: PlannerStatsDeclaredIndexTarget::EdgeProperty,
@@ -5856,7 +5881,6 @@ mod tests {
             kind: PlannerStatsDeclaredIndexKind::Equality,
             target_label_id: 7,
             prop_key: "color".to_string(),
-            range_domain: None,
         });
         stats.equality_index_stats.push(EqualityIndexPlannerStats {
             index_id: 31,
@@ -5930,14 +5954,7 @@ mod tests {
     fn rollup_declared_index_label_zero_is_valid_shape() {
         let mut stats = minimal_stats(1);
         add_eq_stats(&mut stats, 11, 0, "color", 0, 0, Vec::new());
-        add_range_stats(
-            &mut stats,
-            12,
-            0,
-            "score",
-            SecondaryIndexRangeDomain::Int,
-            0,
-        );
+        add_range_stats(&mut stats, 12, 0, "score", 0);
         let available = PlannerStatsAvailability::Available(Box::new(stats));
         let segments = vec![PlannerStatsSegmentSnapshot {
             segment_id: 1,
@@ -5951,7 +5968,7 @@ mod tests {
             &segments,
             &[
                 ready_eq_entry(11, 0, "color"),
-                ready_range_entry(12, 0, "score", SecondaryIndexRangeDomain::Int),
+                ready_range_entry(12, 0, "score"),
             ],
         );
 
@@ -5997,29 +6014,18 @@ mod tests {
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id: 7,
             prop_key: "score".to_string(),
-            range_domain: Some(SecondaryIndexRangeDomain::Int),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
             index_id: 12,
             target_label_id: 7,
             prop_key: "score".to_string(),
-            domain: SecondaryIndexRangeDomain::Int,
             total_entries: 6,
-            min_encoded: Some(10),
-            max_encoded: Some(60),
+            min_key: Some(test_range_stats_key_i64(10)),
+            max_key: Some(test_range_stats_key_i64(60)),
             buckets: vec![
-                RangeBucket {
-                    upper_encoded: 20,
-                    count: 2,
-                },
-                RangeBucket {
-                    upper_encoded: 40,
-                    count: 2,
-                },
-                RangeBucket {
-                    upper_encoded: 60,
-                    count: 2,
-                },
+                test_range_bucket_i64(20, 2),
+                test_range_bucket_i64(40, 2),
+                test_range_bucket_i64(60, 2),
             ],
             sidecar_present_at_build: true,
         });
@@ -6034,16 +6040,15 @@ mod tests {
         let view = build_planner_stats_view_from_snapshots(
             1,
             &segments,
-            &[ready_range_entry(
-                12,
-                7,
-                "score",
-                SecondaryIndexRangeDomain::Int,
-            )],
+            &[ready_range_entry(12, 7, "score")],
         );
 
         assert_eq!(
-            view.range_index_estimate(12, Some((25, true)), Some((35, true))),
+            view.range_index_estimate(
+                12,
+                Some((test_range_key_i64(25), true)),
+                Some((test_range_key_i64(35), true))
+            ),
             Some(PlannerStatsValueEstimate {
                 count: 2,
                 exact: false,
@@ -6057,7 +6062,7 @@ mod tests {
             })
         );
         assert_eq!(
-            view.range_index_estimate(12, Some((100, true)), None),
+            view.range_index_estimate(12, Some((test_range_key_i64(100), true)), None),
             Some(PlannerStatsValueEstimate {
                 count: 0,
                 exact: true,
@@ -6081,10 +6086,9 @@ mod tests {
                 index_id: 12,
                 label_id: 7,
                 prop_key: "score",
-                domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
-                min_encoded: 0,
-                max_encoded: 100,
+                min_value: 0,
+                max_value: 100,
             },
         );
         let mut stats_b = stats_with_timestamp_histogram(2, 7, 100, 0, 300);
@@ -6094,10 +6098,9 @@ mod tests {
                 index_id: 12,
                 label_id: 7,
                 prop_key: "score",
-                domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
-                min_encoded: 0,
-                max_encoded: 300,
+                min_value: 0,
+                max_value: 300,
             },
         );
         let available_a = PlannerStatsAvailability::Available(Box::new(stats_a));
@@ -6120,16 +6123,15 @@ mod tests {
         let view = build_planner_stats_view_from_snapshots(
             1,
             &segments,
-            &[ready_range_entry(
-                12,
-                7,
-                "score",
-                SecondaryIndexRangeDomain::Int,
-            )],
+            &[ready_range_entry(12, 7, "score")],
         );
 
         assert_eq!(
-            view.range_index_estimate(12, Some((50, true)), Some((75, true))),
+            view.range_index_estimate(
+                12,
+                Some((test_range_key_i64(50), true)),
+                Some((test_range_key_i64(75), true))
+            ),
             Some(PlannerStatsValueEstimate {
                 count: 200,
                 exact: false,
@@ -6178,10 +6180,9 @@ mod tests {
                 index_id: 12,
                 label_id: 7,
                 prop_key: "score",
-                domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
-                min_encoded: 0,
-                max_encoded: 100,
+                min_value: 0,
+                max_value: 100,
             },
         );
         let mut stats_b = stats_with_timestamp_histogram(2, 7, 100, 0, 300);
@@ -6191,10 +6192,9 @@ mod tests {
                 index_id: 12,
                 label_id: 7,
                 prop_key: "score",
-                domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
-                min_encoded: 0,
-                max_encoded: 300,
+                min_value: 0,
+                max_value: 300,
             },
         );
         let available_a = PlannerStatsAvailability::Available(Box::new(stats_a));
@@ -6217,16 +6217,11 @@ mod tests {
         let view = build_planner_stats_view_from_snapshots(
             1,
             &segments,
-            &[ready_range_entry(
-                12,
-                7,
-                "score",
-                SecondaryIndexRangeDomain::Int,
-            )],
+            &[ready_range_entry(12, 7, "score")],
         );
 
         assert_eq!(
-            view.range_index_estimate(12, Some((301, true)), None),
+            view.range_index_estimate(12, Some((test_range_key_i64(301), true)), None),
             Some(PlannerStatsValueEstimate {
                 count: 0,
                 exact: true,
@@ -6275,10 +6270,9 @@ mod tests {
                 index_id: 12,
                 label_id: 7,
                 prop_key: "score",
-                domain: SecondaryIndexRangeDomain::Int,
                 count: 100,
-                min_encoded: 0,
-                max_encoded: 100,
+                min_value: 0,
+                max_value: 100,
             },
         );
         let available = PlannerStatsAvailability::Available(Box::new(stats));
@@ -6301,19 +6295,18 @@ mod tests {
         let view = build_planner_stats_view_from_snapshots(
             1,
             &segments,
-            &[ready_range_entry(
-                12,
-                7,
-                "score",
-                SecondaryIndexRangeDomain::Int,
-            )],
+            &[ready_range_entry(12, 7, "score")],
         );
 
         let range = view.range_index_rollups.get(&12).unwrap();
         assert_eq!(range.coverage.covered_segment_ids, vec![1]);
         assert_eq!(range.coverage.uncovered_segment_ids, vec![2]);
         assert_eq!(
-            view.range_index_estimate(12, Some((50, true)), Some((75, true))),
+            view.range_index_estimate(
+                12,
+                Some((test_range_key_i64(50), true)),
+                Some((test_range_key_i64(75), true))
+            ),
             Some(PlannerStatsValueEstimate {
                 count: 100,
                 exact: false,
@@ -6460,7 +6453,7 @@ mod tests {
 
     #[test]
     fn rollup_many_stats_bearing_segments_guard_without_wall_clock() {
-        let value_hash = hash_prop_value(&PropValue::String("active".to_string()));
+        let value_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
         let mut availabilities = Vec::new();
         for segment_id in 1..=256 {
             let mut stats = minimal_stats(segment_id);
@@ -6507,7 +6500,7 @@ mod tests {
 
     #[test]
     fn rollup_many_ready_indexes_leaves_missing_blocks_uncovered() {
-        let value_hash = hash_prop_value(&PropValue::String("active".to_string()));
+        let value_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
         let mut stats = minimal_stats(1);
         add_eq_stats(
             &mut stats,
@@ -6547,27 +6540,24 @@ mod tests {
 
     #[test]
     fn histograms_are_deterministic_equi_depth() {
-        let values = [1, 2, 3, 4, 5, 6, 7, 8];
+        let values = [
+            test_range_stats_key_i64(1),
+            test_range_stats_key_i64(2),
+            test_range_stats_key_i64(3),
+            test_range_stats_key_i64(4),
+            test_range_stats_key_i64(5),
+            test_range_stats_key_i64(6),
+            test_range_stats_key_i64(7),
+            test_range_stats_key_i64(8),
+        ];
         let buckets = range_buckets(&values, 4);
         assert_eq!(
             buckets,
             vec![
-                RangeBucket {
-                    upper_encoded: 2,
-                    count: 2
-                },
-                RangeBucket {
-                    upper_encoded: 4,
-                    count: 2
-                },
-                RangeBucket {
-                    upper_encoded: 6,
-                    count: 2
-                },
-                RangeBucket {
-                    upper_encoded: 8,
-                    count: 2
-                },
+                test_range_bucket_i64(2, 2),
+                test_range_bucket_i64(4, 2),
+                test_range_bucket_i64(6, 2),
+                test_range_bucket_i64(8, 2),
             ]
         );
     }
@@ -6616,7 +6606,6 @@ mod tests {
                 kind: PlannerStatsDeclaredIndexKind::Equality,
                 target_label_id: 7,
                 prop_key: "color".to_string(),
-                range_domain: None,
             },
             DeclaredIndexStatsFingerprint {
                 target: PlannerStatsDeclaredIndexTarget::NodeProperty,
@@ -6624,7 +6613,6 @@ mod tests {
                 kind: PlannerStatsDeclaredIndexKind::Range,
                 target_label_id: 7,
                 prop_key: "score".to_string(),
-                range_domain: Some(SecondaryIndexRangeDomain::Int),
             },
         ];
         stats.equality_index_stats.push(EqualityIndexPlannerStats {
@@ -6644,14 +6632,10 @@ mod tests {
             index_id: 12,
             target_label_id: 7,
             prop_key: "score".to_string(),
-            domain: SecondaryIndexRangeDomain::Int,
             total_entries: 1,
-            min_encoded: Some(10),
-            max_encoded: Some(10),
-            buckets: vec![RangeBucket {
-                upper_encoded: 10,
-                count: 1,
-            }],
+            min_key: Some(test_range_stats_key_i64(10)),
+            max_key: Some(test_range_stats_key_i64(10)),
+            buckets: vec![test_range_bucket_i64(10, 1)],
             sidecar_present_at_build: true,
         });
         stats.property_stats.push(PropertyPlannerStats {

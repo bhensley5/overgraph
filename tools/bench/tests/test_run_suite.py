@@ -44,6 +44,12 @@ class RunSuiteTests(unittest.TestCase):
                     "--dry-run",
                     "--output-root",
                     tmp,
+                    "--scenario-set",
+                    "query",
+                    "--scenario-id",
+                    "S-QUERY-007",
+                    "--scenario-id",
+                    "S-GQL-006",
                 ],
                 cwd=REPO_ROOT,
                 capture_output=True,
@@ -64,6 +70,10 @@ class RunSuiteTests(unittest.TestCase):
 
             result = json.loads((run_dir / "rust.json").read_text(encoding="utf-8"))
             self.assertEqual(result["status"], "dry-run")
+            self.assertEqual(
+                result["command"][-4:],
+                ["--scenario-id", "S-QUERY-007", "--scenario-id", "S-GQL-006"],
+            )
 
     def test_python_scaffold_run_parses_stdout_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

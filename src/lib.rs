@@ -43,6 +43,10 @@ pub(crate) mod dense_hnsw;
 pub(crate) mod edge_metadata;
 #[doc(hidden)]
 pub(crate) mod encoding;
+#[doc(hidden)]
+pub(crate) mod gql;
+#[doc(hidden)]
+pub(crate) mod graph_row;
 // Diagnostic exception: `overgraph-inspect` uses the read-only manifest loader,
 // and `DatabaseEngine::manifest()` remains an explicit introspection surface.
 #[doc(hidden)]
@@ -53,6 +57,10 @@ pub(crate) mod memtable;
 pub(crate) mod parallel;
 #[doc(hidden)]
 pub(crate) mod planner_stats;
+#[doc(hidden)]
+pub(crate) mod property_value_semantics;
+#[doc(hidden)]
+pub(crate) mod row_projection;
 #[doc(hidden)]
 pub(crate) mod scrub;
 #[doc(hidden)]
@@ -77,25 +85,44 @@ pub use types::{
     validate_dense_vector, validate_dense_vector_config, AdjacencyExport, AllShortestPathsOptions,
     CompactionPhase, CompactionProgress, CompactionStats, ComponentOptions, ComponentScrubFinding,
     DbOptions, DbStats, DegreeOptions, DenseMetric, DenseVector, DenseVectorConfig, Direction,
-    EdgeFilterExpr, EdgeInput, EdgeLabelInfo, EdgePattern, EdgePropertyIndexInfo, EdgeQuery,
-    EdgeQueryOrder, EdgeView, ExportEdge, ExportOptions, FusionMode, GraphPatch, GraphPatternQuery,
-    HnswConfig, IntoNodeLabels, IsConnectedOptions, LabelMatchMode, ManifestState, NeighborEntry,
-    NeighborOptions, NodeFilterExpr, NodeIdBuildHasher, NodeIdHasher, NodeIdMap, NodeIdSet,
-    NodeInput, NodeKeyQuery, NodeLabelFilter, NodeLabelInfo, NodePattern, NodePropertyIndexInfo,
-    NodeQuery, NodeQueryOrder, NodeView, PageRequest, PageResult, PatchResult, PatternOrder,
-    PprAlgorithm, PprApproxMeta, PprOptions, PprResult, PropValue, PropertyRangeBound,
-    PropertyRangeCursor, PropertyRangePageRequest, PropertyRangePageResult, PrunePolicy,
-    PrunePolicyInfo, PruneResult, QueryEdgeIdsResult, QueryEdgesResult, QueryMatch,
-    QueryNodeIdsResult, QueryNodesResult, QueryPatternResult, QueryPlan, QueryPlanKind,
+    EdgeFilterExpr, EdgeInput, EdgeLabelInfo, EdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
+    EdgeView, ExportEdge, ExportOptions, FusionMode, GqlCapSummary, GqlEdge, GqlExecutionStats,
+    GqlExplain, GqlLoweringTarget, GqlNode, GqlParamValue, GqlParams, GqlQueryOptions, GqlResult,
+    GqlRow, GqlRowOperation, GqlSemanticErrorCode, GqlValue, GraphBinaryOp, GraphCapExplain,
+    GraphCursorExplain, GraphEdgeField, GraphEdgePattern, GraphEdgeValue, GraphElementProjection,
+    GraphExecutionSummaries, GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
+    GraphNodePattern, GraphNodeValue, GraphOptionalGroup, GraphOrderDirection, GraphOrderExplain,
+    GraphOrderItem, GraphOutputMode, GraphOutputOptions, GraphPageRequest, GraphParamValue,
+    GraphPatch, GraphPath, GraphPathField, GraphPathValue, GraphPatternPiece,
+    GraphProjectionExplain, GraphPropertySelection, GraphQueryOptions, GraphReturnItem,
+    GraphReturnProjection, GraphRow, GraphRowExplain, GraphRowOperationExplain, GraphRowQuery,
+    GraphRowResult, GraphRowStats, GraphSelectedEdgeProjection, GraphSelectedNodeProjection,
+    GraphSelectedPathProjection, GraphSelectedProjection, GraphUnaryOp, GraphValue,
+    GraphVariableLengthPattern, GraphVectorSelection, HnswConfig, IntoNodeLabels,
+    IsConnectedOptions, LabelMatchMode, ManifestState, NeighborEntry, NeighborOptions,
+    NodeFilterExpr, NodeIdBuildHasher, NodeIdHasher, NodeIdMap, NodeIdSet, NodeInput, NodeKeyQuery,
+    NodeLabelFilter, NodeLabelInfo, NodePropertyIndexInfo, NodeQuery, NodeQueryOrder, NodeView,
+    PageRequest, PageResult, PatchResult, PprAlgorithm, PprApproxMeta, PprOptions, PprResult,
+    PropValue, PropertyRangeBound, PropertyRangeCursor, PropertyRangePageRequest,
+    PropertyRangePageResult, PrunePolicy, PrunePolicyInfo, PruneResult, QueryEdgeIdsResult,
+    QueryEdgesResult, QueryNodeIdsResult, QueryNodesResult, QueryPlan, QueryPlanKind,
     QueryPlanNode, QueryPlanNote, QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning,
     ScoringMode, ScrubFindingType, ScrubReport, SecondaryIndexKind, SecondaryIndexManifestEntry,
-    SecondaryIndexRangeDomain, SecondaryIndexState, SecondaryIndexTarget, SegmentInfo,
-    SegmentScrubResult, ShortestPath, ShortestPathOptions, SparseVector, Subgraph, SubgraphOptions,
-    TombstoneEntry, TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult,
-    TraverseOptions, TxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef,
-    TxnNodeView, UpsertEdgeOptions, UpsertNodeOptions, VectorHit, VectorSearchMode,
-    VectorSearchRequest, VectorSearchScope, WalSyncMode, DEFAULT_DENSE_EF_SEARCH,
+    SecondaryIndexState, SecondaryIndexTarget, SegmentInfo, SegmentScrubResult, ShortestPath,
+    ShortestPathOptions, SourceSpan, SparseVector, Subgraph, SubgraphOptions, TombstoneEntry,
+    TopKOptions, TraversalCursor, TraversalHit, TraversalPageResult, TraverseOptions,
+    TxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef, TxnNodeView,
+    UpsertEdgeOptions, UpsertNodeOptions, VectorHit, VectorSearchMode, VectorSearchRequest,
+    VectorSearchScope, WalSyncMode, DEFAULT_DENSE_EF_SEARCH,
 };
+
+#[doc(hidden)]
+pub fn gql_referenced_param_names(
+    query: &str,
+    options: &GqlQueryOptions,
+) -> Result<Vec<String>, EngineError> {
+    crate::gql::params::referenced_param_names_for_query(query, options)
+}
 
 #[cfg(test)]
 mod public_api_boundary_tests {
@@ -164,6 +191,105 @@ mod public_api_boundary_tests {
                 types.contains(required),
                 "`{required}` must remain the internal storage/WAL record boundary"
             );
+        }
+    }
+
+    #[test]
+    fn phase32_graph_row_replacement_names_do_not_use_v2_suffixes() {
+        let paths = rust_source_paths();
+        assert_files_do_not_contain(
+            &paths,
+            &[
+                concat!("GraphRow", "V2").to_string(),
+                concat!("GraphRowQuery", "V2").to_string(),
+                concat!("GraphPatternPiece", "V2").to_string(),
+                concat!("GraphNodePattern", "V2").to_string(),
+                concat!("GraphEdgePattern", "V2").to_string(),
+                concat!("GraphReturnItem", "V2").to_string(),
+                concat!("GraphOutputOptions", "V2").to_string(),
+                concat!("GraphQueryOptions", "V2").to_string(),
+                concat!("GraphRowResult", "V2").to_string(),
+                concat!("GraphRowExplain", "V2").to_string(),
+                concat!("NormalizedGraphRowQuery", "V2").to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn phase32_old_graph_pattern_public_exports_are_removed() {
+        let lib = source("src/lib.rs");
+        let types = source("src/types.rs");
+
+        for forbidden in [
+            concat!("Graph", "Pattern", "Query"),
+            concat!("Pattern", "Order"),
+            concat!("Query", "Match"),
+            concat!("Query", "Pattern", "Result"),
+        ] {
+            assert!(
+                !lib.contains(forbidden),
+                "`{forbidden}` must not be re-exported from the Rust public API"
+            );
+        }
+
+        for forbidden in [
+            concat!("pub struct ", "Graph", "Pattern", "Query"),
+            concat!("pub struct ", "Node", "Pattern"),
+            concat!("pub struct ", "Edge", "Pattern"),
+            concat!("pub enum ", "Pattern", "Order"),
+            concat!("pub struct ", "Query", "Pattern", "Result"),
+            concat!("pub struct ", "Query", "Match"),
+            concat!("Pattern", "Query"),
+            concat!("Pattern", "Expand"),
+            concat!("Pattern", "Edge", "Anchor"),
+            concat!("Unbounded", "Pattern", "Rejected"),
+        ] {
+            assert!(
+                !types.contains(forbidden),
+                "`{forbidden}` must not remain as a public/core graph-pattern DTO"
+            );
+        }
+    }
+
+    #[test]
+    fn phase32_old_graph_pattern_engine_methods_are_removed() {
+        let engine_query = source("src/engine/query.rs");
+        for forbidden in [
+            concat!("pub fn ", "query", "_pattern"),
+            concat!("pub fn ", "explain", "_pattern", "_query"),
+        ] {
+            assert!(
+                !engine_query.contains(forbidden),
+                "`{forbidden}` must not remain on DatabaseEngine"
+            );
+        }
+
+        for path in [
+            "src/engine/query_ir.rs",
+            "src/engine/query_exec.rs",
+            "src/engine/query_plan.rs",
+            "src/engine/projection.rs",
+        ] {
+            let contents = source(path);
+            for forbidden in [
+                concat!("Graph", "Pattern", "Query"),
+                concat!("Pattern", "Order"),
+                concat!("Query", "Match"),
+                concat!("Query", "Pattern", "Result"),
+                concat!("Normalized", "Graph", "Pattern", "Query"),
+                concat!("Planned", "Pattern", "Query"),
+                concat!("Pattern", "Plan", "Cost"),
+                concat!("Pattern", "Query"),
+                concat!("Pattern", "Expand"),
+                concat!("Pattern", "Edge", "Anchor"),
+                concat!("Unbounded", "Pattern", "Rejected"),
+                concat!("project", "_pattern", "_rows"),
+            ] {
+                assert!(
+                    !contents.contains(forbidden),
+                    "`{forbidden}` must not remain in old graph-pattern core path ({path})"
+                );
+            }
         }
     }
 

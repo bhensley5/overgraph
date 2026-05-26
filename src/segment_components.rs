@@ -1,8 +1,5 @@
 use crate::error::EngineError;
-use crate::types::{
-    SecondaryIndexKind, SecondaryIndexManifestEntry, SecondaryIndexRangeDomain,
-    SecondaryIndexTarget,
-};
+use crate::types::{SecondaryIndexKind, SecondaryIndexManifestEntry, SecondaryIndexTarget};
 use crc32fast::Hasher as Crc32Hasher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -792,7 +789,7 @@ pub(crate) fn secondary_index_declaration_fingerprint(
     target_label_id: u32,
     property_key: &[u8],
     index_kind: SecondaryIndexKindFingerprint,
-    range_domain: u64,
+    range_key_schema: u64,
     declaration_generation: u64,
     value_encoding_version: u64,
 ) -> u64 {
@@ -803,7 +800,7 @@ pub(crate) fn secondary_index_declaration_fingerprint(
     put_u32(&mut hasher, target_label_id);
     put_bytes_with_len(&mut hasher, property_key);
     put_u8(&mut hasher, index_kind.tag());
-    put_u64(&mut hasher, range_domain);
+    put_u64(&mut hasher, range_key_schema);
     put_u64(&mut hasher, declaration_generation);
     put_u64(&mut hasher, value_encoding_version);
     fingerprint_from_digest(hasher.finalize().into())
@@ -824,16 +821,9 @@ pub(crate) fn secondary_declaration_dependency(
             prop_key,
         ),
     };
-    let (kind, range_domain) = match entry.kind {
-        SecondaryIndexKind::Equality => (SecondaryIndexKindFingerprint::Equality, 0),
-        SecondaryIndexKind::Range { domain } => {
-            let domain_tag = match domain {
-                SecondaryIndexRangeDomain::Int => 1,
-                SecondaryIndexRangeDomain::UInt => 2,
-                SecondaryIndexRangeDomain::Float => 3,
-            };
-            (SecondaryIndexKindFingerprint::Range, domain_tag)
-        }
+    let (kind, range_key_schema, value_encoding_version) = match entry.kind {
+        SecondaryIndexKind::Equality => (SecondaryIndexKindFingerprint::Equality, 0, 2),
+        SecondaryIndexKind::Range => (SecondaryIndexKindFingerprint::Range, 0, 2),
     };
     let fingerprint = secondary_index_declaration_fingerprint(
         entry.index_id,
@@ -841,9 +831,9 @@ pub(crate) fn secondary_declaration_dependency(
         target_label_id,
         prop_key.as_bytes(),
         kind,
-        range_domain,
+        range_key_schema,
         1,
-        1,
+        value_encoding_version,
     );
     ComponentDependencyV1::SecondaryIndexDeclaration {
         index_id: entry.index_id,

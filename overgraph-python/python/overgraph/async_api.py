@@ -374,6 +374,9 @@ class AsyncOverGraph:
     async def query_pattern(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.query_pattern, request)
 
+    async def query_graph_rows(self, request: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.query_graph_rows, request)
+
     async def explain_node_query(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.explain_node_query, request)
 
@@ -383,20 +386,36 @@ class AsyncOverGraph:
     async def explain_pattern_query(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.explain_pattern_query, request)
 
+    async def explain_graph_rows(self, request: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.explain_graph_rows, request)
+
+    async def execute_gql(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+        **options: Any,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.execute_gql, query, params, **options)
+
+    async def explain_gql(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+        **options: Any,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.explain_gql, query, params, **options)
+
     async def ensure_node_property_index(
         self,
         label: str,
         prop_key: str,
         kind: str,
-        *,
-        domain: str | None = None,
     ) -> NodePropertyIndexInfo:
         return await asyncio.to_thread(
             self._db.ensure_node_property_index,
             label,
             prop_key,
             kind,
-            domain=domain,
         )
 
     async def drop_node_property_index(
@@ -404,15 +423,12 @@ class AsyncOverGraph:
         label: str,
         prop_key: str,
         kind: str,
-        *,
-        domain: str | None = None,
     ) -> bool:
         return await asyncio.to_thread(
             self._db.drop_node_property_index,
             label,
             prop_key,
             kind,
-            domain=domain,
         )
 
     async def list_node_property_indexes(self) -> list[NodePropertyIndexInfo]:
@@ -423,15 +439,12 @@ class AsyncOverGraph:
         label: str,
         prop_key: str,
         kind: str,
-        *,
-        domain: str | None = None,
     ) -> EdgePropertyIndexInfo:
         return await asyncio.to_thread(
             self._db.ensure_edge_property_index,
             label,
             prop_key,
             kind,
-            domain=domain,
         )
 
     async def drop_edge_property_index(
@@ -439,15 +452,12 @@ class AsyncOverGraph:
         label: str,
         prop_key: str,
         kind: str,
-        *,
-        domain: str | None = None,
     ) -> bool:
         return await asyncio.to_thread(
             self._db.drop_edge_property_index,
             label,
             prop_key,
             kind,
-            domain=domain,
         )
 
     async def list_edge_property_indexes(self) -> list[EdgePropertyIndexInfo]:

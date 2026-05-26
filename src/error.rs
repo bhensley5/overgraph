@@ -1,6 +1,8 @@
 use std::fmt;
 use std::io;
 
+use crate::types::{GqlSemanticErrorCode, SourceSpan};
+
 #[derive(Debug)]
 pub enum EngineError {
     IoError(io::Error),
@@ -13,8 +15,31 @@ pub enum EngineError {
     TxnConflict(String),
     TxnClosed,
     InvalidOperation(String),
+    InvalidCursor {
+        message: String,
+    },
     CompactionCancelled,
     WalSyncFailed(String),
+    GqlParse {
+        message: String,
+        span: SourceSpan,
+    },
+    GqlUnsupported {
+        feature: String,
+        message: String,
+        span: SourceSpan,
+    },
+    GqlSemantic {
+        code: GqlSemanticErrorCode,
+        message: String,
+        span: SourceSpan,
+    },
+    GqlParameter {
+        name: String,
+        expected: String,
+        message: String,
+        span: SourceSpan,
+    },
 }
 
 impl fmt::Display for EngineError {
@@ -30,8 +55,42 @@ impl fmt::Display for EngineError {
             EngineError::TxnConflict(msg) => write!(f, "transaction conflict: {}", msg),
             EngineError::TxnClosed => write!(f, "transaction is closed"),
             EngineError::InvalidOperation(msg) => write!(f, "invalid operation: {}", msg),
+            EngineError::InvalidCursor { message } => write!(f, "invalid cursor: {message}"),
             EngineError::CompactionCancelled => write!(f, "compaction cancelled by callback"),
             EngineError::WalSyncFailed(msg) => write!(f, "WAL sync failed: {}", msg),
+            EngineError::GqlParse { message, span } => write!(
+                f,
+                "GQL parse error at line {}, column {}: {}",
+                span.line, span.column, message
+            ),
+            EngineError::GqlUnsupported {
+                feature,
+                message,
+                span,
+            } => write!(
+                f,
+                "unsupported GQL feature '{}' at line {}, column {}: {}",
+                feature, span.line, span.column, message
+            ),
+            EngineError::GqlSemantic {
+                code,
+                message,
+                span,
+            } => write!(
+                f,
+                "GQL semantic error {:?} at line {}, column {}: {}",
+                code, span.line, span.column, message
+            ),
+            EngineError::GqlParameter {
+                name,
+                expected,
+                message,
+                span,
+            } => write!(
+                f,
+                "GQL parameter error for ${} at line {}, column {} (expected {}): {}",
+                name, span.line, span.column, expected, message
+            ),
         }
     }
 }

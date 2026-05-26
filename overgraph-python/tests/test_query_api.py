@@ -3,9 +3,6 @@ import time
 
 from overgraph import (
     EdgeQueryRequest,
-    GraphEdgePattern,
-    GraphNodePattern,
-    GraphPatternRequest,
     NodeQueryRequest,
 )
 
@@ -214,10 +211,10 @@ def test_query_updated_at_exclusive_overflow_is_empty_result(db):
     assert plan_has_kind(lt_plan["root"], "empty_result")
 
 
-def test_query_pattern_and_edge_literal_updated_at(db):
+def test_query_graph_rows_and_edge_literal_updated_at(db):
     ids = seed_query_graph(db)
 
-    result = db.query_pattern(
+    result = db.query_graph_rows(
         {
             "nodes": [
                 {
@@ -227,11 +224,12 @@ def test_query_pattern_and_edge_literal_updated_at(db):
                 },
                 {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
             ],
-            "edges": [
+            "pieces": [
                 {
                     "alias": "employment",
-                    "from_alias": "person",
-                    "to_alias": "company",
+                    "kind": "edge",
+                    "from": "person",
+                    "to": "company",
                     "direction": "outgoing",
                     "label_filter": ["WORKS_AT"],
                     "filter": {
@@ -243,18 +241,21 @@ def test_query_pattern_and_edge_literal_updated_at(db):
                     },
                 }
             ],
+            "return": [
+                {"expr": {"binding": "person"}, "as": "person"},
+                {"expr": {"binding": "company"}, "as": "company"},
+                {"expr": {"binding": "employment"}, "as": "employment"},
+            ],
             "limit": 10,
         }
     )
 
     assert result == {
-        "matches": [
-            {
-                "nodes": {"company": ids["acme"], "person": ids["active_high"]},
-                "edges": {"employment": ids["works_at"]},
-            }
-        ],
-        "truncated": False,
+        "columns": ["person", "company", "employment"],
+        "rows": [{"person": ids["active_high"], "company": ids["acme"], "employment": ids["works_at"]}],
+        "next_cursor": None,
+        "stats": result["stats"],
+        "plan": None,
     }
     assert ids["inactive_works_at"] != ids["works_at"]
 
@@ -289,32 +290,37 @@ def test_direct_edge_queries_and_canonical_pattern_filter(db):
     assert plan_has_kind(plan["root"], "verify_edge_filter")
     assert "edge_property_post_filter" in plan["warnings"]
 
-    pattern = GraphPatternRequest(
-        nodes=[
-            GraphNodePattern("person", ids=[ids["active_high"]]),
-            GraphNodePattern("company", label_filter=node_lf("Company"), keys=["acme"]),
-        ],
-        edges=[
-            GraphEdgePattern(
-                "person",
-                "company",
-                alias="employment",
-                label_filter=["WORKS_AT"],
-                filter={
-                    "and": [
-                        {"valid_at": int(time.time() * 1000)},
-                        {"property": "role", "eq": "engineer"},
-                    ]
-                },
-            )
-        ],
-        limit=10,
-    )
-    assert db.query_pattern(pattern)["matches"] == [
+    graph_rows = db.query_graph_rows(
         {
-            "nodes": {"company": ids["acme"], "person": ids["active_high"]},
-            "edges": {"employment": ids["works_at"]},
+            "nodes": [
+                {"alias": "person", "ids": [ids["active_high"]]},
+                {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
+            ],
+            "pieces": [
+                {
+                    "kind": "edge",
+                    "alias": "employment",
+                    "from": "person",
+                    "to": "company",
+                    "label_filter": ["WORKS_AT"],
+                    "filter": {
+                        "and": [
+                            {"valid_at": int(time.time() * 1000)},
+                            {"property": "role", "eq": "engineer"},
+                        ]
+                    },
+                }
+            ],
+            "return": [
+                {"expr": {"binding": "person"}, "as": "person"},
+                {"expr": {"binding": "company"}, "as": "company"},
+                {"expr": {"binding": "employment"}, "as": "employment"},
+            ],
+            "limit": 10,
         }
+    )
+    assert graph_rows["rows"] == [
+        {"company": ids["acme"], "person": ids["active_high"], "employment": ids["works_at"]}
     ]
 
 
@@ -334,38 +340,44 @@ def test_query_request_helpers_are_directly_usable(db):
     assert sorted(result.items.to_list()) == [ids["active_high"], ids["literal_updated_at"]]
     assert db.explain_node_query(request)["kind"] == "node_query"
 
-    pattern = GraphPatternRequest(
-        nodes=[
-            GraphNodePattern(
-                "person",
-                label_filter=node_lf("Person"),
-                filter={"property": "status", "eq": "active"},
-            ),
-            GraphNodePattern("company", label_filter=node_lf("Company"), keys=["acme"]),
-        ],
-        edges=[
-            GraphEdgePattern(
-                "person",
-                "company",
-                alias="employment",
-                label_filter=["WORKS_AT"],
-                filter={"property": "role", "eq": "engineer"},
-            )
-        ],
-        limit=10,
+    graph_rows = db.query_graph_rows(
+        {
+            "nodes": [
+                {
+                    "alias": "person",
+                    "label_filter": node_lf("Person"),
+                    "filter": {"property": "status", "eq": "active"},
+                },
+                {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
+            ],
+            "pieces": [
+                {
+                    "kind": "edge",
+                    "alias": "employment",
+                    "from": "person",
+                    "to": "company",
+                    "label_filter": ["WORKS_AT"],
+                    "filter": {"property": "role", "eq": "engineer"},
+                }
+            ],
+            "return": [
+                {"expr": {"binding": "person"}, "as": "person"},
+                {"expr": {"binding": "company"}, "as": "company"},
+                {"expr": {"binding": "employment"}, "as": "employment"},
+            ],
+            "limit": 10,
+        }
     )
-    assert db.query_pattern(pattern)["matches"][0] == {
-        "nodes": {"company": ids["acme"], "person": ids["active_high"]},
-        "edges": {"employment": ids["works_at"]},
+    assert graph_rows["rows"][0] == {
+        "company": ids["acme"],
+        "person": ids["active_high"],
+        "employment": ids["works_at"],
     }
 
 
 def test_query_request_helpers_reject_string_list_fields(db):
     with pytest.raises(TypeError, match="keys"):
         db.query_node_ids(NodeQueryRequest(label_filter=node_lf("Person"), keys="acme"))
-
-    with pytest.raises(TypeError, match="keys"):
-        GraphNodePattern("company", label_filter=node_lf("Company"), keys="acme").to_dict()
 
 
 def test_query_explain_uses_lower_snake_recursive_strings(db):
@@ -392,7 +404,7 @@ def test_query_explain_uses_lower_snake_recursive_strings(db):
         {"alias": None, "name": "Admin", "known": True, "mode": "any"},
     ]
 
-    pattern_plan = db.explain_pattern_query(
+    graph_plan = db.explain_graph_rows(
         {
             "nodes": [
                 {
@@ -402,11 +414,12 @@ def test_query_explain_uses_lower_snake_recursive_strings(db):
                 },
                 {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
             ],
-            "edges": [
+            "pieces": [
                 {
                     "alias": "employment",
-                    "from_alias": "person",
-                    "to_alias": "company",
+                    "kind": "edge",
+                    "from": "person",
+                    "to": "company",
                     "label_filter": ["WORKS_AT"],
                     "filter": {"property": "role", "eq": "engineer"},
                 }
@@ -414,10 +427,9 @@ def test_query_explain_uses_lower_snake_recursive_strings(db):
             "limit": 10,
         }
     )
-    assert pattern_plan["kind"] == "pattern_query"
-    assert plan_has_kind(pattern_plan["root"], "pattern_expand")
-    assert plan_has_kind(pattern_plan["root"], "verify_edge_predicates")
-    assert "edge_property_post_filter" in pattern_plan["warnings"]
+    assert graph_plan["columns"] == ["person", "company", "employment"]
+    assert graph_plan["projection"]["output_mode"] == "ids"
+    assert graph_plan["caps"]["max_page_limit"] >= 10
 
     full_edge_plan = db.explain_edge_query(
         {
@@ -447,10 +459,10 @@ def test_query_validation_errors(db):
         db.query_node_ids({"label_filter": node_lf("Person"), "filter": {"property": "score", "gt": 1, "gte": 2}})
     with pytest.raises(Exception, match="use filter"):
         db.query_node_ids({"label_filter": node_lf("Person"), "where": {"status": {"eq": "active"}}})
-    with pytest.raises(Exception, match="use filter"):
-        db.query_pattern({"nodes": [{"alias": "a", "where": {"status": {"eq": "active"}}}], "edges": [], "limit": 1})
+    with pytest.raises(Exception, match="unsupported after Phase 32"):
+        db.query_pattern({"nodes": [], "edges": [], "limit": 1})
     with pytest.raises(Exception, match="full scan|anchor|allow_full_scan"):
-        db.query_edge_ids({"filter": {"weight": {"gte": 1}}})
+        db.query_edge_ids({"filter": {"property": "role", "eq": "engineer"}})
     with pytest.raises(Exception, match="both gt and gte"):
         db.query_edge_ids({"label": "WORKS_AT", "filter": {"weight": {"gt": 1, "gte": 2}}})
     for field in ("where", "predicates"):
@@ -461,13 +473,14 @@ def test_query_validation_errors(db):
         with pytest.raises(Exception, match="use filter"):
             db.explain_edge_query({"label": "WORKS_AT", field: {"role": {"eq": "engineer"}}})
     with pytest.raises(Exception, match="use filter"):
-        db.query_pattern(
+        db.query_graph_rows(
             {
                 "nodes": [{"alias": "a"}],
-                "edges": [
+                "pieces": [
                     {
-                        "from_alias": "a",
-                        "to_alias": "b",
+                        "kind": "edge",
+                        "from": "a",
+                        "to": "b",
                         "filter": {"property": "role", "eq": "engineer"},
                         "where": {"role": {"eq": "engineer"}},
                     }
@@ -476,7 +489,7 @@ def test_query_validation_errors(db):
             }
         )
     with pytest.raises(Exception, match="positive limit|limit must be > 0"):
-        db.query_pattern({"nodes": [], "edges": [], "limit": 0})
+        db.query_graph_rows({"nodes": [], "pieces": [], "limit": 0})
 
 
 def test_query_numeric_fields_reject_bool(db):
@@ -507,31 +520,31 @@ def test_query_numeric_fields_reject_bool(db):
         with pytest.raises(TypeError, match="bool"):
             db.query_edge_ids(request)
 
-    invalid_pattern_bool_requests = [
-        {"nodes": [], "edges": [], "limit": True},
-        {"nodes": [], "edges": [], "limit": 1, "at_epoch": True},
-        {"nodes": [{"alias": "a", "ids": [True]}], "edges": [], "limit": 1},
+    invalid_graph_row_bool_requests = [
+        {"nodes": [], "pieces": [], "limit": True},
+        {"nodes": [], "pieces": [], "limit": 1, "at_epoch": True},
+        {"nodes": [{"alias": "a", "ids": [True]}], "pieces": [], "limit": 1},
     ]
-    for request in invalid_pattern_bool_requests:
+    for request in invalid_graph_row_bool_requests:
         with pytest.raises(TypeError, match="bool"):
-            db.query_pattern(request)
+            db.query_graph_rows(request)
     with pytest.raises(TypeError, match="str"):
         db.query_node_ids({"label_filter": {"labels": [True], "mode": "all"}})
     with pytest.raises(TypeError, match="str"):
-        db.query_pattern(
+        db.query_graph_rows(
             {
                 "nodes": [
                     {"alias": "a", "label_filter": {"labels": [True], "mode": "all"}}
                 ],
-                "edges": [],
+                "pieces": [],
                 "limit": 1,
             }
         )
     with pytest.raises(TypeError, match="str"):
-        db.query_pattern(
+        db.query_graph_rows(
             {
                 "nodes": [],
-                "edges": [{"from_alias": "a", "to_alias": "b", "label_filter": [True]}],
+                "pieces": [{"kind": "edge", "from": "a", "to": "b", "label_filter": [True]}],
                 "limit": 1,
             }
         )
@@ -539,7 +552,7 @@ def test_query_numeric_fields_reject_bool(db):
     with pytest.raises(ValueError, match="label.*label_filter"):
         db.query_node_ids({"label": "Person"})
     with pytest.raises(ValueError, match="label.*label_filter"):
-        db.query_pattern({"nodes": [{"alias": "a", "label": "Person"}], "edges": [], "limit": 1})
+        db.query_graph_rows({"nodes": [{"alias": "a", "label": "Person"}], "pieces": [], "limit": 1})
 
 
 def test_query_boolean_filter_and_value_semantics(db):
@@ -594,10 +607,10 @@ def test_query_boolean_filter_and_value_semantics(db):
     float_node = db.upsert_node("Person", "float-value", props={"kind": 1.0})
     assert db.query_node_ids(
         {"label_filter": node_lf("Person"), "filter": {"property": "kind", "eq": 1}}
-    ).items.to_list() == [int_node]
+    ).items.to_list() == [int_node, float_node]
     assert db.query_node_ids(
         {"label_filter": node_lf("Person"), "filter": {"property": "kind", "eq": 1.0}}
-    ).items.to_list() == [float_node]
+    ).items.to_list() == [int_node, float_node]
 
 
 def test_query_invalid_canonical_filter_shapes(db):
@@ -626,7 +639,7 @@ def test_query_invalid_canonical_filter_shapes(db):
             db.query_node_ids({"label_filter": node_lf("Person"), "filter": filter_expr})
 
     with pytest.raises(Exception, match="use filter"):
-        db.query_pattern(
+        db.query_graph_rows(
             {
                 "nodes": [
                     {
@@ -636,7 +649,7 @@ def test_query_invalid_canonical_filter_shapes(db):
                         ],
                     }
                 ],
-                "edges": [],
+                "pieces": [],
                 "limit": 1,
             }
         )
@@ -749,7 +762,7 @@ async def test_async_query_parity(async_db):
             {"label": "WORKS_AT", "where": {"role": {"eq": "engineer"}}}
         )
 
-    pattern = await async_db.query_pattern(
+    graph_rows = await async_db.query_graph_rows(
         {
             "nodes": [
                 {
@@ -759,20 +772,30 @@ async def test_async_query_parity(async_db):
                 },
                 {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
             ],
-            "edges": [
+            "pieces": [
                 {
+                    "kind": "edge",
                     "alias": "employment",
-                    "from_alias": "person",
-                    "to_alias": "company",
+                    "from": "person",
+                    "to": "company",
                     "label_filter": ["WORKS_AT"],
                 }
+            ],
+            "return": [
+                {"expr": {"binding": "person"}, "as": "person"},
+                {"expr": {"binding": "company"}, "as": "company"},
+                {"expr": {"binding": "employment"}, "as": "employment"},
             ],
             "limit": 10,
         }
     )
-    assert pattern["matches"][0]["nodes"] == {"company": acme, "person": active_high}
+    assert graph_rows["rows"][0] == {
+        "company": acme,
+        "person": active_high,
+        "employment": works_at,
+    }
 
-    pattern_plan = await async_db.explain_pattern_query(
+    graph_plan = await async_db.explain_graph_rows(
         {
             "nodes": [
                 {
@@ -782,16 +805,16 @@ async def test_async_query_parity(async_db):
                 },
                 {"alias": "company", "label_filter": node_lf("Company"), "keys": ["acme"]},
             ],
-            "edges": [
+            "pieces": [
                 {
+                    "kind": "edge",
                     "alias": "employment",
-                    "from_alias": "person",
-                    "to_alias": "company",
+                    "from": "person",
+                    "to": "company",
                     "label_filter": ["WORKS_AT"],
                 }
             ],
             "limit": 10,
         }
     )
-    assert pattern_plan["kind"] == "pattern_query"
-    assert plan_has_kind(pattern_plan["root"], "verify_node_filter")
+    assert graph_plan["projection"]["output_mode"] == "ids"

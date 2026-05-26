@@ -1,6 +1,11 @@
 use crate::edge_metadata::EdgeMetadataCandidate;
 #[cfg(test)]
 use crate::edge_metadata::{i64_matches_bounds, weight_matches_bounds, RangeBoundFlags};
+use crate::property_value_semantics::{
+    hash_prop_equality_key, numeric_range_sort_key_for_value, semantic_property_eq,
+    NumericRangeSortKey,
+};
+use crate::row_projection::{EdgeSelectedFieldNeeds, NodeSelectedFieldNeeds, PropertySelection};
 use crate::types::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Bound, ControlFlow};
@@ -21,36 +26,22 @@ pub(crate) fn endpoint_cursor_entries_visited_for_test() -> usize {
     ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.load(Ordering::Relaxed)
 }
 
-fn encode_signed_range_key(value: i64) -> u64 {
-    (value as u64) ^ (1u64 << 63)
-}
-
-fn encode_float_range_key(value: f64) -> Option<u64> {
-    if !value.is_finite() {
-        return None;
-    }
-    let normalized = if value == 0.0 { 0.0 } else { value };
-    let bits = normalized.to_bits();
-    Some(if bits & (1u64 << 63) != 0 {
-        !bits
-    } else {
-        bits ^ (1u64 << 63)
-    })
-}
-
-pub(crate) fn encode_range_prop_value(
-    domain: SecondaryIndexRangeDomain,
-    value: &PropValue,
-) -> Option<u64> {
-    match (domain, value) {
-        (SecondaryIndexRangeDomain::Int, PropValue::Int(value)) => {
-            Some(encode_signed_range_key(*value))
+fn selected_props_from_map(
+    props: &BTreeMap<String, PropValue>,
+    selection: &PropertySelection,
+) -> BTreeMap<String, PropValue> {
+    match selection {
+        PropertySelection::None => BTreeMap::new(),
+        PropertySelection::Keys(keys) => {
+            let mut selected = BTreeMap::new();
+            for key in keys {
+                if let Some(value) = props.get(key) {
+                    selected.insert(key.clone(), value.clone());
+                }
+            }
+            selected
         }
-        (SecondaryIndexRangeDomain::UInt, PropValue::UInt(value)) => Some(*value),
-        (SecondaryIndexRangeDomain::Float, PropValue::Float(value)) => {
-            encode_float_range_key(*value)
-        }
-        _ => None,
+        PropertySelection::All => props.clone(),
     }
 }
 
@@ -123,7 +114,7 @@ type LookupSlot<V> = VersionedSlot<Option<V>>;
 type MembershipSlot<T> = VersionedSlot<Option<T>>;
 type SecondaryEqMemberState = HashMap<u64, NodeIdMap<MembershipSlot<()>>>;
 type SecondaryEqState = HashMap<u64, SecondaryEqMemberState>;
-type SecondaryRangeState = HashMap<u64, BTreeMap<(u64, u64), MembershipSlot<()>>>;
+type SecondaryRangeState = HashMap<u64, BTreeMap<(NumericRangeSortKey, u64), MembershipSlot<()>>>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MemtableEndpointCountEstimate {
@@ -177,11 +168,8 @@ fn estimate_secondary_eq_lookup_entry(prop_key: &str, index_ids: &[u64]) -> usiz
     48 + prop_key.len() + index_ids.len() * 8
 }
 
-fn estimate_secondary_range_lookup_entry(
-    prop_key: &str,
-    indexes: &[(u64, SecondaryIndexRangeDomain)],
-) -> usize {
-    48 + prop_key.len() + indexes.len() * 16
+fn estimate_secondary_range_lookup_entry(prop_key: &str, indexes: &[u64]) -> usize {
+    48 + prop_key.len() + indexes.len() * 8
 }
 
 fn estimate_secondary_eq_state_groups(groups: &SecondaryEqMemberState) -> usize {
@@ -197,7 +185,7 @@ fn estimate_secondary_eq_state_groups(groups: &SecondaryEqMemberState) -> usize 
 }
 
 fn estimate_secondary_range_state_entries(
-    entries: &BTreeMap<(u64, u64), MembershipSlot<()>>,
+    entries: &BTreeMap<(NumericRangeSortKey, u64), MembershipSlot<()>>,
 ) -> usize {
     entries.values().map(estimate_membership_slot).sum()
 }
@@ -222,10 +210,9 @@ struct MemtableState {
     time_node_index: BTreeMap<(u32, i64, u64), MembershipSlot<()>>,
     secondary_index_declarations: HashMap<u64, SecondaryIndexManifestEntry>,
     secondary_eq_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
-    secondary_range_by_prop: HashMap<u32, HashMap<String, Vec<(u64, SecondaryIndexRangeDomain)>>>,
+    secondary_range_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
     secondary_edge_eq_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
-    secondary_edge_range_by_prop:
-        HashMap<u32, HashMap<String, Vec<(u64, SecondaryIndexRangeDomain)>>>,
+    secondary_edge_range_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
     secondary_eq_state: SecondaryEqState,
     secondary_range_state: SecondaryRangeState,
 }
@@ -240,6 +227,51 @@ fn slot_option_at<T: Clone>(slot: &VersionedSlot<Option<T>>, snapshot_seq: u64) 
 
 fn slot_option_visible<T: Clone>(slot: &VersionedSlot<Option<T>>, snapshot_seq: u64) -> bool {
     slot.at(snapshot_seq).is_some_and(Option::is_some)
+}
+
+fn optional_semantic_property_eq(left: Option<&PropValue>, right: Option<&PropValue>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => semantic_property_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn secondary_range_start_bound(
+    lower: Option<(NumericRangeSortKey, bool)>,
+    after: Option<(NumericRangeSortKey, u64)>,
+) -> std::ops::Bound<(NumericRangeSortKey, u64)> {
+    let mut start = lower.map(|(value, inclusive)| {
+        if inclusive {
+            ((value, 0), false)
+        } else {
+            ((value, u64::MAX), true)
+        }
+    });
+    if let Some(cursor) = after {
+        let cursor_start = (cursor, true);
+        start = Some(match start {
+            Some(existing) if existing.0 > cursor_start.0 => existing,
+            Some(existing) if existing.0 < cursor_start.0 => cursor_start,
+            Some(existing) => (existing.0, existing.1 || cursor_start.1),
+            None => cursor_start,
+        });
+    }
+
+    match start {
+        Some((target, true)) => std::ops::Bound::Excluded(target),
+        Some((target, false)) => std::ops::Bound::Included(target),
+        None => std::ops::Bound::Unbounded,
+    }
+}
+
+fn secondary_range_past_upper(
+    encoded: NumericRangeSortKey,
+    upper: Option<(NumericRangeSortKey, bool)>,
+) -> bool {
+    upper.is_some_and(|(upper_value, inclusive)| {
+        encoded > upper_value || (!inclusive && encoded == upper_value)
+    })
 }
 
 fn record_current<T: Clone>(slot: &VersionedRecordSlot<T>) -> Option<&T> {
@@ -316,7 +348,7 @@ fn current_secondary_eq_state(source: &SecondaryEqState) -> HashMap<u64, HashMap
 
 fn current_secondary_range_state(
     source: &SecondaryRangeState,
-) -> HashMap<u64, BTreeSet<(u64, u64)>> {
+) -> HashMap<u64, BTreeSet<(NumericRangeSortKey, u64)>> {
     let mut result = HashMap::new();
     for (&index_id, entries) in source {
         let mut visible = BTreeSet::new();
@@ -578,7 +610,7 @@ impl MemtableState {
     fn set_secondary_range_slot_in(
         state: &mut SecondaryRangeState,
         index_id: u64,
-        encoded: u64,
+        encoded: NumericRangeSortKey,
         node_id: u64,
         present: bool,
         write_seq: u64,
@@ -722,7 +754,7 @@ impl MemtableState {
     fn set_secondary_range_slot(
         &mut self,
         index_id: u64,
-        encoded: u64,
+        encoded: NumericRangeSortKey,
         node_id: u64,
         present: bool,
         write_seq: u64,
@@ -989,7 +1021,7 @@ impl MemtableState {
         props: &BTreeMap<String, PropValue>,
         present: bool,
         eq_actions: &mut Vec<(u64, u64, u64, bool)>,
-        range_actions: &mut Vec<(u64, u64, u64, bool)>,
+        range_actions: &mut Vec<(u64, NumericRangeSortKey, u64, bool)>,
     ) {
         let eq_by_prop = self.secondary_eq_by_prop.get(&label_id);
         let range_by_prop = self.secondary_range_by_prop.get(&label_id);
@@ -999,7 +1031,7 @@ impl MemtableState {
 
         for (prop_key, prop_value) in props {
             if let Some(index_ids) = eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str())) {
-                let value_hash = hash_prop_value(prop_value);
+                let value_hash = hash_prop_equality_key(prop_value);
                 for &index_id in index_ids {
                     eq_actions.push((index_id, value_hash, node_id, present));
                 }
@@ -1007,8 +1039,8 @@ impl MemtableState {
 
             if let Some(indexes) = range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
             {
-                for &(index_id, domain) in indexes {
-                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                for &index_id in indexes {
+                    if let Some(encoded) = numeric_range_sort_key_for_value(prop_value) {
                         range_actions.push((index_id, encoded, node_id, present));
                     }
                 }
@@ -1022,23 +1054,23 @@ impl MemtableState {
         old_node: &NodeRecord,
         new_node: &NodeRecord,
         eq_actions: &mut Vec<(u64, u64, u64, bool)>,
-        range_actions: &mut Vec<(u64, u64, u64, bool)>,
+        range_actions: &mut Vec<(u64, NumericRangeSortKey, u64, bool)>,
     ) {
         if let Some(by_prop) = self.secondary_eq_by_prop.get(&label_id) {
             for (prop_key, index_ids) in by_prop {
                 let old_value = old_node.props.get(prop_key.as_str());
                 let new_value = new_node.props.get(prop_key.as_str());
-                if old_value == new_value {
+                if optional_semantic_property_eq(old_value, new_value) {
                     continue;
                 }
                 if let Some(old_value) = old_value {
-                    let value_hash = hash_prop_value(old_value);
+                    let value_hash = hash_prop_equality_key(old_value);
                     for &index_id in index_ids {
                         eq_actions.push((index_id, value_hash, old_node.id, false));
                     }
                 }
                 if let Some(new_value) = new_value {
-                    let value_hash = hash_prop_value(new_value);
+                    let value_hash = hash_prop_equality_key(new_value);
                     for &index_id in index_ids {
                         eq_actions.push((index_id, value_hash, new_node.id, true));
                     }
@@ -1050,18 +1082,16 @@ impl MemtableState {
             for (prop_key, indexes) in by_prop {
                 let old_value = old_node.props.get(prop_key.as_str());
                 let new_value = new_node.props.get(prop_key.as_str());
-                if old_value == new_value {
+                let old_encoded = old_value.and_then(numeric_range_sort_key_for_value);
+                let new_encoded = new_value.and_then(numeric_range_sort_key_for_value);
+                if old_encoded == new_encoded {
                     continue;
                 }
-                for &(index_id, domain) in indexes {
-                    if let Some(encoded) =
-                        old_value.and_then(|value| encode_range_prop_value(domain, value))
-                    {
+                for &index_id in indexes {
+                    if let Some(encoded) = old_encoded {
                         range_actions.push((index_id, encoded, old_node.id, false));
                     }
-                    if let Some(encoded) =
-                        new_value.and_then(|value| encode_range_prop_value(domain, value))
-                    {
+                    if let Some(encoded) = new_encoded {
                         range_actions.push((index_id, encoded, new_node.id, true));
                     }
                 }
@@ -1190,7 +1220,7 @@ impl MemtableState {
         let mut range_actions = Vec::new();
         for (prop_key, prop_value) in &edge.props {
             if let Some(index_ids) = eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str())) {
-                let value_hash = hash_prop_value(prop_value);
+                let value_hash = hash_prop_equality_key(prop_value);
                 for &index_id in index_ids {
                     eq_actions.push((index_id, value_hash));
                 }
@@ -1198,8 +1228,8 @@ impl MemtableState {
 
             if let Some(indexes) = range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
             {
-                for &(index_id, domain) in indexes {
-                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                for &index_id in indexes {
+                    if let Some(encoded) = numeric_range_sort_key_for_value(prop_value) {
                         range_actions.push((index_id, encoded));
                     }
                 }
@@ -1227,7 +1257,7 @@ impl MemtableState {
         let mut range_actions = Vec::new();
         for (prop_key, prop_value) in &edge.props {
             if let Some(index_ids) = eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str())) {
-                let value_hash = hash_prop_value(prop_value);
+                let value_hash = hash_prop_equality_key(prop_value);
                 for &index_id in index_ids {
                     eq_actions.push((index_id, value_hash));
                 }
@@ -1235,8 +1265,8 @@ impl MemtableState {
 
             if let Some(indexes) = range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
             {
-                for &(index_id, domain) in indexes {
-                    if let Some(encoded) = encode_range_prop_value(domain, prop_value) {
+                for &index_id in indexes {
+                    if let Some(encoded) = numeric_range_sort_key_for_value(prop_value) {
                         range_actions.push((index_id, encoded));
                     }
                 }
@@ -1284,17 +1314,17 @@ impl MemtableState {
             for (prop_key, index_ids) in by_prop {
                 let old_value = old_edge.props.get(prop_key.as_str());
                 let new_value = new_edge.props.get(prop_key.as_str());
-                if old_value == new_value {
+                if optional_semantic_property_eq(old_value, new_value) {
                     continue;
                 }
                 if let Some(old_value) = old_value {
-                    let value_hash = hash_prop_value(old_value);
+                    let value_hash = hash_prop_equality_key(old_value);
                     for &index_id in index_ids {
                         eq_actions.push((index_id, value_hash, old_edge.id, false));
                     }
                 }
                 if let Some(new_value) = new_value {
-                    let value_hash = hash_prop_value(new_value);
+                    let value_hash = hash_prop_equality_key(new_value);
                     for &index_id in index_ids {
                         eq_actions.push((index_id, value_hash, new_edge.id, true));
                     }
@@ -1306,18 +1336,16 @@ impl MemtableState {
             for (prop_key, indexes) in by_prop {
                 let old_value = old_edge.props.get(prop_key.as_str());
                 let new_value = new_edge.props.get(prop_key.as_str());
-                if old_value == new_value {
+                let old_encoded = old_value.and_then(numeric_range_sort_key_for_value);
+                let new_encoded = new_value.and_then(numeric_range_sort_key_for_value);
+                if old_encoded == new_encoded {
                     continue;
                 }
-                for &(index_id, domain) in indexes {
-                    if let Some(encoded) =
-                        old_value.and_then(|value| encode_range_prop_value(domain, value))
-                    {
+                for &index_id in indexes {
+                    if let Some(encoded) = old_encoded {
                         range_actions.push((index_id, encoded, old_edge.id, false));
                     }
-                    if let Some(encoded) =
-                        new_value.and_then(|value| encode_range_prop_value(domain, value))
-                    {
+                    if let Some(encoded) = new_encoded {
                         range_actions.push((index_id, encoded, new_edge.id, true));
                     }
                 }
@@ -1598,7 +1626,11 @@ impl Memtable {
                         let Some(prop_value) = node.props.get(prop_key) else {
                             continue;
                         };
-                        seeded.push((hash_prop_value(prop_value), node.id, node.last_write_seq));
+                        seeded.push((
+                            hash_prop_equality_key(prop_value),
+                            node.id,
+                            node.last_write_seq,
+                        ));
                     }
                     for (value_hash, node_id, write_seq) in seeded {
                         state.set_secondary_eq_slot(
@@ -1610,20 +1642,20 @@ impl Memtable {
                         );
                     }
                 }
-                SecondaryIndexKind::Range { domain } => {
+                SecondaryIndexKind::Range => {
                     let (lookup_before, lookup_after) = {
                         let by_prop = state.secondary_range_by_prop.entry(*label_id).or_default();
                         match by_prop.get_mut(prop_key) {
                             Some(indexes) => {
                                 let before =
                                     estimate_secondary_range_lookup_entry(prop_key, indexes);
-                                indexes.push((entry.index_id, *domain));
+                                indexes.push(entry.index_id);
                                 let after =
                                     estimate_secondary_range_lookup_entry(prop_key, indexes);
                                 (before, after)
                             }
                             None => {
-                                let indexes = vec![(entry.index_id, *domain)];
+                                let indexes = vec![entry.index_id];
                                 let after =
                                     estimate_secondary_range_lookup_entry(prop_key, &indexes);
                                 by_prop.insert(prop_key.clone(), indexes);
@@ -1647,7 +1679,7 @@ impl Memtable {
                         let Some(prop_value) = node.props.get(prop_key) else {
                             continue;
                         };
-                        let Some(encoded) = encode_range_prop_value(*domain, prop_value) else {
+                        let Some(encoded) = numeric_range_sort_key_for_value(prop_value) else {
                             continue;
                         };
                         seeded.push((encoded, node.id, node.last_write_seq));
@@ -1700,7 +1732,11 @@ impl Memtable {
                         let Some(prop_value) = edge.props.get(prop_key) else {
                             continue;
                         };
-                        seeded.push((hash_prop_value(prop_value), edge.id, edge.last_write_seq));
+                        seeded.push((
+                            hash_prop_equality_key(prop_value),
+                            edge.id,
+                            edge.last_write_seq,
+                        ));
                     }
                     for (value_hash, edge_id, write_seq) in seeded {
                         state.set_secondary_eq_slot(
@@ -1712,7 +1748,7 @@ impl Memtable {
                         );
                     }
                 }
-                SecondaryIndexKind::Range { domain } => {
+                SecondaryIndexKind::Range => {
                     let (lookup_before, lookup_after) = {
                         let by_prop = state
                             .secondary_edge_range_by_prop
@@ -1722,13 +1758,13 @@ impl Memtable {
                             Some(indexes) => {
                                 let before =
                                     estimate_secondary_range_lookup_entry(prop_key, indexes);
-                                indexes.push((entry.index_id, *domain));
+                                indexes.push(entry.index_id);
                                 let after =
                                     estimate_secondary_range_lookup_entry(prop_key, indexes);
                                 (before, after)
                             }
                             None => {
-                                let indexes = vec![(entry.index_id, *domain)];
+                                let indexes = vec![entry.index_id];
                                 let after =
                                     estimate_secondary_range_lookup_entry(prop_key, &indexes);
                                 by_prop.insert(prop_key.clone(), indexes);
@@ -1752,7 +1788,7 @@ impl Memtable {
                         let Some(prop_value) = edge.props.get(prop_key) else {
                             continue;
                         };
-                        let Some(encoded) = encode_range_prop_value(*domain, prop_value) else {
+                        let Some(encoded) = numeric_range_sort_key_for_value(prop_value) else {
                             continue;
                         };
                         seeded.push((encoded, edge.id, edge.last_write_seq));
@@ -1814,7 +1850,7 @@ impl Memtable {
                             .saturating_sub(estimate_secondary_eq_state_groups(&groups));
                     }
                 }
-                SecondaryIndexKind::Range { domain } => {
+                SecondaryIndexKind::Range => {
                     let (lookup_before, lookup_after, remove_label_entry) = {
                         let mut delta = (0, 0);
                         let mut remove_label_entry = false;
@@ -1822,9 +1858,7 @@ impl Memtable {
                             let mut remove_prop_entry = false;
                             if let Some(indexes) = by_prop.get_mut(&prop_key) {
                                 delta.0 = estimate_secondary_range_lookup_entry(&prop_key, indexes);
-                                indexes.retain(|&(id, existing_domain)| {
-                                    id != index_id || existing_domain != domain
-                                });
+                                indexes.retain(|&id| id != index_id);
                                 if indexes.is_empty() {
                                     remove_prop_entry = true;
                                 } else {
@@ -1884,7 +1918,7 @@ impl Memtable {
                             .saturating_sub(estimate_secondary_eq_state_groups(&groups));
                     }
                 }
-                SecondaryIndexKind::Range { domain } => {
+                SecondaryIndexKind::Range => {
                     let (lookup_before, lookup_after, remove_label_entry) = {
                         let mut delta = (0, 0);
                         let mut remove_label_entry = false;
@@ -1893,9 +1927,7 @@ impl Memtable {
                             let mut remove_prop_entry = false;
                             if let Some(indexes) = by_prop.get_mut(&prop_key) {
                                 delta.0 = estimate_secondary_range_lookup_entry(&prop_key, indexes);
-                                indexes.retain(|&(id, existing_domain)| {
-                                    id != index_id || existing_domain != domain
-                                });
+                                indexes.retain(|&id| id != index_id);
                                 if indexes.is_empty() {
                                     remove_prop_entry = true;
                                 } else {
@@ -1957,21 +1989,164 @@ impl Memtable {
         state.edge_at(id, snapshot_seq).cloned()
     }
 
-    pub(crate) fn edge_properties_at(
+    pub(crate) fn batch_get_node_selected_fields_at(
         &self,
-        id: u64,
-        prop_keys: &[String],
+        lookups: &[(usize, u64)],
+        needs: &NodeSelectedFieldNeeds,
         snapshot_seq: u64,
-    ) -> Option<BTreeMap<String, PropValue>> {
+        results: &mut [Option<SelectedNodeFields>],
+        #[cfg(test)] selected_field_read_counters: Option<&SelectedFieldReadCounters>,
+    ) -> Vec<(usize, u64)> {
+        #[derive(Clone, Copy)]
+        enum CachedLookup {
+            Live(usize),
+            Tombstone,
+            Miss,
+        }
+
+        if lookups.is_empty() {
+            return Vec::new();
+        }
+
         let state = self.state.read().unwrap();
-        let edge = state.edge_at(id, snapshot_seq)?;
-        let mut props = BTreeMap::new();
-        for key in prop_keys {
-            if let Some(value) = edge.props.get(key) {
-                props.insert(key.clone(), value.clone());
+        let mut cache =
+            NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
+        let mut remaining = Vec::with_capacity(lookups.len());
+
+        for &(orig_idx, id) in lookups {
+            match cache.get(&id).copied() {
+                Some(CachedLookup::Live(cached_idx)) => {
+                    results[orig_idx] = results[cached_idx].clone();
+                }
+                Some(CachedLookup::Tombstone) => {}
+                Some(CachedLookup::Miss) => remaining.push((orig_idx, id)),
+                None => {
+                    let outcome = match state.nodes.get(&id) {
+                        Some(slot) => match record_at(slot, snapshot_seq) {
+                            Some(RecordState::Live(node)) => {
+                                #[cfg(test)]
+                                let dense_vector = if needs.vectors.needs_dense() {
+                                    let vector = node.dense_vector.clone();
+                                    if vector.is_some() {
+                                        if let Some(counters) = selected_field_read_counters {
+                                            counters.note_node_dense_vector_projection_read();
+                                        }
+                                    }
+                                    vector
+                                } else {
+                                    None
+                                };
+                                #[cfg(not(test))]
+                                let dense_vector = needs
+                                    .vectors
+                                    .needs_dense()
+                                    .then(|| node.dense_vector.clone())
+                                    .flatten();
+                                #[cfg(test)]
+                                let sparse_vector = if needs.vectors.needs_sparse() {
+                                    let vector = node.sparse_vector.clone();
+                                    if vector.is_some() {
+                                        if let Some(counters) = selected_field_read_counters {
+                                            counters.note_node_sparse_vector_projection_read();
+                                        }
+                                    }
+                                    vector
+                                } else {
+                                    None
+                                };
+                                #[cfg(not(test))]
+                                let sparse_vector = needs
+                                    .vectors
+                                    .needs_sparse()
+                                    .then(|| node.sparse_vector.clone())
+                                    .flatten();
+                                results[orig_idx] = Some(SelectedNodeFields {
+                                    meta: NodeMetadataForQuery {
+                                        id: node.id,
+                                        label_ids: node.label_ids,
+                                        updated_at: node.updated_at,
+                                        weight: node.weight,
+                                    },
+                                    key: needs.key.then(|| node.key.clone()),
+                                    props: selected_props_from_map(&node.props, &needs.props),
+                                    created_at: needs.created_at.then_some(node.created_at),
+                                    dense_vector,
+                                    sparse_vector,
+                                });
+                                CachedLookup::Live(orig_idx)
+                            }
+                            Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
+                            None => CachedLookup::Miss,
+                        },
+                        None => CachedLookup::Miss,
+                    };
+                    cache.insert(id, outcome);
+                    if matches!(outcome, CachedLookup::Miss) {
+                        remaining.push((orig_idx, id));
+                    }
+                }
             }
         }
-        Some(props)
+
+        remaining
+    }
+
+    pub(crate) fn batch_get_edge_selected_fields_at(
+        &self,
+        lookups: &[(usize, u64)],
+        needs: &EdgeSelectedFieldNeeds,
+        snapshot_seq: u64,
+        results: &mut [Option<SelectedEdgeFields>],
+        #[cfg(test)] _selected_field_read_counters: Option<&SelectedFieldReadCounters>,
+    ) -> Vec<(usize, u64)> {
+        #[derive(Clone, Copy)]
+        enum CachedLookup {
+            Live(usize),
+            Tombstone,
+            Miss,
+        }
+
+        if lookups.is_empty() {
+            return Vec::new();
+        }
+
+        let state = self.state.read().unwrap();
+        let mut cache =
+            NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
+        let mut remaining = Vec::with_capacity(lookups.len());
+
+        for &(orig_idx, id) in lookups {
+            match cache.get(&id).copied() {
+                Some(CachedLookup::Live(cached_idx)) => {
+                    results[orig_idx] = results[cached_idx].clone();
+                }
+                Some(CachedLookup::Tombstone) => {}
+                Some(CachedLookup::Miss) => remaining.push((orig_idx, id)),
+                None => {
+                    let outcome = match state.edges.get(&id) {
+                        Some(slot) => match record_at(slot, snapshot_seq) {
+                            Some(RecordState::Live(edge)) => {
+                                results[orig_idx] = Some(SelectedEdgeFields {
+                                    meta: EdgeMetadataForQuery::from(edge),
+                                    props: selected_props_from_map(&edge.props, &needs.props),
+                                    created_at: needs.created_at.then_some(edge.created_at),
+                                });
+                                CachedLookup::Live(orig_idx)
+                            }
+                            Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
+                            None => CachedLookup::Miss,
+                        },
+                        None => CachedLookup::Miss,
+                    };
+                    cache.insert(id, outcome);
+                    if matches!(outcome, CachedLookup::Miss) {
+                        remaining.push((orig_idx, id));
+                    }
+                }
+            }
+        }
+
+        remaining
     }
 
     pub(crate) fn get_edge_core_at(
@@ -2220,6 +2395,19 @@ impl Memtable {
         let node_id =
             *slot_option_at(state.node_key_index.get(&label_id)?.get(key)?, snapshot_seq)?;
         state.node_at(node_id, snapshot_seq).cloned()
+    }
+
+    pub(crate) fn node_id_by_key_at(
+        &self,
+        label_id: u32,
+        key: &str,
+        snapshot_seq: u64,
+    ) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        let node_id =
+            *slot_option_at(state.node_key_index.get(&label_id)?.get(key)?, snapshot_seq)?;
+        let node = state.node_at(node_id, snapshot_seq)?;
+        (node.label_ids.contains(label_id) && node.key == key).then_some(node_id)
     }
 
     pub(crate) fn edge_by_triple_at(
@@ -2970,7 +3158,7 @@ impl Memtable {
         max_ids: Option<usize>,
     ) -> Vec<u64> {
         let state = self.state.read().unwrap();
-        let value_hash = hash_prop_value(prop_value);
+        let value_hash = hash_prop_equality_key(prop_value);
         let mut ids = Vec::new();
         if let Some(groups) = state.secondary_eq_state.get(&index_id) {
             if let Some(group) = groups.get(&value_hash) {
@@ -2984,7 +3172,7 @@ impl Memtable {
                     if node
                         .props
                         .get(prop_key)
-                        .is_some_and(|value| value == prop_value)
+                        .is_some_and(|value| semantic_property_eq(value, prop_value))
                     {
                         ids.push(node_id);
                         if max_ids.is_some_and(|max_ids| ids.len() >= max_ids) {
@@ -3035,7 +3223,7 @@ impl Memtable {
         snapshot_seq: u64,
     ) -> usize {
         let state = self.state.read().unwrap();
-        let value_hash = hash_prop_value(prop_value);
+        let value_hash = hash_prop_equality_key(prop_value);
         let Some(groups) = state.secondary_eq_state.get(&index_id) else {
             return 0;
         };
@@ -3054,7 +3242,7 @@ impl Memtable {
             if node
                 .props
                 .get(prop_key)
-                .is_some_and(|value| value == prop_value)
+                .is_some_and(|value| semantic_property_eq(value, prop_value))
             {
                 count += 1;
             }
@@ -3099,7 +3287,7 @@ impl Memtable {
         snapshot_seq: u64,
     ) -> usize {
         let state = self.state.read().unwrap();
-        let value_hash = hash_prop_value(prop_value);
+        let value_hash = hash_prop_equality_key(prop_value);
         let Some(groups) = state.secondary_eq_state.get(&index_id) else {
             return 0;
         };
@@ -3118,7 +3306,7 @@ impl Memtable {
             if edge
                 .props
                 .get(prop_key)
-                .is_some_and(|value| value == prop_value)
+                .is_some_and(|value| semantic_property_eq(value, prop_value))
             {
                 count += 1;
             }
@@ -3126,113 +3314,100 @@ impl Memtable {
         count
     }
 
+    #[cfg(test)]
     pub(crate) fn visible_secondary_range_entries(
         &self,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
-        after: Option<(u64, u64)>,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
         snapshot_seq: u64,
-    ) -> Vec<(u64, u64)> {
-        use std::ops::Bound;
+    ) -> Vec<(NumericRangeSortKey, u64)> {
+        self.visible_secondary_range_entries_limited(
+            index_id,
+            lower,
+            upper,
+            after,
+            snapshot_seq,
+            None,
+        )
+    }
 
+    pub(crate) fn visible_secondary_range_entries_limited(
+        &self,
+        index_id: u64,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
+        snapshot_seq: u64,
+        limit: Option<usize>,
+    ) -> Vec<(NumericRangeSortKey, u64)> {
+        if limit == Some(0) {
+            return Vec::new();
+        }
         let state = self.state.read().unwrap();
         let Some(entries) = state.secondary_range_state.get(&index_id) else {
             return Vec::new();
         };
 
-        let mut start = lower.map(|(value, inclusive)| {
-            if inclusive {
-                ((value, 0), false)
-            } else {
-                ((value, u64::MAX), true)
+        let start = secondary_range_start_bound(lower, after);
+        let mut result = Vec::new();
+        for (&(encoded, node_id), slot) in entries.range((start, std::ops::Bound::Unbounded)) {
+            if secondary_range_past_upper(encoded, upper) {
+                break;
             }
-        });
-        if let Some(cursor) = after {
-            let cursor_start = (cursor, true);
-            start = Some(match start {
-                Some(existing) if existing.0 > cursor_start.0 => existing,
-                Some(existing) if existing.0 < cursor_start.0 => cursor_start,
-                Some(existing) => (existing.0, existing.1 || cursor_start.1),
-                None => cursor_start,
-            });
+            if !slot_option_visible(slot, snapshot_seq) {
+                continue;
+            }
+            result.push((encoded, node_id));
+            if limit.is_some_and(|limit| result.len() >= limit) {
+                break;
+            }
         }
+        result
+    }
 
-        let start = match start {
-            Some((target, strict)) => {
-                if strict {
-                    Bound::Excluded(target)
-                } else {
-                    Bound::Included(target)
-                }
-            }
-            None => Bound::Unbounded,
+    pub(crate) fn visible_secondary_range_entry_count(
+        &self,
+        index_id: u64,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
+        snapshot_seq: u64,
+    ) -> usize {
+        let state = self.state.read().unwrap();
+        let Some(entries) = state.secondary_range_state.get(&index_id) else {
+            return 0;
         };
 
+        let start = secondary_range_start_bound(lower, after);
         entries
-            .range((start, Bound::Unbounded))
-            .filter_map(|(&(encoded, node_id), slot)| {
-                if upper.is_some_and(|(upper_value, inclusive)| {
-                    encoded > upper_value || (!inclusive && encoded == upper_value)
-                }) {
-                    return None;
-                }
-                slot_option_visible(slot, snapshot_seq).then_some((encoded, node_id))
-            })
-            .collect()
+            .range((start, std::ops::Bound::Unbounded))
+            .take_while(|&(&(encoded, _), _)| !secondary_range_past_upper(encoded, upper))
+            .filter(|&(_, slot)| slot_option_visible(slot, snapshot_seq))
+            .count()
     }
 
     pub(crate) fn for_each_visible_secondary_range_entry_at<F>(
         &self,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
-        after: Option<(u64, u64)>,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
         snapshot_seq: u64,
         callback: &mut F,
     ) -> ControlFlow<()>
     where
-        F: FnMut((u64, u64)) -> ControlFlow<()>,
+        F: FnMut((NumericRangeSortKey, u64)) -> ControlFlow<()>,
     {
-        use std::ops::Bound;
-
         let state = self.state.read().unwrap();
         let Some(entries) = state.secondary_range_state.get(&index_id) else {
             return ControlFlow::Continue(());
         };
 
-        let mut start = lower.map(|(value, inclusive)| {
-            if inclusive {
-                ((value, 0), false)
-            } else {
-                ((value, u64::MAX), true)
-            }
-        });
-        if let Some(cursor) = after {
-            let cursor_start = (cursor, true);
-            start = Some(match start {
-                Some(existing) if existing.0 > cursor_start.0 => existing,
-                Some(existing) if existing.0 < cursor_start.0 => cursor_start,
-                Some(existing) => (existing.0, existing.1 || cursor_start.1),
-                None => cursor_start,
-            });
-        }
-
-        let start = match start {
-            Some((target, strict)) => {
-                if strict {
-                    Bound::Excluded(target)
-                } else {
-                    Bound::Included(target)
-                }
-            }
-            None => Bound::Unbounded,
-        };
-
-        for (&(encoded, node_id), slot) in entries.range((start, Bound::Unbounded)) {
-            if upper.is_some_and(|(upper_value, inclusive)| {
-                encoded > upper_value || (!inclusive && encoded == upper_value)
-            }) {
+        let start = secondary_range_start_bound(lower, after);
+        for (&(encoded, node_id), slot) in entries.range((start, std::ops::Bound::Unbounded)) {
+            if secondary_range_past_upper(encoded, upper) {
                 break;
             }
             if !slot_option_visible(slot, snapshot_seq) {
@@ -3397,7 +3572,7 @@ impl Memtable {
         current_secondary_eq_state(&state.secondary_eq_state)
     }
 
-    pub fn secondary_range_state(&self) -> HashMap<u64, BTreeSet<(u64, u64)>> {
+    pub fn secondary_range_state(&self) -> HashMap<u64, BTreeSet<(NumericRangeSortKey, u64)>> {
         let state = self.state.read().unwrap();
         current_secondary_range_state(&state.secondary_range_state)
     }
@@ -3545,6 +3720,19 @@ mod tests {
             valid_from: 0,
             valid_to: i64::MAX,
             last_write_seq: 0,
+        }
+    }
+
+    fn make_edge_with_props(
+        id: u64,
+        from: u64,
+        to: u64,
+        label_id: u32,
+        props: BTreeMap<String, PropValue>,
+    ) -> EdgeRecord {
+        EdgeRecord {
+            props,
+            ..make_edge(id, from, to, label_id)
         }
     }
 
@@ -3949,6 +4137,213 @@ mod tests {
     }
 
     #[test]
+    fn secondary_eq_updates_raw_structural_signed_zero_values_for_nodes_and_edges() {
+        let mt = Memtable::new();
+        let node_entry = SecondaryIndexManifestEntry {
+            index_id: 20,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "p".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let edge_entry = SecondaryIndexManifestEntry {
+            index_id: 21,
+            target: SecondaryIndexTarget::EdgeProperty {
+                label_id: 7,
+                prop_key: "p".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&node_entry);
+        mt.register_secondary_index(&edge_entry);
+
+        let pos_array = PropValue::Array(vec![PropValue::Float(0.0)]);
+        let neg_array = PropValue::Array(vec![PropValue::Float(-0.0)]);
+        let mut node_props = BTreeMap::new();
+        node_props.insert("p".into(), pos_array.clone());
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", node_props)),
+            1,
+        );
+        let mut node_props = BTreeMap::new();
+        node_props.insert("p".into(), neg_array.clone());
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", node_props)),
+            2,
+        );
+
+        assert_eq!(
+            mt.find_secondary_eq_nodes_at(20, "p", &neg_array, 2),
+            vec![1]
+        );
+        assert!(mt
+            .find_secondary_eq_nodes_at(20, "p", &pos_array, 2)
+            .is_empty());
+
+        let mut pos_map = BTreeMap::new();
+        pos_map.insert("zero".into(), PropValue::Float(0.0));
+        let pos_map = PropValue::Map(pos_map);
+        let mut neg_map = BTreeMap::new();
+        neg_map.insert("zero".into(), PropValue::Float(-0.0));
+        let neg_map = PropValue::Map(neg_map);
+        let mut edge_props = BTreeMap::new();
+        edge_props.insert("p".into(), pos_map.clone());
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(10, 1, 2, 7, edge_props)),
+            3,
+        );
+        let mut edge_props = BTreeMap::new();
+        edge_props.insert("p".into(), neg_map.clone());
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(10, 1, 2, 7, edge_props)),
+            4,
+        );
+
+        assert_eq!(mt.secondary_eq_edge_count_at(21, "p", &neg_map, 4), 1);
+        assert_eq!(mt.secondary_eq_edge_count_at(21, "p", &pos_map, 4), 0);
+    }
+
+    #[test]
+    fn semantic_equivalent_numeric_updates_do_not_churn_secondary_membership() {
+        let mt = Memtable::new();
+        let eq_entry = SecondaryIndexManifestEntry {
+            index_id: 30,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "score".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let range_entry = SecondaryIndexManifestEntry {
+            index_id: 31,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "score".into(),
+            },
+            kind: SecondaryIndexKind::Range,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&range_entry);
+
+        let mut props = BTreeMap::new();
+        props.insert("score".into(), PropValue::Int(42));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props)),
+            1,
+        );
+        let mut props = BTreeMap::new();
+        props.insert("score".into(), PropValue::Float(42.0));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props)),
+            2,
+        );
+
+        let state = mt.state.read().unwrap();
+        let value_hash = hash_prop_equality_key(&PropValue::Int(42));
+        let eq_slot = state
+            .secondary_eq_state
+            .get(&30)
+            .and_then(|groups| groups.get(&value_hash))
+            .and_then(|members| members.get(&1))
+            .unwrap();
+        assert!(eq_slot.history.is_none());
+        assert_eq!(eq_slot.head.write_seq, 1);
+        assert_eq!(slot_option_current(eq_slot), Some(&()));
+
+        let encoded_score = numeric_range_sort_key_for_value(&PropValue::Int(42)).unwrap();
+        let range_slot = state
+            .secondary_range_state
+            .get(&31)
+            .and_then(|entries| entries.get(&(encoded_score, 1)))
+            .unwrap();
+        assert!(range_slot.history.is_none());
+        assert_eq!(range_slot.head.write_seq, 1);
+        assert_eq!(slot_option_current(range_slot), Some(&()));
+    }
+
+    #[test]
+    fn secondary_range_entries_limited_chunks_and_resumes() {
+        let mt = Memtable::new();
+        let range_entry = SecondaryIndexManifestEntry {
+            index_id: 40,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "score".into(),
+            },
+            kind: SecondaryIndexKind::Range,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&range_entry);
+
+        for id in 1..=5 {
+            let mut props = BTreeMap::new();
+            props.insert("score".into(), PropValue::Int((id * 10) as i64));
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node_with_props(id, 1, &format!("n{id}"), props)),
+                id,
+            );
+        }
+
+        let encoded_10 = numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap();
+        let encoded_20 = numeric_range_sort_key_for_value(&PropValue::Int(20)).unwrap();
+        let encoded_30 = numeric_range_sort_key_for_value(&PropValue::Int(30)).unwrap();
+        let encoded_40 = numeric_range_sort_key_for_value(&PropValue::Int(40)).unwrap();
+        let encoded_50 = numeric_range_sort_key_for_value(&PropValue::Int(50)).unwrap();
+
+        let first = mt.visible_secondary_range_entries_limited(
+            40,
+            Some((encoded_10, true)),
+            Some((encoded_50, true)),
+            None,
+            5,
+            Some(2),
+        );
+        assert_eq!(first, vec![(encoded_10, 1), (encoded_20, 2)]);
+
+        let second = mt.visible_secondary_range_entries_limited(
+            40,
+            Some((encoded_10, true)),
+            Some((encoded_50, true)),
+            first.last().copied(),
+            5,
+            Some(2),
+        );
+        assert_eq!(second, vec![(encoded_30, 3), (encoded_40, 4)]);
+
+        assert_eq!(
+            mt.visible_secondary_range_entries_limited(
+                40,
+                Some((encoded_20, true)),
+                Some((encoded_20, true)),
+                None,
+                5,
+                Some(10),
+            ),
+            vec![(encoded_20, 2)]
+        );
+        assert!(mt
+            .visible_secondary_range_entries_limited(
+                40,
+                Some((encoded_10, true)),
+                Some((encoded_50, true)),
+                None,
+                5,
+                Some(0),
+            )
+            .is_empty());
+    }
+
+    #[test]
     fn multi_label_secondary_memberships_are_maintained_by_declared_label() {
         let mt = Memtable::new();
         let eq_label_1 = SecondaryIndexManifestEntry {
@@ -3977,9 +4372,7 @@ mod tests {
                 label_id: 2,
                 prop_key: "score".into(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -3989,9 +4382,7 @@ mod tests {
                 label_id: 3,
                 prop_key: "score".into(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -4021,8 +4412,7 @@ mod tests {
             mt.find_secondary_eq_nodes_at(11, "color", &PropValue::String("red".into()), 1),
             vec![1]
         );
-        let encoded_42 =
-            encode_range_prop_value(SecondaryIndexRangeDomain::Int, &PropValue::Int(42)).unwrap();
+        let encoded_42 = numeric_range_sort_key_for_value(&PropValue::Int(42)).unwrap();
         assert_eq!(
             mt.visible_secondary_range_entries(
                 12,
@@ -4068,8 +4458,7 @@ mod tests {
             mt.find_secondary_eq_nodes_at(11, "color", &PropValue::String("blue".into()), 2),
             vec![1]
         );
-        let encoded_50 =
-            encode_range_prop_value(SecondaryIndexRangeDomain::Int, &PropValue::Int(50)).unwrap();
+        let encoded_50 = numeric_range_sort_key_for_value(&PropValue::Int(50)).unwrap();
         assert!(mt
             .visible_secondary_range_entries(
                 13,
@@ -4122,9 +4511,7 @@ mod tests {
                 label_id: 1,
                 prop_key: "age".into(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -4147,15 +4534,16 @@ mod tests {
         let eq_slot = state
             .secondary_eq_state
             .get(&10)
-            .and_then(|groups| groups.get(&hash_prop_value(&PropValue::String("alice".into()))))
+            .and_then(|groups| {
+                groups.get(&hash_prop_equality_key(&PropValue::String("alice".into())))
+            })
             .and_then(|members| members.get(&1))
             .unwrap();
         assert!(eq_slot.history.is_none());
         assert_eq!(eq_slot.head.write_seq, 1);
         assert_eq!(slot_option_current(eq_slot), Some(&()));
 
-        let encoded_age =
-            encode_range_prop_value(SecondaryIndexRangeDomain::Int, &PropValue::Int(42)).unwrap();
+        let encoded_age = numeric_range_sort_key_for_value(&PropValue::Int(42)).unwrap();
         let range_slot = state
             .secondary_range_state
             .get(&11)
@@ -4244,9 +4632,7 @@ mod tests {
                 label_id: 1,
                 prop_key: "age".into(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };

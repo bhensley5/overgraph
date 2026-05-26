@@ -3,12 +3,26 @@ use crate::dense_hnsw::exact_dense_search_above_cutoff;
 use crate::edge_metadata::EdgeMetadataCandidate;
 use crate::error::EngineError;
 use crate::manifest::{default_manifest, load_manifest, load_manifest_readonly, write_manifest};
-use crate::memtable::{encode_range_prop_value, Memtable};
+use crate::memtable::Memtable;
 use crate::planner_stats::{
     planner_stats_declaration_fingerprint_for_entry,
     write_targeted_secondary_index_planner_stats_sidecar, DeclaredIndexRuntimeCoverage,
     EstimateConfidence, PlannerEstimateKind, PlannerStatsDeclaredIndexTarget,
     PlannerStatsDirection, PlannerStatsView, StalePostingRisk,
+};
+use crate::property_value_semantics::{
+    compare_numeric_prop_values, hash_prop_equality_key, hash_semantic_equality_key_bytes,
+    intersect_validated_numeric_ranges, numeric_range_sort_key_for_value,
+    prop_value_within_validated_range, semantic_equality_key_bytes, semantic_property_eq,
+    semantic_range_bound_key_bytes, structural_value_contains_float_zero,
+    validate_numeric_range_bounds, NumericRangeSortKey, ValidatedNumericRange,
+};
+use crate::row_projection::{
+    EdgeOutputProjection, EdgeProjectionField, EdgeSelectedFieldNeeds, EntityProjectionNeeds,
+    NodeOutputProjection, NodeProjectionField, NodeSelectedFieldNeeds, PathSelectedFieldNeeds,
+    ProjectedEdge, ProjectedNode, ProjectedRow, ProjectedRows, ProjectedValue, ProjectionColumn,
+    ProjectionNeedClass, PropertySelection, RowProjectionPlan, VectorSelection, DIRECT_EDGE_ALIAS,
+    DIRECT_NODE_ALIAS,
 };
 use crate::segment_components::{ComponentAvailability, SegmentComponentKind};
 use crate::segment_reader::{SegmentAdjPostingCursor, SegmentLabelPosting, SegmentReader};
@@ -35,7 +49,9 @@ use crate::wal::{remove_wal_generation, truncate_wal_generation_to, WalReader, W
 use crate::wal_sync::{shutdown_sync_thread, sync_thread_loop, WalSyncState};
 use arc_swap::ArcSwap;
 use std::cmp::Reverse;
-use std::collections::{hash_map::Entry, BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{
+    hash_map::Entry, BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque,
+};
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -73,18 +89,10 @@ fn secondary_index_target_prop_key(target: &SecondaryIndexTarget) -> &str {
     }
 }
 
-fn secondary_index_range_domain_rank(domain: SecondaryIndexRangeDomain) -> u8 {
-    match domain {
-        SecondaryIndexRangeDomain::Int => 0,
-        SecondaryIndexRangeDomain::UInt => 1,
-        SecondaryIndexRangeDomain::Float => 2,
-    }
-}
-
 fn secondary_index_kind_rank(kind: &SecondaryIndexKind) -> (u8, u8) {
     match kind {
         SecondaryIndexKind::Equality => (0, 0),
-        SecondaryIndexKind::Range { domain } => (1, secondary_index_range_domain_rank(*domain)),
+        SecondaryIndexKind::Range => (1, 0),
     }
 }
 
@@ -278,7 +286,7 @@ fn normalize_secondary_index_manifest(manifest: &mut ManifestState) -> Result<bo
                 entry.target
             )));
         }
-        if matches!(entry.kind, SecondaryIndexKind::Range { .. }) {
+        if matches!(entry.kind, SecondaryIndexKind::Range) {
             let disc = secondary_index_target_discriminant(&entry.target);
             let target_label_id = secondary_index_target_label_id(&entry.target);
             let prop_key = secondary_index_target_prop_key(&entry.target);
@@ -320,7 +328,7 @@ fn build_secondary_index_catalog(
         let disc = secondary_index_target_discriminant(&entry.target);
         let target_label_id = secondary_index_target_label_id(&entry.target);
         let prop_key = secondary_index_target_prop_key(&entry.target);
-        if matches!(entry.kind, SecondaryIndexKind::Range { .. })
+        if matches!(entry.kind, SecondaryIndexKind::Range)
             && !seen_range_targets.insert((disc, target_label_id, prop_key.to_string()))
         {
             let target_label = match disc {
@@ -1043,7 +1051,7 @@ fn apply_secondary_index_failure_report(
             .iter_mut()
             .find(|entry| entry.index_id == *index_id)
         {
-            if matches!(entry.kind, SecondaryIndexKind::Range { .. }) {
+            if matches!(entry.kind, SecondaryIndexKind::Range) {
                 entry.state = SecondaryIndexState::Failed;
                 entry.last_error = Some(message.clone());
             }
@@ -1087,7 +1095,7 @@ fn reconcile_background_output_range_declarations(
 ) -> Vec<u64> {
     let mut rebuild_index_ids = Vec::new();
     for entry in &mut manifest.secondary_indexes {
-        if !matches!(entry.kind, SecondaryIndexKind::Range { .. })
+        if !matches!(entry.kind, SecondaryIndexKind::Range)
             || maintained_range_index_ids.contains(&entry.index_id)
         {
             continue;
@@ -1164,7 +1172,7 @@ fn build_secondary_eq_groups_for_segment(
 
         if let Some(value_hash) = segment
             .node_property_value_at_offset(meta.node_id, meta.data_offset, prop_key)?
-            .map(|value| hash_prop_value(&value))
+            .map(|value| hash_prop_equality_key(&value))
         {
             groups.entry(value_hash).or_default().push(meta.node_id);
         }
@@ -1181,8 +1189,7 @@ fn build_secondary_range_entries_for_segment(
     segment: &SegmentReader,
     target_label_id: u32,
     prop_key: &str,
-    domain: SecondaryIndexRangeDomain,
-) -> Result<Vec<(u64, u64)>, EngineError> {
+) -> Result<Vec<(NumericRangeSortKey, u64)>, EngineError> {
     let mut entries = Vec::new();
 
     for index in 0..segment.node_meta_count() as usize {
@@ -1196,7 +1203,7 @@ fn build_secondary_range_entries_for_segment(
         else {
             continue;
         };
-        let Some(encoded_value) = encode_range_prop_value(domain, &value) else {
+        let Some(encoded_value) = numeric_range_sort_key_for_value(&value) else {
             continue;
         };
         entries.push((encoded_value, meta.node_id));
@@ -1236,7 +1243,7 @@ fn build_edge_secondary_eq_groups_for_segment(
             segment.edge_property_value_at_offset(edge_id, data_offset, prop_key)?
         {
             groups
-                .entry(hash_prop_value(&value))
+                .entry(hash_prop_equality_key(&value))
                 .or_default()
                 .push(edge_id);
         }
@@ -1253,8 +1260,7 @@ fn build_edge_secondary_range_entries_for_segment(
     segment: &SegmentReader,
     label_id: u32,
     prop_key: &str,
-    domain: SecondaryIndexRangeDomain,
-) -> Result<Vec<(u64, u64)>, EngineError> {
+) -> Result<Vec<(NumericRangeSortKey, u64)>, EngineError> {
     let mut entries = Vec::new();
 
     for index in 0..segment.edge_meta_count() as usize {
@@ -1279,7 +1285,7 @@ fn build_edge_secondary_range_entries_for_segment(
         else {
             continue;
         };
-        let Some(encoded_value) = encode_range_prop_value(domain, &value) else {
+        let Some(encoded_value) = numeric_range_sort_key_for_value(&value) else {
             continue;
         };
         entries.push((encoded_value, edge_id));
@@ -1301,7 +1307,7 @@ fn install_secondary_eq_sidecar(
 fn install_secondary_range_sidecar(
     seg_dir: &Path,
     entry: &SecondaryIndexManifestEntry,
-    entries: &[(u64, u64)],
+    entries: &[(NumericRangeSortKey, u64)],
 ) -> Result<(), EngineError> {
     publish_node_prop_range_sidecar_component(seg_dir, entry, entries)
 }
@@ -1317,7 +1323,7 @@ fn install_edge_secondary_eq_sidecar(
 fn install_edge_secondary_range_sidecar(
     seg_dir: &Path,
     entry: &SecondaryIndexManifestEntry,
-    entries: &[(u64, u64)],
+    entries: &[(NumericRangeSortKey, u64)],
 ) -> Result<(), EngineError> {
     publish_edge_prop_range_sidecar_component(seg_dir, entry, entries)
 }
@@ -1353,7 +1359,6 @@ struct SecondaryRangeBuildSnapshot {
     target: SecondaryIndexTargetDiscriminant,
     target_label_id: u32,
     prop_key: String,
-    domain: SecondaryIndexRangeDomain,
     segment_ids: Vec<u64>,
     segment_infos: Vec<SegmentInfo>,
     secondary_indexes: Vec<SecondaryIndexManifestEntry>,
@@ -1765,9 +1770,9 @@ fn load_secondary_range_build_snapshot(
         return Ok(None);
     }
 
-    let SecondaryIndexKind::Range { domain } = entry.kind else {
+    if !matches!(&entry.kind, SecondaryIndexKind::Range) {
         return Ok(None);
-    };
+    }
     let target = secondary_index_target_discriminant(&entry.target);
     let target_label_id = secondary_index_target_label_id(&entry.target);
     let prop_key = secondary_index_target_prop_key(&entry.target).to_string();
@@ -1780,7 +1785,6 @@ fn load_secondary_range_build_snapshot(
         target,
         target_label_id,
         prop_key,
-        domain,
         segment_ids,
         segment_infos,
         secondary_indexes: manifest.secondary_indexes.clone(),
@@ -1835,7 +1839,6 @@ fn build_secondary_range_sidecars_for_snapshot(
                         &segment,
                         snapshot.target_label_id,
                         &snapshot.prop_key,
-                        snapshot.domain,
                     )?;
                     match install_edge_secondary_range_sidecar(&seg_path, entry, &entries) {
                         Ok(()) => {}
@@ -1856,7 +1859,6 @@ fn build_secondary_range_sidecars_for_snapshot(
                         &segment,
                         snapshot.target_label_id,
                         &snapshot.prop_key,
-                        snapshot.domain,
                     )?;
                     match install_edge_secondary_range_sidecar(&seg_path, entry, &entries) {
                         Ok(()) => {}
@@ -1885,7 +1887,6 @@ fn build_secondary_range_sidecars_for_snapshot(
                     &segment,
                     snapshot.target_label_id,
                     &snapshot.prop_key,
-                    snapshot.domain,
                 )?;
                 match install_secondary_range_sidecar(&seg_path, entry, &entries) {
                     Ok(()) => {}
@@ -1906,7 +1907,6 @@ fn build_secondary_range_sidecars_for_snapshot(
                     &segment,
                     snapshot.target_label_id,
                     &snapshot.prop_key,
-                    snapshot.domain,
                 )?;
                 match install_secondary_range_sidecar(&seg_path, entry, &entries) {
                     Ok(()) => {}
@@ -2023,7 +2023,7 @@ fn finalize_secondary_range_build_snapshot(
 
             let entry = &mut manifest.secondary_indexes[entry_pos];
             if entry.state != SecondaryIndexState::Building
-                || !matches!(entry.kind, SecondaryIndexKind::Range { .. })
+                || !matches!(entry.kind, SecondaryIndexKind::Range)
             {
                 outcome = SecondaryRangeFinalizeOutcome::Inactive;
                 return Ok(());
@@ -2248,7 +2248,7 @@ fn target_secondary_sidecar_is_valid(
         SecondaryIndexKind::Equality => {
             segment.validate_secondary_eq_sidecar_for_target(ready.index_id, target)
         }
-        SecondaryIndexKind::Range { .. } => {
+        SecondaryIndexKind::Range => {
             segment.validate_secondary_range_sidecar_for_target(ready.index_id, target)
         }
     }
@@ -2831,7 +2831,9 @@ struct QueryExecutionCounters {
     final_verifier_record_reads: AtomicUsize,
     edge_full_scan_pages: AtomicUsize,
     endpoint_adjacency_candidates: AtomicUsize,
-    pattern_edge_pending_entries: AtomicUsize,
+    graph_row_query_calls: AtomicUsize,
+    selected_field_reads: SelectedFieldReadCounters,
+    public_node_query_calls: AtomicUsize,
     public_edge_query_calls: AtomicUsize,
 }
 
@@ -2846,7 +2848,14 @@ pub(crate) struct QueryExecutionCounterSnapshot {
     pub final_verifier_record_reads: usize,
     pub edge_full_scan_pages: usize,
     pub endpoint_adjacency_candidates: usize,
-    pub pattern_edge_pending_entries: usize,
+    pub graph_row_query_calls: usize,
+    pub node_selected_field_batches: usize,
+    pub node_selected_field_ids: usize,
+    pub edge_selected_field_batches: usize,
+    pub edge_selected_field_ids: usize,
+    pub node_dense_vector_projection_reads: usize,
+    pub node_sparse_vector_projection_reads: usize,
+    pub public_node_query_calls: usize,
     pub public_edge_query_calls: usize,
 }
 
@@ -4405,10 +4414,13 @@ impl ReadView {
             immutable: &self.immutable_epochs,
             segments: &self.segments,
             snapshot_seq: self.snapshot_seq,
+            #[cfg(test)]
+            selected_field_read_counters: Some(&self.query_execution_counters.selected_field_reads),
         }
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn note_range_planning_probe(&self) {
         self.planning_probe_counters
             .range
@@ -4454,13 +4466,6 @@ impl ReadView {
     }
 
     #[cfg(test)]
-    fn note_final_verifier_record_reads(&self, count: usize) {
-        self.query_execution_counters
-            .final_verifier_record_reads
-            .fetch_add(count, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
     fn note_edge_full_scan_page(&self) {
         self.query_execution_counters
             .edge_full_scan_pages
@@ -4472,13 +4477,6 @@ impl ReadView {
         self.query_execution_counters
             .endpoint_adjacency_candidates
             .fetch_add(count, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    fn note_pattern_edge_pending_entry(&self) {
-        self.query_execution_counters
-            .pattern_edge_pending_entries
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn node_property_index_entry(
@@ -4584,6 +4582,8 @@ impl ReadView {
         &self,
         keys: &[(u32, &str)],
     ) -> Result<Vec<Option<NodeRecord>>, EngineError> {
+        #[cfg(test)]
+        self.note_node_record_hydration_reads(keys.len());
         self.sources().find_nodes_by_label_keys(keys)
     }
 
@@ -4620,6 +4620,8 @@ impl EngineCore {
             immutable: &self.immutable_epochs,
             segments: &self.segments,
             snapshot_seq: self.engine_seq,
+            #[cfg(test)]
+            selected_field_read_counters: None,
         }
     }
 
@@ -4786,7 +4788,7 @@ impl EngineCore {
         else {
             return PublishImpact::NoPublish;
         };
-        if !matches!(current_entry.kind, SecondaryIndexKind::Range { .. }) {
+        if !matches!(current_entry.kind, SecondaryIndexKind::Range) {
             return PublishImpact::NoPublish;
         }
         let should_queue_build = next_state == SecondaryIndexState::Building
@@ -4811,7 +4813,7 @@ impl EngineCore {
                     .iter_mut()
                     .find(|entry| entry.index_id == index_id)
                 {
-                    if matches!(entry.kind, SecondaryIndexKind::Range { .. }) {
+                    if matches!(entry.kind, SecondaryIndexKind::Range) {
                         entry.state = next_state;
                         entry.last_error = next_last_error.clone();
                     }
@@ -6386,10 +6388,45 @@ impl DatabaseEngine {
                 .query_execution_counters
                 .endpoint_adjacency_candidates
                 .load(Ordering::Relaxed),
-            pattern_edge_pending_entries: published
+            graph_row_query_calls: published
                 .view
                 .query_execution_counters
-                .pattern_edge_pending_entries
+                .graph_row_query_calls
+                .load(Ordering::Relaxed),
+            node_selected_field_batches: published
+                .view
+                .query_execution_counters
+                .selected_field_reads
+                .node_selected_field_batches(),
+            node_selected_field_ids: published
+                .view
+                .query_execution_counters
+                .selected_field_reads
+                .node_selected_field_ids(),
+            edge_selected_field_batches: published
+                .view
+                .query_execution_counters
+                .selected_field_reads
+                .edge_selected_field_batches(),
+            edge_selected_field_ids: published
+                .view
+                .query_execution_counters
+                .selected_field_reads
+                .edge_selected_field_ids(),
+            node_dense_vector_projection_reads: published
+                .view
+                .query_execution_counters
+                .selected_field_reads
+                .node_dense_vector_projection_reads(),
+            node_sparse_vector_projection_reads: published
+                .view
+                .query_execution_counters
+                .selected_field_reads
+                .node_sparse_vector_projection_reads(),
+            public_node_query_calls: published
+                .view
+                .query_execution_counters
+                .public_node_query_calls
                 .load(Ordering::Relaxed),
             public_edge_query_calls: published
                 .view
@@ -6445,7 +6482,17 @@ impl DatabaseEngine {
         published
             .view
             .query_execution_counters
-            .pattern_edge_pending_entries
+            .graph_row_query_calls
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .selected_field_reads
+            .reset();
+        published
+            .view
+            .query_execution_counters
+            .public_node_query_calls
             .store(0, Ordering::Relaxed);
         published
             .view
@@ -6653,7 +6700,7 @@ impl DatabaseEngine {
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         after: Option<&PropertyRangeCursor>,
-    ) -> Result<SecondaryIndexRangeDomain, EngineError> {
+    ) -> Result<ValidatedNumericRange, EngineError> {
         ReadView::validate_property_range_bounds(lower, upper, after)
     }
 
@@ -7658,7 +7705,7 @@ impl EngineCore {
                                 }
                             },
                         ),
-                    SecondaryIndexKind::Range { .. } => segment
+                    SecondaryIndexKind::Range => segment
                         .secondary_range_sidecar_lightweight_available_for_target(
                             entry.index_id,
                             match &entry.target {
@@ -7682,7 +7729,7 @@ impl EngineCore {
                                     index_id: entry.index_id,
                                 }
                             }
-                            (SecondaryIndexKind::Range { .. }, false) => {
+                            (SecondaryIndexKind::Range, false) => {
                                 SegmentComponentKind::NodePropertyRangeIndex {
                                     index_id: entry.index_id,
                                 }
@@ -7692,7 +7739,7 @@ impl EngineCore {
                                     index_id: entry.index_id,
                                 }
                             }
-                            (SecondaryIndexKind::Range { .. }, true) => {
+                            (SecondaryIndexKind::Range, true) => {
                                 SegmentComponentKind::EdgePropertyRangeIndex {
                                     index_id: entry.index_id,
                                 }
@@ -8808,7 +8855,7 @@ impl EngineCore {
                         .iter_mut()
                         .find(|entry| entry.index_id == *index_id)
                     {
-                        if matches!(entry.kind, SecondaryIndexKind::Range { .. })
+                        if matches!(entry.kind, SecondaryIndexKind::Range)
                             && entry.state != SecondaryIndexState::Failed
                         {
                             entry.state = SecondaryIndexState::Building;
@@ -11421,6 +11468,7 @@ include!("write.rs");
 include!("read.rs");
 include!("query_ir.rs");
 include!("query_plan.rs");
+include!("projection.rs");
 include!("query_exec.rs");
 include!("query.rs");
 
@@ -11876,5 +11924,8 @@ mod tests {
     include!("tests/write.rs");
     include!("tests/read.rs");
     include!("tests/graph_ops.rs");
+    include!("tests/graph_rows.rs");
     include!("tests/query_planner.rs");
+    include!("tests/projection.rs");
+    include!("tests/gql_execution.rs");
 }

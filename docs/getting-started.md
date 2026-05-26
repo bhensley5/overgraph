@@ -235,33 +235,35 @@ for hit in &hits {
 
 Property queries work without any extra setup. If a property is hot in your workload, you can declare an optional equality or numeric range index for it. OverGraph will use the declaration-backed path when the index is `Ready`, and otherwise fall back to the same public query API.
 
+Equality indexes use semantic numeric equality for finite scalar numbers, so signed integers, unsigned integers, and finite floats compare by exact numeric value. String equality and other non-numeric equality remain unchanged. Range indexes are domainless numeric indexes over finite scalar numeric values; non-finite floats, non-numeric values, arrays, and maps are excluded.
+
 **Python**
 ```python
 from overgraph import PropertyRangeBound
 
 db.ensure_node_property_index("User", "role", "equality")
-db.ensure_node_property_index("Project", "priority", "range", domain="int")
+db.ensure_node_property_index("Project", "priority", "range")
 
 user_ids = db.find_nodes("User", "role", "engineer")
 priority_ids = db.find_nodes_range(
     "Project",
     "priority",
     PropertyRangeBound(1, domain="int"),
-    PropertyRangeBound(5, domain="int"),
+    PropertyRangeBound(5.0, domain="float"),
 )
 ```
 
 **Node.js**
 ```javascript
-db.ensureNodePropertyIndex('User', 'role', { kind: 'equality' });
-db.ensureNodePropertyIndex('Project', 'priority', { kind: 'range', domain: 'int' });
+db.ensureNodePropertyIndex('User', 'role', 'equality');
+db.ensureNodePropertyIndex('Project', 'priority', 'range');
 
 const userIds = db.findNodes('User', 'role', 'engineer');
 const priorityIds = db.findNodesRange(
   'Project',
   'priority',
   { value: 1, inclusive: true, domain: 'int' },
-  { value: 5, inclusive: true, domain: 'int' },
+  { value: 5, inclusive: true, domain: 'float' },
 );
 ```
 
@@ -271,14 +273,12 @@ db.ensure_node_property_index("User", "role", SecondaryIndexKind::Equality)?;
 db.ensure_node_property_index(
     "Project",
     "priority",
-    SecondaryIndexKind::Range {
-        domain: SecondaryIndexRangeDomain::Int,
-    },
+    SecondaryIndexKind::Range,
 )?;
 
 let user_ids = db.find_nodes("User", "role", &PropValue::String("engineer".into()))?;
 let lower = PropertyRangeBound::Included(PropValue::Int(1));
-let upper = PropertyRangeBound::Included(PropValue::Int(5));
+let upper = PropertyRangeBound::Included(PropValue::Float(5.0));
 let priority_ids = db.find_nodes_range(
     "Project",
     "priority",

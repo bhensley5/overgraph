@@ -11,6 +11,8 @@ use crate::edge_metadata::{EdgeMetadataCandidate, RangeBoundFlags};
 use crate::engine::ReadViewImmutableEpoch;
 use crate::error::EngineError;
 use crate::memtable::Memtable;
+use crate::property_value_semantics::NumericRangeSortKey;
+use crate::row_projection::{EdgeSelectedFieldNeeds, NodeSelectedFieldNeeds, PropertySelection};
 use crate::segment_reader::SegmentReader;
 use crate::types::*;
 use std::cmp::Reverse;
@@ -25,6 +27,8 @@ pub struct SourceList<'a> {
     pub(crate) immutable: &'a [ReadViewImmutableEpoch],
     pub(crate) segments: &'a [Arc<SegmentReader>],
     pub(crate) snapshot_seq: u64,
+    #[cfg(test)]
+    pub(crate) selected_field_read_counters: Option<&'a SelectedFieldReadCounters>,
 }
 
 pub(crate) enum LimitedEdgeIndexRead {
@@ -272,6 +276,178 @@ impl<'a> SourceList<'a> {
         Ok(results)
     }
 
+    pub(crate) fn find_node_projected_fields(
+        &self,
+        ids: &[u64],
+        needs: &NodeSelectedFieldNeeds,
+    ) -> Result<Vec<Option<SelectedNodeFields>>, EngineError> {
+        let mut results = vec![None; ids.len()];
+        if ids.is_empty() {
+            return Ok(results);
+        }
+        #[cfg(test)]
+        if let Some(counters) = self.selected_field_read_counters {
+            counters.note_node_selected_field_batch(ids.len());
+        }
+
+        let mut remaining: Vec<(usize, u64)> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| (index, id))
+            .collect();
+
+        remaining = self.active.batch_get_node_selected_fields_at(
+            &remaining,
+            needs,
+            self.snapshot_seq,
+            &mut results,
+            #[cfg(test)]
+            self.selected_field_read_counters,
+        );
+
+        for epoch in self.immutable {
+            if remaining.is_empty() {
+                break;
+            }
+            remaining = epoch.memtable.batch_get_node_selected_fields_at(
+                &remaining,
+                needs,
+                self.snapshot_seq,
+                &mut results,
+                #[cfg(test)]
+                self.selected_field_read_counters,
+            );
+        }
+
+        if !remaining.is_empty() {
+            remaining.sort_unstable_by_key(|&(_, id)| id);
+            let mut compact_lookups = Vec::new();
+            let mut segment_results: Vec<Option<SelectedNodeFields>> = Vec::new();
+            for seg in self.segments {
+                if remaining.is_empty() {
+                    break;
+                }
+
+                remaining.retain(|&(_, id)| !seg.is_node_deleted(id));
+                if remaining.is_empty() {
+                    break;
+                }
+
+                compact_lookups.clear();
+                compact_lookups.reserve(remaining.len());
+                for (compact_index, &(_, id)) in remaining.iter().enumerate() {
+                    compact_lookups.push((compact_index, id));
+                }
+                segment_results.clear();
+                segment_results.resize(remaining.len(), None);
+
+                seg.get_node_selected_fields_batch(
+                    &compact_lookups,
+                    needs,
+                    &mut segment_results,
+                    #[cfg(test)]
+                    self.selected_field_read_counters,
+                )?;
+                let mut compact_index = 0usize;
+                remaining.retain(|&(index, _)| {
+                    let fields = segment_results[compact_index].take();
+                    compact_index += 1;
+                    if let Some(fields) = fields {
+                        results[index] = Some(fields);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub(crate) fn find_edge_projected_fields(
+        &self,
+        ids: &[u64],
+        needs: &EdgeSelectedFieldNeeds,
+    ) -> Result<Vec<Option<SelectedEdgeFields>>, EngineError> {
+        let mut results = vec![None; ids.len()];
+        if ids.is_empty() {
+            return Ok(results);
+        }
+        #[cfg(test)]
+        if let Some(counters) = self.selected_field_read_counters {
+            counters.note_edge_selected_field_batch(ids.len());
+        }
+
+        let mut remaining: Vec<(usize, u64)> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| (index, id))
+            .collect();
+
+        remaining = self.active.batch_get_edge_selected_fields_at(
+            &remaining,
+            needs,
+            self.snapshot_seq,
+            &mut results,
+            #[cfg(test)]
+            self.selected_field_read_counters,
+        );
+
+        for epoch in self.immutable {
+            if remaining.is_empty() {
+                break;
+            }
+            remaining = epoch.memtable.batch_get_edge_selected_fields_at(
+                &remaining,
+                needs,
+                self.snapshot_seq,
+                &mut results,
+                #[cfg(test)]
+                self.selected_field_read_counters,
+            );
+        }
+
+        if !remaining.is_empty() {
+            remaining.sort_unstable_by_key(|&(_, id)| id);
+            let mut compact_lookups = Vec::new();
+            let mut segment_results: Vec<Option<SelectedEdgeFields>> = Vec::new();
+            for seg in self.segments {
+                if remaining.is_empty() {
+                    break;
+                }
+
+                remaining.retain(|&(_, id)| !seg.is_edge_deleted(id));
+                if remaining.is_empty() {
+                    break;
+                }
+
+                compact_lookups.clear();
+                compact_lookups.reserve(remaining.len());
+                for (compact_index, &(_, id)) in remaining.iter().enumerate() {
+                    compact_lookups.push((compact_index, id));
+                }
+                segment_results.clear();
+                segment_results.resize(remaining.len(), None);
+
+                seg.get_edge_selected_fields_batch(&compact_lookups, needs, &mut segment_results)?;
+                let mut compact_index = 0usize;
+                remaining.retain(|&(index, _)| {
+                    let fields = segment_results[compact_index].take();
+                    compact_index += 1;
+                    if let Some(fields) = fields {
+                        results[index] = Some(fields);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Find a node by ID across all sources. Short-circuits on the first
     /// source that has an opinion (live record or tombstone).
     pub fn find_node(&self, id: u64) -> Result<Option<NodeRecord>, EngineError> {
@@ -441,6 +617,112 @@ impl<'a> SourceList<'a> {
                     if node.label_ids.contains(label_id) && node.key == key {
                         results[orig_idx] = Some(node.clone());
                     }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub(crate) fn find_node_ids_by_label_keys<'b>(
+        &self,
+        keys: &[(u32, &'b str)],
+    ) -> Result<Vec<Option<u64>>, EngineError> {
+        let n = keys.len();
+        let mut results = vec![None; n];
+        if n == 0 {
+            return Ok(results);
+        }
+
+        let mut remaining: Vec<(usize, u32, &'b str)> = Vec::with_capacity(n);
+        let mut candidates: Vec<(usize, u32, &'b str, u64)> = Vec::new();
+        for (i, &(label_id, key)) in keys.iter().enumerate() {
+            if let Some(node_id) = self
+                .active
+                .node_id_by_key_at(label_id, key, self.snapshot_seq)
+            {
+                candidates.push((i, label_id, key, node_id));
+            } else {
+                remaining.push((i, label_id, key));
+            }
+        }
+
+        for (epoch_idx, epoch) in self.immutable.iter().enumerate() {
+            if remaining.is_empty() {
+                break;
+            }
+            remaining.retain(|&(i, label_id, key)| {
+                if let Some(node_id) =
+                    epoch
+                        .memtable
+                        .node_id_by_key_at(label_id, key, self.snapshot_seq)
+                {
+                    if self.is_node_tombstoned_above_immutable(node_id, epoch_idx) {
+                        return false;
+                    }
+                    candidates.push((i, label_id, key, node_id));
+                    return false;
+                }
+                true
+            });
+        }
+
+        if !remaining.is_empty() {
+            remaining.sort_unstable_by(|left, right| (left.1, left.2).cmp(&(right.1, right.2)));
+        }
+
+        for seg in self.segments {
+            if remaining.is_empty() {
+                break;
+            }
+
+            let resolved = seg.resolve_keys_to_ids(&remaining)?;
+            if !resolved.is_empty() {
+                let mut found = Vec::with_capacity(resolved.len());
+                for (orig_idx, node_id) in resolved {
+                    let (label_id, key) = keys[orig_idx];
+                    candidates.push((orig_idx, label_id, key, node_id));
+                    found.push(orig_idx);
+                }
+                found.sort_unstable();
+                found.dedup();
+                remaining.retain(|&(i, _, _)| found.binary_search(&i).is_err());
+            }
+        }
+
+        if !candidates.is_empty() {
+            let mut candidate_ids: Vec<u64> = candidates
+                .iter()
+                .map(|&(_, _, _, node_id)| node_id)
+                .collect();
+            candidate_ids.sort_unstable();
+            candidate_ids.dedup();
+
+            let selected = self.find_node_projected_fields(
+                &candidate_ids,
+                &NodeSelectedFieldNeeds {
+                    key: true,
+                    ..NodeSelectedFieldNeeds::default()
+                },
+            )?;
+            let mut selected_positions = NodeIdMap::default();
+            for (position, (&node_id, fields)) in
+                candidate_ids.iter().zip(selected.iter()).enumerate()
+            {
+                if fields.is_some() {
+                    selected_positions.insert(node_id, position);
+                }
+            }
+
+            for (orig_idx, label_id, key, node_id) in candidates {
+                let Some(&position) = selected_positions.get(&node_id) else {
+                    continue;
+                };
+                let Some(fields) = selected[position].as_ref() else {
+                    continue;
+                };
+                if fields.meta.label_ids.contains(label_id) && fields.key.as_deref() == Some(key) {
+                    results[orig_idx] = Some(node_id);
                 }
             }
         }
@@ -1290,37 +1572,42 @@ impl<'a> SourceList<'a> {
     pub(crate) fn edge_ids_by_secondary_range_index_limited(
         &self,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
         limit: usize,
     ) -> Result<Option<Vec<u64>>, EngineError> {
         let mut result = Vec::new();
-        for (_, edge_id) in self.active.visible_secondary_range_entries(
+        let flow = self.active.for_each_visible_secondary_range_entry_at(
             index_id,
             lower,
             upper,
             None,
             self.snapshot_seq,
-        ) {
-            if Self::push_edge_match_limited(&mut result, edge_id, limit).is_break() {
-                return Ok(Some(Self::finalize_edge_matches(result)));
-            }
+            &mut |(_, edge_id)| Self::push_edge_match_limited(&mut result, edge_id, limit),
+        );
+        if flow.is_break() {
+            return Ok(Some(Self::finalize_edge_matches(result)));
         }
 
         for (index, epoch) in self.immutable.iter().enumerate() {
-            for (_, edge_id) in epoch.memtable.visible_secondary_range_entries(
+            let flow = epoch.memtable.for_each_visible_secondary_range_entry_at(
                 index_id,
                 lower,
                 upper,
                 None,
                 self.snapshot_seq,
-            ) {
-                if self.is_edge_shadowed_above_immutable(edge_id, index) {
-                    continue;
-                }
-                if Self::push_edge_match_limited(&mut result, edge_id, limit).is_break() {
-                    return Ok(Some(Self::finalize_edge_matches(result)));
-                }
+                &mut |(_, edge_id)| {
+                    if self.is_edge_shadowed_above_immutable(edge_id, index) {
+                        return ControlFlow::Continue(());
+                    }
+                    if Self::push_edge_match_limited(&mut result, edge_id, limit).is_break() {
+                        return ControlFlow::Break(());
+                    }
+                    ControlFlow::Continue(())
+                },
+            );
+            if flow.is_break() {
+                return Ok(Some(Self::finalize_edge_matches(result)));
             }
         }
 
@@ -1364,68 +1651,17 @@ impl<'a> SourceList<'a> {
         ids: &[u64],
         prop_keys: &[String],
     ) -> Result<Vec<Option<BTreeMap<String, PropValue>>>, EngineError> {
-        let mut results = vec![None; ids.len()];
-        if ids.is_empty() {
-            return Ok(results);
-        }
-        let mut remaining: Vec<(usize, u64)> = ids
-            .iter()
-            .enumerate()
-            .map(|(index, &id)| (index, id))
-            .collect();
-
-        remaining.retain(|&(index, id)| {
-            if let Some(props) = self
-                .active
-                .edge_properties_at(id, prop_keys, self.snapshot_seq)
-            {
-                results[index] = Some(props);
-                false
-            } else {
-                !self.active.is_edge_deleted_at(id, self.snapshot_seq)
-            }
-        });
-
-        for epoch in self.immutable {
-            if remaining.is_empty() {
-                break;
-            }
-            remaining.retain(|&(index, id)| {
-                if let Some(props) =
-                    epoch
-                        .memtable
-                        .edge_properties_at(id, prop_keys, self.snapshot_seq)
-                {
-                    results[index] = Some(props);
-                    false
-                } else {
-                    !epoch.memtable.is_edge_deleted_at(id, self.snapshot_seq)
-                }
-            });
-        }
-
-        if !remaining.is_empty() {
-            remaining.sort_unstable_by_key(|&(_, id)| id);
-            for seg in self.segments {
-                if remaining.is_empty() {
-                    break;
-                }
-                let mut next_remaining = Vec::new();
-                for (index, id) in remaining {
-                    if seg.is_edge_deleted(id) {
-                        continue;
-                    }
-                    if let Some(props) = seg.edge_properties(id, prop_keys)? {
-                        results[index] = Some(props);
-                    } else {
-                        next_remaining.push((index, id));
-                    }
-                }
-                remaining = next_remaining;
-            }
-        }
-
-        Ok(results)
+        Ok(self
+            .find_edge_projected_fields(
+                ids,
+                &EdgeSelectedFieldNeeds {
+                    props: PropertySelection::Keys(prop_keys.to_vec()),
+                    ..EdgeSelectedFieldNeeds::default()
+                },
+            )?
+            .into_iter()
+            .map(|fields| fields.map(|fields| fields.props))
+            .collect())
     }
 
     fn is_node_tombstoned_above_immutable(&self, node_id: u64, imm_idx: usize) -> bool {
@@ -1557,6 +1793,7 @@ mod tests {
             immutable,
             segments: &[],
             snapshot_seq,
+            selected_field_read_counters: None,
         }
     }
 
@@ -1808,6 +2045,7 @@ mod tests {
             immutable: &immutable,
             segments: &segments,
             snapshot_seq: 3,
+            selected_field_read_counters: None,
         };
         let props = sources
             .find_edge_properties(
@@ -1843,6 +2081,158 @@ mod tests {
         );
         assert!(!props[3].as_ref().unwrap().contains_key("ignored"));
         assert!(props[4].is_none());
+
+        let fields = sources
+            .find_edge_projected_fields(
+                &[10, 20, 30, 40, 999],
+                &EdgeSelectedFieldNeeds {
+                    created_at: true,
+                    props: PropertySelection::Keys(vec!["a".to_string()]),
+                },
+            )
+            .unwrap();
+        assert_eq!(fields[0].as_ref().unwrap().created_at, Some(1000));
+        assert_eq!(
+            fields[0].as_ref().unwrap().props.get("a"),
+            Some(&PropValue::String("active".to_string()))
+        );
+        assert_eq!(
+            fields[1].as_ref().unwrap().props.get("a"),
+            Some(&PropValue::String("frozen".to_string()))
+        );
+        assert!(fields[2].is_none());
+        assert_eq!(
+            fields[3].as_ref().unwrap().props.get("a"),
+            Some(&PropValue::String("segment".to_string()))
+        );
+        assert!(fields[4].is_none());
+    }
+
+    #[test]
+    fn test_find_node_projected_fields_projects_across_sources_without_full_hydration() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let segment_mt = Memtable::new();
+        let mut shadowed = make_node(10, "segment-old", 5);
+        shadowed.props.insert(
+            "a".to_string(),
+            PropValue::String("segment-old".to_string()),
+        );
+        shadowed.props.insert("b".to_string(), PropValue::Int(1));
+        segment_mt.apply_op(&WalOp::UpsertNode(shadowed), 1);
+        let mut deleted = make_node(30, "deleted", 5);
+        deleted
+            .props
+            .insert("a".to_string(), PropValue::String("deleted".to_string()));
+        segment_mt.apply_op(&WalOp::UpsertNode(deleted), 1);
+        let mut segment_only = make_node(40, "segment", 5);
+        segment_only
+            .props
+            .insert("a".to_string(), PropValue::String("segment".to_string()));
+        segment_only
+            .props
+            .insert("b".to_string(), PropValue::Int(40));
+        segment_only
+            .props
+            .insert("ignored".to_string(), PropValue::Bool(true));
+        segment_mt.apply_op(&WalOp::UpsertNode(segment_only), 1);
+        write_segment_without_degree_sidecar_for_test(&seg_dir, 1, &segment_mt, None).unwrap();
+        let segments = vec![Arc::new(
+            SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap(),
+        )];
+
+        let active = Memtable::new();
+        let mut active_node = make_node(10, "active", 5);
+        active_node
+            .props
+            .insert("a".to_string(), PropValue::String("active".to_string()));
+        active_node
+            .props
+            .insert("b".to_string(), PropValue::Int(10));
+        active.apply_op(&WalOp::UpsertNode(active_node), 2);
+        active.apply_op(
+            &WalOp::DeleteNode {
+                id: 30,
+                deleted_at: 3,
+            },
+            3,
+        );
+
+        let frozen = Memtable::new();
+        let mut frozen_node = make_node(20, "frozen", 5);
+        frozen_node
+            .props
+            .insert("a".to_string(), PropValue::String("frozen".to_string()));
+        frozen_node
+            .props
+            .insert("b".to_string(), PropValue::Int(20));
+        frozen.apply_op(&WalOp::UpsertNode(frozen_node), 2);
+        let immutable = vec![wrap_imm(frozen)];
+
+        let sources = SourceList {
+            active: &active,
+            immutable: &immutable,
+            segments: &segments,
+            snapshot_seq: 3,
+            selected_field_read_counters: None,
+        };
+        let fields = sources
+            .find_node_projected_fields(
+                &[10, 20, 30, 40, 999],
+                &NodeSelectedFieldNeeds {
+                    key: true,
+                    props: PropertySelection::Keys(vec![
+                        "a".to_string(),
+                        "b".to_string(),
+                        "missing".to_string(),
+                    ]),
+                    ..NodeSelectedFieldNeeds::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(fields[0].as_ref().unwrap().key.as_deref(), Some("active"));
+        assert_eq!(
+            fields[0].as_ref().unwrap().props.get("a"),
+            Some(&PropValue::String("active".to_string()))
+        );
+        assert_eq!(
+            fields[0].as_ref().unwrap().props.get("b"),
+            Some(&PropValue::Int(10))
+        );
+        assert_eq!(fields[1].as_ref().unwrap().key.as_deref(), Some("frozen"));
+        assert_eq!(
+            fields[1].as_ref().unwrap().props.get("a"),
+            Some(&PropValue::String("frozen".to_string()))
+        );
+        assert_eq!(
+            fields[1].as_ref().unwrap().props.get("b"),
+            Some(&PropValue::Int(20))
+        );
+        assert!(fields[2].is_none());
+        assert_eq!(fields[3].as_ref().unwrap().key.as_deref(), Some("segment"));
+        assert_eq!(
+            fields[3].as_ref().unwrap().props.get("a"),
+            Some(&PropValue::String("segment".to_string()))
+        );
+        assert_eq!(
+            fields[3].as_ref().unwrap().props.get("b"),
+            Some(&PropValue::Int(40))
+        );
+        assert!(!fields[3].as_ref().unwrap().props.contains_key("ignored"));
+        assert!(fields[4].is_none());
+
+        let no_key = sources
+            .find_node_projected_fields(
+                &[40],
+                &NodeSelectedFieldNeeds {
+                    props: PropertySelection::Keys(vec!["a".to_string()]),
+                    ..NodeSelectedFieldNeeds::default()
+                },
+            )
+            .unwrap();
+        assert!(no_key[0].as_ref().unwrap().key.is_none());
+        assert_eq!(no_key[0].as_ref().unwrap().props.len(), 1);
     }
 
     #[test]
@@ -1881,6 +2271,7 @@ mod tests {
             immutable: &[],
             segments: &segments,
             snapshot_seq: 2,
+            selected_field_read_counters: None,
         };
 
         assert_eq!(
@@ -1947,6 +2338,7 @@ mod tests {
             immutable: &[],
             segments: &segments,
             snapshot_seq: 2,
+            selected_field_read_counters: None,
         };
 
         assert_eq!(sources.edge_ids_by_label_id(5).unwrap(), Vec::<u64>::new());
@@ -1989,6 +2381,7 @@ mod tests {
             immutable: &[],
             segments: &segments,
             snapshot_seq: 1,
+            selected_field_read_counters: None,
         };
 
         assert_eq!(

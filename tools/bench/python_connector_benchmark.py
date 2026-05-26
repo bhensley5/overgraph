@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=80)
     parser.add_argument("--scenario-set", default="all", choices=["all", "query"])
+    parser.add_argument("--scenario-id", action="append", default=[])
     return parser.parse_args()
 
 
@@ -370,7 +371,7 @@ def build_query_benchmark_db(path: Path, preload_nodes: int) -> tuple[OverGraph,
     wait_for_property_index_ready(db, status.index_id)
     tier = db.ensure_node_property_index("Person", "tier", "equality")
     wait_for_property_index_ready(db, tier.index_id)
-    score = db.ensure_node_property_index("Person", "score", "range", domain="int")
+    score = db.ensure_node_property_index("Person", "score", "range")
     wait_for_property_index_ready(db, score.index_id)
 
     layout = query_benchmark_layout(preload_nodes)
@@ -434,9 +435,232 @@ def build_indexed_edge_query_benchmark_db(
     db, layout, source_id = build_edge_query_benchmark_db(path, preload_edges)
     role = db.ensure_edge_property_index("WORKS_AT", "role", "equality")
     wait_for_edge_property_index_ready(db, role.index_id)
-    score = db.ensure_edge_property_index("WORKS_AT", "score", "range", domain="int")
+    score = db.ensure_edge_property_index("WORKS_AT", "score", "range")
     wait_for_edge_property_index_ready(db, score.index_id)
     return db, layout, source_id
+
+
+def build_graph_row_benchmark_db(path: Path, preload_edges: int) -> tuple[OverGraph, dict[str, int], int]:
+    db = OverGraph.open(str(path))
+    source_count = 1
+    target_count = max(1, preload_edges)
+    nodes = [node_input("Person", f"edge-source-{i}") for i in range(source_count)]
+    nodes.extend(node_input("Company", f"edge-target-{i}") for i in range(target_count))
+    ids = db.batch_upsert_nodes(nodes)
+    source_ids = ids[:source_count]
+    target_ids = ids[source_count:]
+    segments = 1 if preload_edges >= 2 else 0
+    segment_edges = 0 if segments == 0 else max(1, preload_edges // 2)
+    memtable_tail_edges = max(0, preload_edges - segment_edges)
+
+    def make_edges(start: int, count: int) -> list[dict[str, Any]]:
+        edges = []
+        for i in range(start, start + count):
+            edges.append(
+                {
+                    "from_id": source_ids[i % source_count],
+                    "to_id": target_ids[i % len(target_ids)],
+                    "label": "WORKS_AT",
+                    "props": {"role": "lead" if i % 10 == 0 else "member", "score": i % 100},
+                    "weight": 2.0 if i % 2 == 0 else 0.5,
+                }
+            )
+        return edges
+
+    if segment_edges > 0:
+        db.batch_upsert_edges(make_edges(0, segment_edges))
+        db.flush()
+    if memtable_tail_edges > 0:
+        db.batch_upsert_edges(make_edges(segment_edges, memtable_tail_edges))
+
+    docs = [
+        node_input("Document", f"doc-{i}")
+        for i in range(target_count)
+        if i % 8 == 0
+    ]
+    doc_ids = db.batch_upsert_nodes(docs) if docs else []
+    if doc_ids:
+        db.batch_upsert_edges(
+            [
+                {
+                    "from_id": target_ids[doc_index * 8],
+                    "to_id": doc_id,
+                    "label": "MENTIONS",
+                    "weight": 1.0,
+                }
+                for doc_index, doc_id in enumerate(doc_ids)
+            ]
+        )
+
+    role = db.ensure_edge_property_index("WORKS_AT", "role", "equality")
+    wait_for_edge_property_index_ready(db, role.index_id)
+    score = db.ensure_edge_property_index("WORKS_AT", "score", "range")
+    wait_for_edge_property_index_ready(db, score.index_id)
+    return (
+        db,
+        {
+            "segments": segments,
+            "segment_edges": segment_edges,
+            "memtable_tail_edges": memtable_tail_edges,
+        },
+        source_ids[0],
+    )
+
+
+def graph_row_optional_request(source_id: int, limit: int) -> dict[str, Any]:
+    return {
+        "nodes": [
+            {"alias": "source", "label_filter": node_label_filter("Person"), "ids": [source_id]},
+            {"alias": "target", "label_filter": node_label_filter("Company")},
+            {"alias": "doc", "label_filter": node_label_filter("Document")},
+        ],
+        "pieces": [
+            {
+                "kind": "edge",
+                "alias": "edge",
+                "from": "source",
+                "to": "target",
+                "labels": ["WORKS_AT"],
+                "filter": {"property": "role", "eq": "lead"},
+            },
+            {
+                "kind": "optional",
+                "pieces": [
+                    {
+                        "kind": "edge",
+                        "alias": "ref",
+                        "from": "target",
+                        "to": "doc",
+                        "labels": ["MENTIONS"],
+                    }
+                ],
+            },
+        ],
+        "where": {
+            "op": "=",
+            "left": {"property": {"alias": "edge", "key": "role"}},
+            "right": {"param": "role"},
+        },
+        "params": {"role": "lead"},
+        "return": [
+            {"expr": {"binding": "source"}, "as": "source", "projection": "id"},
+            {"expr": {"binding": "edge"}, "as": "edge", "projection": "id"},
+            {"expr": {"binding": "target"}, "as": "target", "projection": "id"},
+            {"expr": {"binding": "ref"}, "as": "ref", "projection": "id"},
+            {"expr": {"binding": "doc"}, "as": "doc", "projection": "id"},
+        ],
+        "order_by": [
+            {
+                "expr": {"property": {"alias": "edge", "key": "score"}},
+                "direction": "desc",
+            },
+            {
+                "expr": {"node_field": {"alias": "target", "field": "id"}},
+                "direction": "asc",
+            },
+        ],
+        "limit": limit,
+    }
+
+
+def graph_row_scenario_params(layout: dict[str, int], preload_edges: int, limit: int) -> dict[str, Any]:
+    return {
+        "labels": {
+            "source": "Person",
+            "target": "Company",
+            "optional": "Document",
+        },
+        "edge_labels": {
+            "required": "WORKS_AT",
+            "optional": "MENTIONS",
+        },
+        "preload_edges": preload_edges,
+        "segments": layout["segments"],
+        "segment_edges": layout["segment_edges"],
+        "memtable_tail_edges": layout["memtable_tail_edges"],
+        "predicate": "edge_role_eq_lead_param",
+        "source_anchor": "first_source_id",
+        "optional": "target_mentions_document_sparse",
+        "row_ops": ["order_by_edge_score_desc", "limit"],
+        "limit": limit,
+    }
+
+
+def push_graph_row_optional_scenario(
+    args: argparse.Namespace,
+    scenario_contract: dict[str, Any],
+    tmp_root: Path,
+    preload_nodes: int,
+    limit: int,
+    scenarios: list[dict[str, Any]],
+) -> None:
+    scenario_id = "S-QUERY-007"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout, source_id = build_graph_row_benchmark_db(
+        tmp_root / "query-graph-rows-optional-edge", preload_nodes
+    )
+    request = graph_row_optional_request(source_id, limit)
+    try:
+        s = run_bench(
+            lambda _i: db.query_graph_rows(request),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "query_graph_rows_optional_edge_traversal",
+                "query",
+                s,
+                iter_cfg,
+                graph_row_scenario_params(layout, preload_nodes, limit),
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+    finally:
+        db.close()
+
+
+def push_gql_graph_row_optional_scenario(
+    args: argparse.Namespace,
+    scenario_contract: dict[str, Any],
+    tmp_root: Path,
+    preload_nodes: int,
+    limit: int,
+    scenarios: list[dict[str, Any]],
+) -> None:
+    scenario_id = "S-GQL-006"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout, source_id = build_graph_row_benchmark_db(
+        tmp_root / "gql-graph-row-optional-edge", preload_nodes
+    )
+    query = f"""
+        MATCH (source:Person)-[edge:WORKS_AT {{role: $role}}]->(target:Company)
+        WHERE id(source) = $source
+        OPTIONAL MATCH (target)-[ref:MENTIONS]->(doc:Document)
+        RETURN id(source) AS source, id(edge) AS edge, id(target) AS target,
+               id(ref) AS ref, id(doc) AS doc
+        ORDER BY edge.score DESC, id(target) LIMIT {limit}
+    """
+    try:
+        s = run_bench(
+            lambda _i: db.execute_gql(query, {"role": "lead", "source": source_id}),
+            iter_cfg["warmup"],
+            iter_cfg["iters"],
+        )
+        scenarios.append(
+            scenario(
+                scenario_id,
+                "execute_gql_optional_edge_traversal_graph_rows",
+                "query",
+                s,
+                iter_cfg,
+                graph_row_scenario_params(layout, preload_nodes, limit),
+                scenario_comparability(scenario_contract, scenario_id),
+            )
+        )
+    finally:
+        db.close()
 
 
 def push_query_scenarios(
@@ -448,6 +672,23 @@ def push_query_scenarios(
 ) -> None:
     preload_nodes = cfg["time_range_nodes"]
     limit = 100
+    selected_scenario_ids = set(args.scenario_id)
+    if selected_scenario_ids:
+        unsupported = selected_scenario_ids - {"S-QUERY-007", "S-GQL-006"}
+        if unsupported:
+            raise ValueError(
+                "--scenario-id is currently limited to CP32.10 final scenarios; "
+                f"unsupported: {', '.join(sorted(unsupported))}"
+            )
+        if "S-QUERY-007" in selected_scenario_ids:
+            push_graph_row_optional_scenario(
+                args, scenario_contract, tmp_root, preload_nodes, limit, scenarios
+            )
+        if "S-GQL-006" in selected_scenario_ids:
+            push_gql_graph_row_optional_scenario(
+                args, scenario_contract, tmp_root, preload_nodes, limit, scenarios
+            )
+        return
 
     scenario_id = "S-QUERY-001"
     iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
@@ -565,54 +806,9 @@ def push_query_scenarios(
     )
     db.close()
 
-    scenario_id = "S-QUERY-007"
-    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
-    db, layout, _source_id = build_indexed_edge_query_benchmark_db(
-        tmp_root / "query-pattern-edge-property-anchor-indexed", preload_nodes
+    push_graph_row_optional_scenario(
+        args, scenario_contract, tmp_root, preload_nodes, limit, scenarios
     )
-    s = run_bench(
-        lambda _i: db.query_pattern(
-            {
-                "nodes": [
-                    {"alias": "source", "label_filter": node_label_filter("Person")},
-                    {"alias": "target", "label_filter": node_label_filter("Company")},
-                ],
-                "edges": [
-                    {
-                        "alias": "edge",
-                        "from_alias": "source",
-                        "to_alias": "target",
-                        "direction": "outgoing",
-                        "label_filter": ["WORKS_AT"],
-                        "filter": {"property": "role", "eq": "lead"},
-                    }
-                ],
-                "limit": limit,
-            }
-        ),
-        iter_cfg["warmup"],
-        iter_cfg["iters"],
-    )
-    scenarios.append(
-        scenario(
-            scenario_id,
-            "query_pattern_edge_property_anchor_indexed",
-            "query",
-            s,
-            iter_cfg,
-            {
-                "label": "WORKS_AT",
-                "preload_edges": preload_nodes,
-                "segments": layout["segments"],
-                "segment_edges": layout["segment_edges"],
-                "memtable_tail_edges": layout["memtable_tail_edges"],
-                "filter": "role_eq_lead",
-                "limit": limit,
-            },
-            scenario_comparability(scenario_contract, scenario_id),
-        )
-    )
-    db.close()
 
     scenario_id = "S-QUERY-003"
     iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
@@ -651,6 +847,10 @@ def push_query_scenarios(
         )
     )
     db.close()
+
+    push_gql_graph_row_optional_scenario(
+        args, scenario_contract, tmp_root, preload_nodes, limit, scenarios
+    )
 
     scenario_id = "S-QUERY-004"
     iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
@@ -735,6 +935,192 @@ def push_query_scenarios(
     )
     db.close()
 
+    scenario_id = "S-GQL-001"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout = build_query_benchmark_db(tmp_root / "gql-node-row-ops", preload_nodes)
+    query = f"""
+        MATCH (n:Person)
+        WHERE n.status = $status AND n.score >= 50
+        RETURN id(n) AS id, n.score AS score
+        ORDER BY n.score DESC LIMIT {limit}
+    """
+    s = run_bench(
+        lambda _i: db.execute_gql(query, {"status": "active"}),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "execute_gql_node_residual_row_ops_object_rows",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "Person",
+                "preload_nodes": preload_nodes,
+                "segments": layout["segments"],
+                "segment_nodes": layout["segment_nodes"],
+                "memtable_tail_nodes": layout["memtable_tail_nodes"],
+                "predicates": ["status_eq_active", "score_gte_50"],
+                "row_ops": ["order_by", "limit"],
+                "row_format": "object",
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-GQL-002"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout = build_query_benchmark_db(tmp_root / "gql-node-compact-row-ops", preload_nodes)
+    query = f"""
+        MATCH (n:Person)
+        WHERE n.status = $status AND n.score >= 50
+        RETURN id(n) AS id, n.score AS score
+        ORDER BY n.score DESC LIMIT {limit}
+    """
+    s = run_bench(
+        lambda _i: db.execute_gql(query, {"status": "active"}, compact_rows=True),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "execute_gql_node_residual_row_ops_compact_rows",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "Person",
+                "preload_nodes": preload_nodes,
+                "segments": layout["segments"],
+                "segment_nodes": layout["segment_nodes"],
+                "memtable_tail_nodes": layout["memtable_tail_nodes"],
+                "predicates": ["status_eq_active", "score_gte_50"],
+                "row_ops": ["order_by", "limit"],
+                "row_format": "compact",
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-GQL-003"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout, _source_id = build_indexed_edge_query_benchmark_db(
+        tmp_root / "gql-edge-property-indexed", preload_nodes
+    )
+    query = f"""
+        MATCH ()-[r:WORKS_AT]->()
+        WHERE r.role = $role
+        RETURN id(r) AS id, r.score AS score
+        ORDER BY r.score DESC LIMIT {limit}
+    """
+    s = run_bench(
+        lambda _i: db.execute_gql(query, {"role": "lead"}),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "execute_gql_edge_property_indexed_row_ops",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "WORKS_AT",
+                "preload_edges": preload_nodes,
+                "segments": layout["segments"],
+                "segment_edges": layout["segment_edges"],
+                "memtable_tail_edges": layout["memtable_tail_edges"],
+                "predicate": "role_eq_lead",
+                "row_ops": ["order_by", "limit"],
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-GQL-004"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout, _source_id = build_indexed_edge_query_benchmark_db(
+        tmp_root / "gql-pattern-property-anchor-indexed", preload_nodes
+    )
+    query = f"""
+        MATCH (source:Person)-[edge:WORKS_AT]->(target:Company)
+        WHERE edge.role = $role
+        RETURN id(source) AS source, id(edge) AS edge, id(target) AS target
+        LIMIT {limit}
+    """
+    s = run_bench(
+        lambda _i: db.execute_gql(query, {"role": "lead"}),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "execute_gql_fixed_pattern_property_anchor",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "WORKS_AT",
+                "preload_edges": preload_nodes,
+                "segments": layout["segments"],
+                "segment_edges": layout["segment_edges"],
+                "memtable_tail_edges": layout["memtable_tail_edges"],
+                "predicate": "role_eq_lead",
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
+    scenario_id = "S-GQL-005"
+    iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+    db, layout = build_query_benchmark_db(tmp_root / "gql-explain-profile", preload_nodes)
+    query = f"""
+        MATCH (n:Person)
+        WHERE n.status = $status
+        RETURN n.score AS score
+        ORDER BY n.score DESC LIMIT {limit}
+    """
+    s = run_bench(
+        lambda _i: db.execute_gql(query, {"status": "active"}, include_plan=True, profile=True),
+        iter_cfg["warmup"],
+        iter_cfg["iters"],
+    )
+    scenarios.append(
+        scenario(
+            scenario_id,
+            "execute_gql_include_plan_profile",
+            "query",
+            s,
+            iter_cfg,
+            {
+                "label": "Person",
+                "preload_nodes": preload_nodes,
+                "segments": layout["segments"],
+                "segment_nodes": layout["segment_nodes"],
+                "memtable_tail_nodes": layout["memtable_tail_nodes"],
+                "predicate": "status_eq_active",
+                "include_plan": True,
+                "profile": True,
+                "limit": limit,
+            },
+            scenario_comparability(scenario_contract, scenario_id),
+        )
+    )
+    db.close()
+
 
 def main() -> int:
     args = parse_args()
@@ -746,7 +1132,7 @@ def main() -> int:
     try:
         push_query_scenarios(args, scenario_contract, cfg, tmp_root, scenarios)
 
-        if args.scenario_set == "query":
+        if args.scenario_set == "query" or args.scenario_id:
             output = {
                 "schema_version": 1,
                 "language": "python",

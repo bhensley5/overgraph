@@ -20,6 +20,13 @@ fn read_node_key_queries(keys: &[(&str, &str)]) -> Vec<NodeKeyQuery> {
         .collect()
 }
 
+fn read_query_test_props(entries: &[(&str, PropValue)]) -> BTreeMap<String, PropValue> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.clone()))
+        .collect()
+}
+
 fn traverse_depth_two_read(
     engine: &DatabaseEngine,
     start: u64,
@@ -2554,6 +2561,341 @@ fn test_find_nodes_ready_equality_index_matches_signed_zero_verifier_semantics()
 }
 
 #[test]
+fn test_find_nodes_active_equality_index_uses_semantic_hashes() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let info = engine
+        .ensure_node_property_index("Person", "score", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let mut expected_numeric = Vec::new();
+    for (key, value) in [
+        ("score-int", PropValue::Int(1)),
+        ("score-uint", PropValue::UInt(1)),
+        ("score-float", PropValue::Float(1.0)),
+    ] {
+        expected_numeric.push(
+            engine
+                .upsert_node(
+                    "Person",
+                    key,
+                    UpsertNodeOptions {
+                        props: read_query_test_props(&[("score", value)]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+    }
+
+    let string_id = engine
+        .upsert_node(
+            "Person",
+            "score-string",
+            UpsertNodeOptions {
+                props: read_query_test_props(&[("score", PropValue::String("1".to_string()))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let array_id = engine
+        .upsert_node(
+            "Person",
+            "score-array-int",
+            UpsertNodeOptions {
+                props: read_query_test_props(&[(
+                    "score",
+                    PropValue::Array(vec![PropValue::Int(1)]),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut map_int = BTreeMap::new();
+    map_int.insert("x".to_string(), PropValue::Int(1));
+    let map_id = engine
+        .upsert_node(
+            "Person",
+            "score-map-int",
+            UpsertNodeOptions {
+                props: read_query_test_props(&[("score", PropValue::Map(map_int))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let inf_id = engine
+        .upsert_node(
+            "Person",
+            "score-infinity",
+            UpsertNodeOptions {
+                props: read_query_test_props(&[("score", PropValue::Float(f64::INFINITY))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_node(
+            "Person",
+            "score-nan",
+            UpsertNodeOptions {
+                props: read_query_test_props(&[("score", PropValue::Float(f64::NAN))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    expected_numeric.sort_unstable();
+    engine.reset_property_query_routes();
+    for rhs in [PropValue::Int(1), PropValue::UInt(1), PropValue::Float(1.0)] {
+        assert_eq!(engine.find_nodes("Person", "score", &rhs).unwrap(), expected_numeric);
+    }
+    assert_eq!(
+        engine
+            .find_nodes("Person", "score", &PropValue::String("1".to_string()))
+            .unwrap(),
+        vec![string_id]
+    );
+    assert_eq!(
+        engine
+            .find_nodes(
+                "Person",
+                "score",
+                &PropValue::Array(vec![PropValue::Int(1)])
+            )
+            .unwrap(),
+        vec![array_id]
+    );
+    assert!(engine
+        .find_nodes(
+            "Person",
+            "score",
+            &PropValue::Array(vec![PropValue::Float(1.0)])
+        )
+        .unwrap()
+        .is_empty());
+    let mut map_float = BTreeMap::new();
+    map_float.insert("x".to_string(), PropValue::Float(1.0));
+    assert_eq!(
+        engine
+            .find_nodes("Person", "score", &PropValue::Map({
+                let mut expected = BTreeMap::new();
+                expected.insert("x".to_string(), PropValue::Int(1));
+                expected
+            }))
+            .unwrap(),
+        vec![map_id]
+    );
+    assert!(engine
+        .find_nodes("Person", "score", &PropValue::Map(map_float))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        engine
+            .find_nodes("Person", "score", &PropValue::Float(f64::INFINITY))
+            .unwrap(),
+        vec![inf_id]
+    );
+    assert!(engine
+        .find_nodes("Person", "score", &PropValue::Float(f64::NAN))
+        .unwrap()
+        .is_empty());
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 0);
+    assert_eq!(routes.equality_index_lookup, 10);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_semantic_equality_index_updates_tombstones_and_shadows() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let info = engine
+        .ensure_node_property_index("Person", "score", SecondaryIndexKind::Equality)
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let node_id = engine
+        .upsert_node(
+            "Person",
+            "mutable-score",
+            UpsertNodeOptions {
+                props: read_query_test_props(&[("score", PropValue::Int(1))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .find_nodes("Person", "score", &PropValue::Float(1.0))
+            .unwrap(),
+        vec![node_id]
+    );
+
+    engine
+        .upsert_node(
+            "Person",
+            "mutable-score",
+            UpsertNodeOptions {
+                props: read_query_test_props(&[("score", PropValue::Float(1.0))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .find_nodes("Person", "score", &PropValue::Int(1))
+            .unwrap(),
+        vec![node_id]
+    );
+
+    engine
+        .upsert_node(
+            "Person",
+            "mutable-score",
+            UpsertNodeOptions {
+                props: read_query_test_props(&[("score", PropValue::Float(2.0))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(engine
+        .find_nodes("Person", "score", &PropValue::Int(1))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        engine
+            .find_nodes("Person", "score", &PropValue::UInt(2))
+            .unwrap(),
+        vec![node_id]
+    );
+
+    engine.flush().unwrap();
+    engine
+        .upsert_node(
+            "Person",
+            "mutable-score",
+            UpsertNodeOptions {
+                props: read_query_test_props(&[("score", PropValue::String("2".to_string()))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(engine
+        .find_nodes("Person", "score", &PropValue::Float(2.0))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        engine
+            .find_nodes("Person", "score", &PropValue::String("2".to_string()))
+            .unwrap(),
+        vec![node_id]
+    );
+
+    engine.delete_node(node_id).unwrap();
+    assert!(engine
+        .find_nodes("Person", "score", &PropValue::String("2".to_string()))
+        .unwrap()
+        .is_empty());
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_scan_fallback_uses_semantic_numeric_equality() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut expected = Vec::new();
+    for (key, value) in [
+        ("score-int", PropValue::Int(1)),
+        ("score-uint", PropValue::UInt(1)),
+        ("score-float", PropValue::Float(1.0)),
+    ] {
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), value);
+        expected.push(
+            engine
+                .upsert_node(
+                    "Person",
+                    key,
+                    UpsertNodeOptions {
+                        props,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+    }
+
+    let mut nan_props = BTreeMap::new();
+    nan_props.insert("score".to_string(), PropValue::Float(f64::NAN));
+    engine
+        .upsert_node(
+            "Person",
+            "score-nan",
+            UpsertNodeOptions {
+                props: nan_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut array_props = BTreeMap::new();
+    array_props.insert("score".to_string(), PropValue::Array(vec![PropValue::Int(1)]));
+    let array_id = engine
+        .upsert_node(
+            "Person",
+            "score-array",
+            UpsertNodeOptions {
+                props: array_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    expected.sort_unstable();
+    for rhs in [PropValue::Int(1), PropValue::UInt(1), PropValue::Float(1.0)] {
+        let mut actual = engine.find_nodes("Person", "score", &rhs).unwrap();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+    assert!(engine
+        .find_nodes("Person", "score", &PropValue::Float(f64::NAN))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        engine
+            .find_nodes(
+                "Person",
+                "score",
+                &PropValue::Array(vec![PropValue::Int(1)])
+            )
+            .unwrap(),
+        vec![array_id]
+    );
+    assert!(engine
+        .find_nodes(
+            "Person",
+            "score",
+            &PropValue::Array(vec![PropValue::Float(1.0)])
+        )
+        .unwrap()
+        .is_empty());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.equality_scan_fallback, 6);
+    assert_eq!(routes.equality_index_lookup, 0);
+    engine.close().unwrap();
+}
+
+#[test]
 fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
@@ -2602,7 +2944,7 @@ fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates()
     drop(engine);
 
     let mut tampered_groups = std::collections::BTreeMap::new();
-    tampered_groups.insert(hash_prop_value(&red), vec![node_id, blue_id]);
+    tampered_groups.insert(hash_prop_equality_key(&red), vec![node_id, blue_id]);
     let manifest = crate::manifest::load_manifest_readonly(&db_path)
         .unwrap()
         .unwrap();
@@ -3247,9 +3589,7 @@ fn test_find_nodes_range_fallback_orders_and_paginates() {
     let info = engine
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
@@ -3321,15 +3661,16 @@ fn test_find_nodes_range_fallback_orders_and_paginates() {
 }
 
 #[test]
-fn test_find_nodes_range_rejects_mixed_bound_variants_and_normalizes_zero() {
+fn test_find_nodes_range_accepts_mixed_bounds_and_normalizes_empty_intervals() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
+    let mut one_id = None;
     for (key, value) in [("neg_zero", -0.0), ("pos_zero", 0.0), ("one", 1.0)] {
         let mut props = BTreeMap::new();
         props.insert("score".to_string(), PropValue::Float(value));
-        engine
+        let id = engine
             .upsert_node(
                 "Person",
                 key,
@@ -3339,6 +3680,9 @@ fn test_find_nodes_range_rejects_mixed_bound_variants_and_normalizes_zero() {
                 },
             )
             .unwrap();
+        if key == "one" {
+            one_id = Some(id);
+        }
     }
 
     let zeros = engine
@@ -3351,32 +3695,116 @@ fn test_find_nodes_range_rejects_mixed_bound_variants_and_normalizes_zero() {
     assert_eq!(zeros.len(), 2);
     assert!(zeros[0] < zeros[1]);
 
-    let err = engine
+    let mixed_singleton = engine
         .find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Int(1))),
             Some(&PropertyRangeBound::Included(PropValue::Float(1.0))),
         )
-        .unwrap_err();
-    assert!(matches!(err, EngineError::InvalidOperation(_)));
+        .unwrap();
+    assert_eq!(mixed_singleton, vec![one_id.unwrap()]);
 
-    let err = engine
+    let empty_descending = engine
         .find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Included(PropValue::Float(2.0))),
             Some(&PropertyRangeBound::Included(PropValue::Float(1.0))),
         )
-        .unwrap_err();
-    assert!(matches!(err, EngineError::InvalidOperation(_)));
+        .unwrap();
+    assert!(empty_descending.is_empty());
 
-    let err = engine
+    let empty_exclusive_zero = engine
         .find_nodes_range("Person",
             "score",
             Some(&PropertyRangeBound::Excluded(PropValue::Float(0.0))),
             Some(&PropertyRangeBound::Included(PropValue::Float(0.0))),
         )
+        .unwrap();
+    assert!(empty_exclusive_zero.is_empty());
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_range_scan_fallback_uses_semantic_numeric_ordering() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut ids_by_key = BTreeMap::new();
+    for (key, value) in [
+        ("score-int", PropValue::Int(1)),
+        ("score-uint", PropValue::UInt(2)),
+        ("score-float", PropValue::Float(1.5)),
+        ("score-neg-zero", PropValue::Float(-0.0)),
+    ] {
+        let mut props = BTreeMap::new();
+        props.insert("score".to_string(), value);
+        ids_by_key.insert(
+            key,
+            engine
+                .upsert_node(
+                    "Person",
+                    key,
+                    UpsertNodeOptions {
+                        props,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+    }
+    let mut string_props = BTreeMap::new();
+    string_props.insert("score".to_string(), PropValue::String("1".to_string()));
+    engine
+        .upsert_node(
+            "Person",
+            "score-string",
+            UpsertNodeOptions {
+                props: string_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let actual = engine
+        .find_nodes_range(
+            "Person",
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Float(-0.0))),
+            Some(&PropertyRangeBound::Included(PropValue::UInt(2))),
+        )
+        .unwrap();
+    let expected = vec![
+        ids_by_key["score-neg-zero"],
+        ids_by_key["score-int"],
+        ids_by_key["score-float"],
+        ids_by_key["score-uint"],
+    ];
+    assert_eq!(actual, expected);
+
+    let err = engine
+        .find_nodes_range(
+            "Person",
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Float(f64::INFINITY))),
+            None,
+        )
         .unwrap_err();
-    assert!(matches!(err, EngineError::InvalidOperation(_)));
+    assert!(err
+        .to_string()
+        .contains("non-finite float is not valid for numeric range bounds"));
+    let err = engine
+        .find_nodes_range(
+            "Person",
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::String("1".to_string()))),
+            None,
+        )
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("range bound must be a finite numeric scalar"));
 
     engine.close().unwrap();
 }
@@ -3522,7 +3950,7 @@ fn brute_force_range_oracle(
     lower: Option<&PropertyRangeBound>,
     upper: Option<&PropertyRangeBound>,
 ) -> Vec<u64> {
-    let domain = DatabaseEngine::validate_property_range_bounds(lower, upper, None).unwrap();
+    DatabaseEngine::validate_property_range_bounds(lower, upper, None).unwrap();
     let mut matches = Vec::new();
     let nodes = engine.get_nodes_raw(node_ids).unwrap();
     for (&node_id, node) in node_ids.iter().zip(nodes.iter()) {
@@ -3535,12 +3963,11 @@ fn brute_force_range_oracle(
         let Some(value) = node.props.get(prop_key) else {
             continue;
         };
-        if range_value_domain(value) != Some(domain)
-            || range_value_within_bounds(value, lower, upper) != Some(true)
-        {
+        if range_value_within_bounds(value, lower, upper) != Some(true) {
             continue;
         }
-        let encoded_value = crate::memtable::encode_range_prop_value(domain, value).unwrap();
+        let encoded_value =
+            crate::property_value_semantics::numeric_range_sort_key_for_value(value).unwrap();
         matches.push((encoded_value, node_id));
     }
     matches.sort_unstable();
@@ -3655,9 +4082,7 @@ fn test_find_nodes_range_open_and_closed_intervals_match_in_fallback_and_ready_p
     let info = engine
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
@@ -3876,25 +4301,19 @@ fn test_find_nodes_range_ready_parity_matches_bruteforce_oracle_across_domains()
     let queries = vec![
         (
             "score_i",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
             Some(PropertyRangeBound::Included(PropValue::Int(0))),
             Some(PropertyRangeBound::Included(PropValue::Int(30))),
         ),
         (
             "score_u",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::UInt,
-            },
+            SecondaryIndexKind::Range,
             Some(PropertyRangeBound::Included(PropValue::UInt(0))),
             Some(PropertyRangeBound::Included(PropValue::UInt(10))),
         ),
         (
             "score_f",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Float,
-            },
+            SecondaryIndexKind::Range,
             Some(PropertyRangeBound::Included(PropValue::Float(-0.0))),
             Some(PropertyRangeBound::Included(PropValue::Float(1.5))),
         ),
@@ -4007,9 +4426,7 @@ fn test_find_nodes_range_ready_refills_segment_chunks_with_pruned_overrides() {
     let info = engine
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
@@ -4137,9 +4554,7 @@ fn test_find_nodes_range_ready_declaration_routes_and_orders_across_sources() {
     let info = engine
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     let ready = wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
@@ -4237,9 +4652,7 @@ fn test_find_nodes_range_ready_declaration_hides_stale_and_incompatible_older_ma
     let info = engine
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
@@ -4291,7 +4704,106 @@ fn test_find_nodes_range_ready_declaration_hides_stale_and_incompatible_older_ma
 }
 
 #[test]
-fn test_find_nodes_range_ready_domain_specific_uint_and_float() {
+fn test_find_nodes_range_ready_paged_verifies_latest_numeric_key_before_cursor() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut mutable_props = BTreeMap::new();
+    mutable_props.insert("score".to_string(), PropValue::Int(20));
+    let mutable_id = engine
+        .upsert_node(
+            "Person",
+            "mutable",
+            UpsertNodeOptions {
+                props: mutable_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut mid_props = BTreeMap::new();
+    mid_props.insert("score".to_string(), PropValue::Int(22));
+    let mid_id = engine
+        .upsert_node(
+            "Person",
+            "mid",
+            UpsertNodeOptions {
+                props: mid_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let info = engine
+        .ensure_node_property_index("Person",
+            "score",
+            SecondaryIndexKind::Range,
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let mut updated_props = BTreeMap::new();
+    updated_props.insert("score".to_string(), PropValue::Int(25));
+    assert_eq!(
+        engine
+            .upsert_node(
+                "Person",
+                "mutable",
+                UpsertNodeOptions {
+                    props: updated_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        mutable_id
+    );
+
+    engine.reset_property_query_routes();
+    let page1 = engine
+        .find_nodes_range_paged("Person",
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(0))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            &PropertyRangePageRequest {
+                limit: Some(1),
+                after: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page1.items, vec![mid_id]);
+    assert_eq!(
+        page1.next_cursor,
+        Some(PropertyRangeCursor {
+            value: PropValue::Int(22),
+            node_id: mid_id,
+        })
+    );
+
+    let page2 = engine
+        .find_nodes_range_paged("Person",
+            "score",
+            Some(&PropertyRangeBound::Included(PropValue::Int(0))),
+            Some(&PropertyRangeBound::Included(PropValue::Int(30))),
+            &PropertyRangePageRequest {
+                limit: Some(1),
+                after: page1.next_cursor.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(page2.items, vec![mutable_id]);
+    assert!(page2.next_cursor.is_none());
+
+    let routes = engine.property_query_route_snapshot();
+    assert_eq!(routes.range_scan_fallback, 0);
+    assert_eq!(routes.range_index_lookup, 2);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_find_nodes_range_ready_domainless_uint_int_and_float() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
@@ -4322,10 +4834,10 @@ fn test_find_nodes_range_ready_domain_specific_uint_and_float() {
         .unwrap();
     let mut incompatible_count_props = BTreeMap::new();
     incompatible_count_props.insert("count".to_string(), PropValue::Int(7));
-    engine
+    let compatible_count = engine
         .upsert_node(
             "Person",
-            "count-bad",
+            "count-compatible-int",
             UpsertNodeOptions {
                 props: incompatible_count_props,
                 ..Default::default()
@@ -4336,9 +4848,7 @@ fn test_find_nodes_range_ready_domain_specific_uint_and_float() {
     let uint_info = engine
         .ensure_node_property_index("Person",
             "count",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::UInt,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&engine, uint_info.index_id, SecondaryIndexState::Ready);
@@ -4352,7 +4862,7 @@ fn test_find_nodes_range_ready_domain_specific_uint_and_float() {
                 Some(&PropertyRangeBound::Included(PropValue::UInt(10))),
             )
             .unwrap(),
-        vec![count_a, count_b]
+        vec![count_a, compatible_count, count_b]
     );
     let routes = engine.property_query_route_snapshot();
     assert_eq!(routes.range_scan_fallback, 0);
@@ -4410,9 +4920,7 @@ fn test_find_nodes_range_ready_domain_specific_uint_and_float() {
     let float_info = engine
         .ensure_node_property_index("Person",
             "temp",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Float,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&engine, float_info.index_id, SecondaryIndexState::Ready);
@@ -17163,9 +17671,7 @@ fn test_multi_label_compaction_rebuilds_declared_sidecars_via_targeted_decode() 
             label_id: 3,
             prop_key: "score".to_string(),
         },
-        kind: SecondaryIndexKind::Range {
-            domain: SecondaryIndexRangeDomain::Int,
-        },
+        kind: SecondaryIndexKind::Range,
         state: SecondaryIndexState::Ready,
         last_error: None,
     };
@@ -17224,7 +17730,7 @@ fn test_multi_label_compaction_rebuilds_declared_sidecars_via_targeted_decode() 
     assert_eq!(nodes_auto_pruned, 0);
     assert_eq!(edges_auto_pruned, 0);
 
-    let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+    let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
     assert_eq!(
         reader
             .find_nodes_by_secondary_eq_index(eq_entry.index_id, red_hash)
@@ -17232,16 +17738,8 @@ fn test_multi_label_compaction_rebuilds_declared_sidecars_via_targeted_decode() 
         vec![1, 2]
     );
 
-    let score_20 = crate::memtable::encode_range_prop_value(
-        SecondaryIndexRangeDomain::Int,
-        &PropValue::Int(20),
-    )
-    .unwrap();
-    let score_30 = crate::memtable::encode_range_prop_value(
-        SecondaryIndexRangeDomain::Int,
-        &PropValue::Int(30),
-    )
-    .unwrap();
+    let score_20 = numeric_range_sort_key_for_value(&PropValue::Int(20)).unwrap();
+    let score_30 = numeric_range_sort_key_for_value(&PropValue::Int(30)).unwrap();
     assert_eq!(
         reader
             .find_nodes_by_secondary_range_index_if_present(
@@ -17278,9 +17776,7 @@ fn test_multi_label_compaction_drops_stale_declared_sidecar_memberships() {
             label_id: 2,
             prop_key: "score".to_string(),
         },
-        kind: SecondaryIndexKind::Range {
-            domain: SecondaryIndexRangeDomain::Int,
-        },
+        kind: SecondaryIndexKind::Range,
         state: SecondaryIndexState::Ready,
         last_error: None,
     };
@@ -17355,7 +17851,7 @@ fn test_multi_label_compaction_drops_stale_declared_sidecar_memberships() {
     );
     assert!(reader.get_node(2).unwrap().is_none());
 
-    let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+    let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
     assert_eq!(
         reader
             .find_nodes_by_secondary_eq_index(eq_entry.index_id, red_hash)

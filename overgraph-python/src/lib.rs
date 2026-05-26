@@ -1,35 +1,47 @@
 #![allow(clippy::too_many_arguments)]
 
+use eg::types::GqlPath;
 use eg::{
-    AdjacencyExport as CoreAdjacencyExport, AllShortestPathsOptions, CompactionPhase,
-    CompactionProgress as CoreCompactionProgress, CompactionStats as CoreCompactionStats,
-    ComponentOptions, ComponentScrubFinding as CoreComponentScrubFinding, DatabaseEngine,
-    DbOptions, DbStats as CoreDbStats, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
-    EdgeFilterExpr, EdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo, EdgePattern,
+    gql_referenced_param_names, AdjacencyExport as CoreAdjacencyExport, AllShortestPathsOptions,
+    CompactionPhase, CompactionProgress as CoreCompactionProgress,
+    CompactionStats as CoreCompactionStats, ComponentOptions,
+    ComponentScrubFinding as CoreComponentScrubFinding, DatabaseEngine, DbOptions,
+    DbStats as CoreDbStats, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
+    EdgeFilterExpr, EdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
     EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
-    EdgeView as CoreEdgeView, EngineError, ExportOptions, FusionMode, GraphPatch,
-    GraphPatternQuery, HnswConfig, IsConnectedOptions, LabelMatchMode,
+    EdgeView as CoreEdgeView, EngineError, ExportOptions, FusionMode, GqlCapSummary, GqlEdge,
+    GqlExecutionStats, GqlExplain, GqlLoweringTarget, GqlNode, GqlParamValue, GqlParams,
+    GqlQueryOptions, GqlResult, GqlRowOperation, GqlValue, GraphBinaryOp, GraphCapExplain,
+    GraphCursorExplain, GraphEdgePattern, GraphEdgeValue, GraphElementProjection,
+    GraphExecutionSummaries, GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
+    GraphNodePattern, GraphNodeValue, GraphOrderDirection, GraphOrderExplain, GraphOrderItem,
+    GraphOutputMode, GraphOutputOptions, GraphPageRequest, GraphParamValue, GraphPatch,
+    GraphPathField, GraphPathValue, GraphPatternPiece, GraphProjectionExplain, GraphQueryOptions,
+    GraphReturnItem, GraphReturnProjection, GraphRowExplain, GraphRowOperationExplain,
+    GraphRowQuery, GraphRowResult, GraphRowStats, GraphSelectedEdgeProjection,
+    GraphSelectedNodeProjection, GraphSelectedPathProjection, GraphSelectedProjection,
+    GraphUnaryOp, GraphValue, GraphVectorSelection, HnswConfig, IsConnectedOptions, LabelMatchMode,
     NeighborEntry as CoreNeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap, NodeInput,
-    NodeKeyQuery, NodeLabelFilter, NodeLabelInfo as CoreNodeLabelInfo, NodePattern,
+    NodeKeyQuery, NodeLabelFilter, NodeLabelInfo as CoreNodeLabelInfo,
     NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
-    NodeView as CoreNodeView, PageRequest, PatternOrder, PprAlgorithm, PprOptions,
-    PprResult as CorePprResult, PropValue, PropertyRangeBound as CorePropertyRangeBound,
+    NodeView as CoreNodeView, PageRequest, PprAlgorithm, PprOptions, PprResult as CorePprResult,
+    PropValue, PropertyRangeBound as CorePropertyRangeBound,
     PropertyRangeCursor as CorePropertyRangeCursor, PropertyRangePageRequest,
     PropertyRangePageResult as CorePropertyRangePageResult, PrunePolicy, PrunePolicyInfo,
-    PruneResult as CorePruneResult, QueryMatch, QueryPatternResult, QueryPlan, QueryPlanKind,
-    QueryPlanNode, QueryPlanNote, QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning,
-    ScoringMode, ScrubReport as CoreScrubReport, SecondaryIndexKind, SecondaryIndexRangeDomain,
-    SecondaryIndexState, SegmentScrubResult as CoreSegmentScrubResult,
-    ShortestPath as CoreShortestPath, ShortestPathOptions, Subgraph as CoreSubgraph,
-    SubgraphOptions, TopKOptions, TraversalCursor as CoreTraversalCursor,
-    TraversalHit as CoreTraversalHit, TraversalPageResult as CoreTraversalPageResult,
-    TraverseOptions, TxnCommitResult as CoreTxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent,
-    TxnLocalRef, TxnNodeRef, TxnNodeView, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode,
+    PruneResult as CorePruneResult, QueryPlan, QueryPlanKind, QueryPlanNode, QueryPlanNote,
+    QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning, ScoringMode,
+    ScrubReport as CoreScrubReport, SecondaryIndexKind, SecondaryIndexState,
+    SegmentScrubResult as CoreSegmentScrubResult, ShortestPath as CoreShortestPath,
+    ShortestPathOptions, Subgraph as CoreSubgraph, SubgraphOptions, TopKOptions,
+    TraversalCursor as CoreTraversalCursor, TraversalHit as CoreTraversalHit,
+    TraversalPageResult as CoreTraversalPageResult, TraverseOptions,
+    TxnCommitResult as CoreTxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef,
+    TxnNodeRef, TxnNodeView, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode,
     VectorSearchRequest, VectorSearchScope, WalSyncMode, WriteTxn as CoreWriteTxn,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyList};
+use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyList, PyString, PyStringMethods, PyTuple};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -440,10 +452,10 @@ impl OverGraph {
         })
     }
 
-    fn query_pattern(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
-        let query = parse_py_graph_pattern_query(py, request)?;
-        let result = with_engine_ref(self, py, move |eng| eng.query_pattern(&query))?;
-        query_pattern_result_to_py(py, result)
+    fn query_pattern(&self, _py: Python<'_>, _request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        Err(OverGraphError::new_err(
+            "query_pattern is unsupported after Phase 32; use query_graph_rows",
+        ))
     }
 
     fn explain_node_query(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
@@ -460,24 +472,126 @@ impl OverGraph {
 
     fn explain_pattern_query(
         &self,
-        py: Python<'_>,
-        request: &Bound<'_, PyAny>,
+        _py: Python<'_>,
+        _request: &Bound<'_, PyAny>,
     ) -> PyResult<PyObject> {
-        let query = parse_py_graph_pattern_query(py, request)?;
-        let plan = with_engine_ref(self, py, move |eng| eng.explain_pattern_query(&query))?;
-        query_plan_to_py(py, plan)
+        Err(OverGraphError::new_err(
+            "explain_pattern_query is unsupported after Phase 32; use explain_graph_rows",
+        ))
     }
 
-    #[pyo3(signature = (label, prop_key, kind, *, domain=None))]
+    fn query_graph_rows(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let query = parse_py_graph_row_query(py, request)?;
+        let compact_rows = query.output.compact_rows;
+        let result = with_engine_ref(self, py, move |eng| eng.query_graph_rows(&query))?;
+        graph_row_result_to_py(py, result, compact_rows)
+    }
+
+    fn explain_graph_rows(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let query = parse_py_graph_row_query(py, request)?;
+        let explain = with_engine_ref(self, py, move |eng| eng.explain_graph_rows(&query))?;
+        graph_row_explain_to_py(py, explain)
+    }
+
+    #[pyo3(signature = (query, params=None, *, allow_full_scan=false, max_rows=None, cursor=None, max_cursor_bytes=None, max_intermediate_bindings=None, max_skip=None, max_query_bytes=None, max_param_bytes=None, max_ast_depth=None, max_literal_items=None, include_plan=false, profile=false, compact_rows=false, include_vectors=false))]
+    fn execute_gql(
+        &self,
+        py: Python<'_>,
+        query: String,
+        params: Option<&Bound<'_, PyDict>>,
+        allow_full_scan: bool,
+        max_rows: Option<usize>,
+        cursor: Option<String>,
+        max_cursor_bytes: Option<usize>,
+        max_intermediate_bindings: Option<usize>,
+        max_skip: Option<usize>,
+        max_query_bytes: Option<usize>,
+        max_param_bytes: Option<usize>,
+        max_ast_depth: Option<usize>,
+        max_literal_items: Option<usize>,
+        include_plan: bool,
+        profile: bool,
+        compact_rows: bool,
+        include_vectors: bool,
+    ) -> PyResult<PyObject> {
+        let options = parse_py_gql_options(
+            allow_full_scan,
+            max_rows,
+            cursor,
+            max_cursor_bytes,
+            max_intermediate_bindings,
+            max_skip,
+            max_query_bytes,
+            max_param_bytes,
+            max_ast_depth,
+            max_literal_items,
+            include_plan,
+            profile,
+            compact_rows,
+            include_vectors,
+        );
+        let referenced_params = gql_referenced_param_names(&query, &options).map_err(to_py_err)?;
+        let params = parse_py_gql_params(py, params, &referenced_params, &options)?;
+        let result = with_engine_ref(self, py, move |eng| {
+            eng.execute_gql(&query, &params, &options)
+        })?;
+        gql_result_to_py(py, result, compact_rows)
+    }
+
+    #[pyo3(signature = (query, params=None, *, allow_full_scan=false, max_rows=None, cursor=None, max_cursor_bytes=None, max_intermediate_bindings=None, max_skip=None, max_query_bytes=None, max_param_bytes=None, max_ast_depth=None, max_literal_items=None, include_plan=false, profile=false, compact_rows=false, include_vectors=false))]
+    fn explain_gql(
+        &self,
+        py: Python<'_>,
+        query: String,
+        params: Option<&Bound<'_, PyDict>>,
+        allow_full_scan: bool,
+        max_rows: Option<usize>,
+        cursor: Option<String>,
+        max_cursor_bytes: Option<usize>,
+        max_intermediate_bindings: Option<usize>,
+        max_skip: Option<usize>,
+        max_query_bytes: Option<usize>,
+        max_param_bytes: Option<usize>,
+        max_ast_depth: Option<usize>,
+        max_literal_items: Option<usize>,
+        include_plan: bool,
+        profile: bool,
+        compact_rows: bool,
+        include_vectors: bool,
+    ) -> PyResult<PyObject> {
+        let options = parse_py_gql_options(
+            allow_full_scan,
+            max_rows,
+            cursor,
+            max_cursor_bytes,
+            max_intermediate_bindings,
+            max_skip,
+            max_query_bytes,
+            max_param_bytes,
+            max_ast_depth,
+            max_literal_items,
+            include_plan,
+            profile,
+            compact_rows,
+            include_vectors,
+        );
+        let referenced_params = gql_referenced_param_names(&query, &options).map_err(to_py_err)?;
+        let params = parse_py_gql_params(py, params, &referenced_params, &options)?;
+        let explain = with_engine_ref(self, py, move |eng| {
+            eng.explain_gql(&query, &params, &options)
+        })?;
+        gql_explain_to_py(py, explain)
+    }
+
+    #[pyo3(signature = (label, prop_key, kind))]
     fn ensure_node_property_index(
         &self,
         py: Python<'_>,
         label: String,
         prop_key: String,
         kind: &str,
-        domain: Option<&str>,
     ) -> PyResult<NodePropertyIndexInfo> {
-        let kind = parse_secondary_index_kind(kind, domain)?;
+        let kind = parse_secondary_index_kind(kind)?;
         with_engine(self, py, move |eng| {
             Ok(NodePropertyIndexInfo::from(
                 eng.ensure_node_property_index(&label, &prop_key, kind.clone())?,
@@ -485,16 +599,15 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (label, prop_key, kind, *, domain=None))]
+    #[pyo3(signature = (label, prop_key, kind))]
     fn drop_node_property_index(
         &self,
         py: Python<'_>,
         label: String,
         prop_key: String,
         kind: &str,
-        domain: Option<&str>,
     ) -> PyResult<bool> {
-        let kind = parse_secondary_index_kind(kind, domain)?;
+        let kind = parse_secondary_index_kind(kind)?;
         with_engine(self, py, move |eng| {
             eng.drop_node_property_index(&label, &prop_key, kind.clone())
         })
@@ -510,16 +623,15 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (label, prop_key, kind, *, domain=None))]
+    #[pyo3(signature = (label, prop_key, kind))]
     fn ensure_edge_property_index(
         &self,
         py: Python<'_>,
         label: String,
         prop_key: String,
         kind: &str,
-        domain: Option<&str>,
     ) -> PyResult<EdgePropertyIndexInfo> {
-        let kind = parse_secondary_index_kind(kind, domain)?;
+        let kind = parse_secondary_index_kind(kind)?;
         with_engine(self, py, move |eng| {
             Ok(EdgePropertyIndexInfo::from(
                 eng.ensure_edge_property_index(&label, &prop_key, kind.clone())?,
@@ -527,16 +639,15 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (label, prop_key, kind, *, domain=None))]
+    #[pyo3(signature = (label, prop_key, kind))]
     fn drop_edge_property_index(
         &self,
         py: Python<'_>,
         label: String,
         prop_key: String,
         kind: &str,
-        domain: Option<&str>,
     ) -> PyResult<bool> {
-        let kind = parse_secondary_index_kind(kind, domain)?;
+        let kind = parse_secondary_index_kind(kind)?;
         with_engine(self, py, move |eng| {
             eng.drop_edge_property_index(&label, &prop_key, kind.clone())
         })
@@ -2165,8 +2276,6 @@ pub struct NodePropertyIndexInfo {
     #[pyo3(get)]
     pub kind: String,
     #[pyo3(get)]
-    pub domain: Option<String>,
-    #[pyo3(get)]
     pub state: String,
     #[pyo3(get)]
     pub last_error: Option<String>,
@@ -2174,13 +2283,12 @@ pub struct NodePropertyIndexInfo {
 
 impl From<CoreNodePropertyIndexInfo> for NodePropertyIndexInfo {
     fn from(info: CoreNodePropertyIndexInfo) -> Self {
-        let (kind, domain) = secondary_index_kind_to_py(&info.kind);
+        let kind = secondary_index_kind_to_py(&info.kind);
         NodePropertyIndexInfo {
             index_id: info.index_id,
             label: info.label,
             prop_key: info.prop_key,
             kind: kind.to_string(),
-            domain: domain.map(str::to_string),
             state: secondary_index_state_to_py(info.state).to_string(),
             last_error: info.last_error,
         }
@@ -2191,8 +2299,8 @@ impl From<CoreNodePropertyIndexInfo> for NodePropertyIndexInfo {
 impl NodePropertyIndexInfo {
     fn __repr__(&self) -> String {
         format!(
-            "NodePropertyIndexInfo(index_id={}, label='{}', prop_key='{}', kind='{}', domain={:?}, state='{}')",
-            self.index_id, self.label, self.prop_key, self.kind, self.domain, self.state
+            "NodePropertyIndexInfo(index_id={}, label='{}', prop_key='{}', kind='{}', state='{}')",
+            self.index_id, self.label, self.prop_key, self.kind, self.state
         )
     }
 }
@@ -2265,8 +2373,6 @@ pub struct EdgePropertyIndexInfo {
     #[pyo3(get)]
     pub kind: String,
     #[pyo3(get)]
-    pub domain: Option<String>,
-    #[pyo3(get)]
     pub state: String,
     #[pyo3(get)]
     pub last_error: Option<String>,
@@ -2274,13 +2380,12 @@ pub struct EdgePropertyIndexInfo {
 
 impl From<CoreEdgePropertyIndexInfo> for EdgePropertyIndexInfo {
     fn from(info: CoreEdgePropertyIndexInfo) -> Self {
-        let (kind, domain) = secondary_index_kind_to_py(&info.kind);
+        let kind = secondary_index_kind_to_py(&info.kind);
         EdgePropertyIndexInfo {
             index_id: info.index_id,
             label: info.label,
             prop_key: info.prop_key,
             kind: kind.to_string(),
-            domain: domain.map(str::to_string),
             state: secondary_index_state_to_py(info.state).to_string(),
             last_error: info.last_error,
         }
@@ -2291,8 +2396,8 @@ impl From<CoreEdgePropertyIndexInfo> for EdgePropertyIndexInfo {
 impl EdgePropertyIndexInfo {
     fn __repr__(&self) -> String {
         format!(
-            "EdgePropertyIndexInfo(index_id={}, label='{}', prop_key='{}', kind='{}', domain={:?}, state='{}')",
-            self.index_id, self.label, self.prop_key, self.kind, self.domain, self.state
+            "EdgePropertyIndexInfo(index_id={}, label='{}', prop_key='{}', kind='{}', state='{}')",
+            self.index_id, self.label, self.prop_key, self.kind, self.state
         )
     }
 }
@@ -2335,7 +2440,7 @@ impl PropertyRangeBound {
     #[new]
     #[pyo3(signature = (value, *, inclusive=true, domain))]
     fn new(value: &Bound<'_, pyo3::PyAny>, inclusive: bool, domain: &str) -> PyResult<Self> {
-        let domain = parse_secondary_index_range_domain(domain)?;
+        let domain = parse_range_value_domain(domain)?;
         Ok(PropertyRangeBound {
             value_internal: py_numeric_to_prop_value(value.py(), value, domain)?,
             inclusive,
@@ -2349,7 +2454,7 @@ impl PropertyRangeBound {
 
     #[getter]
     fn domain(&self) -> PyResult<String> {
-        Ok(range_domain_to_py(range_domain_from_prop_value(
+        Ok(range_value_domain_to_py(range_value_domain_from_prop_value(
             &self.value_internal,
             "property range bound",
         )?)
@@ -2398,7 +2503,7 @@ impl PropertyRangeCursor {
     #[new]
     #[pyo3(signature = (value, node_id, *, domain))]
     fn new(value: &Bound<'_, pyo3::PyAny>, node_id: u64, domain: &str) -> PyResult<Self> {
-        let domain = parse_secondary_index_range_domain(domain)?;
+        let domain = parse_range_value_domain(domain)?;
         Ok(PropertyRangeCursor {
             value_internal: py_numeric_to_prop_value(value.py(), value, domain)?,
             node_id,
@@ -2412,7 +2517,7 @@ impl PropertyRangeCursor {
 
     #[getter]
     fn domain(&self) -> PyResult<String> {
-        Ok(range_domain_to_py(range_domain_from_prop_value(
+        Ok(range_value_domain_to_py(range_value_domain_from_prop_value(
             &self.value_internal,
             "property range cursor",
         )?)
@@ -3185,6 +3290,228 @@ impl AdjacencyExport {
 // Property conversion: Python <-> Rust PropValue
 // ============================================================
 
+fn parse_py_gql_options(
+    allow_full_scan: bool,
+    max_rows: Option<usize>,
+    cursor: Option<String>,
+    max_cursor_bytes: Option<usize>,
+    max_intermediate_bindings: Option<usize>,
+    max_skip: Option<usize>,
+    max_query_bytes: Option<usize>,
+    max_param_bytes: Option<usize>,
+    max_ast_depth: Option<usize>,
+    max_literal_items: Option<usize>,
+    include_plan: bool,
+    profile: bool,
+    compact_rows: bool,
+    include_vectors: bool,
+) -> GqlQueryOptions {
+    let mut options = GqlQueryOptions {
+        allow_full_scan,
+        cursor,
+        include_plan,
+        profile,
+        compact_rows,
+        include_vectors,
+        ..GqlQueryOptions::default()
+    };
+    if let Some(max_rows) = max_rows {
+        options.max_rows = max_rows;
+    }
+    if let Some(max_cursor_bytes) = max_cursor_bytes {
+        options.max_cursor_bytes = max_cursor_bytes;
+    }
+    if let Some(max_intermediate_bindings) = max_intermediate_bindings {
+        options.max_intermediate_bindings = max_intermediate_bindings;
+    }
+    if let Some(max_skip) = max_skip {
+        options.max_skip = max_skip;
+    }
+    if let Some(max_query_bytes) = max_query_bytes {
+        options.max_query_bytes = max_query_bytes;
+    }
+    if let Some(max_param_bytes) = max_param_bytes {
+        options.max_param_bytes = max_param_bytes;
+    }
+    if let Some(max_ast_depth) = max_ast_depth {
+        options.max_ast_depth = max_ast_depth;
+    }
+    if let Some(max_literal_items) = max_literal_items {
+        options.max_literal_items = max_literal_items;
+    }
+    options
+}
+
+struct GqlParamConversionBudget {
+    total_items: usize,
+    total_bytes: usize,
+}
+
+fn parse_py_gql_params(
+    py: Python<'_>,
+    params: Option<&Bound<'_, PyDict>>,
+    referenced_params: &[String],
+    options: &GqlQueryOptions,
+) -> PyResult<GqlParams> {
+    let mut parsed = GqlParams::new();
+    if referenced_params.is_empty() {
+        return Ok(parsed);
+    }
+    let mut budget = GqlParamConversionBudget {
+        total_items: 0,
+        total_bytes: 0,
+    };
+    if let Some(params) = params {
+        for key in referenced_params {
+            if let Some(value) = params.get_item(key)? {
+                parsed.insert(
+                    key.clone(),
+                    py_to_gql_param_value(py, key, &value, 0, options, &mut budget)?,
+                );
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn py_to_gql_param_value(
+    py: Python<'_>,
+    name: &str,
+    obj: &Bound<'_, PyAny>,
+    container_depth: usize,
+    options: &GqlQueryOptions,
+    budget: &mut GqlParamConversionBudget,
+) -> PyResult<GqlParamValue> {
+    if obj.is_none() {
+        Ok(GqlParamValue::Null)
+    } else if obj.is_instance_of::<PyBool>() {
+        Ok(GqlParamValue::Bool(obj.extract::<bool>()?))
+    } else if let Ok(i) = obj.extract::<i64>() {
+        if i < 0 {
+            Ok(GqlParamValue::Int(i))
+        } else {
+            Ok(GqlParamValue::UInt(i as u64))
+        }
+    } else if let Ok(u) = obj.extract::<u64>() {
+        Ok(GqlParamValue::UInt(u))
+    } else if let Ok(f) = obj.extract::<f64>() {
+        if !f.is_finite() {
+            return Err(PyValueError::new_err("GQL numeric params must be finite"));
+        }
+        Ok(GqlParamValue::Float(f))
+    } else if let Ok(b) = obj.downcast::<PyBytes>() {
+        add_py_param_bytes(name, b.as_bytes().len(), "bytes", budget, options)?;
+        Ok(GqlParamValue::Bytes(b.as_bytes().to_vec()))
+    } else if let Ok(s) = obj.downcast::<PyString>() {
+        let value = s.to_str()?;
+        add_py_param_bytes(name, value.len(), "string", budget, options)?;
+        Ok(GqlParamValue::String(value.to_string()))
+    } else if let Ok(list) = obj.downcast::<PyList>() {
+        let depth = container_depth.saturating_add(1);
+        check_py_param_depth(name, depth, options)?;
+        add_py_param_items(name, list.len(), "list", budget, options)?;
+        let items: PyResult<Vec<GqlParamValue>> = list
+            .iter()
+            .map(|item| py_to_gql_param_value(py, name, &item, depth, options, budget))
+            .collect();
+        Ok(GqlParamValue::List(items?))
+    } else if let Ok(tuple) = obj.downcast::<PyTuple>() {
+        let depth = container_depth.saturating_add(1);
+        check_py_param_depth(name, depth, options)?;
+        add_py_param_items(name, tuple.len(), "list", budget, options)?;
+        let items: PyResult<Vec<GqlParamValue>> = tuple
+            .iter()
+            .map(|item| py_to_gql_param_value(py, name, &item, depth, options, budget))
+            .collect();
+        Ok(GqlParamValue::List(items?))
+    } else if let Ok(dict) = obj.downcast::<PyDict>() {
+        let depth = container_depth.saturating_add(1);
+        check_py_param_depth(name, depth, options)?;
+        add_py_param_items(name, dict.len(), "map", budget, options)?;
+        let mut map = BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let key = k.downcast::<PyString>().map_err(|_| {
+                PyTypeError::new_err(format!("GQL parameter '${name}' map keys must be strings"))
+            })?;
+            let key = key.to_str()?;
+            add_py_param_bytes(name, key.len(), "map key", budget, options)?;
+            map.insert(
+                key.to_string(),
+                py_to_gql_param_value(py, name, &v, depth, options, budget)?,
+            );
+        }
+        Ok(GqlParamValue::Map(map))
+    } else {
+        Err(PyTypeError::new_err(format!(
+            "Unsupported GQL param value type: {}",
+            obj.get_type().name()?
+        )))
+    }
+}
+
+fn check_py_param_depth(name: &str, depth: usize, options: &GqlQueryOptions) -> PyResult<()> {
+    if depth > options.max_ast_depth {
+        return Err(PyValueError::new_err(format!(
+            "GQL parameter '${name}' nested list/map depth exceeds max_ast_depth of {}",
+            options.max_ast_depth
+        )));
+    }
+    Ok(())
+}
+
+fn add_py_param_items(
+    name: &str,
+    count: usize,
+    container_kind: &str,
+    budget: &mut GqlParamConversionBudget,
+    options: &GqlQueryOptions,
+) -> PyResult<()> {
+    if count > options.max_literal_items {
+        return Err(PyValueError::new_err(format!(
+            "GQL parameter '${name}' {container_kind} contains {count} items, exceeding max_literal_items of {}",
+            options.max_literal_items
+        )));
+    }
+    budget.total_items = budget
+        .total_items
+        .checked_add(count)
+        .filter(|total| *total <= options.max_literal_items)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "Referenced GQL parameters contain more than max_literal_items={} total list/map items",
+                options.max_literal_items
+            ))
+        })?;
+    Ok(())
+}
+
+fn add_py_param_bytes(
+    name: &str,
+    bytes: usize,
+    value_kind: &str,
+    budget: &mut GqlParamConversionBudget,
+    options: &GqlQueryOptions,
+) -> PyResult<()> {
+    if bytes > options.max_param_bytes {
+        return Err(PyValueError::new_err(format!(
+            "GQL parameter '${name}' {value_kind} is {bytes} bytes, exceeding max_param_bytes of {}",
+            options.max_param_bytes
+        )));
+    }
+    budget.total_bytes = budget
+        .total_bytes
+        .checked_add(bytes)
+        .filter(|total| *total <= options.max_param_bytes)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "Referenced GQL parameters contain more than max_param_bytes={} total string/bytes/map-key bytes",
+                options.max_param_bytes
+            ))
+        })?;
+    Ok(())
+}
+
 #[allow(clippy::only_used_in_recursion)]
 fn py_to_prop_value(py: Python<'_>, obj: &Bound<'_, pyo3::PyAny>) -> PyResult<PropValue> {
     if obj.is_none() {
@@ -3254,31 +3581,545 @@ fn props_to_py(py: Python<'_>, props: &BTreeMap<String, PropValue>) -> PyResult<
     Ok(dict.into_any().unbind())
 }
 
-fn query_pattern_result_to_py(py: Python<'_>, result: QueryPatternResult) -> PyResult<PyObject> {
+fn gql_result_to_py(py: Python<'_>, result: GqlResult, compact_rows: bool) -> PyResult<PyObject> {
     let dict = PyDict::new(py);
-    let matches: PyResult<Vec<PyObject>> = result
-        .matches
+    dict.set_item("columns", result.columns.clone())?;
+    let rows: PyResult<Vec<PyObject>> = result
+        .rows
         .into_iter()
-        .map(|match_| query_match_to_py(py, match_))
+        .map(|row| {
+            if compact_rows {
+                let values: PyResult<Vec<PyObject>> = row
+                    .values
+                    .into_iter()
+                    .map(|value| gql_value_to_py(py, value))
+                    .collect();
+                Ok(PyList::new(py, values?)?.into_any().unbind())
+            } else {
+                let row_dict = PyDict::new(py);
+                for (column, value) in result.columns.iter().zip(row.values) {
+                    row_dict.set_item(column, gql_value_to_py(py, value)?)?;
+                }
+                Ok(row_dict.into_any().unbind())
+            }
+        })
         .collect();
-    dict.set_item("matches", matches?)?;
-    dict.set_item("truncated", result.truncated)?;
+    dict.set_item("rows", rows?)?;
+    dict.set_item("next_cursor", result.next_cursor)?;
+    dict.set_item("stats", gql_stats_to_py(py, result.stats)?)?;
+    match result.plan {
+        Some(plan) => dict.set_item("plan", gql_explain_to_py(py, plan)?)?,
+        None => dict.set_item("plan", py.None())?,
+    }
     Ok(dict.into_any().unbind())
 }
 
-fn query_match_to_py(py: Python<'_>, match_: QueryMatch) -> PyResult<PyObject> {
+fn gql_value_to_py(py: Python<'_>, value: GqlValue) -> PyResult<PyObject> {
+    match value {
+        GqlValue::Null => Ok(py.None()),
+        GqlValue::Bool(value) => Ok(value.into_pyobject(py)?.to_owned().into_any().unbind()),
+        GqlValue::Int(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        GqlValue::UInt(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        GqlValue::Float(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        GqlValue::String(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        GqlValue::Bytes(value) => Ok(PyBytes::new(py, &value).into_any().unbind()),
+        GqlValue::List(values) => {
+            let items: PyResult<Vec<PyObject>> = values
+                .into_iter()
+                .map(|value| gql_value_to_py(py, value))
+                .collect();
+            Ok(PyList::new(py, items?)?.into_any().unbind())
+        }
+        GqlValue::Map(values) => {
+            let dict = PyDict::new(py);
+            for (key, value) in values {
+                dict.set_item(key, gql_value_to_py(py, value)?)?;
+            }
+            Ok(dict.into_any().unbind())
+        }
+        GqlValue::Node(node) => gql_node_to_py(py, node),
+        GqlValue::Edge(edge) => gql_edge_to_py(py, edge),
+        GqlValue::Path(path) => gql_path_to_py(py, path),
+    }
+}
+
+fn gql_node_to_py(py: Python<'_>, node: GqlNode) -> PyResult<PyObject> {
     let dict = PyDict::new(py);
-    let nodes = PyDict::new(py);
-    for (alias, id) in match_.nodes {
-        nodes.set_item(alias, id)?;
+    if let Some(id) = node.id {
+        dict.set_item("id", id)?;
     }
-    let edges = PyDict::new(py);
-    for (alias, id) in match_.edges {
-        edges.set_item(alias, id)?;
+    if let Some(labels) = node.labels {
+        dict.set_item("labels", labels)?;
     }
-    dict.set_item("nodes", nodes)?;
-    dict.set_item("edges", edges)?;
+    if let Some(key) = node.key {
+        dict.set_item("key", key)?;
+    }
+    if let Some(props) = node.props {
+        dict.set_item("props", gql_value_to_py(py, GqlValue::Map(props))?)?;
+    }
+    if let Some(weight) = node.weight {
+        dict.set_item("weight", weight as f64)?;
+    }
+    if let Some(created_at) = node.created_at {
+        dict.set_item("created_at", created_at)?;
+    }
+    if let Some(updated_at) = node.updated_at {
+        dict.set_item("updated_at", updated_at)?;
+    }
+    if let Some(dense_vector) = node.dense_vector {
+        dict.set_item(
+            "dense_vector",
+            dense_vector
+                .into_iter()
+                .map(|value| value as f64)
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    if let Some(sparse_vector) = node.sparse_vector {
+        dict.set_item(
+            "sparse_vector",
+            sparse_vector
+                .into_iter()
+                .map(|(dimension, value)| (dimension, value as f64))
+                .collect::<Vec<_>>(),
+        )?;
+    }
     Ok(dict.into_any().unbind())
+}
+
+fn gql_path_to_py(py: Python<'_>, path: GqlPath) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("node_ids", path.node_ids)?;
+    dict.set_item("edge_ids", path.edge_ids)?;
+    if let Some(nodes) = path.nodes {
+        let values: PyResult<Vec<PyObject>> = nodes
+            .into_iter()
+            .map(|node| gql_node_to_py(py, node))
+            .collect();
+        dict.set_item("nodes", values?)?;
+    }
+    if let Some(edges) = path.edges {
+        let values: PyResult<Vec<PyObject>> = edges
+            .into_iter()
+            .map(|edge| gql_edge_to_py(py, edge))
+            .collect();
+        dict.set_item("edges", values?)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_row_result_to_py(
+    py: Python<'_>,
+    result: GraphRowResult,
+    compact_rows: bool,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("columns", result.columns.clone())?;
+    let rows: PyResult<Vec<PyObject>> = result
+        .rows
+        .into_iter()
+        .map(|row| {
+            if compact_rows {
+                let values: PyResult<Vec<PyObject>> = row
+                    .values
+                    .into_iter()
+                    .map(|value| graph_value_to_py(py, value))
+                    .collect();
+                Ok(PyList::new(py, values?)?.into_any().unbind())
+            } else {
+                let row_dict = PyDict::new(py);
+                for (column, value) in result.columns.iter().zip(row.values) {
+                    row_dict.set_item(column, graph_value_to_py(py, value)?)?;
+                }
+                Ok(row_dict.into_any().unbind())
+            }
+        })
+        .collect();
+    dict.set_item("rows", rows?)?;
+    dict.set_item("next_cursor", result.next_cursor)?;
+    dict.set_item("stats", graph_row_stats_to_py(py, result.stats)?)?;
+    match result.plan {
+        Some(plan) => dict.set_item("plan", graph_row_explain_to_py(py, plan)?)?,
+        None => dict.set_item("plan", py.None())?,
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_value_to_py(py: Python<'_>, value: GraphValue) -> PyResult<PyObject> {
+    match value {
+        GraphValue::Null => Ok(py.None()),
+        GraphValue::Bool(value) => Ok(value.into_pyobject(py)?.to_owned().into_any().unbind()),
+        GraphValue::Int(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        GraphValue::UInt(value) | GraphValue::NodeId(value) | GraphValue::EdgeId(value) => {
+            Ok(value.into_pyobject(py)?.into_any().unbind())
+        }
+        GraphValue::Float(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        GraphValue::String(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        GraphValue::Bytes(value) => Ok(PyBytes::new(py, &value).into_any().unbind()),
+        GraphValue::List(values) => {
+            let items: PyResult<Vec<PyObject>> = values
+                .into_iter()
+                .map(|value| graph_value_to_py(py, value))
+                .collect();
+            Ok(PyList::new(py, items?)?.into_any().unbind())
+        }
+        GraphValue::Map(values) => {
+            let dict = PyDict::new(py);
+            for (key, value) in values {
+                dict.set_item(key, graph_value_to_py(py, value)?)?;
+            }
+            Ok(dict.into_any().unbind())
+        }
+        GraphValue::Node(node) => graph_node_value_to_py(py, node),
+        GraphValue::Edge(edge) => graph_edge_value_to_py(py, edge),
+        GraphValue::Path(path) => graph_path_value_to_py(py, path),
+    }
+}
+
+fn graph_node_value_to_py(py: Python<'_>, node: GraphNodeValue) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    if let Some(id) = node.id {
+        dict.set_item("id", id)?;
+    }
+    if let Some(labels) = node.labels {
+        dict.set_item("labels", labels)?;
+    }
+    if let Some(key) = node.key {
+        dict.set_item("key", key)?;
+    }
+    if let Some(props) = node.props {
+        let props_dict = PyDict::new(py);
+        for (key, value) in props {
+            props_dict.set_item(key, graph_value_to_py(py, value)?)?;
+        }
+        dict.set_item("props", props_dict)?;
+    }
+    if let Some(weight) = node.weight {
+        dict.set_item("weight", weight as f64)?;
+    }
+    if let Some(created_at) = node.created_at {
+        dict.set_item("created_at", created_at)?;
+    }
+    if let Some(updated_at) = node.updated_at {
+        dict.set_item("updated_at", updated_at)?;
+    }
+    if let Some(dense_vector) = node.dense_vector {
+        dict.set_item(
+            "dense_vector",
+            dense_vector
+                .into_iter()
+                .map(|value| value as f64)
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    if let Some(sparse_vector) = node.sparse_vector {
+        dict.set_item(
+            "sparse_vector",
+            sparse_vector
+                .into_iter()
+                .map(|(dimension, value)| (dimension, value as f64))
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_edge_value_to_py(py: Python<'_>, edge: GraphEdgeValue) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    if let Some(id) = edge.id {
+        dict.set_item("id", id)?;
+    }
+    if let Some(from) = edge.from {
+        dict.set_item("from_id", from)?;
+    }
+    if let Some(to) = edge.to {
+        dict.set_item("to_id", to)?;
+    }
+    if let Some(label) = edge.label {
+        dict.set_item("label", label)?;
+    }
+    if let Some(props) = edge.props {
+        let props_dict = PyDict::new(py);
+        for (key, value) in props {
+            props_dict.set_item(key, graph_value_to_py(py, value)?)?;
+        }
+        dict.set_item("props", props_dict)?;
+    }
+    if let Some(weight) = edge.weight {
+        dict.set_item("weight", weight as f64)?;
+    }
+    if let Some(created_at) = edge.created_at {
+        dict.set_item("created_at", created_at)?;
+    }
+    if let Some(updated_at) = edge.updated_at {
+        dict.set_item("updated_at", updated_at)?;
+    }
+    if let Some(valid_from) = edge.valid_from {
+        dict.set_item("valid_from", valid_from)?;
+    }
+    if let Some(valid_to) = edge.valid_to {
+        dict.set_item("valid_to", valid_to)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_path_value_to_py(py: Python<'_>, path: GraphPathValue) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("node_ids", path.node_ids)?;
+    dict.set_item("edge_ids", path.edge_ids)?;
+    if let Some(nodes) = path.nodes {
+        let values: PyResult<Vec<PyObject>> = nodes
+            .into_iter()
+            .map(|node| graph_node_value_to_py(py, node))
+            .collect();
+        dict.set_item("nodes", values?)?;
+    }
+    if let Some(edges) = path.edges {
+        let values: PyResult<Vec<PyObject>> = edges
+            .into_iter()
+            .map(|edge| graph_edge_value_to_py(py, edge))
+            .collect();
+        dict.set_item("edges", values?)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_row_stats_to_py(py: Python<'_>, stats: GraphRowStats) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("rows_returned", stats.rows_returned)?;
+    dict.set_item("rows_after_filter", stats.rows_after_filter)?;
+    dict.set_item("rows_seen_for_page", stats.rows_seen_for_page)?;
+    dict.set_item(
+        "intermediate_bindings_peak",
+        stats.intermediate_bindings_peak,
+    )?;
+    dict.set_item("frontier_peak", stats.frontier_peak)?;
+    dict.set_item("paths_enumerated", stats.paths_enumerated)?;
+    dict.set_item("db_hits", stats.db_hits)?;
+    dict.set_item("elapsed_us", stats.elapsed_us)?;
+    dict.set_item("effective_at_epoch", stats.effective_at_epoch)?;
+    dict.set_item("warnings", stats.warnings)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_edge_to_py(py: Python<'_>, edge: GqlEdge) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    if let Some(id) = edge.id {
+        dict.set_item("id", id)?;
+    }
+    if let Some(from) = edge.from {
+        dict.set_item("from_id", from)?;
+    }
+    if let Some(to) = edge.to {
+        dict.set_item("to_id", to)?;
+    }
+    if let Some(label) = edge.label {
+        dict.set_item("label", label)?;
+    }
+    if let Some(props) = edge.props {
+        dict.set_item("props", gql_value_to_py(py, GqlValue::Map(props))?)?;
+    }
+    if let Some(weight) = edge.weight {
+        dict.set_item("weight", weight as f64)?;
+    }
+    if let Some(created_at) = edge.created_at {
+        dict.set_item("created_at", created_at)?;
+    }
+    if let Some(updated_at) = edge.updated_at {
+        dict.set_item("updated_at", updated_at)?;
+    }
+    if let Some(valid_from) = edge.valid_from {
+        dict.set_item("valid_from", valid_from)?;
+    }
+    if let Some(valid_to) = edge.valid_to {
+        dict.set_item("valid_to", valid_to)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_stats_to_py(py: Python<'_>, stats: GqlExecutionStats) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("rows_returned", stats.rows_returned)?;
+    dict.set_item("rows_matched", stats.rows_matched)?;
+    dict.set_item("rows_after_filter", stats.rows_after_filter)?;
+    dict.set_item("intermediate_bindings", stats.intermediate_bindings)?;
+    dict.set_item("db_hits", stats.db_hits)?;
+    dict.set_item("elapsed_us", stats.elapsed_us)?;
+    dict.set_item("truncated", stats.truncated)?;
+    dict.set_item("warnings", stats.warnings)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_explain_to_py(py: Python<'_>, explain: GqlExplain) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("columns", explain.columns)?;
+    dict.set_item("target", gql_lowering_target_to_py(explain.target))?;
+    match explain.native_plan {
+        Some(plan) => dict.set_item("native_plan", query_plan_to_py(py, plan)?)?,
+        None => dict.set_item("native_plan", py.None())?,
+    }
+    dict.set_item("pushed_down", explain.pushed_down)?;
+    dict.set_item("residual", explain.residual)?;
+    dict.set_item("projection", explain.projection)?;
+    dict.set_item(
+        "row_ops",
+        explain
+            .row_ops
+            .into_iter()
+            .map(gql_row_operation_to_py)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item("caps", gql_caps_to_py(py, explain.caps)?)?;
+    dict.set_item("warnings", explain.warnings)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_caps_to_py(py: Python<'_>, caps: GqlCapSummary) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("allow_full_scan", caps.allow_full_scan)?;
+    dict.set_item("max_rows", caps.max_rows)?;
+    dict.set_item("max_intermediate_bindings", caps.max_intermediate_bindings)?;
+    dict.set_item("max_skip", caps.max_skip)?;
+    dict.set_item("max_query_bytes", caps.max_query_bytes)?;
+    dict.set_item("max_param_bytes", caps.max_param_bytes)?;
+    dict.set_item("max_ast_depth", caps.max_ast_depth)?;
+    dict.set_item("max_literal_items", caps.max_literal_items)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_lowering_target_to_py(target: GqlLoweringTarget) -> &'static str {
+    match target {
+        GqlLoweringTarget::NodeQuery => "node_query",
+        GqlLoweringTarget::EdgeQuery => "edge_query",
+        GqlLoweringTarget::GraphRowQuery => "graph_row_query",
+    }
+}
+
+fn graph_row_explain_to_py(py: Python<'_>, explain: GraphRowExplain) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("columns", explain.columns)?;
+    dict.set_item("effective_at_epoch", explain.effective_at_epoch)?;
+    dict.set_item("fingerprint", explain.fingerprint)?;
+    let plan: PyResult<Vec<PyObject>> = explain
+        .plan
+        .into_iter()
+        .map(|node| graph_explain_node_to_py(py, node))
+        .collect();
+    dict.set_item("plan", plan?)?;
+    let row_ops = explain
+        .row_ops
+        .into_iter()
+        .map(|op| graph_row_operation_to_py(py, op))
+        .collect::<PyResult<Vec<_>>>()?;
+    dict.set_item("row_ops", row_ops)?;
+    dict.set_item("order", graph_order_explain_to_py(py, explain.order)?)?;
+    dict.set_item("cursor", graph_cursor_explain_to_py(py, explain.cursor)?)?;
+    dict.set_item(
+        "projection",
+        graph_projection_explain_to_py(py, explain.projection)?,
+    )?;
+    dict.set_item("caps", graph_cap_explain_to_py(py, explain.caps)?)?;
+    dict.set_item(
+        "summaries",
+        graph_execution_summaries_to_py(py, explain.summaries)?,
+    )?;
+    dict.set_item("warnings", explain.warnings)?;
+    dict.set_item("notes", explain.notes)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_explain_node_to_py(py: Python<'_>, node: GraphExplainNode) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("kind", node.kind)?;
+    dict.set_item("detail", node.detail)?;
+    let children: PyResult<Vec<PyObject>> = node
+        .children
+        .into_iter()
+        .map(|child| graph_explain_node_to_py(py, child))
+        .collect();
+    dict.set_item("children", children?)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_row_operation_to_py(py: Python<'_>, op: GraphRowOperationExplain) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("kind", op.kind)?;
+    dict.set_item("detail", op.detail)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_order_explain_to_py(py: Python<'_>, order: GraphOrderExplain) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("explicit", order.explicit)?;
+    dict.set_item("items", order.items)?;
+    dict.set_item("stable_logical_row_key", order.stable_logical_row_key)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_cursor_explain_to_py(py: Python<'_>, cursor: GraphCursorExplain) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("supplied", cursor.supplied)?;
+    dict.set_item("codec_implemented", cursor.codec_implemented)?;
+    dict.set_item("message", cursor.message)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_projection_explain_to_py(
+    py: Python<'_>,
+    projection: GraphProjectionExplain,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("columns", projection.columns)?;
+    dict.set_item(
+        "output_mode",
+        graph_output_mode_to_py(&projection.output_mode),
+    )?;
+    dict.set_item("include_vectors", projection.include_vectors)?;
+    dict.set_item("compact_rows", projection.compact_rows)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_cap_explain_to_py(py: Python<'_>, caps: GraphCapExplain) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("allow_full_scan", caps.allow_full_scan)?;
+    dict.set_item("max_intermediate_bindings", caps.max_intermediate_bindings)?;
+    dict.set_item("max_frontier", caps.max_frontier)?;
+    dict.set_item("max_path_hops", caps.max_path_hops)?;
+    dict.set_item("max_paths_per_start", caps.max_paths_per_start)?;
+    dict.set_item("max_page_limit", caps.max_page_limit)?;
+    dict.set_item("max_order_materialization", caps.max_order_materialization)?;
+    dict.set_item("max_cursor_bytes", caps.max_cursor_bytes)?;
+    dict.set_item("max_query_bytes", caps.max_query_bytes)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_execution_summaries_to_py(
+    py: Python<'_>,
+    summaries: GraphExecutionSummaries,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("validation_only", summaries.validation_only)?;
+    dict.set_item("rows_planned", summaries.rows_planned)?;
+    dict.set_item("warnings", summaries.warnings)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn graph_output_mode_to_py(mode: &GraphOutputMode) -> &'static str {
+    match mode {
+        GraphOutputMode::Ids => "ids",
+        GraphOutputMode::Elements => "elements",
+        GraphOutputMode::Projected => "projected",
+    }
+}
+
+fn gql_row_operation_to_py(op: GqlRowOperation) -> &'static str {
+    match op {
+        GqlRowOperation::ResidualFilter => "residual_filter",
+        GqlRowOperation::Projection => "projection",
+        GqlRowOperation::Sort => "sort",
+        GqlRowOperation::Skip => "skip",
+        GqlRowOperation::Limit => "limit",
+    }
 }
 
 fn query_plan_to_py(py: Python<'_>, plan: QueryPlan) -> PyResult<PyObject> {
@@ -3311,7 +4152,6 @@ fn query_plan_kind_to_py(kind: &QueryPlanKind) -> &'static str {
     match kind {
         QueryPlanKind::NodeQuery => "node_query",
         QueryPlanKind::EdgeQuery => "edge_query",
-        QueryPlanKind::PatternQuery => "pattern_query",
     }
 }
 
@@ -3366,19 +4206,6 @@ fn query_plan_node_to_py(py: Python<'_>, node: QueryPlanNode) -> PyResult<PyObje
         }
         QueryPlanNode::VerifyEdgePredicates { input } => {
             dict.set_item("kind", "verify_edge_predicates")?;
-            dict.set_item("input", query_plan_node_to_py(py, *input)?)?;
-        }
-        QueryPlanNode::PatternExpand {
-            anchor_alias,
-            input,
-        } => {
-            dict.set_item("kind", "pattern_expand")?;
-            dict.set_item("anchor_alias", anchor_alias)?;
-            dict.set_item("input", query_plan_node_to_py(py, *input)?)?;
-        }
-        QueryPlanNode::PatternEdgeAnchor { edge_alias, input } => {
-            dict.set_item("kind", "pattern_edge_anchor")?;
-            dict.set_item("edge_alias", edge_alias)?;
             dict.set_item("input", query_plan_node_to_py(py, *input)?)?;
         }
         QueryPlanNode::FallbackNodeLabelScan => {
@@ -3448,7 +4275,6 @@ fn query_plan_warning_to_py(warning: &QueryPlanWarning) -> &'static str {
         QueryPlanWarning::UsingFallbackScan => "using_fallback_scan",
         QueryPlanWarning::FullScanRequiresOptIn => "full_scan_requires_opt_in",
         QueryPlanWarning::FullScanExplicitlyAllowed => "full_scan_explicitly_allowed",
-        QueryPlanWarning::UnboundedPatternRejected => "unbounded_pattern_rejected",
         QueryPlanWarning::EdgePropertyPostFilter => "edge_property_post_filter",
         QueryPlanWarning::IndexSkippedAsBroad => "index_skipped_as_broad",
         QueryPlanWarning::CandidateCapExceeded => "candidate_cap_exceeded",
@@ -3553,84 +4379,135 @@ fn parse_py_edge_query_dict(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResul
     })
 }
 
-fn parse_py_graph_pattern_query(
-    py: Python<'_>,
-    value: &Bound<'_, PyAny>,
-) -> PyResult<GraphPatternQuery> {
+fn parse_py_graph_row_query(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<GraphRowQuery> {
     if let Ok(dict) = value.downcast::<PyDict>() {
-        return parse_py_graph_pattern_query_dict(py, dict);
+        return parse_py_graph_row_query_dict(py, dict);
     }
     if value.hasattr("to_dict")? {
         let dict_value = value.call_method0("to_dict")?;
         let dict = dict_value.downcast::<PyDict>()?;
-        return parse_py_graph_pattern_query_dict(py, dict);
+        return parse_py_graph_row_query_dict(py, dict);
     }
     Err(PyTypeError::new_err(
-        "graph pattern request must be a dict or expose to_dict()",
+        "graph row request must be a dict or expose to_dict()",
     ))
 }
 
-fn parse_py_graph_pattern_query_dict(
+fn parse_py_graph_row_query_dict(
     py: Python<'_>,
     dict: &Bound<'_, PyDict>,
-) -> PyResult<GraphPatternQuery> {
-    let nodes_value = py_non_none_item(dict, "nodes")?
-        .ok_or_else(|| PyValueError::new_err("graph pattern request requires nodes"))?;
-    let edges_value = py_non_none_item(dict, "edges")?
-        .ok_or_else(|| PyValueError::new_err("graph pattern request requires edges"))?;
-    let nodes_list = nodes_value.downcast::<PyList>()?;
-    let edges_list = edges_value.downcast::<PyList>()?;
-    let mut nodes = Vec::with_capacity(nodes_list.len());
-    for item in nodes_list.iter() {
-        nodes.push(parse_py_node_pattern(py, item.downcast::<PyDict>()?)?);
+) -> PyResult<GraphRowQuery> {
+    let options = parse_py_graph_query_options(dict)?;
+    let page = GraphPageRequest {
+        skip: py_optional_query_usize(dict, "skip", "graph row skip")?.unwrap_or(0),
+        limit: py_optional_query_usize(dict, "limit", "graph row limit")?
+            .unwrap_or(options.max_page_limit.min(1000)),
+        cursor: py_optional_extract(dict, "cursor")?,
+    };
+
+    let mut nodes = Vec::new();
+    if let Some(nodes_value) = py_non_none_item(dict, "nodes")? {
+        let nodes_list = nodes_value.downcast::<PyList>()?;
+        nodes.reserve(nodes_list.len());
+        for (index, item) in nodes_list.iter().enumerate() {
+            nodes.push(parse_py_graph_node_pattern(
+                py,
+                item.downcast::<PyDict>()?,
+                &format!("graph row nodes[{index}]"),
+            )?);
+        }
     }
-    let mut edges = Vec::with_capacity(edges_list.len());
-    for item in edges_list.iter() {
-        edges.push(parse_py_edge_pattern(py, item.downcast::<PyDict>()?)?);
+
+    let mut pieces = Vec::new();
+    if let Some(pieces_value) = py_non_none_item(dict, "pieces")? {
+        let pieces_list = pieces_value.downcast::<PyList>()?;
+        pieces.reserve(pieces_list.len());
+        for (index, item) in pieces_list.iter().enumerate() {
+            pieces.push(parse_py_graph_pattern_piece(
+                py,
+                item.downcast::<PyDict>()?,
+                &format!("graph row pieces[{index}]"),
+            )?);
+        }
     }
-    let limit_value = py_non_none_item(dict, "limit")?
-        .ok_or_else(|| PyValueError::new_err("graph pattern request requires positive limit"))?;
-    let limit = py_query_usize(&limit_value, "graph pattern limit")?;
-    if limit == 0 {
-        return Err(PyValueError::new_err("graph pattern limit must be > 0"));
+
+    if page.limit == 0 {
+        return Err(PyValueError::new_err("graph row limit must be > 0"));
     }
-    Ok(GraphPatternQuery {
+
+    Ok(GraphRowQuery {
         nodes,
-        edges,
-        at_epoch: py_optional_query_i64(dict, "at_epoch", "graph pattern at_epoch")?,
-        limit,
-        order: PatternOrder::AnchorThenAliasesAsc,
+        pieces,
+        where_: py_non_none_item(dict, "where")?
+            .map(|value| parse_py_graph_expr(py, &value, "graph row where"))
+            .transpose()?,
+        return_items: parse_py_graph_return_items(py, dict)?,
+        order_by: parse_py_graph_order_items(py, dict)?,
+        page,
+        at_epoch: py_optional_query_i64(dict, "at_epoch", "graph row at_epoch")?,
+        params: parse_py_graph_params(py, dict)?,
+        output: parse_py_graph_output_options(dict)?,
+        options,
     })
 }
 
-fn parse_py_node_pattern(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<NodePattern> {
+fn parse_py_graph_node_pattern(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<GraphNodePattern> {
     reject_py_legacy_node_label_field(dict, "node pattern")?;
-    Ok(NodePattern {
+    Ok(GraphNodePattern {
         alias: py_required_extract(dict, "alias")?,
         label_filter: parse_optional_node_label_filter_field(
             dict,
             "label_filter",
-            "node pattern label_filter",
+            &format!("{context} label_filter"),
         )?,
-        ids: py_optional_query_u64_vec(dict, "ids", "node pattern ids")?,
-        keys: py_optional_extract::<Vec<String>>(dict, "keys")?.unwrap_or_default(),
-        filter: parse_py_node_filter(py, dict, "updated_at", "node pattern")?,
+        ids: py_optional_query_u64_vec(dict, "ids", &format!("{context} ids"))?,
+        keys: parse_py_node_key_queries(dict, context)?,
+        filter: parse_py_node_filter(py, dict, "updated_at", context)?,
     })
 }
 
-fn parse_py_edge_pattern(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<EdgePattern> {
-    reject_py_legacy_node_predicate_fields(dict, "edge pattern")?;
+fn parse_py_graph_pattern_piece(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<GraphPatternPiece> {
+    let kind: String = py_required_extract(dict, "kind")?;
+    match kind.as_str() {
+        "edge" => Ok(GraphPatternPiece::Edge(parse_py_graph_edge_pattern(
+            py, dict, context,
+        )?)),
+        "optional" => Ok(GraphPatternPiece::Optional(parse_py_graph_optional_group(
+            py, dict, context,
+        )?)),
+        "variable_length" => Ok(GraphPatternPiece::VariableLength(
+            parse_py_graph_variable_length_pattern(py, dict, context)?,
+        )),
+        other => Err(PyValueError::new_err(format!(
+            "{context} kind must be 'edge', 'optional', or 'variable_length', got '{other}'"
+        ))),
+    }
+}
+
+fn parse_py_graph_edge_pattern(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<GraphEdgePattern> {
+    reject_py_legacy_node_predicate_fields(dict, context)?;
     let direction = match py_non_none_item(dict, "direction")? {
         None => Direction::Outgoing,
         Some(value) => parse_direction(&value.extract::<String>()?)?,
     };
-    Ok(EdgePattern {
+    Ok(GraphEdgePattern {
         alias: py_optional_extract(dict, "alias")?,
-        from_alias: py_required_extract(dict, "from_alias")?,
-        to_alias: py_required_extract(dict, "to_alias")?,
+        from_alias: parse_py_alias_field(dict, &["from", "from_alias"], context)?,
+        to_alias: parse_py_alias_field(dict, &["to", "to_alias"], context)?,
         direction,
-        label_filter: py_optional_string_vec(dict, "label_filter", "edge pattern label_filter")?
-            .unwrap_or_default(),
+        label_filter: parse_py_graph_edge_labels(dict, context)?,
         filter: parse_py_edge_filter(
             py,
             dict,
@@ -3638,9 +4515,1008 @@ fn parse_py_edge_pattern(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<E
             "valid_at",
             "valid_from",
             "valid_to",
-            "edge pattern",
+            context,
         )?,
     })
+}
+
+fn parse_py_graph_optional_group(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<eg::GraphOptionalGroup> {
+    let pieces_value = py_non_none_item(dict, "pieces")?
+        .ok_or_else(|| PyValueError::new_err(format!("{context} requires pieces")))?;
+    let pieces_list = pieces_value.downcast::<PyList>()?;
+    let mut pieces = Vec::with_capacity(pieces_list.len());
+    for (index, item) in pieces_list.iter().enumerate() {
+        pieces.push(parse_py_graph_pattern_piece(
+            py,
+            item.downcast::<PyDict>()?,
+            &format!("{context} pieces[{index}]"),
+        )?);
+    }
+    Ok(eg::GraphOptionalGroup {
+        pieces,
+        where_: py_non_none_item(dict, "where")?
+            .map(|value| parse_py_graph_expr(py, &value, &format!("{context} where")))
+            .transpose()?,
+    })
+}
+
+fn parse_py_graph_variable_length_pattern(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<eg::GraphVariableLengthPattern> {
+    reject_py_legacy_node_predicate_fields(dict, context)?;
+    let direction = match py_non_none_item(dict, "direction")? {
+        None => Direction::Outgoing,
+        Some(value) => parse_direction(&value.extract::<String>()?)?,
+    };
+    Ok(eg::GraphVariableLengthPattern {
+        path_alias: py_optional_extract(dict, "path_alias")?,
+        edge_alias: py_optional_extract(dict, "edge_alias")?,
+        from_alias: parse_py_alias_field(dict, &["from", "from_alias"], context)?,
+        to_alias: parse_py_alias_field(dict, &["to", "to_alias"], context)?,
+        direction,
+        label_filter: parse_py_graph_edge_labels(dict, context)?,
+        filter: parse_py_edge_filter(
+            py,
+            dict,
+            "updated_at",
+            "valid_at",
+            "valid_from",
+            "valid_to",
+            context,
+        )?,
+        min_hops: py_query_u8(
+            &py_non_none_item(dict, "min_hops")?
+                .ok_or_else(|| PyValueError::new_err(format!("{context} requires min_hops")))?,
+            &format!("{context} min_hops"),
+        )?,
+        max_hops: py_query_u8(
+            &py_non_none_item(dict, "max_hops")?
+                .ok_or_else(|| PyValueError::new_err(format!("{context} requires max_hops")))?,
+            &format!("{context} max_hops"),
+        )?,
+    })
+}
+
+fn parse_py_node_key_queries(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<Vec<NodeKeyQuery>> {
+    let Some(value) = py_non_none_item(dict, "keys")? else {
+        return Ok(Vec::new());
+    };
+    let items = value.downcast::<PyList>()?;
+    let mut parsed = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let item_context = format!("{context} keys[{index}]");
+        if let Ok(key) = item.extract::<String>() {
+            let label_filter = parse_optional_node_label_filter_field(
+                dict,
+                "label_filter",
+                &format!("{context} label_filter"),
+            )?;
+            let Some(NodeLabelFilter {
+                labels,
+                mode: LabelMatchMode::All,
+            }) = label_filter
+            else {
+                return Err(PyValueError::new_err(format!(
+                    "{item_context} string form requires label_filter with exactly one all-mode label"
+                )));
+            };
+            if labels.len() != 1 {
+                return Err(PyValueError::new_err(format!(
+                    "{item_context} string form requires exactly one label"
+                )));
+            }
+            parsed.push(NodeKeyQuery {
+                label: labels[0].clone(),
+                key,
+            });
+            continue;
+        }
+        let dict = item.downcast::<PyDict>()?;
+        parsed.push(NodeKeyQuery {
+            label: py_required_extract(dict, "label")?,
+            key: py_required_extract(dict, "key")?,
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_py_alias_field(
+    dict: &Bound<'_, PyDict>,
+    keys: &[&str],
+    context: &str,
+) -> PyResult<String> {
+    let mut found: Option<String> = None;
+    for key in keys {
+        if let Some(value) = py_non_none_item(dict, key)? {
+            if found.is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "{context} accepts only one of {}",
+                    keys.join(", ")
+                )));
+            }
+            found = Some(value.extract()?);
+        }
+    }
+    found.ok_or_else(|| PyValueError::new_err(format!("{context} requires {}", keys.join(" or "))))
+}
+
+fn parse_py_graph_edge_labels(dict: &Bound<'_, PyDict>, context: &str) -> PyResult<Vec<String>> {
+    let has_labels = py_has_field(dict, "labels")?;
+    let has_label_filter = py_has_field(dict, "label_filter")?;
+    if has_labels && has_label_filter {
+        return Err(PyValueError::new_err(format!(
+            "{context} accepts only one of labels or label_filter"
+        )));
+    }
+    if has_labels {
+        py_optional_string_vec(dict, "labels", &format!("{context} labels"))
+            .map(|value| value.unwrap_or_default())
+    } else {
+        py_optional_string_vec(dict, "label_filter", &format!("{context} label_filter"))
+            .map(|value| value.unwrap_or_default())
+    }
+}
+
+fn parse_py_graph_return_items(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+) -> PyResult<Option<Vec<GraphReturnItem>>> {
+    let Some(value) = py_non_none_item(dict, "return")? else {
+        return Ok(None);
+    };
+    let items = value.downcast::<PyList>()?;
+    let mut parsed = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let item = item.downcast::<PyDict>()?;
+        let context = format!("graph row return[{index}]");
+        let expr_value = py_non_none_item(item, "expr")?
+            .ok_or_else(|| PyValueError::new_err(format!("{context} requires expr")))?;
+        let alias = parse_py_graph_return_alias(item, &context)?;
+        parsed.push(GraphReturnItem {
+            expr: parse_py_graph_expr(py, &expr_value, &format!("{context} expr"))?,
+            alias,
+            projection: parse_py_graph_return_projection(item, &context)?,
+        });
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_py_graph_return_alias(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<Option<String>> {
+    let as_alias = py_non_none_item(dict, "as")?
+        .map(|value| {
+            value
+                .extract::<String>()
+                .map_err(|_| PyTypeError::new_err(format!("{context} as alias must be a string")))
+        })
+        .transpose()?;
+    let alias = py_non_none_item(dict, "alias")?
+        .map(|value| {
+            value
+                .extract::<String>()
+                .map_err(|_| PyTypeError::new_err(format!("{context} alias must be a string")))
+        })
+        .transpose()?;
+    match (as_alias, alias) {
+        (Some(_), Some(_)) => Err(PyValueError::new_err(format!(
+            "{context} accepts only one of 'as' or 'alias'"
+        ))),
+        (Some(value), None) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn parse_py_graph_return_projection(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<GraphReturnProjection> {
+    let Some(value) = py_non_none_item(dict, "projection")? else {
+        return Ok(GraphReturnProjection::Auto);
+    };
+    if let Ok(name) = value.extract::<String>() {
+        return parse_py_graph_projection_name(&name, context);
+    }
+    let projection = value.downcast::<PyDict>()?;
+    let discriminants = ["element", "selected"]
+        .iter()
+        .map(|field| py_has_field(projection, field))
+        .collect::<PyResult<Vec<_>>>()?
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if discriminants != 1 {
+        return Err(PyValueError::new_err(format!(
+            "{context} projection object must contain exactly one of 'element' or 'selected'"
+        )));
+    }
+    if let Some(element) = projection.get_item("element")? {
+        let name: String = element.extract()?;
+        return Ok(GraphReturnProjection::Element(
+            parse_py_graph_element_projection(&name, context)?,
+        ));
+    }
+    if let Some(selected) = projection.get_item("selected")? {
+        return Ok(GraphReturnProjection::Selected(
+            parse_py_graph_selected_projection(selected.downcast::<PyDict>()?, context)?,
+        ));
+    }
+    Err(PyValueError::new_err(format!(
+        "{context} projection must be 'auto', 'id', 'compact', 'full', or a selected projection"
+    )))
+}
+
+fn parse_py_graph_projection_name(name: &str, context: &str) -> PyResult<GraphReturnProjection> {
+    match name {
+        "auto" => Ok(GraphReturnProjection::Auto),
+        "id" | "id_only" => Ok(GraphReturnProjection::IdOnly),
+        "element_id" => Ok(GraphReturnProjection::Element(
+            GraphElementProjection::IdOnly,
+        )),
+        "compact" => Ok(GraphReturnProjection::Element(
+            GraphElementProjection::Compact,
+        )),
+        "full" | "element" => Ok(GraphReturnProjection::Element(GraphElementProjection::Full)),
+        other => Err(PyValueError::new_err(format!(
+            "{context} projection has unsupported value '{other}'"
+        ))),
+    }
+}
+
+fn parse_py_graph_element_projection(
+    name: &str,
+    context: &str,
+) -> PyResult<GraphElementProjection> {
+    match name {
+        "id" | "id_only" => Ok(GraphElementProjection::IdOnly),
+        "compact" => Ok(GraphElementProjection::Compact),
+        "full" | "element" => Ok(GraphElementProjection::Full),
+        other => Err(PyValueError::new_err(format!(
+            "{context} element projection has unsupported value '{other}'"
+        ))),
+    }
+}
+
+fn parse_py_graph_selected_projection(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<GraphSelectedProjection> {
+    let discriminants = ["node", "edge", "path"]
+        .iter()
+        .map(|field| py_has_field(dict, field))
+        .collect::<PyResult<Vec<_>>>()?
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if discriminants != 1 {
+        return Err(PyValueError::new_err(format!(
+            "{context} selected projection must contain exactly one of 'node', 'edge', or 'path'"
+        )));
+    }
+    if let Some(node) = py_non_none_item(dict, "node")? {
+        return Ok(GraphSelectedProjection::Node(
+            parse_py_selected_node_projection(node.downcast::<PyDict>()?)?,
+        ));
+    }
+    if let Some(edge) = py_non_none_item(dict, "edge")? {
+        return Ok(GraphSelectedProjection::Edge(
+            parse_py_selected_edge_projection(edge.downcast::<PyDict>()?)?,
+        ));
+    }
+    if let Some(path) = py_non_none_item(dict, "path")? {
+        return Ok(GraphSelectedProjection::Path(
+            parse_py_selected_path_projection(path.downcast::<PyDict>()?)?,
+        ));
+    }
+    Err(PyValueError::new_err(format!(
+        "{context} selected projection requires node, edge, or path"
+    )))
+}
+
+fn parse_py_selected_node_projection(
+    dict: &Bound<'_, PyDict>,
+) -> PyResult<GraphSelectedNodeProjection> {
+    ensure_only_py_fields(
+        dict,
+        &[
+            "id",
+            "labels",
+            "key",
+            "props",
+            "weight",
+            "created_at",
+            "updated_at",
+            "vectors",
+        ],
+        "selected node projection",
+    )?;
+    Ok(GraphSelectedNodeProjection {
+        id: py_optional_extract(dict, "id")?.unwrap_or(false),
+        labels: py_optional_extract(dict, "labels")?.unwrap_or(false),
+        key: py_optional_extract(dict, "key")?.unwrap_or(false),
+        props: parse_py_property_selection(dict)?,
+        weight: py_optional_extract(dict, "weight")?.unwrap_or(false),
+        created_at: py_optional_extract(dict, "created_at")?.unwrap_or(false),
+        updated_at: py_optional_extract(dict, "updated_at")?.unwrap_or(false),
+        vectors: parse_py_vector_selection(dict)?,
+    })
+}
+
+fn parse_py_selected_edge_projection(
+    dict: &Bound<'_, PyDict>,
+) -> PyResult<GraphSelectedEdgeProjection> {
+    ensure_only_py_fields(
+        dict,
+        &[
+            "id",
+            "from",
+            "from_id",
+            "to",
+            "to_id",
+            "label",
+            "props",
+            "weight",
+            "created_at",
+            "updated_at",
+            "valid_from",
+            "valid_to",
+        ],
+        "selected edge projection",
+    )?;
+    let from = parse_py_projection_bool_alias(dict, "from_id", "from", "selected edge projection")?;
+    let to = parse_py_projection_bool_alias(dict, "to_id", "to", "selected edge projection")?;
+    Ok(GraphSelectedEdgeProjection {
+        id: py_optional_extract(dict, "id")?.unwrap_or(false),
+        from,
+        to,
+        label: py_optional_extract(dict, "label")?.unwrap_or(false),
+        props: parse_py_property_selection(dict)?,
+        weight: py_optional_extract(dict, "weight")?.unwrap_or(false),
+        created_at: py_optional_extract(dict, "created_at")?.unwrap_or(false),
+        updated_at: py_optional_extract(dict, "updated_at")?.unwrap_or(false),
+        valid_from: py_optional_extract(dict, "valid_from")?.unwrap_or(false),
+        valid_to: py_optional_extract(dict, "valid_to")?.unwrap_or(false),
+    })
+}
+
+fn parse_py_projection_bool_alias(
+    dict: &Bound<'_, PyDict>,
+    primary: &str,
+    alias: &str,
+    context: &str,
+) -> PyResult<bool> {
+    let primary_value: Option<bool> = py_optional_extract(dict, primary)?;
+    let alias_value: Option<bool> = py_optional_extract(dict, alias)?;
+    match (primary_value, alias_value) {
+        (Some(_), Some(_)) => Err(PyValueError::new_err(format!(
+            "{context} accepts only one of '{primary}' or '{alias}'"
+        ))),
+        (Some(value), None) | (None, Some(value)) => Ok(value),
+        (None, None) => Ok(false),
+    }
+}
+
+fn parse_py_selected_path_projection(
+    dict: &Bound<'_, PyDict>,
+) -> PyResult<GraphSelectedPathProjection> {
+    ensure_only_py_fields(
+        dict,
+        &["node_ids", "edge_ids", "nodes", "edges"],
+        "selected path projection",
+    )?;
+    Ok(GraphSelectedPathProjection {
+        node_ids: py_optional_extract(dict, "node_ids")?.unwrap_or(true),
+        edge_ids: py_optional_extract(dict, "edge_ids")?.unwrap_or(true),
+        nodes: py_non_none_item(dict, "nodes")?
+            .map(|value| parse_py_selected_node_projection(value.downcast::<PyDict>()?))
+            .transpose()?,
+        edges: py_non_none_item(dict, "edges")?
+            .map(|value| parse_py_selected_edge_projection(value.downcast::<PyDict>()?))
+            .transpose()?,
+    })
+}
+
+fn parse_py_property_selection(dict: &Bound<'_, PyDict>) -> PyResult<eg::GraphPropertySelection> {
+    let Some(value) = py_non_none_item(dict, "props")? else {
+        return Ok(eg::GraphPropertySelection::None);
+    };
+    if value.is_instance_of::<PyBool>() {
+        return if value.extract::<bool>()? {
+            Ok(eg::GraphPropertySelection::All)
+        } else {
+            Ok(eg::GraphPropertySelection::None)
+        };
+    }
+    if let Ok(name) = value.extract::<String>() {
+        return match name.as_str() {
+            "all" => Ok(eg::GraphPropertySelection::All),
+            "none" => Ok(eg::GraphPropertySelection::None),
+            other => Err(PyValueError::new_err(format!(
+                "props selection must be 'all', 'none', bool, or a list of keys, got '{other}'"
+            ))),
+        };
+    }
+    Ok(eg::GraphPropertySelection::Keys(
+        value.extract::<Vec<String>>()?,
+    ))
+}
+
+fn parse_py_vector_selection(dict: &Bound<'_, PyDict>) -> PyResult<GraphVectorSelection> {
+    let Some(value) = py_non_none_item(dict, "vectors")? else {
+        return Ok(GraphVectorSelection::None);
+    };
+    let name: String = value.extract()?;
+    match name.as_str() {
+        "none" => Ok(GraphVectorSelection::None),
+        "dense" => Ok(GraphVectorSelection::Dense),
+        "sparse" => Ok(GraphVectorSelection::Sparse),
+        "both" | "all" => Ok(GraphVectorSelection::Both),
+        other => Err(PyValueError::new_err(format!(
+            "vectors selection must be 'none', 'dense', 'sparse', or 'both', got '{other}'"
+        ))),
+    }
+}
+
+fn parse_py_graph_order_items(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+) -> PyResult<Vec<GraphOrderItem>> {
+    let Some(value) = py_non_none_item(dict, "order_by")? else {
+        return Ok(Vec::new());
+    };
+    let items = value.downcast::<PyList>()?;
+    let mut parsed = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let item = item.downcast::<PyDict>()?;
+        let context = format!("graph row order_by[{index}]");
+        let expr_value = py_non_none_item(item, "expr")?
+            .ok_or_else(|| PyValueError::new_err(format!("{context} requires expr")))?;
+        let direction = match py_non_none_item(item, "direction")? {
+            None => GraphOrderDirection::Asc,
+            Some(value) => match value.extract::<String>()?.as_str() {
+                "asc" => GraphOrderDirection::Asc,
+                "desc" => GraphOrderDirection::Desc,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "{context} direction must be 'asc' or 'desc', got '{other}'"
+                    )));
+                }
+            },
+        };
+        parsed.push(GraphOrderItem {
+            expr: parse_py_graph_expr(py, &expr_value, &format!("{context} expr"))?,
+            direction,
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_py_graph_output_options(dict: &Bound<'_, PyDict>) -> PyResult<GraphOutputOptions> {
+    let Some(value) = py_non_none_item(dict, "output")? else {
+        return Ok(GraphOutputOptions::default());
+    };
+    let output = value.downcast::<PyDict>()?;
+    let mut parsed = GraphOutputOptions::default();
+    if let Some(mode) = py_non_none_item(output, "mode")? {
+        parsed.mode = match mode.extract::<String>()?.as_str() {
+            "ids" => GraphOutputMode::Ids,
+            "elements" => GraphOutputMode::Elements,
+            "projected" => GraphOutputMode::Projected,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "graph row output mode must be 'ids', 'elements', or 'projected', got '{other}'"
+                )));
+            }
+        };
+    }
+    if let Some(compact_rows) = py_optional_extract(output, "compact_rows")? {
+        parsed.compact_rows = compact_rows;
+    }
+    if let Some(include_vectors) = py_optional_extract(output, "include_vectors")? {
+        parsed.include_vectors = include_vectors;
+    }
+    Ok(parsed)
+}
+
+fn parse_py_graph_query_options(dict: &Bound<'_, PyDict>) -> PyResult<GraphQueryOptions> {
+    let mut options = GraphQueryOptions::default();
+    if let Some(value) = py_non_none_item(dict, "options")? {
+        let options_dict = value.downcast::<PyDict>()?;
+        if let Some(value) = py_optional_extract(options_dict, "allow_full_scan")? {
+            options.allow_full_scan = value;
+        }
+        if let Some(value) = py_optional_query_usize(
+            options_dict,
+            "max_intermediate_bindings",
+            "max_intermediate_bindings",
+        )? {
+            options.max_intermediate_bindings = value;
+        }
+        if let Some(value) = py_optional_query_usize(options_dict, "max_frontier", "max_frontier")?
+        {
+            options.max_frontier = value;
+        }
+        if let Some(value) = py_optional_query_u8(options_dict, "max_path_hops", "max_path_hops")? {
+            options.max_path_hops = value;
+        }
+        if let Some(value) =
+            py_optional_query_usize(options_dict, "max_paths_per_start", "max_paths_per_start")?
+        {
+            options.max_paths_per_start = value;
+        }
+        if let Some(value) =
+            py_optional_query_usize(options_dict, "max_page_limit", "max_page_limit")?
+        {
+            options.max_page_limit = value;
+        }
+        if let Some(value) = py_optional_query_usize(
+            options_dict,
+            "max_order_materialization",
+            "max_order_materialization",
+        )? {
+            options.max_order_materialization = value;
+        }
+        if let Some(value) =
+            py_optional_query_usize(options_dict, "max_cursor_bytes", "max_cursor_bytes")?
+        {
+            options.max_cursor_bytes = value;
+        }
+        if let Some(value) =
+            py_optional_query_usize(options_dict, "max_query_bytes", "max_query_bytes")?
+        {
+            options.max_query_bytes = value;
+        }
+        if let Some(value) = py_optional_extract(options_dict, "include_plan")? {
+            options.include_plan = value;
+        }
+        if let Some(value) = py_optional_extract(options_dict, "profile")? {
+            options.profile = value;
+        }
+    }
+    Ok(options)
+}
+
+fn parse_py_graph_params(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+) -> PyResult<BTreeMap<String, GraphParamValue>> {
+    let Some(value) = py_non_none_item(dict, "params")? else {
+        return Ok(BTreeMap::new());
+    };
+    let params = value.downcast::<PyDict>()?;
+    let mut parsed = BTreeMap::new();
+    for (key, value) in params.iter() {
+        let key: String = key.extract()?;
+        parsed.insert(key.clone(), py_to_graph_param_value(py, &value, &key)?);
+    }
+    Ok(parsed)
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn py_to_graph_param_value(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<GraphParamValue> {
+    if obj.is_none() {
+        Ok(GraphParamValue::Null)
+    } else if obj.is_instance_of::<PyBool>() {
+        Ok(GraphParamValue::Bool(obj.extract()?))
+    } else if let Ok(i) = obj.extract::<i64>() {
+        if i < 0 {
+            Ok(GraphParamValue::Int(i))
+        } else {
+            Ok(GraphParamValue::UInt(i as u64))
+        }
+    } else if let Ok(u) = obj.extract::<u64>() {
+        Ok(GraphParamValue::UInt(u))
+    } else if let Ok(f) = obj.extract::<f64>() {
+        if !f.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "graph row param '{context}' must be finite"
+            )));
+        }
+        Ok(GraphParamValue::Float(f))
+    } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
+        Ok(GraphParamValue::Bytes(bytes.as_bytes().to_vec()))
+    } else if let Ok(string) = obj.downcast::<PyString>() {
+        Ok(GraphParamValue::String(string.to_str()?.to_string()))
+    } else if let Ok(list) = obj.downcast::<PyList>() {
+        let values = list
+            .iter()
+            .map(|item| py_to_graph_param_value(py, &item, context))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(GraphParamValue::List(values))
+    } else if let Ok(tuple) = obj.downcast::<PyTuple>() {
+        let values = tuple
+            .iter()
+            .map(|item| py_to_graph_param_value(py, &item, context))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(GraphParamValue::List(values))
+    } else if let Ok(dict) = obj.downcast::<PyDict>() {
+        if let Some(bytes) = parse_py_tagged_bytes(dict, context)? {
+            return Ok(GraphParamValue::Bytes(bytes));
+        }
+        if let Some(list) = py_non_none_item(dict, "list")? {
+            ensure_only_py_fields(dict, &["list"], context)?;
+            let items = list.downcast::<PyList>()?;
+            let values = items
+                .iter()
+                .map(|item| py_to_graph_param_value(py, &item, context))
+                .collect::<PyResult<Vec<_>>>()?;
+            return Ok(GraphParamValue::List(values));
+        }
+        if let Some(map) = py_non_none_item(dict, "map")? {
+            ensure_only_py_fields(dict, &["map"], context)?;
+            let map = map.downcast::<PyDict>()?;
+            let mut parsed = BTreeMap::new();
+            for (key, value) in map.iter() {
+                let key: String = key.extract()?;
+                parsed.insert(key.clone(), py_to_graph_param_value(py, &value, &key)?);
+            }
+            return Ok(GraphParamValue::Map(parsed));
+        }
+        let mut parsed = BTreeMap::new();
+        for (key, value) in dict.iter() {
+            let key: String = key.extract()?;
+            parsed.insert(key.clone(), py_to_graph_param_value(py, &value, &key)?);
+        }
+        Ok(GraphParamValue::Map(parsed))
+    } else {
+        Err(PyTypeError::new_err(format!(
+            "Unsupported graph row param value type: {}",
+            obj.get_type().name()?
+        )))
+    }
+}
+
+fn parse_py_graph_expr(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<GraphExpr> {
+    if value.is_none() {
+        return Ok(GraphExpr::Null);
+    }
+    if value.is_instance_of::<PyBool>() {
+        return Ok(GraphExpr::Bool(value.extract()?));
+    }
+    if let Ok(i) = value.extract::<i64>() {
+        return if i < 0 {
+            Ok(GraphExpr::Int(i))
+        } else {
+            Ok(GraphExpr::UInt(i as u64))
+        };
+    }
+    if let Ok(u) = value.extract::<u64>() {
+        return Ok(GraphExpr::UInt(u));
+    }
+    if let Ok(f) = value.extract::<f64>() {
+        if !f.is_finite() {
+            return Err(PyValueError::new_err(format!("{context} must be finite")));
+        }
+        return Ok(GraphExpr::Float(f));
+    }
+    if let Ok(bytes) = value.downcast::<PyBytes>() {
+        return Ok(GraphExpr::Bytes(bytes.as_bytes().to_vec()));
+    }
+    if let Ok(string) = value.downcast::<PyString>() {
+        return Ok(GraphExpr::String(string.to_str()?.to_string()));
+    }
+    let dict = value
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err(format!("{context} must be a graph expression")))?;
+    parse_py_graph_expr_dict(py, dict, context)
+}
+
+fn parse_py_graph_expr_dict(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<GraphExpr> {
+    if dict.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "{context} expression object must not be empty"
+        )));
+    }
+    let discriminants = [
+        "bytes",
+        "list",
+        "map",
+        "param",
+        "binding",
+        "property",
+        "node_field",
+        "edge_field",
+        "path_field",
+        "fn",
+        "op",
+        "is_null",
+        "is_not_null",
+    ];
+    let present = discriminants
+        .iter()
+        .map(|field| py_has_field(dict, field))
+        .collect::<PyResult<Vec<_>>>()?
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+    if present != 1 {
+        return Err(PyValueError::new_err(format!(
+            "{context} expression object must contain exactly one known discriminant"
+        )));
+    }
+    if let Some(bytes) = parse_py_tagged_bytes(dict, context)? {
+        ensure_only_py_fields(dict, &["bytes"], context)?;
+        return Ok(GraphExpr::Bytes(bytes));
+    }
+    if let Some(value) = dict.get_item("list")? {
+        ensure_only_py_fields(dict, &["list"], context)?;
+        let items = value.downcast::<PyList>()?;
+        let parsed = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                parse_py_graph_expr(py, &item, &format!("{context} list[{index}]"))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(GraphExpr::List(parsed));
+    }
+    if let Some(value) = dict.get_item("map")? {
+        ensure_only_py_fields(dict, &["map"], context)?;
+        let items = value.downcast::<PyDict>()?;
+        let mut parsed = BTreeMap::new();
+        for (key, value) in items.iter() {
+            let key: String = key.extract()?;
+            parsed.insert(
+                key.clone(),
+                parse_py_graph_expr(py, &value, &format!("{context} map.{key}"))?,
+            );
+        }
+        return Ok(GraphExpr::Map(parsed));
+    }
+    if let Some(value) = dict.get_item("param")? {
+        ensure_only_py_fields(dict, &["param"], context)?;
+        return Ok(GraphExpr::Param(value.extract()?));
+    }
+    if let Some(value) = dict.get_item("binding")? {
+        ensure_only_py_fields(dict, &["binding"], context)?;
+        return Ok(GraphExpr::Binding(value.extract()?));
+    }
+    if let Some(value) = dict.get_item("property")? {
+        ensure_only_py_fields(dict, &["property"], context)?;
+        let payload = value.downcast::<PyDict>()?;
+        ensure_only_py_fields(payload, &["alias", "key"], context)?;
+        return Ok(GraphExpr::Property {
+            alias: py_required_extract(payload, "alias")?,
+            key: py_required_extract(payload, "key")?,
+        });
+    }
+    if let Some(value) = dict.get_item("node_field")? {
+        ensure_only_py_fields(dict, &["node_field"], context)?;
+        let payload = value.downcast::<PyDict>()?;
+        ensure_only_py_fields(payload, &["alias", "field"], context)?;
+        return Ok(GraphExpr::NodeField {
+            alias: py_required_extract(payload, "alias")?,
+            field: parse_py_graph_node_field(
+                &py_required_extract::<String>(payload, "field")?,
+                context,
+            )?,
+        });
+    }
+    if let Some(value) = dict.get_item("edge_field")? {
+        ensure_only_py_fields(dict, &["edge_field"], context)?;
+        let payload = value.downcast::<PyDict>()?;
+        ensure_only_py_fields(payload, &["alias", "field"], context)?;
+        return Ok(GraphExpr::EdgeField {
+            alias: py_required_extract(payload, "alias")?,
+            field: parse_py_graph_edge_field(
+                &py_required_extract::<String>(payload, "field")?,
+                context,
+            )?,
+        });
+    }
+    if let Some(value) = dict.get_item("path_field")? {
+        ensure_only_py_fields(dict, &["path_field"], context)?;
+        let payload = value.downcast::<PyDict>()?;
+        ensure_only_py_fields(payload, &["alias", "field"], context)?;
+        return Ok(GraphExpr::PathField {
+            alias: py_required_extract(payload, "alias")?,
+            field: parse_py_graph_path_field(
+                &py_required_extract::<String>(payload, "field")?,
+                context,
+            )?,
+        });
+    }
+    if let Some(value) = dict.get_item("fn")? {
+        let name: String = value.extract()?;
+        let args_value = dict
+            .get_item("args")?
+            .ok_or_else(|| PyValueError::new_err(format!("{context} function requires args")))?;
+        ensure_only_py_fields(dict, &["fn", "args"], context)?;
+        let args_list = args_value.downcast::<PyList>()?;
+        let args = args_list
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                parse_py_graph_expr(py, &item, &format!("{context} args[{index}]"))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        return parse_py_graph_function_expr(name, args, context);
+    }
+    if let Some(value) = dict.get_item("op")? {
+        let op: String = value.extract()?;
+        if op == "not" {
+            ensure_only_py_fields(dict, &["op", "expr"], context)?;
+            let expr = dict
+                .get_item("expr")?
+                .ok_or_else(|| PyValueError::new_err(format!("{context} not requires expr")))?;
+            return Ok(GraphExpr::Unary {
+                op: GraphUnaryOp::Not,
+                expr: Box::new(parse_py_graph_expr(py, &expr, &format!("{context} expr"))?),
+            });
+        }
+        ensure_only_py_fields(dict, &["op", "left", "right"], context)?;
+        let left = dict
+            .get_item("left")?
+            .ok_or_else(|| PyValueError::new_err(format!("{context} binary op requires left")))?;
+        let right = dict
+            .get_item("right")?
+            .ok_or_else(|| PyValueError::new_err(format!("{context} binary op requires right")))?;
+        return Ok(GraphExpr::Binary {
+            left: Box::new(parse_py_graph_expr(py, &left, &format!("{context} left"))?),
+            op: parse_py_graph_binary_op(&op, context)?,
+            right: Box::new(parse_py_graph_expr(
+                py,
+                &right,
+                &format!("{context} right"),
+            )?),
+        });
+    }
+    if let Some(value) = dict.get_item("is_null")? {
+        ensure_only_py_fields(dict, &["is_null"], context)?;
+        return Ok(GraphExpr::IsNull(Box::new(parse_py_graph_expr(
+            py,
+            &value,
+            &format!("{context} is_null"),
+        )?)));
+    }
+    if let Some(value) = dict.get_item("is_not_null")? {
+        ensure_only_py_fields(dict, &["is_not_null"], context)?;
+        return Ok(GraphExpr::IsNotNull(Box::new(parse_py_graph_expr(
+            py,
+            &value,
+            &format!("{context} is_not_null"),
+        )?)));
+    }
+    unreachable!("expression discriminant count already checked")
+}
+
+fn parse_py_tagged_bytes(dict: &Bound<'_, PyDict>, context: &str) -> PyResult<Option<Vec<u8>>> {
+    let Some(value) = dict.get_item("bytes")? else {
+        return Ok(None);
+    };
+    let items = value.downcast::<PyList>()?;
+    let mut parsed = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        parsed.push(py_query_u8(&item, &format!("{context} bytes[{index}]"))?);
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_py_graph_node_field(name: &str, context: &str) -> PyResult<GraphNodeField> {
+    match name {
+        "id" => Ok(GraphNodeField::Id),
+        "labels" => Ok(GraphNodeField::Labels),
+        "key" => Ok(GraphNodeField::Key),
+        "weight" => Ok(GraphNodeField::Weight),
+        "created_at" => Ok(GraphNodeField::CreatedAt),
+        "updated_at" => Ok(GraphNodeField::UpdatedAt),
+        other => Err(PyValueError::new_err(format!(
+            "{context} node_field field is unsupported: '{other}'"
+        ))),
+    }
+}
+
+fn parse_py_graph_edge_field(name: &str, context: &str) -> PyResult<eg::GraphEdgeField> {
+    match name {
+        "id" => Ok(eg::GraphEdgeField::Id),
+        "from" | "from_id" => Ok(eg::GraphEdgeField::From),
+        "to" | "to_id" => Ok(eg::GraphEdgeField::To),
+        "label" | "type" => Ok(eg::GraphEdgeField::Label),
+        "weight" => Ok(eg::GraphEdgeField::Weight),
+        "created_at" => Ok(eg::GraphEdgeField::CreatedAt),
+        "updated_at" => Ok(eg::GraphEdgeField::UpdatedAt),
+        "valid_from" => Ok(eg::GraphEdgeField::ValidFrom),
+        "valid_to" => Ok(eg::GraphEdgeField::ValidTo),
+        other => Err(PyValueError::new_err(format!(
+            "{context} edge_field field is unsupported: '{other}'"
+        ))),
+    }
+}
+
+fn parse_py_graph_path_field(name: &str, context: &str) -> PyResult<GraphPathField> {
+    match name {
+        "node_ids" => Ok(GraphPathField::NodeIds),
+        "edge_ids" => Ok(GraphPathField::EdgeIds),
+        "length" => Ok(GraphPathField::Length),
+        other => Err(PyValueError::new_err(format!(
+            "{context} path_field field is unsupported: '{other}'"
+        ))),
+    }
+}
+
+fn parse_py_graph_function_expr(
+    name: String,
+    args: Vec<GraphExpr>,
+    context: &str,
+) -> PyResult<GraphExpr> {
+    if matches!(name.as_str(), "node_ids" | "edge_ids") {
+        if args.len() != 1 {
+            return Err(PyValueError::new_err(format!(
+                "{context} {name}() requires exactly one binding argument"
+            )));
+        }
+        let GraphExpr::Binding(alias) = args.into_iter().next().unwrap() else {
+            return Err(PyValueError::new_err(format!(
+                "{context} {name}() currently requires a binding argument"
+            )));
+        };
+        return Ok(GraphExpr::PathField {
+            alias,
+            field: if name == "node_ids" {
+                GraphPathField::NodeIds
+            } else {
+                GraphPathField::EdgeIds
+            },
+        });
+    }
+    let function = match name.as_str() {
+        "id" => GraphFunction::Id,
+        "labels" => GraphFunction::Labels,
+        "type" => GraphFunction::Type,
+        "length" => GraphFunction::Length,
+        "start_node" => GraphFunction::StartNode,
+        "end_node" => GraphFunction::EndNode,
+        "nodes" => GraphFunction::Nodes,
+        "relationships" => GraphFunction::Relationships,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "{context} function is unsupported: '{other}'"
+            )));
+        }
+    };
+    Ok(GraphExpr::Function {
+        name: function,
+        args,
+    })
+}
+
+fn parse_py_graph_binary_op(name: &str, context: &str) -> PyResult<GraphBinaryOp> {
+    match name {
+        "or" => Ok(GraphBinaryOp::Or),
+        "and" => Ok(GraphBinaryOp::And),
+        "=" | "==" | "eq" => Ok(GraphBinaryOp::Eq),
+        "<>" | "!=" | "neq" => Ok(GraphBinaryOp::Neq),
+        "<" => Ok(GraphBinaryOp::Lt),
+        "<=" => Ok(GraphBinaryOp::Le),
+        ">" => Ok(GraphBinaryOp::Gt),
+        ">=" => Ok(GraphBinaryOp::Ge),
+        "in" => Ok(GraphBinaryOp::In),
+        other => Err(PyValueError::new_err(format!(
+            "{context} binary op is unsupported: '{other}'"
+        ))),
+    }
 }
 
 fn reject_py_legacy_node_predicate_fields(dict: &Bound<'_, PyDict>, context: &str) -> PyResult<()> {
@@ -4300,6 +6176,26 @@ fn py_optional_query_i64(
         .transpose()
 }
 
+fn py_optional_query_usize(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    context: &str,
+) -> PyResult<Option<usize>> {
+    py_non_none_item(dict, key)?
+        .map(|value| py_query_usize(&value, context))
+        .transpose()
+}
+
+fn py_optional_query_u8(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    context: &str,
+) -> PyResult<Option<u8>> {
+    py_non_none_item(dict, key)?
+        .map(|value| py_query_u8(&value, context))
+        .transpose()
+}
+
 fn py_optional_query_u64_vec(
     dict: &Bound<'_, PyDict>,
     key: &str,
@@ -4393,9 +6289,10 @@ fn parse_node_label_filter_arg(
         .map_err(|_| PyTypeError::new_err(format!("{context} must be a dict")))?;
     ensure_only_py_fields(dict, &["labels", "mode"], context)?;
     let labels = parse_node_labels_list_field(dict, "labels", context)?;
-    let mode_value = py_non_none_item(dict, "mode")?
-        .ok_or_else(|| PyValueError::new_err(format!("{context} requires mode")))?;
-    let mode = parse_label_match_mode(&mode_value.extract::<String>()?, context)?;
+    let mode = match py_non_none_item(dict, "mode")? {
+        Some(mode_value) => parse_label_match_mode(&mode_value.extract::<String>()?, context)?,
+        None => LabelMatchMode::All,
+    };
     Ok(NodeLabelFilter { labels, mode })
 }
 
@@ -4473,6 +6370,11 @@ fn next_down_f32(value: f32) -> f32 {
 fn py_query_usize(value: &Bound<'_, PyAny>, context: &str) -> PyResult<usize> {
     reject_py_bool(value, context)?;
     value.extract::<usize>()
+}
+
+fn py_query_u8(value: &Bound<'_, PyAny>, context: &str) -> PyResult<u8> {
+    reject_py_bool(value, context)?;
+    value.extract::<u8>()
 }
 
 fn reject_py_bool(value: &Bound<'_, PyAny>, context: &str) -> PyResult<()> {
@@ -4574,23 +6476,30 @@ fn prop_value_debug_repr(py: Python<'_>, value: &PropValue) -> PyResult<String> 
     prop_value_to_py_obj(py, value)?.bind(py).repr()?.extract()
 }
 
-fn parse_secondary_index_range_domain(domain: &str) -> PyResult<SecondaryIndexRangeDomain> {
+#[derive(Clone, Copy)]
+enum RangeValueDomain {
+    Int,
+    UInt,
+    Float,
+}
+
+fn parse_range_value_domain(domain: &str) -> PyResult<RangeValueDomain> {
     match domain {
-        "int" => Ok(SecondaryIndexRangeDomain::Int),
-        "uint" => Ok(SecondaryIndexRangeDomain::UInt),
-        "float" => Ok(SecondaryIndexRangeDomain::Float),
+        "int" => Ok(RangeValueDomain::Int),
+        "uint" => Ok(RangeValueDomain::UInt),
+        "float" => Ok(RangeValueDomain::Float),
         other => Err(PyValueError::new_err(format!(
-            "Invalid range domain '{}'. Must be 'int', 'uint', or 'float'.",
+            "Invalid range value type annotation '{}'. Must be 'int', 'uint', or 'float'.",
             other
         ))),
     }
 }
 
-fn range_domain_to_py(domain: SecondaryIndexRangeDomain) -> &'static str {
+fn range_value_domain_to_py(domain: RangeValueDomain) -> &'static str {
     match domain {
-        SecondaryIndexRangeDomain::Int => "int",
-        SecondaryIndexRangeDomain::UInt => "uint",
-        SecondaryIndexRangeDomain::Float => "float",
+        RangeValueDomain::Int => "int",
+        RangeValueDomain::UInt => "uint",
+        RangeValueDomain::Float => "float",
     }
 }
 
@@ -4602,28 +6511,17 @@ fn secondary_index_state_to_py(state: SecondaryIndexState) -> &'static str {
     }
 }
 
-fn secondary_index_kind_to_py(kind: &SecondaryIndexKind) -> (&'static str, Option<&'static str>) {
+fn secondary_index_kind_to_py(kind: &SecondaryIndexKind) -> &'static str {
     match kind {
-        SecondaryIndexKind::Equality => ("equality", None),
-        SecondaryIndexKind::Range { domain } => ("range", Some(range_domain_to_py(*domain))),
+        SecondaryIndexKind::Equality => "equality",
+        SecondaryIndexKind::Range => "range",
     }
 }
 
-fn parse_secondary_index_kind(kind: &str, domain: Option<&str>) -> PyResult<SecondaryIndexKind> {
+fn parse_secondary_index_kind(kind: &str) -> PyResult<SecondaryIndexKind> {
     match kind {
-        "equality" => {
-            if domain.is_some() {
-                return Err(PyValueError::new_err(
-                    "equality indexes do not accept a range domain",
-                ));
-            }
-            Ok(SecondaryIndexKind::Equality)
-        }
-        "range" => Ok(SecondaryIndexKind::Range {
-            domain: parse_secondary_index_range_domain(domain.ok_or_else(|| {
-                PyValueError::new_err("range indexes require domain='int', 'uint', or 'float'")
-            })?)?,
-        }),
+        "equality" => Ok(SecondaryIndexKind::Equality),
+        "range" => Ok(SecondaryIndexKind::Range),
         other => Err(PyValueError::new_err(format!(
             "Invalid index kind '{}'. Must be 'equality' or 'range'.",
             other
@@ -4631,14 +6529,14 @@ fn parse_secondary_index_kind(kind: &str, domain: Option<&str>) -> PyResult<Seco
     }
 }
 
-fn range_domain_from_prop_value(
+fn range_value_domain_from_prop_value(
     value: &PropValue,
     context: &str,
-) -> PyResult<SecondaryIndexRangeDomain> {
+) -> PyResult<RangeValueDomain> {
     match value {
-        PropValue::Int(_) => Ok(SecondaryIndexRangeDomain::Int),
-        PropValue::UInt(_) => Ok(SecondaryIndexRangeDomain::UInt),
-        PropValue::Float(value) if value.is_finite() => Ok(SecondaryIndexRangeDomain::Float),
+        PropValue::Int(_) => Ok(RangeValueDomain::Int),
+        PropValue::UInt(_) => Ok(RangeValueDomain::UInt),
+        PropValue::Float(value) if value.is_finite() => Ok(RangeValueDomain::Float),
         _ => Err(PyValueError::new_err(format!(
             "{} must use Int, UInt, or finite Float values",
             context
@@ -4649,7 +6547,7 @@ fn range_domain_from_prop_value(
 fn py_numeric_to_prop_value(
     _py: Python<'_>,
     obj: &Bound<'_, pyo3::PyAny>,
-    domain: SecondaryIndexRangeDomain,
+    domain: RangeValueDomain,
 ) -> PyResult<PropValue> {
     if obj.is_instance_of::<PyBool>() {
         return Err(PyTypeError::new_err(
@@ -4658,9 +6556,9 @@ fn py_numeric_to_prop_value(
     }
 
     match domain {
-        SecondaryIndexRangeDomain::Int => Ok(PropValue::Int(obj.extract::<i64>()?)),
-        SecondaryIndexRangeDomain::UInt => Ok(PropValue::UInt(obj.extract::<u64>()?)),
-        SecondaryIndexRangeDomain::Float => {
+        RangeValueDomain::Int => Ok(PropValue::Int(obj.extract::<i64>()?)),
+        RangeValueDomain::UInt => Ok(PropValue::UInt(obj.extract::<u64>()?)),
+        RangeValueDomain::Float => {
             let value = obj.extract::<f64>()?;
             if !value.is_finite() {
                 return Err(PyValueError::new_err(

@@ -3,7 +3,7 @@ members = [".", "overgraph-node", "overgraph-python"]
 
 [package]
 name = "overgraph"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "An absurdly fast embedded graph database. Pure Rust, sub-microsecond reads."
 license = "MIT OR Apache-2.0"
@@ -47,6 +47,10 @@ required-features = ["cli"]
 [[example]]
 name = "knowledge_graph"
 path = "examples/rust/knowledge_graph.rs"
+
+[[example]]
+name = "gql_readonly"
+path = "examples/rust/gql_readonly.rs"
 
 [[bench]]
 name = "core_ops"

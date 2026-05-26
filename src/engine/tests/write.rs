@@ -98,18 +98,14 @@
             .ensure_node_property_index(
                 "Person",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         engine
             .ensure_node_property_index(
                 "Employee",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
 
@@ -559,9 +555,7 @@
             .ensure_node_property_index(
                 "ImmFreshB",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         let id = engine
@@ -1636,7 +1630,7 @@
     }
 
     #[test]
-    fn test_node_property_index_ensure_drop_list_and_conflicting_range_domains() {
+    fn test_node_property_index_ensure_drop_list_and_reuses_range_declaration() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
@@ -1654,9 +1648,7 @@
         let range = engine
             .ensure_node_property_index("Person",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         assert_eq!(range.state, SecondaryIndexState::Building);
@@ -1666,15 +1658,13 @@
         assert_eq!(indexes[0].prop_key, "color");
         assert_eq!(indexes[1].prop_key, "score");
 
-        let err = engine
+        let range_again = engine
             .ensure_node_property_index("Person",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Float,
-                },
+                SecondaryIndexKind::Range,
             )
-            .unwrap_err();
-        assert!(matches!(err, EngineError::InvalidOperation(_)));
+            .unwrap();
+        assert_eq!(range_again.index_id, range.index_id);
 
         assert!(engine
             .drop_node_property_index("Person", "color", SecondaryIndexKind::Equality)
@@ -1780,13 +1770,11 @@
         let range = engine
             .ensure_node_property_index("Person",
                 "age",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
 
-        let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
+        let status_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
         let active_memtable = engine.active_memtable();
         let active_eq_state = active_memtable.secondary_eq_state();
         let active_eq_ids = active_eq_state
@@ -1811,7 +1799,8 @@
         let active_range = active_range_state
             .get(&range.index_id)
             .unwrap();
-        assert!(active_range.contains(&(35u64 ^ (1u64 << 63), active_id)));
+        let age_35 = numeric_range_sort_key_for_value(&PropValue::Int(35)).unwrap();
+        assert!(active_range.contains(&(age_35, active_id)));
         assert!(!active_range.iter().any(|&(_, node_id)| node_id == bad_id));
 
         let frozen_memtable = engine.immutable_memtable(0);
@@ -1819,7 +1808,8 @@
         let frozen_range = frozen_range_state
             .get(&range.index_id)
             .unwrap();
-        assert!(frozen_range.contains(&(30u64 ^ (1u64 << 63), frozen_id)));
+        let age_30 = numeric_range_sort_key_for_value(&PropValue::Int(30)).unwrap();
+        assert!(frozen_range.contains(&(age_30, frozen_id)));
 
         engine.close().unwrap();
     }
@@ -1875,7 +1865,7 @@
     // --- Edge Property Index Declaration Tests ---
 
     #[test]
-    fn test_edge_property_index_ensure_drop_list_and_conflicting_range_domains() {
+    fn test_edge_property_index_ensure_drop_list_and_reuses_range_declaration() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
@@ -1893,9 +1883,7 @@
         let range = engine
             .ensure_edge_property_index("RELATES_TO",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         assert_eq!(range.state, SecondaryIndexState::Building);
@@ -1905,15 +1893,13 @@
         assert_eq!(indexes[0].prop_key, "label");
         assert_eq!(indexes[1].prop_key, "score");
 
-        let err = engine
+        let range_again = engine
             .ensure_edge_property_index("RELATES_TO",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Float,
-                },
+                SecondaryIndexKind::Range,
             )
-            .unwrap_err();
-        assert!(matches!(err, EngineError::InvalidOperation(_)));
+            .unwrap();
+        assert_eq!(range_again.index_id, range.index_id);
 
         assert!(engine
             .drop_edge_property_index("RELATES_TO", "label", SecondaryIndexKind::Equality)
@@ -2017,13 +2003,11 @@
         let range = engine
             .ensure_edge_property_index("RELATES_TO",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
 
-        let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
+        let status_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
         let active_memtable = engine.active_memtable();
         let active_eq_state = active_memtable.secondary_eq_state();
         let active_eq_ids = active_eq_state
@@ -2044,11 +2028,13 @@
 
         let active_range_state = active_memtable.secondary_range_state();
         let active_range = active_range_state.get(&range.index_id).unwrap();
-        assert!(active_range.contains(&(50u64 ^ (1u64 << 63), active_edge_id)));
+        let score_50 = numeric_range_sort_key_for_value(&PropValue::Int(50)).unwrap();
+        assert!(active_range.contains(&(score_50, active_edge_id)));
 
         let frozen_range_state = frozen_memtable.secondary_range_state();
         let frozen_range = frozen_range_state.get(&range.index_id).unwrap();
-        assert!(frozen_range.contains(&(30u64 ^ (1u64 << 63), frozen_edge_id)));
+        let score_30 = numeric_range_sort_key_for_value(&PropValue::Int(30)).unwrap();
+        assert!(frozen_range.contains(&(score_30, frozen_edge_id)));
 
         engine.close().unwrap();
     }
@@ -2072,9 +2058,7 @@
         let range = engine
             .ensure_edge_property_index("RELATES_TO",
                 "weight",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
 
@@ -2100,7 +2084,7 @@
             )
             .unwrap();
 
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let mem = engine.active_memtable();
         let eq_state = mem.secondary_eq_state();
         assert!(eq_state
@@ -2110,10 +2094,11 @@
             .unwrap()
             .contains(&edge_id));
         let range_state = mem.secondary_range_state();
+        let weight_10 = numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap();
         assert!(range_state
             .get(&range.index_id)
             .unwrap()
-            .contains(&(10u64 ^ (1u64 << 63), edge_id)));
+            .contains(&(weight_10, edge_id)));
 
         let mut updated_props = BTreeMap::new();
         updated_props.insert("color".to_string(), PropValue::String("blue".to_string()));
@@ -2130,7 +2115,7 @@
             )
             .unwrap();
 
-        let blue_hash = hash_prop_value(&PropValue::String("blue".to_string()));
+        let blue_hash = hash_prop_equality_key(&PropValue::String("blue".to_string()));
         let mem = engine.active_memtable();
         let eq_state = mem.secondary_eq_state();
         let red_ids = eq_state
@@ -2145,14 +2130,15 @@
             .unwrap()
             .contains(&edge_id));
         let range_state = mem.secondary_range_state();
+        let weight_20 = numeric_range_sort_key_for_value(&PropValue::Int(20)).unwrap();
         assert!(range_state
             .get(&range.index_id)
             .unwrap()
-            .contains(&(20u64 ^ (1u64 << 63), edge_id)));
+            .contains(&(weight_20, edge_id)));
         assert!(!range_state
             .get(&range.index_id)
             .unwrap()
-            .contains(&(10u64 ^ (1u64 << 63), edge_id)));
+            .contains(&(weight_10, edge_id)));
 
         engine.delete_edge(edge_id).unwrap();
         let mem = engine.active_memtable();
@@ -2165,7 +2151,7 @@
         let range_gone = mem
             .secondary_range_state()
             .get(&range.index_id)
-            .is_none_or(|entries| !entries.contains(&(20u64 ^ (1u64 << 63), edge_id)));
+            .is_none_or(|entries| !entries.contains(&(weight_20, edge_id)));
         assert!(range_gone);
 
         engine.close().unwrap();
@@ -2230,7 +2216,7 @@
             )
             .unwrap();
 
-        let score_hash = hash_prop_value(&PropValue::Int(42));
+        let score_hash = hash_prop_equality_key(&PropValue::Int(42));
         let mem = engine.active_memtable();
         let eq_state = mem.secondary_eq_state();
 
@@ -2289,9 +2275,7 @@
             let weight_info = engine
                 .ensure_edge_property_index("RELATES_TO",
                     "weight",
-                    SecondaryIndexKind::Range {
-                        domain: SecondaryIndexRangeDomain::Float,
-                    },
+                    SecondaryIndexKind::Range,
                 )
                 .unwrap();
             let index_ids = (color_info.index_id, weight_info.index_id);
@@ -2318,9 +2302,7 @@
         assert_eq!(weight.prop_key, "weight");
         assert!(matches!(
             weight.kind,
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Float
-            }
+            SecondaryIndexKind::Range
         ));
         assert_eq!(weight.state, SecondaryIndexState::Ready);
 
@@ -2437,9 +2419,7 @@
         let score = engine
             .ensure_node_property_index("Person",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         assert_eq!(color.state, SecondaryIndexState::Building);
@@ -2541,9 +2521,7 @@
         let score = engine
             .ensure_edge_property_index("RELATES_TO",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         assert_eq!(color.state, SecondaryIndexState::Building);
@@ -2605,7 +2583,7 @@
     }
 
     #[test]
-    fn test_node_edge_range_domain_conflict_scoped_to_target() {
+    fn test_node_edge_range_declarations_are_scoped_to_target() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
@@ -2613,18 +2591,14 @@
         engine
             .ensure_node_property_index("Person",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
 
         let edge_range = engine
             .ensure_edge_property_index("RELATES_TO",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Float,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         assert_eq!(edge_range.state, SecondaryIndexState::Building);
@@ -2649,9 +2623,7 @@
             let range = engine
                 .ensure_edge_property_index("RELATES_TO",
                     "weight",
-                    SecondaryIndexKind::Range {
-                        domain: SecondaryIndexRangeDomain::Int,
-                    },
+                    SecondaryIndexKind::Range,
                 )
                 .unwrap();
             eq_index_id = eq.index_id;
@@ -2692,7 +2664,7 @@
 
         let mem = engine.active_memtable();
         let eq_state = mem.secondary_eq_state();
-        let color_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let color_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let eq_ids = eq_state
             .get(&eq_index_id)
             .expect("eq index should exist after WAL recovery")
@@ -2704,7 +2676,8 @@
         let range_entries = range_state
             .get(&range_index_id)
             .expect("range index should exist after WAL recovery");
-        assert!(range_entries.contains(&(42u64 ^ (1u64 << 63), edge_id)));
+        let weight_42 = numeric_range_sort_key_for_value(&PropValue::Int(42)).unwrap();
+        assert!(range_entries.contains(&(weight_42, edge_id)));
 
         engine.close().unwrap();
     }

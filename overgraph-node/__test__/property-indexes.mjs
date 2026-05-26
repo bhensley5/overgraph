@@ -42,7 +42,7 @@ function planHasKind(node, kind) {
 }
 
 async function ensureRangeIndexReady(db, propKey = 'score') {
-  db.ensureNodePropertyIndex('Person', propKey, { kind: 'range', domain: 'int' });
+  db.ensureNodePropertyIndex('Person', propKey, 'range');
   return waitForIndexState(
     db,
     infos => infos.find(info => info.label === 'Person' && info.propKey === propKey && info.kind === 'range')
@@ -73,14 +73,14 @@ describe('node property index APIs', () => {
   });
 
   it('ensures, lists, and drops declared property indexes', async () => {
-    const eq = db.ensureNodePropertyIndex('Person', 'color', { kind: 'equality' });
+    const eq = db.ensureNodePropertyIndex('Person', 'color', 'equality');
     assert.equal(eq.kind, 'equality');
-    assert.equal(eq.domain, undefined);
+    assert.equal('domain' in eq, false);
     assert.equal(eq.state, 'building');
 
-    const range = db.ensureNodePropertyIndex('Person', 'score', { kind: 'range', domain: 'int' });
+    const range = db.ensureNodePropertyIndex('Person', 'score', 'range');
     assert.equal(range.kind, 'range');
-    assert.equal(range.domain, 'int');
+    assert.equal('domain' in range, false);
     assert.equal(range.state, 'building');
 
     await waitForIndexState(
@@ -91,25 +91,20 @@ describe('node property index APIs', () => {
       db,
       infos => infos.find(info => info.label === 'Person' && info.propKey === 'score' && info.kind === 'range')
     );
-    assert.equal(readyRange.domain, 'int');
+    assert.equal('domain' in readyRange, false);
 
     const listed = db.listNodePropertyIndexes();
     assert.equal(listed.length, 2);
     assert.deepEqual(
-      listed.map(info => [info.propKey, info.kind, info.domain ?? null, info.state]).sort(),
+      listed.map(info => [info.propKey, info.kind, 'domain' in info, info.state]).sort(),
       [
-        ['color', 'equality', null, 'ready'],
-        ['score', 'range', 'int', 'ready'],
+        ['color', 'equality', false, 'ready'],
+        ['score', 'range', false, 'ready'],
       ]
     );
 
-    assert.throws(
-      () => db.ensureNodePropertyIndex('Person', 'score', { kind: 'range', domain: 'float' }),
-      /different domain/i
-    );
-
-    assert.equal(db.dropNodePropertyIndex('Person', 'color', { kind: 'equality' }), true);
-    assert.equal(db.dropNodePropertyIndex('Person', 'color', { kind: 'equality' }), false);
+    assert.equal(db.dropNodePropertyIndex('Person', 'color', 'equality'), true);
+    assert.equal(db.dropNodePropertyIndex('Person', 'color', 'equality'), false);
   });
 
   it('runs range queries and paging through the public API', async () => {
@@ -154,49 +149,40 @@ describe('node property index APIs', () => {
     assert.equal(fallback.length, 4);
   });
 
-  it('validates kind and domain inputs at the binding boundary', () => {
+  it('validates kind and range-bound inputs at the binding boundary', () => {
     assert.throws(
-      () => db.ensureNodePropertyIndex('Person', 'score', { kind: 'bogus' }),
+      () => db.ensureNodePropertyIndex('Person', 'score', 'bogus'),
       /Invalid index kind/i
     );
-    assert.throws(
-      () => db.ensureNodePropertyIndex('Person', 'score', { kind: 'range' }),
-      /Range indexes require domain/i
-    );
-    assert.throws(
-      () => db.ensureNodePropertyIndex('Person', 'score', { kind: 'equality', domain: 'int' }),
-      /do not accept a range domain/i
-    );
+    assert.equal(db.ensureNodePropertyIndex('Person', 'score', 'range').kind, 'range');
     assert.throws(
       () => db.findNodesRange('Person', 'score', { value: 10, inclusive: true, domain: 'bogus' }),
-      /Invalid range domain/i
+      /Invalid range value type annotation/i
     );
-    assert.throws(
-      () =>
-        db.findNodesRange('Person',
-          'score',
-          { value: 10, inclusive: true, domain: 'int' },
-          { value: 20, inclusive: true, domain: 'float' }
-        ),
-      /same PropValue variant/i
+    assert.equal(
+      db.findNodesRange('Person',
+        'score',
+        { value: 10, inclusive: true, domain: 'int' },
+        { value: 20, inclusive: true, domain: 'float' }
+      ).length,
+      2
     );
-    assert.throws(
-      () =>
-        db.findNodesRangePaged('Person',
-          'score',
-          { value: 10, inclusive: true, domain: 'int' },
-          { value: 20, inclusive: true, domain: 'int' },
-          {
-            limit: 2,
-            after: { value: 15, nodeId: 1, domain: 'float' },
-          }
-        ),
-      /cursor must use the same PropValue variant/i
+    assert.equal(
+      db.findNodesRangePaged('Person',
+        'score',
+        { value: 10, inclusive: true, domain: 'int' },
+        { value: 20, inclusive: true, domain: 'int' },
+        {
+          limit: 2,
+          after: { value: 15, nodeId: 1, domain: 'float' },
+        }
+      ).items.length,
+      1
     );
   });
 
   it('supports async property index and range APIs', async () => {
-    const asyncEq = await db.ensureNodePropertyIndexAsync('Person', 'temp', { kind: 'equality' });
+    const asyncEq = await db.ensureNodePropertyIndexAsync('Person', 'temp', 'equality');
     assert.equal(asyncEq.kind, 'equality');
     await waitForIndexState(
       db,
@@ -223,7 +209,7 @@ describe('node property index APIs', () => {
     assert.equal(page.items.length, 2);
     assert.equal(page.nextCursor?.domain, 'int');
 
-    assert.equal(await db.dropNodePropertyIndexAsync('Person', 'temp', { kind: 'equality' }), true);
+    assert.equal(await db.dropNodePropertyIndexAsync('Person', 'temp', 'equality'), true);
   });
 });
 
@@ -239,14 +225,14 @@ describe('edge property index APIs', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-edge-prop-index-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
 
-    const eq = db.ensureEdgePropertyIndex('WORKS_AT', 'status', { kind: 'equality' });
+    const eq = db.ensureEdgePropertyIndex('WORKS_AT', 'status', 'equality');
     assert.equal(eq.kind, 'equality');
-    assert.equal(eq.domain, undefined);
+    assert.equal('domain' in eq, false);
     assert.equal(eq.state, 'building');
 
-    const range = db.ensureEdgePropertyIndex('WORKS_AT', 'score', { kind: 'range', domain: 'int' });
+    const range = db.ensureEdgePropertyIndex('WORKS_AT', 'score', 'range');
     assert.equal(range.kind, 'range');
-    assert.equal(range.domain, 'int');
+    assert.equal('domain' in range, false);
     assert.equal(range.state, 'building');
 
     source = db.upsertNode('Person', 'source');
@@ -279,27 +265,14 @@ describe('edge property index APIs', () => {
   it('ensures, lists, validates, and drops declared edge property indexes', () => {
     const listed = db.listEdgePropertyIndexes();
     assert.deepEqual(
-      listed.map(info => [info.propKey, info.kind, info.domain ?? null, info.state]).sort(),
+      listed.map(info => [info.propKey, info.kind, 'domain' in info, info.state]).sort(),
       [
-        ['score', 'range', 'int', 'ready'],
-        ['status', 'equality', null, 'ready'],
+        ['score', 'range', false, 'ready'],
+        ['status', 'equality', false, 'ready'],
       ]
     );
 
-    assert.throws(
-      () => db.ensureEdgePropertyIndex('WORKS_AT', 'score', { kind: 'range', domain: 'float' }),
-      /different domain/i
-    );
-    assert.throws(
-      () => db.ensureEdgePropertyIndex('WORKS_AT', 'score', { kind: 'range' }),
-      /Range indexes require domain/i
-    );
-    assert.throws(
-      () => db.ensureEdgePropertyIndex('WORKS_AT', 'status', { kind: 'equality', domain: 'int' }),
-      /do not accept a range domain/i
-    );
-
-    assert.equal(db.dropEdgePropertyIndex('WORKS_AT', 'missing', { kind: 'equality' }), false);
+    assert.equal(db.dropEdgePropertyIndex('WORKS_AT', 'missing', 'equality'), false);
   });
 
   it('uses edge property indexes from direct edge queries and pattern explain', () => {
@@ -340,8 +313,9 @@ describe('edge property index APIs', () => {
         { alias: 'a', labelFilter: { labels: ['Person'], mode: 'all' } },
         { alias: 'b', labelFilter: { labels: ['Company'], mode: 'all' } },
       ],
-      edges: [
+      pieces: [
         {
+          kind: 'edge',
           alias: 'e',
           fromAlias: 'a',
           toAlias: 'b',
@@ -350,34 +324,41 @@ describe('edge property index APIs', () => {
           filter: { property: 'status', eq: 'hot' },
         },
       ],
+      return: [
+        { expr: { binding: 'a' }, as: 'a' },
+        { expr: { binding: 'b' }, as: 'b' },
+        { expr: { binding: 'e' }, as: 'e' },
+      ],
       limit: 10,
     };
-    assert.deepEqual(db.queryPattern(pattern).matches, [
-      { nodes: { a: source, b: hotTarget }, edges: { e: hotEdge } },
+    assert.deepEqual(db.queryGraphRows(pattern).rows, [
+      { a: source, b: hotTarget, e: hotEdge },
     ]);
-    const patternPlan = db.explainPatternQuery(pattern);
-    assert.ok(planHasKind(patternPlan.root, 'pattern_edge_anchor'));
-    assert.ok(planHasKind(patternPlan.root, 'edge_property_equality_index'));
+    const patternPlan = db.explainGraphRows(pattern);
+    assert.deepEqual(patternPlan.columns, ['a', 'b', 'e']);
+    assert.ok(patternPlan.plan.length > 0);
+    assert.match(JSON.stringify(patternPlan.plan), /EdgePropertyEqualityIndex/);
 
     const rangePattern = {
       ...pattern,
-      edges: [
+      pieces: [
         {
-          ...pattern.edges[0],
+          ...pattern.pieces[0],
           filter: { property: 'score', gte: 80 },
         },
       ],
     };
-    assert.deepEqual(db.queryPattern(rangePattern).matches, [
-      { nodes: { a: source, b: hotTarget }, edges: { e: hotEdge } },
+    assert.deepEqual(db.queryGraphRows(rangePattern).rows, [
+      { a: source, b: hotTarget, e: hotEdge },
     ]);
-    const rangePatternPlan = db.explainPatternQuery(rangePattern);
-    assert.ok(planHasKind(rangePatternPlan.root, 'pattern_edge_anchor'));
-    assert.ok(planHasKind(rangePatternPlan.root, 'edge_property_range_index'));
+    const rangePatternPlan = db.explainGraphRows(rangePattern);
+    assert.deepEqual(rangePatternPlan.columns, ['a', 'b', 'e']);
+    assert.ok(rangePatternPlan.plan.length > 0);
+    assert.match(JSON.stringify(rangePatternPlan.plan), /EdgePropertyRangeIndex/);
   });
 
   it('supports async edge property index APIs', async () => {
-    const asyncEq = await db.ensureEdgePropertyIndexAsync('WORKS_AT', 'temp', { kind: 'equality' });
+    const asyncEq = await db.ensureEdgePropertyIndexAsync('WORKS_AT', 'temp', 'equality');
     assert.equal(asyncEq.kind, 'equality');
     await waitForEdgeIndexState(
       db,
@@ -387,6 +368,6 @@ describe('edge property index APIs', () => {
     const listed = await db.listEdgePropertyIndexesAsync();
     assert.ok(listed.some(info => info.propKey === 'temp' && info.kind === 'equality'));
 
-    assert.equal(await db.dropEdgePropertyIndexAsync('WORKS_AT', 'temp', { kind: 'equality' }), true);
+    assert.equal(await db.dropEdgePropertyIndexAsync('WORKS_AT', 'temp', 'equality'), true);
   });
 });
