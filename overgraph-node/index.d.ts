@@ -128,15 +128,17 @@ export declare class OverGraph {
   queryNodes(request: import('./query-types').QueryNodeRequest): NodePageResult
   queryEdgeIds(request: import('./query-types').QueryEdgeRequest): IdPageResult
   queryEdges(request: import('./query-types').QueryEdgeRequest): EdgePageResult
-  queryPattern(request: import('./query-types').GraphPatternRequest): import('./query-types').QueryPatternResult
+  queryGraphRows(request: import('./query-types').GraphRowRequest): import('./query-types').GraphRowResult
   explainNodeQuery(request: import('./query-types').QueryNodeRequest): import('./query-types').QueryPlan
   explainEdgeQuery(request: import('./query-types').QueryEdgeRequest): import('./query-types').QueryPlan
-  explainPatternQuery(request: import('./query-types').GraphPatternRequest): import('./query-types').QueryPlan
-  ensureNodePropertyIndex(label: string, propKey: string, kind: SecondaryIndexKind): NodePropertyIndexInfo
-  dropNodePropertyIndex(label: string, propKey: string, kind: SecondaryIndexKind): boolean
+  explainGraphRows(request: import('./query-types').GraphRowRequest): import('./query-types').GraphRowExplain
+  executeGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null): import('./query-types').GqlResult
+  explainGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null): import('./query-types').GqlExplain
+  ensureNodePropertyIndex(label: string, propKey: string, kind: string): NodePropertyIndexInfo
+  dropNodePropertyIndex(label: string, propKey: string, kind: string): boolean
   listNodePropertyIndexes(): Array<NodePropertyIndexInfo>
-  ensureEdgePropertyIndex(label: string, propKey: string, kind: SecondaryIndexKind): EdgePropertyIndexInfo
-  dropEdgePropertyIndex(label: string, propKey: string, kind: SecondaryIndexKind): boolean
+  ensureEdgePropertyIndex(label: string, propKey: string, kind: string): EdgePropertyIndexInfo
+  dropEdgePropertyIndex(label: string, propKey: string, kind: string): boolean
   listEdgePropertyIndexes(): Array<EdgePropertyIndexInfo>
   /** Return all node IDs containing every supplied node label (unpaged). */
   nodesByLabels(labels: string | string[]): Float64Array
@@ -218,15 +220,17 @@ export declare class OverGraph {
   queryNodesAsync(request: import('./query-types').QueryNodeRequest): Promise<NodePageResult>
   queryEdgeIdsAsync(request: import('./query-types').QueryEdgeRequest): Promise<IdPageResult>
   queryEdgesAsync(request: import('./query-types').QueryEdgeRequest): Promise<EdgePageResult>
-  queryPatternAsync(request: import('./query-types').GraphPatternRequest): Promise<import('./query-types').QueryPatternResult>
+  queryGraphRowsAsync(request: import('./query-types').GraphRowRequest): Promise<import('./query-types').GraphRowResult>
   explainNodeQueryAsync(request: import('./query-types').QueryNodeRequest): Promise<import('./query-types').QueryPlan>
   explainEdgeQueryAsync(request: import('./query-types').QueryEdgeRequest): Promise<import('./query-types').QueryPlan>
-  explainPatternQueryAsync(request: import('./query-types').GraphPatternRequest): Promise<import('./query-types').QueryPlan>
-  ensureNodePropertyIndexAsync(label: string, propKey: string, kind: SecondaryIndexKind): Promise<NodePropertyIndexInfo>
-  dropNodePropertyIndexAsync(label: string, propKey: string, kind: SecondaryIndexKind): Promise<boolean>
+  explainGraphRowsAsync(request: import('./query-types').GraphRowRequest): Promise<import('./query-types').GraphRowExplain>
+  executeGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null): Promise<import('./query-types').GqlResult>
+  explainGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null): Promise<import('./query-types').GqlExplain>
+  ensureNodePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<NodePropertyIndexInfo>
+  dropNodePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<boolean>
   listNodePropertyIndexesAsync(): Promise<Array<NodePropertyIndexInfo>>
-  ensureEdgePropertyIndexAsync(label: string, propKey: string, kind: SecondaryIndexKind): Promise<EdgePropertyIndexInfo>
-  dropEdgePropertyIndexAsync(label: string, propKey: string, kind: SecondaryIndexKind): Promise<boolean>
+  ensureEdgePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<EdgePropertyIndexInfo>
+  dropEdgePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<boolean>
   listEdgePropertyIndexesAsync(): Promise<Array<EdgePropertyIndexInfo>>
   findNodesRangeAsync(label: string, propKey: string, lower?: PropertyRangeBound | undefined | null, upper?: PropertyRangeBound | undefined | null): Promise<Float64Array>
   findNodesRangePagedAsync(label: string, propKey: string, lower?: PropertyRangeBound | undefined | null, upper?: PropertyRangeBound | undefined | null, options?: FindNodesRangePagedOptions | undefined | null): Promise<PropertyRangePageResult>
@@ -480,7 +484,6 @@ export interface EdgePropertyIndexInfo {
   label: string
   propKey: string
   kind: string
-  domain?: string
   state: string
   lastError?: string
 }
@@ -511,6 +514,23 @@ export interface FindNodesPagedOptions {
 export interface FindNodesRangePagedOptions {
   limit?: number
   after?: PropertyRangeCursor
+}
+
+export interface GqlQueryOptionsInput {
+  allowFullScan?: boolean
+  maxRows?: number
+  cursor?: string
+  maxCursorBytes?: number
+  maxIntermediateBindings?: number
+  maxSkip?: number
+  maxQueryBytes?: number
+  maxParamBytes?: number
+  maxAstDepth?: number
+  maxLiteralItems?: number
+  includePlan?: boolean
+  profile?: boolean
+  compactRows?: boolean
+  includeVectors?: boolean
 }
 
 export interface GraphPatch {
@@ -606,7 +626,6 @@ export interface NodePropertyIndexInfo {
   label: string
   propKey: string
   kind: string
-  domain?: string
   state: string
   lastError?: string
 }
@@ -681,11 +700,6 @@ export interface ScrubReport {
   totalComponentsFailed: number
   totalBytesDigested: number
   durationMs: number
-}
-
-export interface SecondaryIndexKind {
-  kind: string
-  domain?: string
 }
 
 export interface SegmentScrubResult {

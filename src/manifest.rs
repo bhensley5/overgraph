@@ -523,9 +523,7 @@ mod tests {
                         label_id: 2,
                         prop_key: "weight".to_string(),
                     },
-                    kind: crate::types::SecondaryIndexKind::Range {
-                        domain: crate::types::SecondaryIndexRangeDomain::Float,
-                    },
+                    kind: crate::types::SecondaryIndexKind::Range,
                     state: crate::types::SecondaryIndexState::Building,
                     last_error: None,
                 },
@@ -562,9 +560,7 @@ mod tests {
         assert_eq!(loaded.secondary_indexes[1].index_id, 1);
         assert!(matches!(
             loaded.secondary_indexes[1].kind,
-            crate::types::SecondaryIndexKind::Range {
-                domain: crate::types::SecondaryIndexRangeDomain::Float
-            }
+            crate::types::SecondaryIndexKind::Range
         ));
         assert!(matches!(
             &loaded.secondary_indexes[2].target,
@@ -574,5 +570,35 @@ mod tests {
             loaded.secondary_indexes[2].state,
             crate::types::SecondaryIndexState::Ready
         );
+    }
+
+    #[test]
+    fn test_load_manifest_rejects_legacy_domainful_range_index_kind() {
+        let dir = TempDir::new().unwrap();
+        let state = ManifestState {
+            next_secondary_index_id: 2,
+            secondary_indexes: vec![crate::types::SecondaryIndexManifestEntry {
+                index_id: 1,
+                target: crate::types::SecondaryIndexTarget::NodeProperty {
+                    label_id: 1,
+                    prop_key: "score".to_string(),
+                },
+                kind: crate::types::SecondaryIndexKind::Range,
+                state: crate::types::SecondaryIndexState::Ready,
+                last_error: None,
+            }],
+            ..default_manifest()
+        };
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let legacy_json = json.replace(
+            "\"kind\": \"Range\"",
+            "\"kind\": { \"Range\": { \"domain\": \"Int\" } }",
+        );
+        assert_ne!(json, legacy_json);
+        fs::write(dir.path().join(MANIFEST_CURRENT), legacy_json).unwrap();
+
+        assert!(try_load_manifest_file(&dir.path().join(MANIFEST_CURRENT))
+            .unwrap()
+            .is_none());
     }
 }

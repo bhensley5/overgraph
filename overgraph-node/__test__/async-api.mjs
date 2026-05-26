@@ -112,6 +112,26 @@ describe('async upsert + get', () => {
     assert.equal(await db.removeNodeLabelAsync(id, 'Admin'), false);
     assert.deepEqual((await db.getNodeAsync(id)).labels, ['Person']);
   });
+
+  it('queryGraphRowsAsync and explainGraphRowsAsync call graph-row APIs', async () => {
+    const a = await db.upsertNodeAsync('Person', 'graph-row-a', { props: { rank: 1 } });
+    const b = await db.upsertNodeAsync('Person', 'graph-row-b', { props: { rank: 2 } });
+    const edge = await db.upsertEdgeAsync(a, b, 'KNOWS');
+
+    const request = {
+      nodes: [{ alias: 'a', ids: [a] }, { alias: 'b', ids: [b] }],
+      pieces: [{ kind: 'edge', alias: 'r', fromAlias: 'a', toAlias: 'b', labelFilter: ['KNOWS'] }],
+      return: [{ expr: { binding: 'r' }, as: 'r' }],
+      limit: 10,
+    };
+
+    const rows = await db.queryGraphRowsAsync(request);
+    assert.deepEqual(rows.rows, [{ r: edge }]);
+
+    const explain = await db.explainGraphRowsAsync(request);
+    assert.deepEqual(explain.columns, ['r']);
+    assert.equal(explain.projection.outputMode, 'ids');
+  });
 });
 
 describe('async batch upserts', () => {

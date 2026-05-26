@@ -20,9 +20,9 @@
 
 OverGraph is a graph database that runs inside your process. No server, no network calls, no Docker containers. You open a directory, and you have a full graph database with temporal edges, weighted relationships, sub-microsecond lookups, and built-in vector search.
 
-I built it because I wanted a graph database that was genuinely fast. Not "fast for a database," but fast enough that you forget it's there. Node lookups in 34 nanoseconds. Neighbor traversals in 2 microseconds. Batch writes at 1.29M+ nodes per second. And I wanted graph structure and vector similarity to live together in one engine. No separate vector database, no external index, no synchronization headaches.
+It's built to feel like a library, not a service you have to operate. Drive it with function calls when you're building in code, or with GQL if you want a declarative query language. Both are first-class and run on the same engine, so you're picking syntax, not implementations. And it's genuinely fast. Not "fast for a database," but fast enough that you forget it's there. Node lookups land in tens of nanoseconds and batch writes push past a million nodes per second, so the engine stays out of the way of the rest of your stack.
 
-It's written entirely in Rust and ships a native Node.js connector built with napi-rs, so JavaScript and TypeScript applications call the engine in-process without a server or REST layer.
+Graph structure and vector similarity can live in the same engine, so you can ask things like "find similar nodes within 2 hops of X" without bolting a second database onto the side. The core is pure Rust, with native connectors for Node.js and Python so you can call it from whatever you're building in.
 
 ## Built for
 
@@ -42,7 +42,8 @@ It's written entirely in Rust and ships a native Node.js connector built with na
 - **Fast where it matters.** Node lookups in ~34ns. Neighbor traversal in ~2μs. Batch writes at 1.29M+ nodes/sec. The storage engine is a log-structured merge tree with mmap'd immutable segments, so reads never block writes.
 - **Explicit write transactions.** Stage ordered node and edge mutations locally, read your own staged writes, then commit atomically with optimistic conflict detection through the Node.js API.
 - **Native Node.js, one engine.** Rust core with napi-rs bindings. Not a wrapper around a REST API. Actual FFI into the same Rust engine with minimal overhead.
-- **Full queries as functions.** Use regular APIs for everything: `findNodes` for direct property lookups, `queryNodeIds` / `queryNodes` for full boolean node queries, and `queryPattern` for bounded graph pattern matching. No query strings to parse, escape, or generate.
+- **Full queries as functions.** Use regular APIs for direct lookups, full boolean node/edge queries, and `queryGraphRows` for row-shaped graph patterns, optional matches, and bounded paths.
+- **GQL Beta.** Use `executeGql` / `executeGqlAsync` for familiar read-only `MATCH` / `OPTIONAL MATCH` syntax when the query-string form is the more ergonomic fit.
 
 ## Performance
 
@@ -104,9 +105,31 @@ hits.forEach(h => console.log(`node ${h.nodeId} score ${h.score.toFixed(4)}`));
 db.close();
 ```
 
+## GQL Beta
+
+The Node.js connector includes **GQL Beta**: a read-only GQL/Cypher-style interface backed by the same graph-row executor as `queryGraphRows`. It is not full ISO GQL or full Cypher yet, but it supports required matches, `OPTIONAL MATCH`, bounded variable-length paths, path values, continuation cursors, and familiar row results while still running through OverGraph's Rust parser, planner, indexes, caps, and explain output.
+
+```javascript
+const result = db.executeGql(
+  `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
+   WHERE p.status = $status AND r.since >= $minSince
+   RETURN p.name AS person, r.role AS role, c.name AS company
+   ORDER BY r.since DESC
+   LIMIT 10`,
+  { status: 'active', minSince: 2020 },
+  { includePlan: true, profile: true }
+);
+
+console.log(result.rows);
+console.log(result.stats);
+console.log(result.plan?.rowOps);
+```
+
+GQL Beta supports `MATCH`, `OPTIONAL MATCH`, bounded paths, path functions, `WHERE`, `RETURN`, `ORDER BY`, `SKIP` / `OFFSET`, `LIMIT`, params, compact rows, cursors, explain/profile, full-scan opt-in, and vector opt-in for returned node values. See the full [GQL Beta API reference](../docs/api-reference.md#gql-beta) for supported syntax, result shapes, options, examples, and unsupported beta features.
+
 ### Async support
 
-The Node.js connector includes `Async` suffixed variants for every API, such as `upsertNodeAsync`, `queryNodesAsync`, and `vectorSearchAsync`.
+The Node.js connector includes `Async` suffixed variants for every API, such as `upsertNodeAsync`, `queryNodesAsync`, `queryGraphRowsAsync`, `executeGqlAsync`, and `vectorSearchAsync`.
 
 ## Features
 
@@ -137,9 +160,9 @@ The Node.js connector includes `Async` suffixed variants for every API, such as 
 - **Shortest path.** BFS (unweighted) or bidirectional Dijkstra (weighted). `isConnected` for fast reachability checks. `allShortestPaths` when there are ties.
 - **Connected components.** `connectedComponents()` returns a global WCC labelling (union-find, near-linear). `componentOf(node)` returns the members of a single node's component via BFS. Both support edge-label, node-label, and temporal filters.
 - **Degree counts.** Count edges, sum weights, and compute averages without materializing neighbor lists. Batch `degrees` for bulk analysis.
-- **Direct property queries.** `findNodes` and `findNodesPaged` do focused equality lookups. `findNodesRange` and `findNodesRangePaged` do numeric range scans with exact bound and cursor semantics.
-- **Optional property indexes.** Declare node or edge equality/range indexes only where they pay off. Use `ensureNodePropertyIndex` / `ensureEdgePropertyIndex`, list APIs, and drop APIs to manage them. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
-- **Full query APIs.** `queryNodeIds`, `queryNodes`, `queryEdgeIds`, `queryEdges`, `queryPattern`, and explain APIs combine IDs, keys, node label filters (`{ labels, mode: 'any' | 'all' }`), edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, and bounded graph patterns without a query string. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
+- **Direct property queries.** `findNodes` and `findNodesPaged` do focused equality lookups with semantic numeric equality for finite scalars. `findNodesRange` and `findNodesRangePaged` do domainless numeric range scans with exact bound and cursor semantics.
+- **Optional property indexes.** Declare node or edge equality/range indexes only where they pay off. Range indexes cover finite scalar numeric values across signed integers, unsigned integers, and finite floats; non-finite floats and non-numeric values are excluded. Use `ensureNodePropertyIndex` / `ensureEdgePropertyIndex`, list APIs, and drop APIs to manage them. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
+- **Full query APIs.** `queryNodeIds`, `queryNodes`, `queryEdgeIds`, `queryEdges`, `queryGraphRows`, and explain APIs combine IDs, keys, node label filters (`{ labels, mode: 'any' | 'all' }`), edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths. `executeGql` adds GQL Beta for read-only query strings over the same graph-row substrate. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
 - **Time-range queries.** Find nodes created or updated within a time window. Sorted timestamp index for efficient range scans.
 
 ### Pagination
@@ -163,7 +186,7 @@ OverGraph uses a log-structured storage engine purpose-built from scratch in pur
 
 **Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue unblocked against a fresh memtable. Each segment ships with pre-built adjacency indexes (inbound and outbound), optional declared property-index sidecars, optional advisory planner statistics, optional signed degree-delta sidecars for degree/weight fast paths, and, when the segment contains vectors, HNSW and sparse posting-list indexes.
 
-**Read path:** Queries check the memtable first (freshest data), then merge results across immutable segments using the per-segment indexes. Because every segment carries its own adjacency index, a neighbor query is a handful of index lookups, not a scan across sorted keys. Vector search follows the same model: memtable candidates are found by exact brute-force scan, segment candidates via HNSW or posting-list indexes, then the engine merges and deduplicates across all sources. Property equality and numeric range queries stay index-transparent too: if a matching optional property-index declaration is `Ready`, the engine uses the declaration-backed path, otherwise it falls back to a label-scoped scan through the same public API. Pagination uses early termination to avoid unnecessary work.
+**Read path:** Queries check the memtable first (freshest data), then merge results across immutable segments using the per-segment indexes. Because every segment carries its own adjacency index, a neighbor query is a handful of index lookups, not a scan across sorted keys. Vector search follows the same model: memtable candidates are found by exact brute-force scan, segment candidates via HNSW or posting-list indexes, then the engine merges and deduplicates across all sources. Property equality and domainless numeric range queries stay index-transparent too: if a matching optional property-index declaration is `Ready`, the engine uses the declaration-backed path, otherwise it falls back to a label-scoped scan through the same public API. Pagination uses early termination to avoid unnecessary work, and index candidates are verified against the latest visible records before results are returned.
 
 **Compaction:** A background thread merges older segments together, applying tombstones, prune policies, and deduplication. The compaction path uses packed metadata payloads to plan merges and raw-copies winning records without full deserialization, then rebuilds unified indexes from metadata. This includes rebuilding HNSW and sparse posting-list indexes for the merged output. Fewer segments after compaction means fewer index lookups per query, but even before compaction, reads are fast because every segment is self-indexed.
 
@@ -199,7 +222,7 @@ For a deeper dive, see the [architecture overview](../docs/architecture-overview
 
 - **[overgraph.io/docs](https://overgraph.io/docs)** - full documentation, getting started guide, and API reference.
 - **[API Reference](../docs/api-reference.md)** - every Node.js method, parameter, type, and return value.
-- **[Roadmap](../docs/roadmap.md)** - where OverGraph is headed and what's already shipped.
+- **[Roadmap](../ROADMAP.md)** - where OverGraph is headed and what's already shipped.
 
 ## Running the benchmarks
 

@@ -1,6 +1,6 @@
 {
   "name": "overgraph",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "An absurdly fast embedded graph database for Node.js. Sub-microsecond reads, pure Rust core.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -28,7 +28,7 @@
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Bhensley5/overgraph.git",
+    "url": "git+https://github.com/bhensley5/overgraph.git",
     "directory": "overgraph-node"
   },
   "homepage": "https://overgraph.io",

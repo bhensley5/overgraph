@@ -9,13 +9,17 @@ use crate::dense_hnsw::{
 use crate::dense_hnsw::{DENSE_HNSW_GRAPH_FILENAME, DENSE_HNSW_META_FILENAME};
 use crate::edge_metadata::EdgeMetadataIndexEntries;
 use crate::error::EngineError;
-use crate::memtable::{encode_range_prop_value, AdjEntry, Memtable};
+use crate::memtable::{AdjEntry, Memtable};
 use crate::parallel::{engine_cpu_join, engine_cpu_try_join};
 use crate::planner_stats::{
     assemble_compaction_stats_from_partials, assemble_flush_stats_from_partials,
     build_compaction_stats_core_partial, build_flush_stats_core_partial,
     equality_index_stats_from_written_groups, planner_stats_sidecar_payload,
-    range_index_stats_from_written_entries, DeclaredIndexStatsEvidence, PLANNER_STATS_FILENAME,
+    range_index_stats_from_written_entries, DeclaredIndexStatsEvidence,
+    PlannerStatsDeclaredIndexTarget, PLANNER_STATS_FILENAME,
+};
+use crate::property_value_semantics::{
+    hash_prop_equality_key, numeric_range_sort_key_for_value, NumericRangeSortKey,
 };
 use crate::segment_components::{
     component_build_fingerprint, component_id, decode_identity_header, decode_manifest_envelope,
@@ -230,13 +234,13 @@ fn partition_secondary_indexes(
             (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Equality) => {
                 partitions.node_eq.push(entry);
             }
-            (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range { .. }) => {
+            (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range) => {
                 partitions.node_range.push(entry);
             }
             (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Equality) => {
                 partitions.edge_eq.push(entry);
             }
-            (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range { .. }) => {
+            (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
                 partitions.edge_range.push(entry);
             }
         }
@@ -739,7 +743,7 @@ fn secondary_index_component_kind_for_entry(
                 index_id: entry.index_id,
             }
         }
-        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range { .. }) => {
+        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range) => {
             SegmentComponentKind::NodePropertyRangeIndex {
                 index_id: entry.index_id,
             }
@@ -749,7 +753,7 @@ fn secondary_index_component_kind_for_entry(
                 index_id: entry.index_id,
             }
         }
-        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range { .. }) => {
+        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
             SegmentComponentKind::EdgePropertyRangeIndex {
                 index_id: entry.index_id,
             }
@@ -765,7 +769,7 @@ fn secondary_index_base_relative_path_for_entry(entry: &SecondaryIndexManifestEn
                 SECONDARY_INDEX_DIRNAME, entry.index_id
             )
         }
-        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range { .. }) => {
+        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range) => {
             format!(
                 "{}/node_prop_range_{}.dat",
                 SECONDARY_INDEX_DIRNAME, entry.index_id
@@ -777,7 +781,7 @@ fn secondary_index_base_relative_path_for_entry(entry: &SecondaryIndexManifestEn
                 SECONDARY_INDEX_DIRNAME, entry.index_id
             )
         }
-        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range { .. }) => {
+        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
             format!(
                 "{}/edge_prop_range_{}.dat",
                 SECONDARY_INDEX_DIRNAME, entry.index_id
@@ -878,7 +882,7 @@ pub(crate) fn maintained_secondary_index_ids_from_component_records(
                 SecondaryIndexKind::Equality => {
                     maintained.equality_index_ids.insert(entry.index_id);
                 }
-                SecondaryIndexKind::Range { .. } => {
+                SecondaryIndexKind::Range => {
                     maintained.range_index_ids.insert(entry.index_id);
                 }
             }
@@ -915,6 +919,22 @@ fn manifested_component_path(seg_dir: &Path, kind: &SegmentComponentKind) -> Opt
 
 pub(crate) fn component_fingerprint(namespace: &str, fields: &[u64]) -> u64 {
     component_build_fingerprint(SEGMENT_FORMAT_VERSION, namespace, fields)
+}
+
+pub(crate) fn node_property_equality_component_fingerprint(index_id: u64) -> u64 {
+    component_fingerprint("semantic.node_prop_eq.v2", &[index_id])
+}
+
+pub(crate) fn edge_property_equality_component_fingerprint(index_id: u64) -> u64 {
+    component_fingerprint("semantic.edge_prop_eq.v2", &[index_id])
+}
+
+pub(crate) fn node_property_range_component_fingerprint(index_id: u64) -> u64 {
+    component_fingerprint("semantic.node_prop_range.v2", &[index_id])
+}
+
+pub(crate) fn edge_property_range_component_fingerprint(index_id: u64) -> u64 {
+    component_fingerprint("semantic.edge_prop_range.v2", &[index_id])
 }
 
 pub(crate) fn planner_stats_component_dependencies(
@@ -1679,7 +1699,7 @@ fn write_flush_declared_equality_components(
             },
             ComponentTrustClass::OptionalCandidateIndex,
             dependencies,
-            component_fingerprint("flush.node_prop_eq", &[entry.index_id]),
+            node_property_equality_component_fingerprint(entry.index_id),
             |writer| write_node_prop_eq_sidecar_payload(writer, &groups),
         )?;
         records.push(record);
@@ -1708,7 +1728,7 @@ fn write_flush_declared_range_components(
     let secondary_range_state = memtable.secondary_range_state();
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in range_entries {
-        let sidecar_entries: Vec<(u64, u64)> = secondary_range_state
+        let sidecar_entries: Vec<(NumericRangeSortKey, u64)> = secondary_range_state
             .get(&entry.index_id)
             .map(|entries| entries.iter().copied().collect())
             .unwrap_or_default();
@@ -1734,7 +1754,7 @@ fn write_flush_declared_range_components(
             },
             ComponentTrustClass::OptionalCandidateIndex,
             dependencies,
-            component_fingerprint("flush.node_prop_range", &[entry.index_id]),
+            node_property_range_component_fingerprint(entry.index_id),
             |writer| write_node_prop_range_sidecar_payload(writer, &sidecar_entries),
         )?;
         records.push(record);
@@ -1869,7 +1889,7 @@ fn write_flush_declared_edge_equality_components(
             },
             ComponentTrustClass::OptionalCandidateIndex,
             dependencies,
-            component_fingerprint("flush.edge_prop_eq", &[entry.index_id]),
+            edge_property_equality_component_fingerprint(entry.index_id),
             |writer| write_node_prop_eq_sidecar_payload(writer, &groups),
         )?;
         records.push(record);
@@ -1898,7 +1918,7 @@ fn write_flush_declared_edge_range_components(
     let secondary_range_state = memtable.secondary_range_state();
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in range_entries {
-        let sidecar_entries: Vec<(u64, u64)> = secondary_range_state
+        let sidecar_entries: Vec<(NumericRangeSortKey, u64)> = secondary_range_state
             .get(&entry.index_id)
             .map(|entries| entries.iter().copied().collect())
             .unwrap_or_default();
@@ -1924,7 +1944,7 @@ fn write_flush_declared_edge_range_components(
             },
             ComponentTrustClass::OptionalCandidateIndex,
             dependencies,
-            component_fingerprint("flush.edge_prop_range", &[entry.index_id]),
+            edge_property_range_component_fingerprint(entry.index_id),
             |writer| write_node_prop_range_sidecar_payload(writer, &sidecar_entries),
         )?;
         records.push(record);
@@ -2216,7 +2236,7 @@ pub(crate) fn publish_node_prop_eq_sidecar_component(
         },
         ComponentTrustClass::OptionalCandidateIndex,
         dependencies,
-        component_fingerprint("flush.node_prop_eq", &[entry.index_id]),
+        node_property_equality_component_fingerprint(entry.index_id),
         |writer| write_node_prop_eq_sidecar_payload(writer, groups),
     )
 }
@@ -2249,7 +2269,7 @@ fn write_node_prop_eq_sidecar_payload(
 #[cfg(test)]
 pub(crate) fn write_node_prop_range_sidecar_to_path(
     path: &Path,
-    entries: &[(u64, u64)],
+    entries: &[(NumericRangeSortKey, u64)],
 ) -> Result<(), EngineError> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -2262,7 +2282,7 @@ pub(crate) fn write_node_prop_range_sidecar_to_path(
 pub(crate) fn publish_node_prop_range_sidecar_component(
     seg_dir: &Path,
     entry: &SecondaryIndexManifestEntry,
-    entries: &[(u64, u64)],
+    entries: &[(NumericRangeSortKey, u64)],
 ) -> Result<(), EngineError> {
     let manifest = read_segment_component_manifest(seg_dir)?;
     let source_groups = segment_source_groups_from_records(
@@ -2292,7 +2312,7 @@ pub(crate) fn publish_node_prop_range_sidecar_component(
         },
         ComponentTrustClass::OptionalCandidateIndex,
         dependencies,
-        component_fingerprint("flush.node_prop_range", &[entry.index_id]),
+        node_property_range_component_fingerprint(entry.index_id),
         |writer| write_node_prop_range_sidecar_payload(writer, entries),
     )
 }
@@ -2330,7 +2350,7 @@ pub(crate) fn publish_edge_prop_eq_sidecar_component(
         },
         ComponentTrustClass::OptionalCandidateIndex,
         dependencies,
-        component_fingerprint("build.edge_prop_eq", &[entry.index_id]),
+        edge_property_equality_component_fingerprint(entry.index_id),
         |writer| write_node_prop_eq_sidecar_payload(writer, groups),
     )
 }
@@ -2338,7 +2358,7 @@ pub(crate) fn publish_edge_prop_eq_sidecar_component(
 pub(crate) fn publish_edge_prop_range_sidecar_component(
     seg_dir: &Path,
     entry: &SecondaryIndexManifestEntry,
-    entries: &[(u64, u64)],
+    entries: &[(NumericRangeSortKey, u64)],
 ) -> Result<(), EngineError> {
     let manifest = read_segment_component_manifest(seg_dir)?;
     let source_groups = segment_source_groups_from_records(
@@ -2368,18 +2388,18 @@ pub(crate) fn publish_edge_prop_range_sidecar_component(
         },
         ComponentTrustClass::OptionalCandidateIndex,
         dependencies,
-        component_fingerprint("build.edge_prop_range", &[entry.index_id]),
+        edge_property_range_component_fingerprint(entry.index_id),
         |writer| write_node_prop_range_sidecar_payload(writer, entries),
     )
 }
 
 fn write_node_prop_range_sidecar_payload(
     mut writer: &mut impl Write,
-    entries: &[(u64, u64)],
+    entries: &[(NumericRangeSortKey, u64)],
 ) -> Result<(), EngineError> {
     write_u64(&mut writer, entries.len() as u64)?;
     for &(encoded_value, node_id) in entries {
-        write_u64(&mut writer, encoded_value)?;
+        writer.write_all(&encoded_value.as_bytes())?;
         write_u64(&mut writer, node_id)?;
     }
     Ok(())
@@ -4592,6 +4612,10 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
                                             &partitions.edge_eq,
                                             source_groups,
                                         )?;
+                                    let mut report = SecondaryIndexMaintenanceReport::default();
+                                    report
+                                        .failed_equality_indexes
+                                        .extend(edge_eq_outcome.report.failed_equality_indexes);
                                     let mut declared_evidence = edge_eq_outcome.stats_evidence;
                                     external_records.extend(edge_eq_outcome.records);
                                     let edge_range_outcome =
@@ -4603,18 +4627,24 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
                                             &partitions.edge_range,
                                             source_groups,
                                         )?;
+                                    report
+                                        .failed_range_indexes
+                                        .extend(edge_range_outcome.report.failed_range_indexes);
                                     declared_evidence.extend(edge_range_outcome.stats_evidence);
                                     declared_evidence.sort();
                                     external_records.extend(edge_range_outcome.records);
-                                    Ok(FlushEdgeIndexOutput {
-                                        adj_out,
-                                        adj_in,
-                                        edge_label_index,
-                                        edge_triple_index,
-                                        edge_metadata_indexes,
-                                        external_records,
-                                        declared_evidence,
-                                    })
+                                    Ok((
+                                        FlushEdgeIndexOutput {
+                                            adj_out,
+                                            adj_in,
+                                            edge_label_index,
+                                            edge_triple_index,
+                                            edge_metadata_indexes,
+                                            external_records,
+                                            declared_evidence,
+                                        },
+                                        report,
+                                    ))
                                 },
                             )
                         },
@@ -4635,7 +4665,13 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
         || build_compaction_stats_core_partial(segments, node_metas, edge_metas, secondary_indexes),
     );
     let (indexes_result, built_hnsw) = index_result?;
-    let (((node_output, report), edge_output), sparse_records) = indexes_result;
+    let (((node_output, mut report), (edge_output, edge_report)), sparse_records) = indexes_result;
+    report
+        .failed_equality_indexes
+        .extend(edge_report.failed_equality_indexes);
+    report
+        .failed_range_indexes
+        .extend(edge_report.failed_range_indexes);
     let dense_records = write_compaction_prebuilt_dense_hnsw_components(
         seg_dir,
         segment_id,
@@ -4815,6 +4851,39 @@ fn build_secondary_eq_groups_from_source_sidecars(
     Ok(groups)
 }
 
+fn build_edge_secondary_eq_groups_from_source_sidecars(
+    segments: &[Arc<SegmentReader>],
+    edge_metas: &[CompactEdgeMeta],
+    entry: &SecondaryIndexManifestEntry,
+    target_label_id: u32,
+) -> Result<BTreeMap<u64, Vec<u64>>, EngineError> {
+    let winner_sources: HashMap<u64, usize> = edge_metas
+        .iter()
+        .filter(|meta| meta.label_id == target_label_id)
+        .map(|meta| (meta.edge_id, meta.src_seg_idx))
+        .collect();
+    let mut groups: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        seg.for_each_declared_secondary_eq_group(entry, |value_hash, ids| {
+            let group = groups.entry(value_hash).or_default();
+            for &edge_id in ids {
+                if winner_sources.get(&edge_id) == Some(&seg_idx) {
+                    group.push(edge_id);
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    for ids in groups.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+
+    Ok(groups)
+}
+
 fn build_secondary_eq_groups_from_targeted_decode(
     segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
@@ -4833,7 +4902,7 @@ fn build_secondary_eq_groups_from_targeted_decode(
             prop_key,
         )? {
             groups
-                .entry(hash_prop_value(&value))
+                .entry(hash_prop_equality_key(&value))
                 .or_default()
                 .push(meta.node_id);
         }
@@ -4864,7 +4933,7 @@ fn build_secondary_range_entries_from_source_sidecars(
     node_metas: &[CompactNodeMeta],
     index_id: u64,
     target_label_id: u32,
-) -> Result<Vec<(u64, u64)>, EngineError> {
+) -> Result<Vec<(NumericRangeSortKey, u64)>, EngineError> {
     let winner_sources: HashMap<u64, usize> = node_metas
         .iter()
         .filter(|meta| meta.label_ids.contains(target_label_id))
@@ -4886,13 +4955,39 @@ fn build_secondary_range_entries_from_source_sidecars(
     Ok(entries)
 }
 
+fn build_edge_secondary_range_entries_from_source_sidecars(
+    segments: &[Arc<SegmentReader>],
+    edge_metas: &[CompactEdgeMeta],
+    entry: &SecondaryIndexManifestEntry,
+    target_label_id: u32,
+) -> Result<Vec<(NumericRangeSortKey, u64)>, EngineError> {
+    let winner_sources: HashMap<u64, usize> = edge_metas
+        .iter()
+        .filter(|meta| meta.label_id == target_label_id)
+        .map(|meta| (meta.edge_id, meta.src_seg_idx))
+        .collect();
+    let mut entries = Vec::new();
+
+    for (seg_idx, seg) in segments.iter().enumerate() {
+        seg.for_each_declared_secondary_range_entry(entry, |encoded_value, edge_id| {
+            if winner_sources.get(&edge_id) == Some(&seg_idx) {
+                entries.push((encoded_value, edge_id));
+            }
+            Ok(())
+        })?;
+    }
+
+    entries.sort_unstable();
+    entries.dedup();
+    Ok(entries)
+}
+
 fn build_secondary_range_entries_from_targeted_decode(
     segments: &[Arc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     target_label_id: u32,
     prop_key: &str,
-    domain: SecondaryIndexRangeDomain,
-) -> Result<Vec<(u64, u64)>, EngineError> {
+) -> Result<Vec<(NumericRangeSortKey, u64)>, EngineError> {
     let mut entries = Vec::new();
 
     for meta in node_metas
@@ -4907,7 +5002,7 @@ fn build_secondary_range_entries_from_targeted_decode(
         else {
             continue;
         };
-        let Some(encoded_value) = encode_range_prop_value(domain, &value) else {
+        let Some(encoded_value) = numeric_range_sort_key_for_value(&value) else {
             continue;
         };
         entries.push((encoded_value, meta.node_id));
@@ -4933,7 +5028,7 @@ fn build_edge_secondary_eq_groups_from_targeted_decode(
             prop_key,
         )? {
             groups
-                .entry(hash_prop_value(&value))
+                .entry(hash_prop_equality_key(&value))
                 .or_default()
                 .push(meta.edge_id);
         }
@@ -4952,8 +5047,7 @@ fn build_edge_secondary_range_entries_from_targeted_decode(
     edge_metas: &[CompactEdgeMeta],
     label_id: u32,
     prop_key: &str,
-    domain: SecondaryIndexRangeDomain,
-) -> Result<Vec<(u64, u64)>, EngineError> {
+) -> Result<Vec<(NumericRangeSortKey, u64)>, EngineError> {
     let mut entries = Vec::new();
 
     for meta in edge_metas.iter().filter(|meta| meta.label_id == label_id) {
@@ -4965,7 +5059,7 @@ fn build_edge_secondary_range_entries_from_targeted_decode(
         else {
             continue;
         };
-        let Some(encoded_value) = encode_range_prop_value(domain, &value) else {
+        let Some(encoded_value) = numeric_range_sort_key_for_value(&value) else {
             continue;
         };
         entries.push((encoded_value, meta.edge_id));
@@ -5003,7 +5097,10 @@ fn write_declared_equality_sidecars_from_metadata(
         } else {
             let mut all_present = true;
             for seg in segments {
-                match seg.validate_secondary_eq_sidecar_uncached(entry.index_id) {
+                match seg.secondary_eq_sidecar_lightweight_available_for_target(
+                    entry.index_id,
+                    PlannerStatsDeclaredIndexTarget::NodeProperty,
+                ) {
                     Ok(true) => {}
                     Ok(false) => {
                         if entry.state == SecondaryIndexState::Ready {
@@ -5071,7 +5168,7 @@ fn write_declared_equality_sidecars_from_metadata(
             },
             ComponentTrustClass::OptionalCandidateIndex,
             dependencies,
-            component_fingerprint("flush.node_prop_eq", &[entry.index_id]),
+            node_property_equality_component_fingerprint(entry.index_id),
             |writer| write_node_prop_eq_sidecar_payload(writer, &groups),
         )?;
         outcome.records.push(record);
@@ -5108,9 +5205,9 @@ fn write_declared_range_sidecars_from_metadata(
         let SecondaryIndexTarget::NodeProperty { label_id, prop_key } = &entry.target else {
             continue;
         };
-        let SecondaryIndexKind::Range { domain } = entry.kind else {
+        if !matches!(&entry.kind, SecondaryIndexKind::Range) {
             continue;
-        };
+        }
         let mut failure_message = None;
         let use_source_sidecars = if entry.state == SecondaryIndexState::Failed {
             false
@@ -5152,7 +5249,7 @@ fn write_declared_range_sidecars_from_metadata(
             )?
         } else {
             build_secondary_range_entries_from_targeted_decode(
-                segments, node_metas, *label_id, prop_key, domain,
+                segments, node_metas, *label_id, prop_key,
             )?
         };
 
@@ -5185,7 +5282,7 @@ fn write_declared_range_sidecars_from_metadata(
             },
             ComponentTrustClass::OptionalCandidateIndex,
             dependencies,
-            component_fingerprint("flush.node_prop_range", &[entry.index_id]),
+            node_property_range_component_fingerprint(entry.index_id),
             |writer| write_node_prop_range_sidecar_payload(writer, &sidecar_entries),
         )?;
         outcome.records.push(record);
@@ -5225,9 +5322,57 @@ fn write_declared_edge_equality_sidecars_from_metadata(
         let SecondaryIndexTarget::EdgeProperty { label_id, prop_key } = &entry.target else {
             continue;
         };
-        let groups = build_edge_secondary_eq_groups_from_targeted_decode(
-            segments, edge_metas, *label_id, prop_key,
-        )?;
+        let mut failure_message = None;
+        let use_source_sidecars = if entry.state == SecondaryIndexState::Failed {
+            false
+        } else {
+            let mut all_present = true;
+            for seg in segments {
+                match seg.secondary_eq_sidecar_lightweight_available_for_target(
+                    entry.index_id,
+                    PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if entry.state == SecondaryIndexState::Ready {
+                            let kind = SegmentComponentKind::EdgePropertyEqualityIndex {
+                                index_id: entry.index_id,
+                            };
+                            if let Some(reason) = sidecar_unavailable_failure_reason(seg, kind) {
+                                failure_message = Some(reason);
+                            }
+                        }
+                        all_present = false;
+                        break;
+                    }
+                    Err(error) => {
+                        all_present = false;
+                        if entry.state == SecondaryIndexState::Ready {
+                            failure_message = Some(error.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+            all_present
+        };
+
+        let groups = if use_source_sidecars {
+            build_edge_secondary_eq_groups_from_source_sidecars(
+                segments, edge_metas, entry, *label_id,
+            )?
+        } else {
+            build_edge_secondary_eq_groups_from_targeted_decode(
+                segments, edge_metas, *label_id, prop_key,
+            )?
+        };
+
+        if let Some(message) = failure_message {
+            outcome
+                .report
+                .failed_equality_indexes
+                .push((entry.index_id, message));
+        }
         let dependencies = vec![
             source_group_dependency(
                 SegmentSourceGroupKind::EdgeSource,
@@ -5250,7 +5395,7 @@ fn write_declared_edge_equality_sidecars_from_metadata(
             },
             ComponentTrustClass::OptionalCandidateIndex,
             dependencies,
-            component_fingerprint("compaction.edge_prop_eq", &[entry.index_id]),
+            edge_property_equality_component_fingerprint(entry.index_id),
             |writer| write_node_prop_eq_sidecar_payload(writer, &groups),
         )?;
         outcome.records.push(record);
@@ -5287,12 +5432,59 @@ fn write_declared_edge_range_sidecars_from_metadata(
         let SecondaryIndexTarget::EdgeProperty { label_id, prop_key } = &entry.target else {
             continue;
         };
-        let SecondaryIndexKind::Range { domain } = entry.kind else {
+        if !matches!(&entry.kind, SecondaryIndexKind::Range) {
             continue;
+        }
+        let mut failure_message = None;
+        let use_source_sidecars = if entry.state == SecondaryIndexState::Failed {
+            false
+        } else {
+            let mut all_present = true;
+            for seg in segments {
+                match seg.validate_secondary_range_sidecar_for_target(
+                    entry.index_id,
+                    PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if entry.state == SecondaryIndexState::Ready {
+                            let kind = SegmentComponentKind::EdgePropertyRangeIndex {
+                                index_id: entry.index_id,
+                            };
+                            if let Some(reason) = sidecar_unavailable_failure_reason(seg, kind) {
+                                failure_message = Some(reason);
+                            }
+                        }
+                        all_present = false;
+                        break;
+                    }
+                    Err(error) => {
+                        all_present = false;
+                        if entry.state == SecondaryIndexState::Ready {
+                            failure_message = Some(error.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+            all_present
         };
-        let sidecar_entries = build_edge_secondary_range_entries_from_targeted_decode(
-            segments, edge_metas, *label_id, prop_key, domain,
-        )?;
+
+        let sidecar_entries = if use_source_sidecars {
+            build_edge_secondary_range_entries_from_source_sidecars(
+                segments, edge_metas, entry, *label_id,
+            )?
+        } else {
+            build_edge_secondary_range_entries_from_targeted_decode(
+                segments, edge_metas, *label_id, prop_key,
+            )?
+        };
+        if let Some(message) = failure_message {
+            outcome
+                .report
+                .failed_range_indexes
+                .push((entry.index_id, message));
+        }
         let dependencies = vec![
             source_group_dependency(
                 SegmentSourceGroupKind::EdgeSource,
@@ -5315,7 +5507,7 @@ fn write_declared_edge_range_sidecars_from_metadata(
             },
             ComponentTrustClass::OptionalCandidateIndex,
             dependencies,
-            component_fingerprint("compaction.edge_prop_range", &[entry.index_id]),
+            edge_property_range_component_fingerprint(entry.index_id),
             |writer| write_node_prop_range_sidecar_payload(writer, &sidecar_entries),
         )?;
         outcome.records.push(record);
@@ -5656,6 +5848,7 @@ fn sort_sparse_posting_groups(
 mod tests {
     use super::*;
     use crate::degree_cache::DegreeDelta;
+    use crate::property_value_semantics::NUMERIC_RANGE_KEY_BYTES;
     use std::sync::Arc;
 
     fn write_segment(
@@ -6007,15 +6200,97 @@ mod tests {
         groups
     }
 
-    fn read_secondary_range_entries(seg_dir: &Path, kind: SegmentComponentKind) -> Vec<(u64, u64)> {
+    fn rewrite_eq_sidecar_as_old_raw_hash(
+        seg_dir: &Path,
+        kind: SegmentComponentKind,
+        old_build_fingerprint: u64,
+        groups: &BTreeMap<u64, Vec<u64>>,
+    ) {
+        let mut payload = Vec::new();
+        write_node_prop_eq_sidecar_payload(&mut payload, groups).unwrap();
+        let payload_digest: [u8; 32] = Sha256::digest(&payload).into();
+
+        let mut manifest = read_segment_component_manifest(seg_dir).unwrap();
+        let segment_id = manifest.segment_id;
+        let (relative_path, payload_offset, payload_len, header) = {
+            let record = manifest
+                .components
+                .iter_mut()
+                .find(|record| record.kind == kind)
+                .unwrap_or_else(|| panic!("missing component {:?}", kind));
+            let ComponentHandleV1::ExternalFile {
+                relative_path,
+                payload_offset,
+                payload_len,
+            } = &mut record.handle
+            else {
+                panic!("equality sidecar should be external");
+            };
+
+            record.payload_len = payload.len() as u64;
+            *payload_len = record.payload_len;
+            record.payload_digest = Some(payload_digest);
+            record.build_fingerprint = old_build_fingerprint;
+            record.component_id = component_id(
+                segment_id,
+                &record.kind,
+                record.logical_format_version,
+                record.payload_len,
+                record.payload_digest.as_ref(),
+                &record.dependency_digest,
+                record.build_fingerprint,
+            );
+            let header = ComponentIdentityHeaderV1 {
+                segment_format_version: SEGMENT_FORMAT_VERSION,
+                segment_id,
+                component_kind: record.kind.clone(),
+                logical_format_version: record.logical_format_version,
+                created_generation: record.created_generation,
+                payload_offset: *payload_offset,
+                payload_len: record.payload_len,
+                component_id: record.component_id,
+                dependency_digest: record.dependency_digest,
+                build_fingerprint: record.build_fingerprint,
+                payload_digest: record.payload_digest,
+            };
+            (relative_path.clone(), *payload_offset, *payload_len, header)
+        };
+
+        let path = seg_dir.join(relative_path);
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let header_bytes = encode_identity_header(&header);
+        assert_eq!(header_bytes.len(), COMPONENT_IDENTITY_HEADER_LEN);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.seek(SeekFrom::Start(payload_offset)).unwrap();
+        file.write_all(&payload).unwrap();
+        assert_eq!(payload_len as usize, payload.len());
+        file.sync_all().unwrap();
+
+        write_segment_component_manifest(seg_dir, &manifest).unwrap();
+    }
+
+    fn read_secondary_range_entries(
+        seg_dir: &Path,
+        kind: SegmentComponentKind,
+    ) -> Vec<(NumericRangeSortKey, u64)> {
         let payload = read_manifest_component_payload(seg_dir, kind);
         let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
         (0..count)
             .map(|index| {
-                let off = 8 + index * 16;
+                let off = 8 + index * 32;
                 (
-                    u64::from_le_bytes(payload[off..off + 8].try_into().unwrap()),
-                    u64::from_le_bytes(payload[off + 8..off + 16].try_into().unwrap()),
+                    NumericRangeSortKey::from_sidecar_bytes(
+                        payload[off..off + NUMERIC_RANGE_KEY_BYTES]
+                            .try_into()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                    u64::from_le_bytes(
+                        payload[off + NUMERIC_RANGE_KEY_BYTES..off + NUMERIC_RANGE_KEY_BYTES + 8]
+                            .try_into()
+                            .unwrap(),
+                    ),
                 )
             })
             .collect()
@@ -8040,8 +8315,8 @@ mod tests {
         let reader =
             SegmentReader::open_with_info(&seg_dir, &info, None, std::slice::from_ref(&entry))
                 .unwrap();
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
-        let green_hash = hash_prop_value(&PropValue::String("green".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
+        let green_hash = hash_prop_equality_key(&PropValue::String("green".to_string()));
 
         let mut reds = reader
             .find_nodes_by_secondary_eq_index(entry.index_id, red_hash)
@@ -8098,9 +8373,7 @@ mod tests {
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Building,
             last_error: None,
         };
@@ -8144,7 +8417,7 @@ mod tests {
         ));
         assert_eq!(
             eq_record.build_fingerprint,
-            component_fingerprint("flush.edge_prop_eq", &[eq_entry.index_id])
+            edge_property_equality_component_fingerprint(eq_entry.index_id)
         );
         assert!(eq_record.dependencies.iter().any(|dependency| {
             matches!(
@@ -8179,8 +8452,8 @@ mod tests {
                 index_id: eq_entry.index_id,
             },
         );
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
-        let blue_hash = hash_prop_value(&PropValue::String("blue".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
+        let blue_hash = hash_prop_equality_key(&PropValue::String("blue".to_string()));
         let eq_count = u64::from_le_bytes(eq_payload[0..8].try_into().unwrap()) as usize;
         let mut eq_groups = BTreeMap::new();
         for index in 0..eq_count {
@@ -8217,16 +8490,35 @@ mod tests {
         let range_count = u64::from_le_bytes(range_payload[0..8].try_into().unwrap()) as usize;
         let range_entries = (0..range_count)
             .map(|index| {
-                let off = 8 + index * 16;
+                let off = 8 + index * 32;
                 (
-                    u64::from_le_bytes(range_payload[off..off + 8].try_into().unwrap()),
-                    u64::from_le_bytes(range_payload[off + 8..off + 16].try_into().unwrap()),
+                    NumericRangeSortKey::from_sidecar_bytes(
+                        range_payload[off..off + NUMERIC_RANGE_KEY_BYTES]
+                            .try_into()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                    u64::from_le_bytes(
+                        range_payload
+                            [off + NUMERIC_RANGE_KEY_BYTES..off + NUMERIC_RANGE_KEY_BYTES + 8]
+                            .try_into()
+                            .unwrap(),
+                    ),
                 )
             })
             .collect::<Vec<_>>();
         assert_eq!(
             range_entries,
-            vec![(10u64 ^ (1u64 << 63), 10), (20u64 ^ (1u64 << 63), 11)]
+            vec![
+                (
+                    numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap(),
+                    10
+                ),
+                (
+                    numeric_range_sort_key_for_value(&PropValue::Int(20)).unwrap(),
+                    11
+                )
+            ]
         );
     }
 
@@ -8277,9 +8569,7 @@ mod tests {
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Building,
             last_error: None,
         };
@@ -8324,7 +8614,7 @@ mod tests {
             .expect("compacted edge equality sidecar record");
         assert_eq!(
             eq_record.build_fingerprint,
-            component_fingerprint("compaction.edge_prop_eq", &[eq_entry.index_id])
+            edge_property_equality_component_fingerprint(eq_entry.index_id)
         );
         assert!(eq_record.dependencies.iter().any(|dependency| {
             matches!(
@@ -8346,11 +8636,11 @@ mod tests {
             .expect("compacted edge range sidecar record");
         assert_eq!(
             range_record.build_fingerprint,
-            component_fingerprint("compaction.edge_prop_range", &[range_entry.index_id])
+            edge_property_range_component_fingerprint(range_entry.index_id)
         );
 
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
-        let blue_hash = hash_prop_value(&PropValue::String("blue".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
+        let blue_hash = hash_prop_equality_key(&PropValue::String("blue".to_string()));
         let groups = read_secondary_eq_groups(
             &compact_seg,
             SegmentComponentKind::EdgePropertyEqualityIndex {
@@ -8368,8 +8658,156 @@ mod tests {
         );
         assert_eq!(
             range_entries,
-            vec![(10u64 ^ (1u64 << 63), 10), (20u64 ^ (1u64 << 63), 11)]
+            vec![
+                (
+                    numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap(),
+                    10
+                ),
+                (
+                    numeric_range_sort_key_for_value(&PropValue::Int(20)).unwrap(),
+                    11
+                )
+            ]
         );
+    }
+
+    #[test]
+    fn test_old_raw_hash_equality_sidecars_are_rebuilt_during_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_seg = dir.path().join("seg_0001");
+        let compact_seg = dir.path().join("seg_0002");
+
+        let mt = Memtable::new();
+        let mut node_props = BTreeMap::new();
+        node_props.insert("score".to_string(), PropValue::Int(1));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "one", node_props, 1001)),
+            1,
+        );
+        mt.apply_op(&WalOp::UpsertNode(make_node_with_props(2, 1, "two")), 2);
+
+        let mut edge_props = BTreeMap::new();
+        edge_props.insert("score".to_string(), PropValue::UInt(1));
+        let mut edge = make_edge(10, 1, 2, 1);
+        edge.props = edge_props;
+        mt.apply_op(&WalOp::UpsertEdge(edge), 3);
+
+        let node_entry = SecondaryIndexManifestEntry {
+            index_id: 317,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let edge_entry = SecondaryIndexManifestEntry {
+            index_id: 318,
+            target: SecondaryIndexTarget::EdgeProperty {
+                label_id: 1,
+                prop_key: "score".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&node_entry);
+        mt.register_secondary_index(&edge_entry);
+        let indexes = vec![node_entry.clone(), edge_entry.clone()];
+
+        let source_info =
+            write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
+        let semantic_hash = hash_prop_equality_key(&PropValue::Float(1.0));
+        let raw_node_hash = hash_prop_value(&PropValue::Int(1));
+        let raw_edge_hash = hash_prop_value(&PropValue::UInt(1));
+        assert_ne!(raw_node_hash, semantic_hash);
+        assert_ne!(raw_edge_hash, semantic_hash);
+
+        rewrite_eq_sidecar_as_old_raw_hash(
+            &source_seg,
+            SegmentComponentKind::NodePropertyEqualityIndex {
+                index_id: node_entry.index_id,
+            },
+            component_fingerprint("flush.node_prop_eq", &[node_entry.index_id]),
+            &BTreeMap::from([(raw_node_hash, vec![1])]),
+        );
+        rewrite_eq_sidecar_as_old_raw_hash(
+            &source_seg,
+            SegmentComponentKind::EdgePropertyEqualityIndex {
+                index_id: edge_entry.index_id,
+            },
+            component_fingerprint("flush.edge_prop_eq", &[edge_entry.index_id]),
+            &BTreeMap::from([(raw_edge_hash, vec![10])]),
+        );
+
+        let source = Arc::new(
+            SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
+        );
+        assert!(matches!(
+            source.optional_component_availability(
+                SegmentComponentKind::NodePropertyEqualityIndex {
+                    index_id: node_entry.index_id,
+                }
+            ),
+            ComponentAvailability::Incompatible { .. }
+        ));
+        assert!(matches!(
+            source.optional_component_availability(
+                SegmentComponentKind::EdgePropertyEqualityIndex {
+                    index_id: edge_entry.index_id,
+                }
+            ),
+            ComponentAvailability::Incompatible { .. }
+        ));
+
+        let compact_reader = compact_copy_segment_for_test(source, &compact_seg, 2, &indexes);
+        assert_eq!(
+            compact_reader
+                .secondary_eq_posting_count_if_present(node_entry.index_id, semantic_hash)
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            compact_reader
+                .edge_secondary_eq_posting_count_if_present(edge_entry.index_id, semantic_hash)
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            compact_reader.optional_component_availability(
+                SegmentComponentKind::NodePropertyEqualityIndex {
+                    index_id: node_entry.index_id,
+                }
+            ),
+            ComponentAvailability::Available
+        );
+        assert_eq!(
+            compact_reader.optional_component_availability(
+                SegmentComponentKind::EdgePropertyEqualityIndex {
+                    index_id: edge_entry.index_id,
+                }
+            ),
+            ComponentAvailability::Available
+        );
+
+        let node_groups = read_secondary_eq_groups(
+            &compact_seg,
+            SegmentComponentKind::NodePropertyEqualityIndex {
+                index_id: node_entry.index_id,
+            },
+        );
+        assert_eq!(node_groups.get(&semantic_hash), Some(&vec![1]));
+        assert!(!node_groups.contains_key(&raw_node_hash));
+
+        let edge_groups = read_secondary_eq_groups(
+            &compact_seg,
+            SegmentComponentKind::EdgePropertyEqualityIndex {
+                index_id: edge_entry.index_id,
+            },
+        );
+        assert_eq!(edge_groups.get(&semantic_hash), Some(&vec![10]));
+        assert!(!edge_groups.contains_key(&raw_edge_hash));
     }
 
     #[test]
@@ -8395,7 +8833,7 @@ mod tests {
             state: SecondaryIndexState::Building,
             last_error: None,
         };
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let groups = BTreeMap::from([(red_hash, vec![10])]);
         publish_edge_prop_eq_sidecar_component(&seg_dir, &entry, &groups).unwrap();
 
@@ -8416,7 +8854,7 @@ mod tests {
             .expect("background-built edge equality sidecar record");
         assert_eq!(
             record.build_fingerprint,
-            component_fingerprint("build.edge_prop_eq", &[entry.index_id])
+            edge_property_equality_component_fingerprint(entry.index_id)
         );
 
         let reader =
@@ -8475,7 +8913,7 @@ mod tests {
         let indexes = vec![node_entry.clone(), edge_entry.clone()];
 
         let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let node_groups = BTreeMap::from([(red_hash, vec![1])]);
         publish_node_prop_eq_sidecar_component(&seg_dir, &node_entry, &node_groups).unwrap();
 
@@ -8496,7 +8934,7 @@ mod tests {
             .expect("flush-built edge sidecar survives optional refresh");
         assert_eq!(
             edge_record.build_fingerprint,
-            component_fingerprint("flush.edge_prop_eq", &[edge_entry.index_id])
+            edge_property_equality_component_fingerprint(edge_entry.index_id)
         );
 
         let reader = SegmentReader::open_with_info(&seg_dir, &info, None, &indexes).unwrap();
@@ -8539,9 +8977,7 @@ mod tests {
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Building,
             last_error: None,
         };
@@ -8686,9 +9122,7 @@ mod tests {
                 label_id: 7,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -8810,9 +9244,7 @@ mod tests {
                 label_id: 4,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -9131,9 +9563,7 @@ mod tests {
                 label_id: 9,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -9221,9 +9651,7 @@ mod tests {
                 label_id: 12,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -9276,15 +9704,14 @@ mod tests {
         assert!(compact_reader.node_by_key(1, "two").unwrap().is_none());
         assert!(compact_reader.node_by_key(9, "ten").unwrap().is_none());
 
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         assert_eq!(
             compact_reader
                 .find_nodes_by_secondary_eq_index(eq_entry.index_id, red_hash)
                 .unwrap(),
             vec![2]
         );
-        let encoded_score =
-            encode_range_prop_value(SecondaryIndexRangeDomain::Int, &PropValue::Int(30)).unwrap();
+        let encoded_score = numeric_range_sort_key_for_value(&PropValue::Int(30)).unwrap();
         assert_eq!(
             compact_reader
                 .find_nodes_by_secondary_range_index_if_present(

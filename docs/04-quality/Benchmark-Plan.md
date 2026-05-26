@@ -82,6 +82,12 @@ Graph shapes for each profile:
 | `S-CRUD-005` | `upsert_edge_fixed_triple` | required | required | required |
 | `S-QUERY-001` | `query_node_ids_intersected_predicates` | required | required | required |
 | `S-QUERY-002` | `query_nodes_intersected_predicates_hydrated` | required | required | required |
+| `S-QUERY-003` | `query_edge_ids_endpoint_metadata` | required | required | required |
+| `S-QUERY-004` | `query_edges_endpoint_property_hydrated` | required | required | required |
+| `S-QUERY-005` | `query_edge_ids_property_indexed_equality` | required | required | required |
+| `S-QUERY-006` | `query_edge_ids_property_indexed_range` | required | required | required |
+| `S-QUERY-007` | `query_graph_rows_optional_edge_traversal` | required | required | required |
+| `S-GQL-006` | `execute_gql_optional_edge_traversal_graph_rows` | required | required | required |
 | `S-TXN-001` | explicit write transaction commit, 4/16/64 staged intents | required | required | required |
 | `S-TXN-002` | explicit transaction conflict-heavy same-target writes | required | required | required |
 | `S-TXN-003` | connector ordered `stage(operations)` payload parsing | not used | required | required |

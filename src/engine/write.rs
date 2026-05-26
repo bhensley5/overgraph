@@ -1618,28 +1618,6 @@ impl EngineCore {
         let prop_key = prop_key.to_string();
         let (entry, outcome) = self.with_runtime_manifest_write(|manifest| {
             stage_label_tokens_in_manifest(manifest, &node_labels_to_stage, &[])?;
-            if matches!(&kind, SecondaryIndexKind::Range { .. }) {
-                for existing in &manifest.secondary_indexes {
-                    let SecondaryIndexTarget::NodeProperty {
-                        label_id: existing_label_id,
-                        prop_key: existing_prop_key,
-                    } = &existing.target
-                    else {
-                        continue;
-                    };
-                    if *existing_label_id == label_id
-                        && existing_prop_key == &prop_key
-                        && matches!(existing.kind, SecondaryIndexKind::Range { .. })
-                        && existing.kind != kind
-                    {
-                        return Err(EngineError::InvalidOperation(format!(
-                            "property index ({}, {}) already has a range declaration with a different domain",
-                            label_id, prop_key
-                        )));
-                    }
-                }
-            }
-
             if let Some(existing) = manifest.secondary_indexes.iter_mut().find(|entry| {
                 entry.target
                     == SecondaryIndexTarget::NodeProperty {
@@ -1758,28 +1736,6 @@ impl EngineCore {
         let prop_key = prop_key.to_string();
         let (entry, outcome) = self.with_runtime_manifest_write(|manifest| {
             stage_label_tokens_in_manifest(manifest, &[], &edge_labels_to_stage)?;
-            if matches!(&kind, SecondaryIndexKind::Range { .. }) {
-                for existing in &manifest.secondary_indexes {
-                    let SecondaryIndexTarget::EdgeProperty {
-                label_id: existing_label_id,
-                        prop_key: existing_prop_key,
-                    } = &existing.target
-                    else {
-                        continue;
-                    };
-                    if *existing_label_id == label_id
-                        && existing_prop_key == &prop_key
-                        && matches!(existing.kind, SecondaryIndexKind::Range { .. })
-                        && existing.kind != kind
-                    {
-                        return Err(EngineError::InvalidOperation(format!(
-                            "edge property index ({}, {}) already has a range declaration with a different domain",
-                            label_id, prop_key
-                        )));
-                    }
-                }
-            }
-
             if let Some(existing) = manifest.secondary_indexes.iter_mut().find(|entry| {
                 entry.target
                     == SecondaryIndexTarget::EdgeProperty {

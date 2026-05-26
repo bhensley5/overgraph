@@ -3,9 +3,9 @@ use overgraph::{
     AllShortestPathsOptions, DatabaseEngine, DbOptions, DegreeOptions, Direction, EdgeInput,
     ExportOptions, GraphPatch, IsConnectedOptions, LabelMatchMode, NeighborOptions, NodeInput,
     NodeKeyQuery, NodeLabelFilter, PageRequest, PprAlgorithm, PprOptions, PropValue,
-    PropertyRangeBound, PrunePolicy, SecondaryIndexKind, SecondaryIndexRangeDomain,
-    SecondaryIndexState, ShortestPathOptions, TopKOptions, TraverseOptions, TxnIntent, TxnLocalRef,
-    TxnNodeRef, UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
+    PropertyRangeBound, PrunePolicy, SecondaryIndexKind, SecondaryIndexState, ShortestPathOptions,
+    TopKOptions, TraverseOptions, TxnIntent, TxnLocalRef, TxnNodeRef, UpsertEdgeOptions,
+    UpsertNodeOptions, WalSyncMode,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -639,9 +639,7 @@ fn ensure_property_query_declarations(engine: &mut DatabaseEngine) {
         .ensure_node_property_index(
             &label,
             PROPERTY_RANGE_DECLARED_KEY,
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(engine, range.index_id, SecondaryIndexState::Ready);

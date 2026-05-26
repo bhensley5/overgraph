@@ -125,31 +125,8 @@ impl EqualityRawPostingBudget {
     }
 }
 
-fn normalized_range_float(value: f64) -> Option<f64> {
-    if !value.is_finite() {
-        return None;
-    }
-    Some(if value == 0.0 { 0.0 } else { value })
-}
-
-fn range_value_domain(value: &PropValue) -> Option<SecondaryIndexRangeDomain> {
-    match value {
-        PropValue::Int(_) => Some(SecondaryIndexRangeDomain::Int),
-        PropValue::UInt(_) => Some(SecondaryIndexRangeDomain::UInt),
-        PropValue::Float(value) if value.is_finite() => Some(SecondaryIndexRangeDomain::Float),
-        _ => None,
-    }
-}
-
 fn compare_range_values(left: &PropValue, right: &PropValue) -> Option<std::cmp::Ordering> {
-    match (left, right) {
-        (PropValue::Int(left), PropValue::Int(right)) => Some(left.cmp(right)),
-        (PropValue::UInt(left), PropValue::UInt(right)) => Some(left.cmp(right)),
-        (PropValue::Float(left), PropValue::Float(right)) => {
-            Some(normalized_range_float(*left)?.total_cmp(&normalized_range_float(*right)?))
-        }
-        _ => None,
-    }
+    compare_numeric_prop_values(left, right)
 }
 
 fn compare_range_cursor_to_candidate(
@@ -166,48 +143,12 @@ fn compare_range_cursor_to_candidate(
     })
 }
 
-fn range_value_matches_bound(value: &PropValue, bound: &PropertyRangeBound) -> Option<bool> {
-    let ordering = compare_range_values(value, bound.value())?;
-    Some(match bound {
-        PropertyRangeBound::Included(_) => ordering != std::cmp::Ordering::Less,
-        PropertyRangeBound::Excluded(_) => ordering == std::cmp::Ordering::Greater,
-    })
-}
-
 fn range_value_within_bounds(
     value: &PropValue,
     lower: Option<&PropertyRangeBound>,
     upper: Option<&PropertyRangeBound>,
 ) -> Option<bool> {
-    if let Some(lower) = lower {
-        if !range_value_matches_bound(value, lower)? {
-            return Some(false);
-        }
-    }
-    if let Some(upper) = upper {
-        let ordering = compare_range_values(value, upper.value())?;
-        let in_upper = match upper {
-            PropertyRangeBound::Included(_) => ordering != std::cmp::Ordering::Greater,
-            PropertyRangeBound::Excluded(_) => ordering == std::cmp::Ordering::Less,
-        };
-        if !in_upper {
-            return Some(false);
-        }
-    }
-    Some(true)
-}
-
-fn encode_range_sort_key(domain: SecondaryIndexRangeDomain, value: &PropValue) -> Option<u64> {
-    crate::memtable::encode_range_prop_value(domain, value)
-}
-
-fn signed_zero_equality_probe_values(value: &PropValue) -> Option<[PropValue; 2]> {
-    match value {
-        PropValue::Float(value) if *value == 0.0 => {
-            Some([PropValue::Float(0.0), PropValue::Float(-0.0)])
-        }
-        _ => None,
-    }
+    crate::property_value_semantics::numeric_range_value_within_bounds(value, lower, upper)
 }
 
 fn memtable_secondary_eq_nodes_for_filter(
@@ -217,22 +158,7 @@ fn memtable_secondary_eq_nodes_for_filter(
     prop_value: &PropValue,
     snapshot_seq: u64,
 ) -> Vec<u64> {
-    let Some(probe_values) = signed_zero_equality_probe_values(prop_value) else {
-        return memtable.find_secondary_eq_nodes_at(index_id, prop_key, prop_value, snapshot_seq);
-    };
-
-    let mut ids = Vec::new();
-    for probe_value in &probe_values {
-        ids.extend(memtable.find_secondary_eq_nodes_at(
-            index_id,
-            prop_key,
-            probe_value,
-            snapshot_seq,
-        ));
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    ids
+    memtable.find_secondary_eq_nodes_at(index_id, prop_key, prop_value, snapshot_seq)
 }
 
 fn memtable_secondary_eq_raw_nodes_for_filter(
@@ -267,16 +193,7 @@ fn memtable_secondary_eq_count_for_filter(
     prop_value: &PropValue,
     snapshot_seq: u64,
 ) -> usize {
-    let Some(probe_values) = signed_zero_equality_probe_values(prop_value) else {
-        return memtable.secondary_eq_node_count_at(index_id, prop_key, prop_value, snapshot_seq);
-    };
-
-    probe_values
-        .iter()
-        .map(|probe_value| {
-            memtable.secondary_eq_node_count_at(index_id, prop_key, probe_value, snapshot_seq)
-        })
-        .sum()
+    memtable.secondary_eq_node_count_at(index_id, prop_key, prop_value, snapshot_seq)
 }
 
 fn segment_secondary_eq_ids_for_filter(
@@ -284,15 +201,10 @@ fn segment_secondary_eq_ids_for_filter(
     index_id: u64,
     prop_value: &PropValue,
 ) -> Result<Option<Vec<u64>>, EngineError> {
-    let Some(probe_values) = signed_zero_equality_probe_values(prop_value) else {
-        return segment
-            .find_nodes_by_secondary_eq_index_if_present(index_id, hash_prop_value(prop_value));
-    };
-
     let mut ids = Vec::new();
-    for probe_value in &probe_values {
+    for value_hash in equality_probe_value_hashes(prop_value) {
         let Some(mut probe_ids) = segment
-            .find_nodes_by_secondary_eq_index_if_present(index_id, hash_prop_value(probe_value))?
+            .find_nodes_by_secondary_eq_index_if_present(index_id, value_hash)?
         else {
             return Ok(None);
         };
@@ -308,14 +220,10 @@ fn segment_secondary_eq_posting_count_for_filter(
     index_id: u64,
     prop_value: &PropValue,
 ) -> Result<Option<usize>, EngineError> {
-    let Some(probe_values) = signed_zero_equality_probe_values(prop_value) else {
-        return segment.secondary_eq_posting_count_if_present(index_id, hash_prop_value(prop_value));
-    };
-
     let mut count = 0usize;
-    for probe_value in &probe_values {
+    for value_hash in equality_probe_value_hashes(prop_value) {
         let Some(probe_count) =
-            segment.secondary_eq_posting_count_if_present(index_id, hash_prop_value(probe_value))?
+            segment.secondary_eq_posting_count_if_present(index_id, value_hash)?
         else {
             return Ok(None);
         };
@@ -326,7 +234,7 @@ fn segment_secondary_eq_posting_count_for_filter(
 
 #[derive(Clone, Debug)]
 struct RangeScanMatch {
-    encoded_value: u64,
+    encoded_value: NumericRangeSortKey,
     value: PropValue,
     node_id: u64,
 }
@@ -354,20 +262,31 @@ impl PartialOrd for RangeScanMatch {
 }
 
 enum ReadyRangeSourceStep {
-    Entry((u64, u64)),
+    Entry((NumericRangeSortKey, u64)),
     Exhausted,
     MissingSidecar,
 }
 
 enum ReadyRangeSourceKind<'a> {
-    Iter(Box<dyn Iterator<Item = (u64, u64)> + 'a>),
+    Memtable {
+        memtable: &'a Memtable,
+        index_id: u64,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
+        snapshot_seq: u64,
+        buffer: Vec<(NumericRangeSortKey, u64)>,
+        offset: usize,
+        chunk_size: usize,
+        exhausted: bool,
+    },
     Segment {
         segment: &'a SegmentReader,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
-        after: Option<(u64, u64)>,
-        buffer: Vec<(u64, u64)>,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
+        buffer: Vec<(NumericRangeSortKey, u64)>,
         offset: usize,
         chunk_size: usize,
     },
@@ -400,10 +319,44 @@ fn push_unique_candidate_id_limited(
 impl ReadyRangeSource<'_> {
     fn next_entry(&mut self) -> Result<ReadyRangeSourceStep, EngineError> {
         match &mut self.kind {
-            ReadyRangeSourceKind::Iter(iter) => Ok(iter
-                .next()
-                .map(ReadyRangeSourceStep::Entry)
-                .unwrap_or(ReadyRangeSourceStep::Exhausted)),
+            ReadyRangeSourceKind::Memtable {
+                memtable,
+                index_id,
+                lower,
+                upper,
+                after,
+                snapshot_seq,
+                buffer,
+                offset,
+                chunk_size,
+                exhausted,
+            } => loop {
+                if *offset < buffer.len() {
+                    let entry = buffer[*offset];
+                    *offset += 1;
+                    return Ok(ReadyRangeSourceStep::Entry(entry));
+                }
+                if *exhausted {
+                    return Ok(ReadyRangeSourceStep::Exhausted);
+                }
+
+                let entries = memtable.visible_secondary_range_entries_limited(
+                    *index_id,
+                    *lower,
+                    *upper,
+                    *after,
+                    *snapshot_seq,
+                    Some(*chunk_size),
+                );
+                if entries.is_empty() {
+                    *exhausted = true;
+                    return Ok(ReadyRangeSourceStep::Exhausted);
+                }
+
+                *after = entries.last().copied();
+                *buffer = entries;
+                *offset = 0;
+            },
             ReadyRangeSourceKind::Segment {
                 segment,
                 index_id,
@@ -609,7 +562,7 @@ impl ReadView {
             || !node
                 .props
                 .get(prop_key)
-                .map(|value| value == prop_value)
+                .map(|value| prop_values_equal_for_filter(value, prop_value))
                 .unwrap_or(false)
         {
             return false;
@@ -1003,95 +956,14 @@ impl ReadView {
         };
 
         let mut raw_posting_budget = raw_posting_cap.map(EqualityRawPostingBudget::new);
-        if let Some(probe_values) = signed_zero_equality_probe_values(prop_value) {
-            let mut accepted = NodeIdSet::default();
-            for node_id in memtable_secondary_eq_nodes_for_filter(
-                &self.memtable,
-                index_id,
-                prop_key,
-                prop_value,
-                self.snapshot_seq,
-            ) {
-                accepted.insert(node_id);
-                if accepted.len() >= max_ids {
-                    let mut ids: Vec<u64> = accepted.into_iter().collect();
-                    ids.sort_unstable();
-                    return Ok((Some(ids), None));
-                }
-            }
-
-            for epoch in &self.immutable_epochs {
-                let ids = memtable_secondary_eq_nodes_for_filter(
-                    &epoch.memtable,
-                    index_id,
-                    prop_key,
-                    prop_value,
-                    self.snapshot_seq,
-                );
-                if self.extend_verified_equality_candidates(
-                    ids,
-                    prop_key,
-                    prop_value,
-                    max_ids,
-                    &mut accepted,
-                )? {
-                    let mut ids: Vec<u64> = accepted.into_iter().collect();
-                    ids.sort_unstable();
-                    return Ok((Some(ids), None));
-                }
-            }
-
-            for segment in &self.segments {
-                for probe_value in &probe_values {
-                    match self.extend_verified_equality_candidates_from_segment_postings(
-                        segment,
-                        index_id,
-                        hash_prop_value(probe_value),
-                        prop_key,
-                        prop_value,
-                        max_ids,
-                        raw_posting_budget.as_mut(),
-                        &mut accepted,
-                    ) {
-                        Ok(Some(EqualitySegmentPostingScan::AcceptedCapReached)) => {
-                            let mut ids: Vec<u64> = accepted.into_iter().collect();
-                            ids.sort_unstable();
-                            return Ok((Some(ids), None));
-                        }
-                        Ok(Some(EqualitySegmentPostingScan::RawCapExceeded)) => {
-                            return Ok((None, None));
-                        }
-                        Ok(Some(EqualitySegmentPostingScan::Exhausted)) => {}
-                        Ok(None) => {
-                            return Ok((
-                                None,
-                                self.equality_sidecar_failure_followup(index_id, None),
-                            ));
-                        }
-                        Err(error) => {
-                            return Ok((
-                                None,
-                                self.equality_sidecar_failure_followup(index_id, Some(error)),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            let mut ids: Vec<u64> = accepted.into_iter().collect();
-            ids.sort_unstable();
-            return Ok((Some(ids), None));
-        }
-
         let mut accepted = NodeIdSet::default();
-        let memtable_ids = self.memtable.find_secondary_eq_nodes_at_limited(
+        for node_id in memtable_secondary_eq_nodes_for_filter(
+            &self.memtable,
             index_id,
             prop_key,
             prop_value,
             self.snapshot_seq,
-            Some(max_ids),
-        );
-        for node_id in memtable_ids {
+        ) {
             accepted.insert(node_id);
             if accepted.len() >= max_ids {
                 break;
@@ -1125,33 +997,35 @@ impl ReadView {
         }
 
         for seg in &self.segments {
-            match self.extend_verified_equality_candidates_from_segment_postings(
-                seg,
-                index_id,
-                hash_prop_value(prop_value),
-                prop_key,
-                prop_value,
-                max_ids,
-                raw_posting_budget.as_mut(),
-                &mut accepted,
-            ) {
-                Ok(Some(EqualitySegmentPostingScan::AcceptedCapReached)) => {
-                    let mut ids: Vec<u64> = accepted.into_iter().collect();
-                    ids.sort_unstable();
-                    return Ok((Some(ids), None));
-                }
-                Ok(Some(EqualitySegmentPostingScan::RawCapExceeded)) => {
-                    return Ok((None, None));
-                }
-                Ok(Some(EqualitySegmentPostingScan::Exhausted)) => {}
-                Ok(None) => {
-                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
-                }
-                Err(error) => {
-                    return Ok((
-                        None,
-                        self.equality_sidecar_failure_followup(index_id, Some(error)),
-                    ));
+            for value_hash in equality_probe_value_hashes(prop_value) {
+                match self.extend_verified_equality_candidates_from_segment_postings(
+                    seg,
+                    index_id,
+                    value_hash,
+                    prop_key,
+                    prop_value,
+                    max_ids,
+                    raw_posting_budget.as_mut(),
+                    &mut accepted,
+                ) {
+                    Ok(Some(EqualitySegmentPostingScan::AcceptedCapReached)) => {
+                        let mut ids: Vec<u64> = accepted.into_iter().collect();
+                        ids.sort_unstable();
+                        return Ok((Some(ids), None));
+                    }
+                    Ok(Some(EqualitySegmentPostingScan::RawCapExceeded)) => {
+                        return Ok((None, None));
+                    }
+                    Ok(Some(EqualitySegmentPostingScan::Exhausted)) => {}
+                    Ok(None) => {
+                        return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                    }
+                    Err(error) => {
+                        return Ok((
+                            None,
+                            self.equality_sidecar_failure_followup(index_id, Some(error)),
+                        ));
+                    }
                 }
             }
         }
@@ -1216,7 +1090,7 @@ impl ReadView {
             if node
                 .props
                 .get(prop_key)
-                .is_some_and(|candidate| candidate == prop_value)
+                .is_some_and(|candidate| prop_values_equal_for_filter(candidate, prop_value))
             {
                 accepted.insert(node_id);
                 if accepted.len() >= max_ids {
@@ -1251,7 +1125,7 @@ impl ReadView {
             .secondary_index_entries
             .iter()
             .find(|entry| entry.index_id == index_id)?;
-        if !matches!(current_entry.kind, SecondaryIndexKind::Range { .. }) {
+        if !matches!(current_entry.kind, SecondaryIndexKind::Range) {
             return None;
         }
         if current_entry.state == next_state && current_entry.last_error == next_last_error {
@@ -1486,82 +1360,8 @@ impl ReadView {
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         cursor: Option<&PropertyRangeCursor>,
-    ) -> Result<SecondaryIndexRangeDomain, EngineError> {
-        let mut domain = None;
-
-        for value in lower.into_iter().map(PropertyRangeBound::value) {
-            let current = range_value_domain(value).ok_or_else(|| {
-                EngineError::InvalidOperation(
-                    "property range bounds must use Int, UInt, or finite Float values".into(),
-                )
-            })?;
-            if let Some(existing) = domain {
-                if existing != current {
-                    return Err(EngineError::InvalidOperation(
-                        "property range bounds must use the same PropValue variant".into(),
-                    ));
-                }
-            } else {
-                domain = Some(current);
-            }
-        }
-
-        for value in upper.into_iter().map(PropertyRangeBound::value) {
-            let current = range_value_domain(value).ok_or_else(|| {
-                EngineError::InvalidOperation(
-                    "property range bounds must use Int, UInt, or finite Float values".into(),
-                )
-            })?;
-            if let Some(existing) = domain {
-                if existing != current {
-                    return Err(EngineError::InvalidOperation(
-                        "property range bounds must use the same PropValue variant".into(),
-                    ));
-                }
-            } else {
-                domain = Some(current);
-            }
-        }
-
-        let domain = domain.ok_or_else(|| {
-            EngineError::InvalidOperation(
-                "property range queries require at least one lower or upper bound".into(),
-            )
-        })?;
-
-        if let Some(cursor) = cursor {
-            let cursor_domain = range_value_domain(&cursor.value).ok_or_else(|| {
-                EngineError::InvalidOperation(
-                    "property range cursor must use Int, UInt, or finite Float values".into(),
-                )
-            })?;
-            if cursor_domain != domain {
-                return Err(EngineError::InvalidOperation(
-                    "property range cursor must use the same PropValue variant as the bounds"
-                        .into(),
-                ));
-            }
-        }
-
-        if let (Some(lower), Some(upper)) = (lower, upper) {
-            match compare_range_values(lower.value(), upper.value()) {
-                Some(std::cmp::Ordering::Greater) => {
-                    return Err(EngineError::InvalidOperation(
-                        "property range lower bound must be <= upper bound".into(),
-                    ));
-                }
-                Some(std::cmp::Ordering::Equal)
-                    if !(lower.is_inclusive() && upper.is_inclusive()) =>
-                {
-                    return Err(EngineError::InvalidOperation(
-                        "property range bounds must not describe an empty interval".into(),
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        Ok(domain)
+    ) -> Result<ValidatedNumericRange, EngineError> {
+        validate_numeric_range_bounds(lower, upper, cursor)
     }
 
     fn find_nodes_scan_fallback(
@@ -1581,7 +1381,7 @@ impl ReadView {
                 if node
                     .props
                     .get(prop_key)
-                    .is_some_and(|value| value == prop_value)
+                    .is_some_and(|value| prop_values_equal_for_filter(value, prop_value))
                 {
                     results.push(node_id);
                 }
@@ -1616,7 +1416,7 @@ impl ReadView {
                     if node
                         .props
                         .get(prop_key)
-                        .is_some_and(|value| value == prop_value)
+                        .is_some_and(|value| prop_values_equal_for_filter(value, prop_value))
                     {
                         items.push(node_id);
                     }
@@ -1640,7 +1440,7 @@ impl ReadView {
                 if node
                     .props
                     .get(prop_key)
-                    .is_some_and(|value| value == prop_value)
+                    .is_some_and(|value| prop_values_equal_for_filter(value, prop_value))
                 {
                     items.push(node_id);
                     if items.len() >= target {
@@ -1786,7 +1586,7 @@ impl ReadView {
         node: Option<&NodeRecord>,
         label_id: u32,
         prop_key: &str,
-        domain: SecondaryIndexRangeDomain,
+        candidate_key: NumericRangeSortKey,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
@@ -1799,9 +1599,10 @@ impl ReadView {
         }
 
         let value = node.props.get(prop_key)?;
-        if range_value_domain(value) != Some(domain)
-            || range_value_within_bounds(value, lower, upper) != Some(true)
-        {
+        if numeric_range_sort_key_for_value(value) != Some(candidate_key) {
+            return None;
+        }
+        if range_value_within_bounds(value, lower, upper) != Some(true) {
             return None;
         }
 
@@ -1809,12 +1610,11 @@ impl ReadView {
     }
 
     fn encode_property_range_bound(
-        domain: SecondaryIndexRangeDomain,
         bound: Option<&PropertyRangeBound>,
-    ) -> Option<(u64, bool)> {
+    ) -> Option<(NumericRangeSortKey, bool)> {
         bound.map(|bound| {
             (
-                encode_range_sort_key(domain, bound.value())
+                numeric_range_sort_key_for_value(bound.value())
                     .expect("validated property range bounds must encode"),
                 bound.is_inclusive(),
             )
@@ -1822,12 +1622,11 @@ impl ReadView {
     }
 
     fn encode_property_range_cursor(
-        domain: SecondaryIndexRangeDomain,
         cursor: Option<&PropertyRangeCursor>,
-    ) -> Option<(u64, u64)> {
+    ) -> Option<(NumericRangeSortKey, u64)> {
         cursor.map(|cursor| {
             (
-                encode_range_sort_key(domain, &cursor.value)
+                numeric_range_sort_key_for_value(&cursor.value)
                     .expect("validated property range cursor must encode"),
                 cursor.node_id,
             )
@@ -1842,58 +1641,37 @@ impl ReadView {
         }
     }
 
-    fn record_ready_range_memtable_owners(
-        owners: &mut NodeIdMap<usize>,
-        source_idx: usize,
-        memtable: &Memtable,
-        snapshot_seq: u64,
-    ) {
-        for node_id in memtable.collect_deleted_nodes_at(snapshot_seq) {
-            owners.entry(node_id).or_insert(source_idx);
-        }
-        let _ = memtable.for_each_visible_node_at(snapshot_seq, &mut |node| {
-            owners.entry(node.id).or_insert(source_idx);
-            ControlFlow::Continue(())
-        });
-    }
-
-    fn record_ready_range_segment_owners(
-        owners: &mut NodeIdMap<usize>,
-        source_idx: usize,
-        segment: &SegmentReader,
-    ) -> Result<(), EngineError> {
-        for node_id in segment.deleted_node_id_iter() {
-            owners.entry(node_id).or_insert(source_idx);
-        }
-        for &node_id in segment.node_ids()? {
-            owners.entry(node_id).or_insert(source_idx);
-        }
-        Ok(())
-    }
-
     fn ready_range_memtable_source<'a>(
         memtable: &'a Memtable,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
-        after: Option<(u64, u64)>,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
         snapshot_seq: u64,
+        chunk_size: usize,
     ) -> ReadyRangeSource<'a> {
-        let entries =
-            memtable.visible_secondary_range_entries(index_id, lower, upper, after, snapshot_seq);
-        let iter: Box<dyn Iterator<Item = (u64, u64)> + 'a> = Box::new(entries.into_iter());
-
         ReadyRangeSource {
-            kind: ReadyRangeSourceKind::Iter(iter),
+            kind: ReadyRangeSourceKind::Memtable {
+                memtable,
+                index_id,
+                lower,
+                upper,
+                after,
+                snapshot_seq,
+                buffer: Vec::new(),
+                offset: 0,
+                chunk_size: chunk_size.max(1),
+                exhausted: false,
+            },
         }
     }
 
     fn ready_range_segment_source<'a>(
         segment: &'a SegmentReader,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
-        after: Option<(u64, u64)>,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
         chunk_size: usize,
     ) -> ReadyRangeSource<'a> {
         ReadyRangeSource {
@@ -1910,34 +1688,23 @@ impl ReadView {
         }
     }
 
-    fn ready_range_candidate_hidden(
-        owners: &NodeIdMap<usize>,
-        source_idx: usize,
-        node_id: u64,
-    ) -> bool {
-        owners
-            .get(&node_id)
-            .is_some_and(|owner_idx| *owner_idx < source_idx)
-    }
-
     fn ready_range_candidate_ids(
         &self,
         index_id: u64,
-        domain: SecondaryIndexRangeDomain,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         max_ids: usize,
     ) -> Result<(Option<Vec<u64>>, Option<SecondaryIndexReadFollowup>), EngineError> {
-        let lower_encoded = Self::encode_property_range_bound(domain, lower);
-        let upper_encoded = Self::encode_property_range_bound(domain, upper);
+        let lower_key = Self::encode_property_range_bound(lower);
+        let upper_key = Self::encode_property_range_bound(upper);
         let mut ids = Vec::with_capacity(max_ids.min(4096));
         let mut seen = NodeIdSet::default();
 
         for seg in &self.segments {
             match seg.find_nodes_by_secondary_range_index_if_present_limited(
                 index_id,
-                lower_encoded,
-                upper_encoded,
+                lower_key,
+                upper_key,
                 None,
                 Some(1),
             ) {
@@ -1956,8 +1723,8 @@ impl ReadView {
 
         let flow = self.memtable.for_each_visible_secondary_range_entry_at(
             index_id,
-            lower_encoded,
-            upper_encoded,
+            lower_key,
+            upper_key,
             None,
             self.snapshot_seq,
             &mut |(_, node_id)| {
@@ -1972,8 +1739,8 @@ impl ReadView {
         for epoch in &self.immutable_epochs {
             let flow = epoch.memtable.for_each_visible_secondary_range_entry_at(
                 index_id,
-                lower_encoded,
-                upper_encoded,
+                lower_key,
+                upper_key,
                 None,
                 self.snapshot_seq,
                 &mut |(_, node_id)| {
@@ -1991,8 +1758,8 @@ impl ReadView {
             let mut source = Self::ready_range_segment_source(
                 seg,
                 index_id,
-                lower_encoded,
-                upper_encoded,
+                lower_key,
+                upper_key,
                 None,
                 chunk_size,
             );
@@ -2035,7 +1802,6 @@ impl ReadView {
         label_id: u32,
         index_id: u64,
         prop_key: &str,
-        domain: SecondaryIndexRangeDomain,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         page: &PropertyRangePageRequest,
@@ -2046,9 +1812,9 @@ impl ReadView {
         ),
         EngineError,
     > {
-        let lower_encoded = Self::encode_property_range_bound(domain, lower);
-        let upper_encoded = Self::encode_property_range_bound(domain, upper);
-        let after_encoded = Self::encode_property_range_cursor(domain, page.after.as_ref());
+        let lower_key = Self::encode_property_range_bound(lower);
+        let upper_key = Self::encode_property_range_bound(upper);
+        let after_encoded = Self::encode_property_range_cursor(page.after.as_ref());
         let policy_cutoffs = self.query_policy_cutoffs();
         let limit = page.limit.unwrap_or(0);
         let chunk_limit = Self::ready_range_chunk_limit(limit);
@@ -2058,51 +1824,39 @@ impl ReadView {
             limit.saturating_add(1)
         };
 
-        let mut owners = NodeIdMap::default();
         let mut sources = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
-        Self::record_ready_range_memtable_owners(
-            &mut owners,
-            sources.len(),
-            &self.memtable,
-            self.snapshot_seq,
-        );
         sources.push(Self::ready_range_memtable_source(
             &self.memtable,
             index_id,
-            lower_encoded,
-            upper_encoded,
+            lower_key,
+            upper_key,
             after_encoded,
             self.snapshot_seq,
+            chunk_limit,
         ));
         for epoch in &self.immutable_epochs {
-            Self::record_ready_range_memtable_owners(
-                &mut owners,
-                sources.len(),
-                epoch.memtable.as_ref(),
-                self.snapshot_seq,
-            );
             sources.push(Self::ready_range_memtable_source(
                 epoch.memtable.as_ref(),
                 index_id,
-                lower_encoded,
-                upper_encoded,
+                lower_key,
+                upper_key,
                 after_encoded,
                 self.snapshot_seq,
+                chunk_limit,
             ));
         }
         for seg in &self.segments {
-            Self::record_ready_range_segment_owners(&mut owners, sources.len(), seg)?;
             sources.push(Self::ready_range_segment_source(
                 seg,
                 index_id,
-                lower_encoded,
-                upper_encoded,
+                lower_key,
+                upper_key,
                 after_encoded,
                 chunk_limit,
             ));
         }
 
-        let mut heap: BinaryHeap<Reverse<((u64, u64), usize)>> =
+        let mut heap: BinaryHeap<Reverse<((NumericRangeSortKey, u64), usize)>> =
             BinaryHeap::with_capacity(sources.len());
         for (source_idx, source) in sources.iter_mut().enumerate() {
             match source.next_entry() {
@@ -2123,42 +1877,36 @@ impl ReadView {
         }
 
         let mut visible = Vec::new();
+        let mut seen = NodeIdSet::default();
         let mut pending = Vec::with_capacity(chunk_limit);
-        let hydrate_pending = |pending: &mut Vec<(u64, u64)>,
-                               visible: &mut Vec<(u64, PropertyRangeCursor)>|
+        let hydrate_pending = |pending: &mut Vec<(NumericRangeSortKey, u64)>,
+                               visible: &mut Vec<(u64, PropertyRangeCursor)>,
+                               seen: &mut NodeIdSet|
          -> Result<(), EngineError> {
             if pending.is_empty() {
                 return Ok(());
             }
 
             let node_ids: Vec<u64> = pending.iter().map(|&(_, node_id)| node_id).collect();
-            let current_label_ids = self.filter_node_ids_by_current_label(node_ids, label_id)?;
-            let current_label_ids: NodeIdSet = current_label_ids.into_iter().collect();
-            let node_ids: Vec<u64> = pending
-                .iter()
-                .filter_map(|&(_, node_id)| current_label_ids.contains(&node_id).then_some(node_id))
-                .collect();
             let hydrated = self.get_nodes_raw(&node_ids)?;
-            let mut hydrated = hydrated.into_iter();
-            for (_, node_id) in pending
-                .iter()
-                .filter(|(_, node_id)| current_label_ids.contains(node_id))
-            {
+            for ((candidate_key, node_id), node) in pending.iter().zip(hydrated.into_iter()) {
                 if visible.len() >= target_visible {
                     break;
                 }
-                let node = hydrated.next().flatten();
                 let Some(value) = Self::ready_range_node_value(
                     node.as_ref(),
                     label_id,
                     prop_key,
-                    domain,
+                    *candidate_key,
                     lower,
                     upper,
                     policy_cutoffs.as_ref(),
                 ) else {
                     continue;
                 };
+                if !seen.insert(*node_id) {
+                    continue;
+                }
                 visible.push((
                     *node_id,
                     PropertyRangeCursor {
@@ -2192,17 +1940,17 @@ impl ReadView {
                 }
             }
 
-            if Self::ready_range_candidate_hidden(&owners, source_idx, entry.1) {
+            if seen.contains(&entry.1) {
                 continue;
             }
 
             pending.push(entry);
             if pending.len() >= chunk_limit {
-                hydrate_pending(&mut pending, &mut visible)?;
+                hydrate_pending(&mut pending, &mut visible, &mut seen)?;
             }
         }
         if visible.len() < target_visible {
-            hydrate_pending(&mut pending, &mut visible)?;
+            hydrate_pending(&mut pending, &mut visible, &mut seen)?;
         }
 
         if limit == 0 {
@@ -2235,7 +1983,6 @@ impl ReadView {
         &self,
         label_id: u32,
         prop_key: &str,
-        domain: SecondaryIndexRangeDomain,
         lower: Option<&PropertyRangeBound>,
         upper: Option<&PropertyRangeBound>,
         after: Option<&PropertyRangeCursor>,
@@ -2254,9 +2001,6 @@ impl ReadView {
                 let Some(value) = node.props.get(prop_key) else {
                     return Ok(ControlFlow::Continue(()));
                 };
-                if range_value_domain(value) != Some(domain) {
-                    return Ok(ControlFlow::Continue(()));
-                }
                 if range_value_within_bounds(value, lower, upper) != Some(true) {
                     return Ok(ControlFlow::Continue(()));
                 }
@@ -2266,7 +2010,7 @@ impl ReadView {
                 }) {
                     return Ok(ControlFlow::Continue(()));
                 }
-                let Some(encoded_value) = encode_range_sort_key(domain, value) else {
+                let Some(encoded_value) = numeric_range_sort_key_for_value(value) else {
                     return Ok(ControlFlow::Continue(()));
                 };
                 let entry = RangeScanMatch {
@@ -4185,39 +3929,77 @@ impl ReadView {
         upper: Option<&PropertyRangeBound>,
         page: &PropertyRangePageRequest,
     ) -> Result<PropertyQueryOutcome<PropertyRangePageResult<u64>>, EngineError> {
-        let domain = Self::validate_property_range_bounds(lower, upper, page.after.as_ref())?;
-        let ready_entry = self.node_property_index_entry(
-            label_id,
-            prop_key,
-            &SecondaryIndexKind::Range { domain },
-        );
-        let mut followup = None;
-        if let Some(entry) = ready_entry.filter(|entry| entry.state == SecondaryIndexState::Ready) {
-            let (result, ready_followup) = self.find_nodes_paged_ready_range_index(
-                label_id,
-                entry.index_id,
-                prop_key,
-                domain,
-                lower,
-                upper,
-                page,
-            )?;
-            if let Some(result) = result {
-                return Ok(PropertyQueryOutcome {
-                    value: result,
-                    route: PropertyQueryRouteKind::RangeIndexLookup,
-                    followup: ready_followup,
-                });
-            }
-            followup = ready_followup;
+        let validated = Self::validate_property_range_bounds(lower, upper, page.after.as_ref())?;
+        if validated.is_empty {
+            return Ok(PropertyQueryOutcome {
+                value: PropertyRangePageResult {
+                    items: Vec::new(),
+                    next_cursor: None,
+                },
+                route: PropertyQueryRouteKind::RangeScanFallback,
+                followup: None,
+            });
         }
 
+        if let Some(entry) = self.node_property_index_entry(
+            label_id,
+            prop_key,
+            &SecondaryIndexKind::Range,
+        ) {
+            if entry.state == SecondaryIndexState::Ready {
+                let (ready_value, followup) = self.find_nodes_paged_ready_range_index(
+                    label_id,
+                    entry.index_id,
+                    prop_key,
+                    lower,
+                    upper,
+                    page,
+                )?;
+                if let Some(value) = ready_value {
+                    return Ok(PropertyQueryOutcome {
+                        value,
+                        route: PropertyQueryRouteKind::RangeIndexLookup,
+                        followup,
+                    });
+                }
+                if let Some(followup) = followup {
+                    let value = self.find_nodes_range_scan_page(
+                        label_id,
+                        prop_key,
+                        lower,
+                        upper,
+                        page,
+                    )?;
+                    return Ok(PropertyQueryOutcome {
+                        value,
+                        route: PropertyQueryRouteKind::RangeScanFallback,
+                        followup: Some(followup),
+                    });
+                }
+            }
+        }
+
+        let value = self.find_nodes_range_scan_page(label_id, prop_key, lower, upper, page)?;
+        Ok(PropertyQueryOutcome {
+            value,
+            route: PropertyQueryRouteKind::RangeScanFallback,
+            followup: None,
+        })
+    }
+
+    fn find_nodes_range_scan_page(
+        &self,
+        label_id: u32,
+        prop_key: &str,
+        lower: Option<&PropertyRangeBound>,
+        upper: Option<&PropertyRangeBound>,
+        page: &PropertyRangePageRequest,
+    ) -> Result<PropertyRangePageResult<u64>, EngineError> {
         let value = match page.limit {
             Some(limit) if limit > 0 => {
                 let matches = self.collect_property_range_scan_matches(
                     label_id,
                     prop_key,
-                    domain,
                     lower,
                     upper,
                     page.after.as_ref(),
@@ -4240,7 +4022,6 @@ impl ReadView {
                 let matches = self.collect_property_range_scan_matches(
                     label_id,
                     prop_key,
-                    domain,
                     lower,
                     upper,
                     page.after.as_ref(),
@@ -4252,12 +4033,7 @@ impl ReadView {
                 }
             }
         };
-
-        Ok(PropertyQueryOutcome {
-            value,
-            route: PropertyQueryRouteKind::RangeScanFallback,
-            followup,
-        })
+        Ok(value)
     }
 
     // --- Timestamp range queries ---

@@ -12,10 +12,12 @@ jobs:
   # ──────────────────────────────────────────────
   # Rust: publish to crates.io
   # ──────────────────────────────────────────────
-  # TODO: Switch to Trusted Publishing (crates-io-auth-action) after repo is public
   publish-rust:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,9 +28,11 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@v1
       - run: cargo publish -p overgraph
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   # ──────────────────────────────────────────────
   # Node.js: build native binaries for each platform
@@ -72,16 +76,18 @@ jobs:
   # ──────────────────────────────────────────────
   # Node.js: publish to npm
   # ──────────────────────────────────────────────
-  # TODO: Switch to Trusted Publishing (OIDC) after repo is public
   publish-node:
     name: Publish to npm
     needs: build-node
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -99,8 +105,6 @@ jobs:
       - name: Publish
         working-directory: overgraph-node
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ──────────────────────────────────────────────
   # Python: build wheels for each platform

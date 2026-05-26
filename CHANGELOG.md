@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-26
+
+### Added
+
+#### GQL Beta
+- **Read-only GQL/Cypher-style query strings.** Added `execute_gql` and `explain_gql` in Rust, `executeGql` / `executeGqlAsync` and `explainGql` / `explainGqlAsync` in Node.js, and `execute_gql` / `explain_gql` on both Python sync and async APIs.
+- **Graph-row-backed execution.** GQL Beta now lowers into the same shared graph-row executor as native APIs, so required matches, `OPTIONAL MATCH`, bounded variable-length paths, path values, row operations, cursors, caps, explain output, and connector result shapes share one implementation.
+- **Supported read syntax.** Added GQL support for `MATCH`, `OPTIONAL MATCH`, node and edge labels, relationship directions, finite bounded path quantifiers, `WHERE`, `RETURN`, aliases, scalar expressions, path functions, `ORDER BY`, `SKIP` / `OFFSET`, `LIMIT`, parameters, and explicit full-scan opt-in.
+- **Path result values.** Returning path aliases can now produce node IDs, edge IDs, optional hydrated elements, `length`, `start_node`, `end_node`, `nodes`, `relationships`, `node_ids`, and `edge_ids` values across Rust, Node.js, and Python.
+
+### Changed
+
+#### Query Execution
+- **Native graph-row substrate is now shared public API machinery.** Structured graph-row queries now cover optional groups, bounded paths, ordering, cursors, compact rows, selected-field projection, vector opt-in, and truthful explain/profile summaries across all connectors.
+- **GQL public naming is unified around execute/explain.** The final advertised GQL Beta surface uses `execute_gql` / `executeGql` and `explain_gql` / `explainGql`, matching the read execution model and leaving mutation-capable naming room for a later beta.
+- **Public docs position GQL as a first-class query option.** README, API reference, and `docs/gql-subset.md` now document when to use native function APIs versus GQL Beta query strings, the supported subset, and intentionally unsupported beta features.
+
+### Fixed
+
+- **GQL planner and runtime parity.** GQL reads now match native graph-row behavior for optional null extension, path expansion, relaxed self-loop distinctness, temporal and prune visibility, stale index verification, row caps, cursor validation, ordering, projection needs, and vector omission defaults.
+- **Connector parity.** Node.js TypeScript declarations, Python stubs, async wrappers, and tests now expose the same GQL Beta behavior as the Rust core.
+
 ## [0.8.0] - 2026-05-20
 
 ### Breaking Changes
@@ -334,6 +356,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.9.0]: https://github.com/bhensley5/overgraph/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/bhensley5/overgraph/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/bhensley5/overgraph/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/bhensley5/overgraph/compare/v0.5.0...v0.6.0

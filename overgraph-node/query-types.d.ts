@@ -268,15 +268,16 @@ export interface QueryEdgeRequest {
   allowFullScan?: boolean
 }
 
-export interface GraphNodePattern {
+export interface GraphRowNodePattern {
   alias: string
   labelFilter?: NodeLabelFilter
   ids?: Array<number>
-  keys?: Array<string>
+  keys?: Array<string | { label: string; key: string }>
   filter?: QueryNodeFilter | null
 }
 
-export interface GraphEdgePattern {
+export interface GraphRowEdgePiece {
+  kind: 'edge'
   alias?: string
   fromAlias: string
   toAlias: string
@@ -285,31 +286,266 @@ export interface GraphEdgePattern {
   filter?: QueryEdgeFilter | null
 }
 
-export interface GraphPatternRequest {
-  nodes: Array<GraphNodePattern>
-  edges: Array<GraphEdgePattern>
-  atEpoch?: number
-  limit: number
+export interface GraphRowOptionalPiece {
+  kind: 'optional'
+  pieces: Array<GraphRowPatternPiece>
+  where?: GraphExpr | null
 }
 
-export interface QueryMatch {
-  nodes: Record<string, number>
-  edges: Record<string, number>
+export interface GraphRowVariableLengthPiece {
+  kind: 'variableLength'
+  pathAlias?: string
+  edgeAlias?: string
+  fromAlias: string
+  toAlias: string
+  direction?: 'outgoing' | 'incoming' | 'both'
+  labelFilter?: Array<string>
+  filter?: QueryEdgeFilter | null
+  minHops: number
+  maxHops: number
 }
 
-export interface QueryPatternResult {
-  matches: Array<QueryMatch>
-  truncated: boolean
+export type GraphRowPatternPiece =
+  | GraphRowEdgePiece
+  | GraphRowOptionalPiece
+  | GraphRowVariableLengthPiece
+
+export type GraphScalar = null | boolean | number | string
+
+export type GraphParamValue =
+  | GraphScalar
+  | { bytes: Array<number> }
+  | { list: Array<GraphParamValue> }
+  | { map: Record<string, GraphParamValue> }
+
+export type GraphExpr =
+  | GraphScalar
+  | { bytes: Array<number> }
+  | { list: Array<GraphExpr> }
+  | { map: Record<string, GraphExpr> }
+  | { param: string }
+  | { binding: string }
+  | { property: { alias: string; key: string } }
+  | { nodeField: { alias: string; field: 'id' | 'labels' | 'key' | 'weight' | 'createdAt' | 'updatedAt' } }
+  | { edgeField: { alias: string; field: 'id' | 'from' | 'to' | 'label' | 'weight' | 'createdAt' | 'updatedAt' | 'validFrom' | 'validTo' } }
+  | { pathField: { alias: string; field: 'nodeIds' | 'edgeIds' | 'length' } }
+  | { fn: 'id' | 'labels' | 'type' | 'length' | 'startNode' | 'endNode' | 'nodes' | 'relationships' | 'nodeIds' | 'edgeIds'; args: Array<GraphExpr> }
+  | { op: 'and' | 'or' | '=' | '==' | 'eq' | '<>' | '!=' | 'neq' | '<' | 'lt' | '<=' | 'lte' | '>' | 'gt' | '>=' | 'gte' | 'in'; left: GraphExpr; right: GraphExpr }
+  | { op: 'not'; expr: GraphExpr }
+  | { isNull: GraphExpr }
+  | { isNotNull: GraphExpr }
+
+export type GraphElementProjection = 'idOnly' | 'compact' | 'full'
+export type GraphPropertySelection = boolean | 'all' | 'none' | Array<string>
+export type GraphVectorSelection = boolean | 'none' | 'dense' | 'sparse' | 'both'
+
+export interface GraphSelectedNodeProjection {
+  id?: boolean
+  labels?: boolean
+  key?: boolean
+  props?: GraphPropertySelection
+  weight?: boolean
+  createdAt?: boolean
+  updatedAt?: boolean
+  vectors?: GraphVectorSelection
 }
 
-export type QueryPlanKind = 'node_query' | 'edge_query' | 'pattern_query'
+export interface GraphSelectedEdgeProjection {
+  id?: boolean
+  from?: boolean
+  to?: boolean
+  label?: boolean
+  props?: GraphPropertySelection
+  weight?: boolean
+  createdAt?: boolean
+  updatedAt?: boolean
+  validFrom?: boolean
+  validTo?: boolean
+}
+
+export interface GraphSelectedPathProjection {
+  nodeIds?: boolean
+  edgeIds?: boolean
+  nodes?: GraphSelectedNodeProjection
+  edges?: GraphSelectedEdgeProjection
+}
+
+export type GraphSelectedProjection =
+  | { node: GraphSelectedNodeProjection }
+  | { edge: GraphSelectedEdgeProjection }
+  | { path: GraphSelectedPathProjection }
+
+export type GraphReturnProjection =
+  | 'auto'
+  | 'idOnly'
+  | 'id'
+  | 'element'
+  | 'compact'
+  | 'full'
+  | { element: GraphElementProjection }
+  | { selected: GraphSelectedProjection }
+
+export interface GraphReturnItem {
+  expr: GraphExpr
+  as?: string
+  projection?: GraphReturnProjection
+}
+
+export interface GraphOrderItem {
+  expr: GraphExpr
+  direction?: 'asc' | 'desc'
+}
+
+export interface GraphOutputOptions {
+  mode?: 'ids' | 'elements' | 'projected'
+  compactRows?: boolean
+  includeVectors?: boolean
+}
+
+export interface GraphQueryOptions {
+  allowFullScan?: boolean
+  maxIntermediateBindings?: number
+  maxFrontier?: number
+  maxPathHops?: number
+  maxPathsPerStart?: number
+  maxPageLimit?: number
+  maxOrderMaterialization?: number
+  maxCursorBytes?: number
+  maxQueryBytes?: number
+  includePlan?: boolean
+  profile?: boolean
+}
+
+export interface GraphRowRequest {
+  nodes?: Array<GraphRowNodePattern>
+  pieces?: Array<GraphRowPatternPiece>
+  where?: GraphExpr | null
+  return?: Array<GraphReturnItem>
+  orderBy?: Array<GraphOrderItem>
+  skip?: number
+  limit?: number
+  cursor?: string | null
+  atEpoch?: number | null
+  params?: Record<string, GraphParamValue>
+  output?: GraphOutputOptions
+  options?: GraphQueryOptions
+}
+
+export type GraphValue =
+  | GraphScalar
+  | Buffer
+  | Array<GraphValue>
+  | { [key: string]: GraphValue }
+  | GraphNodeValue
+  | GraphEdgeValue
+  | GraphPathValue
+
+export interface GraphNodeValue {
+  id?: number
+  labels?: Array<string>
+  key?: string
+  props?: Record<string, GraphValue>
+  weight?: number
+  createdAt?: number
+  updatedAt?: number
+  denseVector?: Array<number>
+  sparseVector?: Array<{ dimension: number; value: number }>
+}
+
+export interface GraphEdgeValue {
+  id?: number
+  from?: number
+  to?: number
+  label?: string
+  props?: Record<string, GraphValue>
+  weight?: number
+  createdAt?: number
+  updatedAt?: number
+  validFrom?: number
+  validTo?: number
+}
+
+export interface GraphPathValue {
+  nodeIds: Array<number>
+  edgeIds: Array<number>
+  nodes?: Array<GraphNodeValue>
+  edges?: Array<GraphEdgeValue>
+}
+
+export interface GraphRowStats {
+  rowsReturned: number
+  rowsAfterFilter: number
+  rowsSeenForPage: number
+  intermediateBindingsPeak: number
+  frontierPeak: number
+  pathsEnumerated: number
+  dbHits: number
+  elapsedUs: number | null
+  effectiveAtEpoch: number
+  warnings: Array<string>
+}
+
+export interface GraphExplainNode {
+  kind: string
+  detail: string
+  children: Array<GraphExplainNode>
+}
+
+export interface GraphRowOperationExplain {
+  kind: string
+  detail: string
+}
+
+export interface GraphRowExplain {
+  columns: Array<string>
+  effectiveAtEpoch: number | null
+  fingerprint: string
+  plan: Array<GraphExplainNode>
+  rowOps: Array<GraphRowOperationExplain>
+  order: { explicit: boolean; items: number; stableLogicalRowKey: boolean }
+  cursor: { supplied: boolean; codecImplemented: boolean; message: string | null }
+  projection: { columns: Array<string>; outputMode: 'ids' | 'elements' | 'projected'; includeVectors: boolean; compactRows: boolean }
+  caps: {
+    allowFullScan: boolean
+    maxIntermediateBindings: number
+    maxFrontier: number
+    maxPathHops: number
+    maxPathsPerStart: number
+    maxPageLimit: number
+    maxOrderMaterialization: number
+    maxCursorBytes: number
+    maxQueryBytes: number
+  }
+  summaries: { validationOnly: boolean; rowsPlanned: number; warnings: Array<string> }
+  warnings: Array<string>
+  notes: Array<string>
+}
+
+export interface GraphObjectRowsResult {
+  columns: Array<string>
+  rows: Array<Record<string, GraphValue>>
+  nextCursor: string | null
+  stats: GraphRowStats
+  plan: GraphRowExplain | null
+}
+
+export interface GraphCompactRowsResult {
+  columns: Array<string>
+  rows: Array<Array<GraphValue>>
+  nextCursor: string | null
+  stats: GraphRowStats
+  plan: GraphRowExplain | null
+}
+
+export type GraphRowResult = GraphObjectRowsResult | GraphCompactRowsResult
+
+export type QueryPlanKind = 'node_query' | 'edge_query'
 
 export type QueryPlanWarning =
   | 'missing_ready_index'
   | 'using_fallback_scan'
   | 'full_scan_requires_opt_in'
   | 'full_scan_explicitly_allowed'
-  | 'unbounded_pattern_rejected'
   | 'edge_property_post_filter'
   | 'index_skipped_as_broad'
   | 'candidate_cap_exceeded'
@@ -363,8 +599,6 @@ export type QueryPlanNode =
   | { kind: 'verify_node_filter'; input: QueryPlanNode }
   | { kind: 'verify_edge_filter'; input: QueryPlanNode }
   | { kind: 'verify_edge_predicates'; input: QueryPlanNode }
-  | { kind: 'pattern_expand'; anchorAlias: string; input: QueryPlanNode }
-  | { kind: 'pattern_edge_anchor'; edgeAlias?: string | null; input: QueryPlanNode }
   | { kind: 'fallback_node_label_scan' }
   | { kind: 'fallback_full_node_scan' }
   | { kind: 'fallback_edge_label_scan' }
@@ -379,3 +613,129 @@ export interface QueryPlan {
   notes: Array<QueryPlanNote>
   publicInputs: QueryPlanPublicInputs
 }
+
+export type GqlParam =
+  | null
+  | boolean
+  | number
+  | string
+  | Buffer
+  | Array<GqlParam>
+  | { [key: string]: GqlParam }
+
+export type GqlParams = Record<string, GqlParam>
+
+export interface GqlQueryOptions {
+  allowFullScan?: boolean
+  maxRows?: number
+  cursor?: string
+  maxCursorBytes?: number
+  maxIntermediateBindings?: number
+  maxSkip?: number
+  maxQueryBytes?: number
+  maxParamBytes?: number
+  maxAstDepth?: number
+  maxLiteralItems?: number
+  includePlan?: boolean
+  profile?: boolean
+  compactRows?: boolean
+  includeVectors?: boolean
+}
+
+export type GqlScalar = null | boolean | number | string | Buffer
+
+export type GqlValue =
+  | GqlScalar
+  | Array<GqlValue>
+  | { [key: string]: GqlValue }
+  | GqlNode
+  | GqlEdge
+  | GqlPath
+
+export interface GqlNode {
+  id?: number
+  labels?: Array<string>
+  key?: string
+  props?: Record<string, GqlValue>
+  weight?: number
+  createdAt?: number
+  updatedAt?: number
+  denseVector?: Array<number>
+  sparseVector?: Array<{ dimension: number; value: number }>
+}
+
+export interface GqlEdge {
+  id?: number
+  from?: number
+  to?: number
+  label?: string
+  props?: Record<string, GqlValue>
+  weight?: number
+  createdAt?: number
+  updatedAt?: number
+  validFrom?: number
+  validTo?: number
+}
+
+export interface GqlPath {
+  nodeIds: Array<number>
+  edgeIds: Array<number>
+  nodes?: Array<GqlNode>
+  edges?: Array<GqlEdge>
+}
+
+export interface GqlExecutionStats {
+  rowsReturned: number
+  rowsMatched: number
+  rowsAfterFilter: number
+  intermediateBindings: number
+  dbHits: number
+  elapsedUs: number | null
+  truncated: boolean
+  warnings: Array<string>
+}
+
+export interface GqlCapSummary {
+  allowFullScan: boolean
+  maxRows: number
+  maxIntermediateBindings: number
+  maxSkip: number
+  maxQueryBytes: number
+  maxParamBytes: number
+  maxAstDepth: number
+  maxLiteralItems: number
+}
+
+export type GqlLoweringTarget = 'node_query' | 'edge_query' | 'graph_row_query'
+
+export type GqlRowOperation = 'residual_filter' | 'projection' | 'sort' | 'skip' | 'limit'
+
+export interface GqlExplain {
+  columns: Array<string>
+  target: GqlLoweringTarget
+  nativePlan: QueryPlan | null
+  pushedDown: Array<string>
+  residual: Array<string>
+  projection: Array<string>
+  rowOps: Array<GqlRowOperation>
+  caps: GqlCapSummary
+  warnings: Array<string>
+}
+
+export interface GqlObjectRowsResult {
+  columns: Array<string>
+  rows: Array<Record<string, GqlValue>>
+  nextCursor: string | null
+  stats: GqlExecutionStats
+  plan: GqlExplain | null
+}
+
+export interface GqlCompactRowsResult {
+  columns: Array<string>
+  rows: Array<Array<GqlValue>>
+  nextCursor: string | null
+  stats: GqlExecutionStats
+  plan: GqlExplain | null
+}
+
+export type GqlResult = GqlObjectRowsResult | GqlCompactRowsResult

@@ -117,42 +117,1642 @@ struct NormalizedEdgeQuery {
 }
 
 #[derive(Clone, Debug)]
-struct NormalizedNodePattern {
-    alias: String,
-    query: NormalizedNodeQuery,
+pub(crate) struct NormalizedGraphRowQuery {
+    pub(crate) binding_schema: crate::graph_row::GraphBindingSchema,
+    pub(crate) nodes: Vec<GraphNodePattern>,
+    pub(crate) pieces: Vec<GraphPatternPiece>,
+    pub(crate) fixed_paths: Vec<GraphFixedPathBinding>,
+    pub(crate) edge_id_constraints: BTreeMap<String, Vec<u64>>,
+    pub(crate) fingerprint_where: Option<GraphExpr>,
+    pub(crate) fingerprint_order_by: Vec<GraphOrderItem>,
+    pub(crate) fingerprint_return_items: Option<Vec<GraphReturnItem>>,
+    pub(crate) return_items: Vec<GraphReturnItem>,
+    pub(crate) bound_return_items: Vec<crate::graph_row::BoundGraphReturnItem>,
+    pub(crate) columns: Vec<String>,
+    pub(crate) order_by: Vec<GraphOrderItem>,
+    pub(crate) bound_order_by: Vec<crate::graph_row::BoundGraphOrderItem>,
+    pub(crate) bound_where: Option<crate::graph_row::BoundGraphExpr>,
+    pub(crate) page: GraphPageRequest,
+    pub(crate) logical_limit: Option<usize>,
+    pub(crate) at_epoch: Option<i64>,
+    pub(crate) output: GraphOutputOptions,
+    pub(crate) options: GraphQueryOptions,
+    pub(crate) projection_needs: crate::row_projection::ProjectionNeeds,
+    pub(crate) referenced_params: Vec<(String, GraphParamValue)>,
 }
 
-#[derive(Clone, Debug)]
-struct NormalizedEdgePattern {
-    alias: Option<String>,
-    from_index: usize,
-    to_index: usize,
-    direction: Direction,
-    label_filter_ids: Option<Vec<u32>>,
-    filter: NormalizedEdgeFilter,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GraphFixedPathBinding {
+    pub(crate) scope: Vec<usize>,
+    pub(crate) alias: String,
+    pub(crate) node_aliases: Vec<String>,
+    pub(crate) edge_piece_indices: Vec<usize>,
+    pub(crate) after_piece_index: usize,
 }
 
-#[derive(Clone, Debug)]
-struct NormalizedGraphPatternQuery {
-    nodes: Vec<NormalizedNodePattern>,
-    edges: Vec<NormalizedEdgePattern>,
-    at_epoch: Option<i64>,
-    limit: usize,
-    order: PatternOrder,
-    warnings: Vec<QueryPlanWarning>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphAliasScope {
+    Required,
+    Optional,
+}
+
+#[derive(Default)]
+struct GraphRowAliasState {
+    node_aliases: HashSet<String>,
+    edge_aliases: HashSet<String>,
+    path_aliases: HashSet<String>,
+    node_first_scope: HashMap<String, GraphAliasScope>,
+    edge_first_scope: HashMap<String, GraphAliasScope>,
+    path_first_scope: HashMap<String, GraphAliasScope>,
+    node_order: Vec<String>,
+    required_edge_order: Vec<String>,
+    optional_alias_order: Vec<String>,
+    path_order: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct GraphRowVisibleAliases {
+    node_aliases: HashSet<String>,
+    edge_aliases: HashSet<String>,
+    path_aliases: HashSet<String>,
+}
+
+#[derive(Default)]
+struct GraphRowAnchorState {
+    bound_nodes: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphExprKind {
+    Scalar,
+    List,
+    NodeList,
+    EdgeList,
+    Map,
+    Node,
+    Edge,
+    Path,
 }
 
 fn prop_value_canonical_bytes(value: &PropValue) -> Vec<u8> {
-    rmp_serde::to_vec(value).expect("PropValue must be serializable")
+    semantic_equality_key_bytes(value)
+}
+
+pub(crate) fn normalize_graph_row_query(
+    query: &GraphRowQuery,
+) -> Result<NormalizedGraphRowQuery, EngineError> {
+    normalize_graph_row_query_with_internal_limits(query, &BTreeMap::new(), None, &[])
+}
+
+pub(crate) fn normalize_graph_row_query_with_gql_fixed_paths(
+    query: &GraphRowQuery,
+    edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+    logical_limit: Option<usize>,
+    fixed_paths: &[GraphFixedPathBinding],
+) -> Result<NormalizedGraphRowQuery, EngineError> {
+    normalize_graph_row_query_with_internal_limits(
+        query,
+        edge_id_constraints,
+        logical_limit,
+        fixed_paths,
+    )
+}
+
+fn normalize_graph_row_query_with_internal_limits(
+    query: &GraphRowQuery,
+    edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+    logical_limit: Option<usize>,
+    fixed_paths: &[GraphFixedPathBinding],
+) -> Result<NormalizedGraphRowQuery, EngineError> {
+    validate_graph_row_page(&query.page, &query.options)?;
+    let referenced_params = collect_graph_row_referenced_params(query)?;
+
+    let mut aliases = GraphRowAliasState::default();
+    collect_graph_row_node_aliases(query, &mut aliases)?;
+    for piece in &query.pieces {
+        collect_graph_row_piece_aliases(piece, GraphAliasScope::Required, &mut aliases)?;
+    }
+    validate_and_collect_graph_row_fixed_paths(fixed_paths, &query.pieces, &mut aliases)?;
+    validate_graph_row_vlp_options(&query.pieces, query.options.max_path_hops)?;
+    for alias in &aliases.node_order {
+        aliases
+            .node_first_scope
+            .entry(alias.clone())
+            .or_insert(GraphAliasScope::Required);
+    }
+
+    validate_graph_row_anchors(query, edge_id_constraints)?;
+    validate_graph_row_optional_filters(&query.pieces, fixed_paths, &aliases, &query.params)?;
+    if let Some(expr) = query.where_.as_ref() {
+        validate_graph_expr_aliases(expr, &aliases, &query.params)?;
+    }
+    for order in &query.order_by {
+        validate_graph_order_expr(order, &aliases, &query.params)?;
+    }
+    validate_graph_row_required_connectivity(query)?;
+
+    let mut return_items = match query.return_items.as_ref() {
+        Some(items) => {
+            if items.is_empty() {
+                return Err(EngineError::InvalidOperation(
+                    "graph row return_items must not be empty".to_string(),
+                ));
+            }
+            items.clone()
+        }
+        None => expand_graph_row_return_star(&aliases)?,
+    };
+    for item in &mut return_items {
+        item.expr = resolve_graph_expr_params(&item.expr, &query.params)?;
+    }
+    let resolved_pieces = resolve_graph_row_piece_params(&query.pieces, &query.params)?;
+    let resolved_where = query
+        .where_
+        .as_ref()
+        .map(|expr| resolve_graph_expr_params(expr, &query.params))
+        .transpose()?;
+    let resolved_order_by = query
+        .order_by
+        .iter()
+        .map(|item| {
+            Ok(GraphOrderItem {
+                expr: resolve_graph_expr_params(&item.expr, &query.params)?,
+                direction: item.direction,
+            })
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+
+    if matches!(query.output.mode, GraphOutputMode::Projected)
+        && return_items
+            .iter()
+            .any(|item| matches!(item.projection, GraphReturnProjection::Auto))
+    {
+        return Err(EngineError::InvalidOperation(
+            "graph row projected output mode requires selected return projections".to_string(),
+        ));
+    }
+
+    let mut columns = Vec::with_capacity(return_items.len());
+    for item in &return_items {
+        let expr_kind = graph_expr_kind(&item.expr, &aliases, &query.params)?;
+        validate_graph_return_projection(&item.projection, &query.output, expr_kind)?;
+        columns.push(graph_return_column_name(item)?);
+    }
+    let binding_schema = build_graph_row_binding_schema(&aliases, &query.pieces)?;
+    let bound_return_items = crate::graph_row::bind_graph_return_items(&binding_schema, &return_items)?;
+    let bound_order_by = crate::graph_row::bind_graph_order_items(&binding_schema, &resolved_order_by)?;
+    let bound_where = resolved_where
+        .as_ref()
+        .map(|expr| crate::graph_row::bind_graph_expr(&binding_schema, expr))
+        .transpose()?;
+    let node_filters = query
+        .nodes
+        .iter()
+        .map(|node| (node.alias.clone(), node.filter.clone()))
+        .collect::<Vec<_>>();
+    let projection_needs = crate::graph_row::collect_graph_row_projection_needs(
+        &binding_schema,
+        &node_filters,
+        &resolved_pieces,
+        resolved_where.as_ref(),
+        &resolved_order_by,
+        &return_items,
+        &query.output,
+    )?;
+
+    Ok(NormalizedGraphRowQuery {
+        binding_schema,
+        nodes: query.nodes.clone(),
+        pieces: resolved_pieces,
+        fixed_paths: fixed_paths.to_vec(),
+        edge_id_constraints: edge_id_constraints.clone(),
+        fingerprint_where: query.where_.clone(),
+        fingerprint_order_by: query.order_by.clone(),
+        fingerprint_return_items: query.return_items.clone(),
+        return_items,
+        bound_return_items,
+        columns,
+        order_by: resolved_order_by,
+        bound_order_by,
+        bound_where,
+        page: query.page.clone(),
+        logical_limit,
+        at_epoch: query.at_epoch,
+        output: query.output.clone(),
+        options: query.options.clone(),
+        projection_needs,
+        referenced_params,
+    })
+}
+
+fn collect_graph_row_referenced_params(
+    query: &GraphRowQuery,
+) -> Result<Vec<(String, GraphParamValue)>, EngineError> {
+    let mut names = BTreeSet::new();
+    if let Some(expr) = query.where_.as_ref() {
+        collect_graph_expr_param_names(expr, &mut names);
+    }
+    for item in &query.order_by {
+        collect_graph_expr_param_names(&item.expr, &mut names);
+    }
+    if let Some(items) = query.return_items.as_ref() {
+        for item in items {
+            collect_graph_expr_param_names(&item.expr, &mut names);
+        }
+    }
+    collect_graph_piece_param_names(&query.pieces, &mut names);
+
+    names
+        .into_iter()
+        .map(|name| {
+            let value = query.params.get(&name).cloned().ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row expression references missing param '{name}'"
+                ))
+            })?;
+            Ok((name, value))
+        })
+        .collect()
+}
+
+fn collect_graph_piece_param_names(pieces: &[GraphPatternPiece], names: &mut BTreeSet<String>) {
+    for piece in pieces {
+        match piece {
+            GraphPatternPiece::Optional(group) => {
+                if let Some(expr) = group.where_.as_ref() {
+                    collect_graph_expr_param_names(expr, names);
+                }
+                collect_graph_piece_param_names(&group.pieces, names);
+            }
+            GraphPatternPiece::Edge(_) | GraphPatternPiece::VariableLength(_) => {}
+        }
+    }
+}
+
+fn collect_graph_expr_param_names(expr: &GraphExpr, names: &mut BTreeSet<String>) {
+    match expr {
+        GraphExpr::Param(name) => {
+            names.insert(name.clone());
+        }
+        GraphExpr::List(items) => {
+            for item in items {
+                collect_graph_expr_param_names(item, names);
+            }
+        }
+        GraphExpr::Map(items) => {
+            for item in items.values() {
+                collect_graph_expr_param_names(item, names);
+            }
+        }
+        GraphExpr::Function { args, .. } => {
+            for arg in args {
+                collect_graph_expr_param_names(arg, names);
+            }
+        }
+        GraphExpr::Unary { expr, .. } | GraphExpr::IsNull(expr) | GraphExpr::IsNotNull(expr) => {
+            collect_graph_expr_param_names(expr, names);
+        }
+        GraphExpr::Binary { left, right, .. } => {
+            collect_graph_expr_param_names(left, names);
+            collect_graph_expr_param_names(right, names);
+        }
+        GraphExpr::Null
+        | GraphExpr::Bool(_)
+        | GraphExpr::Int(_)
+        | GraphExpr::UInt(_)
+        | GraphExpr::Float(_)
+        | GraphExpr::String(_)
+        | GraphExpr::Bytes(_)
+        | GraphExpr::Binding(_)
+        | GraphExpr::Property { .. }
+        | GraphExpr::NodeField { .. }
+        | GraphExpr::EdgeField { .. }
+        | GraphExpr::PathField { .. } => {}
+    }
+}
+
+fn validate_graph_row_required_connectivity(query: &GraphRowQuery) -> Result<(), EngineError> {
+    let required_edges = query
+        .pieces
+        .iter()
+        .filter_map(|piece| match piece {
+            GraphPatternPiece::Edge(edge) => Some(edge),
+            GraphPatternPiece::Optional(_) | GraphPatternPiece::VariableLength(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    if required_edges.len() != query.pieces.len() {
+        return Ok(());
+    }
+
+    if required_edges.is_empty() {
+        return Ok(());
+    }
+
+    let required_nodes = query
+        .nodes
+        .iter()
+        .map(|node| node.alias.as_str())
+        .collect::<HashSet<_>>();
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in &required_edges {
+        if required_nodes.contains(edge.from_alias.as_str())
+            && required_nodes.contains(edge.to_alias.as_str())
+        {
+            adjacency
+                .entry(edge.from_alias.as_str())
+                .or_default()
+                .push(edge.to_alias.as_str());
+            adjacency
+                .entry(edge.to_alias.as_str())
+                .or_default()
+                .push(edge.from_alias.as_str());
+        }
+    }
+
+    let start = required_edges[0].from_alias.as_str();
+    let mut visited = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(alias) = stack.pop() {
+        if !visited.insert(alias) {
+            continue;
+        }
+        if let Some(next) = adjacency.get(alias) {
+            stack.extend(next.iter().copied());
+        }
+    }
+
+    for node in &query.nodes {
+        if !visited.contains(node.alias.as_str()) {
+            return Err(EngineError::InvalidOperation(
+                "graph row required fixed patterns must be connected".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_graph_row_piece_params(
+    pieces: &[GraphPatternPiece],
+    params: &BTreeMap<String, GraphParamValue>,
+) -> Result<Vec<GraphPatternPiece>, EngineError> {
+    pieces
+        .iter()
+        .map(|piece| resolve_graph_row_piece_param_refs(piece, params))
+        .collect()
+}
+
+fn resolve_graph_row_piece_param_refs(
+    piece: &GraphPatternPiece,
+    params: &BTreeMap<String, GraphParamValue>,
+) -> Result<GraphPatternPiece, EngineError> {
+    Ok(match piece {
+        GraphPatternPiece::Edge(edge) => GraphPatternPiece::Edge(edge.clone()),
+        GraphPatternPiece::VariableLength(path) => GraphPatternPiece::VariableLength(path.clone()),
+        GraphPatternPiece::Optional(group) => GraphPatternPiece::Optional(GraphOptionalGroup {
+            pieces: resolve_graph_row_piece_params(&group.pieces, params)?,
+            where_: group
+                .where_
+                .as_ref()
+                .map(|expr| resolve_graph_expr_params(expr, params))
+                .transpose()?,
+        }),
+    })
+}
+
+fn resolve_graph_expr_params(
+    expr: &GraphExpr,
+    params: &BTreeMap<String, GraphParamValue>,
+) -> Result<GraphExpr, EngineError> {
+    Ok(match expr {
+        GraphExpr::Param(name) => graph_param_value_to_expr(params.get(name).ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "graph row expression references missing param '{name}'"
+            ))
+        })?)?,
+        GraphExpr::List(items) => GraphExpr::List(
+            items
+                .iter()
+                .map(|item| resolve_graph_expr_params(item, params))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        GraphExpr::Map(items) => GraphExpr::Map(
+            items
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), resolve_graph_expr_params(value, params)?)))
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()?,
+        ),
+        GraphExpr::Function { name, args } => GraphExpr::Function {
+            name: *name,
+            args: args
+                .iter()
+                .map(|arg| resolve_graph_expr_params(arg, params))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        GraphExpr::Unary { op, expr } => GraphExpr::Unary {
+            op: *op,
+            expr: Box::new(resolve_graph_expr_params(expr, params)?),
+        },
+        GraphExpr::Binary { left, op, right } => GraphExpr::Binary {
+            left: Box::new(resolve_graph_expr_params(left, params)?),
+            op: *op,
+            right: Box::new(resolve_graph_expr_params(right, params)?),
+        },
+        GraphExpr::IsNull(inner) => {
+            GraphExpr::IsNull(Box::new(resolve_graph_expr_params(inner, params)?))
+        }
+        GraphExpr::IsNotNull(inner) => {
+            GraphExpr::IsNotNull(Box::new(resolve_graph_expr_params(inner, params)?))
+        }
+        GraphExpr::Null
+        | GraphExpr::Bool(_)
+        | GraphExpr::Int(_)
+        | GraphExpr::UInt(_)
+        | GraphExpr::Float(_)
+        | GraphExpr::String(_)
+        | GraphExpr::Bytes(_)
+        | GraphExpr::Binding(_)
+        | GraphExpr::Property { .. }
+        | GraphExpr::NodeField { .. }
+        | GraphExpr::EdgeField { .. }
+        | GraphExpr::PathField { .. } => expr.clone(),
+    })
+}
+
+fn graph_param_value_to_expr(value: &GraphParamValue) -> Result<GraphExpr, EngineError> {
+    Ok(match value {
+        GraphParamValue::Null => GraphExpr::Null,
+        GraphParamValue::Bool(value) => GraphExpr::Bool(*value),
+        GraphParamValue::Int(value) => GraphExpr::Int(*value),
+        GraphParamValue::UInt(value) => GraphExpr::UInt(*value),
+        GraphParamValue::Float(value) => GraphExpr::Float(*value),
+        GraphParamValue::String(value) => GraphExpr::String(value.clone()),
+        GraphParamValue::Bytes(value) => GraphExpr::Bytes(value.clone()),
+        GraphParamValue::List(values) => GraphExpr::List(
+            values
+                .iter()
+                .map(graph_param_value_to_expr)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        GraphParamValue::Map(values) => GraphExpr::Map(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), graph_param_value_to_expr(value)?)))
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()?,
+        ),
+    })
+}
+
+pub(crate) fn validate_graph_row_page(
+    page: &GraphPageRequest,
+    options: &GraphQueryOptions,
+) -> Result<(), EngineError> {
+    if page.limit == 0 {
+        return Err(EngineError::InvalidOperation(
+            "graph row page limit must be > 0".to_string(),
+        ));
+    }
+    if page.limit > options.max_page_limit {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row page limit {} exceeds max_page_limit {}",
+            page.limit, options.max_page_limit
+        )));
+    }
+    if let Some(cursor) = page.cursor.as_ref() {
+        let cursor_bytes = cursor.len();
+        let transport_limit = graph_row_encoded_cursor_transport_limit(options.max_cursor_bytes);
+        if cursor_bytes > transport_limit {
+            return Err(EngineError::InvalidCursor {
+                message: format!(
+                    "encoded graph row cursor is too large to decode within max_cursor_bytes {}",
+                    options.max_cursor_bytes
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_graph_row_anchors(
+    query: &GraphRowQuery,
+    edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+) -> Result<(), EngineError> {
+    if query.pieces.is_empty() {
+        return validate_graph_row_no_piece_anchors(query);
+    }
+
+    if query.options.allow_full_scan {
+        return Ok(());
+    }
+
+    let node_by_alias: HashMap<&str, &GraphNodePattern> = query
+        .nodes
+        .iter()
+        .map(|node| (node.alias.as_str(), node))
+        .collect();
+    let mut anchors = GraphRowAnchorState::default();
+    for node in &query.nodes {
+        if graph_node_pattern_has_structural_anchor(node) {
+            anchors.bound_nodes.insert(node.alias.clone());
+        }
+    }
+
+    for piece in &query.pieces {
+        validate_graph_row_piece_anchor(piece, &node_by_alias, edge_id_constraints, &mut anchors)?;
+    }
+    Ok(())
+}
+
+fn validate_graph_row_no_piece_anchors(query: &GraphRowQuery) -> Result<(), EngineError> {
+    if query.nodes.len() > 1 {
+        return Err(EngineError::InvalidOperation(
+            "graph row queries with multiple unconnected node aliases are out of scope"
+                .to_string(),
+        ));
+    }
+    if query.options.allow_full_scan || query.nodes.is_empty() {
+        return Ok(());
+    }
+    let Some(node) = query.nodes.first() else {
+        return Ok(());
+    };
+    if graph_node_pattern_has_structural_anchor(node) {
+        Ok(())
+    } else {
+        Err(EngineError::InvalidOperation(
+            "graph row query requires an anchor or allow_full_scan=true".to_string(),
+        ))
+    }
+}
+
+fn validate_graph_row_piece_anchor(
+    piece: &GraphPatternPiece,
+    node_by_alias: &HashMap<&str, &GraphNodePattern>,
+    edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+    anchors: &mut GraphRowAnchorState,
+) -> Result<(), EngineError> {
+    match piece {
+        GraphPatternPiece::Edge(edge) => {
+            if !graph_edge_has_structural_anchor(edge, node_by_alias, edge_id_constraints, anchors) {
+                return Err(EngineError::InvalidOperation(
+                    "graph row required edge pattern requires an anchor or allow_full_scan=true"
+                        .to_string(),
+                ));
+            }
+            anchors.bound_nodes.insert(edge.from_alias.clone());
+            anchors.bound_nodes.insert(edge.to_alias.clone());
+        }
+        GraphPatternPiece::VariableLength(path) => {
+            if !graph_vlp_has_structural_anchor(path, node_by_alias, edge_id_constraints, anchors) {
+                return Err(EngineError::InvalidOperation(
+                    "graph row variable-length pattern requires an anchor or allow_full_scan=true"
+                        .to_string(),
+                ));
+            }
+            anchors.bound_nodes.insert(path.from_alias.clone());
+            anchors.bound_nodes.insert(path.to_alias.clone());
+        }
+        GraphPatternPiece::Optional(group) => {
+            let mut group_anchors = GraphRowAnchorState {
+                bound_nodes: anchors.bound_nodes.clone(),
+            };
+            let had_correlation = group
+                .pieces
+                .iter()
+                .any(|piece| graph_piece_references_bound_node(piece, &anchors.bound_nodes));
+            let had_internal_anchor = group.pieces.iter().any(|piece| {
+                graph_piece_has_internal_structural_anchor(
+                    piece,
+                    node_by_alias,
+                    edge_id_constraints,
+                    &anchors.bound_nodes,
+                )
+            });
+            if !had_correlation && !had_internal_anchor {
+                return Err(EngineError::InvalidOperation(
+                    "graph row optional group requires correlation, an internal anchor, or allow_full_scan=true"
+                        .to_string(),
+                ));
+            }
+            for child in &group.pieces {
+                validate_graph_row_piece_anchor(
+                    child,
+                    node_by_alias,
+                    edge_id_constraints,
+                    &mut group_anchors,
+                )?;
+            }
+            anchors.bound_nodes.extend(group_anchors.bound_nodes);
+        }
+    }
+    Ok(())
+}
+
+fn graph_node_pattern_has_structural_anchor(node: &GraphNodePattern) -> bool {
+    !node.ids.is_empty()
+        || !node.keys.is_empty()
+        || node.filter.is_some()
+        || node
+            .label_filter
+            .as_ref()
+            .is_some_and(|filter| !filter.labels.is_empty())
+}
+
+fn graph_edge_has_structural_anchor(
+    edge: &GraphEdgePattern,
+    node_by_alias: &HashMap<&str, &GraphNodePattern>,
+    edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+    anchors: &GraphRowAnchorState,
+) -> bool {
+    !edge.label_filter.is_empty()
+        || edge.filter.is_some()
+        || edge
+            .alias
+            .as_ref()
+            .is_some_and(|alias| edge_id_constraints.get(alias).is_some_and(|ids| !ids.is_empty()))
+        || anchors.bound_nodes.contains(&edge.from_alias)
+        || anchors.bound_nodes.contains(&edge.to_alias)
+        || node_by_alias
+            .get(edge.from_alias.as_str())
+            .is_some_and(|node| graph_node_pattern_has_structural_anchor(node))
+        || node_by_alias
+            .get(edge.to_alias.as_str())
+            .is_some_and(|node| graph_node_pattern_has_structural_anchor(node))
+}
+
+fn graph_vlp_has_structural_anchor(
+    path: &GraphVariableLengthPattern,
+    node_by_alias: &HashMap<&str, &GraphNodePattern>,
+    edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+    anchors: &GraphRowAnchorState,
+) -> bool {
+    anchors.bound_nodes.contains(&path.from_alias)
+        || anchors.bound_nodes.contains(&path.to_alias)
+        || path
+            .edge_alias
+            .as_ref()
+            .is_some_and(|alias| edge_id_constraints.get(alias).is_some_and(|ids| !ids.is_empty()))
+        || (path.min_hops == 1
+            && path.max_hops == 1
+            && (!path.label_filter.is_empty() || path.filter.is_some()))
+        || node_by_alias
+            .get(path.from_alias.as_str())
+            .is_some_and(|node| graph_node_pattern_has_structural_anchor(node))
+        || node_by_alias
+            .get(path.to_alias.as_str())
+            .is_some_and(|node| graph_node_pattern_has_structural_anchor(node))
+}
+
+fn graph_piece_references_bound_node(
+    piece: &GraphPatternPiece,
+    bound_nodes: &HashSet<String>,
+) -> bool {
+    match piece {
+        GraphPatternPiece::Edge(edge) => {
+            bound_nodes.contains(&edge.from_alias) || bound_nodes.contains(&edge.to_alias)
+        }
+        GraphPatternPiece::VariableLength(path) => {
+            bound_nodes.contains(&path.from_alias) || bound_nodes.contains(&path.to_alias)
+        }
+        GraphPatternPiece::Optional(group) => group
+            .pieces
+            .iter()
+            .any(|child| graph_piece_references_bound_node(child, bound_nodes)),
+    }
+}
+
+fn graph_piece_has_internal_structural_anchor(
+    piece: &GraphPatternPiece,
+    node_by_alias: &HashMap<&str, &GraphNodePattern>,
+    edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+    outer_bound_nodes: &HashSet<String>,
+) -> bool {
+    match piece {
+        GraphPatternPiece::Edge(edge) => {
+            !edge.label_filter.is_empty()
+                || edge.alias.as_ref().is_some_and(|alias| {
+                    edge_id_constraints.get(alias).is_some_and(|ids| !ids.is_empty())
+                })
+                || (!outer_bound_nodes.contains(&edge.from_alias)
+                    && node_by_alias
+                        .get(edge.from_alias.as_str())
+                        .is_some_and(|node| graph_node_pattern_has_structural_anchor(node)))
+                || (!outer_bound_nodes.contains(&edge.to_alias)
+                    && node_by_alias
+                        .get(edge.to_alias.as_str())
+                        .is_some_and(|node| graph_node_pattern_has_structural_anchor(node)))
+        }
+        GraphPatternPiece::VariableLength(path) => {
+            path.edge_alias.as_ref().is_some_and(|alias| {
+                edge_id_constraints.get(alias).is_some_and(|ids| !ids.is_empty())
+            })
+                || (path.min_hops == 1
+                && path.max_hops == 1
+                && (!path.label_filter.is_empty() || path.filter.is_some()))
+                || (!outer_bound_nodes.contains(&path.from_alias)
+                && node_by_alias
+                    .get(path.from_alias.as_str())
+                    .is_some_and(|node| graph_node_pattern_has_structural_anchor(node)))
+                || (!outer_bound_nodes.contains(&path.to_alias)
+                    && node_by_alias
+                        .get(path.to_alias.as_str())
+                        .is_some_and(|node| graph_node_pattern_has_structural_anchor(node)))
+        }
+        GraphPatternPiece::Optional(group) => group.pieces.iter().any(|child| {
+            graph_piece_has_internal_structural_anchor(
+                child,
+                node_by_alias,
+                edge_id_constraints,
+                outer_bound_nodes,
+            )
+        }),
+    }
+}
+
+fn collect_graph_row_node_aliases(
+    query: &GraphRowQuery,
+    aliases: &mut GraphRowAliasState,
+) -> Result<(), EngineError> {
+    for node in &query.nodes {
+        validate_graph_alias("node", &node.alias)?;
+        if !aliases.node_aliases.insert(node.alias.clone()) {
+            return Err(EngineError::InvalidOperation(format!(
+                "graph row node alias '{}' is introduced more than once",
+                node.alias
+            )));
+        }
+        aliases.node_order.push(node.alias.clone());
+    }
+    Ok(())
+}
+
+fn collect_graph_row_piece_aliases(
+    piece: &GraphPatternPiece,
+    scope: GraphAliasScope,
+    aliases: &mut GraphRowAliasState,
+) -> Result<(), EngineError> {
+    match piece {
+        GraphPatternPiece::Edge(edge) => {
+            collect_graph_row_node_reference(&edge.from_alias, scope, aliases)?;
+            collect_graph_row_node_reference(&edge.to_alias, scope, aliases)?;
+            if let Some(alias) = edge.alias.as_ref() {
+                collect_graph_row_edge_alias(alias, scope, aliases)?;
+            }
+        }
+        GraphPatternPiece::Optional(group) => {
+            for child in &group.pieces {
+                collect_graph_row_piece_aliases(child, GraphAliasScope::Optional, aliases)?;
+            }
+        }
+        GraphPatternPiece::VariableLength(path) => {
+            collect_graph_row_node_reference(&path.from_alias, scope, aliases)?;
+            collect_graph_row_node_reference(&path.to_alias, scope, aliases)?;
+            if path.min_hops > path.max_hops {
+                return Err(EngineError::InvalidOperation(format!(
+                    "graph row variable-length pattern has min_hops {} greater than max_hops {}",
+                    path.min_hops, path.max_hops
+                )));
+            }
+            if let Some(alias) = path.edge_alias.as_ref() {
+                if path.min_hops != 1 || path.max_hops != 1 {
+                    return Err(EngineError::InvalidOperation(
+                        "graph row variable-length edge_alias is only supported for 1..1 patterns"
+                            .to_string(),
+                    ));
+                }
+                collect_graph_row_edge_alias(alias, scope, aliases)?;
+            }
+            if let Some(alias) = path.path_alias.as_ref() {
+                collect_graph_row_path_alias(alias, scope, aliases)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_graph_row_vlp_options(
+    pieces: &[GraphPatternPiece],
+    max_path_hops: u8,
+) -> Result<(), EngineError> {
+    for piece in pieces {
+        match piece {
+            GraphPatternPiece::Edge(_) => {}
+            GraphPatternPiece::Optional(group) => {
+                validate_graph_row_vlp_options(&group.pieces, max_path_hops)?;
+            }
+            GraphPatternPiece::VariableLength(path) => {
+                if path.max_hops > max_path_hops {
+                    return Err(EngineError::InvalidOperation(format!(
+                        "graph row variable-length max_hops {} exceeds max_path_hops {}",
+                        path.max_hops, max_path_hops
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_graph_row_node_reference(
+    alias: &str,
+    scope: GraphAliasScope,
+    aliases: &mut GraphRowAliasState,
+) -> Result<(), EngineError> {
+    if !aliases.node_aliases.contains(alias) {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row pattern references unknown node alias '{alias}'"
+        )));
+    }
+    if !aliases.node_first_scope.contains_key(alias) {
+        aliases.node_first_scope.insert(alias.to_string(), scope);
+        if scope == GraphAliasScope::Optional {
+            aliases.optional_alias_order.push(alias.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn collect_graph_row_edge_alias(
+    alias: &str,
+    scope: GraphAliasScope,
+    aliases: &mut GraphRowAliasState,
+) -> Result<(), EngineError> {
+    validate_graph_alias("edge", alias)?;
+    if aliases.node_aliases.contains(alias) {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row edge alias '{alias}' collides with a node alias"
+        )));
+    }
+    if aliases.path_aliases.contains(alias) {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row edge alias '{alias}' collides with a path alias"
+        )));
+    }
+    if !aliases.edge_aliases.insert(alias.to_string()) {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row edge alias '{alias}' is introduced more than once"
+        )));
+    }
+    aliases.edge_first_scope.insert(alias.to_string(), scope);
+    match scope {
+        GraphAliasScope::Required => aliases.required_edge_order.push(alias.to_string()),
+        GraphAliasScope::Optional => {
+            aliases.optional_alias_order.push(alias.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn collect_graph_row_path_alias(
+    alias: &str,
+    scope: GraphAliasScope,
+    aliases: &mut GraphRowAliasState,
+) -> Result<(), EngineError> {
+    validate_graph_alias("path", alias)?;
+    if aliases.node_aliases.contains(alias) || aliases.edge_aliases.contains(alias) {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row path alias '{alias}' collides with a node or edge alias"
+        )));
+    }
+    if !aliases.path_aliases.insert(alias.to_string()) {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row path alias '{alias}' is introduced more than once"
+        )));
+    }
+    aliases.path_first_scope.insert(alias.to_string(), scope);
+    aliases.path_order.push(alias.to_string());
+    Ok(())
+}
+
+fn validate_and_collect_graph_row_fixed_paths(
+    fixed_paths: &[GraphFixedPathBinding],
+    root_pieces: &[GraphPatternPiece],
+    aliases: &mut GraphRowAliasState,
+) -> Result<(), EngineError> {
+    for fixed_path in fixed_paths {
+        let (scope_pieces, scope) = graph_row_fixed_path_scope_pieces(root_pieces, &fixed_path.scope)?;
+        if fixed_path.edge_piece_indices.is_empty() {
+            return Err(EngineError::InvalidOperation(format!(
+                "graph row fixed path alias '{}' requires at least one edge",
+                fixed_path.alias
+            )));
+        }
+        if fixed_path.node_aliases.len() != fixed_path.edge_piece_indices.len() + 1 {
+            return Err(EngineError::InvalidOperation(format!(
+                "graph row fixed path alias '{}' must have exactly one more node alias than edge reference",
+                fixed_path.alias
+            )));
+        }
+        if fixed_path.after_piece_index >= scope_pieces.len() {
+            return Err(EngineError::InvalidOperation(format!(
+                "graph row fixed path alias '{}' references out-of-range after_piece_index {}",
+                fixed_path.alias, fixed_path.after_piece_index
+            )));
+        }
+
+        for alias in &fixed_path.node_aliases {
+            collect_graph_row_node_reference(alias, scope, aliases)?;
+        }
+
+        for (path_index, edge_piece_index) in fixed_path.edge_piece_indices.iter().copied().enumerate() {
+            if edge_piece_index > fixed_path.after_piece_index {
+                return Err(EngineError::InvalidOperation(format!(
+                    "graph row fixed path alias '{}' has edge piece {} after composition point {}",
+                    fixed_path.alias, edge_piece_index, fixed_path.after_piece_index
+                )));
+            }
+            let Some(GraphPatternPiece::Edge(edge)) = scope_pieces.get(edge_piece_index) else {
+                return Err(EngineError::InvalidOperation(format!(
+                    "graph row fixed path alias '{}' references non-fixed edge piece {}",
+                    fixed_path.alias, edge_piece_index
+                )));
+            };
+            let expected_from = &fixed_path.node_aliases[path_index];
+            let expected_to = &fixed_path.node_aliases[path_index + 1];
+            if &edge.from_alias != expected_from || &edge.to_alias != expected_to {
+                return Err(EngineError::InvalidOperation(format!(
+                    "graph row fixed path alias '{}' edge piece {} does not match source-order node aliases",
+                    fixed_path.alias, edge_piece_index
+                )));
+            }
+        }
+
+        collect_graph_row_path_alias(&fixed_path.alias, scope, aliases)?;
+    }
+    Ok(())
+}
+
+fn graph_row_fixed_path_scope_pieces<'a>(
+    root_pieces: &'a [GraphPatternPiece],
+    scope: &[usize],
+) -> Result<(&'a [GraphPatternPiece], GraphAliasScope), EngineError> {
+    let mut pieces = root_pieces;
+    for piece_index in scope {
+        match pieces.get(*piece_index) {
+            Some(GraphPatternPiece::Optional(group)) => {
+                pieces = &group.pieces;
+            }
+            Some(_) => {
+                return Err(EngineError::InvalidOperation(format!(
+                    "graph row fixed path scope references non-optional piece {piece_index}"
+                )));
+            }
+            None => {
+                return Err(EngineError::InvalidOperation(format!(
+                    "graph row fixed path scope references out-of-range piece {piece_index}"
+                )));
+            }
+        }
+    }
+    let scope = if scope.is_empty() {
+        GraphAliasScope::Required
+    } else {
+        GraphAliasScope::Optional
+    };
+    Ok((pieces, scope))
+}
+
+fn validate_graph_alias(kind: &str, alias: &str) -> Result<(), EngineError> {
+    if alias.is_empty() {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row {kind} alias must be non-empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_graph_row_optional_filters(
+    pieces: &[GraphPatternPiece],
+    fixed_paths: &[GraphFixedPathBinding],
+    aliases: &GraphRowAliasState,
+    params: &BTreeMap<String, GraphParamValue>,
+) -> Result<(), EngineError> {
+    let referenced_nodes = graph_row_piece_node_references(pieces);
+    let mut visible = GraphRowVisibleAliases {
+        node_aliases: aliases
+            .node_aliases
+            .difference(&referenced_nodes)
+            .cloned()
+            .collect(),
+        edge_aliases: HashSet::new(),
+        path_aliases: HashSet::new(),
+    };
+    validate_graph_row_optional_filters_scoped(pieces, fixed_paths, &[], &mut visible, params)
+}
+
+fn validate_graph_row_optional_filters_scoped(
+    pieces: &[GraphPatternPiece],
+    fixed_paths: &[GraphFixedPathBinding],
+    scope: &[usize],
+    visible: &mut GraphRowVisibleAliases,
+    params: &BTreeMap<String, GraphParamValue>,
+) -> Result<(), EngineError> {
+    for (piece_index, piece) in pieces.iter().enumerate() {
+        match piece {
+            GraphPatternPiece::Edge(edge) => {
+                visible.node_aliases.insert(edge.from_alias.clone());
+                visible.node_aliases.insert(edge.to_alias.clone());
+                if let Some(alias) = edge.alias.as_ref() {
+                    visible.edge_aliases.insert(alias.clone());
+                }
+            }
+            GraphPatternPiece::VariableLength(path) => {
+                visible.node_aliases.insert(path.from_alias.clone());
+                visible.node_aliases.insert(path.to_alias.clone());
+                if let Some(alias) = path.edge_alias.as_ref() {
+                    visible.edge_aliases.insert(alias.clone());
+                }
+                if let Some(alias) = path.path_alias.as_ref() {
+                    visible.path_aliases.insert(alias.clone());
+                }
+            }
+            GraphPatternPiece::Optional(group) => {
+                let mut group_visible = visible.clone();
+                let mut group_scope = scope.to_vec();
+                group_scope.push(piece_index);
+                validate_graph_row_optional_filters_scoped(
+                    &group.pieces,
+                    fixed_paths,
+                    &group_scope,
+                    &mut group_visible,
+                    params,
+                )?;
+                if let Some(expr) = group.where_.as_ref() {
+                    validate_graph_expr_aliases(expr, &group_visible.to_alias_state(), params)?;
+                }
+                visible.node_aliases.extend(group_visible.node_aliases);
+                visible.edge_aliases.extend(group_visible.edge_aliases);
+                visible.path_aliases.extend(group_visible.path_aliases);
+            }
+        }
+        for fixed_path in fixed_paths {
+            if fixed_path.scope.as_slice() == scope && fixed_path.after_piece_index == piece_index {
+                visible.path_aliases.insert(fixed_path.alias.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn graph_row_piece_node_references(pieces: &[GraphPatternPiece]) -> HashSet<String> {
+    let mut references = HashSet::new();
+    collect_graph_row_piece_node_references(pieces, &mut references);
+    references
+}
+
+fn collect_graph_row_piece_node_references(
+    pieces: &[GraphPatternPiece],
+    references: &mut HashSet<String>,
+) {
+    for piece in pieces {
+        match piece {
+            GraphPatternPiece::Edge(edge) => {
+                references.insert(edge.from_alias.clone());
+                references.insert(edge.to_alias.clone());
+            }
+            GraphPatternPiece::VariableLength(path) => {
+                references.insert(path.from_alias.clone());
+                references.insert(path.to_alias.clone());
+            }
+            GraphPatternPiece::Optional(group) => {
+                collect_graph_row_piece_node_references(&group.pieces, references);
+            }
+        }
+    }
+}
+
+impl GraphRowVisibleAliases {
+    fn to_alias_state(&self) -> GraphRowAliasState {
+        GraphRowAliasState {
+            node_aliases: self.node_aliases.clone(),
+            edge_aliases: self.edge_aliases.clone(),
+            path_aliases: self.path_aliases.clone(),
+            node_first_scope: HashMap::new(),
+            edge_first_scope: HashMap::new(),
+            path_first_scope: HashMap::new(),
+            node_order: Vec::new(),
+            required_edge_order: Vec::new(),
+            optional_alias_order: Vec::new(),
+            path_order: Vec::new(),
+        }
+    }
+}
+
+fn validate_graph_order_expr(
+    order: &GraphOrderItem,
+    aliases: &GraphRowAliasState,
+    params: &BTreeMap<String, GraphParamValue>,
+) -> Result<(), EngineError> {
+    let kind = graph_expr_kind(&order.expr, aliases, params)?;
+    if graph_expr_kind_is_list_or_map(kind) {
+        return Err(EngineError::InvalidOperation(
+            "graph row order expression must not be a list or map value".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_graph_expr_aliases(
+    expr: &GraphExpr,
+    aliases: &GraphRowAliasState,
+    params: &BTreeMap<String, GraphParamValue>,
+) -> Result<(), EngineError> {
+    graph_expr_kind(expr, aliases, params).map(|_| ())
+}
+
+fn graph_expr_kind(
+    expr: &GraphExpr,
+    aliases: &GraphRowAliasState,
+    params: &BTreeMap<String, GraphParamValue>,
+) -> Result<GraphExprKind, EngineError> {
+    match expr {
+        GraphExpr::Null
+        | GraphExpr::Bool(_)
+        | GraphExpr::Int(_)
+        | GraphExpr::UInt(_)
+        | GraphExpr::Float(_)
+        | GraphExpr::String(_)
+        | GraphExpr::Bytes(_) => Ok(GraphExprKind::Scalar),
+        GraphExpr::List(items) => graph_list_expr_kind(
+            items
+                .iter()
+                .map(|item| graph_expr_kind(item, aliases, params))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        GraphExpr::Map(map) => {
+            for item in map.values() {
+                graph_expr_kind(item, aliases, params)?;
+            }
+            Ok(GraphExprKind::Map)
+        }
+        GraphExpr::Param(name) => {
+            graph_param_expr_kind(params.get(name).ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row expression references missing param '{name}'"
+                ))
+            })?)
+        }
+        GraphExpr::Binding(alias) => graph_binding_alias_kind(alias, aliases),
+        GraphExpr::Property { alias, .. } => {
+            if aliases.node_aliases.contains(alias) || aliases.edge_aliases.contains(alias) {
+                Ok(GraphExprKind::Scalar)
+            } else if aliases.path_aliases.contains(alias) {
+                Err(EngineError::InvalidOperation(format!(
+                    "graph row property expression cannot reference path alias '{alias}'"
+                )))
+            } else {
+                Err(unknown_graph_alias(alias))
+            }
+        }
+        GraphExpr::NodeField { alias, field } => {
+            if aliases.node_aliases.contains(alias) {
+                Ok(match field {
+                    GraphNodeField::Labels => GraphExprKind::List,
+                    GraphNodeField::Id
+                    | GraphNodeField::Key
+                    | GraphNodeField::Weight
+                    | GraphNodeField::CreatedAt
+                    | GraphNodeField::UpdatedAt => GraphExprKind::Scalar,
+                })
+            } else if aliases.edge_aliases.contains(alias) || aliases.path_aliases.contains(alias) {
+                Err(EngineError::InvalidOperation(format!(
+                    "graph row node field references non-node alias '{alias}'"
+                )))
+            } else {
+                Err(unknown_graph_alias(alias))
+            }
+        }
+        GraphExpr::EdgeField { alias, .. } => {
+            if aliases.edge_aliases.contains(alias) {
+                Ok(GraphExprKind::Scalar)
+            } else if aliases.node_aliases.contains(alias) || aliases.path_aliases.contains(alias) {
+                Err(EngineError::InvalidOperation(format!(
+                    "graph row edge field references non-edge alias '{alias}'"
+                )))
+            } else {
+                Err(unknown_graph_alias(alias))
+            }
+        }
+        GraphExpr::PathField { alias, field } => {
+            if aliases.path_aliases.contains(alias) {
+                Ok(match field {
+                    GraphPathField::NodeIds | GraphPathField::EdgeIds => GraphExprKind::List,
+                    GraphPathField::Length => GraphExprKind::Scalar,
+                })
+            } else if aliases.node_aliases.contains(alias) || aliases.edge_aliases.contains(alias) {
+                Err(EngineError::InvalidOperation(format!(
+                    "graph row path field references non-path alias '{alias}'"
+                )))
+            } else {
+                Err(unknown_graph_alias(alias))
+            }
+        }
+        GraphExpr::Function { name, args } => graph_function_expr_kind(*name, args, aliases, params),
+        GraphExpr::Unary { expr, .. } => {
+            graph_expr_kind(expr, aliases, params)?;
+            Ok(GraphExprKind::Scalar)
+        }
+        GraphExpr::IsNull(expr) | GraphExpr::IsNotNull(expr) => {
+            graph_expr_kind(expr, aliases, params)?;
+            Ok(GraphExprKind::Scalar)
+        }
+        GraphExpr::Binary { left, right, .. } => {
+            graph_expr_kind(left, aliases, params)?;
+            graph_expr_kind(right, aliases, params)?;
+            Ok(GraphExprKind::Scalar)
+        }
+    }
+}
+
+fn graph_param_expr_kind(value: &GraphParamValue) -> Result<GraphExprKind, EngineError> {
+    Ok(match value {
+        GraphParamValue::List(_) => GraphExprKind::List,
+        GraphParamValue::Map(_) => GraphExprKind::Map,
+        GraphParamValue::Null
+        | GraphParamValue::Bool(_)
+        | GraphParamValue::Int(_)
+        | GraphParamValue::UInt(_)
+        | GraphParamValue::Float(_)
+        | GraphParamValue::String(_)
+        | GraphParamValue::Bytes(_) => GraphExprKind::Scalar,
+    })
+}
+
+fn graph_function_expr_kind(
+    name: GraphFunction,
+    args: &[GraphExpr],
+    aliases: &GraphRowAliasState,
+    params: &BTreeMap<String, GraphParamValue>,
+) -> Result<GraphExprKind, EngineError> {
+    if args.len() != 1 {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row function {} expects exactly one argument",
+            graph_function_name(name)
+        )));
+    }
+    let arg_kind = graph_expr_kind(&args[0], aliases, params)?;
+    match name {
+        GraphFunction::Id if matches!(arg_kind, GraphExprKind::Node | GraphExprKind::Edge) => {
+            Ok(GraphExprKind::Scalar)
+        }
+        GraphFunction::Labels if arg_kind == GraphExprKind::Node => Ok(GraphExprKind::List),
+        GraphFunction::Type if arg_kind == GraphExprKind::Edge => Ok(GraphExprKind::Scalar),
+        GraphFunction::Length if arg_kind == GraphExprKind::Path => Ok(GraphExprKind::Scalar),
+        GraphFunction::StartNode | GraphFunction::EndNode if arg_kind == GraphExprKind::Path => {
+            Ok(GraphExprKind::Node)
+        }
+        GraphFunction::Nodes if arg_kind == GraphExprKind::Path => Ok(GraphExprKind::NodeList),
+        GraphFunction::Relationships if arg_kind == GraphExprKind::Path => {
+            Ok(GraphExprKind::EdgeList)
+        }
+        GraphFunction::Id => Err(graph_function_kind_error(name, "a node or edge", arg_kind)),
+        GraphFunction::Labels => Err(graph_function_kind_error(name, "a node", arg_kind)),
+        GraphFunction::Type => Err(graph_function_kind_error(name, "an edge", arg_kind)),
+        GraphFunction::Length
+        | GraphFunction::StartNode
+        | GraphFunction::EndNode
+        | GraphFunction::Nodes
+        | GraphFunction::Relationships => {
+            Err(graph_function_kind_error(name, "a path", arg_kind))
+        }
+    }
+}
+
+fn graph_list_expr_kind(item_kinds: Vec<GraphExprKind>) -> Result<GraphExprKind, EngineError> {
+    if item_kinds.is_empty() {
+        return Ok(GraphExprKind::List);
+    }
+    if item_kinds
+        .iter()
+        .all(|kind| *kind == GraphExprKind::Node)
+    {
+        return Ok(GraphExprKind::NodeList);
+    }
+    if item_kinds
+        .iter()
+        .all(|kind| *kind == GraphExprKind::Edge)
+    {
+        return Ok(GraphExprKind::EdgeList);
+    }
+    Ok(GraphExprKind::List)
+}
+
+fn graph_expr_kind_is_list_or_map(kind: GraphExprKind) -> bool {
+    matches!(
+        kind,
+        GraphExprKind::List | GraphExprKind::NodeList | GraphExprKind::EdgeList | GraphExprKind::Map
+    )
+}
+
+fn graph_function_kind_error(
+    name: GraphFunction,
+    expected: &str,
+    actual: GraphExprKind,
+) -> EngineError {
+    EngineError::InvalidOperation(format!(
+        "graph row function {} expects {}, got {}",
+        graph_function_name(name),
+        expected,
+        graph_expr_kind_name(actual)
+    ))
+}
+
+fn graph_function_name(name: GraphFunction) -> &'static str {
+    match name {
+        GraphFunction::Id => "id",
+        GraphFunction::Labels => "labels",
+        GraphFunction::Type => "type",
+        GraphFunction::Length => "length",
+        GraphFunction::StartNode => "start_node",
+        GraphFunction::EndNode => "end_node",
+        GraphFunction::Nodes => "nodes",
+        GraphFunction::Relationships => "relationships",
+    }
+}
+
+fn graph_expr_kind_name(kind: GraphExprKind) -> &'static str {
+    match kind {
+        GraphExprKind::Scalar => "a scalar",
+        GraphExprKind::List => "a list",
+        GraphExprKind::NodeList => "a node list",
+        GraphExprKind::EdgeList => "an edge list",
+        GraphExprKind::Map => "a map",
+        GraphExprKind::Node => "a node",
+        GraphExprKind::Edge => "an edge",
+        GraphExprKind::Path => "a path",
+    }
+}
+
+fn graph_binding_alias_kind(
+    alias: &str,
+    aliases: &GraphRowAliasState,
+) -> Result<GraphExprKind, EngineError> {
+    if aliases.node_aliases.contains(alias) {
+        Ok(GraphExprKind::Node)
+    } else if aliases.edge_aliases.contains(alias) {
+        Ok(GraphExprKind::Edge)
+    } else if aliases.path_aliases.contains(alias) {
+        Ok(GraphExprKind::Path)
+    } else {
+        Err(unknown_graph_alias(alias))
+    }
+}
+
+fn unknown_graph_alias(alias: &str) -> EngineError {
+    EngineError::InvalidOperation(format!("graph row expression references unknown alias '{alias}'"))
+}
+
+fn expand_graph_row_return_star(
+    aliases: &GraphRowAliasState,
+) -> Result<Vec<GraphReturnItem>, EngineError> {
+    let mut items = Vec::new();
+    for alias in &aliases.node_order {
+        if aliases.node_first_scope.get(alias) != Some(&GraphAliasScope::Optional) {
+            items.push(graph_return_binding(alias));
+        }
+    }
+    for alias in &aliases.required_edge_order {
+        items.push(graph_return_binding(alias));
+    }
+    for alias in &aliases.path_order {
+        items.push(graph_return_binding(alias));
+    }
+    for alias in &aliases.optional_alias_order {
+        items.push(graph_return_binding(alias));
+    }
+    if items.is_empty() {
+        return Err(EngineError::InvalidOperation(
+            "graph row RETURN * requires at least one user-visible alias".to_string(),
+        ));
+    }
+    Ok(items)
+}
+
+fn build_graph_row_binding_schema(
+    aliases: &GraphRowAliasState,
+    pieces: &[GraphPatternPiece],
+) -> Result<crate::graph_row::GraphBindingSchema, EngineError> {
+    let mut schema = crate::graph_row::GraphBindingSchema::new();
+    for alias in &aliases.node_order {
+        let nullable = aliases.node_first_scope.get(alias) == Some(&GraphAliasScope::Optional);
+        schema.add_node_alias(alias.clone(), nullable)?;
+    }
+    for alias in &aliases.required_edge_order {
+        schema.add_edge_alias(alias.clone(), false)?;
+    }
+    for alias in &aliases.optional_alias_order {
+        if aliases.edge_aliases.contains(alias) {
+            schema.add_edge_alias(alias.clone(), true)?;
+        }
+    }
+    for alias in &aliases.path_order {
+        let nullable = aliases.path_first_scope.get(alias) == Some(&GraphAliasScope::Optional);
+        schema.add_path_alias(alias.clone(), nullable)?;
+    }
+    add_hidden_occurrence_slots(pieces, &mut schema, &mut 0, false)?;
+    Ok(schema)
+}
+
+fn add_hidden_occurrence_slots(
+    pieces: &[GraphPatternPiece],
+    schema: &mut crate::graph_row::GraphBindingSchema,
+    next_id: &mut usize,
+    in_optional: bool,
+) -> Result<(), EngineError> {
+    for piece in pieces {
+        match piece {
+            GraphPatternPiece::Edge(edge) => {
+                if edge.alias.is_none() {
+                    let label = format!("__hidden_edge_occurrence_{next_id}");
+                    *next_id += 1;
+                    schema.add_hidden_occurrence_with_nullability(label, in_optional)?;
+                }
+            }
+            GraphPatternPiece::VariableLength(path) => {
+                if path.edge_alias.is_none() && path.path_alias.is_none() {
+                    let label = format!("__hidden_path_occurrence_{next_id}");
+                    *next_id += 1;
+                    schema.add_hidden_occurrence_with_nullability(label, in_optional)?;
+                }
+            }
+            GraphPatternPiece::Optional(group) => {
+                add_hidden_occurrence_slots(&group.pieces, schema, next_id, true)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn graph_return_binding(alias: &str) -> GraphReturnItem {
+    GraphReturnItem {
+        expr: GraphExpr::Binding(alias.to_string()),
+        alias: Some(alias.to_string()),
+        projection: GraphReturnProjection::Auto,
+    }
+}
+
+fn validate_graph_return_projection(
+    projection: &GraphReturnProjection,
+    output: &GraphOutputOptions,
+    expr_kind: GraphExprKind,
+) -> Result<(), EngineError> {
+    if !output.include_vectors && graph_projection_requests_vectors(projection) {
+        return Err(EngineError::InvalidOperation(
+            "graph row selected vector projection requires include_vectors=true".to_string(),
+        ));
+    }
+    match projection {
+        GraphReturnProjection::Auto | GraphReturnProjection::IdOnly => Ok(()),
+        GraphReturnProjection::Element(_) => {
+            if matches!(
+                expr_kind,
+                GraphExprKind::Node
+                    | GraphExprKind::Edge
+                    | GraphExprKind::Path
+                    | GraphExprKind::NodeList
+                    | GraphExprKind::EdgeList
+            ) {
+                Ok(())
+            } else {
+                Err(graph_projection_kind_error(
+                    "element projection",
+                    "a node, edge, or path",
+                    expr_kind,
+                ))
+            }
+        }
+        GraphReturnProjection::Selected(GraphSelectedProjection::Node(_)) => {
+            if matches!(expr_kind, GraphExprKind::Node | GraphExprKind::NodeList) {
+                Ok(())
+            } else {
+                Err(graph_projection_kind_error(
+                    "selected node projection",
+                    "a node or node list",
+                    expr_kind,
+                ))
+            }
+        }
+        GraphReturnProjection::Selected(GraphSelectedProjection::Edge(_)) => {
+            if matches!(expr_kind, GraphExprKind::Edge | GraphExprKind::EdgeList) {
+                Ok(())
+            } else {
+                Err(graph_projection_kind_error(
+                    "selected edge projection",
+                    "an edge or edge list",
+                    expr_kind,
+                ))
+            }
+        }
+        GraphReturnProjection::Selected(GraphSelectedProjection::Path(_)) => {
+            if expr_kind == GraphExprKind::Path {
+                Ok(())
+            } else {
+                Err(graph_projection_kind_error(
+                    "selected path projection",
+                    "a path",
+                    expr_kind,
+                ))
+            }
+        }
+    }
+}
+
+fn graph_projection_kind_error(
+    projection: &str,
+    expected: &str,
+    actual: GraphExprKind,
+) -> EngineError {
+    EngineError::InvalidOperation(format!(
+        "graph row {projection} expects {expected}, got {}",
+        graph_expr_kind_name(actual)
+    ))
+}
+
+fn graph_projection_requests_vectors(projection: &GraphReturnProjection) -> bool {
+    match projection {
+        GraphReturnProjection::Auto
+        | GraphReturnProjection::IdOnly
+        | GraphReturnProjection::Element(_) => false,
+        GraphReturnProjection::Selected(GraphSelectedProjection::Node(node)) => {
+            node.vectors != GraphVectorSelection::None
+        }
+        GraphReturnProjection::Selected(GraphSelectedProjection::Edge(_)) => false,
+        GraphReturnProjection::Selected(GraphSelectedProjection::Path(path)) => {
+            path.nodes
+                .as_ref()
+                .is_some_and(|node| node.vectors != GraphVectorSelection::None)
+        }
+    }
+}
+
+fn graph_return_column_name(item: &GraphReturnItem) -> Result<String, EngineError> {
+    if let Some(alias) = item.alias.as_ref() {
+        validate_graph_alias("return", alias)?;
+        return Ok(alias.clone());
+    }
+    match &item.expr {
+        GraphExpr::Binding(alias) => Ok(alias.clone()),
+        GraphExpr::Property { alias, key } => Ok(format!("{alias}.{key}")),
+        GraphExpr::NodeField { alias, field } => Ok(format!("{alias}.{}", graph_node_field_name(*field))),
+        GraphExpr::EdgeField { alias, field } => Ok(format!("{alias}.{}", graph_edge_field_name(*field))),
+        GraphExpr::PathField { alias, field } => Ok(format!("{alias}.{}", graph_path_field_name(*field))),
+        _ => Err(EngineError::InvalidOperation(
+            "graph row complex return expressions require an alias".to_string(),
+        )),
+    }
+}
+
+fn graph_node_field_name(field: GraphNodeField) -> &'static str {
+    match field {
+        GraphNodeField::Id => "id",
+        GraphNodeField::Labels => "labels",
+        GraphNodeField::Key => "key",
+        GraphNodeField::Weight => "weight",
+        GraphNodeField::CreatedAt => "created_at",
+        GraphNodeField::UpdatedAt => "updated_at",
+    }
+}
+
+fn graph_edge_field_name(field: GraphEdgeField) -> &'static str {
+    match field {
+        GraphEdgeField::Id => "id",
+        GraphEdgeField::From => "from",
+        GraphEdgeField::To => "to",
+        GraphEdgeField::Label => "label",
+        GraphEdgeField::Weight => "weight",
+        GraphEdgeField::CreatedAt => "created_at",
+        GraphEdgeField::UpdatedAt => "updated_at",
+        GraphEdgeField::ValidFrom => "valid_from",
+        GraphEdgeField::ValidTo => "valid_to",
+    }
+}
+
+fn graph_path_field_name(field: GraphPathField) -> &'static str {
+    match field {
+        GraphPathField::NodeIds => "node_ids",
+        GraphPathField::EdgeIds => "edge_ids",
+        GraphPathField::Length => "length",
+    }
 }
 
 fn prop_values_equal_for_filter(left: &PropValue, right: &PropValue) -> bool {
-    left == right
+    semantic_property_eq(left, right)
 }
 
 fn push_len_prefixed_bytes(target: &mut Vec<u8>, bytes: &[u8]) {
     target.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
     target.extend_from_slice(bytes);
+}
+
+fn push_range_bound_structural_key(target: &mut Vec<u8>, bound: Option<&PropertyRangeBound>) {
+    match bound {
+        Some(bound) => {
+            target.push(1);
+            push_len_prefixed_bytes(target, &semantic_range_bound_key_bytes(bound));
+        }
+        None => target.push(0),
+    }
 }
 
 impl NormalizedNodeFilter {
@@ -192,7 +1792,8 @@ impl NormalizedNodeFilter {
             } => {
                 key.push(4);
                 push_len_prefixed_bytes(&mut key, prop_key.as_bytes());
-                key.extend_from_slice(format!("{lower:?}:{upper:?}").as_bytes());
+                push_range_bound_structural_key(&mut key, lower.as_ref());
+                push_range_bound_structural_key(&mut key, upper.as_ref());
             }
             Self::PropertyExists { key: prop_key } => {
                 key.push(5);
@@ -237,6 +1838,28 @@ impl NormalizedEdgeFilter {
         matches!(self, Self::AlwaysFalse)
     }
 
+    fn has_metadata_anchor(&self) -> bool {
+        match self {
+            Self::WeightRange { .. }
+            | Self::UpdatedAtRange { .. }
+            | Self::ValidAt { .. }
+            | Self::ValidFromRange { .. }
+            | Self::ValidToRange { .. } => true,
+            Self::And(children) => children.iter().any(Self::has_metadata_anchor),
+            Self::Or(children) => {
+                !children.is_empty() && children.iter().all(Self::has_metadata_anchor)
+            }
+            Self::Not(_) => false,
+            Self::AlwaysTrue
+            | Self::AlwaysFalse
+            | Self::PropertyEquals { .. }
+            | Self::PropertyIn { .. }
+            | Self::PropertyRange { .. }
+            | Self::PropertyExists { .. }
+            | Self::PropertyMissing { .. } => false,
+        }
+    }
+
     fn structural_key(&self) -> Vec<u8> {
         let mut key = Vec::new();
         match self {
@@ -265,7 +1888,8 @@ impl NormalizedEdgeFilter {
             } => {
                 key.push(4);
                 push_len_prefixed_bytes(&mut key, prop_key.as_bytes());
-                key.extend_from_slice(format!("{lower:?}:{upper:?}").as_bytes());
+                push_range_bound_structural_key(&mut key, lower.as_ref());
+                push_range_bound_structural_key(&mut key, upper.as_ref());
             }
             Self::PropertyExists { key: prop_key } => {
                 key.push(5);
@@ -338,10 +1962,36 @@ fn filter_children_sorted_dedup(mut children: Vec<NormalizedNodeFilter>) -> Vec<
     children
 }
 
+fn insert_range_constraint(
+    ranges_by_key: &mut HashMap<String, ValidatedNumericRange>,
+    key: &str,
+    range: ValidatedNumericRange,
+) -> bool {
+    if range.is_empty {
+        return false;
+    }
+    match ranges_by_key.entry(key.to_string()) {
+        Entry::Occupied(mut entry) => {
+            let intersected = intersect_validated_numeric_ranges(entry.get(), &range);
+            if intersected.is_empty {
+                false
+            } else {
+                entry.insert(intersected);
+                true
+            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(range);
+            true
+        }
+    }
+}
+
 fn normalize_normalized_and_filter(
     mut flattened: Vec<NormalizedNodeFilter>,
 ) -> Result<NormalizedNodeFilter, EngineError> {
     let mut eq_by_key: HashMap<String, PropValue> = HashMap::new();
+    let mut ranges_by_key: HashMap<String, ValidatedNumericRange> = HashMap::new();
     let mut exists_keys = HashSet::new();
     let mut missing_keys = HashSet::new();
     for child in &flattened {
@@ -353,6 +2003,13 @@ fn normalize_normalized_and_filter(
                     }
                 } else {
                     eq_by_key.insert(key.clone(), value.clone());
+                }
+                exists_keys.insert(key.clone());
+            }
+            NormalizedNodeFilter::PropertyRange { key, lower, upper } => {
+                let range = validate_numeric_range_bounds(lower.as_ref(), upper.as_ref(), None)?;
+                if !insert_range_constraint(&mut ranges_by_key, key, range) {
+                    return Ok(NormalizedNodeFilter::AlwaysFalse);
                 }
                 exists_keys.insert(key.clone());
             }
@@ -368,6 +2025,14 @@ fn normalize_normalized_and_filter(
 
     if exists_keys.iter().any(|key| missing_keys.contains(key)) {
         return Ok(NormalizedNodeFilter::AlwaysFalse);
+    }
+
+    for (key, value) in &eq_by_key {
+        if let Some(range) = ranges_by_key.get(key) {
+            if !prop_value_within_validated_range(value, range) {
+                return Ok(NormalizedNodeFilter::AlwaysFalse);
+            }
+        }
     }
 
     flattened.retain(|child| match child {
@@ -469,7 +2134,9 @@ fn normalize_node_filter_expr(expr: &NodeFilterExpr) -> Result<NormalizedNodeFil
         }
         NodeFilterExpr::PropertyRange { key, lower, upper } => {
             require_non_empty_filter_key(key, "property range filter")?;
-            ReadView::validate_property_range_bounds(lower.as_ref(), upper.as_ref(), None)?;
+            if validate_numeric_range_bounds(lower.as_ref(), upper.as_ref(), None)?.is_empty {
+                return Ok(NormalizedNodeFilter::AlwaysFalse);
+            }
             Ok(NormalizedNodeFilter::PropertyRange {
                 key: key.clone(),
                 lower: lower.clone(),
@@ -530,6 +2197,7 @@ fn normalize_normalized_edge_and_filter(
     mut flattened: Vec<NormalizedEdgeFilter>,
 ) -> Result<NormalizedEdgeFilter, EngineError> {
     let mut eq_by_key: HashMap<String, PropValue> = HashMap::new();
+    let mut ranges_by_key: HashMap<String, ValidatedNumericRange> = HashMap::new();
     let mut exists_keys = HashSet::new();
     let mut missing_keys = HashSet::new();
     for child in &flattened {
@@ -544,8 +2212,14 @@ fn normalize_normalized_edge_and_filter(
                 }
                 exists_keys.insert(key.clone());
             }
+            NormalizedEdgeFilter::PropertyRange { key, lower, upper } => {
+                let range = validate_numeric_range_bounds(lower.as_ref(), upper.as_ref(), None)?;
+                if !insert_range_constraint(&mut ranges_by_key, key, range) {
+                    return Ok(NormalizedEdgeFilter::AlwaysFalse);
+                }
+                exists_keys.insert(key.clone());
+            }
             NormalizedEdgeFilter::PropertyIn { key, .. }
-            | NormalizedEdgeFilter::PropertyRange { key, .. }
             | NormalizedEdgeFilter::PropertyExists { key } => {
                 exists_keys.insert(key.clone());
             }
@@ -558,6 +2232,14 @@ fn normalize_normalized_edge_and_filter(
 
     if exists_keys.iter().any(|key| missing_keys.contains(key)) {
         return Ok(NormalizedEdgeFilter::AlwaysFalse);
+    }
+
+    for (key, value) in &eq_by_key {
+        if let Some(range) = ranges_by_key.get(key) {
+            if !prop_value_within_validated_range(value, range) {
+                return Ok(NormalizedEdgeFilter::AlwaysFalse);
+            }
+        }
     }
 
     flattened.retain(|child| match child {
@@ -698,7 +2380,9 @@ fn normalize_edge_filter_expr(expr: &EdgeFilterExpr) -> Result<NormalizedEdgeFil
         }
         EdgeFilterExpr::PropertyRange { key, lower, upper } => {
             require_non_empty_filter_key(key, "edge property range filter")?;
-            ReadView::validate_property_range_bounds(lower.as_ref(), upper.as_ref(), None)?;
+            if validate_numeric_range_bounds(lower.as_ref(), upper.as_ref(), None)?.is_empty {
+                return Ok(NormalizedEdgeFilter::AlwaysFalse);
+            }
             Ok(NormalizedEdgeFilter::PropertyRange {
                 key: key.clone(),
                 lower: lower.clone(),
@@ -799,13 +2483,6 @@ fn single_resolved_label_id(filter: &ResolvedNodeLabelFilter) -> Option<u32> {
     }
 }
 
-fn normalized_query_has_label_anchor(query: &NormalizedNodeQuery) -> bool {
-    matches!(
-        query.label_filter,
-        ResolvedNodeLabelFilter::LabelSet { .. } | ResolvedNodeLabelFilter::Empty { .. }
-    )
-}
-
 impl ReadView {
     fn resolve_node_query_label_filter(
         &self,
@@ -814,21 +2491,6 @@ impl ReadView {
         let resolved = self
             .label_catalog
             .resolve_node_label_filter_request(label_filter)?;
-        let mut warnings = Vec::new();
-        if unknown_node_label_count(&resolved) > 0 {
-            push_query_warning(&mut warnings, QueryPlanWarning::UnknownNodeLabel);
-        }
-        let single_label_id = single_resolved_label_id(&resolved);
-        Ok((resolved, single_label_id, warnings))
-    }
-
-    fn resolve_node_pattern_label_filter(
-        &self,
-        pattern: &NodePattern,
-    ) -> Result<(ResolvedNodeLabelFilter, Option<u32>, Vec<QueryPlanWarning>), EngineError> {
-        let resolved = self
-            .label_catalog
-            .resolve_node_label_filter_request(pattern.label_filter.as_ref())?;
         let mut warnings = Vec::new();
         if unknown_node_label_count(&resolved) > 0 {
             push_query_warning(&mut warnings, QueryPlanWarning::UnknownNodeLabel);
@@ -865,11 +2527,12 @@ impl ReadView {
             && from_ids.is_empty()
             && to_ids.is_empty()
             && endpoint_ids.is_empty()
+            && !filter.has_metadata_anchor()
             && !query.allow_full_scan
             && !filter.is_always_false()
         {
             return Err(EngineError::InvalidOperation(
-                "edge query requires label, ids, from_ids, to_ids, endpoint_ids, or allow_full_scan".into(),
+                "edge query requires label, ids, from_ids, to_ids, endpoint_ids, metadata filter, or allow_full_scan".into(),
             ));
         }
 
@@ -959,194 +2622,4 @@ impl ReadView {
         self.normalize_node_query_with_anchor_requirement(query, true)
     }
 
-    fn normalize_node_pattern(
-        &self,
-        pattern: &NodePattern,
-    ) -> Result<NormalizedNodePattern, EngineError> {
-        if pattern.alias.is_empty() {
-            return Err(EngineError::InvalidOperation(
-                "node pattern aliases must be non-empty".into(),
-            ));
-        }
-
-        let (label_filter, single_label_id, warnings) =
-            self.resolve_node_pattern_label_filter(pattern)?;
-        let mut filter = normalize_optional_node_filter(pattern.filter.as_ref())?;
-        if label_filter.is_empty_constraint() {
-            filter = NormalizedNodeFilter::AlwaysFalse;
-        }
-        if !pattern.keys.is_empty() {
-            match label_filter {
-                ResolvedNodeLabelFilter::LabelSet { label_ids, .. } if label_ids.len() == 1 => {}
-                ResolvedNodeLabelFilter::Empty { .. } => {}
-                ResolvedNodeLabelFilter::Unconstrained => {
-                    return Err(EngineError::InvalidOperation(
-                        "node pattern keys require exactly one resolved label".into(),
-                    ));
-                }
-                ResolvedNodeLabelFilter::LabelSet { .. } => {
-                    return Err(EngineError::InvalidOperation(
-                        "node pattern keys require exactly one resolved label".into(),
-                    ));
-                }
-            }
-        }
-        let mut ids = pattern.ids.clone();
-        ids.sort_unstable();
-        ids.dedup();
-        let mut keys = pattern.keys.clone();
-        keys.sort();
-        keys.dedup();
-        Ok(NormalizedNodePattern {
-            alias: pattern.alias.clone(),
-            query: NormalizedNodeQuery {
-                single_label_id,
-                label_filter,
-                ids,
-                keys,
-                filter,
-                allow_full_scan: false,
-                page: PageRequest::default(),
-                warnings,
-            },
-        })
-    }
-
-    fn normalize_pattern_query(
-        &self,
-        query: &GraphPatternQuery,
-    ) -> Result<NormalizedGraphPatternQuery, EngineError> {
-        if query.nodes.is_empty() {
-            return Err(EngineError::InvalidOperation(
-                "pattern query requires at least one node pattern".into(),
-            ));
-        }
-        if query.edges.is_empty() {
-            return Err(EngineError::InvalidOperation(
-                "pattern query requires at least one edge pattern".into(),
-            ));
-        }
-        if query.limit == 0 {
-            return Err(EngineError::InvalidOperation(
-                "pattern query limit must be greater than zero".into(),
-            ));
-        }
-
-        let mut query_warnings = Vec::new();
-
-        let mut nodes = Vec::with_capacity(query.nodes.len());
-        let mut alias_to_index = HashMap::with_capacity(query.nodes.len());
-        for pattern in &query.nodes {
-            let normalized = self.normalize_node_pattern(pattern)?;
-            for warning in &normalized.query.warnings {
-                push_query_warning(&mut query_warnings, *warning);
-            }
-            if alias_to_index
-                .insert(normalized.alias.clone(), nodes.len())
-                .is_some()
-            {
-                return Err(EngineError::InvalidOperation(
-                    "node pattern aliases must be unique".into(),
-                ));
-            }
-            nodes.push(normalized);
-        }
-
-        let mut edge_aliases = HashSet::new();
-        let mut edges = Vec::with_capacity(query.edges.len());
-        let mut adjacency = vec![Vec::<usize>::new(); nodes.len()];
-        let mut incident_counts = vec![0usize; nodes.len()];
-        for pattern in &query.edges {
-            if let Some(alias) = pattern.alias.as_ref() {
-                if alias.is_empty() {
-                    return Err(EngineError::InvalidOperation(
-                        "edge pattern aliases must be non-empty".into(),
-                    ));
-                }
-                if !edge_aliases.insert(alias.clone()) {
-                    return Err(EngineError::InvalidOperation(
-                        "edge pattern aliases must be unique".into(),
-                    ));
-                }
-            }
-
-            let Some(&from_index) = alias_to_index.get(&pattern.from_alias) else {
-                return Err(EngineError::InvalidOperation(format!(
-                    "edge pattern references unknown from alias '{}'",
-                    pattern.from_alias
-                )));
-            };
-            let Some(&to_index) = alias_to_index.get(&pattern.to_alias) else {
-                return Err(EngineError::InvalidOperation(format!(
-                    "edge pattern references unknown to alias '{}'",
-                    pattern.to_alias
-                )));
-            };
-
-            incident_counts[from_index] += 1;
-            if from_index != to_index {
-                incident_counts[to_index] += 1;
-            }
-            adjacency[from_index].push(to_index);
-            adjacency[to_index].push(from_index);
-
-            let (label_filter_ids, mut warnings) =
-                match self
-                    .label_catalog
-                    .resolve_edge_label_filter(Some(&pattern.label_filter))?
-                {
-                    (LabelFilterResolution::Unconstrained, warnings) => (None, warnings),
-                    (LabelFilterResolution::Known(label_ids), warnings) => (Some(label_ids), warnings),
-                    (LabelFilterResolution::EmptyConstraint, warnings) => {
-                        (Some(Vec::new()), warnings)
-                    }
-                };
-            for warning in warnings.drain(..) {
-                push_query_warning(&mut query_warnings, warning);
-            }
-
-            let filter = normalize_optional_edge_filter(pattern.filter.as_ref())?;
-
-            edges.push(NormalizedEdgePattern {
-                alias: pattern.alias.clone(),
-                from_index,
-                to_index,
-                direction: pattern.direction,
-                label_filter_ids,
-                filter,
-            });
-        }
-
-        if incident_counts.contains(&0) {
-            return Err(EngineError::InvalidOperation(
-                "every pattern node alias must be attached to an edge".into(),
-            ));
-        }
-
-        let mut visited = vec![false; nodes.len()];
-        let mut stack = vec![edges[0].from_index];
-        visited[edges[0].from_index] = true;
-        while let Some(index) = stack.pop() {
-            for &neighbor in &adjacency[index] {
-                if !visited[neighbor] {
-                    visited[neighbor] = true;
-                    stack.push(neighbor);
-                }
-            }
-        }
-        if visited.iter().any(|seen| !*seen) {
-            return Err(EngineError::InvalidOperation(
-                "pattern query must be one connected component".into(),
-            ));
-        }
-
-        Ok(NormalizedGraphPatternQuery {
-            nodes,
-            edges,
-            at_epoch: query.at_epoch,
-            limit: query.limit,
-            order: query.order,
-            warnings: query_warnings,
-        })
-    }
 }

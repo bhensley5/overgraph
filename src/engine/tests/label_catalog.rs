@@ -2044,8 +2044,14 @@ fn test_public_label_property_and_time_queries_preserve_empty_and_validation_sem
     assert_eq!(db.list_node_labels().unwrap().len(), catalog_len);
 
     let mixed_upper = PropertyRangeBound::Included(PropValue::Float(1.0));
-    assert!(
+    assert_eq!(
         db.find_nodes_range("Missing", "score", Some(&lower), Some(&mixed_upper))
+            .unwrap(),
+        Vec::<u64>::new()
+    );
+    let invalid_upper = PropertyRangeBound::Included(PropValue::String("1".to_string()));
+    assert!(
+        db.find_nodes_range("Missing", "score", Some(&lower), Some(&invalid_upper))
             .is_err()
     );
     assert!(db.find_nodes(" Article", "color", &red).is_err());

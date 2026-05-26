@@ -1,14 +1,17 @@
 use overgraph::{
-    DatabaseEngine, DbOptions, DegreeOptions, DenseMetric, DenseVectorConfig, EdgeFilterExpr,
-    EdgeInput, EdgeQuery, ExportOptions, HnswConfig, IsConnectedOptions, LabelMatchMode,
-    NeighborOptions, NodeFilterExpr, NodeInput, NodeLabelFilter, NodeQuery, PageRequest,
-    PprOptions, PropValue, PropertyRangeBound, SecondaryIndexKind, SecondaryIndexRangeDomain,
-    SecondaryIndexState, ShortestPathOptions, TopKOptions, TraverseOptions, UpsertEdgeOptions,
-    UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, WalSyncMode,
+    DatabaseEngine, DbOptions, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
+    EdgeFilterExpr, EdgeInput, EdgeQuery, ExportOptions, GqlParamValue, GqlParams, GqlQueryOptions,
+    GraphBinaryOp, GraphEdgePattern, GraphExpr, GraphNodeField, GraphNodePattern,
+    GraphOrderDirection, GraphOrderItem, GraphOutputOptions, GraphPageRequest, GraphParamValue,
+    GraphPatternPiece, GraphQueryOptions, GraphReturnItem, GraphReturnProjection, GraphRowQuery,
+    HnswConfig, IsConnectedOptions, LabelMatchMode, NeighborOptions, NodeFilterExpr, NodeInput,
+    NodeLabelFilter, NodeQuery, PageRequest, PprOptions, PropValue, PropertyRangeBound,
+    SecondaryIndexKind, SecondaryIndexState, ShortestPathOptions, TopKOptions, TraverseOptions,
+    UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, WalSyncMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +38,7 @@ struct CliArgs {
     warmup: usize,
     iters: usize,
     scenario_set: ScenarioSet,
+    scenario_ids: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,7 +302,7 @@ fn main() -> Result<(), String> {
         push_query_scenarios(&args, &scenario_contract, &cfg, &tmp_root, &mut scenarios)?;
     }
 
-    if !args.scenario_set.includes_legacy() {
+    if !args.scenario_set.includes_legacy() || !args.scenario_ids.is_empty() {
         return emit_output(
             args,
             profiles_payload,
@@ -1181,7 +1185,7 @@ fn main() -> Result<(), String> {
             1,
             stats,
             json!({
-                "label_id": 1,
+                "label": "Person",
                 "preload_nodes": cfg.time_range_nodes,
                 "from_ms": cfg.time_range_from_ms,
                 "to_ms_window": cfg.time_range_window_ms
@@ -1491,6 +1495,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut warmup: usize = 20;
     let mut iters: usize = 80;
     let mut scenario_set = ScenarioSet::All;
+    let mut scenario_ids = HashSet::new();
 
     let mut args = env::args().skip(1);
     while let Some(token) = args.next() {
@@ -1531,6 +1536,12 @@ fn parse_args() -> Result<CliArgs, String> {
                     }
                 };
             }
+            "--scenario-id" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--scenario-id requires a value".to_string())?;
+                scenario_ids.insert(raw);
+            }
             "--help" | "-h" => {
                 return Err(help_text());
             }
@@ -1552,11 +1563,16 @@ fn parse_args() -> Result<CliArgs, String> {
         warmup,
         iters,
         scenario_set,
+        scenario_ids,
     })
 }
 
 fn help_text() -> String {
-    "Usage: cargo run --release --features cli --bin benchmark-harness -- --profile <small|medium|large|xlarge> --warmup <n> --iters <n> [--scenario-set <all|query>]".to_string()
+    "Usage: cargo run --release --features cli --bin benchmark-harness -- --profile <small|medium|large|xlarge> --warmup <n> --iters <n> [--scenario-set <all|query>] [--scenario-id <id> ...]".to_string()
+}
+
+fn scenario_selected(args: &CliArgs, scenario_id: &str) -> bool {
+    args.scenario_ids.is_empty() || args.scenario_ids.contains(scenario_id)
 }
 
 fn effective_config(
@@ -1898,6 +1914,26 @@ fn bench_node_label(label_id: u32) -> String {
     format!("BenchNode{label_id}")
 }
 
+fn query_person_label() -> String {
+    "Person".to_string()
+}
+
+fn query_company_label() -> String {
+    "Company".to_string()
+}
+
+fn query_document_label() -> String {
+    "Document".to_string()
+}
+
+fn query_work_edge_label() -> String {
+    "WORKS_AT".to_string()
+}
+
+fn query_optional_edge_label() -> String {
+    "MENTIONS".to_string()
+}
+
 fn query_bench_props(i: usize) -> BTreeMap<String, PropValue> {
     let mut props = BTreeMap::new();
     props.insert(
@@ -1950,6 +1986,30 @@ fn wait_for_property_index_state(
     }
 }
 
+fn wait_for_edge_property_index_state(
+    engine: &DatabaseEngine,
+    index_id: u64,
+    expected_state: SecondaryIndexState,
+) -> Result<(), String> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if engine
+            .list_edge_property_indexes()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .any(|info| info.index_id == index_id && info.state == expected_state)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for edge property index {index_id} to reach {expected_state:?}"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[derive(Clone, Copy)]
 struct QueryBenchmarkLayout {
     segments: usize,
@@ -1978,7 +2038,7 @@ fn build_query_benchmark_engine(
     preload_nodes: usize,
 ) -> Result<(DatabaseEngine, QueryBenchmarkLayout), String> {
     let engine = open_db(path)?;
-    let node_label = bench_node_label(1);
+    let node_label = query_person_label();
     let status = engine
         .ensure_node_property_index(&node_label, "status", SecondaryIndexKind::Equality)
         .map_err(|e| e.to_string())?;
@@ -1990,13 +2050,7 @@ fn build_query_benchmark_engine(
     wait_for_property_index_state(&engine, tier.index_id, SecondaryIndexState::Ready)?;
 
     let score = engine
-        .ensure_node_property_index(
-            &node_label,
-            "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
-        )
+        .ensure_node_property_index(&node_label, "score", SecondaryIndexKind::Range)
         .map_err(|e| e.to_string())?;
     wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready)?;
 
@@ -2005,7 +2059,7 @@ fn build_query_benchmark_engine(
         let start = segment * layout.segment_nodes;
         let inputs: Vec<NodeInput> = (start..start + layout.segment_nodes)
             .map(|i| NodeInput {
-                labels: vec![bench_node_label(1)],
+                labels: vec![query_person_label()],
                 key: format!("q-{i}"),
                 props: query_bench_props(i),
                 weight: 1.0,
@@ -2022,7 +2076,7 @@ fn build_query_benchmark_engine(
     let tail_start = layout.segments * layout.segment_nodes;
     let tail_inputs: Vec<NodeInput> = (tail_start..tail_start + layout.memtable_tail_nodes)
         .map(|i| NodeInput {
-            labels: vec![bench_node_label(1)],
+            labels: vec![query_person_label()],
             key: format!("q-{i}"),
             props: query_bench_props(i),
             weight: 1.0,
@@ -2040,7 +2094,7 @@ fn build_query_benchmark_engine(
 fn query_ids_intersected_request(limit: usize) -> NodeQuery {
     NodeQuery {
         label_filter: Some(NodeLabelFilter {
-            labels: vec![bench_node_label(1)],
+            labels: vec![query_person_label()],
             mode: LabelMatchMode::All,
         }),
         filter: filter_and![
@@ -2064,7 +2118,7 @@ fn query_ids_intersected_request(limit: usize) -> NodeQuery {
 fn query_nodes_hydrated_request(limit: usize) -> NodeQuery {
     NodeQuery {
         label_filter: Some(NodeLabelFilter {
-            labels: vec![bench_node_label(1)],
+            labels: vec![query_person_label()],
             mode: LabelMatchMode::All,
         }),
         filter: filter_and![
@@ -2096,6 +2150,7 @@ struct EdgeBenchmarkFixture {
     engine: DatabaseEngine,
     layout: EdgeBenchmarkLayout,
     source_id: u64,
+    target_ids: Vec<u64>,
 }
 
 fn build_edge_query_benchmark_engine(
@@ -2107,7 +2162,7 @@ fn build_edge_query_benchmark_engine(
     let target_count = preload_edges.max(1);
     let mut nodes = Vec::with_capacity(source_count + target_count);
     nodes.extend((0..source_count).map(|i| NodeInput {
-        labels: vec![bench_node_label(1)],
+        labels: vec![query_person_label()],
         key: format!("edge-source-{i}"),
         props: BTreeMap::new(),
         weight: 1.0,
@@ -2115,7 +2170,7 @@ fn build_edge_query_benchmark_engine(
         sparse_vector: None,
     }));
     nodes.extend((0..target_count).map(|i| NodeInput {
-        labels: vec![bench_node_label(2)],
+        labels: vec![query_company_label()],
         key: format!("edge-target-{i}"),
         props: BTreeMap::new(),
         weight: 1.0,
@@ -2128,6 +2183,7 @@ fn build_edge_query_benchmark_engine(
     let source_ids = &ids[..source_count];
     let target_ids = &ids[source_count..];
     let source_id = source_ids[0];
+    let target_ids_vec = target_ids.to_vec();
 
     let segments = if preload_edges >= 2 { 1 } else { 0 };
     let segment_edges = if segments == 0 {
@@ -2144,10 +2200,11 @@ fn build_edge_query_benchmark_engine(
                     "role".to_string(),
                     PropValue::String(if i % 10 == 0 { "lead" } else { "member" }.to_string()),
                 );
+                props.insert("score".to_string(), PropValue::Int((i % 100) as i64));
                 EdgeInput {
                     from: source_ids[i % source_count],
                     to: target_ids[i % target_ids.len()],
-                    label: "BenchEdge10".to_string(),
+                    label: query_work_edge_label(),
                     props,
                     weight: if i % 2 == 0 { 2.0 } else { 0.5 },
                     valid_from: None,
@@ -2176,12 +2233,13 @@ fn build_edge_query_benchmark_engine(
             memtable_tail_edges,
         },
         source_id,
+        target_ids: target_ids_vec,
     })
 }
 
 fn query_edge_ids_request(source_id: u64, limit: usize) -> EdgeQuery {
     EdgeQuery {
-        label: Some("BenchEdge10".to_string()),
+        label: Some(query_work_edge_label()),
         from_ids: vec![source_id],
         filter: Some(EdgeFilterExpr::WeightRange {
             lower: Some(1.0),
@@ -2197,7 +2255,7 @@ fn query_edge_ids_request(source_id: u64, limit: usize) -> EdgeQuery {
 
 fn query_edges_hydrated_request(source_id: u64, limit: usize) -> EdgeQuery {
     EdgeQuery {
-        label: Some("BenchEdge10".to_string()),
+        label: Some(query_work_edge_label()),
         from_ids: vec![source_id],
         filter: Some(EdgeFilterExpr::And(vec![
             EdgeFilterExpr::WeightRange {
@@ -2217,6 +2275,250 @@ fn query_edges_hydrated_request(source_id: u64, limit: usize) -> EdgeQuery {
     }
 }
 
+fn build_indexed_edge_query_benchmark_engine(
+    path: &Path,
+    preload_edges: usize,
+) -> Result<EdgeBenchmarkFixture, String> {
+    let fixture = build_edge_query_benchmark_engine(path, preload_edges)?;
+    let role = fixture
+        .engine
+        .ensure_edge_property_index(
+            &query_work_edge_label(),
+            "role",
+            SecondaryIndexKind::Equality,
+        )
+        .map_err(|e| e.to_string())?;
+    wait_for_edge_property_index_state(&fixture.engine, role.index_id, SecondaryIndexState::Ready)?;
+    let score = fixture
+        .engine
+        .ensure_edge_property_index(&query_work_edge_label(), "score", SecondaryIndexKind::Range)
+        .map_err(|e| e.to_string())?;
+    wait_for_edge_property_index_state(
+        &fixture.engine,
+        score.index_id,
+        SecondaryIndexState::Ready,
+    )?;
+    Ok(fixture)
+}
+
+fn query_edge_ids_indexed_equality_request(source_id: u64, limit: usize) -> EdgeQuery {
+    EdgeQuery {
+        label: Some(query_work_edge_label()),
+        from_ids: vec![source_id],
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "role".to_string(),
+            value: PropValue::String("lead".to_string()),
+        }),
+        page: PageRequest {
+            limit: Some(limit),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn query_edge_ids_indexed_range_request(source_id: u64, limit: usize) -> EdgeQuery {
+    EdgeQuery {
+        label: Some(query_work_edge_label()),
+        from_ids: vec![source_id],
+        filter: Some(EdgeFilterExpr::PropertyRange {
+            key: "score".to_string(),
+            lower: Some(PropertyRangeBound::Included(PropValue::Int(90))),
+            upper: None,
+        }),
+        page: PageRequest {
+            limit: Some(limit),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn build_graph_row_benchmark_engine(
+    path: &Path,
+    preload_edges: usize,
+) -> Result<EdgeBenchmarkFixture, String> {
+    let fixture = build_indexed_edge_query_benchmark_engine(path, preload_edges)?;
+    let target_count = preload_edges.max(1);
+    let docs: Vec<NodeInput> = (0..target_count)
+        .filter(|i| i % 8 == 0)
+        .map(|i| NodeInput {
+            labels: vec![query_document_label()],
+            key: format!("doc-{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect();
+    let doc_ids = fixture
+        .engine
+        .batch_upsert_nodes(docs.clone())
+        .map_err(|e| e.to_string())?;
+    if !doc_ids.is_empty() {
+        let doc_edges: Vec<EdgeInput> = doc_ids
+            .iter()
+            .enumerate()
+            .map(|(doc_index, &doc_id)| {
+                let target_ordinal = doc_index * 8;
+                EdgeInput {
+                    from: fixture.target_ids[target_ordinal],
+                    to: doc_id,
+                    label: query_optional_edge_label(),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                }
+            })
+            .collect();
+        fixture
+            .engine
+            .batch_upsert_edges(doc_edges)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(fixture)
+}
+
+fn graph_row_optional_request(source_id: u64, limit: usize) -> GraphRowQuery {
+    GraphRowQuery {
+        nodes: vec![
+            GraphNodePattern {
+                alias: "source".to_string(),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![query_person_label()],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: vec![source_id],
+                keys: Vec::new(),
+                filter: None,
+            },
+            GraphNodePattern {
+                alias: "target".to_string(),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![query_company_label()],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: None,
+            },
+            GraphNodePattern {
+                alias: "doc".to_string(),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![query_document_label()],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: None,
+            },
+        ],
+        pieces: vec![
+            GraphPatternPiece::Edge(GraphEdgePattern {
+                alias: Some("edge".to_string()),
+                from_alias: "source".to_string(),
+                to_alias: "target".to_string(),
+                direction: Direction::Outgoing,
+                label_filter: vec![query_work_edge_label()],
+                filter: Some(EdgeFilterExpr::PropertyEquals {
+                    key: "role".to_string(),
+                    value: PropValue::String("lead".to_string()),
+                }),
+            }),
+            GraphPatternPiece::Optional(overgraph::GraphOptionalGroup {
+                pieces: vec![GraphPatternPiece::Edge(GraphEdgePattern {
+                    alias: Some("ref".to_string()),
+                    from_alias: "target".to_string(),
+                    to_alias: "doc".to_string(),
+                    direction: Direction::Outgoing,
+                    label_filter: vec![query_optional_edge_label()],
+                    filter: None,
+                })],
+                where_: None,
+            }),
+        ],
+        where_: Some(GraphExpr::Binary {
+            left: Box::new(GraphExpr::Property {
+                alias: "edge".to_string(),
+                key: "role".to_string(),
+            }),
+            op: GraphBinaryOp::Eq,
+            right: Box::new(GraphExpr::Param("role".to_string())),
+        }),
+        return_items: Some(vec![
+            graph_row_return_binding("source"),
+            graph_row_return_binding("edge"),
+            graph_row_return_binding("target"),
+            graph_row_return_binding("ref"),
+            graph_row_return_binding("doc"),
+        ]),
+        order_by: vec![
+            GraphOrderItem {
+                expr: GraphExpr::Property {
+                    alias: "edge".to_string(),
+                    key: "score".to_string(),
+                },
+                direction: GraphOrderDirection::Desc,
+            },
+            GraphOrderItem {
+                expr: GraphExpr::NodeField {
+                    alias: "target".to_string(),
+                    field: GraphNodeField::Id,
+                },
+                direction: GraphOrderDirection::Asc,
+            },
+        ],
+        page: GraphPageRequest {
+            skip: 0,
+            limit,
+            cursor: None,
+        },
+        at_epoch: None,
+        params: BTreeMap::from([(
+            "role".to_string(),
+            GraphParamValue::String("lead".to_string()),
+        )]),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions::default(),
+    }
+}
+
+fn graph_row_return_binding(alias: &str) -> GraphReturnItem {
+    GraphReturnItem {
+        expr: GraphExpr::Binding(alias.to_string()),
+        alias: Some(alias.to_string()),
+        projection: GraphReturnProjection::IdOnly,
+    }
+}
+
+fn graph_row_scenario_params(
+    layout: &EdgeBenchmarkLayout,
+    preload_edges: usize,
+    limit: usize,
+) -> Value {
+    json!({
+        "labels": {
+            "source": "Person",
+            "target": "Company",
+            "optional": "Document"
+        },
+        "edge_labels": {
+            "required": "WORKS_AT",
+            "optional": "MENTIONS"
+        },
+        "preload_edges": preload_edges,
+        "segments": layout.segments,
+        "segment_edges": layout.segment_edges,
+        "memtable_tail_edges": layout.memtable_tail_edges,
+        "predicate": "edge_role_eq_lead_param",
+        "source_anchor": "first_source_id",
+        "optional": "target_mentions_document_sparse",
+        "row_ops": ["order_by_edge_score_desc", "limit"],
+        "limit": limit
+    })
+}
+
 fn push_query_scenarios(
     args: &CliArgs,
     scenario_contract: &ScenarioContract,
@@ -2229,130 +2531,280 @@ fn push_query_scenarios(
 
     {
         let scenario_id = "S-QUERY-001";
-        let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
-        let (engine, layout) = build_query_benchmark_engine(
-            &tmp_root.db_path("query-node-ids-intersected"),
-            preload_nodes,
-        )?;
-        let request = query_ids_intersected_request(limit);
-        let stats = run_bench(iter_cfg, |_i| engine.query_node_ids(&request).map(|_| ()))?;
-        engine.close().map_err(|e| e.to_string())?;
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let (engine, layout) = build_query_benchmark_engine(
+                &tmp_root.db_path("query-node-ids-intersected"),
+                preload_nodes,
+            )?;
+            let request = query_ids_intersected_request(limit);
+            let stats = run_bench(iter_cfg, |_i| engine.query_node_ids(&request).map(|_| ()))?;
+            engine.close().map_err(|e| e.to_string())?;
 
-        scenarios.push(make_scenario(
-            scenario_id,
-            "query_node_ids_intersected_predicates",
-            "query",
-            iter_cfg,
-            1,
-            stats,
-            json!({
-                "label_id": 1,
-                "preload_nodes": preload_nodes,
-                "segments": layout.segments,
-                "segment_nodes": layout.segment_nodes,
-                "memtable_tail_nodes": layout.memtable_tail_nodes,
-                "predicates": ["status_eq_active", "tier_eq_gold"],
-                "limit": limit
-            }),
-            scenario_comparability(scenario_contract, scenario_id),
-        ));
+            scenarios.push(make_scenario(
+                scenario_id,
+                "query_node_ids_intersected_predicates",
+                "query",
+                iter_cfg,
+                1,
+                stats,
+                json!({
+                    "label": "Person",
+                    "preload_nodes": preload_nodes,
+                    "segments": layout.segments,
+                    "segment_nodes": layout.segment_nodes,
+                    "memtable_tail_nodes": layout.memtable_tail_nodes,
+                    "predicates": ["status_eq_active", "tier_eq_gold"],
+                    "limit": limit
+                }),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
     }
 
     {
         let scenario_id = "S-QUERY-002";
-        let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
-        let (engine, layout) = build_query_benchmark_engine(
-            &tmp_root.db_path("query-nodes-hydrated-intersected"),
-            preload_nodes,
-        )?;
-        let request = query_nodes_hydrated_request(limit);
-        let stats = run_bench(iter_cfg, |_i| engine.query_nodes(&request).map(|_| ()))?;
-        engine.close().map_err(|e| e.to_string())?;
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let (engine, layout) = build_query_benchmark_engine(
+                &tmp_root.db_path("query-nodes-hydrated-intersected"),
+                preload_nodes,
+            )?;
+            let request = query_nodes_hydrated_request(limit);
+            let stats = run_bench(iter_cfg, |_i| engine.query_nodes(&request).map(|_| ()))?;
+            engine.close().map_err(|e| e.to_string())?;
 
-        scenarios.push(make_scenario(
-            scenario_id,
-            "query_nodes_intersected_predicates_hydrated",
-            "query",
-            iter_cfg,
-            1,
-            stats,
-            json!({
-                "label_id": 1,
-                "preload_nodes": preload_nodes,
-                "segments": layout.segments,
-                "segment_nodes": layout.segment_nodes,
-                "memtable_tail_nodes": layout.memtable_tail_nodes,
-                "predicates": ["status_eq_active", "score_gte_50"],
-                "limit": limit
-            }),
-            scenario_comparability(scenario_contract, scenario_id),
-        ));
+            scenarios.push(make_scenario(
+                scenario_id,
+                "query_nodes_intersected_predicates_hydrated",
+                "query",
+                iter_cfg,
+                1,
+                stats,
+                json!({
+                    "label_id": 1,
+                    "preload_nodes": preload_nodes,
+                    "segments": layout.segments,
+                    "segment_nodes": layout.segment_nodes,
+                    "memtable_tail_nodes": layout.memtable_tail_nodes,
+                    "predicates": ["status_eq_active", "score_gte_50"],
+                    "limit": limit
+                }),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
     }
 
     {
         let scenario_id = "S-QUERY-003";
-        let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
-        let fixture = build_edge_query_benchmark_engine(
-            &tmp_root.db_path("query-edge-ids-endpoint-metadata"),
-            preload_nodes,
-        )?;
-        let request = query_edge_ids_request(fixture.source_id, limit);
-        let stats = run_bench(iter_cfg, |_i| {
-            fixture.engine.query_edge_ids(&request).map(|_| ())
-        })?;
-        fixture.engine.close().map_err(|e| e.to_string())?;
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let fixture = build_edge_query_benchmark_engine(
+                &tmp_root.db_path("query-edge-ids-endpoint-metadata"),
+                preload_nodes,
+            )?;
+            let request = query_edge_ids_request(fixture.source_id, limit);
+            let stats = run_bench(iter_cfg, |_i| {
+                fixture.engine.query_edge_ids(&request).map(|_| ())
+            })?;
+            fixture.engine.close().map_err(|e| e.to_string())?;
 
-        scenarios.push(make_scenario(
-            scenario_id,
-            "query_edge_ids_endpoint_metadata",
-            "query",
-            iter_cfg,
-            1,
-            stats,
-            json!({
-                "label_id": 10,
-                "preload_edges": preload_nodes,
-                "segments": fixture.layout.segments,
-                "segment_edges": fixture.layout.segment_edges,
-                "memtable_tail_edges": fixture.layout.memtable_tail_edges,
-                "filter": "weight_gte_1",
-                "limit": limit
-            }),
-            scenario_comparability(scenario_contract, scenario_id),
-        ));
+            scenarios.push(make_scenario(
+                scenario_id,
+                "query_edge_ids_endpoint_metadata",
+                "query",
+                iter_cfg,
+                1,
+                stats,
+                json!({
+                    "label": "WORKS_AT",
+                    "preload_edges": preload_nodes,
+                    "segments": fixture.layout.segments,
+                    "segment_edges": fixture.layout.segment_edges,
+                    "memtable_tail_edges": fixture.layout.memtable_tail_edges,
+                    "filter": "weight_gte_1",
+                    "limit": limit
+                }),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
     }
 
     {
         let scenario_id = "S-QUERY-004";
-        let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
-        let fixture = build_edge_query_benchmark_engine(
-            &tmp_root.db_path("query-edges-endpoint-property-hydrated"),
-            preload_nodes,
-        )?;
-        let request = query_edges_hydrated_request(fixture.source_id, limit);
-        let stats = run_bench(iter_cfg, |_i| {
-            fixture.engine.query_edges(&request).map(|_| ())
-        })?;
-        fixture.engine.close().map_err(|e| e.to_string())?;
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let fixture = build_edge_query_benchmark_engine(
+                &tmp_root.db_path("query-edges-endpoint-property-hydrated"),
+                preload_nodes,
+            )?;
+            let request = query_edges_hydrated_request(fixture.source_id, limit);
+            let stats = run_bench(iter_cfg, |_i| {
+                fixture.engine.query_edges(&request).map(|_| ())
+            })?;
+            fixture.engine.close().map_err(|e| e.to_string())?;
 
-        scenarios.push(make_scenario(
-            scenario_id,
-            "query_edges_endpoint_property_hydrated",
-            "query",
-            iter_cfg,
-            1,
-            stats,
-            json!({
-                "label_id": 10,
-                "preload_edges": preload_nodes,
-                "segments": fixture.layout.segments,
-                "segment_edges": fixture.layout.segment_edges,
-                "memtable_tail_edges": fixture.layout.memtable_tail_edges,
-                "filter": "weight_gte_1_and_role_eq_lead",
-                "limit": limit
-            }),
-            scenario_comparability(scenario_contract, scenario_id),
-        ));
+            scenarios.push(make_scenario(
+                scenario_id,
+                "query_edges_endpoint_property_hydrated",
+                "query",
+                iter_cfg,
+                1,
+                stats,
+                json!({
+                    "label": "WORKS_AT",
+                    "preload_edges": preload_nodes,
+                    "segments": fixture.layout.segments,
+                    "segment_edges": fixture.layout.segment_edges,
+                    "memtable_tail_edges": fixture.layout.memtable_tail_edges,
+                    "filter": "weight_gte_1_and_role_eq_lead",
+                    "limit": limit
+                }),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
+    }
+
+    {
+        let scenario_id = "S-QUERY-005";
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let fixture = build_indexed_edge_query_benchmark_engine(
+                &tmp_root.db_path("query-edge-ids-property-indexed-equality"),
+                preload_nodes,
+            )?;
+            let request = query_edge_ids_indexed_equality_request(fixture.source_id, limit);
+            let stats = run_bench(iter_cfg, |_i| {
+                fixture.engine.query_edge_ids(&request).map(|_| ())
+            })?;
+            fixture.engine.close().map_err(|e| e.to_string())?;
+
+            scenarios.push(make_scenario(
+                scenario_id,
+                "query_edge_ids_property_indexed_equality",
+                "query",
+                iter_cfg,
+                1,
+                stats,
+                json!({
+                    "label": "WORKS_AT",
+                    "preload_edges": preload_nodes,
+                    "segments": fixture.layout.segments,
+                    "segment_edges": fixture.layout.segment_edges,
+                    "memtable_tail_edges": fixture.layout.memtable_tail_edges,
+                    "filter": "role_eq_lead",
+                    "limit": limit
+                }),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
+    }
+
+    {
+        let scenario_id = "S-QUERY-006";
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let fixture = build_indexed_edge_query_benchmark_engine(
+                &tmp_root.db_path("query-edge-ids-property-indexed-range"),
+                preload_nodes,
+            )?;
+            let request = query_edge_ids_indexed_range_request(fixture.source_id, limit);
+            let stats = run_bench(iter_cfg, |_i| {
+                fixture.engine.query_edge_ids(&request).map(|_| ())
+            })?;
+            fixture.engine.close().map_err(|e| e.to_string())?;
+
+            scenarios.push(make_scenario(
+                scenario_id,
+                "query_edge_ids_property_indexed_range",
+                "query",
+                iter_cfg,
+                1,
+                stats,
+                json!({
+                    "label": "WORKS_AT",
+                    "preload_edges": preload_nodes,
+                    "segments": fixture.layout.segments,
+                    "segment_edges": fixture.layout.segment_edges,
+                    "memtable_tail_edges": fixture.layout.memtable_tail_edges,
+                    "filter": "score_gte_90",
+                    "limit": limit
+                }),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
+    }
+
+    {
+        let scenario_id = "S-QUERY-007";
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let fixture = build_graph_row_benchmark_engine(
+                &tmp_root.db_path("query-graph-rows-optional-edge"),
+                preload_nodes,
+            )?;
+            let request = graph_row_optional_request(fixture.source_id, limit);
+            let stats = run_bench(iter_cfg, |_i| {
+                fixture.engine.query_graph_rows(&request).map(|_| ())
+            })?;
+            fixture.engine.close().map_err(|e| e.to_string())?;
+
+            scenarios.push(make_scenario(
+                scenario_id,
+                "query_graph_rows_optional_edge_traversal",
+                "query",
+                iter_cfg,
+                1,
+                stats,
+                graph_row_scenario_params(&fixture.layout, preload_nodes, limit),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
+    }
+
+    {
+        let scenario_id = "S-GQL-006";
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let fixture = build_graph_row_benchmark_engine(
+                &tmp_root.db_path("gql-graph-row-optional-edge"),
+                preload_nodes,
+            )?;
+            let query = format!(
+                "MATCH (source:Person)-[edge:WORKS_AT {{role: $role}}]->(target:Company) \
+             WHERE id(source) = $source \
+             OPTIONAL MATCH (target)-[ref:MENTIONS]->(doc:Document) \
+             RETURN id(source) AS source, id(edge) AS edge, id(target) AS target, \
+                    id(ref) AS ref, id(doc) AS doc \
+             ORDER BY edge.score DESC, id(target) LIMIT {limit}"
+            );
+            let params = GqlParams::from([
+                (
+                    "role".to_string(),
+                    GqlParamValue::String("lead".to_string()),
+                ),
+                ("source".to_string(), GqlParamValue::UInt(fixture.source_id)),
+            ]);
+            let options = GqlQueryOptions::default();
+            let stats = run_bench(iter_cfg, |_i| {
+                fixture
+                    .engine
+                    .execute_gql(&query, &params, &options)
+                    .map(|_| ())
+            })?;
+            fixture.engine.close().map_err(|e| e.to_string())?;
+
+            scenarios.push(make_scenario(
+                scenario_id,
+                "execute_gql_optional_edge_traversal_graph_rows",
+                "query",
+                iter_cfg,
+                1,
+                stats,
+                graph_row_scenario_params(&fixture.layout, preload_nodes, limit),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
     }
 
     Ok(())

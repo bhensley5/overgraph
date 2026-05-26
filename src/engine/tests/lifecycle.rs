@@ -222,7 +222,8 @@ fn corrupt_equality_sidecar_tail_group_order_in_place(path: &std::path::Path, va
 fn corrupt_range_sidecar_tail_sort_order_in_place(path: &std::path::Path) {
     use std::io::{Seek, SeekFrom, Write};
 
-    const SECONDARY_RANGE_ENTRY_SIZE: usize = 16;
+    const SECONDARY_RANGE_KEY_BYTES: usize = 24;
+    const SECONDARY_RANGE_ENTRY_SIZE: usize = SECONDARY_RANGE_KEY_BYTES + 8;
     let data = std::fs::read(path).unwrap();
     let payload_offset = component_payload_offset_for_test(path) as usize;
     let payload = &data[payload_offset..];
@@ -239,8 +240,7 @@ fn corrupt_range_sidecar_tail_sort_order_in_place(path: &std::path::Path) {
     );
     let previous_off = 8 + (count - 2) * SECONDARY_RANGE_ENTRY_SIZE;
     let tail_off = 8 + (count - 1) * SECONDARY_RANGE_ENTRY_SIZE;
-    let previous_encoded =
-        u64::from_le_bytes(payload[previous_off..previous_off + 8].try_into().unwrap());
+    let previous_key = &payload[previous_off..previous_off + SECONDARY_RANGE_KEY_BYTES];
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -248,7 +248,7 @@ fn corrupt_range_sidecar_tail_sort_order_in_place(path: &std::path::Path) {
         .unwrap();
     file.seek(SeekFrom::Start((payload_offset + tail_off) as u64))
         .unwrap();
-    file.write_all(&previous_encoded.to_le_bytes()).unwrap();
+    file.write_all(previous_key).unwrap();
     file.sync_all().unwrap();
 }
 
@@ -12778,7 +12778,7 @@ fn test_property_index_manifest_reopens_and_reseeds_active_memtable() {
                 },
             )
             .unwrap();
-        let status_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let status_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let active_memtable = db.active_memtable();
         let eq_state = active_memtable.secondary_eq_state();
         let eq_ids = eq_state
@@ -12828,7 +12828,7 @@ fn test_ensure_property_index_while_flush_in_flight_preserves_manifest_and_seedi
         .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
-    let status_hash = hash_prop_value(&PropValue::String("active".to_string()));
+    let status_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
     let frozen_memtable = db.immutable_memtable(0);
     let frozen_eq_state = frozen_memtable.secondary_eq_state();
     let frozen_eq_ids = frozen_eq_state
@@ -13144,9 +13144,7 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
         let range = db
             .ensure_node_property_index("Person",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         db.with_runtime_manifest_write(|manifest| {
@@ -13502,7 +13500,7 @@ fn test_ready_equality_sidecar_tail_corruption_does_not_full_scan_on_open() {
 
     let seg_dir = segment_dir(&db_path, seg_id);
     let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, index_id);
-    corrupt_equality_sidecar_tail_group_order_in_place(&sidecar_path, hash_prop_value(&blue));
+    corrupt_equality_sidecar_tail_group_order_in_place(&sidecar_path, hash_prop_equality_key(&blue));
 
     let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = reopened
@@ -14102,7 +14100,7 @@ fn test_drop_equality_index_while_build_paused_stale_sidecar_does_not_resurrect(
     let stale_sidecar_path =
         crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, info.index_id);
     let mut stale_groups = BTreeMap::new();
-    stale_groups.insert(hash_prop_value(&red), vec![node_id]);
+    stale_groups.insert(hash_prop_equality_key(&red), vec![node_id]);
     std::fs::create_dir_all(stale_sidecar_path.parent().unwrap()).unwrap();
     crate::segment_writer::write_node_prop_eq_sidecar_to_path(&stale_sidecar_path, &stale_groups)
         .unwrap();
@@ -14150,9 +14148,7 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
@@ -14161,7 +14157,8 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
     let frozen_range = frozen_range_state
         .get(&info.index_id)
         .unwrap();
-    assert!(frozen_range.contains(&(10u64 ^ (1u64 << 63), node_id)));
+    let score_10 = numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap();
+    assert!(frozen_range.contains(&(score_10, node_id)));
 
     release_tx.send(()).unwrap();
     assert!(db.wait_one_flush().unwrap().is_some());
@@ -14222,9 +14219,7 @@ fn test_ready_property_range_index_downgrades_when_flush_publish_missed_declarat
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -14308,9 +14303,7 @@ fn test_missing_range_sidecar_reopens_and_repairs_to_ready() {
         let info = db
             .ensure_node_property_index("Person",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -14369,9 +14362,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
         let info = db
             .ensure_node_property_index("Person",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -14455,9 +14446,7 @@ fn test_ready_range_sidecar_tail_corruption_does_not_full_scan_on_open() {
         let info = db
             .ensure_node_property_index("Person",
                 "score",
-                SecondaryIndexKind::Range {
-                    domain: SecondaryIndexRangeDomain::Int,
-                },
+                SecondaryIndexKind::Range,
             )
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -14521,9 +14510,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -14646,9 +14633,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -14732,9 +14717,7 @@ fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() 
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -14811,9 +14794,7 @@ fn test_compaction_with_missing_ready_range_sidecar_rebuilds_index_via_targeted_
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -14917,9 +14898,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -14947,9 +14926,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
     assert!(db
         .drop_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap());
     assert!(
@@ -15076,9 +15053,7 @@ fn test_range_backfill_survives_compaction_during_build() {
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     ready_rx
@@ -15139,9 +15114,7 @@ fn test_range_index_close_fast_while_build_paused_reopens_and_resumes() {
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     ready_rx
@@ -15213,9 +15186,7 @@ fn test_open_rejects_conflicting_range_declarations_for_same_property() {
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Building,
             last_error: None,
         },
@@ -15225,9 +15196,7 @@ fn test_open_rejects_conflicting_range_declarations_for_same_property() {
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Float,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Building,
             last_error: None,
         },
@@ -16913,9 +16882,7 @@ fn test_targeted_range_stats_refresh_writes_minimal_stats_when_missing() {
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -16995,9 +16962,7 @@ fn test_targeted_range_stats_refresh_writes_minimal_stats_when_corrupt() {
     let info = db
         .ensure_node_property_index("Person",
             "score",
-            SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            SecondaryIndexKind::Range,
         )
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -17221,9 +17186,7 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Building,
             last_error: None,
         };
@@ -17239,7 +17202,6 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
             target: SecondaryIndexTargetDiscriminant::Node,
             target_label_id: 1,
             prop_key: "score".to_string(),
-            domain: SecondaryIndexRangeDomain::Int,
             segment_ids: Vec::new(),
             segment_infos: Vec::new(),
             secondary_indexes: vec![entry.clone()],

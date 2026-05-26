@@ -122,6 +122,12 @@
       "iters_divisor": 2,
       "iters_min": 20
     },
+    "S-GQL-006": {
+      "warmup_divisor": 2,
+      "warmup_min": 5,
+      "iters_divisor": 2,
+      "iters_min": 20
+    },
     "S-TRAV-003": {
       "iters_multiplier": 2
     },
@@ -219,6 +225,29 @@
       "status": "comparable"
     },
     "S-QUERY-007": {
+      "status": "comparable"
+    },
+    "S-GQL-001": {
+      "status": "non_comparable",
+      "reason": "Connector-only GQL object-row baseline; Rust core parity is covered by S-GQL-006."
+    },
+    "S-GQL-002": {
+      "status": "non_comparable",
+      "reason": "Connector-only GQL compact-row baseline; Rust core parity is covered by S-GQL-006."
+    },
+    "S-GQL-003": {
+      "status": "non_comparable",
+      "reason": "Connector-only direct-edge GQL baseline; Rust core parity is covered by S-GQL-006."
+    },
+    "S-GQL-004": {
+      "status": "non_comparable",
+      "reason": "Connector-only fixed-pattern GQL baseline; Rust core parity is covered by S-GQL-006."
+    },
+    "S-GQL-005": {
+      "status": "non_comparable",
+      "reason": "Connector-only GQL include-plan/profile baseline; Rust core parity is covered by S-GQL-006."
+    },
+    "S-GQL-006": {
       "status": "comparable"
     },
     "S-ADV-005": {

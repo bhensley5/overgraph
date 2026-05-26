@@ -1,6 +1,6 @@
 """Type stubs for the overgraph Python connector."""
 
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, TypedDict
 
 IntList = list[int] | tuple[int, ...]
 StrList = list[str] | tuple[str, ...]
@@ -9,6 +9,9 @@ MappingList = list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...]
 QueryNodeFilter = Mapping[str, Any]
 QueryEdgeFilter = Mapping[str, Any]
 NodeLabelFilter = Mapping[str, Any]
+GqlScalar = None | bool | int | float | str | bytes
+GqlParam = GqlScalar | list["GqlParam"] | tuple["GqlParam", ...] | Mapping[str, "GqlParam"]
+GqlParams = Mapping[str, GqlParam]
 
 # ============================================================
 # Data types
@@ -116,7 +119,6 @@ class NodePropertyIndexInfo:
     label: str
     prop_key: str
     kind: str
-    domain: str | None
     state: str
     last_error: str | None
     def __repr__(self) -> str: ...
@@ -126,7 +128,6 @@ class EdgePropertyIndexInfo:
     label: str
     prop_key: str
     kind: str
-    domain: str | None
     state: str
     last_error: str | None
     def __repr__(self) -> str: ...
@@ -347,53 +348,107 @@ class EdgeQueryRequest:
 
 QueryEdgeRequest = EdgeQueryRequest
 
-class GraphNodePattern:
-    alias: str
-    label_filter: NodeLabelFilter | None
-    ids: IntList | None
-    keys: StrList | None
-    filter: QueryNodeFilter | None
-    def __init__(
-        self,
-        alias: str,
-        label_filter: NodeLabelFilter | None = None,
-        ids: IntList | None = None,
-        keys: StrList | None = None,
-        filter: QueryNodeFilter | None = None,
-    ) -> None: ...
-    def to_dict(self) -> dict[str, Any]: ...
+GraphParamValue = None | bool | int | float | str | bytes | list["GraphParamValue"] | dict[str, "GraphParamValue"]
+GraphExpr = Any
+GraphRowRequest = Mapping[str, Any]
 
-class GraphEdgePattern:
-    from_alias: str
-    to_alias: str
-    alias: str | None
-    direction: str | None
-    label_filter: StrList | None
-    filter: QueryEdgeFilter | None
-    def __init__(
-        self,
-        from_alias: str,
-        to_alias: str,
-        alias: str | None = None,
-        direction: str | None = None,
-        label_filter: StrList | None = None,
-        filter: QueryEdgeFilter | None = None,
-    ) -> None: ...
-    def to_dict(self) -> dict[str, Any]: ...
+class GraphPathValue(TypedDict, total=False):
+    node_ids: list[int]
+    edge_ids: list[int]
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
 
-class GraphPatternRequest:
-    nodes: list[GraphNodePattern | Mapping[str, Any]] | tuple[GraphNodePattern | Mapping[str, Any], ...]
-    edges: list[GraphEdgePattern | Mapping[str, Any]] | tuple[GraphEdgePattern | Mapping[str, Any], ...]
-    limit: int
-    at_epoch: int | None
-    def __init__(
-        self,
-        nodes: list[GraphNodePattern | Mapping[str, Any]] | tuple[GraphNodePattern | Mapping[str, Any], ...],
-        edges: list[GraphEdgePattern | Mapping[str, Any]] | tuple[GraphEdgePattern | Mapping[str, Any], ...],
-        limit: int,
-        at_epoch: int | None = None,
-    ) -> None: ...
-    def to_dict(self) -> dict[str, Any]: ...
+GraphValue = None | bool | int | float | str | bytes | list["GraphValue"] | dict[str, Any] | GraphPathValue
+
+class GraphRowStats(TypedDict):
+    rows_returned: int
+    rows_after_filter: int
+    rows_seen_for_page: int
+    intermediate_bindings_peak: int
+    frontier_peak: int
+    paths_enumerated: int
+    db_hits: int
+    elapsed_us: int | None
+    effective_at_epoch: int
+    warnings: list[str]
+
+class GraphRowResult(TypedDict):
+    columns: list[str]
+    rows: list[dict[str, GraphValue]] | list[list[GraphValue]]
+    next_cursor: str | None
+    stats: GraphRowStats
+    plan: dict[str, Any] | None
+
+GraphRowExplain = dict[str, Any]
+
+class GqlNode(TypedDict, total=False):
+    id: int
+    labels: list[str]
+    key: str
+    props: dict[str, Any]
+    weight: float
+    created_at: int
+    updated_at: int
+    dense_vector: list[float]
+    sparse_vector: list[tuple[int, float]]
+
+class GqlEdge(TypedDict, total=False):
+    id: int
+    from_id: int
+    to_id: int
+    label: str
+    props: dict[str, Any]
+    weight: float
+    created_at: int
+    updated_at: int
+    valid_from: int
+    valid_to: int
+
+class GqlPath(TypedDict, total=False):
+    node_ids: list[int]
+    edge_ids: list[int]
+    nodes: list[GqlNode]
+    edges: list[GqlEdge]
+
+GqlValue = GqlScalar | list["GqlValue"] | dict[str, "GqlValue"] | GqlNode | GqlEdge | GqlPath
+
+class GqlExecutionStats(TypedDict):
+    rows_returned: int
+    rows_matched: int
+    rows_after_filter: int
+    intermediate_bindings: int
+    db_hits: int
+    elapsed_us: int | None
+    truncated: bool
+    warnings: list[str]
+
+class GqlCapSummary(TypedDict):
+    allow_full_scan: bool
+    max_rows: int
+    max_intermediate_bindings: int
+    max_skip: int
+    max_query_bytes: int
+    max_param_bytes: int
+    max_ast_depth: int
+    max_literal_items: int
+
+class GqlExplain(TypedDict):
+    columns: list[str]
+    target: str
+    native_plan: dict[str, Any] | None
+    pushed_down: list[str]
+    residual: list[str]
+    projection: list[str]
+    row_ops: list[str]
+    caps: GqlCapSummary
+    warnings: list[str]
+
+class GqlResult(TypedDict):
+    columns: list[str]
+    rows: list[dict[str, GqlValue]] | list[list[GqlValue]]
+    next_cursor: str | None
+    stats: GqlExecutionStats
+    plan: GqlExplain | None
 
 # ============================================================
 # Exception
@@ -476,15 +531,55 @@ class OverGraph:
     def query_nodes(self, request: dict[str, Any] | NodeQueryRequest) -> NodePageResult: ...
     def query_edge_ids(self, request: dict[str, Any] | EdgeQueryRequest) -> IdPageResult: ...
     def query_edges(self, request: dict[str, Any] | EdgeQueryRequest) -> EdgePageResult: ...
-    def query_pattern(self, request: dict[str, Any] | GraphPatternRequest) -> dict[str, Any]: ...
+    def query_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowResult: ...
     def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> dict[str, Any]: ...
     def explain_edge_query(self, request: dict[str, Any] | EdgeQueryRequest) -> dict[str, Any]: ...
-    def explain_pattern_query(self, request: dict[str, Any] | GraphPatternRequest) -> dict[str, Any]: ...
-    def ensure_node_property_index(self, label: str, prop_key: str, kind: str, *, domain: str | None = None) -> NodePropertyIndexInfo: ...
-    def drop_node_property_index(self, label: str, prop_key: str, kind: str, *, domain: str | None = None) -> bool: ...
+    def explain_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowExplain: ...
+    def execute_gql(
+        self,
+        query: str,
+        params: GqlParams | None = None,
+        *,
+        allow_full_scan: bool = False,
+        max_rows: int | None = None,
+        cursor: str | None = None,
+        max_cursor_bytes: int | None = None,
+        max_intermediate_bindings: int | None = None,
+        max_skip: int | None = None,
+        max_query_bytes: int | None = None,
+        max_param_bytes: int | None = None,
+        max_ast_depth: int | None = None,
+        max_literal_items: int | None = None,
+        include_plan: bool = False,
+        profile: bool = False,
+        compact_rows: bool = False,
+        include_vectors: bool = False,
+    ) -> GqlResult: ...
+    def explain_gql(
+        self,
+        query: str,
+        params: GqlParams | None = None,
+        *,
+        allow_full_scan: bool = False,
+        max_rows: int | None = None,
+        cursor: str | None = None,
+        max_cursor_bytes: int | None = None,
+        max_intermediate_bindings: int | None = None,
+        max_skip: int | None = None,
+        max_query_bytes: int | None = None,
+        max_param_bytes: int | None = None,
+        max_ast_depth: int | None = None,
+        max_literal_items: int | None = None,
+        include_plan: bool = False,
+        profile: bool = False,
+        compact_rows: bool = False,
+        include_vectors: bool = False,
+    ) -> GqlExplain: ...
+    def ensure_node_property_index(self, label: str, prop_key: str, kind: str) -> NodePropertyIndexInfo: ...
+    def drop_node_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
     def list_node_property_indexes(self) -> list[NodePropertyIndexInfo]: ...
-    def ensure_edge_property_index(self, label: str, prop_key: str, kind: str, *, domain: str | None = None) -> EdgePropertyIndexInfo: ...
-    def drop_edge_property_index(self, label: str, prop_key: str, kind: str, *, domain: str | None = None) -> bool: ...
+    def ensure_edge_property_index(self, label: str, prop_key: str, kind: str) -> EdgePropertyIndexInfo: ...
+    def drop_edge_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
     def list_edge_property_indexes(self) -> list[EdgePropertyIndexInfo]: ...
     def nodes_by_labels(self, labels: NodeLabels) -> IdArray: ...
     def edges_by_label(self, label: str) -> IdArray: ...
@@ -852,15 +947,27 @@ class AsyncOverGraph:
     async def query_nodes(self, request: dict[str, Any] | NodeQueryRequest) -> NodePageResult: ...
     async def query_edge_ids(self, request: dict[str, Any] | EdgeQueryRequest) -> IdPageResult: ...
     async def query_edges(self, request: dict[str, Any] | EdgeQueryRequest) -> EdgePageResult: ...
-    async def query_pattern(self, request: dict[str, Any] | GraphPatternRequest) -> dict[str, Any]: ...
+    async def query_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowResult: ...
     async def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> dict[str, Any]: ...
     async def explain_edge_query(self, request: dict[str, Any] | EdgeQueryRequest) -> dict[str, Any]: ...
-    async def explain_pattern_query(self, request: dict[str, Any] | GraphPatternRequest) -> dict[str, Any]: ...
-    async def ensure_node_property_index(self, label: str, prop_key: str, kind: str, *, domain: str | None = None) -> NodePropertyIndexInfo: ...
-    async def drop_node_property_index(self, label: str, prop_key: str, kind: str, *, domain: str | None = None) -> bool: ...
+    async def explain_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowExplain: ...
+    async def execute_gql(
+        self,
+        query: str,
+        params: GqlParams | None = None,
+        **options: Any,
+    ) -> GqlResult: ...
+    async def explain_gql(
+        self,
+        query: str,
+        params: GqlParams | None = None,
+        **options: Any,
+    ) -> GqlExplain: ...
+    async def ensure_node_property_index(self, label: str, prop_key: str, kind: str) -> NodePropertyIndexInfo: ...
+    async def drop_node_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
     async def list_node_property_indexes(self) -> list[NodePropertyIndexInfo]: ...
-    async def ensure_edge_property_index(self, label: str, prop_key: str, kind: str, *, domain: str | None = None) -> EdgePropertyIndexInfo: ...
-    async def drop_edge_property_index(self, label: str, prop_key: str, kind: str, *, domain: str | None = None) -> bool: ...
+    async def ensure_edge_property_index(self, label: str, prop_key: str, kind: str) -> EdgePropertyIndexInfo: ...
+    async def drop_edge_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
     async def list_edge_property_indexes(self) -> list[EdgePropertyIndexInfo]: ...
     async def nodes_by_labels(self, labels: NodeLabels) -> IdArray: ...
     async def edges_by_label(self, label: str) -> IdArray: ...

@@ -3,6 +3,217 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub offset: usize,
+    pub length: usize,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl SourceSpan {
+    pub const fn new(offset: usize, length: usize, line: u32, column: u32) -> Self {
+        Self {
+            offset,
+            length,
+            line,
+            column,
+        }
+    }
+
+    pub fn end_offset(&self) -> usize {
+        self.offset.saturating_add(self.length)
+    }
+}
+
+pub type GqlParams = BTreeMap<String, GqlParamValue>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GqlParamValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    List(Vec<GqlParamValue>),
+    Map(BTreeMap<String, GqlParamValue>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GqlQueryOptions {
+    pub allow_full_scan: bool,
+    pub max_rows: usize,
+    pub cursor: Option<String>,
+    pub max_cursor_bytes: usize,
+    pub max_intermediate_bindings: usize,
+    pub max_skip: usize,
+    pub max_query_bytes: usize,
+    pub max_param_bytes: usize,
+    pub max_ast_depth: usize,
+    pub max_literal_items: usize,
+    pub include_plan: bool,
+    pub profile: bool,
+    pub compact_rows: bool,
+    pub include_vectors: bool,
+}
+
+impl Default for GqlQueryOptions {
+    fn default() -> Self {
+        Self {
+            allow_full_scan: false,
+            max_rows: 10_000,
+            cursor: None,
+            max_cursor_bytes: 16 * 1024,
+            max_intermediate_bindings: 65_536,
+            max_skip: 100_000,
+            max_query_bytes: 1_048_576,
+            max_param_bytes: 1_048_576,
+            max_ast_depth: 256,
+            max_literal_items: 10_000,
+            include_plan: false,
+            profile: false,
+            compact_rows: false,
+            include_vectors: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GqlValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    List(Vec<GqlValue>),
+    Map(BTreeMap<String, GqlValue>),
+    Node(GqlNode),
+    Edge(GqlEdge),
+    Path(GqlPath),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlNode {
+    pub id: Option<u64>,
+    pub labels: Option<Vec<String>>,
+    pub key: Option<String>,
+    pub props: Option<BTreeMap<String, GqlValue>>,
+    pub weight: Option<f32>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub dense_vector: Option<Vec<f32>>,
+    pub sparse_vector: Option<Vec<(u32, f32)>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlEdge {
+    pub id: Option<u64>,
+    pub from: Option<u64>,
+    pub to: Option<u64>,
+    pub label: Option<String>,
+    pub props: Option<BTreeMap<String, GqlValue>>,
+    pub weight: Option<f32>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub valid_from: Option<i64>,
+    pub valid_to: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlPath {
+    pub node_ids: Vec<u64>,
+    pub edge_ids: Vec<u64>,
+    pub nodes: Option<Vec<GqlNode>>,
+    pub edges: Option<Vec<GqlEdge>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlRow {
+    pub values: Vec<GqlValue>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<GqlRow>,
+    pub next_cursor: Option<String>,
+    pub stats: GqlExecutionStats,
+    pub plan: Option<GqlExplain>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlExecutionStats {
+    pub rows_returned: usize,
+    pub rows_matched: usize,
+    pub rows_after_filter: usize,
+    pub intermediate_bindings: usize,
+    pub db_hits: usize,
+    pub elapsed_us: Option<u64>,
+    pub truncated: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlExplain {
+    pub columns: Vec<String>,
+    pub target: GqlLoweringTarget,
+    pub native_plan: Option<QueryPlan>,
+    pub pushed_down: Vec<String>,
+    pub residual: Vec<String>,
+    pub projection: Vec<String>,
+    pub row_ops: Vec<GqlRowOperation>,
+    pub caps: GqlCapSummary,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GqlLoweringTarget {
+    NodeQuery,
+    EdgeQuery,
+    GraphRowQuery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GqlRowOperation {
+    ResidualFilter,
+    Projection,
+    Sort,
+    Skip,
+    Limit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GqlCapSummary {
+    pub allow_full_scan: bool,
+    pub max_rows: usize,
+    pub max_intermediate_bindings: usize,
+    pub max_skip: usize,
+    pub max_query_bytes: usize,
+    pub max_param_bytes: usize,
+    pub max_ast_depth: usize,
+    pub max_literal_items: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GqlSemanticErrorCode {
+    DuplicateAlias,
+    UnknownVariable,
+    InvalidParameter,
+    ParameterTypeMismatch,
+    InvalidReturnExpression,
+    InvalidPropertyAccess,
+    DynamicLabelNotSupported,
+    DynamicRelationshipTypeNotSupported,
+    FullScanNotAllowed,
+    ReadOnlyViolation,
+}
 
 pub(crate) const LABEL_TOKEN_SCHEMA_VERSION: u32 = 1;
 #[allow(dead_code)]
@@ -485,11 +696,153 @@ pub(crate) enum NodeVisibilityState {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NodeMetadataForQuery {
+    pub(crate) id: u64,
+    pub(crate) label_ids: NodeLabelSet,
+    pub(crate) updated_at: i64,
+    pub(crate) weight: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SelectedNodeFields {
+    pub(crate) meta: NodeMetadataForQuery,
+    pub(crate) key: Option<String>,
+    pub(crate) props: BTreeMap<String, PropValue>,
+    pub(crate) created_at: Option<i64>,
+    pub(crate) dense_vector: Option<DenseVector>,
+    pub(crate) sparse_vector: Option<SparseVector>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EdgeVisibilityState {
     Live,
     Deleted,
     Missing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EdgeMetadataForQuery {
+    pub(crate) id: u64,
+    pub(crate) from: u64,
+    pub(crate) to: u64,
+    pub(crate) label_id: u32,
+    pub(crate) updated_at: i64,
+    pub(crate) weight: f32,
+    pub(crate) valid_from: i64,
+    pub(crate) valid_to: i64,
+}
+
+impl From<&EdgeRecord> for EdgeMetadataForQuery {
+    fn from(edge: &EdgeRecord) -> Self {
+        Self {
+            id: edge.id,
+            from: edge.from,
+            to: edge.to,
+            label_id: edge.label_id,
+            updated_at: edge.updated_at,
+            weight: edge.weight,
+            valid_from: edge.valid_from,
+            valid_to: edge.valid_to,
+        }
+    }
+}
+
+impl From<crate::edge_metadata::EdgeMetadataCandidate> for EdgeMetadataForQuery {
+    fn from(meta: crate::edge_metadata::EdgeMetadataCandidate) -> Self {
+        Self {
+            id: meta.edge_id,
+            from: meta.from,
+            to: meta.to,
+            label_id: meta.label_id,
+            updated_at: meta.updated_at,
+            weight: meta.weight,
+            valid_from: meta.valid_from,
+            valid_to: meta.valid_to,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SelectedEdgeFields {
+    pub(crate) meta: EdgeMetadataForQuery,
+    pub(crate) props: BTreeMap<String, PropValue>,
+    pub(crate) created_at: Option<i64>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SelectedFieldReadCounters {
+    node_selected_field_batches: AtomicUsize,
+    node_selected_field_ids: AtomicUsize,
+    edge_selected_field_batches: AtomicUsize,
+    edge_selected_field_ids: AtomicUsize,
+    node_dense_vector_projection_reads: AtomicUsize,
+    node_sparse_vector_projection_reads: AtomicUsize,
+}
+
+#[cfg(test)]
+impl SelectedFieldReadCounters {
+    pub(crate) fn note_node_selected_field_batch(&self, ids: usize) {
+        self.node_selected_field_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.node_selected_field_ids
+            .fetch_add(ids, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_edge_selected_field_batch(&self, ids: usize) {
+        self.edge_selected_field_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.edge_selected_field_ids
+            .fetch_add(ids, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_node_dense_vector_projection_read(&self) {
+        self.node_dense_vector_projection_reads
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_node_sparse_vector_projection_read(&self) {
+        self.node_sparse_vector_projection_reads
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn node_selected_field_batches(&self) -> usize {
+        self.node_selected_field_batches.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn node_selected_field_ids(&self) -> usize {
+        self.node_selected_field_ids.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn edge_selected_field_batches(&self) -> usize {
+        self.edge_selected_field_batches.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn edge_selected_field_ids(&self) -> usize {
+        self.edge_selected_field_ids.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn node_dense_vector_projection_reads(&self) -> usize {
+        self.node_dense_vector_projection_reads
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn node_sparse_vector_projection_reads(&self) -> usize {
+        self.node_sparse_vector_projection_reads
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reset(&self) {
+        self.node_selected_field_batches.store(0, Ordering::Relaxed);
+        self.node_selected_field_ids.store(0, Ordering::Relaxed);
+        self.edge_selected_field_batches.store(0, Ordering::Relaxed);
+        self.edge_selected_field_ids.store(0, Ordering::Relaxed);
+        self.node_dense_vector_projection_reads
+            .store(0, Ordering::Relaxed);
+        self.node_sparse_vector_projection_reads
+            .store(0, Ordering::Relaxed);
+    }
 }
 
 /// Property value types supported in node/edge properties.
@@ -508,7 +861,7 @@ pub enum PropValue {
 
 /// Deterministic FNV-1a hash for byte slices.
 /// Used to hash property keys and values for index lookups.
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         hash ^= b as u64;
@@ -1017,30 +1370,56 @@ pub struct QueryEdgesResult {
     pub next_cursor: Option<u64>,
 }
 
-/// Request for planner-backed graph pattern queries.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GraphPatternQuery {
-    pub nodes: Vec<NodePattern>,
-    pub edges: Vec<EdgePattern>,
+/// Public structured graph-row query request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphRowQuery {
+    pub nodes: Vec<GraphNodePattern>,
+    pub pieces: Vec<GraphPatternPiece>,
+    pub where_: Option<GraphExpr>,
+    pub return_items: Option<Vec<GraphReturnItem>>,
+    pub order_by: Vec<GraphOrderItem>,
+    pub page: GraphPageRequest,
     pub at_epoch: Option<i64>,
-    pub limit: usize,
-    pub order: PatternOrder,
+    pub params: BTreeMap<String, GraphParamValue>,
+    pub output: GraphOutputOptions,
+    pub options: GraphQueryOptions,
 }
 
-/// Node variable inside a graph pattern query.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NodePattern {
+/// Parameter value accepted by graph-row requests.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphParamValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    List(Vec<GraphParamValue>),
+    Map(BTreeMap<String, GraphParamValue>),
+}
+
+/// Node variable declaration for graph-row queries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphNodePattern {
     pub alias: String,
-    /// Optional node-label membership filter.
     pub label_filter: Option<NodeLabelFilter>,
     pub ids: Vec<u64>,
-    pub keys: Vec<String>,
+    pub keys: Vec<NodeKeyQuery>,
     pub filter: Option<NodeFilterExpr>,
 }
 
-/// Edge variable or edge constraint inside a graph pattern query.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EdgePattern {
+/// Pattern piece inside a graph-row query.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphPatternPiece {
+    Edge(GraphEdgePattern),
+    Optional(GraphOptionalGroup),
+    VariableLength(GraphVariableLengthPattern),
+}
+
+/// Fixed edge pattern piece for graph-row queries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphEdgePattern {
     pub alias: Option<String>,
     pub from_alias: String,
     pub to_alias: String,
@@ -1049,28 +1428,454 @@ pub struct EdgePattern {
     pub filter: Option<EdgeFilterExpr>,
 }
 
-/// Result ordering for planner-backed graph pattern queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatternOrder {
-    AnchorThenAliasesAsc,
+/// Optional graph-row pattern group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphOptionalGroup {
+    pub pieces: Vec<GraphPatternPiece>,
+    pub where_: Option<GraphExpr>,
 }
 
-/// ID-binding result for planner-backed graph pattern queries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryPatternResult {
-    pub matches: Vec<QueryMatch>,
-    pub truncated: bool,
+/// Bounded variable-length path pattern piece.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphVariableLengthPattern {
+    pub path_alias: Option<String>,
+    pub edge_alias: Option<String>,
+    pub from_alias: String,
+    pub to_alias: String,
+    pub direction: Direction,
+    pub label_filter: Vec<String>,
+    pub filter: Option<EdgeFilterExpr>,
+    pub min_hops: u8,
+    pub max_hops: u8,
 }
 
-/// One graph pattern match. Unnamed edge patterns are constraints only.
-///
-/// Distinct node aliases bind distinct node IDs. Distinct edge aliases may bind
-/// the same edge ID when multiple pattern edge variables are satisfied by the
-/// same visible edge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryMatch {
-    pub nodes: BTreeMap<String, u64>,
-    pub edges: BTreeMap<String, u64>,
+/// Row-level graph expression shared by native graph-row APIs and text lowering.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphExpr {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    List(Vec<GraphExpr>),
+    Map(BTreeMap<String, GraphExpr>),
+    Param(String),
+    Binding(String),
+    Property {
+        alias: String,
+        key: String,
+    },
+    NodeField {
+        alias: String,
+        field: GraphNodeField,
+    },
+    EdgeField {
+        alias: String,
+        field: GraphEdgeField,
+    },
+    PathField {
+        alias: String,
+        field: GraphPathField,
+    },
+    Function {
+        name: GraphFunction,
+        args: Vec<GraphExpr>,
+    },
+    Unary {
+        op: GraphUnaryOp,
+        expr: Box<GraphExpr>,
+    },
+    Binary {
+        left: Box<GraphExpr>,
+        op: GraphBinaryOp,
+        right: Box<GraphExpr>,
+    },
+    IsNull(Box<GraphExpr>),
+    IsNotNull(Box<GraphExpr>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GraphNodeField {
+    Id,
+    Labels,
+    Key,
+    Weight,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GraphEdgeField {
+    Id,
+    From,
+    To,
+    Label,
+    Weight,
+    CreatedAt,
+    UpdatedAt,
+    ValidFrom,
+    ValidTo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GraphPathField {
+    NodeIds,
+    EdgeIds,
+    Length,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GraphFunction {
+    Id,
+    Labels,
+    Type,
+    Length,
+    StartNode,
+    EndNode,
+    Nodes,
+    Relationships,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GraphUnaryOp {
+    Not,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GraphBinaryOp {
+    Or,
+    And,
+    Eq,
+    Neq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    In,
+}
+
+/// One output column requested by a graph-row query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphReturnItem {
+    pub expr: GraphExpr,
+    pub alias: Option<String>,
+    pub projection: GraphReturnProjection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphReturnProjection {
+    Auto,
+    IdOnly,
+    Element(GraphElementProjection),
+    Selected(GraphSelectedProjection),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphElementProjection {
+    IdOnly,
+    Compact,
+    Full,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphSelectedProjection {
+    Node(GraphSelectedNodeProjection),
+    Edge(GraphSelectedEdgeProjection),
+    Path(GraphSelectedPathProjection),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphSelectedNodeProjection {
+    pub id: bool,
+    pub labels: bool,
+    pub key: bool,
+    pub props: GraphPropertySelection,
+    pub weight: bool,
+    pub created_at: bool,
+    pub updated_at: bool,
+    pub vectors: GraphVectorSelection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphSelectedEdgeProjection {
+    pub id: bool,
+    pub from: bool,
+    pub to: bool,
+    pub label: bool,
+    pub props: GraphPropertySelection,
+    pub weight: bool,
+    pub created_at: bool,
+    pub updated_at: bool,
+    pub valid_from: bool,
+    pub valid_to: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphSelectedPathProjection {
+    pub node_ids: bool,
+    pub edge_ids: bool,
+    pub nodes: Option<GraphSelectedNodeProjection>,
+    pub edges: Option<GraphSelectedEdgeProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphPropertySelection {
+    None,
+    Keys(Vec<String>),
+    All,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphVectorSelection {
+    None,
+    Dense,
+    Sparse,
+    Both,
+}
+
+/// Output defaults for graph-row values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphOutputOptions {
+    pub mode: GraphOutputMode,
+    pub compact_rows: bool,
+    pub include_vectors: bool,
+}
+
+impl Default for GraphOutputOptions {
+    fn default() -> Self {
+        Self {
+            mode: GraphOutputMode::Ids,
+            compact_rows: false,
+            include_vectors: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphOutputMode {
+    Ids,
+    Elements,
+    Projected,
+}
+
+/// Runtime graph-row value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    List(Vec<GraphValue>),
+    Map(BTreeMap<String, GraphValue>),
+    NodeId(u64),
+    EdgeId(u64),
+    Node(GraphNodeValue),
+    Edge(GraphEdgeValue),
+    Path(GraphPathValue),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphNodeValue {
+    pub id: Option<u64>,
+    pub labels: Option<Vec<String>>,
+    pub key: Option<String>,
+    pub props: Option<BTreeMap<String, GraphValue>>,
+    pub weight: Option<f32>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub dense_vector: Option<Vec<f32>>,
+    pub sparse_vector: Option<Vec<(u32, f32)>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphEdgeValue {
+    pub id: Option<u64>,
+    pub from: Option<u64>,
+    pub to: Option<u64>,
+    pub label: Option<String>,
+    pub props: Option<BTreeMap<String, GraphValue>>,
+    pub weight: Option<f32>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub valid_from: Option<i64>,
+    pub valid_to: Option<i64>,
+}
+
+/// Compact path identity used by graph-row execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphPath {
+    pub nodes: Vec<u64>,
+    pub edges: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphPathValue {
+    pub node_ids: Vec<u64>,
+    pub edge_ids: Vec<u64>,
+    pub nodes: Option<Vec<GraphNodeValue>>,
+    pub edges: Option<Vec<GraphEdgeValue>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphOrderItem {
+    pub expr: GraphExpr,
+    pub direction: GraphOrderDirection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphOrderDirection {
+    Asc,
+    Desc,
+}
+
+/// Final-row page request for native graph-row APIs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphPageRequest {
+    pub skip: usize,
+    pub limit: usize,
+    pub cursor: Option<String>,
+}
+
+/// Graph-row validation, safety, and explain options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphQueryOptions {
+    pub allow_full_scan: bool,
+    pub max_intermediate_bindings: usize,
+    pub max_frontier: usize,
+    pub max_path_hops: u8,
+    pub max_paths_per_start: usize,
+    pub max_page_limit: usize,
+    pub max_order_materialization: usize,
+    pub max_cursor_bytes: usize,
+    pub max_query_bytes: usize,
+    pub include_plan: bool,
+    pub profile: bool,
+}
+
+impl Default for GraphQueryOptions {
+    fn default() -> Self {
+        Self {
+            allow_full_scan: false,
+            max_intermediate_bindings: 65_536,
+            max_frontier: 65_536,
+            max_path_hops: 16,
+            max_paths_per_start: 4_096,
+            max_page_limit: 10_000,
+            max_order_materialization: 65_536,
+            max_cursor_bytes: 16 * 1024,
+            max_query_bytes: 1_048_576,
+            include_plan: false,
+            profile: false,
+        }
+    }
+}
+
+/// Result of a graph-row query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphRowResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<GraphRow>,
+    pub next_cursor: Option<String>,
+    pub stats: GraphRowStats,
+    pub plan: Option<GraphRowExplain>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphRow {
+    pub values: Vec<GraphValue>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphRowStats {
+    pub rows_returned: usize,
+    pub rows_after_filter: usize,
+    pub rows_seen_for_page: usize,
+    pub intermediate_bindings_peak: usize,
+    pub frontier_peak: usize,
+    pub paths_enumerated: usize,
+    pub db_hits: usize,
+    pub elapsed_us: Option<u64>,
+    pub effective_at_epoch: i64,
+    pub warnings: Vec<String>,
+}
+
+/// Explain output for graph-row planning and execution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphRowExplain {
+    pub columns: Vec<String>,
+    pub effective_at_epoch: Option<i64>,
+    pub fingerprint: String,
+    pub plan: Vec<GraphExplainNode>,
+    pub row_ops: Vec<GraphRowOperationExplain>,
+    pub order: GraphOrderExplain,
+    pub cursor: GraphCursorExplain,
+    pub projection: GraphProjectionExplain,
+    pub caps: GraphCapExplain,
+    pub summaries: GraphExecutionSummaries,
+    pub warnings: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+/// Minimal graph-row explain plan node. Later checkpoints fill in richer
+/// structured details without changing the root explain contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphExplainNode {
+    pub kind: String,
+    pub detail: String,
+    pub children: Vec<GraphExplainNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphRowOperationExplain {
+    pub kind: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphOrderExplain {
+    pub explicit: bool,
+    pub items: usize,
+    pub stable_logical_row_key: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphCursorExplain {
+    pub supplied: bool,
+    pub codec_implemented: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphProjectionExplain {
+    pub columns: Vec<String>,
+    pub output_mode: GraphOutputMode,
+    pub include_vectors: bool,
+    pub compact_rows: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphCapExplain {
+    pub allow_full_scan: bool,
+    pub max_intermediate_bindings: usize,
+    pub max_frontier: usize,
+    pub max_path_hops: u8,
+    pub max_paths_per_start: usize,
+    pub max_page_limit: usize,
+    pub max_order_materialization: usize,
+    pub max_cursor_bytes: usize,
+    pub max_query_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphExecutionSummaries {
+    pub validation_only: bool,
+    pub rows_planned: usize,
+    pub warnings: Vec<String>,
 }
 
 /// Kind of planner-backed query represented by a plan.
@@ -1078,7 +1883,6 @@ pub struct QueryMatch {
 pub enum QueryPlanKind {
     NodeQuery,
     EdgeQuery,
-    PatternQuery,
 }
 
 /// Explain output for planner-backed queries.
@@ -1139,29 +1943,11 @@ pub enum QueryPlanNode {
     EdgeMetadataScan,
     EdgePropertyEqualityIndex,
     EdgePropertyRangeIndex,
-    Intersect {
-        inputs: Vec<QueryPlanNode>,
-    },
-    Union {
-        inputs: Vec<QueryPlanNode>,
-    },
-    VerifyNodeFilter {
-        input: Box<QueryPlanNode>,
-    },
-    VerifyEdgeFilter {
-        input: Box<QueryPlanNode>,
-    },
-    VerifyEdgePredicates {
-        input: Box<QueryPlanNode>,
-    },
-    PatternExpand {
-        anchor_alias: String,
-        input: Box<QueryPlanNode>,
-    },
-    PatternEdgeAnchor {
-        edge_alias: Option<String>,
-        input: Box<QueryPlanNode>,
-    },
+    Intersect { inputs: Vec<QueryPlanNode> },
+    Union { inputs: Vec<QueryPlanNode> },
+    VerifyNodeFilter { input: Box<QueryPlanNode> },
+    VerifyEdgeFilter { input: Box<QueryPlanNode> },
+    VerifyEdgePredicates { input: Box<QueryPlanNode> },
     FallbackNodeLabelScan,
     FallbackFullNodeScan,
     FallbackEdgeLabelScan,
@@ -1176,7 +1962,6 @@ pub enum QueryPlanWarning {
     UsingFallbackScan,
     FullScanRequiresOptIn,
     FullScanExplicitlyAllowed,
-    UnboundedPatternRejected,
     EdgePropertyPostFilter,
     IndexSkippedAsBroad,
     CandidateCapExceeded,
@@ -1189,19 +1974,11 @@ pub enum QueryPlanWarning {
     UnknownEdgeLabel,
 }
 
-/// Range domain for an optional secondary index declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SecondaryIndexRangeDomain {
-    Int,
-    UInt,
-    Float,
-}
-
 /// Kind of optional secondary index declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SecondaryIndexKind {
     Equality,
-    Range { domain: SecondaryIndexRangeDomain },
+    Range,
 }
 
 /// Diagnostic/internal target for an optional secondary index declaration.

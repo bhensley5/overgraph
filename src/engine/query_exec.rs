@@ -1,6 +1,5 @@
 const QUERY_VERIFY_CHUNK: usize = 256;
 const PROPERTY_IN_LINEAR_VERIFY_THRESHOLD: usize = 16;
-const PATTERN_FRONTIER_BUDGET: usize = 65_536;
 const EDGE_INTERSECTION_TINY_SET: usize = 64;
 
 struct QueryExecutionOutcome<T> {
@@ -514,7 +513,12 @@ fn edge_plan_is_filter_source(plan: &EdgePhysicalPlan) -> bool {
     match plan {
         EdgePhysicalPlan::Source(source) => matches!(
             source.kind,
-            EdgeQueryCandidateSourceKind::EdgeWeightIndex
+            EdgeQueryCandidateSourceKind::EdgeLabelIndex
+                | EdgeQueryCandidateSourceKind::EdgeTripleIndex
+                | EdgeQueryCandidateSourceKind::FromEndpointAdjacency
+                | EdgeQueryCandidateSourceKind::ToEndpointAdjacency
+                | EdgeQueryCandidateSourceKind::AnyEndpointAdjacency
+                | EdgeQueryCandidateSourceKind::EdgeWeightIndex
                 | EdgeQueryCandidateSourceKind::EdgeUpdatedAtIndex
                 | EdgeQueryCandidateSourceKind::EdgeValidFromIndex
                 | EdgeQueryCandidateSourceKind::EdgeValidToIndex
@@ -656,21 +660,15 @@ fn union_candidate_sets(candidate_sets: &[Vec<u64>]) -> Vec<u64> {
     current
 }
 
-fn prop_value_contains_zero_float(value: &PropValue) -> bool {
-    match value {
-        PropValue::Float(value) => *value == 0.0,
-        PropValue::Array(values) => values.iter().any(prop_value_contains_zero_float),
-        PropValue::Map(values) => values.values().any(prop_value_contains_zero_float),
-        _ => false,
-    }
-}
-
 fn property_in_filter_matches(
     candidate: &PropValue,
     values: &[PropValue],
     value_keys: &[Vec<u8>],
 ) -> bool {
-    if values.len() <= PROPERTY_IN_LINEAR_VERIFY_THRESHOLD || values.len() != value_keys.len() {
+    if values.len() <= PROPERTY_IN_LINEAR_VERIFY_THRESHOLD
+        || values.len() != value_keys.len()
+        || structural_value_contains_float_zero(candidate)
+    {
         return values
             .iter()
             .any(|value| prop_values_equal_for_filter(candidate, value));
@@ -679,53 +677,45 @@ fn property_in_filter_matches(
     let candidate_key = prop_value_canonical_bytes(candidate);
     match value_keys.binary_search(&candidate_key) {
         Ok(index) => prop_values_equal_for_filter(candidate, &values[index]),
-        Err(_) if prop_value_contains_zero_float(candidate) => values
-            .iter()
-            .any(|value| prop_values_equal_for_filter(candidate, value)),
         Err(_) => false,
     }
 }
 
-fn node_filter_matches(filter: &NormalizedNodeFilter, node: &NodeRecord) -> bool {
-    match filter {
-        NormalizedNodeFilter::AlwaysTrue => true,
-        NormalizedNodeFilter::AlwaysFalse => false,
-        NormalizedNodeFilter::PropertyEquals { key, value } => {
-            node.props
-                .get(key)
-                .is_some_and(|candidate| prop_values_equal_for_filter(candidate, value))
-        }
-        NormalizedNodeFilter::PropertyIn {
-            key,
-            values,
-            value_keys,
-        } => node
-            .props
-            .get(key)
-            .is_some_and(|candidate| property_in_filter_matches(candidate, values, value_keys)),
-        NormalizedNodeFilter::PropertyRange { key, lower, upper } => node
-            .props
-            .get(key)
-            .and_then(|value| range_value_within_bounds(value, lower.as_ref(), upper.as_ref()))
-            == Some(true),
-        NormalizedNodeFilter::PropertyExists { key } => node.props.contains_key(key),
-        NormalizedNodeFilter::PropertyMissing { key } => !node.props.contains_key(key),
-        NormalizedNodeFilter::UpdatedAtRange { lower_ms, upper_ms } => {
-            node.updated_at >= *lower_ms && node.updated_at <= *upper_ms
-        }
-        NormalizedNodeFilter::And(children) => {
-            children.iter().all(|child| node_filter_matches(child, node))
-        }
-        NormalizedNodeFilter::Or(children) => {
-            children.iter().any(|child| node_filter_matches(child, node))
-        }
-        NormalizedNodeFilter::Not(child) => !node_filter_matches(child, node),
+fn node_query_meta_from_visibility(node_id: u64, meta: &NodeVisibilityMeta) -> NodeMetadataForQuery {
+    NodeMetadataForQuery {
+        id: node_id,
+        label_ids: meta.label_ids,
+        updated_at: meta.updated_at,
+        weight: meta.weight,
     }
 }
 
-fn node_filter_visibility_meta_matches(
+fn collect_node_filter_property_keys(filter: &NormalizedNodeFilter, keys: &mut Vec<String>) {
+    match filter {
+        NormalizedNodeFilter::PropertyEquals { key, .. }
+        | NormalizedNodeFilter::PropertyIn { key, .. }
+        | NormalizedNodeFilter::PropertyRange { key, .. }
+        | NormalizedNodeFilter::PropertyExists { key }
+        | NormalizedNodeFilter::PropertyMissing { key } => {
+            if !keys.iter().any(|existing| existing == key) {
+                keys.push(key.clone());
+            }
+        }
+        NormalizedNodeFilter::And(children) | NormalizedNodeFilter::Or(children) => {
+            for child in children {
+                collect_node_filter_property_keys(child, keys);
+            }
+        }
+        NormalizedNodeFilter::Not(child) => collect_node_filter_property_keys(child, keys),
+        NormalizedNodeFilter::AlwaysTrue
+        | NormalizedNodeFilter::AlwaysFalse
+        | NormalizedNodeFilter::UpdatedAtRange { .. } => {}
+    }
+}
+
+fn node_filter_metadata_outcome(
     filter: &NormalizedNodeFilter,
-    meta: &NodeVisibilityMeta,
+    meta: &NodeMetadataForQuery,
 ) -> Option<bool> {
     match filter {
         NormalizedNodeFilter::AlwaysTrue => Some(true),
@@ -734,32 +724,29 @@ fn node_filter_visibility_meta_matches(
             Some(meta.updated_at >= *lower_ms && meta.updated_at <= *upper_ms)
         }
         NormalizedNodeFilter::And(children) => {
+            let mut unknown = false;
             for child in children {
-                match node_filter_visibility_meta_matches(child, meta) {
-                    Some(true) => {}
+                match node_filter_metadata_outcome(child, meta) {
                     Some(false) => return Some(false),
-                    None => return None,
+                    Some(true) => {}
+                    None => unknown = true,
                 }
             }
-            Some(true)
+            if unknown { None } else { Some(true) }
         }
         NormalizedNodeFilter::Or(children) => {
-            let mut needs_record = false;
+            let mut unknown = false;
             for child in children {
-                match node_filter_visibility_meta_matches(child, meta) {
+                match node_filter_metadata_outcome(child, meta) {
                     Some(true) => return Some(true),
                     Some(false) => {}
-                    None => needs_record = true,
+                    None => unknown = true,
                 }
             }
-            if needs_record {
-                None
-            } else {
-                Some(false)
-            }
+            if unknown { None } else { Some(false) }
         }
         NormalizedNodeFilter::Not(child) => {
-            node_filter_visibility_meta_matches(child, meta).map(|matched| !matched)
+            node_filter_metadata_outcome(child, meta).map(|matched| !matched)
         }
         NormalizedNodeFilter::PropertyEquals { .. }
         | NormalizedNodeFilter::PropertyIn { .. }
@@ -769,20 +756,42 @@ fn node_filter_visibility_meta_matches(
     }
 }
 
-fn node_filter_visibility_meta_compatible(filter: &NormalizedNodeFilter) -> bool {
+fn node_filter_projected_matches(
+    filter: &NormalizedNodeFilter,
+    selected: &SelectedNodeFields,
+) -> bool {
     match filter {
-        NormalizedNodeFilter::AlwaysTrue
-        | NormalizedNodeFilter::AlwaysFalse
-        | NormalizedNodeFilter::UpdatedAtRange { .. } => true,
-        NormalizedNodeFilter::And(children) | NormalizedNodeFilter::Or(children) => {
-            children.iter().all(node_filter_visibility_meta_compatible)
+        NormalizedNodeFilter::AlwaysTrue => true,
+        NormalizedNodeFilter::AlwaysFalse => false,
+        NormalizedNodeFilter::PropertyEquals { key, value } => selected
+            .props
+            .get(key)
+            .is_some_and(|candidate| prop_values_equal_for_filter(candidate, value)),
+        NormalizedNodeFilter::PropertyIn {
+            key,
+            values,
+            value_keys,
+        } => selected
+            .props
+            .get(key)
+            .is_some_and(|candidate| property_in_filter_matches(candidate, values, value_keys)),
+        NormalizedNodeFilter::PropertyRange { key, lower, upper } => selected
+            .props
+            .get(key)
+            .and_then(|value| range_value_within_bounds(value, lower.as_ref(), upper.as_ref()))
+            == Some(true),
+        NormalizedNodeFilter::PropertyExists { key } => selected.props.contains_key(key),
+        NormalizedNodeFilter::PropertyMissing { key } => !selected.props.contains_key(key),
+        NormalizedNodeFilter::UpdatedAtRange { lower_ms, upper_ms } => {
+            selected.meta.updated_at >= *lower_ms && selected.meta.updated_at <= *upper_ms
         }
-        NormalizedNodeFilter::Not(child) => node_filter_visibility_meta_compatible(child),
-        NormalizedNodeFilter::PropertyEquals { .. }
-        | NormalizedNodeFilter::PropertyIn { .. }
-        | NormalizedNodeFilter::PropertyRange { .. }
-        | NormalizedNodeFilter::PropertyExists { .. }
-        | NormalizedNodeFilter::PropertyMissing { .. } => false,
+        NormalizedNodeFilter::And(children) => children
+            .iter()
+            .all(|child| node_filter_projected_matches(child, selected)),
+        NormalizedNodeFilter::Or(children) => children
+            .iter()
+            .any(|child| node_filter_projected_matches(child, selected)),
+        NormalizedNodeFilter::Not(child) => !node_filter_projected_matches(child, selected),
     }
 }
 
@@ -803,30 +812,15 @@ fn node_label_filter_matches(filter: &ResolvedNodeLabelFilter, labels: &NodeLabe
     }
 }
 
-fn query_node_matches(query: &NormalizedNodeQuery, node: &NodeRecord) -> bool {
-    if !node_label_filter_matches(&query.label_filter, &node.label_ids) {
-        return false;
-    }
-    if !query.ids.is_empty() && query.ids.binary_search(&node.id).is_err() {
-        return false;
-    }
-    if !query.keys.is_empty() && query.keys.binary_search(&node.key).is_err() {
-        return false;
-    }
-
-    node_filter_matches(&query.filter, node)
-}
-
-fn query_node_visibility_meta_matches(
+fn query_node_metadata_constraints_match(
     query: &NormalizedNodeQuery,
-    node_id: u64,
-    meta: &NodeVisibilityMeta,
+    meta: &NodeMetadataForQuery,
     policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
 ) -> bool {
     if !node_label_filter_matches(&query.label_filter, &meta.label_ids) {
         return false;
     }
-    if !query.ids.is_empty() && query.ids.binary_search(&node_id).is_err() {
+    if !query.ids.is_empty() && query.ids.binary_search(&meta.id).is_err() {
         return false;
     }
     if policy_cutoffs.is_some_and(|cutoffs| {
@@ -834,52 +828,19 @@ fn query_node_visibility_meta_matches(
     }) {
         return false;
     }
-    if !node_filter_visibility_meta_matches(&query.filter, meta).unwrap_or(false) {
-        return false;
-    }
     true
 }
 
-#[derive(Clone, Copy, Debug)]
-struct EdgeMetadataForQuery {
-    id: u64,
-    from: u64,
-    to: u64,
-    label_id: u32,
-    updated_at: i64,
-    weight: f32,
-    valid_from: i64,
-    valid_to: i64,
-}
-
-impl From<&EdgeRecord> for EdgeMetadataForQuery {
-    fn from(edge: &EdgeRecord) -> Self {
-        Self {
-            id: edge.id,
-            from: edge.from,
-            to: edge.to,
-            label_id: edge.label_id,
-            updated_at: edge.updated_at,
-            weight: edge.weight,
-            valid_from: edge.valid_from,
-            valid_to: edge.valid_to,
-        }
+fn query_node_selected_fields_match(query: &NormalizedNodeQuery, selected: &SelectedNodeFields) -> bool {
+    if !query.keys.is_empty()
+        && selected
+            .key
+            .as_ref()
+            .is_none_or(|key| query.keys.binary_search(key).is_err())
+    {
+        return false;
     }
-}
-
-impl From<crate::edge_metadata::EdgeMetadataCandidate> for EdgeMetadataForQuery {
-    fn from(meta: crate::edge_metadata::EdgeMetadataCandidate) -> Self {
-        Self {
-            id: meta.edge_id,
-            from: meta.from,
-            to: meta.to,
-            label_id: meta.label_id,
-            updated_at: meta.updated_at,
-            weight: meta.weight,
-            valid_from: meta.valid_from,
-            valid_to: meta.valid_to,
-        }
-    }
+    node_filter_projected_matches(&query.filter, selected)
 }
 
 fn i64_range_matches(value: i64, lower: i64, upper: i64) -> bool {
@@ -912,104 +873,6 @@ fn edge_filter_requires_hydration(filter: &NormalizedEdgeFilter) -> bool {
         NormalizedEdgeFilter::Not(child) => edge_filter_requires_hydration(child),
         _ => false,
     }
-}
-
-fn edge_filter_needs_full_metadata(filter: &NormalizedEdgeFilter) -> bool {
-    match filter {
-        NormalizedEdgeFilter::UpdatedAtRange { .. } => true,
-        NormalizedEdgeFilter::And(children) | NormalizedEdgeFilter::Or(children) => {
-            children.iter().any(edge_filter_needs_full_metadata)
-        }
-        NormalizedEdgeFilter::Not(child) => edge_filter_needs_full_metadata(child),
-        _ => false,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PatternEdgeFilterMode {
-    AlwaysTrue,
-    PostingMetadataOnly,
-    BatchMetadataNeeded,
-    PropertyVerifier,
-}
-
-fn pattern_edge_filter_mode(filter: &NormalizedEdgeFilter) -> PatternEdgeFilterMode {
-    if filter.is_always_true() {
-        PatternEdgeFilterMode::AlwaysTrue
-    } else if edge_filter_requires_hydration(filter) {
-        PatternEdgeFilterMode::PropertyVerifier
-    } else if edge_filter_needs_full_metadata(filter) {
-        PatternEdgeFilterMode::BatchMetadataNeeded
-    } else {
-        PatternEdgeFilterMode::PostingMetadataOnly
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct EdgePostingMetadataForQuery {
-    weight: f32,
-    valid_from: i64,
-    valid_to: i64,
-}
-
-fn edge_filter_posting_metadata_outcome(
-    filter: &NormalizedEdgeFilter,
-    meta: &EdgePostingMetadataForQuery,
-) -> Option<bool> {
-    match filter {
-        NormalizedEdgeFilter::AlwaysTrue => Some(true),
-        NormalizedEdgeFilter::AlwaysFalse => Some(false),
-        NormalizedEdgeFilter::PropertyEquals { .. }
-        | NormalizedEdgeFilter::PropertyIn { .. }
-        | NormalizedEdgeFilter::PropertyRange { .. }
-        | NormalizedEdgeFilter::PropertyExists { .. }
-        | NormalizedEdgeFilter::PropertyMissing { .. }
-        | NormalizedEdgeFilter::UpdatedAtRange { .. } => None,
-        NormalizedEdgeFilter::WeightRange { lower, upper } => {
-            Some(edge_weight_range_matches(meta.weight, *lower, *upper))
-        }
-        NormalizedEdgeFilter::ValidAt { epoch_ms } => {
-            Some(meta.valid_from <= *epoch_ms && *epoch_ms < meta.valid_to)
-        }
-        NormalizedEdgeFilter::ValidFromRange { lower_ms, upper_ms } => {
-            Some(i64_range_matches(meta.valid_from, *lower_ms, *upper_ms))
-        }
-        NormalizedEdgeFilter::ValidToRange { lower_ms, upper_ms } => {
-            Some(i64_range_matches(meta.valid_to, *lower_ms, *upper_ms))
-        }
-        NormalizedEdgeFilter::And(children) => {
-            let mut unknown = false;
-            for child in children {
-                match edge_filter_posting_metadata_outcome(child, meta) {
-                    Some(false) => return Some(false),
-                    Some(true) => {}
-                    None => unknown = true,
-                }
-            }
-            if unknown { None } else { Some(true) }
-        }
-        NormalizedEdgeFilter::Or(children) => {
-            let mut unknown = false;
-            for child in children {
-                match edge_filter_posting_metadata_outcome(child, meta) {
-                    Some(true) => return Some(true),
-                    Some(false) => {}
-                    None => unknown = true,
-                }
-            }
-            if unknown { None } else { Some(false) }
-        }
-        NormalizedEdgeFilter::Not(child) => {
-            edge_filter_posting_metadata_outcome(child, meta).map(|matched| !matched)
-        }
-    }
-}
-
-fn edge_filter_posting_metadata_maybe_matches(
-    filter: &NormalizedEdgeFilter,
-    meta: &EdgePostingMetadataForQuery,
-) -> bool {
-    edge_filter_posting_metadata_outcome(filter, meta).unwrap_or(true)
 }
 
 fn edge_filter_metadata_outcome(
@@ -1153,50 +1016,52 @@ fn collect_edge_filter_property_keys(filter: &NormalizedEdgeFilter, keys: &mut V
 
 fn edge_filter_projected_matches(
     filter: &NormalizedEdgeFilter,
-    meta: &EdgeMetadataForQuery,
-    props: &BTreeMap<String, PropValue>,
+    selected: &SelectedEdgeFields,
 ) -> bool {
     match filter {
         NormalizedEdgeFilter::AlwaysTrue => true,
         NormalizedEdgeFilter::AlwaysFalse => false,
-        NormalizedEdgeFilter::PropertyEquals { key, value } => props
+        NormalizedEdgeFilter::PropertyEquals { key, value } => selected
+            .props
             .get(key)
             .is_some_and(|candidate| prop_values_equal_for_filter(candidate, value)),
         NormalizedEdgeFilter::PropertyIn {
             key,
             values,
             value_keys,
-        } => props
+        } => selected
+            .props
             .get(key)
             .is_some_and(|candidate| property_in_filter_matches(candidate, values, value_keys)),
-        NormalizedEdgeFilter::PropertyRange { key, lower, upper } => props
+        NormalizedEdgeFilter::PropertyRange { key, lower, upper } => selected
+            .props
             .get(key)
             .and_then(|value| range_value_within_bounds(value, lower.as_ref(), upper.as_ref()))
             == Some(true),
-        NormalizedEdgeFilter::PropertyExists { key } => props.contains_key(key),
-        NormalizedEdgeFilter::PropertyMissing { key } => !props.contains_key(key),
+        NormalizedEdgeFilter::PropertyExists { key } => selected.props.contains_key(key),
+        NormalizedEdgeFilter::PropertyMissing { key } => !selected.props.contains_key(key),
         NormalizedEdgeFilter::WeightRange { lower, upper } => {
-            edge_weight_range_matches(meta.weight, *lower, *upper)
+            edge_weight_range_matches(selected.meta.weight, *lower, *upper)
         }
         NormalizedEdgeFilter::UpdatedAtRange { lower_ms, upper_ms } => {
-            i64_range_matches(meta.updated_at, *lower_ms, *upper_ms)
+            i64_range_matches(selected.meta.updated_at, *lower_ms, *upper_ms)
         }
         NormalizedEdgeFilter::ValidAt { epoch_ms } => {
-            meta.valid_from <= *epoch_ms && *epoch_ms < meta.valid_to
+            selected.meta.valid_from <= *epoch_ms && *epoch_ms < selected.meta.valid_to
         }
         NormalizedEdgeFilter::ValidFromRange { lower_ms, upper_ms } => {
-            i64_range_matches(meta.valid_from, *lower_ms, *upper_ms)
+            i64_range_matches(selected.meta.valid_from, *lower_ms, *upper_ms)
         }
         NormalizedEdgeFilter::ValidToRange { lower_ms, upper_ms } => {
-            i64_range_matches(meta.valid_to, *lower_ms, *upper_ms)
+            i64_range_matches(selected.meta.valid_to, *lower_ms, *upper_ms)
         }
         NormalizedEdgeFilter::And(children) => children
             .iter()
-            .all(|child| edge_filter_projected_matches(child, meta, props)),
+            .all(|child| edge_filter_projected_matches(child, selected)),
         NormalizedEdgeFilter::Or(children) => children
             .iter()
-            .any(|child| edge_filter_projected_matches(child, meta, props)),
-        NormalizedEdgeFilter::Not(child) => !edge_filter_projected_matches(child, meta, props),
+            .any(|child| edge_filter_projected_matches(child, selected)),
+        NormalizedEdgeFilter::Not(child) => !edge_filter_projected_matches(child, selected),
     }
 }
 
@@ -1248,72 +1113,221 @@ fn edge_query_matches(query: &NormalizedEdgeQuery, edge: &EdgeRecord) -> bool {
 }
 
 #[derive(Clone)]
-struct PatternExecutionState {
-    nodes: Vec<Option<u64>>,
-    edges: Vec<Option<u64>>,
-}
-
-#[derive(Clone, Copy)]
-struct VerifiedPatternEdgeAnchor {
-    meta: EdgeMetadataCandidate,
-}
-
-enum PatternAnchorFrontier {
-    Ready {
-        states: Vec<PatternExecutionState>,
-        followups: Vec<SecondaryIndexReadFollowup>,
-        expansion_order: Vec<usize>,
-        sort_anchor_alias: String,
-    },
-    TooBroad {
-        followups: Vec<SecondaryIndexReadFollowup>,
-    },
-}
-
-#[derive(Clone, Copy)]
-struct PatternEdgeContext {
-    source_id: u64,
-    target_index: usize,
-    target_id: Option<u64>,
-    direction: Direction,
-}
-
-struct PatternUnnamedAccumulator {
-    seen_edges: NodeIdSet,
-    best_by_target: NodeIdMap<NeighborRecord>,
-    best_bound_entry: Option<NeighborRecord>,
-    exceeded: bool,
-}
-
-impl PatternUnnamedAccumulator {
-    fn new() -> Self {
-        Self {
-            seen_edges: NodeIdSet::default(),
-            best_by_target: NodeIdMap::default(),
-            best_bound_entry: None,
-            exceeded: false,
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.best_bound_entry.is_some() || self.exceeded
-    }
+struct GraphRowRuntimeNode {
+    alias: String,
+    slot: crate::graph_row::GraphBindingSlotRef,
+    query: NormalizedNodeQuery,
 }
 
 #[derive(Clone)]
-struct PatternPendingEntry {
-    state_index: usize,
-    entry: NeighborRecord,
+struct GraphRowRuntimeEdge {
+    alias: Option<String>,
+    edge_slot: Option<crate::graph_row::GraphBindingSlotRef>,
+    hidden_slot: Option<crate::graph_row::GraphBindingSlotRef>,
+    from_alias: String,
+    to_alias: String,
+    from_slot: crate::graph_row::GraphBindingSlotRef,
+    to_slot: crate::graph_row::GraphBindingSlotRef,
+    direction: Direction,
+    candidate_edge_ids: Vec<u64>,
+    label_filter_ids: Option<Vec<u32>>,
+    filter: NormalizedEdgeFilter,
+    warnings: Vec<QueryPlanWarning>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct PatternMatchSortKey {
-    anchor_node_id: u64,
-    node_ids: Vec<u64>,
-    edge_ids: Vec<u64>,
+#[derive(Clone)]
+struct GraphRowRuntimeVariableLength {
+    piece_index: usize,
+    path_alias: Option<String>,
+    edge_alias: Option<String>,
+    path_slot: Option<crate::graph_row::GraphBindingSlotRef>,
+    edge_slot: Option<crate::graph_row::GraphBindingSlotRef>,
+    hidden_slot: Option<crate::graph_row::GraphBindingSlotRef>,
+    from_alias: String,
+    to_alias: String,
+    from_slot: crate::graph_row::GraphBindingSlotRef,
+    to_slot: crate::graph_row::GraphBindingSlotRef,
+    direction: Direction,
+    candidate_edge_ids: Vec<u64>,
+    label_filter_ids: Option<Vec<u32>>,
+    filter: NormalizedEdgeFilter,
+    min_hops: u8,
+    max_hops: u8,
+    warnings: Vec<QueryPlanWarning>,
 }
 
-fn reverse_pattern_direction(direction: Direction) -> Direction {
+#[derive(Clone)]
+struct GraphRowRuntimeFixedPath {
+    alias: String,
+    path_slot: crate::graph_row::GraphBindingSlotRef,
+    node_slots: Vec<crate::graph_row::GraphBindingSlotRef>,
+    edge_slots: Vec<GraphRowRuntimeFixedPathEdgeSlot>,
+}
+
+#[derive(Clone, Copy)]
+enum GraphRowRuntimeFixedPathEdgeSlot {
+    Edge(crate::graph_row::GraphBindingSlotRef),
+    Hidden(crate::graph_row::GraphBindingSlotRef),
+}
+
+struct GraphRowRuntimePlan {
+    nodes: Vec<GraphRowRuntimeNode>,
+    node_by_alias: BTreeMap<String, usize>,
+    edges: Vec<GraphRowRuntimeEdge>,
+    required_segments: Vec<GraphRowRequiredSegment>,
+    steps: Vec<GraphRowRuntimeStep>,
+    warnings: Vec<QueryPlanWarning>,
+}
+
+enum GraphRowRuntimeStep {
+    RequiredSegment(usize),
+    FixedPath(GraphRowRuntimeFixedPath),
+    Optional(GraphRowRuntimeOptionalGroup),
+    VariableLength(GraphRowRuntimeVariableLength),
+}
+
+struct GraphRowRuntimeOptionalGroup {
+    piece_index: usize,
+    pieces_len: usize,
+    runtime: Box<GraphRowRuntimePlan>,
+    introduced_slots: Vec<crate::graph_row::GraphBindingSlotRef>,
+    dependency_slots: Vec<crate::graph_row::GraphBindingSlotRef>,
+    left_slots: Vec<crate::graph_row::GraphBindingSlotRef>,
+    where_expr: Option<crate::graph_row::BoundGraphExpr>,
+    where_needs: EntityProjectionNeeds,
+    where_present: bool,
+}
+
+struct GraphRowOptionalLeftGroup {
+    key: Vec<crate::graph_row::GraphSortAtom>,
+    representative: crate::graph_row::GraphBindingRow,
+    rows: Vec<crate::graph_row::GraphBindingRow>,
+}
+
+struct GraphRowPathSearchSeed {
+    node_id: u64,
+    reverse: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct GraphRowVlpSearchKey {
+    bound_from: Option<u64>,
+    bound_to: Option<u64>,
+}
+
+struct GraphRowVlpSearchResult {
+    seed_count: usize,
+    paths: Vec<GraphPath>,
+}
+
+struct GraphRowPartialPath {
+    current: u64,
+    nodes: Vec<u64>,
+    edges: Vec<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct GraphRowVlpStepEdge {
+    edge_id: u64,
+    next_node: u64,
+}
+
+#[derive(Clone, Debug)]
+struct GraphRowRequiredSegment {
+    edge_indices: Vec<usize>,
+    barriers_before: Vec<GraphRowPlanBarrier>,
+}
+
+#[derive(Clone, Debug)]
+struct GraphRowPlanBarrier {
+    kind: GraphRowPlanBarrierKind,
+    piece_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphRowPlanBarrierKind {
+    Optional,
+    VariableLength,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphRowEdgeCandidateSourceChoice {
+    ExplicitIds,
+    EndpointAdjacency,
+    EdgeCandidateSource,
+    MixedEndpointAndEdgeSource,
+    EmptyResult,
+    SkippedEmptyFrontier,
+}
+
+enum GraphRowEdgeSourceRead {
+    Ready {
+        ids: Vec<u64>,
+        followups: Vec<SecondaryIndexReadFollowup>,
+        materialized_source: String,
+        subset_source: Option<String>,
+    },
+    TooBroad {
+        followups: Vec<SecondaryIndexReadFollowup>,
+        planned_source: String,
+    },
+    NoLegalSource,
+}
+
+#[derive(Clone, Copy)]
+struct GraphRowOrientedEdge {
+    meta: EdgeMetadataForQuery,
+    logical_from: u64,
+    logical_to: u64,
+}
+
+struct GraphRowEdgeCandidateBuckets {
+    by_pair: HashMap<(u64, u64), Vec<usize>>,
+    by_from: NodeIdMap<Vec<usize>>,
+    by_to: NodeIdMap<Vec<usize>>,
+}
+
+fn graph_row_cap_error(name: &str, cap: usize) -> EngineError {
+    EngineError::InvalidOperation(format!("graph row {name} exceeded configured cap {cap}"))
+}
+
+fn graph_row_vlp_cap_error(
+    name: &str,
+    cap: usize,
+    path: &GraphRowRuntimeVariableLength,
+) -> EngineError {
+    EngineError::InvalidOperation(format!(
+        "graph row {name} exceeded configured cap {cap}; path={}; piece_index={}",
+        graph_row_vlp_context(path),
+        path.piece_index
+    ))
+}
+
+fn graph_row_vlp_context(path: &GraphRowRuntimeVariableLength) -> String {
+    path.path_alias
+        .as_deref()
+        .or(path.edge_alias.as_deref())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("variable_length_piece_{}", path.piece_index))
+}
+
+fn graph_row_record_frontier_cap_peak(
+    peak: &mut usize,
+    len: usize,
+    cap: usize,
+    vlp_context: Option<&GraphRowRuntimeVariableLength>,
+) -> Result<(), EngineError> {
+    *peak = (*peak).max(len);
+    if len > cap {
+        return Err(match vlp_context {
+            Some(path) => graph_row_vlp_cap_error("max_frontier", cap, path),
+            None => graph_row_cap_error("max_frontier", cap),
+        });
+    }
+    Ok(())
+}
+
+fn graph_row_reverse_direction(direction: Direction) -> Direction {
     match direction {
         Direction::Outgoing => Direction::Incoming,
         Direction::Incoming => Direction::Outgoing,
@@ -1321,153 +1335,2794 @@ fn reverse_pattern_direction(direction: Direction) -> Direction {
     }
 }
 
-fn pattern_distinct_node_binding_ok(
-    state: &PatternExecutionState,
-    target_index: usize,
-    candidate_id: u64,
-) -> bool {
-    state
-        .nodes
-        .iter()
-        .enumerate()
-        .all(|(index, bound)| index == target_index || *bound != Some(candidate_id))
-}
-
-fn pattern_match_from_state(
-    query: &NormalizedGraphPatternQuery,
-    state: &PatternExecutionState,
-) -> QueryMatch {
-    let mut nodes = BTreeMap::new();
-    for (index, pattern) in query.nodes.iter().enumerate() {
-        nodes.insert(
-            pattern.alias.clone(),
-            state.nodes[index].expect("complete pattern match must bind every node alias"),
-        );
-    }
-
-    let mut edges = BTreeMap::new();
-    for (index, pattern) in query.edges.iter().enumerate() {
-        if let Some(alias) = pattern.alias.as_ref() {
-            edges.insert(
-                alias.clone(),
-                state.edges[index].expect("named edge alias must be bound in a complete match"),
-            );
+fn graph_row_materialize_partial_path(partial: &GraphRowPartialPath, reverse: bool) -> GraphPath {
+    if reverse {
+        let mut nodes = partial.nodes.clone();
+        let mut edges = partial.edges.clone();
+        nodes.reverse();
+        edges.reverse();
+        GraphPath { nodes, edges }
+    } else {
+        GraphPath {
+            nodes: partial.nodes.clone(),
+            edges: partial.edges.clone(),
         }
     }
-
-    QueryMatch { nodes, edges }
 }
 
-fn pattern_match_sort_key(match_: &QueryMatch, anchor_alias: &str) -> PatternMatchSortKey {
-    PatternMatchSortKey {
-        anchor_node_id: *match_
-            .nodes
-            .get(anchor_alias)
-            .expect("pattern match must contain anchor alias"),
-        node_ids: match_.nodes.values().copied().collect(),
-        edge_ids: match_.edges.values().copied().collect(),
+fn graph_row_runtime_node<'a>(
+    runtime: &'a GraphRowRuntimePlan,
+    alias: &str,
+) -> Result<&'a GraphRowRuntimeNode, EngineError> {
+    let index = runtime.node_by_alias.get(alias).ok_or_else(|| {
+        EngineError::InvalidOperation(format!(
+            "graph row runtime is missing node alias '{alias}'"
+        ))
+    })?;
+    runtime.nodes.get(*index).ok_or_else(|| {
+        EngineError::InvalidOperation(format!(
+            "graph row runtime node index {index} for alias '{alias}' is out of bounds"
+        ))
+    })
+}
+
+fn graph_row_record_cap_peak(
+    peak: &mut usize,
+    len: usize,
+    name: &str,
+    cap: usize,
+) -> Result<(), EngineError> {
+    *peak = (*peak).max(len);
+    if len > cap {
+        return Err(graph_row_cap_error(name, cap));
     }
+    Ok(())
 }
 
-fn sort_pattern_matches(matches: &mut [QueryMatch], anchor_alias: &str) {
-    matches.sort_by(|left, right| {
-        pattern_match_sort_key(left, anchor_alias).cmp(&pattern_match_sort_key(right, anchor_alias))
-    });
+fn graph_row_push_optional_joined_row(
+    query: &NormalizedGraphRowQuery,
+    rows: &mut Vec<crate::graph_row::GraphBindingRow>,
+    row: crate::graph_row::GraphBindingRow,
+) -> Result<(), EngineError> {
+    rows.push(row);
+    if rows.len() > query.options.max_intermediate_bindings {
+        return Err(graph_row_cap_error(
+            "max_intermediate_bindings",
+            query.options.max_intermediate_bindings,
+        ));
+    }
+    Ok(())
 }
 
-fn insert_bounded_pattern_match(
-    matches: &mut Vec<QueryMatch>,
-    candidate: QueryMatch,
-    limit: usize,
-    anchor_alias: &str,
+fn graph_row_any_slot_null(
+    row: &crate::graph_row::GraphBindingRow,
+    slots: &[crate::graph_row::GraphBindingSlotRef],
+) -> Result<bool, EngineError> {
+    for slot in slots {
+        if row.slot_is_null(*slot)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn graph_row_slot_list_detail(
+    query: &NormalizedGraphRowQuery,
+    slots: &[crate::graph_row::GraphBindingSlotRef],
+) -> String {
+    if slots.is_empty() {
+        return "none".to_string();
+    }
+    slots
+        .iter()
+        .map(|slot| {
+            query
+                .binding_schema
+                .slot(*slot)
+                .map(|slot| format!("{}:{:?}", slot.name, slot.kind))
+                .unwrap_or_else(|| format!("{:?}:{}", slot.kind, slot.index))
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn graph_row_node_query_has_anchor(query: &NormalizedNodeQuery) -> bool {
+    !query.ids.is_empty()
+        || matches!(
+            query.label_filter,
+            ResolvedNodeLabelFilter::LabelSet { .. } | ResolvedNodeLabelFilter::Empty { .. }
+        )
+        || !query.filter.is_always_true()
+        || query.filter.is_always_false()
+}
+
+fn graph_row_collect_endpoint_sources(
+    pattern_direction: Direction,
+    is_from_alias: bool,
+    node_id: Option<u64>,
+    outgoing: &mut Vec<u64>,
+    incoming: &mut Vec<u64>,
+    both: &mut Vec<u64>,
 ) {
-    if matches.contains(&candidate) {
+    let Some(node_id) = node_id else {
         return;
+    };
+    match (pattern_direction, is_from_alias) {
+        (Direction::Outgoing, true) | (Direction::Incoming, false) => outgoing.push(node_id),
+        (Direction::Outgoing, false) | (Direction::Incoming, true) => incoming.push(node_id),
+        (Direction::Both, _) => both.push(node_id),
     }
-    matches.push(candidate);
-    sort_pattern_matches(matches, anchor_alias);
-    let keep = limit.saturating_add(1);
-    if matches.len() > keep {
-        matches.truncate(keep);
+}
+
+fn graph_row_push_required_segment(
+    segments: &mut Vec<GraphRowRequiredSegment>,
+    current_edges: &mut Vec<usize>,
+    pending_barriers: &mut Vec<GraphRowPlanBarrier>,
+) -> Option<usize> {
+    if current_edges.is_empty() {
+        return None;
     }
+    let segment_index = segments.len();
+    segments.push(GraphRowRequiredSegment {
+        edge_indices: std::mem::take(current_edges),
+        barriers_before: std::mem::take(pending_barriers),
+    });
+    Some(segment_index)
+}
+
+fn graph_row_fixed_paths_for_scope<'a>(
+    query: &'a NormalizedGraphRowQuery,
+    scope: &[usize],
+) -> Vec<&'a GraphFixedPathBinding> {
+    let mut fixed_paths = query
+        .fixed_paths
+        .iter()
+        .filter(|path| path.scope.as_slice() == scope)
+        .collect::<Vec<_>>();
+    fixed_paths.sort_by(|left, right| {
+        left.after_piece_index
+            .cmp(&right.after_piece_index)
+            .then_with(|| left.alias.cmp(&right.alias))
+    });
+    fixed_paths
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_pattern_unnamed_entry(
-    state: &PatternExecutionState,
-    context: &PatternEdgeContext,
-    edge_filter: &NormalizedEdgeFilter,
-    reference_time: i64,
-    deleted_nodes: &NodeIdSet,
-    deleted_edges: &NodeIdSet,
-    seen_edges: &mut NodeIdSet,
-    best_by_target: &mut NodeIdMap<NeighborRecord>,
-    best_bound_entry: &mut Option<NeighborRecord>,
-    exceeded: &mut bool,
-    edge_id: u64,
-    neighbor_id: u64,
-    edge_label_id: u32,
-    weight: f32,
-    valid_from: i64,
-    valid_to: i64,
-) -> ControlFlow<()> {
-    if !seen_edges.insert(edge_id) {
-        return ControlFlow::Continue(());
+fn graph_row_push_fixed_path_steps_before_piece(
+    query: &NormalizedGraphRowQuery,
+    fixed_paths: &[&GraphFixedPathBinding],
+    piece_index: usize,
+    edge_by_piece: &BTreeMap<usize, usize>,
+    nodes: &[GraphRowRuntimeNode],
+    node_by_alias: &BTreeMap<String, usize>,
+    edges: &[GraphRowRuntimeEdge],
+    next_fixed_path: &mut usize,
+    steps: &mut Vec<GraphRowRuntimeStep>,
+    bound_slots: &mut BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+) -> Result<(), EngineError> {
+    while fixed_paths
+        .get(*next_fixed_path)
+        .is_some_and(|path| path.after_piece_index < piece_index)
+    {
+        let runtime = graph_row_runtime_fixed_path(
+            query,
+            fixed_paths[*next_fixed_path],
+            edge_by_piece,
+            nodes,
+            node_by_alias,
+            edges,
+        )?;
+        bound_slots.insert(runtime.path_slot);
+        steps.push(GraphRowRuntimeStep::FixedPath(runtime));
+        *next_fixed_path += 1;
     }
-    if deleted_edges.contains(&edge_id) || deleted_nodes.contains(&neighbor_id) {
-        return ControlFlow::Continue(());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_row_push_remaining_fixed_path_steps(
+    query: &NormalizedGraphRowQuery,
+    fixed_paths: &[&GraphFixedPathBinding],
+    edge_by_piece: &BTreeMap<usize, usize>,
+    nodes: &[GraphRowRuntimeNode],
+    node_by_alias: &BTreeMap<String, usize>,
+    edges: &[GraphRowRuntimeEdge],
+    next_fixed_path: &mut usize,
+    steps: &mut Vec<GraphRowRuntimeStep>,
+    bound_slots: &mut BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+) -> Result<(), EngineError> {
+    while let Some(fixed_path) = fixed_paths.get(*next_fixed_path) {
+        let runtime = graph_row_runtime_fixed_path(
+            query,
+            fixed_path,
+            edge_by_piece,
+            nodes,
+            node_by_alias,
+            edges,
+        )?;
+        bound_slots.insert(runtime.path_slot);
+        steps.push(GraphRowRuntimeStep::FixedPath(runtime));
+        *next_fixed_path += 1;
     }
-    if !is_edge_valid_at(valid_from, valid_to, reference_time) {
-        return ControlFlow::Continue(());
+    Ok(())
+}
+
+fn graph_row_runtime_fixed_path(
+    query: &NormalizedGraphRowQuery,
+    fixed_path: &GraphFixedPathBinding,
+    edge_by_piece: &BTreeMap<usize, usize>,
+    nodes: &[GraphRowRuntimeNode],
+    node_by_alias: &BTreeMap<String, usize>,
+    edges: &[GraphRowRuntimeEdge],
+) -> Result<GraphRowRuntimeFixedPath, EngineError> {
+    let path_slot = query
+        .binding_schema
+        .slot_for_alias(&fixed_path.alias)
+        .ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "graph row fixed path alias '{}' is missing from binding schema",
+                fixed_path.alias
+            ))
+        })?;
+    let node_slots = fixed_path
+        .node_aliases
+        .iter()
+        .map(|alias| {
+            let index = node_by_alias.get(alias).copied().ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row fixed path '{}' references missing node alias '{}'",
+                    fixed_path.alias, alias
+                ))
+            })?;
+            Ok(nodes[index].slot)
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    let edge_slots = fixed_path
+        .edge_piece_indices
+        .iter()
+        .map(|piece_index| {
+            let edge_index = edge_by_piece.get(piece_index).copied().ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row fixed path '{}' references missing fixed edge piece {}",
+                    fixed_path.alias, piece_index
+                ))
+            })?;
+            let edge = edges.get(edge_index).ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row fixed path '{}' references missing runtime edge {}",
+                    fixed_path.alias, edge_index
+                ))
+            })?;
+            if let Some(slot) = edge.edge_slot {
+                Ok(GraphRowRuntimeFixedPathEdgeSlot::Edge(slot))
+            } else if let Some(slot) = edge.hidden_slot {
+                Ok(GraphRowRuntimeFixedPathEdgeSlot::Hidden(slot))
+            } else {
+                Err(EngineError::InvalidOperation(format!(
+                    "graph row fixed path '{}' edge piece {} has no edge occurrence slot",
+                    fixed_path.alias, piece_index
+                )))
+            }
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    Ok(GraphRowRuntimeFixedPath {
+        alias: fixed_path.alias.clone(),
+        path_slot,
+        node_slots,
+        edge_slots,
+    })
+}
+
+fn graph_row_optional_dependency_slots(
+    group: &GraphOptionalGroup,
+    schema: &crate::graph_row::GraphBindingSchema,
+    prior_slots: &BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+) -> Result<Vec<crate::graph_row::GraphBindingSlotRef>, EngineError> {
+    let mut slots = BTreeSet::new();
+    for piece in &group.pieces {
+        graph_row_collect_piece_dependency_slots(piece, schema, prior_slots, &mut slots)?;
     }
-    let posting_meta = EdgePostingMetadataForQuery {
-        weight,
-        valid_from,
-        valid_to,
-    };
-    if !edge_filter_posting_metadata_maybe_matches(edge_filter, &posting_meta) {
-        return ControlFlow::Continue(());
+    if let Some(expr) = group.where_.as_ref() {
+        graph_row_collect_expr_dependency_slots(expr, schema, prior_slots, &mut slots)?;
     }
-    if let Some(target_id) = context.target_id {
-        if neighbor_id != target_id {
-            return ControlFlow::Continue(());
+    Ok(slots.into_iter().collect())
+}
+
+fn graph_row_collect_piece_dependency_slots(
+    piece: &GraphPatternPiece,
+    schema: &crate::graph_row::GraphBindingSchema,
+    prior_slots: &BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+    slots: &mut BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+) -> Result<(), EngineError> {
+    match piece {
+        GraphPatternPiece::Edge(edge) => {
+            graph_row_maybe_collect_dependency_alias(
+                &edge.from_alias,
+                schema,
+                prior_slots,
+                slots,
+            )?;
+            graph_row_maybe_collect_dependency_alias(&edge.to_alias, schema, prior_slots, slots)?;
         }
-        *best_bound_entry = Some(NeighborRecord {
-            node_id: neighbor_id,
-            edge_id,
-            edge_label_id,
-            weight,
-            valid_from,
-            valid_to,
-        });
-        return ControlFlow::Break(());
+        GraphPatternPiece::Optional(group) => {
+            for child in &group.pieces {
+                graph_row_collect_piece_dependency_slots(child, schema, prior_slots, slots)?;
+            }
+            if let Some(expr) = group.where_.as_ref() {
+                graph_row_collect_expr_dependency_slots(expr, schema, prior_slots, slots)?;
+            }
+        }
+        GraphPatternPiece::VariableLength(path) => {
+            graph_row_maybe_collect_dependency_alias(
+                &path.from_alias,
+                schema,
+                prior_slots,
+                slots,
+            )?;
+            graph_row_maybe_collect_dependency_alias(&path.to_alias, schema, prior_slots, slots)?;
+        }
     }
-    if !pattern_distinct_node_binding_ok(state, context.target_index, neighbor_id) {
-        return ControlFlow::Continue(());
+    Ok(())
+}
+
+fn graph_row_collect_expr_dependency_slots(
+    expr: &GraphExpr,
+    schema: &crate::graph_row::GraphBindingSchema,
+    prior_slots: &BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+    slots: &mut BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+) -> Result<(), EngineError> {
+    match expr {
+        GraphExpr::Binding(alias)
+        | GraphExpr::Property { alias, .. }
+        | GraphExpr::NodeField { alias, .. }
+        | GraphExpr::EdgeField { alias, .. }
+        | GraphExpr::PathField { alias, .. } => {
+            graph_row_maybe_collect_dependency_alias(alias, schema, prior_slots, slots)?;
+        }
+        GraphExpr::List(items) => {
+            for item in items {
+                graph_row_collect_expr_dependency_slots(item, schema, prior_slots, slots)?;
+            }
+        }
+        GraphExpr::Map(items) => {
+            for item in items.values() {
+                graph_row_collect_expr_dependency_slots(item, schema, prior_slots, slots)?;
+            }
+        }
+        GraphExpr::Function { args, .. } => {
+            for arg in args {
+                graph_row_collect_expr_dependency_slots(arg, schema, prior_slots, slots)?;
+            }
+        }
+        GraphExpr::Unary { expr, .. }
+        | GraphExpr::IsNull(expr)
+        | GraphExpr::IsNotNull(expr) => {
+            graph_row_collect_expr_dependency_slots(expr, schema, prior_slots, slots)?;
+        }
+        GraphExpr::Binary { left, right, .. } => {
+            graph_row_collect_expr_dependency_slots(left, schema, prior_slots, slots)?;
+            graph_row_collect_expr_dependency_slots(right, schema, prior_slots, slots)?;
+        }
+        GraphExpr::Null
+        | GraphExpr::Bool(_)
+        | GraphExpr::Int(_)
+        | GraphExpr::UInt(_)
+        | GraphExpr::Float(_)
+        | GraphExpr::String(_)
+        | GraphExpr::Bytes(_)
+        | GraphExpr::Param(_) => {}
     }
-    let entry = NeighborRecord {
-        node_id: neighbor_id,
-        edge_id,
-        edge_label_id,
-        weight,
-        valid_from,
-        valid_to,
+    Ok(())
+}
+
+fn graph_row_maybe_collect_dependency_alias(
+    alias: &str,
+    schema: &crate::graph_row::GraphBindingSchema,
+    prior_slots: &BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+    slots: &mut BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+) -> Result<(), EngineError> {
+    let slot = schema.slot_for_alias(alias).ok_or_else(|| {
+        EngineError::InvalidOperation(format!("graph row references unknown binding '{alias}'"))
+    })?;
+    if prior_slots.contains(&slot) {
+        slots.insert(slot);
+    }
+    Ok(())
+}
+
+fn graph_row_source_choice_label(choice: GraphRowEdgeCandidateSourceChoice) -> &'static str {
+    match choice {
+        GraphRowEdgeCandidateSourceChoice::ExplicitIds => "ExplicitEdgeIds",
+        GraphRowEdgeCandidateSourceChoice::EndpointAdjacency => "EndpointAdjacency",
+        GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource => "EdgeCandidateSource",
+        GraphRowEdgeCandidateSourceChoice::MixedEndpointAndEdgeSource => {
+            "MixedEndpointAndEdgeSource"
+        }
+        GraphRowEdgeCandidateSourceChoice::EmptyResult => "EmptyResult",
+        GraphRowEdgeCandidateSourceChoice::SkippedEmptyFrontier => "SkippedEmptyFrontier",
+    }
+}
+
+fn graph_row_edge_orientations(
+    direction: Direction,
+    meta: EdgeMetadataForQuery,
+) -> Vec<(u64, u64)> {
+    match direction {
+        Direction::Outgoing => vec![(meta.from, meta.to)],
+        Direction::Incoming => vec![(meta.to, meta.from)],
+        Direction::Both if meta.from == meta.to => vec![(meta.from, meta.to)],
+        Direction::Both => vec![(meta.from, meta.to), (meta.to, meta.from)],
+    }
+}
+
+impl GraphRowEdgeCandidateBuckets {
+    fn new(candidates: &[GraphRowOrientedEdge]) -> Self {
+        let mut by_pair: HashMap<(u64, u64), Vec<usize>> = HashMap::new();
+        let mut by_from: NodeIdMap<Vec<usize>> = NodeIdMap::default();
+        let mut by_to: NodeIdMap<Vec<usize>> = NodeIdMap::default();
+        for (index, candidate) in candidates.iter().enumerate() {
+            by_pair
+                .entry((candidate.logical_from, candidate.logical_to))
+                .or_default()
+                .push(index);
+            by_from
+                .entry(candidate.logical_from)
+                .or_default()
+                .push(index);
+            by_to.entry(candidate.logical_to).or_default().push(index);
+        }
+        Self {
+            by_pair,
+            by_from,
+            by_to,
+        }
+    }
+
+    fn indices_for(&self, from: Option<u64>, to: Option<u64>) -> Option<&[usize]> {
+        match (from, to) {
+            (Some(from), Some(to)) => self
+                .by_pair
+                .get(&(from, to))
+                .map(|indices| indices.as_slice()),
+            (Some(from), None) => self.by_from.get(&from).map(|indices| indices.as_slice()),
+            (None, Some(to)) => self.by_to.get(&to).map(|indices| indices.as_slice()),
+            (None, None) => None,
+        }
+    }
+}
+
+fn compare_graph_logical_keys(
+    left: &[crate::graph_row::GraphSortAtom],
+    right: &[crate::graph_row::GraphSortAtom],
+) -> std::cmp::Ordering {
+    for (left, right) in left.iter().zip(right.iter()) {
+        let ordering = crate::graph_row::compare_graph_sort_atoms(left, right);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+#[derive(Clone)]
+struct GraphRowPageCandidate {
+    sort_key: Vec<crate::graph_row::GraphSortAtom>,
+    logical_key: Vec<crate::graph_row::GraphSortAtom>,
+    row: crate::graph_row::GraphBindingRow,
+}
+
+#[derive(Clone, Debug)]
+struct GraphRowCursorPayload {
+    effective_at_epoch: i64,
+    original_skip: u64,
+    page_sequence: u64,
+    rows_emitted_after_skip: u64,
+    query_fingerprint: u128,
+    order_fingerprint: u128,
+    output_fingerprint: u128,
+    params_fingerprint: u128,
+    last_sort_key: Vec<crate::graph_row::GraphSortAtom>,
+    last_logical_row_key: Vec<crate::graph_row::GraphSortAtom>,
+}
+
+#[derive(Clone)]
+struct GraphRowCursorState {
+    decoded: Option<GraphRowCursorPayload>,
+    effective_at_epoch: i64,
+    original_skip: u64,
+    rows_emitted_after_skip: u64,
+}
+
+impl GraphRowCursorState {
+    fn is_cursor_page(&self) -> bool {
+        self.decoded.is_some()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GraphRowCursorFingerprints {
+    query: u128,
+    order: u128,
+    output: u128,
+    params: u128,
+}
+
+const GRAPH_ROW_CURSOR_PREFIX: &str = "ogr32c1_";
+const GRAPH_ROW_CURSOR_MAGIC: &[u8; 8] = b"OGR32CUR";
+const GRAPH_ROW_CURSOR_VERSION: u8 = 1;
+const GRAPH_ROW_CURSOR_SEMANTIC_VERSION: u16 = 2;
+const GRAPH_ROW_CURSOR_FLAGS: u16 = 0;
+const FNV128_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+const FNV128_PRIME: u128 = 0x0000000001000000000000000000013b;
+
+fn graph_row_explicit_sort_key(
+    query: &NormalizedGraphRowQuery,
+    row: &crate::graph_row::GraphBindingRow,
+) -> Result<Vec<crate::graph_row::GraphSortAtom>, EngineError> {
+    if query.bound_order_by.is_empty() {
+        return Ok(Vec::new());
+    }
+    let context = crate::graph_row::BoundGraphEvalContext { row };
+    query
+        .bound_order_by
+        .iter()
+        .map(|item| {
+            let value = crate::graph_row::eval_bound_graph_expr(&item.expr, &context)?;
+            crate::graph_row::graph_sort_atom_for_value(&value)
+        })
+        .collect()
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct GraphRowFinalSortKey {
+    sort_key: Vec<crate::graph_row::GraphSortAtom>,
+    logical_key: Vec<crate::graph_row::GraphSortAtom>,
+    directions: Arc<[GraphOrderDirection]>,
+}
+
+impl Ord for GraphRowFinalSortKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_graph_final_keys_by_directions(
+            &self.sort_key,
+            &self.logical_key,
+            &other.sort_key,
+            &other.logical_key,
+            &self.directions,
+        )
+    }
+}
+
+impl PartialOrd for GraphRowFinalSortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone)]
+struct GraphRowHeapCandidate {
+    key: GraphRowFinalSortKey,
+    candidate: GraphRowPageCandidate,
+}
+
+impl Eq for GraphRowHeapCandidate {}
+
+impl PartialEq for GraphRowHeapCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Ord for GraphRowHeapCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl PartialOrd for GraphRowHeapCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn graph_row_insert_bounded_candidate(
+    selected: &mut BinaryHeap<GraphRowHeapCandidate>,
+    candidate: GraphRowPageCandidate,
+    capacity: usize,
+    directions: &Arc<[GraphOrderDirection]>,
+) {
+    if capacity == 0 {
+        return;
+    }
+    let key = GraphRowFinalSortKey {
+        sort_key: candidate.sort_key.clone(),
+        logical_key: candidate.logical_key.clone(),
+        directions: Arc::clone(directions),
     };
-    match best_by_target.get_mut(&neighbor_id) {
-        Some(existing) if entry.edge_id < existing.edge_id => *existing = entry,
-        Some(_) => {}
-        None => {
-            best_by_target.insert(neighbor_id, entry);
-            if best_by_target.len() > PATTERN_FRONTIER_BUDGET {
-                *exceeded = true;
-                return ControlFlow::Break(());
+    let heap_candidate = GraphRowHeapCandidate { key, candidate };
+    if selected.len() < capacity {
+        selected.push(heap_candidate);
+        return;
+    }
+    if selected
+        .peek()
+        .is_some_and(|worst| heap_candidate.key < worst.key)
+    {
+        let _ = selected.pop();
+        selected.push(heap_candidate);
+    }
+}
+
+fn graph_row_order_directions(
+    order_by: &[crate::graph_row::BoundGraphOrderItem],
+) -> Arc<[GraphOrderDirection]> {
+    order_by
+        .iter()
+        .map(|item| item.direction)
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn compare_graph_final_keys_by_directions(
+    left_sort: &[crate::graph_row::GraphSortAtom],
+    left_logical: &[crate::graph_row::GraphSortAtom],
+    right_sort: &[crate::graph_row::GraphSortAtom],
+    right_logical: &[crate::graph_row::GraphSortAtom],
+    directions: &[GraphOrderDirection],
+) -> std::cmp::Ordering {
+    for (index, direction) in directions.iter().enumerate() {
+        let Some(left) = left_sort.get(index) else {
+            return left_sort.len().cmp(&right_sort.len());
+        };
+        let Some(right) = right_sort.get(index) else {
+            return left_sort.len().cmp(&right_sort.len());
+        };
+        let mut ordering = crate::graph_row::compare_graph_sort_atoms(left, right);
+        if *direction == GraphOrderDirection::Desc
+            && !matches!(left, crate::graph_row::GraphSortAtom::Null)
+            && !matches!(right, crate::graph_row::GraphSortAtom::Null)
+        {
+            ordering = ordering.reverse();
+        }
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    compare_graph_logical_keys(left_logical, right_logical)
+}
+
+fn graph_row_decode_request_cursor(
+    page: &GraphPageRequest,
+    options: &GraphQueryOptions,
+) -> Result<Option<GraphRowCursorPayload>, EngineError> {
+    validate_graph_row_page(page, options)?;
+    page.cursor
+        .as_ref()
+        .map(|cursor| graph_row_decode_cursor(cursor, options.max_cursor_bytes))
+        .transpose()
+}
+
+fn graph_row_cursor_state_from_decoded(
+    decoded_cursor: Option<GraphRowCursorPayload>,
+    page: &GraphPageRequest,
+    at_epoch: Option<i64>,
+) -> Result<GraphRowCursorState, EngineError> {
+    let effective_at_epoch = match (decoded_cursor.as_ref(), at_epoch) {
+        (None, Some(epoch)) => epoch,
+        (None, None) => now_millis(),
+        (Some(cursor), None) => cursor.effective_at_epoch,
+        (Some(cursor), Some(epoch)) if epoch == cursor.effective_at_epoch => epoch,
+        (Some(cursor), Some(epoch)) => {
+            return Err(invalid_graph_row_cursor(format!(
+                "explicit at_epoch {epoch} does not match cursor epoch {}",
+                cursor.effective_at_epoch
+            )));
+        }
+    };
+    let original_skip = match decoded_cursor.as_ref() {
+        Some(cursor) => {
+            let current_skip = page.skip as u64;
+            if current_skip != 0 && current_skip != cursor.original_skip {
+                return Err(invalid_graph_row_cursor(format!(
+                    "cursor page skip {current_skip} does not match original skip {}",
+                    cursor.original_skip
+                )));
+            }
+            cursor.original_skip
+        }
+        None => page.skip as u64,
+    };
+    let rows_emitted_after_skip = decoded_cursor
+        .as_ref()
+        .map_or(0, |cursor| cursor.rows_emitted_after_skip);
+    Ok(GraphRowCursorState {
+        decoded: decoded_cursor,
+        effective_at_epoch,
+        original_skip,
+        rows_emitted_after_skip,
+    })
+}
+
+fn graph_row_prepare_cursor_state(
+    page: &GraphPageRequest,
+    at_epoch: Option<i64>,
+    options: &GraphQueryOptions,
+) -> Result<GraphRowCursorState, EngineError> {
+    let decoded = graph_row_decode_request_cursor(page, options)?;
+    graph_row_cursor_state_from_decoded(decoded, page, at_epoch)
+}
+
+fn graph_row_validate_cursor_fingerprints(
+    cursor: &GraphRowCursorPayload,
+    fingerprints: &GraphRowCursorFingerprints,
+) -> Result<(), EngineError> {
+    if cursor.query_fingerprint != fingerprints.query {
+        return Err(invalid_graph_row_cursor("query fingerprint mismatch"));
+    }
+    if cursor.order_fingerprint != fingerprints.order {
+        return Err(invalid_graph_row_cursor("order fingerprint mismatch"));
+    }
+    if cursor.output_fingerprint != fingerprints.output {
+        return Err(invalid_graph_row_cursor("output fingerprint mismatch"));
+    }
+    if cursor.params_fingerprint != fingerprints.params {
+        return Err(invalid_graph_row_cursor("params fingerprint mismatch"));
+    }
+    Ok(())
+}
+
+fn graph_row_validate_cursor_shape(
+    query: &NormalizedGraphRowQuery,
+    cursor: &GraphRowCursorPayload,
+) -> Result<(), EngineError> {
+    if let Some(limit) = query.logical_limit {
+        if cursor.rows_emitted_after_skip >= limit as u64 {
+            return Err(invalid_graph_row_cursor(
+                "cursor has already exhausted the logical row limit",
+            ));
+        }
+    }
+    if cursor.last_sort_key.len() != query.bound_order_by.len() {
+        return Err(invalid_graph_row_cursor(format!(
+            "cursor sort key has {} atom(s), expected {}",
+            cursor.last_sort_key.len(),
+            query.bound_order_by.len()
+        )));
+    }
+    if cursor.last_logical_row_key.len() != query.binding_schema.slots().len() {
+        return Err(invalid_graph_row_cursor(format!(
+            "cursor logical row key has {} atom(s), expected {}",
+            cursor.last_logical_row_key.len(),
+            query.binding_schema.slots().len()
+        )));
+    }
+    for (slot, atom) in query
+        .binding_schema
+        .slots()
+        .iter()
+        .zip(cursor.last_logical_row_key.iter())
+    {
+        if !graph_row_cursor_atom_matches_slot(atom, slot) {
+            return Err(invalid_graph_row_cursor(format!(
+                "cursor logical row key atom does not match slot '{}'",
+                slot.name
+            )));
+        }
+    }
+    for (index, (item, atom)) in query
+        .bound_order_by
+        .iter()
+        .zip(cursor.last_sort_key.iter())
+        .enumerate()
+    {
+        let expectation =
+            graph_row_cursor_order_atom_expectation(&item.expr, &query.binding_schema)?;
+        if !graph_row_cursor_atom_matches_expectation(atom, expectation) {
+            return Err(invalid_graph_row_cursor(format!(
+                "cursor order key atom {} does not match order expression result kind",
+                index + 1
+            )));
+        }
+        if let crate::graph_row::GraphSortAtom::Path {
+            hop_count,
+            nodes,
+            edges,
+        } = atom
+        {
+            graph_row_validate_cursor_path_atom(*hop_count, nodes, edges)?;
+        }
+    }
+    for atom in &cursor.last_logical_row_key {
+        if let crate::graph_row::GraphSortAtom::Path {
+            hop_count,
+            nodes,
+            edges,
+        } = atom
+        {
+            graph_row_validate_cursor_path_atom(*hop_count, nodes, edges)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphRowCursorAtomExpectation {
+    AnyOrderable,
+    Unsupported,
+    Scalar,
+    Bool,
+    Number,
+    String,
+    Bytes,
+    Node,
+    Slot(crate::graph_row::GraphBindingSlotKind, bool),
+}
+
+fn graph_row_cursor_order_atom_expectation(
+    expr: &crate::graph_row::BoundGraphExpr,
+    schema: &crate::graph_row::GraphBindingSchema,
+) -> Result<GraphRowCursorAtomExpectation, EngineError> {
+    use crate::graph_row::BoundGraphExpr;
+    Ok(match expr {
+        BoundGraphExpr::Null => GraphRowCursorAtomExpectation::AnyOrderable,
+        BoundGraphExpr::Bool(_) => GraphRowCursorAtomExpectation::Bool,
+        BoundGraphExpr::Int(_) | BoundGraphExpr::UInt(_) | BoundGraphExpr::Float(_) => {
+            GraphRowCursorAtomExpectation::Number
+        }
+        BoundGraphExpr::String(_) => GraphRowCursorAtomExpectation::String,
+        BoundGraphExpr::Bytes(_) => GraphRowCursorAtomExpectation::Bytes,
+        BoundGraphExpr::List(_) | BoundGraphExpr::Map(_) => GraphRowCursorAtomExpectation::Unsupported,
+        BoundGraphExpr::Binding(slot) => {
+            let slot = schema
+                .slot(*slot)
+                .ok_or_else(|| invalid_graph_row_cursor("cursor order binding slot is not in schema"))?;
+            GraphRowCursorAtomExpectation::Slot(slot.kind, slot.nullable)
+        }
+        BoundGraphExpr::Property { .. } => GraphRowCursorAtomExpectation::Scalar,
+        BoundGraphExpr::NodeField { field, .. } => match field {
+            GraphNodeField::Id
+            | GraphNodeField::Weight
+            | GraphNodeField::CreatedAt
+            | GraphNodeField::UpdatedAt => GraphRowCursorAtomExpectation::Number,
+            GraphNodeField::Key => GraphRowCursorAtomExpectation::String,
+            GraphNodeField::Labels => GraphRowCursorAtomExpectation::Unsupported,
+        },
+        BoundGraphExpr::EdgeField { field, .. } => match field {
+            GraphEdgeField::Id
+            | GraphEdgeField::From
+            | GraphEdgeField::To
+            | GraphEdgeField::Weight
+            | GraphEdgeField::CreatedAt
+            | GraphEdgeField::UpdatedAt
+            | GraphEdgeField::ValidFrom
+            | GraphEdgeField::ValidTo => GraphRowCursorAtomExpectation::Number,
+            GraphEdgeField::Label => GraphRowCursorAtomExpectation::String,
+        },
+        BoundGraphExpr::PathField { field, .. } => match field {
+            GraphPathField::Length => GraphRowCursorAtomExpectation::Number,
+            GraphPathField::NodeIds | GraphPathField::EdgeIds => {
+                GraphRowCursorAtomExpectation::Unsupported
+            }
+        },
+        BoundGraphExpr::Function { name, .. } => match name {
+            GraphFunction::Id | GraphFunction::Length => GraphRowCursorAtomExpectation::Number,
+            GraphFunction::Type => GraphRowCursorAtomExpectation::String,
+            GraphFunction::StartNode | GraphFunction::EndNode => GraphRowCursorAtomExpectation::Node,
+            GraphFunction::Labels | GraphFunction::Nodes | GraphFunction::Relationships => {
+                GraphRowCursorAtomExpectation::Unsupported
+            }
+        },
+        BoundGraphExpr::Unary { .. }
+        | BoundGraphExpr::Binary { .. }
+        | BoundGraphExpr::IsNull(_)
+        | BoundGraphExpr::IsNotNull(_) => GraphRowCursorAtomExpectation::Bool,
+    })
+}
+
+fn graph_row_cursor_atom_matches_expectation(
+    atom: &crate::graph_row::GraphSortAtom,
+    expectation: GraphRowCursorAtomExpectation,
+) -> bool {
+    match expectation {
+        GraphRowCursorAtomExpectation::AnyOrderable => true,
+        GraphRowCursorAtomExpectation::Unsupported => matches!(atom, crate::graph_row::GraphSortAtom::Null),
+        GraphRowCursorAtomExpectation::Scalar => matches!(
+            atom,
+            crate::graph_row::GraphSortAtom::Null
+                | crate::graph_row::GraphSortAtom::Bool(_)
+                | crate::graph_row::GraphSortAtom::Number(_)
+                | crate::graph_row::GraphSortAtom::String(_)
+                | crate::graph_row::GraphSortAtom::Bytes(_)
+        ),
+        GraphRowCursorAtomExpectation::Bool => {
+            matches!(
+                atom,
+                crate::graph_row::GraphSortAtom::Null | crate::graph_row::GraphSortAtom::Bool(_)
+            )
+        }
+        GraphRowCursorAtomExpectation::Number => {
+            matches!(
+                atom,
+                crate::graph_row::GraphSortAtom::Null | crate::graph_row::GraphSortAtom::Number(_)
+            )
+        }
+        GraphRowCursorAtomExpectation::String => {
+            matches!(
+                atom,
+                crate::graph_row::GraphSortAtom::Null | crate::graph_row::GraphSortAtom::String(_)
+            )
+        }
+        GraphRowCursorAtomExpectation::Bytes => {
+            matches!(
+                atom,
+                crate::graph_row::GraphSortAtom::Null | crate::graph_row::GraphSortAtom::Bytes(_)
+            )
+        }
+        GraphRowCursorAtomExpectation::Node => {
+            matches!(
+                atom,
+                crate::graph_row::GraphSortAtom::Null | crate::graph_row::GraphSortAtom::Node(_)
+            )
+        }
+        GraphRowCursorAtomExpectation::Slot(slot_kind, nullable) => {
+            graph_row_cursor_atom_matches_slot_kind(atom, slot_kind, nullable)
+        }
+    }
+}
+
+fn graph_row_cursor_atom_matches_slot(
+    atom: &crate::graph_row::GraphSortAtom,
+    slot: &crate::graph_row::GraphBindingSlot,
+) -> bool {
+    graph_row_cursor_atom_matches_slot_kind(atom, slot.kind, slot.nullable)
+}
+
+fn graph_row_cursor_atom_matches_slot_kind(
+    atom: &crate::graph_row::GraphSortAtom,
+    slot_kind: crate::graph_row::GraphBindingSlotKind,
+    nullable: bool,
+) -> bool {
+    match atom {
+        crate::graph_row::GraphSortAtom::Null => nullable,
+        crate::graph_row::GraphSortAtom::Node(_) => {
+            slot_kind == crate::graph_row::GraphBindingSlotKind::Node
+        }
+        crate::graph_row::GraphSortAtom::Edge(_) => {
+            matches!(
+                slot_kind,
+                crate::graph_row::GraphBindingSlotKind::Edge
+                    | crate::graph_row::GraphBindingSlotKind::HiddenOccurrence
+            )
+        }
+        crate::graph_row::GraphSortAtom::Path { .. } => {
+            matches!(
+                slot_kind,
+                crate::graph_row::GraphBindingSlotKind::Path
+                    | crate::graph_row::GraphBindingSlotKind::HiddenOccurrence
+            )
+        }
+        crate::graph_row::GraphSortAtom::Bool(_)
+        | crate::graph_row::GraphSortAtom::Number(_)
+        | crate::graph_row::GraphSortAtom::String(_)
+        | crate::graph_row::GraphSortAtom::Bytes(_) => {
+            slot_kind == crate::graph_row::GraphBindingSlotKind::Scalar
+        }
+    }
+}
+
+fn graph_row_validate_cursor_path_atom(
+    hop_count: usize,
+    nodes: &[u64],
+    edges: &[u64],
+) -> Result<(), EngineError> {
+    if hop_count != edges.len() {
+        return Err(invalid_graph_row_cursor(
+            "cursor path sort atom hop count does not match edge count",
+        ));
+    }
+    if nodes.len() != edges.len().saturating_add(1) {
+        return Err(invalid_graph_row_cursor(
+            "cursor path sort atom node count must equal edge count plus one",
+        ));
+    }
+    Ok(())
+}
+
+fn graph_row_cursor_fingerprints(
+    query: &NormalizedGraphRowQuery,
+    effective_at_epoch: i64,
+    original_skip: u64,
+) -> GraphRowCursorFingerprints {
+    let mut query_writer = GraphRowFingerprintWriter::new("query");
+    query_writer.u16(GRAPH_ROW_CURSOR_SEMANTIC_VERSION);
+    query_writer.i64(effective_at_epoch);
+    query_writer.u64(original_skip);
+    match query.logical_limit {
+        Some(limit) => {
+            query_writer.tag(1);
+            query_writer.u64(limit as u64);
+        }
+        None => query_writer.tag(0),
+    }
+    graph_row_fingerprint_node_patterns(&mut query_writer, &query.nodes);
+    graph_row_fingerprint_pattern_pieces(&mut query_writer, &query.pieces);
+    graph_row_fingerprint_fixed_paths(&mut query_writer, &query.fixed_paths);
+    graph_row_fingerprint_edge_id_constraints(&mut query_writer, &query.edge_id_constraints);
+    graph_row_fingerprint_option_expr(&mut query_writer, query.fingerprint_where.as_ref());
+
+    let mut order_writer = GraphRowFingerprintWriter::new("order");
+    graph_row_fingerprint_order_items(&mut order_writer, &query.fingerprint_order_by);
+
+    let mut output_writer = GraphRowFingerprintWriter::new("output");
+    graph_row_fingerprint_option_return_items(
+        &mut output_writer,
+        query.fingerprint_return_items.as_ref(),
+    );
+    graph_row_fingerprint_string_vec(&mut output_writer, &query.columns);
+    graph_row_fingerprint_output_options(&mut output_writer, &query.output);
+
+    let mut params_writer = GraphRowFingerprintWriter::new("params");
+    params_writer.len(query.referenced_params.len());
+    for (name, value) in &query.referenced_params {
+        params_writer.str(name);
+        graph_row_fingerprint_param_value(&mut params_writer, value);
+    }
+
+    GraphRowCursorFingerprints {
+        query: query_writer.finish(),
+        order: order_writer.finish(),
+        output: output_writer.finish(),
+        params: params_writer.finish(),
+    }
+}
+
+struct GraphRowFingerprintWriter {
+    hash: u128,
+}
+
+impl GraphRowFingerprintWriter {
+    fn new(namespace: &str) -> Self {
+        let mut writer = Self {
+            hash: FNV128_OFFSET,
+        };
+        writer.str(namespace);
+        writer
+    }
+
+    fn finish(self) -> u128 {
+        self.hash
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.u64(bytes.len() as u64);
+        self.raw_bytes(bytes);
+    }
+
+    fn raw_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.hash ^= *byte as u128;
+            self.hash = self.hash.wrapping_mul(FNV128_PRIME);
+        }
+    }
+
+    fn tag(&mut self, tag: u8) {
+        self.raw_bytes(&[tag]);
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.tag(u8::from(value));
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.raw_bytes(&[value]);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.raw_bytes(&value.to_be_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.raw_bytes(&value.to_be_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.raw_bytes(&value.to_be_bytes());
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.u64(value as u64);
+    }
+
+    fn len(&mut self, value: usize) {
+        self.usize(value);
+    }
+
+    fn f32(&mut self, value: f32) {
+        self.raw_bytes(&value.to_bits().to_be_bytes());
+    }
+
+    fn f64(&mut self, value: f64) {
+        self.raw_bytes(&value.to_bits().to_be_bytes());
+    }
+
+    fn str(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
+}
+
+fn graph_row_fingerprint_string_vec(writer: &mut GraphRowFingerprintWriter, values: &[String]) {
+    writer.len(values.len());
+    for value in values {
+        writer.str(value);
+    }
+}
+
+fn graph_row_fingerprint_node_patterns(
+    writer: &mut GraphRowFingerprintWriter,
+    nodes: &[GraphNodePattern],
+) {
+    writer.len(nodes.len());
+    for node in nodes {
+        writer.str(&node.alias);
+        graph_row_fingerprint_node_label_filter(writer, node.label_filter.as_ref());
+        writer.len(node.ids.len());
+        for id in &node.ids {
+            writer.u64(*id);
+        }
+        writer.len(node.keys.len());
+        for key in &node.keys {
+            writer.str(&key.label);
+            writer.str(&key.key);
+        }
+        graph_row_fingerprint_node_filter(writer, node.filter.as_ref());
+    }
+}
+
+fn graph_row_fingerprint_pattern_pieces(
+    writer: &mut GraphRowFingerprintWriter,
+    pieces: &[GraphPatternPiece],
+) {
+    writer.len(pieces.len());
+    for piece in pieces {
+        match piece {
+            GraphPatternPiece::Edge(edge) => {
+                writer.tag(0);
+                graph_row_fingerprint_edge_pattern(writer, edge);
+            }
+            GraphPatternPiece::Optional(group) => {
+                writer.tag(1);
+                graph_row_fingerprint_pattern_pieces(writer, &group.pieces);
+                graph_row_fingerprint_option_expr(writer, group.where_.as_ref());
+            }
+            GraphPatternPiece::VariableLength(pattern) => {
+                writer.tag(2);
+                graph_row_fingerprint_opt_str(writer, pattern.path_alias.as_deref());
+                graph_row_fingerprint_opt_str(writer, pattern.edge_alias.as_deref());
+                writer.str(&pattern.from_alias);
+                writer.str(&pattern.to_alias);
+                graph_row_fingerprint_direction(writer, pattern.direction);
+                graph_row_fingerprint_string_vec(writer, &pattern.label_filter);
+                graph_row_fingerprint_edge_filter(writer, pattern.filter.as_ref());
+                writer.u8(pattern.min_hops);
+                writer.u8(pattern.max_hops);
             }
         }
     }
-    ControlFlow::Continue(())
+}
+
+fn graph_row_fingerprint_fixed_paths(
+    writer: &mut GraphRowFingerprintWriter,
+    fixed_paths: &[GraphFixedPathBinding],
+) {
+    writer.len(fixed_paths.len());
+    for fixed_path in fixed_paths {
+        writer.len(fixed_path.scope.len());
+        for piece_index in &fixed_path.scope {
+            writer.u64(*piece_index as u64);
+        }
+        writer.str(&fixed_path.alias);
+        graph_row_fingerprint_string_vec(writer, &fixed_path.node_aliases);
+        writer.len(fixed_path.edge_piece_indices.len());
+        for piece_index in &fixed_path.edge_piece_indices {
+            writer.u64(*piece_index as u64);
+        }
+        writer.u64(fixed_path.after_piece_index as u64);
+    }
+}
+
+fn graph_row_fingerprint_edge_pattern(
+    writer: &mut GraphRowFingerprintWriter,
+    edge: &GraphEdgePattern,
+) {
+    graph_row_fingerprint_opt_str(writer, edge.alias.as_deref());
+    writer.str(&edge.from_alias);
+    writer.str(&edge.to_alias);
+    graph_row_fingerprint_direction(writer, edge.direction);
+    graph_row_fingerprint_string_vec(writer, &edge.label_filter);
+    graph_row_fingerprint_edge_filter(writer, edge.filter.as_ref());
+}
+
+fn graph_row_fingerprint_direction(writer: &mut GraphRowFingerprintWriter, direction: Direction) {
+    writer.tag(match direction {
+        Direction::Outgoing => 0,
+        Direction::Incoming => 1,
+        Direction::Both => 2,
+    });
+}
+
+fn graph_row_fingerprint_node_label_filter(
+    writer: &mut GraphRowFingerprintWriter,
+    filter: Option<&NodeLabelFilter>,
+) {
+    match filter {
+        Some(filter) => {
+            writer.tag(1);
+            writer.tag(match filter.mode {
+                LabelMatchMode::Any => 0,
+                LabelMatchMode::All => 1,
+            });
+            graph_row_fingerprint_string_vec(writer, &filter.labels);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_edge_id_constraints(
+    writer: &mut GraphRowFingerprintWriter,
+    constraints: &BTreeMap<String, Vec<u64>>,
+) {
+    writer.len(constraints.len());
+    for (alias, ids) in constraints {
+        writer.str(alias);
+        writer.len(ids.len());
+        for id in ids {
+            writer.u64(*id);
+        }
+    }
+}
+
+fn graph_row_fingerprint_option_expr(
+    writer: &mut GraphRowFingerprintWriter,
+    expr: Option<&GraphExpr>,
+) {
+    match expr {
+        Some(expr) => {
+            writer.tag(1);
+            graph_row_fingerprint_expr(writer, expr);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_expr(writer: &mut GraphRowFingerprintWriter, expr: &GraphExpr) {
+    match expr {
+        GraphExpr::Null => writer.tag(0),
+        GraphExpr::Bool(value) => {
+            writer.tag(1);
+            writer.bool(*value);
+        }
+        GraphExpr::Int(value) => {
+            writer.tag(2);
+            writer.i64(*value);
+        }
+        GraphExpr::UInt(value) => {
+            writer.tag(3);
+            writer.u64(*value);
+        }
+        GraphExpr::Float(value) => {
+            writer.tag(4);
+            writer.f64(*value);
+        }
+        GraphExpr::String(value) => {
+            writer.tag(5);
+            writer.str(value);
+        }
+        GraphExpr::Bytes(value) => {
+            writer.tag(6);
+            writer.bytes(value);
+        }
+        GraphExpr::List(items) => {
+            writer.tag(7);
+            writer.len(items.len());
+            for item in items {
+                graph_row_fingerprint_expr(writer, item);
+            }
+        }
+        GraphExpr::Map(items) => {
+            writer.tag(8);
+            writer.len(items.len());
+            for (key, value) in items {
+                writer.str(key);
+                graph_row_fingerprint_expr(writer, value);
+            }
+        }
+        GraphExpr::Param(name) => {
+            writer.tag(9);
+            writer.str(name);
+        }
+        GraphExpr::Binding(alias) => {
+            writer.tag(10);
+            writer.str(alias);
+        }
+        GraphExpr::Property { alias, key } => {
+            writer.tag(11);
+            writer.str(alias);
+            writer.str(key);
+        }
+        GraphExpr::NodeField { alias, field } => {
+            writer.tag(12);
+            writer.str(alias);
+            writer.tag(*field as u8);
+        }
+        GraphExpr::EdgeField { alias, field } => {
+            writer.tag(13);
+            writer.str(alias);
+            writer.tag(*field as u8);
+        }
+        GraphExpr::PathField { alias, field } => {
+            writer.tag(14);
+            writer.str(alias);
+            writer.tag(*field as u8);
+        }
+        GraphExpr::Function { name, args } => {
+            writer.tag(15);
+            writer.tag(*name as u8);
+            writer.len(args.len());
+            for arg in args {
+                graph_row_fingerprint_expr(writer, arg);
+            }
+        }
+        GraphExpr::Unary { op, expr } => {
+            writer.tag(16);
+            writer.tag(*op as u8);
+            graph_row_fingerprint_expr(writer, expr);
+        }
+        GraphExpr::Binary { left, op, right } => {
+            writer.tag(17);
+            writer.tag(*op as u8);
+            graph_row_fingerprint_expr(writer, left);
+            graph_row_fingerprint_expr(writer, right);
+        }
+        GraphExpr::IsNull(expr) => {
+            writer.tag(18);
+            graph_row_fingerprint_expr(writer, expr);
+        }
+        GraphExpr::IsNotNull(expr) => {
+            writer.tag(19);
+            graph_row_fingerprint_expr(writer, expr);
+        }
+    }
+}
+
+fn graph_row_fingerprint_order_items(
+    writer: &mut GraphRowFingerprintWriter,
+    items: &[GraphOrderItem],
+) {
+    writer.len(items.len());
+    for item in items {
+        graph_row_fingerprint_expr(writer, &item.expr);
+        writer.tag(match item.direction {
+            GraphOrderDirection::Asc => 0,
+            GraphOrderDirection::Desc => 1,
+        });
+    }
+}
+
+fn graph_row_fingerprint_option_return_items(
+    writer: &mut GraphRowFingerprintWriter,
+    items: Option<&Vec<GraphReturnItem>>,
+) {
+    match items {
+        Some(items) => {
+            writer.tag(1);
+            graph_row_fingerprint_return_items(writer, items);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_return_items(
+    writer: &mut GraphRowFingerprintWriter,
+    items: &[GraphReturnItem],
+) {
+    writer.len(items.len());
+    for item in items {
+        graph_row_fingerprint_expr(writer, &item.expr);
+        graph_row_fingerprint_opt_str(writer, item.alias.as_deref());
+        graph_row_fingerprint_return_projection(writer, &item.projection);
+    }
+}
+
+fn graph_row_fingerprint_return_projection(
+    writer: &mut GraphRowFingerprintWriter,
+    projection: &GraphReturnProjection,
+) {
+    match projection {
+        GraphReturnProjection::Auto => writer.tag(0),
+        GraphReturnProjection::IdOnly => writer.tag(1),
+        GraphReturnProjection::Element(element) => {
+            writer.tag(2);
+            writer.tag(match element {
+                GraphElementProjection::IdOnly => 0,
+                GraphElementProjection::Compact => 1,
+                GraphElementProjection::Full => 2,
+            });
+        }
+        GraphReturnProjection::Selected(selected) => {
+            writer.tag(3);
+            graph_row_fingerprint_selected_projection(writer, selected);
+        }
+    }
+}
+
+fn graph_row_fingerprint_selected_projection(
+    writer: &mut GraphRowFingerprintWriter,
+    selected: &GraphSelectedProjection,
+) {
+    match selected {
+        GraphSelectedProjection::Node(node) => {
+            writer.tag(0);
+            writer.bool(node.id);
+            writer.bool(node.labels);
+            writer.bool(node.key);
+            graph_row_fingerprint_graph_property_selection(writer, &node.props);
+            writer.bool(node.weight);
+            writer.bool(node.created_at);
+            writer.bool(node.updated_at);
+            graph_row_fingerprint_graph_vector_selection(writer, node.vectors);
+        }
+        GraphSelectedProjection::Edge(edge) => {
+            writer.tag(1);
+            writer.bool(edge.id);
+            writer.bool(edge.from);
+            writer.bool(edge.to);
+            writer.bool(edge.label);
+            graph_row_fingerprint_graph_property_selection(writer, &edge.props);
+            writer.bool(edge.weight);
+            writer.bool(edge.created_at);
+            writer.bool(edge.updated_at);
+            writer.bool(edge.valid_from);
+            writer.bool(edge.valid_to);
+        }
+        GraphSelectedProjection::Path(path) => {
+            writer.tag(2);
+            writer.bool(path.node_ids);
+            writer.bool(path.edge_ids);
+            graph_row_fingerprint_opt_selected_node(writer, path.nodes.as_ref());
+            graph_row_fingerprint_opt_selected_edge(writer, path.edges.as_ref());
+        }
+    }
+}
+
+fn graph_row_fingerprint_opt_selected_node(
+    writer: &mut GraphRowFingerprintWriter,
+    node: Option<&GraphSelectedNodeProjection>,
+) {
+    match node {
+        Some(node) => {
+            writer.tag(1);
+            graph_row_fingerprint_selected_projection(
+                writer,
+                &GraphSelectedProjection::Node(node.clone()),
+            );
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_opt_selected_edge(
+    writer: &mut GraphRowFingerprintWriter,
+    edge: Option<&GraphSelectedEdgeProjection>,
+) {
+    match edge {
+        Some(edge) => {
+            writer.tag(1);
+            graph_row_fingerprint_selected_projection(
+                writer,
+                &GraphSelectedProjection::Edge(edge.clone()),
+            );
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_graph_property_selection(
+    writer: &mut GraphRowFingerprintWriter,
+    selection: &GraphPropertySelection,
+) {
+    match selection {
+        GraphPropertySelection::None => writer.tag(0),
+        GraphPropertySelection::Keys(keys) => {
+            writer.tag(1);
+            graph_row_fingerprint_string_vec(writer, keys);
+        }
+        GraphPropertySelection::All => writer.tag(2),
+    }
+}
+
+fn graph_row_fingerprint_graph_vector_selection(
+    writer: &mut GraphRowFingerprintWriter,
+    selection: GraphVectorSelection,
+) {
+    writer.tag(match selection {
+        GraphVectorSelection::None => 0,
+        GraphVectorSelection::Dense => 1,
+        GraphVectorSelection::Sparse => 2,
+        GraphVectorSelection::Both => 3,
+    });
+}
+
+fn graph_row_fingerprint_output_options(
+    writer: &mut GraphRowFingerprintWriter,
+    output: &GraphOutputOptions,
+) {
+    writer.tag(match output.mode {
+        GraphOutputMode::Ids => 0,
+        GraphOutputMode::Elements => 1,
+        GraphOutputMode::Projected => 2,
+    });
+    writer.bool(output.include_vectors);
+}
+
+fn graph_row_fingerprint_node_filter(
+    writer: &mut GraphRowFingerprintWriter,
+    filter: Option<&NodeFilterExpr>,
+) {
+    match filter {
+        Some(filter) => {
+            writer.tag(1);
+            graph_row_fingerprint_node_filter_inner(writer, filter);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_node_filter_inner(
+    writer: &mut GraphRowFingerprintWriter,
+    filter: &NodeFilterExpr,
+) {
+    match filter {
+        NodeFilterExpr::PropertyEquals { key, value } => {
+            writer.tag(0);
+            writer.str(key);
+            graph_row_fingerprint_prop_value(writer, value);
+        }
+        NodeFilterExpr::PropertyIn { key, values } => {
+            writer.tag(1);
+            writer.str(key);
+            writer.len(values.len());
+            for value in values {
+                graph_row_fingerprint_prop_value(writer, value);
+            }
+        }
+        NodeFilterExpr::PropertyRange { key, lower, upper } => {
+            writer.tag(2);
+            writer.str(key);
+            graph_row_fingerprint_range_bound(writer, lower.as_ref());
+            graph_row_fingerprint_range_bound(writer, upper.as_ref());
+        }
+        NodeFilterExpr::PropertyExists { key } => {
+            writer.tag(3);
+            writer.str(key);
+        }
+        NodeFilterExpr::PropertyMissing { key } => {
+            writer.tag(4);
+            writer.str(key);
+        }
+        NodeFilterExpr::UpdatedAtRange { lower_ms, upper_ms } => {
+            writer.tag(5);
+            graph_row_fingerprint_opt_i64(writer, *lower_ms);
+            graph_row_fingerprint_opt_i64(writer, *upper_ms);
+        }
+        NodeFilterExpr::And(filters) => {
+            writer.tag(6);
+            writer.len(filters.len());
+            for filter in filters {
+                graph_row_fingerprint_node_filter_inner(writer, filter);
+            }
+        }
+        NodeFilterExpr::Or(filters) => {
+            writer.tag(7);
+            writer.len(filters.len());
+            for filter in filters {
+                graph_row_fingerprint_node_filter_inner(writer, filter);
+            }
+        }
+        NodeFilterExpr::Not(filter) => {
+            writer.tag(8);
+            graph_row_fingerprint_node_filter_inner(writer, filter);
+        }
+    }
+}
+
+fn graph_row_fingerprint_edge_filter(
+    writer: &mut GraphRowFingerprintWriter,
+    filter: Option<&EdgeFilterExpr>,
+) {
+    match filter {
+        Some(filter) => {
+            writer.tag(1);
+            graph_row_fingerprint_edge_filter_inner(writer, filter);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_edge_filter_inner(
+    writer: &mut GraphRowFingerprintWriter,
+    filter: &EdgeFilterExpr,
+) {
+    match filter {
+        EdgeFilterExpr::PropertyEquals { key, value } => {
+            writer.tag(0);
+            writer.str(key);
+            graph_row_fingerprint_prop_value(writer, value);
+        }
+        EdgeFilterExpr::PropertyIn { key, values } => {
+            writer.tag(1);
+            writer.str(key);
+            writer.len(values.len());
+            for value in values {
+                graph_row_fingerprint_prop_value(writer, value);
+            }
+        }
+        EdgeFilterExpr::PropertyRange { key, lower, upper } => {
+            writer.tag(2);
+            writer.str(key);
+            graph_row_fingerprint_range_bound(writer, lower.as_ref());
+            graph_row_fingerprint_range_bound(writer, upper.as_ref());
+        }
+        EdgeFilterExpr::PropertyExists { key } => {
+            writer.tag(3);
+            writer.str(key);
+        }
+        EdgeFilterExpr::PropertyMissing { key } => {
+            writer.tag(4);
+            writer.str(key);
+        }
+        EdgeFilterExpr::WeightRange { lower, upper } => {
+            writer.tag(5);
+            graph_row_fingerprint_opt_f32(writer, *lower);
+            graph_row_fingerprint_opt_f32(writer, *upper);
+        }
+        EdgeFilterExpr::UpdatedAtRange { lower_ms, upper_ms } => {
+            writer.tag(6);
+            graph_row_fingerprint_opt_i64(writer, *lower_ms);
+            graph_row_fingerprint_opt_i64(writer, *upper_ms);
+        }
+        EdgeFilterExpr::ValidAt { epoch_ms } => {
+            writer.tag(7);
+            writer.i64(*epoch_ms);
+        }
+        EdgeFilterExpr::ValidFromRange { lower_ms, upper_ms } => {
+            writer.tag(8);
+            graph_row_fingerprint_opt_i64(writer, *lower_ms);
+            graph_row_fingerprint_opt_i64(writer, *upper_ms);
+        }
+        EdgeFilterExpr::ValidToRange { lower_ms, upper_ms } => {
+            writer.tag(9);
+            graph_row_fingerprint_opt_i64(writer, *lower_ms);
+            graph_row_fingerprint_opt_i64(writer, *upper_ms);
+        }
+        EdgeFilterExpr::And(filters) => {
+            writer.tag(10);
+            writer.len(filters.len());
+            for filter in filters {
+                graph_row_fingerprint_edge_filter_inner(writer, filter);
+            }
+        }
+        EdgeFilterExpr::Or(filters) => {
+            writer.tag(11);
+            writer.len(filters.len());
+            for filter in filters {
+                graph_row_fingerprint_edge_filter_inner(writer, filter);
+            }
+        }
+        EdgeFilterExpr::Not(filter) => {
+            writer.tag(12);
+            graph_row_fingerprint_edge_filter_inner(writer, filter);
+        }
+    }
+}
+
+fn graph_row_fingerprint_range_bound(
+    writer: &mut GraphRowFingerprintWriter,
+    bound: Option<&PropertyRangeBound>,
+) {
+    match bound {
+        Some(PropertyRangeBound::Included(value)) => {
+            writer.tag(1);
+            graph_row_fingerprint_prop_value(writer, value);
+        }
+        Some(PropertyRangeBound::Excluded(value)) => {
+            writer.tag(2);
+            graph_row_fingerprint_prop_value(writer, value);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_prop_value(writer: &mut GraphRowFingerprintWriter, value: &PropValue) {
+    match value {
+        PropValue::Null => writer.tag(0),
+        PropValue::Bool(value) => {
+            writer.tag(1);
+            writer.bool(*value);
+        }
+        PropValue::Int(value) => {
+            writer.tag(2);
+            writer.i64(*value);
+        }
+        PropValue::UInt(value) => {
+            writer.tag(3);
+            writer.u64(*value);
+        }
+        PropValue::Float(value) => {
+            writer.tag(4);
+            writer.f64(*value);
+        }
+        PropValue::String(value) => {
+            writer.tag(5);
+            writer.str(value);
+        }
+        PropValue::Bytes(value) => {
+            writer.tag(6);
+            writer.bytes(value);
+        }
+        PropValue::Array(values) => {
+            writer.tag(7);
+            writer.len(values.len());
+            for value in values {
+                graph_row_fingerprint_prop_value(writer, value);
+            }
+        }
+        PropValue::Map(values) => {
+            writer.tag(8);
+            writer.len(values.len());
+            for (key, value) in values {
+                writer.str(key);
+                graph_row_fingerprint_prop_value(writer, value);
+            }
+        }
+    }
+}
+
+fn graph_row_fingerprint_param_value(
+    writer: &mut GraphRowFingerprintWriter,
+    value: &GraphParamValue,
+) {
+    match value {
+        GraphParamValue::Null => writer.tag(0),
+        GraphParamValue::Bool(value) => {
+            writer.tag(1);
+            writer.bool(*value);
+        }
+        GraphParamValue::Int(value) => {
+            writer.tag(2);
+            writer.i64(*value);
+        }
+        GraphParamValue::UInt(value) => {
+            writer.tag(3);
+            writer.u64(*value);
+        }
+        GraphParamValue::Float(value) => {
+            writer.tag(4);
+            writer.f64(*value);
+        }
+        GraphParamValue::String(value) => {
+            writer.tag(5);
+            writer.str(value);
+        }
+        GraphParamValue::Bytes(value) => {
+            writer.tag(6);
+            writer.bytes(value);
+        }
+        GraphParamValue::List(values) => {
+            writer.tag(7);
+            writer.len(values.len());
+            for value in values {
+                graph_row_fingerprint_param_value(writer, value);
+            }
+        }
+        GraphParamValue::Map(values) => {
+            writer.tag(8);
+            writer.len(values.len());
+            for (key, value) in values {
+                writer.str(key);
+                graph_row_fingerprint_param_value(writer, value);
+            }
+        }
+    }
+}
+
+fn graph_row_fingerprint_opt_str(writer: &mut GraphRowFingerprintWriter, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            writer.tag(1);
+            writer.str(value);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_opt_i64(writer: &mut GraphRowFingerprintWriter, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            writer.tag(1);
+            writer.i64(value);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_opt_f32(writer: &mut GraphRowFingerprintWriter, value: Option<f32>) {
+    match value {
+        Some(value) => {
+            writer.tag(1);
+            writer.f32(value);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_encode_cursor(
+    cursor: &GraphRowCursorPayload,
+    max_cursor_bytes: usize,
+) -> Result<String, EngineError> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(GRAPH_ROW_CURSOR_MAGIC);
+    push_u8(&mut bytes, GRAPH_ROW_CURSOR_VERSION);
+    push_u16(&mut bytes, GRAPH_ROW_CURSOR_SEMANTIC_VERSION);
+    push_u16(&mut bytes, GRAPH_ROW_CURSOR_FLAGS);
+    push_i64(&mut bytes, cursor.effective_at_epoch);
+    push_u64(&mut bytes, cursor.original_skip);
+    push_u64(&mut bytes, cursor.page_sequence);
+    push_u64(&mut bytes, cursor.rows_emitted_after_skip);
+    push_u128(&mut bytes, cursor.query_fingerprint);
+    push_u128(&mut bytes, cursor.order_fingerprint);
+    push_u128(&mut bytes, cursor.output_fingerprint);
+    push_u128(&mut bytes, cursor.params_fingerprint);
+    encode_graph_sort_atoms(&mut bytes, &cursor.last_sort_key)?;
+    encode_graph_sort_atoms(&mut bytes, &cursor.last_logical_row_key)?;
+    let checksum = crate::types::fnv1a(&bytes);
+    push_u64(&mut bytes, checksum);
+    if bytes.len() > max_cursor_bytes {
+        return Err(invalid_graph_row_cursor(format!(
+            "emitted graph row cursor payload is {} bytes, exceeding max_cursor_bytes {}",
+            bytes.len(),
+            max_cursor_bytes
+        )));
+    }
+    let encoded = format!(
+        "{GRAPH_ROW_CURSOR_PREFIX}{}",
+        base64url_no_pad_encode(&bytes)
+    );
+    Ok(encoded)
+}
+
+fn graph_row_decode_cursor(
+    cursor: &str,
+    max_cursor_bytes: usize,
+) -> Result<GraphRowCursorPayload, EngineError> {
+    let Some(encoded) = cursor.strip_prefix(GRAPH_ROW_CURSOR_PREFIX) else {
+        return Err(invalid_graph_row_cursor("invalid graph row cursor prefix"));
+    };
+    let bytes = base64url_no_pad_decode(encoded)?;
+    if bytes.len() > max_cursor_bytes {
+        return Err(invalid_graph_row_cursor(format!(
+            "decoded graph row cursor is {} bytes, exceeding max_cursor_bytes {}",
+            bytes.len(),
+            max_cursor_bytes
+        )));
+    }
+    if bytes.len() < GRAPH_ROW_CURSOR_MAGIC.len() + 1 + 2 + 2 + 8 {
+        return Err(invalid_graph_row_cursor("cursor payload is too short"));
+    }
+    if bytes.len() < 8 {
+        return Err(invalid_graph_row_cursor("cursor payload is missing checksum"));
+    }
+    let checksum_offset = bytes.len() - 8;
+    let expected_checksum = crate::types::fnv1a(&bytes[..checksum_offset]);
+    let stored_checksum = u64::from_be_bytes(
+        bytes[checksum_offset..]
+            .try_into()
+            .map_err(|_| invalid_graph_row_cursor("cursor checksum is malformed"))?,
+    );
+    if stored_checksum != expected_checksum {
+        return Err(invalid_graph_row_cursor("cursor checksum mismatch"));
+    }
+
+    let mut reader = CursorPayloadReader::new(&bytes[..checksum_offset]);
+    let magic = reader.take(GRAPH_ROW_CURSOR_MAGIC.len())?;
+    if magic != GRAPH_ROW_CURSOR_MAGIC {
+        return Err(invalid_graph_row_cursor("cursor magic mismatch"));
+    }
+    let version = reader.read_u8()?;
+    if version != GRAPH_ROW_CURSOR_VERSION {
+        return Err(invalid_graph_row_cursor(format!(
+            "unsupported cursor version {version}"
+        )));
+    }
+    let semantic_version = reader.read_u16()?;
+    if semantic_version != GRAPH_ROW_CURSOR_SEMANTIC_VERSION {
+        return Err(invalid_graph_row_cursor(format!(
+            "unsupported cursor semantic version {semantic_version}"
+        )));
+    }
+    let flags = reader.read_u16()?;
+    if flags != GRAPH_ROW_CURSOR_FLAGS {
+        return Err(invalid_graph_row_cursor(format!(
+            "unsupported cursor flags {flags}"
+        )));
+    }
+    let payload = GraphRowCursorPayload {
+        effective_at_epoch: reader.read_i64()?,
+        original_skip: reader.read_u64()?,
+        page_sequence: reader.read_u64()?,
+        rows_emitted_after_skip: reader.read_u64()?,
+        query_fingerprint: reader.read_u128()?,
+        order_fingerprint: reader.read_u128()?,
+        output_fingerprint: reader.read_u128()?,
+        params_fingerprint: reader.read_u128()?,
+        last_sort_key: decode_graph_sort_atoms(&mut reader)?,
+        last_logical_row_key: decode_graph_sort_atoms(&mut reader)?,
+    };
+    if !reader.is_finished() {
+        return Err(invalid_graph_row_cursor("cursor payload has trailing bytes"));
+    }
+    Ok(payload)
+}
+
+fn encode_graph_sort_atoms(
+    bytes: &mut Vec<u8>,
+    atoms: &[crate::graph_row::GraphSortAtom],
+) -> Result<(), EngineError> {
+    push_u32(bytes, atoms.len().try_into().map_err(|_| {
+        EngineError::InvalidOperation("graph row cursor sort key is too large".to_string())
+    })?);
+    for atom in atoms {
+        match atom {
+            crate::graph_row::GraphSortAtom::Null => push_u8(bytes, 0),
+            crate::graph_row::GraphSortAtom::Bool(value) => {
+                push_u8(bytes, 1);
+                push_u8(bytes, u8::from(*value));
+            }
+            crate::graph_row::GraphSortAtom::Number(value) => {
+                push_u8(bytes, 2);
+                bytes.extend_from_slice(&value.as_bytes());
+            }
+            crate::graph_row::GraphSortAtom::String(value) => {
+                push_u8(bytes, 3);
+                push_bytes(bytes, value)?;
+            }
+            crate::graph_row::GraphSortAtom::Bytes(value) => {
+                push_u8(bytes, 4);
+                push_bytes(bytes, value)?;
+            }
+            crate::graph_row::GraphSortAtom::Node(value) => {
+                push_u8(bytes, 5);
+                push_u64(bytes, *value);
+            }
+            crate::graph_row::GraphSortAtom::Edge(value) => {
+                push_u8(bytes, 6);
+                push_u64(bytes, *value);
+            }
+            crate::graph_row::GraphSortAtom::Path {
+                hop_count,
+                nodes,
+                edges,
+            } => {
+                push_u8(bytes, 7);
+                push_u64(bytes, (*hop_count).try_into().map_err(|_| {
+                    EngineError::InvalidOperation(
+                        "graph row cursor path hop count is too large".to_string(),
+                    )
+                })?);
+                push_u64_vec(bytes, nodes)?;
+                push_u64_vec(bytes, edges)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_graph_sort_atoms(
+    reader: &mut CursorPayloadReader<'_>,
+) -> Result<Vec<crate::graph_row::GraphSortAtom>, EngineError> {
+    let len = reader.read_u32()? as usize;
+    if len > reader.remaining() {
+        return Err(invalid_graph_row_cursor(
+            "cursor sort atom count exceeds remaining payload",
+        ));
+    }
+    let mut atoms = Vec::with_capacity(len);
+    for _ in 0..len {
+        let tag = reader.read_u8()?;
+        let atom = match tag {
+            0 => crate::graph_row::GraphSortAtom::Null,
+            1 => match reader.read_u8()? {
+                0 => crate::graph_row::GraphSortAtom::Bool(false),
+                1 => crate::graph_row::GraphSortAtom::Bool(true),
+                value => {
+                    return Err(invalid_graph_row_cursor(format!(
+                        "invalid bool sort atom value {value}"
+                    )));
+                }
+            },
+            2 => {
+                let bytes: [u8; crate::property_value_semantics::NUMERIC_RANGE_KEY_BYTES] = reader
+                    .take(crate::property_value_semantics::NUMERIC_RANGE_KEY_BYTES)?
+                    .try_into()
+                    .map_err(|_| invalid_graph_row_cursor("malformed numeric sort atom"))?;
+                crate::graph_row::GraphSortAtom::Number(
+                    NumericRangeSortKey::from_sidecar_bytes(bytes)
+                        .map_err(|_| invalid_graph_row_cursor("invalid numeric sort atom"))?,
+                )
+            }
+            3 => crate::graph_row::GraphSortAtom::String(reader.read_bytes()?.to_vec()),
+            4 => crate::graph_row::GraphSortAtom::Bytes(reader.read_bytes()?.to_vec()),
+            5 => crate::graph_row::GraphSortAtom::Node(reader.read_u64()?),
+            6 => crate::graph_row::GraphSortAtom::Edge(reader.read_u64()?),
+            7 => {
+                let hop_count: usize = reader.read_u64()?.try_into().map_err(|_| {
+                    invalid_graph_row_cursor("path hop count does not fit usize")
+                })?;
+                let nodes = reader.read_u64_vec()?;
+                let edges = reader.read_u64_vec()?;
+                graph_row_validate_cursor_path_atom(hop_count, &nodes, &edges)?;
+                crate::graph_row::GraphSortAtom::Path {
+                    hop_count,
+                    nodes,
+                    edges,
+                }
+            }
+            value => {
+                return Err(invalid_graph_row_cursor(format!(
+                    "invalid sort atom tag {value}"
+                )));
+            }
+        };
+        atoms.push(atom);
+    }
+    Ok(atoms)
+}
+
+struct CursorPayloadReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CursorPayloadReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], EngineError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| invalid_graph_row_cursor("cursor payload offset overflow"))?;
+        let Some(slice) = self.bytes.get(self.offset..end) else {
+            return Err(invalid_graph_row_cursor("truncated cursor payload"));
+        };
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, EngineError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16, EngineError> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| invalid_graph_row_cursor("malformed u16"))?,
+        ))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, EngineError> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| invalid_graph_row_cursor("malformed u32"))?,
+        ))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, EngineError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| invalid_graph_row_cursor("malformed u64"))?,
+        ))
+    }
+
+    fn read_i64(&mut self) -> Result<i64, EngineError> {
+        Ok(i64::from_be_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| invalid_graph_row_cursor("malformed i64"))?,
+        ))
+    }
+
+    fn read_u128(&mut self) -> Result<u128, EngineError> {
+        Ok(u128::from_be_bytes(
+            self.take(16)?
+                .try_into()
+                .map_err(|_| invalid_graph_row_cursor("malformed u128"))?,
+        ))
+    }
+
+    fn read_bytes(&mut self) -> Result<&'a [u8], EngineError> {
+        let len = self.read_u32()? as usize;
+        self.take(len)
+    }
+
+    fn read_u64_vec(&mut self) -> Result<Vec<u64>, EngineError> {
+        let len = self.read_u32()? as usize;
+        let required = len
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| invalid_graph_row_cursor("cursor u64 vector length overflow"))?;
+        if required > self.remaining() {
+            return Err(invalid_graph_row_cursor(
+                "cursor u64 vector length exceeds remaining payload",
+            ));
+        }
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(self.read_u64()?);
+        }
+        Ok(values)
+    }
+}
+
+fn push_u8(bytes: &mut Vec<u8>, value: u8) {
+    bytes.push(value);
+}
+
+fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_i64(bytes: &mut Vec<u8>, value: i64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_u128(bytes: &mut Vec<u8>, value: u128) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), EngineError> {
+    push_u32(bytes, value.len().try_into().map_err(|_| {
+        EngineError::InvalidOperation("graph row cursor byte field is too large".to_string())
+    })?);
+    bytes.extend_from_slice(value);
+    Ok(())
+}
+
+fn push_u64_vec(bytes: &mut Vec<u8>, values: &[u64]) -> Result<(), EngineError> {
+    push_u32(bytes, values.len().try_into().map_err(|_| {
+        EngineError::InvalidOperation("graph row cursor id vector is too large".to_string())
+    })?);
+    for value in values {
+        push_u64(bytes, *value);
+    }
+    Ok(())
+}
+
+fn base64url_no_pad_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity((bytes.len() * 4).div_ceil(3));
+    let mut index = 0usize;
+    while index + 3 <= bytes.len() {
+        let chunk = ((bytes[index] as u32) << 16)
+            | ((bytes[index + 1] as u32) << 8)
+            | bytes[index + 2] as u32;
+        output.push(ALPHABET[((chunk >> 18) & 0x3f) as usize] as char);
+        output.push(ALPHABET[((chunk >> 12) & 0x3f) as usize] as char);
+        output.push(ALPHABET[((chunk >> 6) & 0x3f) as usize] as char);
+        output.push(ALPHABET[(chunk & 0x3f) as usize] as char);
+        index += 3;
+    }
+    match bytes.len() - index {
+        1 => {
+            let chunk = (bytes[index] as u32) << 16;
+            output.push(ALPHABET[((chunk >> 18) & 0x3f) as usize] as char);
+            output.push(ALPHABET[((chunk >> 12) & 0x3f) as usize] as char);
+        }
+        2 => {
+            let chunk = ((bytes[index] as u32) << 16) | ((bytes[index + 1] as u32) << 8);
+            output.push(ALPHABET[((chunk >> 18) & 0x3f) as usize] as char);
+            output.push(ALPHABET[((chunk >> 12) & 0x3f) as usize] as char);
+            output.push(ALPHABET[((chunk >> 6) & 0x3f) as usize] as char);
+        }
+        _ => {}
+    }
+    output
+}
+
+fn base64url_no_pad_decode(encoded: &str) -> Result<Vec<u8>, EngineError> {
+    if encoded.len() % 4 == 1 {
+        return Err(invalid_graph_row_cursor("malformed base64url cursor"));
+    }
+    let mut output = Vec::with_capacity(encoded.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for byte in encoded.bytes() {
+        if byte == b'=' {
+            return Err(invalid_graph_row_cursor(
+                "padded base64 is not valid for graph row cursors",
+            ));
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return Err(invalid_graph_row_cursor("invalid base64url cursor byte")),
+        } as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        while bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    if bits > 0 && buffer != 0 {
+        return Err(invalid_graph_row_cursor("non-zero trailing base64 cursor bits"));
+    }
+    Ok(output)
+}
+
+fn graph_row_encoded_cursor_transport_limit(max_decoded_bytes: usize) -> usize {
+    let tail = match max_decoded_bytes % 3 {
+        0 => 0,
+        1 => 2,
+        _ => 3,
+    };
+    let encoded = (max_decoded_bytes / 3)
+        .checked_mul(4)
+        .and_then(|value| value.checked_add(tail))
+        .unwrap_or(usize::MAX);
+    GRAPH_ROW_CURSOR_PREFIX.len().saturating_add(encoded)
+}
+
+fn invalid_graph_row_cursor(message: impl Into<String>) -> EngineError {
+    EngineError::InvalidCursor {
+        message: message.into(),
+    }
+}
+
+fn graph_row_collect_node_ids(
+    rows: &[crate::graph_row::GraphBindingRow],
+    slot: crate::graph_row::GraphBindingSlotRef,
+) -> Result<Vec<u64>, EngineError> {
+    let mut ids = Vec::new();
+    for row in rows {
+        if let Some(id) = row.node_id_for_slot_if_bound(slot)? {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn graph_row_collect_edge_ids(
+    rows: &[crate::graph_row::GraphBindingRow],
+    slot: crate::graph_row::GraphBindingSlotRef,
+) -> Result<Vec<u64>, EngineError> {
+    let mut ids = Vec::new();
+    for row in rows {
+        if let Some(id) = row.edge_id_for_slot_if_bound(slot)? {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn graph_row_remaining_output_needs(
+    output: &EntityProjectionNeeds,
+    loaded: &EntityProjectionNeeds,
+) -> EntityProjectionNeeds {
+    let mut remaining = EntityProjectionNeeds::default();
+    for (alias, needs) in &output.nodes {
+        match loaded.nodes.get(alias) {
+            Some(loaded_needs) => {
+                if let Some(needs) = graph_row_remaining_node_needs(needs, loaded_needs) {
+                    remaining.nodes.insert(alias.clone(), needs);
+                }
+            }
+            None => {
+                remaining.nodes.insert(alias.clone(), needs.clone());
+            }
+        }
+    }
+    for (alias, needs) in &output.edges {
+        match loaded.edges.get(alias) {
+            Some(loaded_needs) => {
+                if let Some(needs) = graph_row_remaining_edge_needs(needs, loaded_needs) {
+                    remaining.edges.insert(alias.clone(), needs);
+                }
+            }
+            None => {
+                remaining.edges.insert(alias.clone(), needs.clone());
+            }
+        }
+    }
+    for (alias, needs) in &output.paths {
+        match loaded.paths.get(alias) {
+            Some(loaded_needs) => {
+                if let Some(needs) = graph_row_remaining_path_needs(needs, loaded_needs) {
+                    remaining.paths.insert(alias.clone(), needs);
+                }
+            }
+            None => {
+                if graph_row_path_needs_require_selected_field_reads(needs) {
+                    remaining.paths.insert(alias.clone(), needs.clone());
+                }
+            }
+        }
+    }
+    for (slot, needs) in &output.hidden_edges {
+        match loaded.hidden_edges.get(slot) {
+            Some(loaded_needs) => {
+                if let Some(needs) = graph_row_remaining_edge_needs(needs, loaded_needs) {
+                    remaining.hidden_edges.insert(*slot, needs);
+                }
+            }
+            None => {
+                remaining.hidden_edges.insert(*slot, needs.clone());
+            }
+        }
+    }
+    for (slot, needs) in &output.hidden_paths {
+        match loaded.hidden_paths.get(slot) {
+            Some(loaded_needs) => {
+                if let Some(needs) = graph_row_remaining_path_needs(needs, loaded_needs) {
+                    remaining.hidden_paths.insert(*slot, needs);
+                }
+            }
+            None => {
+                if graph_row_path_needs_require_selected_field_reads(needs) {
+                    remaining.hidden_paths.insert(*slot, needs.clone());
+                }
+            }
+        }
+    }
+    remaining
+}
+
+fn graph_row_remaining_node_needs(
+    needed: &NodeSelectedFieldNeeds,
+    loaded: &NodeSelectedFieldNeeds,
+) -> Option<NodeSelectedFieldNeeds> {
+    let remaining = NodeSelectedFieldNeeds {
+        key: needed.key && !loaded.key,
+        created_at: needed.created_at && !loaded.created_at,
+        props: graph_row_remaining_props(&needed.props, &loaded.props),
+        vectors: graph_row_remaining_vectors(needed.vectors, loaded.vectors),
+    };
+    graph_row_node_needs_has_source_fields(&remaining).then_some(remaining)
+}
+
+fn graph_row_remaining_edge_needs(
+    needed: &EdgeSelectedFieldNeeds,
+    loaded: &EdgeSelectedFieldNeeds,
+) -> Option<EdgeSelectedFieldNeeds> {
+    let remaining = EdgeSelectedFieldNeeds {
+        created_at: needed.created_at && !loaded.created_at,
+        props: graph_row_remaining_props(&needed.props, &loaded.props),
+    };
+    graph_row_edge_needs_has_source_fields(&remaining).then_some(remaining)
+}
+
+fn graph_row_remaining_path_needs(
+    needed: &PathSelectedFieldNeeds,
+    loaded: &PathSelectedFieldNeeds,
+) -> Option<PathSelectedFieldNeeds> {
+    let remaining = PathSelectedFieldNeeds {
+        node_ids: false,
+        edge_ids: false,
+        start_node: match (&needed.start_node, &loaded.start_node) {
+            (Some(needed), Some(loaded)) => graph_row_remaining_node_needs(needed, loaded),
+            (Some(needed), None) => {
+                graph_row_node_needs_has_source_fields(needed).then_some(needed.clone())
+            }
+            (None, _) => None,
+        },
+        end_node: match (&needed.end_node, &loaded.end_node) {
+            (Some(needed), Some(loaded)) => graph_row_remaining_node_needs(needed, loaded),
+            (Some(needed), None) => {
+                graph_row_node_needs_has_source_fields(needed).then_some(needed.clone())
+            }
+            (None, _) => None,
+        },
+        nodes: match (&needed.nodes, &loaded.nodes) {
+            (Some(needed), Some(loaded)) => graph_row_remaining_node_needs(needed, loaded),
+            (Some(needed), None) => {
+                graph_row_node_needs_has_source_fields(needed).then_some(needed.clone())
+            }
+            (None, _) => None,
+        },
+        edges: match (&needed.edges, &loaded.edges) {
+            (Some(needed), Some(loaded)) => graph_row_remaining_edge_needs(needed, loaded),
+            (Some(needed), None) => {
+                graph_row_edge_needs_has_source_fields(needed).then_some(needed.clone())
+            }
+            (None, _) => None,
+        },
+    };
+    graph_row_path_needs_require_selected_field_reads(&remaining).then_some(remaining)
+}
+
+fn graph_row_node_needs_has_source_fields(needs: &NodeSelectedFieldNeeds) -> bool {
+    needs.key
+        || needs.created_at
+        || !matches!(needs.props, PropertySelection::None)
+        || !matches!(needs.vectors, VectorSelection::None)
+}
+
+fn graph_row_edge_needs_has_source_fields(needs: &EdgeSelectedFieldNeeds) -> bool {
+    needs.created_at || !matches!(needs.props, PropertySelection::None)
+}
+
+fn graph_row_entity_needs_require_selected_field_reads(needs: &EntityProjectionNeeds) -> bool {
+    !needs.nodes.is_empty()
+        || !needs.edges.is_empty()
+        || !needs.hidden_edges.is_empty()
+        || needs
+            .paths
+            .values()
+            .any(graph_row_path_needs_require_selected_field_reads)
+        || needs
+            .hidden_paths
+            .values()
+            .any(graph_row_path_needs_require_selected_field_reads)
+}
+
+fn graph_row_path_needs_require_selected_field_reads(needs: &PathSelectedFieldNeeds) -> bool {
+    needs.start_node.is_some()
+        || needs.end_node.is_some()
+        || needs.nodes.is_some()
+        || needs.edges.is_some()
+}
+
+fn graph_row_merge_node_selected_needs(
+    target: &mut NodeSelectedFieldNeeds,
+    incoming: &NodeSelectedFieldNeeds,
+) -> Result<(), EngineError> {
+    target.key |= incoming.key;
+    target.created_at |= incoming.created_at;
+    target.props.merge_from(&incoming.props, ProjectionNeedClass::Output)?;
+    target.vectors = target.vectors.union(incoming.vectors);
+    Ok(())
+}
+
+fn graph_row_merge_edge_selected_needs(
+    target: &mut EdgeSelectedFieldNeeds,
+    incoming: &EdgeSelectedFieldNeeds,
+) -> Result<(), EngineError> {
+    target.created_at |= incoming.created_at;
+    target.props.merge_from(&incoming.props, ProjectionNeedClass::Output)?;
+    Ok(())
+}
+
+fn graph_row_path_node_hydration_needs(
+    needs: &PathSelectedFieldNeeds,
+) -> Result<Option<NodeSelectedFieldNeeds>, EngineError> {
+    let mut merged = NodeSelectedFieldNeeds::default();
+    let mut any = false;
+    for node_needs in [
+        needs.start_node.as_ref(),
+        needs.end_node.as_ref(),
+        needs.nodes.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        graph_row_merge_node_selected_needs(&mut merged, node_needs)?;
+        any = true;
+    }
+    Ok(any.then_some(merged))
+}
+
+fn graph_row_path_edge_hydration_needs(
+    needs: &PathSelectedFieldNeeds,
+) -> Result<Option<EdgeSelectedFieldNeeds>, EngineError> {
+    let Some(edge_needs) = needs.edges.as_ref() else {
+        return Ok(None);
+    };
+    let mut merged = EdgeSelectedFieldNeeds::default();
+    graph_row_merge_edge_selected_needs(&mut merged, edge_needs)?;
+    Ok(Some(merged))
+}
+
+fn graph_row_collect_path_node_ids(
+    rows: &[crate::graph_row::GraphBindingRow],
+    slot: crate::graph_row::GraphBindingSlotRef,
+    needs: &PathSelectedFieldNeeds,
+) -> Result<Vec<u64>, EngineError> {
+    let mut ids = Vec::new();
+    for row in rows {
+        let Some(path) = row.path_for_slot_if_bound(slot)? else {
+            continue;
+        };
+        if needs.nodes.is_some() {
+            ids.extend(path.path.nodes.iter().copied());
+        } else {
+            if needs.start_node.is_some() {
+                ids.extend(path.path.nodes.first().copied());
+            }
+            if needs.end_node.is_some() {
+                ids.extend(path.path.nodes.last().copied());
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn graph_row_collect_path_edge_ids(
+    rows: &[crate::graph_row::GraphBindingRow],
+    slot: crate::graph_row::GraphBindingSlotRef,
+    needs: &PathSelectedFieldNeeds,
+) -> Result<Vec<u64>, EngineError> {
+    if needs.edges.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    for row in rows {
+        let Some(path) = row.path_for_slot_if_bound(slot)? else {
+            continue;
+        };
+        ids.extend(path.path.edges.iter().copied());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn graph_row_remaining_props(
+    needed: &PropertySelection,
+    loaded: &PropertySelection,
+) -> PropertySelection {
+    match (needed, loaded) {
+        (PropertySelection::None, _) | (_, PropertySelection::All) => PropertySelection::None,
+        (PropertySelection::All, _) => PropertySelection::All,
+        (PropertySelection::Keys(keys), PropertySelection::Keys(loaded_keys)) => {
+            let remaining = keys
+                .iter()
+                .filter(|key| !loaded_keys.contains(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            if remaining.is_empty() {
+                PropertySelection::None
+            } else {
+                PropertySelection::Keys(remaining)
+            }
+        }
+        (PropertySelection::Keys(keys), PropertySelection::None) => {
+            PropertySelection::Keys(keys.clone())
+        }
+    }
+}
+
+fn graph_row_remaining_vectors(
+    needed: VectorSelection,
+    loaded: VectorSelection,
+) -> VectorSelection {
+    match (
+        needed.needs_dense() && !loaded.needs_dense(),
+        needed.needs_sparse() && !loaded.needs_sparse(),
+    ) {
+        (false, false) => VectorSelection::None,
+        (true, false) => VectorSelection::Dense,
+        (false, true) => VectorSelection::Sparse,
+        (true, true) => VectorSelection::Both,
+    }
+}
+
+fn graph_node_value_from_selected(
+    node_id: u64,
+    fields: &SelectedNodeFields,
+    catalog: &ReadLabelCatalogSnapshot,
+) -> Result<GraphNodeValue, EngineError> {
+    Ok(GraphNodeValue {
+        id: Some(node_id),
+        labels: Some(graph_row_node_label_names(node_id, fields.meta.label_ids, catalog)?),
+        key: fields.key.clone(),
+        props: Some(graph_row_props_to_values(&fields.props)?),
+        weight: Some(fields.meta.weight),
+        created_at: fields.created_at,
+        updated_at: Some(fields.meta.updated_at),
+        dense_vector: fields.dense_vector.clone(),
+        sparse_vector: fields.sparse_vector.clone(),
+    })
+}
+
+fn graph_edge_value_from_selected(
+    edge_id: u64,
+    fields: &SelectedEdgeFields,
+    catalog: &ReadLabelCatalogSnapshot,
+) -> Result<GraphEdgeValue, EngineError> {
+    Ok(GraphEdgeValue {
+        id: Some(edge_id),
+        from: Some(fields.meta.from),
+        to: Some(fields.meta.to),
+        label: Some(
+            catalog
+                .edge_label(fields.meta.label_id)
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "edge record {} references missing edge-label label_id {}",
+                        edge_id, fields.meta.label_id
+                    ))
+                })?
+                .to_string(),
+        ),
+        props: Some(graph_row_props_to_values(&fields.props)?),
+        weight: Some(fields.meta.weight),
+        created_at: fields.created_at,
+        updated_at: Some(fields.meta.updated_at),
+        valid_from: Some(fields.meta.valid_from),
+        valid_to: Some(fields.meta.valid_to),
+    })
+}
+
+fn graph_row_node_label_names(
+    node_id: u64,
+    label_ids: NodeLabelSet,
+    catalog: &ReadLabelCatalogSnapshot,
+) -> Result<Vec<String>, EngineError> {
+    let mut labels = Vec::with_capacity(label_ids.len());
+    for &label_id in label_ids.as_slice() {
+        labels.push(
+            catalog
+                .node_label(label_id)
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "node record {} references missing node label_id {}",
+                        node_id, label_id
+                    ))
+                })?
+                .to_string(),
+        );
+    }
+    Ok(labels)
+}
+
+fn graph_row_props_to_values(
+    props: &BTreeMap<String, PropValue>,
+) -> Result<BTreeMap<String, GraphValue>, EngineError> {
+    props.iter()
+        .map(|(key, value)| Ok((key.clone(), graph_row_prop_to_value(value)?)))
+        .collect()
+}
+
+fn graph_row_prop_to_value(value: &PropValue) -> Result<GraphValue, EngineError> {
+    Ok(match value {
+        PropValue::Null => GraphValue::Null,
+        PropValue::Bool(value) => GraphValue::Bool(*value),
+        PropValue::Int(value) => GraphValue::Int(*value),
+        PropValue::UInt(value) => GraphValue::UInt(*value),
+        PropValue::Float(value) => GraphValue::Float(*value),
+        PropValue::String(value) => GraphValue::String(value.clone()),
+        PropValue::Bytes(value) => GraphValue::Bytes(value.clone()),
+        PropValue::Array(values) => GraphValue::List(
+            values
+                .iter()
+                .map(graph_row_prop_to_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        PropValue::Map(values) => GraphValue::Map(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), graph_row_prop_to_value(value)?)))
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()?,
+        ),
+    })
 }
 
 impl ReadView {
+    fn populate_verified_node_records(
+        &self,
+        page: &mut VerifiedNodePage,
+    ) -> Result<(), EngineError> {
+        let nodes = self.get_nodes_raw(&page.ids)?;
+        page.nodes = nodes.into_iter().flatten().collect();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_node_candidate_chunk(
+        &self,
+        chunk: &[u64],
+        query: &NormalizedNodeQuery,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        include_key: bool,
+        property_keys: &[String],
+        ids: &mut Vec<u64>,
+        target: usize,
+    ) -> Result<ControlFlow<()>, EngineError> {
+        #[cfg(test)]
+        self.note_node_visibility_meta_reads(chunk.len());
+        let visibility = self.sources().find_node_visibility_meta(chunk)?;
+        let mut decisions = Vec::new();
+        let mut projected_candidate_ids = Vec::new();
+
+        for (&node_id, state) in chunk.iter().zip(visibility.iter()) {
+            let NodeVisibilityState::Live(meta) = state else {
+                continue;
+            };
+            let query_meta = node_query_meta_from_visibility(node_id, meta);
+            if !query_node_metadata_constraints_match(query, &query_meta, policy_cutoffs) {
+                continue;
+            }
+            match node_filter_metadata_outcome(&query.filter, &query_meta) {
+                Some(false) => continue,
+                Some(true) if !include_key => decisions.push((node_id, false)),
+                Some(true) | None => {
+                    decisions.push((node_id, true));
+                    projected_candidate_ids.push(node_id);
+                }
+            }
+        }
+
+        let mut projected_matches = NodeIdSet::default();
+        if !projected_candidate_ids.is_empty() {
+            let projected = self.sources().find_node_projected_fields(
+                &projected_candidate_ids,
+                &NodeSelectedFieldNeeds {
+                    key: include_key,
+                    props: PropertySelection::Keys(property_keys.to_vec()),
+                    ..NodeSelectedFieldNeeds::default()
+                },
+            )?;
+            for (&node_id, selected) in projected_candidate_ids.iter().zip(projected.iter()) {
+                let Some(selected) = selected else {
+                    continue;
+                };
+                if query_node_selected_fields_match(query, selected) {
+                    projected_matches.insert(node_id);
+                }
+            }
+        }
+
+        for (node_id, needs_projection) in decisions {
+            if needs_projection && !projected_matches.contains(&node_id) {
+                continue;
+            }
+            ids.push(node_id);
+            if ids.len() >= target {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+
+        Ok(ControlFlow::Continue(()))
+    }
+
     fn query_node_page_from_candidates(
         &self,
         candidate_ids: &[u64],
@@ -1475,87 +4130,34 @@ impl ReadView {
         hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<VerifiedNodePage, EngineError> {
-        if query.filter.is_always_true() && query.keys.is_empty() {
-            return self.query_node_page_from_metadata_candidates(
-                candidate_ids,
-                query,
-                hydrate,
-                policy_cutoffs,
-            );
-        }
-
         let limit = page_limit(&query.page);
         let target = page_verify_target(limit);
         let start = first_candidate_after(candidate_ids, query.page.after);
         let mut ids = Vec::with_capacity(if limit > 0 { limit } else { 0 });
-        let mut nodes = Vec::with_capacity(if hydrate && limit > 0 { limit } else { 0 });
+        let include_key = !query.keys.is_empty();
+        let mut property_keys = Vec::new();
+        collect_node_filter_property_keys(&query.filter, &mut property_keys);
 
         for chunk in candidate_ids[start..].chunks(QUERY_VERIFY_CHUNK) {
-            #[cfg(test)]
-            self.note_final_verifier_record_reads(chunk.len());
-            let chunk_nodes = self.get_nodes_raw(chunk)?;
-            for (&node_id, node) in chunk.iter().zip(chunk_nodes.into_iter()) {
-                let Some(node) = node.as_ref() else {
-                    continue;
-                };
-                if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                    continue;
-                }
-                if !query_node_matches(query, node) {
-                    continue;
-                }
-                ids.push(node_id);
-                if hydrate {
-                    nodes.push(node.clone());
-                }
-                if ids.len() >= target {
-                    return Ok(finalize_verified_page(ids, nodes, limit));
-                }
-            }
-        }
-
-        Ok(finalize_verified_page(ids, nodes, limit))
-    }
-
-    fn query_node_page_from_metadata_candidates(
-        &self,
-        candidate_ids: &[u64],
-        query: &NormalizedNodeQuery,
-        hydrate: bool,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<VerifiedNodePage, EngineError> {
-        let limit = page_limit(&query.page);
-        let target = page_verify_target(limit);
-        let start = first_candidate_after(candidate_ids, query.page.after);
-        let mut ids = Vec::with_capacity(if limit > 0 { limit } else { 0 });
-
-        for chunk in candidate_ids[start..].chunks(QUERY_VERIFY_CHUNK) {
-            #[cfg(test)]
-            self.note_node_visibility_meta_reads(chunk.len());
-            let visibility = self.sources().find_node_visibility_meta(chunk)?;
-            for (&node_id, state) in chunk.iter().zip(visibility.iter()) {
-                let NodeVisibilityState::Live(meta) = state else {
-                    continue;
-                };
-                if !query_node_visibility_meta_matches(query, node_id, meta, policy_cutoffs) {
-                    continue;
-                }
-                ids.push(node_id);
-                if ids.len() >= target {
-                    let mut page = finalize_verified_page(ids, Vec::new(), limit);
-                    if hydrate {
-                        let nodes = self.get_nodes_raw(&page.ids)?;
-                        page.nodes = nodes.into_iter().flatten().collect();
-                    }
-                    return Ok(page);
-                }
+            if self
+                .verify_node_candidate_chunk(
+                    chunk,
+                    query,
+                    policy_cutoffs,
+                    include_key,
+                    &property_keys,
+                    &mut ids,
+                    target,
+                )?
+                .is_break()
+            {
+                break;
             }
         }
 
         let mut page = finalize_verified_page(ids, Vec::new(), limit);
         if hydrate {
-            let nodes = self.get_nodes_raw(&page.ids)?;
-            page.nodes = nodes.into_iter().flatten().collect();
+            self.populate_verified_node_records(&mut page)?;
         }
         Ok(page)
     }
@@ -1573,74 +4175,33 @@ impl ReadView {
             Some(limit) if limit > 0 => limit.saturating_add(1).saturating_mul(4).max(limit + 1),
             _ => QUERY_VERIFY_CHUNK,
         };
-        let metadata_only = query.filter.is_always_true() && query.keys.is_empty();
         let mut ids = Vec::with_capacity(if limit > 0 { limit } else { 0 });
-        let mut nodes = Vec::with_capacity(if hydrate && limit > 0 { limit } else { 0 });
+        let include_key = !query.keys.is_empty();
+        let mut property_keys = Vec::new();
+        collect_node_filter_property_keys(&query.filter, &mut property_keys);
 
         self.scan_raw_node_label_candidates(
             label_ids,
             query.page.after,
             chunk_limit,
             |chunk| {
-                if metadata_only {
-                    #[cfg(test)]
-                    self.note_node_visibility_meta_reads(chunk.len());
-                    let visibility = self.sources().find_node_visibility_meta(chunk)?;
-                    for (&node_id, state) in chunk.iter().zip(visibility.iter()) {
-                        let NodeVisibilityState::Live(meta) = state else {
-                            continue;
-                        };
-                        if !query_node_visibility_meta_matches(
-                            query,
-                            node_id,
-                            meta,
-                            policy_cutoffs,
-                        ) {
-                            continue;
-                        }
-                        ids.push(node_id);
-                        if ids.len() >= target {
-                            return Ok(ControlFlow::Break(()));
-                        }
-                    }
-                    return Ok(ControlFlow::Continue(()));
-                }
-
-                #[cfg(test)]
-                self.note_final_verifier_record_reads(chunk.len());
-                let chunk_nodes = self.get_nodes_raw(chunk)?;
-                for (&node_id, node) in chunk.iter().zip(chunk_nodes.into_iter()) {
-                    let Some(node) = node.as_ref() else {
-                        continue;
-                    };
-                    if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                        continue;
-                    }
-                    if !query_node_matches(query, node) {
-                        continue;
-                    }
-                    ids.push(node_id);
-                    if hydrate {
-                        nodes.push(node.clone());
-                    }
-                    if ids.len() >= target {
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-                Ok(ControlFlow::Continue(()))
+                self.verify_node_candidate_chunk(
+                    chunk,
+                    query,
+                    policy_cutoffs,
+                    include_key,
+                    &property_keys,
+                    &mut ids,
+                    target,
+                )
             },
         )?;
 
-        if metadata_only {
-            let mut page = finalize_verified_page(ids, Vec::new(), limit);
-            if hydrate {
-                let nodes = self.get_nodes_raw(&page.ids)?;
-                page.nodes = nodes.into_iter().flatten().collect();
-            }
-            Ok(page)
-        } else {
-            Ok(finalize_verified_page(ids, nodes, limit))
+        let mut page = finalize_verified_page(ids, Vec::new(), limit);
+        if hydrate {
+            self.populate_verified_node_records(&mut page)?;
         }
+        Ok(page)
     }
 
     fn query_node_page_from_single_label_scan(
@@ -1650,15 +4211,6 @@ impl ReadView {
         hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<VerifiedNodePage, EngineError> {
-        let limit = page_limit(&query.page);
-        let target = page_verify_target(limit);
-        let chunk_limit = match query.page.limit {
-            Some(limit) if limit > 0 => limit.saturating_add(1).saturating_mul(4).max(limit + 1),
-            _ => QUERY_VERIFY_CHUNK,
-        };
-        let mut ids = Vec::with_capacity(if limit > 0 { limit } else { 0 });
-        let mut nodes = Vec::with_capacity(if hydrate && limit > 0 { limit } else { 0 });
-
         if !hydrate
             && policy_cutoffs.is_none()
             && query.filter.is_always_true()
@@ -1675,35 +4227,7 @@ impl ReadView {
             });
         }
 
-        if query.filter.is_always_true() && query.keys.is_empty() {
-            return self.query_node_page_from_label_scan(
-                query,
-                &[single_label_id],
-                hydrate,
-                policy_cutoffs,
-            );
-        }
-
-        self.scan_nodes_by_single_label_id_filtered(
-            single_label_id,
-            query.page.after,
-            chunk_limit,
-            policy_cutoffs,
-            |node_id, node| {
-                if query_node_matches(query, node) {
-                    ids.push(node_id);
-                    if hydrate {
-                        nodes.push(node.clone());
-                    }
-                    if ids.len() >= target {
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-                Ok(ControlFlow::Continue(()))
-            },
-        )?;
-
-        Ok(finalize_verified_page(ids, nodes, limit))
+        self.query_node_page_from_label_scan(query, &[single_label_id], hydrate, policy_cutoffs)
     }
 
     fn full_scan_source_node_ids(&self) -> Result<Vec<FullScanNodeSource<'_>>, EngineError> {
@@ -1722,15 +4246,14 @@ impl ReadView {
         Ok(sources)
     }
 
-    fn scan_full_node_ids_filtered<F>(
+    fn scan_full_node_id_chunks<F>(
         &self,
         start_after: Option<u64>,
         chunk_limit: usize,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         mut visitor: F,
     ) -> Result<(), EngineError>
     where
-        F: FnMut(u64, &NodeRecord) -> Result<ControlFlow<()>, EngineError>,
+        F: FnMut(&[u64]) -> Result<ControlFlow<()>, EngineError>,
     {
         let sources = self.full_scan_source_node_ids()?;
         let mut heap = BinaryHeap::new();
@@ -1755,7 +4278,7 @@ impl ReadView {
             last_seen = Some(node_id);
             chunk.push(node_id);
             if chunk.len() >= chunk_limit.max(1) {
-                if self.visit_full_scan_chunk(&chunk, policy_cutoffs, &mut visitor)?.is_break() {
+                if visitor(&chunk)?.is_break() {
                     return Ok(());
                 }
                 chunk.clear();
@@ -1763,33 +4286,9 @@ impl ReadView {
         }
 
         if !chunk.is_empty() {
-            let _ = self.visit_full_scan_chunk(&chunk, policy_cutoffs, &mut visitor)?;
+            let _ = visitor(&chunk)?;
         }
         Ok(())
-    }
-
-    fn visit_full_scan_chunk<F>(
-        &self,
-        chunk: &[u64],
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-        visitor: &mut F,
-    ) -> Result<ControlFlow<()>, EngineError>
-    where
-        F: FnMut(u64, &NodeRecord) -> Result<ControlFlow<()>, EngineError>,
-    {
-        let nodes = self.get_nodes_raw(chunk)?;
-        for (&node_id, node) in chunk.iter().zip(nodes.iter()) {
-            let Some(node) = node.as_ref() else {
-                continue;
-            };
-            if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                continue;
-            }
-            if visitor(node_id, node)?.is_break() {
-                return Ok(ControlFlow::Break(()));
-            }
-        }
-        Ok(ControlFlow::Continue(()))
     }
 
     fn query_node_page_from_full_scan(
@@ -1805,27 +4304,27 @@ impl ReadView {
             _ => QUERY_VERIFY_CHUNK,
         };
         let mut ids = Vec::with_capacity(if limit > 0 { limit } else { 0 });
-        let mut nodes = Vec::with_capacity(if hydrate && limit > 0 { limit } else { 0 });
+        let include_key = !query.keys.is_empty();
+        let mut property_keys = Vec::new();
+        collect_node_filter_property_keys(&query.filter, &mut property_keys);
 
-        self.scan_full_node_ids_filtered(
-            query.page.after,
-            chunk_limit,
-            policy_cutoffs,
-            |node_id, node| {
-                if query_node_matches(query, node) {
-                    ids.push(node_id);
-                    if hydrate {
-                        nodes.push(node.clone());
-                    }
-                    if ids.len() >= target {
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-                Ok(ControlFlow::Continue(()))
-            },
-        )?;
+        self.scan_full_node_id_chunks(query.page.after, chunk_limit, |chunk| {
+            self.verify_node_candidate_chunk(
+                chunk,
+                query,
+                policy_cutoffs,
+                include_key,
+                &property_keys,
+                &mut ids,
+                target,
+            )
+        })?;
 
-        Ok(finalize_verified_page(ids, nodes, limit))
+        let mut page = finalize_verified_page(ids, Vec::new(), limit);
+        if hydrate {
+            self.populate_verified_node_records(&mut page)?;
+        }
+        Ok(page)
     }
 
     fn materialize_node_candidate_source(
@@ -1882,13 +4381,11 @@ impl ReadView {
             }
             NodeCandidateMaterialization::PropertyRangeIndex {
                 index_id,
-                domain,
                 lower,
                 upper,
             } => {
                 let (ids, followup) = self.ready_range_candidate_ids(
                     *index_id,
-                    *domain,
                     lower.as_ref(),
                     upper.as_ref(),
                     eager_cap + 1,
@@ -2116,50 +4613,64 @@ impl ReadView {
     fn query_node_page_planned(
         &self,
         query: &NormalizedNodeQuery,
-        planned: &PlannedNodeQuery,
+        planned: PlannedNodeQuery,
         hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<(VerifiedNodePage, Vec<SecondaryIndexReadFollowup>), EngineError> {
-        match &planned.driver {
+        let PlannedNodeQuery {
+            driver,
+            cap_context,
+            warnings: _,
+            mut followups,
+        } = planned;
+
+        match &driver {
             NodePhysicalPlan::Empty => Ok((
                 VerifiedNodePage {
                     ids: Vec::new(),
                     nodes: Vec::new(),
                     next_cursor: None,
                 },
-                Vec::new(),
+                followups,
             )),
             NodePhysicalPlan::Source(source) => {
-                self.query_node_page_from_source_driver(
+                let (page, mut source_followups) = self.query_node_page_from_source_driver(
                     source,
                     query,
-                    planned.cap_context,
+                    cap_context,
                     hydrate,
                     policy_cutoffs,
-                )
+                )?;
+                followups.append(&mut source_followups);
+                Ok((page, followups))
             }
             plan => {
-                match self.materialize_node_physical_plan(query, planned.cap_context, plan)? {
-                    CandidateMaterializationResult::Ready { ids, followups } => Ok((
-                        self.query_node_page_from_candidates(
+                match self.materialize_node_physical_plan(query, cap_context, plan)? {
+                    CandidateMaterializationResult::Ready {
+                        ids,
+                        followups: mut materialization_followups,
+                    } => {
+                        let page = self.query_node_page_from_candidates(
                             &ids,
                             query,
                             hydrate,
                             policy_cutoffs,
-                        )?,
-                        followups,
-                    )),
+                        )?;
+                        followups.append(&mut materialization_followups);
+                        Ok((page, followups))
+                    }
                     CandidateMaterializationResult::TooBroad {
                         followups: mut materialization_followups,
                     } => {
                         let (page, mut fallback_followups) = self.query_node_page_from_legal_universe(
                             query,
-                            planned.cap_context,
+                            cap_context,
                             hydrate,
                             policy_cutoffs,
                         )?;
-                        materialization_followups.append(&mut fallback_followups);
-                        Ok((page, materialization_followups))
+                        followups.append(&mut materialization_followups);
+                        followups.append(&mut fallback_followups);
+                        Ok((page, followups))
                     }
                 }
             }
@@ -2174,7 +4685,7 @@ impl ReadView {
         let planned = self.plan_normalized_node_query(&normalized)?;
         let policy_cutoffs = self.query_policy_cutoffs();
         let (page, followups) =
-            self.query_node_page_planned(&normalized, &planned, false, policy_cutoffs.as_ref())?;
+            self.query_node_page_planned(&normalized, planned, false, policy_cutoffs.as_ref())?;
         let value = QueryNodeIdsResult {
             items: page.ids,
             next_cursor: page.next_cursor,
@@ -2190,7 +4701,7 @@ impl ReadView {
         let planned = self.plan_normalized_node_query(&normalized)?;
         let policy_cutoffs = self.query_policy_cutoffs();
         let (page, followups) =
-            self.query_node_page_planned(&normalized, &planned, true, policy_cutoffs.as_ref())?;
+            self.query_node_page_planned(&normalized, planned, true, policy_cutoffs.as_ref())?;
         let items = page
             .nodes
             .into_iter()
@@ -2350,14 +4861,12 @@ impl ReadView {
                 index_id,
                 label_id,
                 prop_key,
-                domain,
                 lower,
                 upper,
             } => {
                 let _ = (label_id, prop_key);
                 let (ids, followup) = self.ready_edge_range_candidate_ids(
                     *index_id,
-                    *domain,
                     lower.as_ref(),
                     upper.as_ref(),
                     cap.saturating_add(1),
@@ -2822,14 +5331,19 @@ impl ReadView {
             let projected = self
                 .sources()
                 .find_edge_properties(&property_candidate_ids, &property_keys)?;
-            for (&edge_id, props) in property_candidate_ids.iter().zip(projected.iter()) {
+            for (&edge_id, props) in property_candidate_ids.iter().zip(projected.into_iter()) {
                 let Some(props) = props else {
                     continue;
                 };
                 let Some(query_meta) = metadata_by_property_candidate.get(&edge_id) else {
                     continue;
                 };
-                if edge_filter_projected_matches(&query.filter, query_meta, props) {
+                let selected = SelectedEdgeFields {
+                    meta: *query_meta,
+                    props,
+                    created_at: None,
+                };
+                if edge_filter_projected_matches(&query.filter, &selected) {
                     property_matches.insert(edge_id);
                 }
             }
@@ -3222,1527 +5736,3439 @@ impl ReadView {
         })
     }
 
-    fn pattern_edge_context(
-        edge: &NormalizedEdgePattern,
-        state: &PatternExecutionState,
-    ) -> Result<PatternEdgeContext, EngineError> {
-        let from_bound = state.nodes[edge.from_index].is_some();
-        let to_bound = state.nodes[edge.to_index].is_some();
-        let (source_index, target_index, direction) = if from_bound {
-            (edge.from_index, edge.to_index, edge.direction)
-        } else if to_bound {
-            (
-                edge.to_index,
-                edge.from_index,
-                reverse_pattern_direction(edge.direction),
-            )
-        } else {
-            return Err(EngineError::InvalidOperation(
-                "pattern expansion encountered an unbound edge".into(),
-            ));
-        };
+    fn normalize_graph_row_runtime_plan(
+        &self,
+        query: &NormalizedGraphRowQuery,
+    ) -> Result<GraphRowRuntimePlan, EngineError> {
+        let mut nodes = Vec::with_capacity(query.nodes.len());
+        let mut node_by_alias = BTreeMap::new();
+        let mut warnings = Vec::new();
+        for node in &query.nodes {
+            let runtime = self.normalize_graph_row_runtime_node(node, query)?;
+            for warning in &runtime.query.warnings {
+                push_query_warning(&mut warnings, *warning);
+            }
+            node_by_alias.insert(runtime.alias.clone(), nodes.len());
+            nodes.push(runtime);
+        }
 
-        Ok(PatternEdgeContext {
-            source_id: state.nodes[source_index]
-                .expect("pattern expansion source alias must already be bound"),
-            target_index,
-            target_id: state.nodes[target_index],
-            direction,
+        let mut bound_slots = BTreeSet::new();
+        let mut next_hidden_id = 0usize;
+        let mut runtime = self.normalize_graph_row_runtime_piece_plan(
+            query,
+            &query.pieces,
+            &[],
+            nodes,
+            node_by_alias,
+            &mut next_hidden_id,
+            &mut bound_slots,
+        )?;
+        for warning in warnings {
+            push_query_warning(&mut runtime.warnings, warning);
+        }
+        Ok(runtime)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn normalize_graph_row_runtime_piece_plan(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        pieces: &[GraphPatternPiece],
+        scope: &[usize],
+        nodes: Vec<GraphRowRuntimeNode>,
+        node_by_alias: BTreeMap<String, usize>,
+        next_hidden_id: &mut usize,
+        bound_slots: &mut BTreeSet<crate::graph_row::GraphBindingSlotRef>,
+    ) -> Result<GraphRowRuntimePlan, EngineError> {
+        let mut edges = Vec::new();
+        let mut required_segments = Vec::new();
+        let mut steps = Vec::new();
+        let mut warnings = Vec::new();
+        let mut current_segment_edges = Vec::new();
+        let mut pending_barriers = Vec::new();
+        let mut edge_by_piece = BTreeMap::new();
+        let fixed_paths = graph_row_fixed_paths_for_scope(query, scope);
+        let mut next_fixed_path = 0usize;
+        for (piece_index, piece) in pieces.iter().enumerate() {
+            match piece {
+                GraphPatternPiece::Edge(edge) => {
+                    let runtime =
+                        self.normalize_graph_row_runtime_edge(edge, query, next_hidden_id)?;
+                    for warning in &runtime.warnings {
+                        push_query_warning(&mut warnings, *warning);
+                    }
+                    current_segment_edges.push(edges.len());
+                    bound_slots.insert(runtime.from_slot);
+                    bound_slots.insert(runtime.to_slot);
+                    if let Some(edge_slot) = runtime.edge_slot {
+                        bound_slots.insert(edge_slot);
+                    }
+                    if let Some(hidden_slot) = runtime.hidden_slot {
+                        bound_slots.insert(hidden_slot);
+                    }
+                    edge_by_piece.insert(piece_index, edges.len());
+                    edges.push(runtime);
+                }
+                GraphPatternPiece::Optional(group) => {
+                    if let Some(segment_index) = graph_row_push_required_segment(
+                        &mut required_segments,
+                        &mut current_segment_edges,
+                        &mut pending_barriers,
+                    ) {
+                        steps.push(GraphRowRuntimeStep::RequiredSegment(segment_index));
+                    }
+                    graph_row_push_fixed_path_steps_before_piece(
+                        query,
+                        &fixed_paths,
+                        piece_index,
+                        &edge_by_piece,
+                        &nodes,
+                        &node_by_alias,
+                        &edges,
+                        &mut next_fixed_path,
+                        &mut steps,
+                        bound_slots,
+                    )?;
+                    let left_slots = bound_slots.iter().copied().collect::<Vec<_>>();
+                    let dependency_slots = graph_row_optional_dependency_slots(
+                        group,
+                        &query.binding_schema,
+                        bound_slots,
+                    )?;
+                    let before_group = bound_slots.clone();
+                    let mut group_bound_slots = before_group.clone();
+                    let mut group_scope = scope.to_vec();
+                    group_scope.push(piece_index);
+                    let group_runtime = self.normalize_graph_row_runtime_piece_plan(
+                        query,
+                        &group.pieces,
+                        &group_scope,
+                        nodes.clone(),
+                        node_by_alias.clone(),
+                        next_hidden_id,
+                        &mut group_bound_slots,
+                    )?;
+                    let mut introduced_slots = group_bound_slots
+                        .difference(&before_group)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    introduced_slots.sort_unstable();
+                    for warning in &group_runtime.warnings {
+                        push_query_warning(&mut warnings, *warning);
+                    }
+                    let where_expr = group
+                        .where_
+                        .as_ref()
+                        .map(|expr| crate::graph_row::bind_graph_expr(&query.binding_schema, expr))
+                        .transpose()?;
+                    let where_needs = group
+                        .where_
+                        .as_ref()
+                        .map(|expr| {
+                            crate::graph_row::collect_graph_expr_projection_needs(
+                                &query.binding_schema,
+                                expr,
+                                ProjectionNeedClass::Residual,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+                    let where_present = where_expr.is_some();
+                    steps.push(GraphRowRuntimeStep::Optional(GraphRowRuntimeOptionalGroup {
+                        piece_index,
+                        pieces_len: group.pieces.len(),
+                        runtime: Box::new(group_runtime),
+                        introduced_slots: introduced_slots.clone(),
+                        dependency_slots,
+                        left_slots,
+                        where_expr,
+                        where_needs,
+                        where_present,
+                    }));
+                    bound_slots.extend(introduced_slots);
+                    pending_barriers.push(GraphRowPlanBarrier {
+                        kind: GraphRowPlanBarrierKind::Optional,
+                        piece_index,
+                    });
+                }
+                GraphPatternPiece::VariableLength(vlp) => {
+                    if let Some(segment_index) = graph_row_push_required_segment(
+                        &mut required_segments,
+                        &mut current_segment_edges,
+                        &mut pending_barriers,
+                    ) {
+                        steps.push(GraphRowRuntimeStep::RequiredSegment(segment_index));
+                    }
+                    graph_row_push_fixed_path_steps_before_piece(
+                        query,
+                        &fixed_paths,
+                        piece_index,
+                        &edge_by_piece,
+                        &nodes,
+                        &node_by_alias,
+                        &edges,
+                        &mut next_fixed_path,
+                        &mut steps,
+                        bound_slots,
+                    )?;
+                    let runtime =
+                        self.normalize_graph_row_runtime_vlp(piece_index, vlp, query, next_hidden_id)?;
+                    for warning in &runtime.warnings {
+                        push_query_warning(&mut warnings, *warning);
+                    }
+                    bound_slots.insert(runtime.from_slot);
+                    bound_slots.insert(runtime.to_slot);
+                    if let Some(edge_slot) = runtime.edge_slot {
+                        bound_slots.insert(edge_slot);
+                    }
+                    if let Some(path_slot) = runtime.path_slot {
+                        bound_slots.insert(path_slot);
+                    }
+                    if let Some(hidden_slot) = runtime.hidden_slot {
+                        bound_slots.insert(hidden_slot);
+                    }
+                    steps.push(GraphRowRuntimeStep::VariableLength(runtime));
+                    pending_barriers.push(GraphRowPlanBarrier {
+                        kind: GraphRowPlanBarrierKind::VariableLength,
+                        piece_index,
+                    });
+                }
+            }
+        }
+        if let Some(segment_index) = graph_row_push_required_segment(
+            &mut required_segments,
+            &mut current_segment_edges,
+            &mut pending_barriers,
+        ) {
+            steps.push(GraphRowRuntimeStep::RequiredSegment(segment_index));
+        }
+        graph_row_push_remaining_fixed_path_steps(
+            query,
+            &fixed_paths,
+            &edge_by_piece,
+            &nodes,
+            &node_by_alias,
+            &edges,
+            &mut next_fixed_path,
+            &mut steps,
+            bound_slots,
+        )?;
+
+        Ok(GraphRowRuntimePlan {
+            nodes,
+            node_by_alias,
+            edges,
+            required_segments,
+            steps,
+            warnings,
         })
     }
 
-    fn pattern_verified_target_ids_by_index(
+    fn normalize_graph_row_runtime_node(
         &self,
-        query: &NormalizedGraphPatternQuery,
-        mut candidate_ids_by_index: Vec<Vec<u64>>,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<Vec<NodeIdSet>, EngineError> {
-        let mut verified_by_index = vec![NodeIdSet::default(); query.nodes.len()];
-        for (target_index, candidate_ids) in candidate_ids_by_index.iter_mut().enumerate() {
-            if candidate_ids.is_empty() {
-                continue;
+        node: &GraphNodePattern,
+        query: &NormalizedGraphRowQuery,
+    ) -> Result<GraphRowRuntimeNode, EngineError> {
+        let slot = query
+            .binding_schema
+            .slot_for_alias(&node.alias)
+            .ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row node alias '{}' is missing from binding schema",
+                    node.alias
+                ))
+            })?;
+        let (label_filter, single_label_id, warnings) =
+            self.resolve_node_query_label_filter(node.label_filter.as_ref())?;
+        let mut filter = normalize_optional_node_filter(node.filter.as_ref())?;
+        if label_filter.is_empty_constraint() {
+            filter = NormalizedNodeFilter::AlwaysFalse;
+        }
+
+        let mut ids = node.ids.clone();
+        if !node.keys.is_empty() {
+            let mut key_refs = Vec::with_capacity(node.keys.len());
+            for key in &node.keys {
+                match self.label_catalog.resolve_node_label_for_read(&key.label)? {
+                    Some(label_id) => key_refs.push((label_id, key.key.as_str())),
+                    None => {
+                        filter = NormalizedNodeFilter::AlwaysFalse;
+                    }
+                }
             }
-            candidate_ids.sort_unstable();
-            candidate_ids.dedup();
-            let target_query = &query.nodes[target_index].query;
-            if target_query.keys.is_empty()
-                && node_filter_visibility_meta_compatible(&target_query.filter)
-            {
-                #[cfg(test)]
-                self.note_node_visibility_meta_reads(candidate_ids.len());
-                let visibility = self.sources().find_node_visibility_meta(candidate_ids)?;
-                for (&node_id, state) in candidate_ids.iter().zip(visibility.iter()) {
-                    let NodeVisibilityState::Live(meta) = state else {
-                        continue;
-                    };
-                    if query_node_visibility_meta_matches(
-                        target_query,
-                        node_id,
-                        meta,
-                        policy_cutoffs,
-                    ) {
-                        verified_by_index[target_index].insert(node_id);
-                    }
-                }
-            } else {
-                let nodes = self.get_nodes_raw(candidate_ids)?;
-                for (&node_id, node) in candidate_ids.iter().zip(nodes.iter()) {
-                    let Some(node) = node.as_ref() else {
-                        continue;
-                    };
-                    if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
-                        continue;
-                    }
-                    if query_node_matches(target_query, node) {
-                        verified_by_index[target_index].insert(node_id);
-                    }
-                }
+            if !key_refs.is_empty() {
+                ids.extend(
+                    self.sources()
+                        .find_node_ids_by_label_keys(&key_refs)?
+                        .into_iter()
+                        .flatten(),
+                );
             }
         }
-        Ok(verified_by_index)
+        ids.sort_unstable();
+        ids.dedup();
+
+        Ok(GraphRowRuntimeNode {
+            alias: node.alias.clone(),
+            slot,
+            query: NormalizedNodeQuery {
+                single_label_id,
+                label_filter,
+                ids,
+                keys: Vec::new(),
+                filter,
+                allow_full_scan: query.options.allow_full_scan,
+                page: PageRequest::default(),
+                warnings,
+            },
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn flush_pattern_pending_entries(
+    fn normalize_graph_row_runtime_edge(
         &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        edge: &NormalizedEdgePattern,
-        states: &[PatternExecutionState],
-        contexts: &[PatternEdgeContext],
-        pending: &mut Vec<PatternPendingEntry>,
-        edge_filter_match_cache: &mut NodeIdMap<bool>,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-        unnamed_emitted_targets: &mut [NodeIdSet],
-        unnamed_bound_satisfied: &mut [bool],
-        on_next: &mut impl FnMut(PatternExecutionState) -> Result<ControlFlow<()>, EngineError>,
-    ) -> Result<ControlFlow<()>, EngineError> {
-        if pending.is_empty() {
-            return Ok(ControlFlow::Continue(()));
-        }
-
-        let mode = pattern_edge_filter_mode(&edge.filter);
-        let matching_edges = match mode {
-            PatternEdgeFilterMode::AlwaysTrue | PatternEdgeFilterMode::PostingMetadataOnly => None,
-            PatternEdgeFilterMode::BatchMetadataNeeded
-            | PatternEdgeFilterMode::PropertyVerifier => {
-                let mut edge_ids: Vec<u64> = pending
-                    .iter()
-                    .map(|pending| pending.entry.edge_id)
-                    .collect();
-                edge_ids.sort_unstable();
-                edge_ids.dedup();
-                let mut matching_edges = NodeIdSet::default();
-                let mut unresolved_edge_ids = Vec::new();
-                for edge_id in edge_ids {
-                    match edge_filter_match_cache.get(&edge_id).copied() {
-                        Some(true) => {
-                            matching_edges.insert(edge_id);
-                        }
-                        Some(false) => {}
-                        None => unresolved_edge_ids.push(edge_id),
-                    }
-                }
-
-                let metadata = self.sources().find_edge_metadata(&unresolved_edge_ids)?;
-                let requires_properties = mode == PatternEdgeFilterMode::PropertyVerifier;
-                let mut property_candidate_ids = Vec::new();
-                let mut metadata_by_property_candidate =
-                    NodeIdMap::with_capacity_and_hasher(unresolved_edge_ids.len(), Default::default());
-                for (&edge_id, meta) in unresolved_edge_ids.iter().zip(metadata.iter()) {
-                    let Some(meta) = meta else {
-                        edge_filter_match_cache.insert(edge_id, false);
-                        continue;
-                    };
-                    let query_meta = EdgeMetadataForQuery::from(*meta);
-                    match edge_filter_metadata_outcome(&edge.filter, &query_meta) {
-                        Some(false) => {
-                            edge_filter_match_cache.insert(edge_id, false);
-                        }
-                        Some(true) => {
-                            edge_filter_match_cache.insert(edge_id, true);
-                            matching_edges.insert(edge_id);
-                        }
-                        None if requires_properties => {
-                            property_candidate_ids.push(edge_id);
-                            metadata_by_property_candidate.insert(edge_id, query_meta);
-                        }
-                        None => {
-                            edge_filter_match_cache.insert(edge_id, true);
-                            matching_edges.insert(edge_id);
-                        }
-                    }
-                }
-
-                if requires_properties && !property_candidate_ids.is_empty() {
-                    let mut property_keys = Vec::new();
-                    collect_edge_filter_property_keys(&edge.filter, &mut property_keys);
-                    let projected = self
-                        .sources()
-                        .find_edge_properties(&property_candidate_ids, &property_keys)?;
-                    for (&edge_id, props) in property_candidate_ids.iter().zip(projected.iter()) {
-                        let matched = props.as_ref().is_some_and(|props| {
-                            metadata_by_property_candidate
-                                .get(&edge_id)
-                                .is_some_and(|query_meta| {
-                                    edge_filter_projected_matches(&edge.filter, query_meta, props)
-                                })
-                        });
-                        edge_filter_match_cache.insert(edge_id, matched);
-                        if matched {
-                            matching_edges.insert(edge_id);
-                        }
-                    }
-                }
-                Some(matching_edges)
-            }
+        edge: &GraphEdgePattern,
+        query: &NormalizedGraphRowQuery,
+        next_hidden_id: &mut usize,
+    ) -> Result<GraphRowRuntimeEdge, EngineError> {
+        let from_slot = query
+            .binding_schema
+            .slot_for_alias(&edge.from_alias)
+            .ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row edge references unknown from alias '{}'",
+                    edge.from_alias
+                ))
+            })?;
+        let to_slot = query
+            .binding_schema
+            .slot_for_alias(&edge.to_alias)
+            .ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row edge references unknown to alias '{}'",
+                    edge.to_alias
+                ))
+            })?;
+        let edge_slot = edge
+            .alias
+            .as_ref()
+            .map(|alias| {
+                query.binding_schema.slot_for_alias(alias).ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "graph row edge alias '{alias}' is missing from binding schema"
+                    ))
+                })
+            })
+            .transpose()?;
+        let hidden_slot = if edge.alias.is_none() {
+            let slot = crate::graph_row::GraphBindingSlotRef {
+                kind: crate::graph_row::GraphBindingSlotKind::HiddenOccurrence,
+                index: *next_hidden_id,
+            };
+            query.binding_schema.slot(slot).ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row hidden edge occurrence slot {} is missing",
+                    *next_hidden_id
+                ))
+            })?;
+            *next_hidden_id += 1;
+            Some(slot)
+        } else {
+            None
         };
 
-        let mut candidate_ids_by_index = vec![Vec::new(); query.nodes.len()];
-        for pending_entry in pending.iter() {
-            if matching_edges
-                .as_ref()
-                .is_some_and(|matching| !matching.contains(&pending_entry.entry.edge_id))
-            {
-                continue;
-            }
-            let context = contexts[pending_entry.state_index];
-            if context.target_id.is_none() {
-                candidate_ids_by_index[context.target_index].push(pending_entry.entry.node_id);
+        let (label_resolution, warnings) = self
+            .label_catalog
+            .resolve_edge_label_filter(Some(&edge.label_filter))?;
+        let label_filter_ids = match label_resolution {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => Some(Vec::new()),
+        };
+        let mut candidate_edge_ids = edge
+            .alias
+            .as_ref()
+            .and_then(|alias| query.edge_id_constraints.get(alias))
+            .cloned()
+            .unwrap_or_default();
+        candidate_edge_ids.sort_unstable();
+        candidate_edge_ids.dedup();
+
+        Ok(GraphRowRuntimeEdge {
+            alias: edge.alias.clone(),
+            edge_slot,
+            hidden_slot,
+            from_alias: edge.from_alias.clone(),
+            to_alias: edge.to_alias.clone(),
+            from_slot,
+            to_slot,
+            direction: edge.direction,
+            candidate_edge_ids,
+            label_filter_ids,
+            filter: normalize_optional_edge_filter(edge.filter.as_ref())?,
+            warnings,
+        })
+    }
+
+    fn normalize_graph_row_runtime_vlp(
+        &self,
+        piece_index: usize,
+        path: &GraphVariableLengthPattern,
+        query: &NormalizedGraphRowQuery,
+        next_hidden_id: &mut usize,
+    ) -> Result<GraphRowRuntimeVariableLength, EngineError> {
+        let from_slot = query
+            .binding_schema
+            .slot_for_alias(&path.from_alias)
+            .ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row variable-length pattern references unknown from alias '{}'",
+                    path.from_alias
+                ))
+            })?;
+        let to_slot = query
+            .binding_schema
+            .slot_for_alias(&path.to_alias)
+            .ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row variable-length pattern references unknown to alias '{}'",
+                    path.to_alias
+                ))
+            })?;
+        let path_slot = path
+            .path_alias
+            .as_ref()
+            .map(|alias| {
+                query.binding_schema.slot_for_alias(alias).ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "graph row path alias '{alias}' is missing from binding schema"
+                    ))
+                })
+            })
+            .transpose()?;
+        let edge_slot = path
+            .edge_alias
+            .as_ref()
+            .map(|alias| {
+                query.binding_schema.slot_for_alias(alias).ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "graph row variable-length edge alias '{alias}' is missing from binding schema"
+                    ))
+                })
+            })
+            .transpose()?;
+        let hidden_slot = if path.edge_alias.is_none() && path.path_alias.is_none() {
+            let slot = crate::graph_row::GraphBindingSlotRef {
+                kind: crate::graph_row::GraphBindingSlotKind::HiddenOccurrence,
+                index: *next_hidden_id,
+            };
+            query.binding_schema.slot(slot).ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "graph row hidden path occurrence slot {} is missing",
+                    *next_hidden_id
+                ))
+            })?;
+            *next_hidden_id += 1;
+            Some(slot)
+        } else {
+            None
+        };
+
+        let (label_resolution, warnings) = self
+            .label_catalog
+            .resolve_edge_label_filter(Some(&path.label_filter))?;
+        let label_filter_ids = match label_resolution {
+            LabelFilterResolution::Unconstrained => None,
+            LabelFilterResolution::Known(label_ids) => Some(label_ids),
+            LabelFilterResolution::EmptyConstraint => Some(Vec::new()),
+        };
+        let mut candidate_edge_ids = path
+            .edge_alias
+            .as_ref()
+            .and_then(|alias| query.edge_id_constraints.get(alias))
+            .cloned()
+            .unwrap_or_default();
+        candidate_edge_ids.sort_unstable();
+        candidate_edge_ids.dedup();
+
+        Ok(GraphRowRuntimeVariableLength {
+            piece_index,
+            path_alias: path.path_alias.clone(),
+            edge_alias: path.edge_alias.clone(),
+            path_slot,
+            edge_slot,
+            hidden_slot,
+            from_alias: path.from_alias.clone(),
+            to_alias: path.to_alias.clone(),
+            from_slot,
+            to_slot,
+            direction: path.direction,
+            candidate_edge_ids,
+            label_filter_ids,
+            filter: normalize_optional_edge_filter(path.filter.as_ref())?,
+            min_hops: path.min_hops,
+            max_hops: path.max_hops,
+            warnings,
+        })
+    }
+
+    fn query_graph_rows_outcome(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        cursor_state: GraphRowCursorState,
+    ) -> Result<QueryExecutionOutcome<GraphRowResult>, EngineError> {
+        let started_at = std::time::Instant::now();
+        #[cfg(test)]
+        self.query_execution_counters
+            .graph_row_query_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let effective_at_epoch = cursor_state.effective_at_epoch;
+        let original_skip = cursor_state.original_skip;
+        let fingerprints = graph_row_cursor_fingerprints(query, effective_at_epoch, original_skip);
+        if let Some(cursor) = cursor_state.decoded.as_ref() {
+            graph_row_validate_cursor_fingerprints(cursor, &fingerprints)?;
+            graph_row_validate_cursor_shape(query, cursor)?;
+        }
+        let page_start = if cursor_state.is_cursor_page() {
+            0
+        } else {
+            query.page.skip
+        };
+        let selection_capacity = graph_row_selection_capacity(query, &cursor_state)?;
+
+        let runtime = self.normalize_graph_row_runtime_plan(query)?;
+        let physical_plan = self.plan_graph_row_physical(query, &runtime)?;
+        let policy_cutoffs = self.query_policy_cutoffs();
+        let mut explain_trace = if query.options.include_plan {
+            let mut trace = GraphRowExplainTrace::default();
+            self.populate_graph_row_explain_trace_from_runtime(
+                query,
+                &cursor_state,
+                &runtime,
+                &physical_plan,
+                &mut trace,
+            )?;
+            Some(trace)
+        } else {
+            None
+        };
+        if graph_row_node_only_default_order_fast_path(query, &runtime) {
+            if let Some(outcome) = self.query_graph_rows_node_only_default_order_outcome(
+                query,
+                &runtime,
+                &cursor_state,
+                &fingerprints,
+                effective_at_epoch,
+                original_skip,
+                selection_capacity,
+                started_at,
+                policy_cutoffs.as_ref(),
+                explain_trace.take(),
+            )? {
+                return Ok(outcome);
             }
         }
-        let verified_targets = self.pattern_verified_target_ids_by_index(
+        let mut followups = Vec::new();
+        let mut intermediate_peak = 0;
+        let mut frontier_peak = 0;
+        let mut paths_enumerated = 0;
+        let mut rows = self.graph_row_execute_runtime_plan(
             query,
-            candidate_ids_by_index,
-            policy_cutoffs,
+            &runtime,
+            &physical_plan,
+            None,
+            effective_at_epoch,
+            policy_cutoffs.as_ref(),
+            &mut followups,
+            &mut frontier_peak,
+            &mut intermediate_peak,
+            &mut paths_enumerated,
+            explain_trace.as_mut(),
         )?;
 
-        for pending_entry in pending.drain(..) {
-            if matching_edges
-                .as_ref()
-                .is_some_and(|matching| !matching.contains(&pending_entry.entry.edge_id))
-            {
-                continue;
-            }
-
-            let context = contexts[pending_entry.state_index];
-            if context.target_id.is_none()
-                && !verified_targets[context.target_index].contains(&pending_entry.entry.node_id)
-            {
-                continue;
-            }
-
-            if edge.alias.is_none() {
-                if context.target_id.is_some() {
-                    if unnamed_bound_satisfied[pending_entry.state_index] {
-                        continue;
-                    }
-                    unnamed_bound_satisfied[pending_entry.state_index] = true;
-                } else if !unnamed_emitted_targets[pending_entry.state_index]
-                    .insert(pending_entry.entry.node_id)
-                {
+        let residual_needs = query.projection_needs.residual.clone();
+        if rows.len() > query.options.max_order_materialization
+            && graph_row_entity_needs_require_selected_field_reads(&residual_needs)
+        {
+            return Err(graph_row_cap_error(
+                "max_order_materialization",
+                query.options.max_order_materialization,
+            ));
+        }
+        let mut pre_page_needs = residual_needs.clone();
+        let order_loaded_before_filter = rows.len() <= query.options.max_order_materialization;
+        if order_loaded_before_filter {
+            pre_page_needs.merge_from(&query.projection_needs.order, ProjectionNeedClass::Order)?;
+        }
+        self.hydrate_graph_rows_for_needs(&mut rows, &query.binding_schema, &pre_page_needs)?;
+        let mut filtered = Vec::with_capacity(rows.len().min(query.options.max_order_materialization));
+        for row in rows {
+            if let Some(where_expr) = query.bound_where.as_ref() {
+                let context = crate::graph_row::BoundGraphEvalContext { row: &row };
+                if !crate::graph_row::eval_bound_graph_predicate(where_expr, &context)? {
                     continue;
                 }
             }
-
-            let state = &states[pending_entry.state_index];
-            let mut next = state.clone();
-            if next.nodes[context.target_index].is_none() {
-                next.nodes[context.target_index] = Some(pending_entry.entry.node_id);
+            if filtered.len() >= query.options.max_order_materialization {
+                return Err(graph_row_cap_error(
+                    "max_order_materialization",
+                    query.options.max_order_materialization,
+                ));
             }
-            next.edges[edge_index] = Some(pending_entry.entry.edge_id);
-            if on_next(next)?.is_break() {
-                return Ok(ControlFlow::Break(()));
+            filtered.push(row);
+        }
+        let rows_after_filter = filtered.len();
+        if !order_loaded_before_filter {
+            let order_needs =
+                graph_row_remaining_output_needs(&query.projection_needs.order, &pre_page_needs);
+            self.hydrate_graph_rows_for_needs(&mut filtered, &query.binding_schema, &order_needs)?;
+            pre_page_needs.merge_from(&query.projection_needs.order, ProjectionNeedClass::Order)?;
+        }
+
+        let mut selected = BinaryHeap::new();
+        let mut rows_seen_for_page = 0usize;
+        let order_directions = graph_row_order_directions(&query.bound_order_by);
+        for row in filtered {
+            let logical_key = row.logical_sort_key(&query.binding_schema)?;
+            let sort_key = graph_row_explicit_sort_key(query, &row)?;
+            if let Some(cursor) = cursor_state.decoded.as_ref() {
+                let ordering = compare_graph_final_keys_by_directions(
+                    &sort_key,
+                    &logical_key,
+                    &cursor.last_sort_key,
+                    &cursor.last_logical_row_key,
+                    &order_directions,
+                );
+                if ordering != std::cmp::Ordering::Greater {
+                    continue;
+                }
             }
+            rows_seen_for_page = rows_seen_for_page.saturating_add(1);
+            graph_row_insert_bounded_candidate(
+                &mut selected,
+                GraphRowPageCandidate {
+                    sort_key,
+                    logical_key,
+                    row,
+                },
+                selection_capacity,
+                &order_directions,
+            );
         }
-
-        Ok(ControlFlow::Continue(()))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn record_pattern_general_pending_entry(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        edge: &NormalizedEdgePattern,
-        states: &[PatternExecutionState],
-        contexts: &[PatternEdgeContext],
-        seen_edges: &mut [NodeIdSet],
-        pending: &mut Vec<PatternPendingEntry>,
-        edge_filter_match_cache: &mut NodeIdMap<bool>,
-        unnamed_emitted_targets: &mut [NodeIdSet],
-        unnamed_bound_satisfied: &mut [bool],
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-        on_next: &mut impl FnMut(PatternExecutionState) -> Result<ControlFlow<()>, EngineError>,
-        state_index: usize,
-        edge_id: u64,
-        neighbor_id: u64,
-        edge_label_id: u32,
-        weight: f32,
-        valid_from: i64,
-        valid_to: i64,
-        reference_time: i64,
-        deleted_nodes: &NodeIdSet,
-        deleted_edges: &NodeIdSet,
-    ) -> Result<ControlFlow<()>, EngineError> {
-        if edge.alias.is_none() && unnamed_bound_satisfied[state_index] {
-            return Ok(ControlFlow::Continue(()));
-        }
-        if !seen_edges[state_index].insert(edge_id) {
-            return Ok(ControlFlow::Continue(()));
-        }
-        if deleted_edges.contains(&edge_id) || deleted_nodes.contains(&neighbor_id) {
-            return Ok(ControlFlow::Continue(()));
-        }
-        if !is_edge_valid_at(valid_from, valid_to, reference_time) {
-            return Ok(ControlFlow::Continue(()));
-        }
-        let posting_meta = EdgePostingMetadataForQuery {
-            weight,
-            valid_from,
-            valid_to,
-        };
-        if !edge_filter_posting_metadata_maybe_matches(&edge.filter, &posting_meta) {
-            return Ok(ControlFlow::Continue(()));
-        }
-
-        let state = &states[state_index];
-        let context = contexts[state_index];
-        if let Some(target_id) = context.target_id {
-            if neighbor_id != target_id {
-                return Ok(ControlFlow::Continue(()));
-            }
-        } else if !pattern_distinct_node_binding_ok(state, context.target_index, neighbor_id) {
-            return Ok(ControlFlow::Continue(()));
-        }
-
-        #[cfg(test)]
-        self.note_pattern_edge_pending_entry();
-        pending.push(PatternPendingEntry {
-            state_index,
-            entry: NeighborRecord {
-                node_id: neighbor_id,
-                edge_id,
-                edge_label_id,
-                weight,
-                valid_from,
-                valid_to,
-            },
+        let mut selected = selected
+            .into_iter()
+            .map(|candidate| candidate.candidate)
+            .collect::<Vec<_>>();
+        selected.sort_by(|left, right| {
+            compare_graph_final_keys_by_directions(
+                &left.sort_key,
+                &left.logical_key,
+                &right.sort_key,
+                &right.logical_key,
+                &order_directions,
+            )
         });
 
-        let flush_now = pending.len() >= QUERY_VERIFY_CHUNK;
-        if flush_now {
-            return self.flush_pattern_pending_entries(
-                query,
-                edge_index,
-                edge,
-                states,
-                contexts,
-                pending,
-                edge_filter_match_cache,
-                policy_cutoffs,
-                unnamed_emitted_targets,
-                unnamed_bound_satisfied,
-                on_next,
-            );
+        let effective_page_limit = graph_row_effective_page_limit(query, &cursor_state);
+        let page_end = page_start
+            .saturating_add(effective_page_limit)
+            .min(selected.len());
+        let mut page_candidates = if page_start >= selected.len() {
+            Vec::new()
+        } else {
+            selected[page_start..page_end].to_vec()
+        };
+        let rows_emitted_after_page =
+            graph_row_rows_emitted_after_page(&cursor_state, page_candidates.len())?;
+        let has_more = !graph_row_logical_limit_exhausted(query, rows_emitted_after_page)
+            && selected.len() > page_end;
+        let next_cursor = if has_more {
+            page_candidates.last().map(|last| {
+                graph_row_encode_cursor(&GraphRowCursorPayload {
+                    effective_at_epoch,
+                    original_skip,
+                    page_sequence: cursor_state
+                        .decoded
+                        .as_ref()
+                        .map(|cursor| cursor.page_sequence.saturating_add(1))
+                        .unwrap_or(1),
+                    rows_emitted_after_skip: rows_emitted_after_page,
+                    query_fingerprint: fingerprints.query,
+                    order_fingerprint: fingerprints.order,
+                    output_fingerprint: fingerprints.output,
+                    params_fingerprint: fingerprints.params,
+                    last_sort_key: last.sort_key.clone(),
+                    last_logical_row_key: last.logical_key.clone(),
+                }, query.options.max_cursor_bytes)
+            })
+        } else {
+            None
+        }
+        .transpose()?;
+
+        let mut page_rows = page_candidates
+            .drain(..)
+            .map(|candidate| candidate.row)
+            .collect::<Vec<_>>();
+        let output_needs =
+            graph_row_remaining_output_needs(&query.projection_needs.output, &pre_page_needs);
+        self.hydrate_graph_rows_for_needs(&mut page_rows, &query.binding_schema, &output_needs)?;
+
+        let mut result_rows = Vec::with_capacity(page_rows.len());
+        for row in &page_rows {
+            result_rows.push(GraphRow {
+                values: crate::graph_row::project_bound_graph_row_values(
+                    row,
+                    &query.bound_return_items,
+                    &query.output,
+                )?,
+            });
         }
 
-        Ok(ControlFlow::Continue(()))
-    }
-
-    fn execute_pattern_unnamed_constraint_frontier_for_each(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        states: Vec<PatternExecutionState>,
-        reference_time: i64,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-        mut on_next: impl FnMut(PatternExecutionState) -> Result<ControlFlow<()>, EngineError>,
-    ) -> Result<(), EngineError> {
-        let edge = &query.edges[edge_index];
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
-        let label_filter_ids = edge.label_filter_ids.as_deref();
-        let mut contexts = Vec::with_capacity(states.len());
-
-        for state in &states {
-            contexts.push(Self::pattern_edge_context(edge, state)?);
-        }
-
-        let mut accumulators: Vec<PatternUnnamedAccumulator> = states
+        let mut warnings = runtime
+            .warnings
             .iter()
-            .map(|_| PatternUnnamedAccumulator::new())
-            .collect();
-
-        for (state_index, state) in states.iter().enumerate() {
-            let context = contexts[state_index];
-            let accumulator = &mut accumulators[state_index];
-            let flow = self.memtable.for_each_adj_entry_at(
-                context.source_id,
-                context.direction,
-                label_filter_ids,
-                self.snapshot_seq,
-                &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
-                    record_pattern_unnamed_entry(
-                        state,
-                        &context,
-                        &edge.filter,
-                        reference_time,
-                        &deleted_nodes,
-                        &deleted_edges,
-                        &mut accumulator.seen_edges,
-                        &mut accumulator.best_by_target,
-                        &mut accumulator.best_bound_entry,
-                        &mut accumulator.exceeded,
-                        edge_id,
-                        neighbor_id,
-                        0,
-                        weight,
-                        valid_from,
-                        valid_to,
-                    )
-                },
-            );
-            if accumulator.exceeded {
-                return Err(EngineError::InvalidOperation(format!(
-                    "pattern intermediate frontier exceeded {PATTERN_FRONTIER_BUDGET} states"
-                )));
-            }
-            if flow.is_break() && accumulator.best_bound_entry.is_some() {
-                continue;
-            }
-        }
-
-        for epoch in &self.immutable_epochs {
-            for (state_index, state) in states.iter().enumerate() {
-                if accumulators[state_index].is_done() {
-                    continue;
-                }
-                let context = contexts[state_index];
-                let accumulator = &mut accumulators[state_index];
-                let flow = epoch.memtable.for_each_adj_entry_at(
-                    context.source_id,
-                    context.direction,
-                    label_filter_ids,
-                    self.snapshot_seq,
-                    &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
-                        record_pattern_unnamed_entry(
-                            state,
-                            &context,
-                            &edge.filter,
-                            reference_time,
-                            &deleted_nodes,
-                            &deleted_edges,
-                            &mut accumulator.seen_edges,
-                            &mut accumulator.best_by_target,
-                            &mut accumulator.best_bound_entry,
-                            &mut accumulator.exceeded,
-                            edge_id,
-                            neighbor_id,
-                            0,
-                            weight,
-                            valid_from,
-                            valid_to,
-                        )
-                    },
-                );
-                if accumulator.exceeded {
-                    return Err(EngineError::InvalidOperation(format!(
-                        "pattern intermediate frontier exceeded {PATTERN_FRONTIER_BUDGET} states"
-                    )));
-                }
-                if flow.is_break() && accumulator.best_bound_entry.is_some() {
-                    continue;
-                }
-            }
-        }
-
-        for segment in &self.segments {
-            for direction in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
-                let mut source_ids = Vec::new();
-                let mut context_indices_by_source: NodeIdMap<Vec<usize>> = NodeIdMap::default();
-                for (state_index, context) in contexts.iter().enumerate() {
-                    if context.direction != direction || accumulators[state_index].is_done() {
-                        continue;
-                    }
-                    context_indices_by_source
-                        .entry(context.source_id)
-                        .or_default()
-                        .push(state_index);
-                    source_ids.push(context.source_id);
-                }
-                if source_ids.is_empty() {
-                    continue;
-                }
-                source_ids.sort_unstable();
-                source_ids.dedup();
-                let mut remaining_contexts = context_indices_by_source
-                    .values()
-                    .map(Vec::len)
-                    .sum::<usize>();
-
-                let flow = segment.for_each_adj_posting_batch(
-                    &source_ids,
-                    direction,
-                    label_filter_ids,
-                    &mut |queried_node_id, edge_id, neighbor_id, weight, valid_from, valid_to| {
-                        let Some(state_indices) = context_indices_by_source.get(&queried_node_id)
-                        else {
-                            return ControlFlow::Continue(());
-                        };
-                        for &state_index in state_indices {
-                            if accumulators[state_index].is_done() {
-                                continue;
-                            }
-                            let context = contexts[state_index];
-                            let accumulator = &mut accumulators[state_index];
-                            let was_done = accumulator.is_done();
-                            let flow = record_pattern_unnamed_entry(
-                                &states[state_index],
-                                &context,
-                                &edge.filter,
-                                reference_time,
-                                &deleted_nodes,
-                                &deleted_edges,
-                                &mut accumulator.seen_edges,
-                                &mut accumulator.best_by_target,
-                                &mut accumulator.best_bound_entry,
-                                &mut accumulator.exceeded,
-                                edge_id,
-                                neighbor_id,
-                                0,
-                                weight,
-                                valid_from,
-                                valid_to,
-                            );
-                            if !was_done && accumulator.is_done() {
-                                remaining_contexts = remaining_contexts.saturating_sub(1);
-                            }
-                            if accumulator.exceeded {
-                                return ControlFlow::Break(());
-                            }
-                            if flow.is_break() && remaining_contexts == 0 {
-                                return ControlFlow::Break(());
-                            }
-                        }
-                        if remaining_contexts == 0 {
-                            return ControlFlow::Break(());
-                        }
-                        ControlFlow::Continue(())
-                    },
-                )?;
-                if flow.is_break() && accumulators.iter().any(|accumulator| accumulator.exceeded)
-                {
-                    return Err(EngineError::InvalidOperation(format!(
-                        "pattern intermediate frontier exceeded {PATTERN_FRONTIER_BUDGET} states"
-                    )));
-                }
-            }
-        }
-
-        let mut pending_entries = 0usize;
-        let mut candidate_ids_by_index = vec![Vec::new(); query.nodes.len()];
-        for (context, accumulator) in contexts.iter().zip(accumulators.iter()) {
-            if accumulator.exceeded {
-                return Err(EngineError::InvalidOperation(format!(
-                    "pattern intermediate frontier exceeded {PATTERN_FRONTIER_BUDGET} states"
-                )));
-            }
-            if accumulator.best_bound_entry.is_some() {
-                pending_entries = pending_entries.saturating_add(1);
-            } else {
-                pending_entries = pending_entries.saturating_add(accumulator.best_by_target.len());
-                if context.target_id.is_none() {
-                    candidate_ids_by_index[context.target_index]
-                        .extend(accumulator.best_by_target.keys().copied());
-                }
-            }
-            if pending_entries > PATTERN_FRONTIER_BUDGET {
-                return Err(EngineError::InvalidOperation(format!(
-                    "pattern intermediate frontier exceeded {PATTERN_FRONTIER_BUDGET} states"
-                )));
-            }
-        }
-
-        let verified_targets =
-            self.pattern_verified_target_ids_by_index(query, candidate_ids_by_index, policy_cutoffs)?;
-
-        for ((state, context), accumulator) in states
-            .into_iter()
-            .zip(contexts.into_iter())
-            .zip(accumulators.into_iter())
-        {
-            let mut entries: Vec<NeighborRecord> =
-                if let Some(entry) = accumulator.best_bound_entry {
-                    vec![entry]
-                } else {
-                    accumulator.best_by_target.into_values().collect()
-                };
-            entries.sort_by_key(|entry| (entry.node_id, entry.edge_id));
-            for entry in entries {
-                if context.target_id.is_none()
-                    && !verified_targets[context.target_index].contains(&entry.node_id)
-                {
-                    continue;
-                }
-                let mut next = state.clone();
-                if next.nodes[context.target_index].is_none() {
-                    next.nodes[context.target_index] = Some(entry.node_id);
-                }
-                next.edges[edge_index] = Some(entry.edge_id);
-                if on_next(next)?.is_break() {
-                    return Ok(());
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn execute_pattern_general_edge_frontier_for_each(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        states: Vec<PatternExecutionState>,
-        reference_time: i64,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-        mut on_next: impl FnMut(PatternExecutionState) -> Result<ControlFlow<()>, EngineError>,
-    ) -> Result<(), EngineError> {
-        let edge = &query.edges[edge_index];
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
-        let label_filter_ids = edge.label_filter_ids.as_deref();
-        let mut contexts = Vec::with_capacity(states.len());
-        for state in &states {
-            contexts.push(Self::pattern_edge_context(edge, state)?);
-        }
-
-        let mut seen_edges: Vec<NodeIdSet> =
-            states.iter().map(|_| NodeIdSet::default()).collect();
-        let mut pending = Vec::with_capacity(QUERY_VERIFY_CHUNK);
-        let mut edge_filter_match_cache = NodeIdMap::default();
-        let mut unnamed_emitted_targets: Vec<NodeIdSet> =
-            states.iter().map(|_| NodeIdSet::default()).collect();
-        let mut unnamed_bound_satisfied = vec![false; states.len()];
-
-        for (state_index, context) in contexts.iter().copied().enumerate() {
-            if edge.alias.is_none() && unnamed_bound_satisfied[state_index] {
-                continue;
-            }
-            let mut stream_error = None;
-            let mut satisfied_this_walk = false;
-            let flow = self.memtable.for_each_adj_entry_at(
-                context.source_id,
-                context.direction,
-                label_filter_ids,
-                self.snapshot_seq,
-                &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
-                    let was_satisfied = unnamed_bound_satisfied[state_index];
-                    match self.record_pattern_general_pending_entry(
-                        query,
-                        edge_index,
-                        edge,
-                        &states,
-                        &contexts,
-                        &mut seen_edges,
-                        &mut pending,
-                        &mut edge_filter_match_cache,
-                        &mut unnamed_emitted_targets,
-                        &mut unnamed_bound_satisfied,
-                        policy_cutoffs,
-                        &mut on_next,
-                        state_index,
-                        edge_id,
-                        neighbor_id,
-                        0,
-                        weight,
-                        valid_from,
-                        valid_to,
-                        reference_time,
-                        &deleted_nodes,
-                        &deleted_edges,
-                    ) {
-                        Ok(flow) => {
-                            if flow.is_break() {
-                                return flow;
-                            }
-                            if edge.alias.is_none()
-                                && context.target_id.is_some()
-                                && !was_satisfied
-                                && unnamed_bound_satisfied[state_index]
-                            {
-                                satisfied_this_walk = true;
-                                return ControlFlow::Break(());
-                            }
-                            ControlFlow::Continue(())
-                        }
-                        Err(error) => {
-                            stream_error = Some(error);
-                            ControlFlow::Break(())
-                        }
-                    }
-                },
-            );
-            if let Some(error) = stream_error {
-                return Err(error);
-            }
-            if edge.alias.is_none() && context.target_id.is_some() {
-                if self
-                    .flush_pattern_pending_entries(
-                        query,
-                        edge_index,
-                        edge,
-                        &states,
-                        &contexts,
-                        &mut pending,
-                        &mut edge_filter_match_cache,
-                        policy_cutoffs,
-                        &mut unnamed_emitted_targets,
-                        &mut unnamed_bound_satisfied,
-                        &mut on_next,
-                    )?
-                    .is_break()
-                {
-                    return Ok(());
-                }
-                if !flow.is_break() && unnamed_bound_satisfied[state_index] {
-                    satisfied_this_walk = true;
-                }
-            }
-            if flow.is_break() && !satisfied_this_walk {
-                return Ok(());
-            }
-        }
-
-        for epoch in &self.immutable_epochs {
-            for (state_index, context) in contexts.iter().copied().enumerate() {
-                if edge.alias.is_none() && unnamed_bound_satisfied[state_index] {
-                    continue;
-                }
-                let mut stream_error = None;
-                let mut satisfied_this_walk = false;
-                let flow = epoch.memtable.for_each_adj_entry_at(
-                    context.source_id,
-                    context.direction,
-                    label_filter_ids,
-                    self.snapshot_seq,
-                    &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
-                        let was_satisfied = unnamed_bound_satisfied[state_index];
-                        match self.record_pattern_general_pending_entry(
-                            query,
-                            edge_index,
-                            edge,
-                            &states,
-                            &contexts,
-                            &mut seen_edges,
-                            &mut pending,
-                            &mut edge_filter_match_cache,
-                            &mut unnamed_emitted_targets,
-                            &mut unnamed_bound_satisfied,
-                            policy_cutoffs,
-                            &mut on_next,
-                            state_index,
-                            edge_id,
-                            neighbor_id,
-                            0,
-                            weight,
-                            valid_from,
-                            valid_to,
-                            reference_time,
-                            &deleted_nodes,
-                            &deleted_edges,
-                        ) {
-                            Ok(flow) => {
-                                if flow.is_break() {
-                                    return flow;
-                                }
-                                if edge.alias.is_none()
-                                    && context.target_id.is_some()
-                                    && !was_satisfied
-                                    && unnamed_bound_satisfied[state_index]
-                                {
-                                    satisfied_this_walk = true;
-                                    return ControlFlow::Break(());
-                                }
-                                ControlFlow::Continue(())
-                            }
-                            Err(error) => {
-                                stream_error = Some(error);
-                                ControlFlow::Break(())
-                            }
-                        }
-                    },
-                );
-                if let Some(error) = stream_error {
-                    return Err(error);
-                }
-                if edge.alias.is_none() && context.target_id.is_some() {
-                    if self
-                        .flush_pattern_pending_entries(
-                            query,
-                            edge_index,
-                            edge,
-                            &states,
-                            &contexts,
-                            &mut pending,
-                            &mut edge_filter_match_cache,
-                            policy_cutoffs,
-                            &mut unnamed_emitted_targets,
-                            &mut unnamed_bound_satisfied,
-                            &mut on_next,
-                        )?
-                        .is_break()
-                    {
-                        return Ok(());
-                    }
-                    if !flow.is_break() && unnamed_bound_satisfied[state_index] {
-                        satisfied_this_walk = true;
-                    }
-                }
-                if flow.is_break() && !satisfied_this_walk {
-                    return Ok(());
-                }
-            }
-        }
-
-        for segment in &self.segments {
-            for direction in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
-                let mut source_ids = Vec::new();
-                let mut context_indices_by_source: NodeIdMap<Vec<usize>> = NodeIdMap::default();
-                for (state_index, context) in contexts.iter().enumerate() {
-                    if context.direction != direction {
-                        continue;
-                    }
-                    if edge.alias.is_none() && unnamed_bound_satisfied[state_index] {
-                        continue;
-                    }
-                    context_indices_by_source
-                        .entry(context.source_id)
-                        .or_default()
-                        .push(state_index);
-                    source_ids.push(context.source_id);
-                }
-                if source_ids.is_empty() {
-                    continue;
-                }
-                source_ids.sort_unstable();
-                source_ids.dedup();
-                let mut remaining_target_bound = if edge.alias.is_none() {
-                    contexts
-                        .iter()
-                        .enumerate()
-                        .filter(|(state_index, context)| {
-                            context.direction == direction
-                                && context.target_id.is_some()
-                                && !unnamed_bound_satisfied[*state_index]
-                        })
-                        .count()
-                } else {
-                    0
-                };
-                let stop_when_target_bound = remaining_target_bound > 0;
-
-                let mut stream_error = None;
-                let flow = segment.for_each_adj_posting_batch(
-                    &source_ids,
-                    direction,
-                    label_filter_ids,
-                    &mut |queried_node_id, edge_id, neighbor_id, weight, valid_from, valid_to| {
-                        let Some(state_indices) = context_indices_by_source.get(&queried_node_id)
-                        else {
-                            return ControlFlow::Continue(());
-                        };
-                        for &state_index in state_indices {
-                            if edge.alias.is_none() && unnamed_bound_satisfied[state_index] {
-                                continue;
-                            }
-                            let was_satisfied = unnamed_bound_satisfied[state_index];
-                            match self.record_pattern_general_pending_entry(
-                                query,
-                                edge_index,
-                                edge,
-                                &states,
-                                &contexts,
-                                &mut seen_edges,
-                                &mut pending,
-                                &mut edge_filter_match_cache,
-                                &mut unnamed_emitted_targets,
-                                &mut unnamed_bound_satisfied,
-                                policy_cutoffs,
-                                &mut on_next,
-                                state_index,
-                                edge_id,
-                                neighbor_id,
-                                0,
-                                weight,
-                                valid_from,
-                                valid_to,
-                                reference_time,
-                                &deleted_nodes,
-                                &deleted_edges,
-                            ) {
-                                Ok(ControlFlow::Continue(())) => {
-                                    if edge.alias.is_none()
-                                        && contexts[state_index].target_id.is_some()
-                                        && !was_satisfied
-                                        && unnamed_bound_satisfied[state_index]
-                                    {
-                                        remaining_target_bound =
-                                            remaining_target_bound.saturating_sub(1);
-                                    }
-                                }
-                                Ok(ControlFlow::Break(())) => return ControlFlow::Break(()),
-                                Err(error) => {
-                                    stream_error = Some(error);
-                                    return ControlFlow::Break(());
-                                }
-                            }
-                        }
-                        if stop_when_target_bound && remaining_target_bound == 0 {
-                            return ControlFlow::Break(());
-                        }
-                        ControlFlow::Continue(())
-                    },
-                )?;
-                if let Some(error) = stream_error {
-                    return Err(error);
-                }
-                if stop_when_target_bound {
-                    if self
-                        .flush_pattern_pending_entries(
-                            query,
-                            edge_index,
-                            edge,
-                            &states,
-                            &contexts,
-                            &mut pending,
-                            &mut edge_filter_match_cache,
-                            policy_cutoffs,
-                            &mut unnamed_emitted_targets,
-                            &mut unnamed_bound_satisfied,
-                            &mut on_next,
-                        )?
-                        .is_break()
-                    {
-                        return Ok(());
-                    }
-                    remaining_target_bound = contexts
-                        .iter()
-                        .enumerate()
-                        .filter(|(state_index, context)| {
-                            context.direction == direction
-                                && context.target_id.is_some()
-                                && !unnamed_bound_satisfied[*state_index]
-                        })
-                        .count();
-                }
-                if flow.is_break() {
-                    return Ok(());
-                }
-                if stop_when_target_bound && remaining_target_bound == 0 {
-                    continue;
-                }
-            }
-        }
-
-        if self
-            .flush_pattern_pending_entries(
+            .map(|warning| format!("{warning:?}"))
+            .collect::<Vec<_>>();
+        warnings.sort();
+        warnings.dedup();
+        let rows_returned = result_rows.len();
+        let runtime_stats = GraphRowExplainRuntimeStats {
+            rows_returned,
+            rows_after_filter,
+            rows_seen_for_page,
+            intermediate_bindings_peak: intermediate_peak,
+            frontier_peak,
+            paths_enumerated,
+            next_cursor: next_cursor.is_some(),
+        };
+        let plan = explain_trace.map(|trace| {
+            build_graph_row_explain(
                 query,
-                edge_index,
-                edge,
-                &states,
-                &contexts,
-                &mut pending,
-                &mut edge_filter_match_cache,
-                policy_cutoffs,
-                &mut unnamed_emitted_targets,
-                &mut unnamed_bound_satisfied,
-                &mut on_next,
-            )?
-            .is_break()
-        {
-            return Ok(());
-        }
-
-        Ok(())
-    }
-
-    fn execute_pattern_edge_frontier_for_each(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        states: Vec<PatternExecutionState>,
-        reference_time: i64,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-        on_next: impl FnMut(PatternExecutionState) -> Result<ControlFlow<()>, EngineError>,
-    ) -> Result<(), EngineError> {
-        if states.is_empty() {
-            return Ok(());
-        }
-
-        let edge = &query.edges[edge_index];
-        let mode = pattern_edge_filter_mode(&edge.filter);
-        if edge.alias.is_none()
-            && matches!(
-                mode,
-                PatternEdgeFilterMode::AlwaysTrue | PatternEdgeFilterMode::PostingMetadataOnly
+                Some(effective_at_epoch),
+                &cursor_state,
+                Some(trace),
+                Some(runtime_stats),
             )
+        });
+        let result = GraphRowResult {
+            columns: query.columns.clone(),
+            rows: result_rows,
+            next_cursor,
+            stats: GraphRowStats {
+                rows_returned,
+                rows_after_filter,
+                rows_seen_for_page,
+                intermediate_bindings_peak: intermediate_peak,
+                frontier_peak,
+                paths_enumerated,
+                db_hits: 0,
+                elapsed_us: query
+                    .options
+                    .profile
+                    .then(|| started_at.elapsed().as_micros() as u64),
+                effective_at_epoch,
+                warnings,
+            },
+            plan,
+        };
+        Ok(QueryExecutionOutcome {
+            value: result,
+            followups,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_graph_rows_node_only_default_order_outcome(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        cursor_state: &GraphRowCursorState,
+        fingerprints: &GraphRowCursorFingerprints,
+        effective_at_epoch: i64,
+        original_skip: u64,
+        selection_capacity: usize,
+        started_at: std::time::Instant,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        explain_trace: Option<GraphRowExplainTrace>,
+    ) -> Result<Option<QueryExecutionOutcome<GraphRowResult>>, EngineError> {
+        if !query.pieces.is_empty()
+            || runtime.nodes.len() != 1
+            || !query.bound_order_by.is_empty()
+            || query.bound_where.is_some()
+            || !query.edge_id_constraints.is_empty()
         {
-            return self.execute_pattern_unnamed_constraint_frontier_for_each(
+            return Ok(None);
+        }
+
+        let anchor = &runtime.nodes[0];
+        let cursor_after = match cursor_state.decoded.as_ref() {
+            Some(cursor) => match cursor.last_logical_row_key.as_slice() {
+                [crate::graph_row::GraphSortAtom::Node(id)] => Some(*id),
+                [crate::graph_row::GraphSortAtom::Null] => {
+                    return Err(invalid_graph_row_cursor(
+                        "node-only cursor logical row key cannot be null",
+                    ));
+                }
+                _ => return Ok(None),
+            },
+            None => None,
+        };
+
+        let mut anchor_query = anchor.query.clone();
+        anchor_query.page.after = cursor_after;
+        anchor_query.page.limit = Some(selection_capacity);
+        let planned = self.plan_normalized_node_query(&anchor_query)?;
+        let (page, followups) =
+            self.query_node_page_planned(&anchor_query, planned, false, policy_cutoffs)?;
+
+        let page_start = if cursor_state.is_cursor_page() {
+            0
+        } else {
+            query.page.skip
+        };
+        let rows_seen_for_page = page.ids.len().saturating_sub(page_start);
+        let mut page_ids = page
+            .ids
+            .iter()
+            .copied()
+            .skip(page_start)
+            .collect::<Vec<_>>();
+        let effective_page_limit = graph_row_effective_page_limit(query, cursor_state);
+        let page_ids_had_extra = page_ids.len() > effective_page_limit;
+        if page_ids_had_extra {
+            page_ids.truncate(effective_page_limit);
+        }
+        let rows_emitted_after_page =
+            graph_row_rows_emitted_after_page(cursor_state, page_ids.len())?;
+        let has_more = !graph_row_logical_limit_exhausted(query, rows_emitted_after_page)
+            && (page.next_cursor.is_some() || page_ids_had_extra);
+
+        let next_cursor = if has_more {
+            page_ids.last().map(|last_id| {
+                graph_row_encode_cursor(&GraphRowCursorPayload {
+                    effective_at_epoch,
+                    original_skip,
+                    page_sequence: cursor_state
+                        .decoded
+                        .as_ref()
+                        .map(|cursor| cursor.page_sequence.saturating_add(1))
+                        .unwrap_or(1),
+                    rows_emitted_after_skip: rows_emitted_after_page,
+                    query_fingerprint: fingerprints.query,
+                    order_fingerprint: fingerprints.order,
+                    output_fingerprint: fingerprints.output,
+                    params_fingerprint: fingerprints.params,
+                    last_sort_key: Vec::new(),
+                    last_logical_row_key: vec![crate::graph_row::GraphSortAtom::Node(*last_id)],
+                }, query.options.max_cursor_bytes)
+            })
+        } else {
+            None
+        }
+        .transpose()?;
+
+        let mut page_rows = Vec::with_capacity(page_ids.len());
+        for node_id in page_ids {
+            let mut row = query.binding_schema.empty_row();
+            row.bind_node(
+                anchor.slot,
+                crate::graph_row::GraphBoundNode::id_only(node_id),
+            )?;
+            page_rows.push(row);
+        }
+        self.hydrate_graph_rows_for_needs(
+            &mut page_rows,
+            &query.binding_schema,
+            &query.projection_needs.output,
+        )?;
+
+        let mut result_rows = Vec::with_capacity(page_rows.len());
+        for row in &page_rows {
+            result_rows.push(GraphRow {
+                values: crate::graph_row::project_bound_graph_row_values(
+                    row,
+                    &query.bound_return_items,
+                    &query.output,
+                )?,
+            });
+        }
+
+        let mut warnings = runtime
+            .warnings
+            .iter()
+            .map(|warning| format!("{warning:?}"))
+            .collect::<Vec<_>>();
+        warnings.sort();
+        warnings.dedup();
+        let rows_returned = result_rows.len();
+        let rows_after_filter = page.ids.len();
+        let runtime_stats = GraphRowExplainRuntimeStats {
+            rows_returned,
+            rows_after_filter,
+            rows_seen_for_page,
+            intermediate_bindings_peak: rows_after_filter,
+            frontier_peak: 0,
+            paths_enumerated: 0,
+            next_cursor: next_cursor.is_some(),
+        };
+        let plan = explain_trace.map(|trace| {
+            build_graph_row_explain(
                 query,
-                edge_index,
-                states,
-                reference_time,
+                Some(effective_at_epoch),
+                cursor_state,
+                Some(trace),
+                Some(runtime_stats),
+            )
+        });
+        Ok(Some(QueryExecutionOutcome {
+            value: GraphRowResult {
+                columns: query.columns.clone(),
+                rows: result_rows,
+                next_cursor,
+                stats: GraphRowStats {
+                    rows_returned,
+                    rows_after_filter,
+                    rows_seen_for_page,
+                    intermediate_bindings_peak: rows_after_filter,
+                    frontier_peak: 0,
+                    paths_enumerated: 0,
+                    db_hits: 0,
+                    elapsed_us: query
+                        .options
+                        .profile
+                        .then(|| started_at.elapsed().as_micros() as u64),
+                    effective_at_epoch,
+                    warnings,
+                },
+                plan,
+            },
+            followups,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_execute_runtime_plan(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        physical_plan: &GraphRowPhysicalPlan,
+        initial_rows: Option<Vec<crate::graph_row::GraphBindingRow>>,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        intermediate_peak: &mut usize,
+        paths_enumerated: &mut usize,
+        mut explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        if runtime.steps.is_empty() {
+            let rows = match initial_rows {
+                Some(rows) => rows,
+                None => self.graph_row_initial_rows(
+                    query,
+                    runtime,
+                    &physical_plan.initial_driver,
+                    policy_cutoffs,
+                    followups,
+                )?,
+            };
+            graph_row_record_cap_peak(
+                intermediate_peak,
+                rows.len(),
+                "max_intermediate_bindings",
+                query.options.max_intermediate_bindings,
+            )?;
+            return Ok(rows);
+        }
+
+        let mut rows = initial_rows;
+        for step in &runtime.steps {
+            let next_rows = match step {
+                GraphRowRuntimeStep::RequiredSegment(segment_index) => {
+                    let segment_plan = physical_plan
+                        .segments
+                        .iter()
+                        .find(|segment| segment.segment_index == *segment_index)
+                        .ok_or_else(|| {
+                            EngineError::InvalidOperation(format!(
+                                "graph row physical plan is missing required segment {segment_index}"
+                            ))
+                        })?;
+                    self.graph_row_execute_required_segment(
+                        query,
+                        runtime,
+                        physical_plan,
+                        segment_plan,
+                        rows.take(),
+                        effective_at_epoch,
+                        policy_cutoffs,
+                        followups,
+                        frontier_peak,
+                        explain_trace.as_deref_mut(),
+                    )?
+                }
+                GraphRowRuntimeStep::FixedPath(path) => {
+                    let left_rows = rows
+                        .take()
+                        .unwrap_or_else(|| vec![query.binding_schema.empty_row()]);
+                    self.graph_row_compose_fixed_path_rows(
+                        path,
+                        left_rows,
+                        explain_trace.as_deref_mut(),
+                    )?
+                }
+                GraphRowRuntimeStep::Optional(group) => {
+                    let left_rows = rows
+                        .take()
+                        .unwrap_or_else(|| vec![query.binding_schema.empty_row()]);
+                    self.graph_row_execute_optional_group(
+                        query,
+                        group,
+                        left_rows,
+                        effective_at_epoch,
+                        policy_cutoffs,
+                        followups,
+                        frontier_peak,
+                        intermediate_peak,
+                        paths_enumerated,
+                        explain_trace.as_deref_mut(),
+                    )?
+                }
+                GraphRowRuntimeStep::VariableLength(path) => {
+                    let left_rows = rows
+                        .take()
+                        .unwrap_or_else(|| vec![query.binding_schema.empty_row()]);
+                    self.graph_row_execute_variable_length(
+                        query,
+                        runtime,
+                        path,
+                        left_rows,
+                        effective_at_epoch,
+                        policy_cutoffs,
+                        followups,
+                        frontier_peak,
+                        paths_enumerated,
+                        explain_trace.as_deref_mut(),
+                    )?
+                }
+            };
+            graph_row_record_cap_peak(
+                intermediate_peak,
+                next_rows.len(),
+                "max_intermediate_bindings",
+                query.options.max_intermediate_bindings,
+            )?;
+            rows = Some(next_rows);
+        }
+
+        Ok(rows.unwrap_or_else(|| vec![query.binding_schema.empty_row()]))
+    }
+
+    fn graph_row_compose_fixed_path_rows(
+        &self,
+        fixed_path: &GraphRowRuntimeFixedPath,
+        mut rows: Vec<crate::graph_row::GraphBindingRow>,
+        explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        for row in &mut rows {
+            let mut node_ids = Vec::with_capacity(fixed_path.node_slots.len());
+            for slot in &fixed_path.node_slots {
+                let Some(node_id) = row.node_id_for_slot_if_bound(*slot)? else {
+                    return Err(EngineError::InvalidOperation(format!(
+                        "graph row fixed path '{}' cannot compose from an unbound node slot",
+                        fixed_path.alias
+                    )));
+                };
+                node_ids.push(node_id);
+            }
+            let mut edge_ids = Vec::with_capacity(fixed_path.edge_slots.len());
+            for slot in &fixed_path.edge_slots {
+                let edge_id = match slot {
+                    GraphRowRuntimeFixedPathEdgeSlot::Edge(slot) => {
+                        row.edge_id_for_slot_if_bound(*slot)?
+                    }
+                    GraphRowRuntimeFixedPathEdgeSlot::Hidden(slot) => {
+                        row.hidden_edge_id_for_slot_if_bound(*slot)?
+                    }
+                }
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "graph row fixed path '{}' cannot compose from an unbound edge slot",
+                        fixed_path.alias
+                    ))
+                })?;
+                edge_ids.push(edge_id);
+            }
+            row.bind_path(
+                fixed_path.path_slot,
+                crate::graph_row::GraphBoundPath::id_only(GraphPath {
+                    nodes: node_ids,
+                    edges: edge_ids,
+                })?,
+            )?;
+        }
+        if let Some(trace) = explain_trace {
+            trace.record_plan(
+                "FixedPathComposeRuntime",
+                format!(
+                    "path={}; rows={}; edges_per_path={}; no_new_index_scans=true; hydration_deferred=true",
+                    fixed_path.alias,
+                    rows.len(),
+                    fixed_path.edge_slots.len()
+                ),
+            );
+        }
+        Ok(rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_execute_required_segment(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        physical_plan: &GraphRowPhysicalPlan,
+        segment_plan: &GraphRowPhysicalSegment,
+        current_rows: Option<Vec<crate::graph_row::GraphBindingRow>>,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        mut explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let mut rows = match current_rows {
+            Some(rows) => self.graph_row_seed_required_segment_rows(
+                query,
+                runtime,
+                &segment_plan.initial_driver,
+                rows,
                 policy_cutoffs,
-                on_next,
+                followups,
+            )?,
+            None => self.graph_row_initial_rows(
+                query,
+                runtime,
+                &segment_plan.initial_driver,
+                policy_cutoffs,
+                followups,
+            )?,
+        };
+
+        for &edge_index in &segment_plan.edge_order {
+            let edge = &runtime.edges[edge_index];
+            let planned_source_choice = physical_plan
+                .edge_source_choices
+                .get(edge_index)
+                .and_then(|choice| *choice);
+            rows = self.graph_row_expand_fixed_edge(
+                query,
+                runtime,
+                edge,
+                planned_source_choice,
+                rows,
+                effective_at_epoch,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+                explain_trace.as_deref_mut(),
+            )?;
+        }
+        Ok(rows)
+    }
+
+    fn graph_row_seed_required_segment_rows(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        initial_driver: &GraphRowInitialDriver,
+        rows: Vec<crate::graph_row::GraphBindingRow>,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let GraphRowInitialDriver::Node { node_index, .. } = initial_driver else {
+            return Ok(rows);
+        };
+        if rows.is_empty() {
+            return Ok(rows);
+        }
+        let anchor = runtime.nodes.get(*node_index).ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "graph row physical plan references missing node index {node_index}"
+            ))
+        })?;
+
+        let mut output = Vec::with_capacity(rows.len());
+        let mut anchor_ids: Option<Vec<u64>> = None;
+        for row in rows {
+            if row.slot_is_null(anchor.slot)? {
+                continue;
+            }
+            if row.slot_is_bound(anchor.slot)? {
+                output.push(row);
+                continue;
+            }
+            if anchor_ids.is_none() {
+                anchor_ids = Some(self.graph_row_initial_node_ids(
+                    query,
+                    anchor,
+                    policy_cutoffs,
+                    followups,
+                )?);
+            }
+            for node_id in anchor_ids.as_deref().unwrap_or_default() {
+                let mut next = row.clone();
+                next.bind_node(
+                    anchor.slot,
+                    crate::graph_row::GraphBoundNode::id_only(*node_id),
+                )?;
+                output.push(next);
+                if output.len() > query.options.max_intermediate_bindings {
+                    return Err(graph_row_cap_error(
+                        "max_intermediate_bindings",
+                        query.options.max_intermediate_bindings,
+                    ));
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_execute_optional_group(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        group: &GraphRowRuntimeOptionalGroup,
+        left_rows: Vec<crate::graph_row::GraphBindingRow>,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        intermediate_peak: &mut usize,
+        paths_enumerated: &mut usize,
+        mut explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        if left_rows.is_empty() {
+            if let Some(trace) = explain_trace.as_deref_mut() {
+                trace.record_plan(
+                    "OptionalApplyRuntime",
+                    format!(
+                        "piece_index={}; left_rows=0; hits=0; misses=0; output_rows=0; skipped_due_to_empty_frontier=true",
+                        group.piece_index
+                    ),
+                );
+            }
+            return Ok(left_rows);
+        }
+
+        let group_physical_plan = self.plan_graph_row_physical(query, &group.runtime)?;
+        if group.dependency_slots.is_empty() {
+            return self.graph_row_execute_uncorrelated_optional_group(
+                query,
+                group,
+                &group_physical_plan,
+                left_rows,
+                effective_at_epoch,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+                intermediate_peak,
+                paths_enumerated,
+                explain_trace.as_deref_mut(),
             );
         }
 
-        self.execute_pattern_general_edge_frontier_for_each(
+        self.graph_row_execute_correlated_optional_group(
             query,
-            edge_index,
-            states,
-            reference_time,
+            group,
+            &group_physical_plan,
+            left_rows,
+            effective_at_epoch,
             policy_cutoffs,
-            on_next,
+            followups,
+            frontier_peak,
+            intermediate_peak,
+            paths_enumerated,
+            explain_trace,
         )
     }
 
-    fn execute_pattern_edge_frontier(
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_execute_uncorrelated_optional_group(
         &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        states: Vec<PatternExecutionState>,
-        reference_time: i64,
+        query: &NormalizedGraphRowQuery,
+        group: &GraphRowRuntimeOptionalGroup,
+        group_physical_plan: &GraphRowPhysicalPlan,
+        left_rows: Vec<crate::graph_row::GraphBindingRow>,
+        effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<Vec<PatternExecutionState>, EngineError> {
-        let mut next_states = Vec::new();
-        let mut exceeded = false;
-        self.execute_pattern_edge_frontier_for_each(
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        intermediate_peak: &mut usize,
+        paths_enumerated: &mut usize,
+        mut explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let left_count = left_rows.len();
+        let group_rows = self.graph_row_execute_runtime_plan(
             query,
-            edge_index,
-            states,
-            reference_time,
+            &group.runtime,
+            group_physical_plan,
+            Some(vec![query.binding_schema.empty_row()]),
+            effective_at_epoch,
             policy_cutoffs,
-            |next| {
-                if next_states.len() >= PATTERN_FRONTIER_BUDGET {
-                    exceeded = true;
-                    return Ok(ControlFlow::Break(()));
-                }
-                next_states.push(next);
-                Ok(ControlFlow::Continue(()))
-            },
+            followups,
+            frontier_peak,
+            intermediate_peak,
+            paths_enumerated,
+            explain_trace.as_deref_mut(),
         )?;
-        if exceeded {
-            return Err(EngineError::InvalidOperation(format!(
-                "pattern intermediate frontier exceeded {PATTERN_FRONTIER_BUDGET} states"
-            )));
+        let group_rows = self.graph_row_apply_optional_where(query, group, group_rows)?;
+        let mut output = Vec::new();
+        if group_rows.is_empty() {
+            for row in left_rows {
+                graph_row_push_optional_joined_row(
+                    query,
+                    &mut output,
+                    self.graph_row_null_extend_optional_row(query, group, row)?,
+                )?;
+            }
+        } else {
+            for left in left_rows {
+                for group_row in &group_rows {
+                    let mut next = left.clone();
+                    next.copy_slots_from(group_row, &group.introduced_slots)?;
+                    graph_row_push_optional_joined_row(query, &mut output, next)?;
+                }
+            }
         }
-        Ok(next_states)
+        let hit_rows = if group_rows.is_empty() {
+            0
+        } else {
+            left_count.saturating_mul(group_rows.len())
+        };
+        let miss_rows = if group_rows.is_empty() { left_count } else { 0 };
+        if let Some(trace) = explain_trace {
+            trace.record_plan(
+                "OptionalApplyRuntime",
+                format!(
+                    "piece_index={}; correlated=false; left_rows={}; reusable_subplan_rows={}; hit_rows={}; miss_rows={}; output_rows={}; left_outer=true; full_scan_per_left_row=false; where_present={}; introduced_slots={}; dependency_slots={}; left_slots={}",
+                    group.piece_index,
+                    left_count,
+                    group_rows.len(),
+                    hit_rows,
+                    miss_rows,
+                    output.len(),
+                    group.where_present,
+                    graph_row_slot_list_detail(query, &group.introduced_slots),
+                    graph_row_slot_list_detail(query, &group.dependency_slots),
+                    graph_row_slot_list_detail(query, &group.left_slots)
+                ),
+            );
+        }
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn collect_pattern_matches_from_final_edge(
+    fn graph_row_execute_correlated_optional_group(
         &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        states: Vec<PatternExecutionState>,
-        matches: &mut Vec<QueryMatch>,
-        anchor_alias: &str,
-        reference_time: i64,
+        query: &NormalizedGraphRowQuery,
+        group: &GraphRowRuntimeOptionalGroup,
+        group_physical_plan: &GraphRowPhysicalPlan,
+        left_rows: Vec<crate::graph_row::GraphBindingRow>,
+        effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<(), EngineError> {
-        self.execute_pattern_edge_frontier_for_each(
-            query,
-            edge_index,
-            states,
-            reference_time,
-            policy_cutoffs,
-            |next| {
-                insert_bounded_pattern_match(
-                    matches,
-                    pattern_match_from_state(query, &next),
-                    query.limit,
-                    anchor_alias,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        intermediate_peak: &mut usize,
+        paths_enumerated: &mut usize,
+        mut explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let left_count = left_rows.len();
+        let mut dependency_null_misses = Vec::new();
+        let mut left_groups = Vec::<GraphRowOptionalLeftGroup>::new();
+        let mut left_group_by_key: BTreeMap<Vec<crate::graph_row::GraphSortAtom>, usize> =
+            BTreeMap::new();
+
+        for row in left_rows {
+            if graph_row_any_slot_null(&row, &group.dependency_slots)? {
+                dependency_null_misses.push(row);
+                continue;
+            }
+            let key = row.logical_sort_key_for_slots(&query.binding_schema, &group.dependency_slots)?;
+            match left_group_by_key.get(&key).copied() {
+                Some(index) => left_groups[index].rows.push(row),
+                None => {
+                    let index = left_groups.len();
+                    left_group_by_key.insert(key.clone(), index);
+                    left_groups.push(GraphRowOptionalLeftGroup {
+                        key,
+                        representative: row.clone(),
+                        rows: vec![row],
+                    });
+                }
+            }
+        }
+
+        let representatives = left_groups
+            .iter()
+            .map(|group| group.representative.clone())
+            .collect::<Vec<_>>();
+        let mut group_rows = if representatives.is_empty() {
+            Vec::new()
+        } else {
+            self.graph_row_execute_runtime_plan(
+                query,
+                &group.runtime,
+                group_physical_plan,
+                Some(representatives),
+                effective_at_epoch,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+                intermediate_peak,
+                paths_enumerated,
+                explain_trace.as_deref_mut(),
+            )?
+        };
+        group_rows = self.graph_row_apply_optional_where(query, group, group_rows)?;
+
+        let mut hits_by_key: BTreeMap<Vec<crate::graph_row::GraphSortAtom>, Vec<crate::graph_row::GraphBindingRow>> =
+            BTreeMap::new();
+        for row in group_rows {
+            let key = row.logical_sort_key_for_slots(&query.binding_schema, &group.dependency_slots)?;
+            hits_by_key.entry(key).or_default().push(row);
+        }
+
+        let mut output = Vec::new();
+        let mut hit_groups = 0usize;
+        let mut missed_groups = 0usize;
+        for left_group in left_groups {
+            match hits_by_key.get(&left_group.key) {
+                Some(hits) if !hits.is_empty() => {
+                    hit_groups = hit_groups.saturating_add(1);
+                    for left in left_group.rows {
+                        for hit in hits {
+                            let mut next = left.clone();
+                            next.copy_slots_from(hit, &group.introduced_slots)?;
+                            graph_row_push_optional_joined_row(query, &mut output, next)?;
+                        }
+                    }
+                }
+                _ => {
+                    missed_groups = missed_groups.saturating_add(1);
+                    for left in left_group.rows {
+                        graph_row_push_optional_joined_row(
+                            query,
+                            &mut output,
+                            self.graph_row_null_extend_optional_row(query, group, left)?,
+                        )?;
+                    }
+                }
+            }
+        }
+        let dependency_null_miss_rows = dependency_null_misses.len();
+        for row in dependency_null_misses {
+            missed_groups = missed_groups.saturating_add(1);
+            graph_row_push_optional_joined_row(
+                query,
+                &mut output,
+                self.graph_row_null_extend_optional_row(query, group, row)?,
+            )?;
+        }
+
+        if let Some(trace) = explain_trace {
+            trace.record_plan(
+                "OptionalApplyRuntime",
+                format!(
+                    "piece_index={}; correlated=true; left_rows={left_count}; distinct_dependency_bindings={}; dependency_null_misses={}; hit_groups={hit_groups}; missed_groups={missed_groups}; output_rows={}; left_outer=true; batched_by_dependency_bindings=true; where_present={}; introduced_slots={}; dependency_slots={}; left_slots={}",
+                    group.piece_index,
+                    left_group_by_key.len(),
+                    dependency_null_miss_rows,
+                    output.len(),
+                    group.where_present,
+                    graph_row_slot_list_detail(query, &group.introduced_slots),
+                    graph_row_slot_list_detail(query, &group.dependency_slots),
+                    graph_row_slot_list_detail(query, &group.left_slots)
+                ),
+            );
+        }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_execute_variable_length(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        path: &GraphRowRuntimeVariableLength,
+        left_rows: Vec<crate::graph_row::GraphBindingRow>,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        paths_enumerated: &mut usize,
+        mut explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        if left_rows.is_empty() {
+            if let Some(trace) = explain_trace.as_deref_mut() {
+                trace.record_plan(
+                    "VariableLengthPathRuntime",
+                    format!(
+                        "piece_index={}; path={}; left_rows=0; output_rows=0; skipped_due_to_empty_frontier=true",
+                        path.piece_index,
+                        graph_row_vlp_context(path)
+                    ),
                 );
-                Ok(ControlFlow::Continue(()))
-            },
-        )
+            }
+            return Ok(left_rows);
+        }
+
+        let left_count = left_rows.len();
+        let rows = left_rows
+            .into_iter()
+            .filter_map(|row| {
+                match (
+                    row.slot_is_null(path.from_slot),
+                    row.slot_is_null(path.to_slot),
+                ) {
+                    (Ok(false), Ok(false)) => Some(Ok(row)),
+                    (Ok(_), Ok(_)) => None,
+                    (Err(err), _) | (_, Err(err)) => Some(Err(err)),
+                }
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        if rows.is_empty() {
+            if let Some(trace) = explain_trace.as_deref_mut() {
+                trace.record_plan(
+                    "VariableLengthPathRuntime",
+                    format!(
+                        "piece_index={}; path={}; output_rows=0; skipped_due_to_null_required_endpoint=true",
+                        path.piece_index,
+                        graph_row_vlp_context(path)
+                    ),
+                );
+            }
+            return Ok(rows);
+        }
+
+        if path.min_hops == 1 && path.max_hops == 1 {
+            return self.graph_row_execute_one_hop_variable_length(
+                query,
+                runtime,
+                path,
+                rows,
+                effective_at_epoch,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+                paths_enumerated,
+                explain_trace.as_deref_mut(),
+            );
+        }
+
+        let from_node = graph_row_runtime_node(runtime, &path.from_alias)?;
+        let to_node = graph_row_runtime_node(runtime, &path.to_alias)?;
+        let mut output = Vec::new();
+        let mut starts_considered = 0usize;
+        let mut search_cache: BTreeMap<GraphRowVlpSearchKey, GraphRowVlpSearchResult> =
+            BTreeMap::new();
+        let mut search_cache_hits = 0usize;
+
+        for row in rows {
+            let key = GraphRowVlpSearchKey {
+                bound_from: row.node_id_for_slot_if_bound(path.from_slot)?,
+                bound_to: row.node_id_for_slot_if_bound(path.to_slot)?,
+            };
+            if let std::collections::btree_map::Entry::Vacant(e) = search_cache.entry(key) {
+                let mut per_start_counts: NodeIdMap<usize> = NodeIdMap::default();
+                let seeds = self.graph_row_vlp_seeds(
+                    query,
+                    path,
+                    from_node,
+                    to_node,
+                    &row,
+                    policy_cutoffs,
+                    followups,
+                    frontier_peak,
+                )?;
+                let seed_count = seeds.len();
+                let mut paths = Vec::new();
+                for seed in seeds {
+                    let seed_paths = self.graph_row_enumerate_vlp_paths_for_seed(
+                        query,
+                        path,
+                        from_node,
+                        to_node,
+                        &row,
+                        seed,
+                        effective_at_epoch,
+                        policy_cutoffs,
+                        frontier_peak,
+                        &mut per_start_counts,
+                    )?;
+                    paths.extend(seed_paths);
+                }
+                *paths_enumerated = paths_enumerated.saturating_add(paths.len());
+                e.insert(GraphRowVlpSearchResult { seed_count, paths });
+            } else {
+                search_cache_hits = search_cache_hits.saturating_add(1);
+            }
+
+            let Some(search_result) = search_cache.get(&key) else {
+                continue;
+            };
+            starts_considered = starts_considered.saturating_add(search_result.seed_count);
+            let mut per_start_counts: NodeIdMap<usize> = NodeIdMap::default();
+            for graph_path in &search_result.paths {
+                let Some(&logical_start) = graph_path.nodes.first() else {
+                    continue;
+                };
+                let count = per_start_counts.entry(logical_start).or_default();
+                if *count >= query.options.max_paths_per_start {
+                    return Err(graph_row_vlp_cap_error(
+                        "max_paths_per_start",
+                        query.options.max_paths_per_start,
+                        path,
+                    ));
+                }
+                *count += 1;
+                self.graph_row_push_vlp_path_row(
+                    query,
+                    path,
+                    &row,
+                    graph_path.clone(),
+                    &mut output,
+                )?;
+            }
+        }
+
+        if let Some(trace) = explain_trace {
+            trace.record_plan(
+                "VariableLengthPathRuntime",
+                format!(
+                    "piece_index={}; path={}; left_rows={}; starts_considered={}; distinct_search_groups={}; search_cache_hits={}; output_rows={}; min_hops={}; max_hops={}; direction={:?}; relationship_simple=true; max_frontier={}; max_paths_per_start={}; source_verification=latest_visible_edges_and_endpoints",
+                    path.piece_index,
+                    graph_row_vlp_context(path),
+                    left_count,
+                    starts_considered,
+                    search_cache.len(),
+                    search_cache_hits,
+                    output.len(),
+                    path.min_hops,
+                    path.max_hops,
+                    path.direction,
+                    query.options.max_frontier,
+                    query.options.max_paths_per_start
+                ),
+            );
+        }
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn verify_pattern_edge_anchor_candidate_chunk(
+    fn graph_row_execute_one_hop_variable_length(
         &self,
-        candidate_ids: &[u64],
-        edge: &NormalizedEdgePattern,
-        reference_time: i64,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        path: &GraphRowRuntimeVariableLength,
+        rows: Vec<crate::graph_row::GraphBindingRow>,
+        effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-        endpoint_cache: &mut EdgeEndpointVisibilityCache,
-        property_keys: &[String],
-        verified: &mut Vec<VerifiedPatternEdgeAnchor>,
-    ) -> Result<(), EngineError> {
-        let metadata = self.sources().find_edge_metadata(candidate_ids)?;
-        let mut metas = Vec::new();
-        for meta in metadata.into_iter().flatten() {
-            if edge
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        paths_enumerated: &mut usize,
+        mut explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let temp_edge = GraphRowRuntimeEdge {
+            alias: path.edge_alias.clone(),
+            edge_slot: path.edge_slot,
+            hidden_slot: None,
+            from_alias: path.from_alias.clone(),
+            to_alias: path.to_alias.clone(),
+            from_slot: path.from_slot,
+            to_slot: path.to_slot,
+            direction: path.direction,
+            candidate_edge_ids: path.candidate_edge_ids.clone(),
+            label_filter_ids: path.label_filter_ids.clone(),
+            filter: path.filter.clone(),
+            warnings: path.warnings.clone(),
+        };
+        let candidates = self.graph_row_fixed_edge_candidates(
+            query,
+            &temp_edge,
+            None,
+            &rows,
+            effective_at_epoch,
+            policy_cutoffs,
+            followups,
+            frontier_peak,
+            None,
+            Some(path),
+        )?;
+        if candidates.is_empty() {
+            if let Some(trace) = explain_trace.as_deref_mut() {
+                trace.record_plan(
+                    "VariableLengthPathRuntime",
+                    format!(
+                        "piece_index={}; path={}; one_hop_fixed_equivalent=true; output_rows=0",
+                        path.piece_index,
+                        graph_row_vlp_context(path)
+                    ),
+                );
+            }
+            return Ok(Vec::new());
+        }
+
+        let from_node = graph_row_runtime_node(runtime, &path.from_alias)?;
+        let to_node = graph_row_runtime_node(runtime, &path.to_alias)?;
+        let mut from_candidates = Vec::with_capacity(candidates.len());
+        let mut to_candidates = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            from_candidates.push(candidate.logical_from);
+            to_candidates.push(candidate.logical_to);
+        }
+        let verified_from =
+            self.graph_row_verified_node_ids(from_node, from_candidates, policy_cutoffs)?;
+        let verified_to = if from_node.alias == to_node.alias {
+            verified_from.clone()
+        } else {
+            self.graph_row_verified_node_ids(to_node, to_candidates, policy_cutoffs)?
+        };
+
+        let buckets = GraphRowEdgeCandidateBuckets::new(&candidates);
+        let mut output = Vec::new();
+        for row in rows {
+            let mut per_start_counts: NodeIdMap<usize> = NodeIdMap::default();
+            let bound_from = row.node_id_for_slot_if_bound(path.from_slot)?;
+            let bound_to = row.node_id_for_slot_if_bound(path.to_slot)?;
+            let all_indices;
+            let indices = match buckets.indices_for(bound_from, bound_to) {
+                Some(indices) => indices,
+                None if bound_from.is_none() && bound_to.is_none() => {
+                    all_indices = (0..candidates.len()).collect::<Vec<_>>();
+                    all_indices.as_slice()
+                }
+                None => continue,
+            };
+            for &candidate_index in indices {
+                let candidate = &candidates[candidate_index];
+                if bound_from.is_some_and(|node_id| node_id != candidate.logical_from)
+                    || bound_to.is_some_and(|node_id| node_id != candidate.logical_to)
+                {
+                    continue;
+                }
+                if bound_from.is_none() && !verified_from.contains(&candidate.logical_from) {
+                    continue;
+                }
+                if bound_to.is_none() && !verified_to.contains(&candidate.logical_to) {
+                    continue;
+                }
+                let count = per_start_counts.entry(candidate.logical_from).or_default();
+                if *count >= query.options.max_paths_per_start {
+                    return Err(graph_row_vlp_cap_error(
+                        "max_paths_per_start",
+                        query.options.max_paths_per_start,
+                        path,
+                    ));
+                }
+                *count += 1;
+                let graph_path = GraphPath {
+                    nodes: vec![candidate.logical_from, candidate.logical_to],
+                    edges: vec![candidate.meta.id],
+                };
+                self.graph_row_push_vlp_path_row(query, path, &row, graph_path, &mut output)?;
+            }
+        }
+        *paths_enumerated = paths_enumerated.saturating_add(output.len());
+        if let Some(trace) = explain_trace {
+            trace.record_plan(
+                "VariableLengthPathRuntime",
+                format!(
+                    "piece_index={}; path={}; one_hop_fixed_equivalent=true; output_rows={}; edge_alias={}; path_alias={}; direction={:?}; source_verification=latest_visible_edges_and_endpoints",
+                    path.piece_index,
+                    graph_row_vlp_context(path),
+                    output.len(),
+                    path.edge_alias.is_some(),
+                    path.path_alias.is_some(),
+                    path.direction
+                ),
+            );
+        }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_vlp_seeds(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        path: &GraphRowRuntimeVariableLength,
+        from_node: &GraphRowRuntimeNode,
+        to_node: &GraphRowRuntimeNode,
+        row: &crate::graph_row::GraphBindingRow,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+    ) -> Result<Vec<GraphRowPathSearchSeed>, EngineError> {
+        let bound_from = row.node_id_for_slot_if_bound(path.from_slot)?;
+        let bound_to = row.node_id_for_slot_if_bound(path.to_slot)?;
+        if let Some(node_id) = bound_from {
+            return Ok(vec![GraphRowPathSearchSeed {
+                node_id,
+                reverse: false,
+            }]);
+        }
+        if let Some(node_id) = bound_to {
+            return Ok(vec![GraphRowPathSearchSeed {
+                node_id,
+                reverse: true,
+            }]);
+        }
+
+        let from_legal = graph_row_node_query_has_anchor(&from_node.query)
+            || query.options.allow_full_scan;
+        let to_legal =
+            graph_row_node_query_has_anchor(&to_node.query) || query.options.allow_full_scan;
+
+        let from_ids = if from_legal {
+            Some(self.graph_row_vlp_node_candidate_ids(
+                query,
+                path,
+                from_node,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+            ))
+        } else {
+            None
+        };
+        let to_ids = if to_legal {
+            Some(self.graph_row_vlp_node_candidate_ids(
+                query,
+                path,
+                to_node,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+            ))
+        } else {
+            None
+        };
+
+        match (from_ids, to_ids) {
+            (Some(Ok(from_ids)), Some(Ok(to_ids))) if to_ids.len() < from_ids.len() => {
+                Ok(to_ids
+                    .into_iter()
+                    .map(|node_id| GraphRowPathSearchSeed {
+                        node_id,
+                        reverse: true,
+                    })
+                    .collect())
+            }
+            (Some(Ok(from_ids)), _) => Ok(from_ids
+                .into_iter()
+                .map(|node_id| GraphRowPathSearchSeed {
+                    node_id,
+                    reverse: false,
+                })
+                .collect()),
+            (Some(Err(_)), Some(Ok(to_ids))) => Ok(to_ids
+                .into_iter()
+                .map(|node_id| GraphRowPathSearchSeed {
+                    node_id,
+                    reverse: true,
+                })
+                .collect()),
+            (Some(Err(err)), Some(Err(_))) | (Some(Err(err)), None) => Err(err),
+            (None, Some(Ok(to_ids))) => Ok(to_ids
+                .into_iter()
+                .map(|node_id| GraphRowPathSearchSeed {
+                    node_id,
+                    reverse: true,
+                })
+                .collect()),
+            (None, Some(Err(err))) => Err(err),
+            (None, None) => Err(EngineError::InvalidOperation(
+                "graph row variable-length pattern requires an anchor or allow_full_scan=true"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn graph_row_vlp_node_candidate_ids(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        path: &GraphRowRuntimeVariableLength,
+        node: &GraphRowRuntimeNode,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+    ) -> Result<Vec<u64>, EngineError> {
+        let cap = query.options.max_frontier;
+        let mut node_query = node.query.clone();
+        node_query.page.limit = Some(cap.saturating_add(1));
+        let planned = self.plan_normalized_node_query(&node_query)?;
+        let (page, mut node_followups) =
+            self.query_node_page_planned(&node_query, planned, false, policy_cutoffs)?;
+        followups.append(&mut node_followups);
+        if page.next_cursor.is_some() || page.ids.len() > cap {
+            return Err(graph_row_vlp_cap_error("max_frontier", cap, path));
+        }
+        graph_row_record_frontier_cap_peak(frontier_peak, page.ids.len(), cap, Some(path))?;
+        Ok(page.ids)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_enumerate_vlp_paths_for_seed(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        path: &GraphRowRuntimeVariableLength,
+        from_node: &GraphRowRuntimeNode,
+        to_node: &GraphRowRuntimeNode,
+        row: &crate::graph_row::GraphBindingRow,
+        seed: GraphRowPathSearchSeed,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        frontier_peak: &mut usize,
+        per_start_counts: &mut NodeIdMap<usize>,
+    ) -> Result<Vec<GraphPath>, EngineError> {
+        let target_bound = if seed.reverse {
+            row.node_id_for_slot_if_bound(path.from_slot)?
+        } else {
+            row.node_id_for_slot_if_bound(path.to_slot)?
+        };
+        let endpoint_node = if seed.reverse { from_node } else { to_node };
+        let mut frontier = vec![GraphRowPartialPath {
+            current: seed.node_id,
+            nodes: vec![seed.node_id],
+            edges: Vec::new(),
+        }];
+        graph_row_record_frontier_cap_peak(
+            frontier_peak,
+            frontier.len(),
+            query.options.max_frontier,
+            Some(path),
+        )?;
+
+        let mut accepted = Vec::new();
+        for depth in 0..=path.max_hops {
+            if depth >= path.min_hops {
+                let mut candidates = Vec::new();
+                for partial in &frontier {
+                    if target_bound.is_some_and(|target| target != partial.current) {
+                        continue;
+                    }
+                    candidates.push(graph_row_materialize_partial_path(partial, seed.reverse));
+                }
+                let candidates = self.graph_row_filter_vlp_endpoint_paths(
+                    candidates,
+                    endpoint_node,
+                    seed.reverse,
+                    policy_cutoffs,
+                )?;
+                for graph_path in candidates {
+                    let Some(&logical_start) = graph_path.nodes.first() else {
+                        continue;
+                    };
+                    let count = per_start_counts.entry(logical_start).or_default();
+                    if *count >= query.options.max_paths_per_start {
+                        return Err(graph_row_vlp_cap_error(
+                            "max_paths_per_start",
+                            query.options.max_paths_per_start,
+                            path,
+                        ));
+                    }
+                    *count += 1;
+                    accepted.push(graph_path);
+                }
+            }
+            if depth == path.max_hops {
+                break;
+            }
+
+            let frontier_nodes = frontier
+                .iter()
+                .map(|partial| partial.current)
+                .collect::<Vec<_>>();
+            let step_edges = self.graph_row_vlp_step_edges(
+                query,
+                path,
+                seed.reverse,
+                frontier_nodes,
+                effective_at_epoch,
+                policy_cutoffs,
+                frontier_peak,
+            )?;
+            if step_edges.is_empty() {
+                break;
+            }
+            let mut next_frontier = Vec::new();
+            for partial in &frontier {
+                let Some(edges) = step_edges.get(&partial.current) else {
+                    continue;
+                };
+                for edge in edges {
+                    if partial.edges.contains(&edge.edge_id) {
+                        continue;
+                    }
+                    if next_frontier.len() >= query.options.max_frontier {
+                        return Err(graph_row_vlp_cap_error(
+                            "max_frontier",
+                            query.options.max_frontier,
+                            path,
+                        ));
+                    }
+                    let mut next_nodes = partial.nodes.clone();
+                    next_nodes.push(edge.next_node);
+                    let mut next_edges = partial.edges.clone();
+                    next_edges.push(edge.edge_id);
+                    next_frontier.push(GraphRowPartialPath {
+                        current: edge.next_node,
+                        nodes: next_nodes,
+                        edges: next_edges,
+                    });
+                }
+            }
+            next_frontier.sort_by(|left, right| {
+                left.nodes
+                    .cmp(&right.nodes)
+                    .then_with(|| left.edges.cmp(&right.edges))
+            });
+            graph_row_record_frontier_cap_peak(
+                frontier_peak,
+                next_frontier.len(),
+                query.options.max_frontier,
+                Some(path),
+            )?;
+            frontier = next_frontier;
+        }
+
+        accepted.sort_by(|left, right| {
+            left.edges
+                .len()
+                .cmp(&right.edges.len())
+                .then_with(|| left.nodes.cmp(&right.nodes))
+                .then_with(|| left.edges.cmp(&right.edges))
+        });
+        Ok(accepted)
+    }
+
+    fn graph_row_filter_vlp_endpoint_paths(
+        &self,
+        paths: Vec<GraphPath>,
+        endpoint_node: &GraphRowRuntimeNode,
+        use_start_node: bool,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Result<Vec<GraphPath>, EngineError> {
+        if paths.is_empty() {
+            return Ok(paths);
+        }
+        let candidate_ids = paths
+            .iter()
+            .filter_map(|path| {
+                if use_start_node {
+                    path.nodes.first().copied()
+                } else {
+                    path.nodes.last().copied()
+                }
+            })
+            .collect::<Vec<_>>();
+        let verified =
+            self.graph_row_verified_node_ids(endpoint_node, candidate_ids, policy_cutoffs)?;
+        Ok(paths
+            .into_iter()
+            .filter(|path| {
+                let endpoint = if use_start_node {
+                    path.nodes.first()
+                } else {
+                    path.nodes.last()
+                };
+                endpoint.is_some_and(|node_id| verified.contains(node_id))
+            })
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_vlp_step_edges(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        path: &GraphRowRuntimeVariableLength,
+        reverse: bool,
+        mut frontier_nodes: Vec<u64>,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        frontier_peak: &mut usize,
+    ) -> Result<NodeIdMap<Vec<GraphRowVlpStepEdge>>, EngineError> {
+        frontier_nodes.sort_unstable();
+        frontier_nodes.dedup();
+        graph_row_record_frontier_cap_peak(
+            frontier_peak,
+            frontier_nodes.len(),
+            query.options.max_frontier,
+            Some(path),
+        )?;
+        if frontier_nodes.is_empty()
+            || path.filter.is_always_false()
+            || path
                 .label_filter_ids
                 .as_ref()
-                .is_some_and(|label_ids| label_ids.binary_search(&meta.label_id).is_err())
-            {
-                continue;
-            }
-            if !is_edge_valid_at(meta.valid_from, meta.valid_to, reference_time) {
-                continue;
-            }
-            metas.push(meta);
-        }
-
+                .is_some_and(|label_ids| label_ids.is_empty())
         {
-            let sources = self.sources();
-            endpoint_cache.ensure_edge_endpoints(&sources, &metas, policy_cutoffs)?;
+            return Ok(NodeIdMap::default());
         }
 
-        let mut decisions = Vec::new();
-        let mut property_candidate_ids = Vec::new();
+        let direction = if reverse {
+            graph_row_reverse_direction(path.direction)
+        } else {
+            path.direction
+        };
+        let mut candidate_ids = path.candidate_edge_ids.clone();
+        if candidate_ids.is_empty() {
+            self.graph_row_collect_endpoint_edge_ids(
+                &mut candidate_ids,
+                match direction {
+                    Direction::Outgoing => frontier_nodes.clone(),
+                    _ => Vec::new(),
+                },
+                match direction {
+                    Direction::Incoming => frontier_nodes.clone(),
+                    _ => Vec::new(),
+                },
+                match direction {
+                    Direction::Both => frontier_nodes.clone(),
+                    _ => Vec::new(),
+                },
+                path.label_filter_ids.as_deref(),
+                query.options.max_frontier,
+                frontier_peak,
+                Some(path),
+            )?;
+        } else {
+            candidate_ids.sort_unstable();
+            candidate_ids.dedup();
+            graph_row_record_frontier_cap_peak(
+                frontier_peak,
+                candidate_ids.len(),
+                query.options.max_frontier,
+                Some(path),
+            )?;
+        }
 
-        for meta in metas {
-            if !endpoint_cache.edge_endpoints_visible(meta) {
-                continue;
-            }
-            let query_meta = EdgeMetadataForQuery::from(meta);
-            match edge_filter_metadata_outcome(&edge.filter, &query_meta) {
-                Some(false) => continue,
-                Some(true) => decisions.push((meta, false)),
-                None => {
-                    property_candidate_ids.push(meta.edge_id);
-                    decisions.push((meta, true));
+        let verified = self.graph_row_verify_edge_candidate_ids(
+            &candidate_ids,
+            path.label_filter_ids.as_deref(),
+            &path.filter,
+            effective_at_epoch,
+            policy_cutoffs,
+        )?;
+        let frontier_set: NodeIdSet = frontier_nodes.into_iter().collect();
+        let mut by_source: NodeIdMap<Vec<GraphRowVlpStepEdge>> = NodeIdMap::default();
+        for meta in verified {
+            match direction {
+                Direction::Outgoing => {
+                    if frontier_set.contains(&meta.from) {
+                        by_source.entry(meta.from).or_default().push(GraphRowVlpStepEdge {
+                            edge_id: meta.id,
+                            next_node: meta.to,
+                        });
+                    }
+                }
+                Direction::Incoming => {
+                    if frontier_set.contains(&meta.to) {
+                        by_source.entry(meta.to).or_default().push(GraphRowVlpStepEdge {
+                            edge_id: meta.id,
+                            next_node: meta.from,
+                        });
+                    }
+                }
+                Direction::Both => {
+                    if frontier_set.contains(&meta.from) {
+                        by_source.entry(meta.from).or_default().push(GraphRowVlpStepEdge {
+                            edge_id: meta.id,
+                            next_node: meta.to,
+                        });
+                    }
+                    if meta.to != meta.from && frontier_set.contains(&meta.to) {
+                        by_source.entry(meta.to).or_default().push(GraphRowVlpStepEdge {
+                            edge_id: meta.id,
+                            next_node: meta.from,
+                        });
+                    }
                 }
             }
         }
+        for edges in by_source.values_mut() {
+            edges.sort_by_key(|edge| (edge.next_node, edge.edge_id));
+        }
+        Ok(by_source)
+    }
 
-        let mut property_matches = NodeIdSet::default();
-        if !property_candidate_ids.is_empty() {
-            let mut metadata_by_edge_id =
-                NodeIdMap::with_capacity_and_hasher(property_candidate_ids.len(), Default::default());
-            for (meta, needs_properties) in &decisions {
-                if *needs_properties {
-                    metadata_by_edge_id.insert(meta.edge_id, EdgeMetadataForQuery::from(*meta));
-                }
+    fn graph_row_push_vlp_path_row(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        path: &GraphRowRuntimeVariableLength,
+        row: &crate::graph_row::GraphBindingRow,
+        graph_path: GraphPath,
+        output: &mut Vec<crate::graph_row::GraphBindingRow>,
+    ) -> Result<(), EngineError> {
+        if output.len() >= query.options.max_intermediate_bindings {
+            return Err(graph_row_vlp_cap_error(
+                "max_intermediate_bindings",
+                query.options.max_intermediate_bindings,
+                path,
+            ));
+        }
+        let Some(&logical_from) = graph_path.nodes.first() else {
+            return Ok(());
+        };
+        let Some(&logical_to) = graph_path.nodes.last() else {
+            return Ok(());
+        };
+        let mut next = row.clone();
+        if next
+            .bind_node(
+                path.from_slot,
+                crate::graph_row::GraphBoundNode::id_only(logical_from),
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        if next
+            .bind_node(
+                path.to_slot,
+                crate::graph_row::GraphBoundNode::id_only(logical_to),
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Some(edge_slot) = path.edge_slot {
+            let Some(&edge_id) = graph_path.edges.first() else {
+                return Ok(());
+            };
+            next.bind_edge(edge_slot, crate::graph_row::GraphBoundEdge::id_only(edge_id))?;
+        }
+        if let Some(path_slot) = path.path_slot {
+            next.bind_path(
+                path_slot,
+                crate::graph_row::GraphBoundPath::id_only(graph_path.clone())?,
+            )?;
+        }
+        if let Some(hidden_slot) = path.hidden_slot {
+            next.bind_hidden(
+                hidden_slot,
+                crate::graph_row::GraphHiddenOccurrence::Path(graph_path),
+            )?;
+        }
+        output.push(next);
+        Ok(())
+    }
+
+    fn graph_row_apply_optional_where(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        group: &GraphRowRuntimeOptionalGroup,
+        mut rows: Vec<crate::graph_row::GraphBindingRow>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let Some(where_expr) = group.where_expr.as_ref() else {
+            return Ok(rows);
+        };
+        self.hydrate_graph_rows_for_needs(
+            &mut rows,
+            &query.binding_schema,
+            &group.where_needs,
+        )?;
+        let mut filtered = Vec::with_capacity(rows.len());
+        for row in rows {
+            let context = crate::graph_row::BoundGraphEvalContext { row: &row };
+            if crate::graph_row::eval_bound_graph_predicate(where_expr, &context)? {
+                filtered.push(row);
             }
-            let projected = self
-                .sources()
-                .find_edge_properties(&property_candidate_ids, property_keys)?;
-            for (&edge_id, props) in property_candidate_ids.iter().zip(projected.iter()) {
-                let Some(props) = props else {
+        }
+        Ok(filtered)
+    }
+
+    fn graph_row_null_extend_optional_row(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        group: &GraphRowRuntimeOptionalGroup,
+        mut row: crate::graph_row::GraphBindingRow,
+    ) -> Result<crate::graph_row::GraphBindingRow, EngineError> {
+        for slot in &group.introduced_slots {
+            row.set_null(&query.binding_schema, *slot)?;
+        }
+        Ok(row)
+    }
+
+    fn graph_row_initial_rows(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        initial_driver: &GraphRowInitialDriver,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let GraphRowInitialDriver::Node { node_index, .. } = initial_driver else {
+            return Ok(vec![query.binding_schema.empty_row()]);
+        };
+        let anchor = runtime.nodes.get(*node_index).ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "graph row physical plan references missing node index {node_index}"
+            ))
+        })?;
+        let ids = self.graph_row_initial_node_ids(query, anchor, policy_cutoffs, followups)?;
+
+        let mut rows = Vec::with_capacity(ids.len());
+        for node_id in ids {
+            let mut row = query.binding_schema.empty_row();
+            row.bind_node(anchor.slot, crate::graph_row::GraphBoundNode::id_only(node_id))?;
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    fn graph_row_initial_node_ids(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        anchor: &GraphRowRuntimeNode,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+    ) -> Result<Vec<u64>, EngineError> {
+        let mut anchor_query = anchor.query.clone();
+        anchor_query.page.limit = Some(query.options.max_intermediate_bindings.saturating_add(1));
+        let planned = self.plan_normalized_node_query(&anchor_query)?;
+        let (page, mut node_followups) =
+            self.query_node_page_planned(&anchor_query, planned, false, policy_cutoffs)?;
+        followups.append(&mut node_followups);
+        if page.next_cursor.is_some() || page.ids.len() > query.options.max_intermediate_bindings {
+            return Err(graph_row_cap_error(
+                "max_intermediate_bindings",
+                query.options.max_intermediate_bindings,
+            ));
+        }
+        Ok(page.ids)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_expand_fixed_edge(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        edge: &GraphRowRuntimeEdge,
+        planned_source_choice: Option<GraphRowEdgeCandidateSourceChoice>,
+        rows: Vec<crate::graph_row::GraphBindingRow>,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        if rows.is_empty() {
+            if let Some(trace) = explain_trace {
+                let planned_driver =
+                    graph_row_source_choice_label(planned_source_choice.unwrap_or_else(|| {
+                        graph_row_deterministic_fallback_edge_source_choice(edge, None)
+                    }));
+                trace.record_runtime_edge_source(
+                    edge,
+                    GraphRowEdgeCandidateSourceChoice::SkippedEmptyFrontier,
+                    format!("planned_driver={planned_driver}; materialized_source=none; fallback_source=none; skipped_due_to_empty_frontier=true; subset_intersection_source_materialized=none"),
+                    0,
+                );
+            }
+            return Ok(rows);
+        }
+        let rows = rows
+            .into_iter()
+            .filter_map(|row| {
+                match (
+                    row.slot_is_null(edge.from_slot),
+                    row.slot_is_null(edge.to_slot),
+                ) {
+                    (Ok(false), Ok(false)) => Some(Ok(row)),
+                    (Ok(_), Ok(_)) => None,
+                    (Err(err), _) | (_, Err(err)) => Some(Err(err)),
+                }
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        if rows.is_empty() {
+            if let Some(trace) = explain_trace {
+                let planned_driver =
+                    graph_row_source_choice_label(planned_source_choice.unwrap_or_else(|| {
+                        graph_row_deterministic_fallback_edge_source_choice(edge, None)
+                    }));
+                trace.record_runtime_edge_source(
+                    edge,
+                    GraphRowEdgeCandidateSourceChoice::SkippedEmptyFrontier,
+                    format!("planned_driver={planned_driver}; materialized_source=none; fallback_source=none; skipped_due_to_null_required_endpoint=true; subset_intersection_source_materialized=none"),
+                    0,
+                );
+            }
+            return Ok(rows);
+        }
+
+        let candidates = self.graph_row_fixed_edge_candidates(
+            query,
+            edge,
+            planned_source_choice,
+            &rows,
+            effective_at_epoch,
+            policy_cutoffs,
+            followups,
+            frontier_peak,
+            explain_trace,
+            None,
+        )?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let from_node = &runtime.nodes[*runtime.node_by_alias.get(&edge.from_alias).ok_or_else(
+            || {
+                EngineError::InvalidOperation(format!(
+                    "graph row edge references missing node alias '{}'",
+                    edge.from_alias
+                ))
+            },
+        )?];
+        let to_node = &runtime.nodes[*runtime.node_by_alias.get(&edge.to_alias).ok_or_else(
+            || {
+                EngineError::InvalidOperation(format!(
+                    "graph row edge references missing node alias '{}'",
+                    edge.to_alias
+                ))
+            },
+        )?];
+
+        let mut from_candidates = Vec::new();
+        let mut to_candidates = Vec::new();
+        for candidate in &candidates {
+            from_candidates.push(candidate.logical_from);
+            to_candidates.push(candidate.logical_to);
+        }
+        let verified_from =
+            self.graph_row_verified_node_ids(from_node, from_candidates, policy_cutoffs)?;
+        let verified_to = if from_node.alias == to_node.alias {
+            verified_from.clone()
+        } else {
+            self.graph_row_verified_node_ids(to_node, to_candidates, policy_cutoffs)?
+        };
+
+        let buckets = GraphRowEdgeCandidateBuckets::new(&candidates);
+        let mut next_rows = Vec::new();
+        for row in rows {
+            let bound_from = row.node_id_for_slot_if_bound(edge.from_slot)?;
+            let bound_to = row.node_id_for_slot_if_bound(edge.to_slot)?;
+            if bound_from.is_some() || bound_to.is_some() {
+                let Some(indices) = buckets.indices_for(bound_from, bound_to) else {
                     continue;
                 };
-                let Some(query_meta) = metadata_by_edge_id.get(&edge_id) else {
-                    continue;
-                };
-                if edge_filter_projected_matches(&edge.filter, query_meta, props) {
-                    property_matches.insert(edge_id);
+                for &candidate_index in indices {
+                    let candidate = &candidates[candidate_index];
+                    self.graph_row_push_edge_candidate_row(
+                        query,
+                        edge,
+                        &verified_from,
+                        &verified_to,
+                        bound_from,
+                        bound_to,
+                        &row,
+                        candidate,
+                        &mut next_rows,
+                    )?;
+                }
+            } else {
+                for candidate in &candidates {
+                    self.graph_row_push_edge_candidate_row(
+                        query,
+                        edge,
+                        &verified_from,
+                        &verified_to,
+                        bound_from,
+                        bound_to,
+                        &row,
+                        candidate,
+                        &mut next_rows,
+                    )?;
                 }
             }
         }
+        Ok(next_rows)
+    }
 
-        for (meta, needs_properties) in decisions {
-            if needs_properties && !property_matches.contains(&meta.edge_id) {
-                continue;
-            }
-            verified.push(VerifiedPatternEdgeAnchor { meta });
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_push_edge_candidate_row(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+        verified_from: &NodeIdSet,
+        verified_to: &NodeIdSet,
+        bound_from: Option<u64>,
+        bound_to: Option<u64>,
+        row: &crate::graph_row::GraphBindingRow,
+        candidate: &GraphRowOrientedEdge,
+        next_rows: &mut Vec<crate::graph_row::GraphBindingRow>,
+    ) -> Result<(), EngineError> {
+        if bound_from.is_some_and(|node_id| node_id != candidate.logical_from)
+            || bound_to.is_some_and(|node_id| node_id != candidate.logical_to)
+        {
+            return Ok(());
+        }
+        if bound_from.is_none() && !verified_from.contains(&candidate.logical_from) {
+            return Ok(());
+        }
+        if bound_to.is_none() && !verified_to.contains(&candidate.logical_to) {
+            return Ok(());
+        }
+
+        let mut next = row.clone();
+        if next
+            .bind_node(
+                edge.from_slot,
+                crate::graph_row::GraphBoundNode::id_only(candidate.logical_from),
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        if next
+            .bind_node(
+                edge.to_slot,
+                crate::graph_row::GraphBoundNode::id_only(candidate.logical_to),
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Some(edge_slot) = edge.edge_slot {
+            next.bind_edge(
+                edge_slot,
+                crate::graph_row::GraphBoundEdge::id_only(candidate.meta.id),
+            )?;
+        }
+        if let Some(hidden_slot) = edge.hidden_slot {
+            next.bind_hidden(
+                hidden_slot,
+                crate::graph_row::GraphHiddenOccurrence::Edge(candidate.meta.id),
+            )?;
+        }
+        next_rows.push(next);
+        if next_rows.len() > query.options.max_intermediate_bindings {
+            return Err(graph_row_cap_error(
+                "max_intermediate_bindings",
+                query.options.max_intermediate_bindings,
+            ));
         }
         Ok(())
     }
 
-    fn verify_pattern_edge_anchor_candidates(
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_fixed_edge_candidates(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+        planned_source_choice: Option<GraphRowEdgeCandidateSourceChoice>,
+        rows: &[crate::graph_row::GraphBindingRow],
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        mut explain_trace: Option<&mut GraphRowExplainTrace>,
+        vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
+    ) -> Result<Vec<GraphRowOrientedEdge>, EngineError> {
+        let mut has_bound_endpoint = false;
+        let mut has_unbound_endpoint_pair = false;
+        let mut outgoing = Vec::new();
+        let mut incoming = Vec::new();
+        let mut both = Vec::new();
+
+        for row in rows {
+            let from = row.node_id_for_slot_if_bound(edge.from_slot)?;
+            let to = row.node_id_for_slot_if_bound(edge.to_slot)?;
+            match (from, to) {
+                (None, None) => has_unbound_endpoint_pair = true,
+                _ => has_bound_endpoint = true,
+            }
+            graph_row_collect_endpoint_sources(
+                edge.direction,
+                true,
+                from,
+                &mut outgoing,
+                &mut incoming,
+                &mut both,
+            );
+            graph_row_collect_endpoint_sources(
+                edge.direction,
+                false,
+                to,
+                &mut outgoing,
+                &mut incoming,
+                &mut both,
+            );
+        }
+
+        let mut candidate_ids = Vec::new();
+        let planned_driver =
+            graph_row_source_choice_label(planned_source_choice.unwrap_or_else(|| {
+                graph_row_deterministic_fallback_edge_source_choice(edge, None)
+            }));
+        if !edge.candidate_edge_ids.is_empty() {
+            candidate_ids.extend_from_slice(&edge.candidate_edge_ids);
+            candidate_ids.sort_unstable();
+            candidate_ids.dedup();
+            graph_row_record_frontier_cap_peak(
+                frontier_peak,
+                candidate_ids.len(),
+                query.options.max_frontier,
+                vlp_cap_context,
+            )?;
+            if let Some(trace) = explain_trace.as_deref_mut() {
+                trace.record_runtime_edge_source(
+                    edge,
+                    GraphRowEdgeCandidateSourceChoice::ExplicitIds,
+                    format!("planned_driver={planned_driver}; materialized_source=ExplicitEdgeIds; fallback_source=none; skipped_due_to_empty_frontier=false; subset_intersection_source_materialized=none"),
+                    candidate_ids.len(),
+                );
+            }
+        } else if edge.filter.is_always_false()
+            || edge
+                .label_filter_ids
+                .as_ref()
+                .is_some_and(|label_ids| label_ids.is_empty())
+        {
+            if let Some(trace) = explain_trace.as_deref_mut() {
+                trace.record_runtime_edge_source(
+                    edge,
+                    GraphRowEdgeCandidateSourceChoice::EmptyResult,
+                    format!("planned_driver={planned_driver}; materialized_source=EmptyResult; fallback_source=none; skipped_due_to_empty_frontier=false; subset_intersection_source_materialized=none"),
+                    0,
+                );
+            }
+            return Ok(Vec::new());
+        } else if has_bound_endpoint && !has_unbound_endpoint_pair {
+            let choice = self.graph_row_choose_bound_edge_source(
+                query,
+                edge,
+                &outgoing,
+                &incoming,
+                &both,
+            )?;
+            match choice {
+                GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource => {
+                    match self.graph_row_materialize_edge_candidate_source(
+                        query,
+                        edge,
+                        policy_cutoffs,
+                        frontier_peak,
+                        vlp_cap_context,
+                    )? {
+                        GraphRowEdgeSourceRead::Ready {
+                            ids,
+                            followups: mut source_followups,
+                            materialized_source,
+                            subset_source,
+                        } => {
+                            followups.append(&mut source_followups);
+                            candidate_ids = ids;
+                            if let Some(trace) = explain_trace.as_deref_mut() {
+                                trace.record_runtime_edge_source(
+                                    edge,
+                                    choice,
+                                    format!(
+                                        "planned_driver={planned_driver}; materialized_source={materialized_source}; fallback_source=none; skipped_due_to_empty_frontier=false; subset_intersection_source_materialized={}",
+                                        subset_source.as_deref().unwrap_or("none")
+                                    ),
+                                    candidate_ids.len(),
+                                );
+                            }
+                        }
+                        GraphRowEdgeSourceRead::TooBroad {
+                            followups: mut source_followups,
+                            planned_source,
+                        } => {
+                            followups.append(&mut source_followups);
+                            self.graph_row_collect_endpoint_edge_ids(
+                                &mut candidate_ids,
+                                outgoing,
+                                incoming,
+                                both,
+                                edge.label_filter_ids.as_deref(),
+                                query.options.max_frontier,
+                                frontier_peak,
+                                vlp_cap_context,
+                            )?;
+                            if let Some(trace) = explain_trace.as_deref_mut() {
+                                trace.record_runtime_edge_source(
+                                    edge,
+                                    choice,
+                                    format!(
+                                        "planned_driver={planned_driver}; materialized_source={planned_source}; fallback_source=EndpointAdjacency; skipped_due_to_empty_frontier=false; subset_intersection_source_materialized=too_broad"
+                                    ),
+                                    candidate_ids.len(),
+                                );
+                            }
+                        }
+                        GraphRowEdgeSourceRead::NoLegalSource => {
+                            self.graph_row_collect_endpoint_edge_ids(
+                                &mut candidate_ids,
+                                outgoing,
+                                incoming,
+                                both,
+                                edge.label_filter_ids.as_deref(),
+                                query.options.max_frontier,
+                                frontier_peak,
+                                vlp_cap_context,
+                            )?;
+                            if let Some(trace) = explain_trace.as_deref_mut() {
+                                trace.record_runtime_edge_source(
+                                    edge,
+                                    choice,
+                                    format!("planned_driver={planned_driver}; materialized_source=none; fallback_source=EndpointAdjacency; skipped_due_to_empty_frontier=false; subset_intersection_source_materialized=none"),
+                                    candidate_ids.len(),
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let empty_frontier = outgoing.is_empty() && incoming.is_empty() && both.is_empty();
+                    self.graph_row_collect_endpoint_edge_ids(
+                        &mut candidate_ids,
+                        outgoing,
+                        incoming,
+                        both,
+                        edge.label_filter_ids.as_deref(),
+                        query.options.max_frontier,
+                        frontier_peak,
+                        vlp_cap_context,
+                    )?;
+                    if let Some(trace) = explain_trace.as_deref_mut() {
+                        trace.record_runtime_edge_source(
+                            edge,
+                            GraphRowEdgeCandidateSourceChoice::EndpointAdjacency,
+                            format!(
+                                "planned_driver={planned_driver}; materialized_source=EndpointAdjacency; fallback_source=none; skipped_due_to_empty_frontier={empty_frontier}; subset_intersection_source_materialized=none"
+                            ),
+                            candidate_ids.len(),
+                        );
+                    }
+                }
+            }
+        } else {
+            if has_bound_endpoint {
+                self.graph_row_collect_endpoint_edge_ids(
+                    &mut candidate_ids,
+                    outgoing,
+                    incoming,
+                    both,
+                    edge.label_filter_ids.as_deref(),
+                    query.options.max_frontier,
+                    frontier_peak,
+                    vlp_cap_context,
+                )?;
+            }
+            if has_unbound_endpoint_pair {
+                match self.graph_row_materialize_edge_candidate_source(
+                    query,
+                    edge,
+                    policy_cutoffs,
+                    frontier_peak,
+                    vlp_cap_context,
+                )? {
+                    GraphRowEdgeSourceRead::Ready {
+                        mut ids,
+                        followups: mut source_followups,
+                        materialized_source,
+                        subset_source,
+                    } => {
+                        followups.append(&mut source_followups);
+                        candidate_ids.append(&mut ids);
+                        let runtime_choice = if has_bound_endpoint {
+                            GraphRowEdgeCandidateSourceChoice::MixedEndpointAndEdgeSource
+                        } else {
+                            GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource
+                        };
+                        let runtime_planned_driver = if has_bound_endpoint {
+                            "MixedEndpointAndEdgeSource"
+                        } else {
+                            "EdgeCandidateSource"
+                        };
+                        let planned_driver = planned_source_choice
+                            .map(graph_row_source_choice_label)
+                            .unwrap_or(runtime_planned_driver);
+                        if let Some(trace) = explain_trace {
+                            trace.record_runtime_edge_source(
+                                edge,
+                                runtime_choice,
+                                format!(
+                                    "planned_driver={planned_driver}; materialized_source={materialized_source}; fallback_source=none; skipped_due_to_empty_frontier=false; subset_intersection_source_materialized={}",
+                                    subset_source.as_deref().unwrap_or("none")
+                                ),
+                                candidate_ids.len(),
+                            );
+                        }
+                    }
+                    GraphRowEdgeSourceRead::TooBroad { planned_source, .. } => {
+                        if let Some(path) = vlp_cap_context {
+                            return Err(graph_row_vlp_cap_error(
+                                "max_frontier",
+                                query.options.max_frontier,
+                                path,
+                            ));
+                        }
+                        return Err(EngineError::InvalidOperation(format!(
+                            "graph row max_frontier exceeded configured cap {}; source=EdgeCandidateSource edge={} planned_source={planned_source}",
+                            query.options.max_frontier,
+                            edge.explain_name()
+                        )));
+                    }
+                    GraphRowEdgeSourceRead::NoLegalSource => {
+                        return Err(EngineError::InvalidOperation(
+                            "graph row required edge pattern requires an anchor or allow_full_scan=true"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        candidate_ids.sort_unstable();
+        candidate_ids.dedup();
+        graph_row_record_frontier_cap_peak(
+            frontier_peak,
+            candidate_ids.len(),
+            query.options.max_frontier,
+            vlp_cap_context,
+        )?;
+
+        let verified = self.graph_row_verify_edge_candidates(
+            &candidate_ids,
+            edge,
+            effective_at_epoch,
+            policy_cutoffs,
+        )?;
+        let mut oriented = Vec::new();
+        for meta in verified {
+            for (logical_from, logical_to) in graph_row_edge_orientations(edge.direction, meta) {
+                oriented.push(GraphRowOrientedEdge {
+                    meta,
+                    logical_from,
+                    logical_to,
+                });
+            }
+        }
+        oriented.sort_by_key(|candidate| {
+            (
+                candidate.logical_from,
+                candidate.logical_to,
+                candidate.meta.id,
+            )
+        });
+        graph_row_record_frontier_cap_peak(
+            frontier_peak,
+            oriented.len(),
+            query.options.max_frontier,
+            vlp_cap_context,
+        )?;
+        Ok(oriented)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_collect_endpoint_edge_ids(
+        &self,
+        target: &mut Vec<u64>,
+        outgoing: Vec<u64>,
+        incoming: Vec<u64>,
+        both: Vec<u64>,
+        label_filter_ids: Option<&[u32]>,
+        cap: usize,
+        frontier_peak: &mut usize,
+        vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
+    ) -> Result<(), EngineError> {
+        self.graph_row_extend_endpoint_edge_ids(
+            target,
+            Direction::Outgoing,
+            outgoing,
+            label_filter_ids,
+            cap,
+            frontier_peak,
+            vlp_cap_context,
+        )?;
+        self.graph_row_extend_endpoint_edge_ids(
+            target,
+            Direction::Incoming,
+            incoming,
+            label_filter_ids,
+            cap,
+            frontier_peak,
+            vlp_cap_context,
+        )?;
+        self.graph_row_extend_endpoint_edge_ids(
+            target,
+            Direction::Both,
+            both,
+            label_filter_ids,
+            cap,
+            frontier_peak,
+            vlp_cap_context,
+        )
+    }
+
+    fn graph_row_choose_bound_edge_source(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+        outgoing: &[u64],
+        incoming: &[u64],
+        both: &[u64],
+    ) -> Result<GraphRowEdgeCandidateSourceChoice, EngineError> {
+        let endpoint_cost = self.graph_row_endpoint_source_cost(
+            outgoing,
+            incoming,
+            both,
+            edge.label_filter_ids.as_deref(),
+        );
+        let Some((edge_cost, _, _)) = self.graph_row_edge_source_plan_cost(query, edge)? else {
+            return Ok(GraphRowEdgeCandidateSourceChoice::EndpointAdjacency);
+        };
+        let Some(edge_candidates) = edge_cost.estimated_candidates else {
+            return Ok(GraphRowEdgeCandidateSourceChoice::EndpointAdjacency);
+        };
+        let Some(endpoint_candidates) = endpoint_cost.estimated_candidates else {
+            return Ok(GraphRowEdgeCandidateSourceChoice::EndpointAdjacency);
+        };
+        let edge_work = edge_cost
+            .estimated_work
+            .saturating_add(edge_candidates.saturating_mul(2));
+        let endpoint_work = endpoint_cost
+            .estimated_work
+            .saturating_add(endpoint_candidates.saturating_mul(2));
+        if edge_work < endpoint_work {
+            Ok(GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource)
+        } else {
+            Ok(GraphRowEdgeCandidateSourceChoice::EndpointAdjacency)
+        }
+    }
+
+    fn graph_row_endpoint_source_cost(
+        &self,
+        outgoing: &[u64],
+        incoming: &[u64],
+        both: &[u64],
+        label_filter_ids: Option<&[u32]>,
+    ) -> PlanCost {
+        let mut count = 0u64;
+        let mut confidence = EstimateConfidence::Exact;
+        let mut exact = true;
+        for (node_ids, direction) in [
+            (outgoing, Direction::Outgoing),
+            (incoming, Direction::Incoming),
+            (both, Direction::Both),
+        ] {
+            if node_ids.is_empty() {
+                continue;
+            }
+            let estimate = self.edge_endpoint_estimate(node_ids, direction, label_filter_ids);
+            match estimate.known_upper_bound() {
+                Some(estimate_count) => count = count.saturating_add(estimate_count),
+                None => exact = false,
+            }
+            confidence = weaker_confidence(confidence, estimate.confidence);
+        }
+        let estimate = if exact {
+            PlannerEstimate::upper_bound_with_confidence(count, confidence)
+        } else {
+            PlannerEstimate::unknown()
+        };
+        let source = PlannedEdgeCandidateSource::endpoint_adjacency(
+            EdgeQueryCandidateSourceKind::AnyEndpointAdjacency,
+            Vec::new(),
+            label_filter_ids.map(Vec::from),
+            estimate,
+        );
+        EdgePhysicalPlan::source(source).plan_cost()
+    }
+
+    fn graph_row_materialize_edge_candidate_source(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        frontier_peak: &mut usize,
+        vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
+    ) -> Result<GraphRowEdgeSourceRead, EngineError> {
+        let cap = query.options.max_frontier;
+        if edge.filter.is_always_false()
+            || edge
+                .label_filter_ids
+                .as_ref()
+                .is_some_and(|label_ids| label_ids.is_empty())
+        {
+            return Ok(GraphRowEdgeSourceRead::Ready {
+                ids: Vec::new(),
+                followups: Vec::new(),
+                materialized_source: "EmptyResult".to_string(),
+                subset_source: None,
+            });
+        }
+
+        let label_branches: Vec<Option<u32>> = match edge.label_filter_ids.as_deref() {
+            Some(label_ids) => label_ids.iter().copied().map(Some).collect(),
+            None => vec![None],
+        };
+        let mut all_ids = Vec::new();
+        let mut followups = Vec::new();
+        let mut sources = Vec::new();
+        let mut subset_sources = Vec::new();
+
+        for label_id in label_branches {
+            let normalized = NormalizedEdgeQuery {
+                label_id,
+                ids: edge.candidate_edge_ids.clone(),
+                from_ids: Vec::new(),
+                to_ids: Vec::new(),
+                endpoint_ids: Vec::new(),
+                filter: edge.filter.clone(),
+                allow_full_scan: query.options.allow_full_scan,
+                page: PageRequest {
+                    limit: Some(cap.saturating_add(1)),
+                    after: None,
+                },
+                warnings: Vec::new(),
+            };
+            let planned = match self.plan_normalized_edge_query(&normalized) {
+                Ok(planned) => planned,
+                Err(EngineError::InvalidOperation(_)) => return Ok(GraphRowEdgeSourceRead::NoLegalSource),
+                Err(error) => return Err(error),
+            };
+            let planned_source = format!("{:?}", planned.driver.plan_node());
+            let subset_source = if matches!(planned.driver, EdgePhysicalPlan::Intersect(_)) {
+                Some(planned_source.clone())
+            } else {
+                None
+            };
+            if matches!(
+                &planned.driver,
+                EdgePhysicalPlan::Source(source)
+                    if source.kind == EdgeQueryCandidateSourceKind::FallbackFullEdgeScan
+            ) && planned
+                .estimated_candidate_count()
+                .is_some_and(|count| count <= cap as u64)
+            {
+                let (page, mut source_followups) =
+                    self.query_edge_page_planned(&normalized, planned, false, policy_cutoffs)?;
+                followups.append(&mut source_followups);
+                all_ids.extend(page.ids);
+                sources.push(planned_source);
+                all_ids.sort_unstable();
+                all_ids.dedup();
+                if all_ids.len() > cap {
+                    return Ok(GraphRowEdgeSourceRead::TooBroad {
+                        followups,
+                        planned_source: "FallbackFullEdgeScan".to_string(),
+                    });
+                }
+                graph_row_record_frontier_cap_peak(
+                    frontier_peak,
+                    all_ids.len(),
+                    cap,
+                    vlp_cap_context,
+                )?;
+                continue;
+            }
+            match self.materialize_edge_physical_plan(
+                &normalized,
+                planned.cap_context,
+                &planned.driver,
+            )? {
+                CandidateMaterializationResult::Ready {
+                    mut ids,
+                    followups: mut source_followups,
+                } => {
+                    followups.append(&mut source_followups);
+                    all_ids.append(&mut ids);
+                    sources.push(planned_source);
+                    if let Some(subset_source) = subset_source {
+                        subset_sources.push(subset_source);
+                    }
+                    all_ids.sort_unstable();
+                    all_ids.dedup();
+                    if all_ids.len() > cap {
+                        return Ok(GraphRowEdgeSourceRead::TooBroad {
+                            followups,
+                            planned_source: sources
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| "EdgeCandidateSource".to_string()),
+                        });
+                    }
+                    graph_row_record_frontier_cap_peak(
+                        frontier_peak,
+                        all_ids.len(),
+                        cap,
+                        vlp_cap_context,
+                    )?;
+                }
+                CandidateMaterializationResult::TooBroad {
+                    followups: mut source_followups,
+                } => {
+                    followups.append(&mut source_followups);
+                    return Ok(GraphRowEdgeSourceRead::TooBroad {
+                        followups,
+                        planned_source,
+                    });
+                }
+            }
+        }
+
+        all_ids.sort_unstable();
+        all_ids.dedup();
+        if all_ids.len() > cap {
+            return Ok(GraphRowEdgeSourceRead::TooBroad {
+                followups,
+                planned_source: sources.join("|"),
+            });
+        }
+        graph_row_record_frontier_cap_peak(frontier_peak, all_ids.len(), cap, vlp_cap_context)?;
+        Ok(GraphRowEdgeSourceRead::Ready {
+            ids: all_ids,
+            followups,
+            materialized_source: if sources.is_empty() {
+                "none".to_string()
+            } else {
+                sources.join("|")
+            },
+            subset_source: if subset_sources.is_empty() {
+                None
+            } else {
+                Some(subset_sources.join("|"))
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_extend_endpoint_edge_ids(
+        &self,
+        target: &mut Vec<u64>,
+        direction: Direction,
+        mut node_ids: Vec<u64>,
+        label_filter_ids: Option<&[u32]>,
+        cap: usize,
+        frontier_peak: &mut usize,
+        vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
+    ) -> Result<(), EngineError> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+        node_ids.sort_unstable();
+        node_ids.dedup();
+        graph_row_record_frontier_cap_peak(frontier_peak, node_ids.len(), cap, vlp_cap_context)?;
+        let mut ids = self.sources().edge_ids_by_endpoints_limited(
+            &node_ids,
+            direction,
+            label_filter_ids,
+            cap.saturating_add(1),
+        )?;
+        graph_row_record_frontier_cap_peak(frontier_peak, ids.len(), cap, vlp_cap_context)?;
+        target.append(&mut ids);
+        target.sort_unstable();
+        target.dedup();
+        graph_row_record_frontier_cap_peak(frontier_peak, target.len(), cap, vlp_cap_context)?;
+        Ok(())
+    }
+
+    fn graph_row_verify_edge_candidates(
         &self,
         candidate_ids: &[u64],
-        edge: &NormalizedEdgePattern,
-        reference_time: i64,
+        edge: &GraphRowRuntimeEdge,
+        effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<Vec<VerifiedPatternEdgeAnchor>, EngineError> {
+    ) -> Result<Vec<EdgeMetadataForQuery>, EngineError> {
+        self.graph_row_verify_edge_candidate_ids(
+            candidate_ids,
+            edge.label_filter_ids.as_deref(),
+            &edge.filter,
+            effective_at_epoch,
+            policy_cutoffs,
+        )
+    }
+
+    fn graph_row_verify_edge_candidate_ids(
+        &self,
+        candidate_ids: &[u64],
+        label_filter_ids: Option<&[u32]>,
+        filter: &NormalizedEdgeFilter,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Result<Vec<EdgeMetadataForQuery>, EngineError> {
         let mut verified = Vec::new();
         let mut endpoint_cache = EdgeEndpointVisibilityCache::default();
         let mut property_keys = Vec::new();
-        collect_edge_filter_property_keys(&edge.filter, &mut property_keys);
+        collect_edge_filter_property_keys(filter, &mut property_keys);
 
         for chunk in candidate_ids.chunks(QUERY_VERIFY_CHUNK) {
-            self.verify_pattern_edge_anchor_candidate_chunk(
-                chunk,
-                edge,
-                reference_time,
-                policy_cutoffs,
-                &mut endpoint_cache,
-                &property_keys,
-                &mut verified,
-            )?;
+            let metadata = self.sources().find_edge_metadata(chunk)?;
+            let mut metas = Vec::new();
+            for meta in metadata.into_iter().flatten() {
+                if label_filter_ids
+                    .is_some_and(|label_ids| label_ids.binary_search(&meta.label_id).is_err())
+                {
+                    continue;
+                }
+                if !is_edge_valid_at(meta.valid_from, meta.valid_to, effective_at_epoch) {
+                    continue;
+                }
+                metas.push(meta);
+            }
+
+            {
+                let sources = self.sources();
+                endpoint_cache.ensure_edge_endpoints(&sources, &metas, policy_cutoffs)?;
+            }
+
+            let mut decisions = Vec::new();
+            let mut property_candidate_ids = Vec::new();
+            for meta in metas {
+                if !endpoint_cache.edge_endpoints_visible(meta) {
+                    continue;
+                }
+                let query_meta = EdgeMetadataForQuery::from(meta);
+                match edge_filter_metadata_outcome(filter, &query_meta) {
+                    Some(false) => continue,
+                    Some(true) => decisions.push((query_meta, false)),
+                    None => {
+                        property_candidate_ids.push(query_meta.id);
+                        decisions.push((query_meta, true));
+                    }
+                }
+            }
+
+            let mut property_matches = NodeIdSet::default();
+            if !property_candidate_ids.is_empty() {
+                let mut metadata_by_edge_id = NodeIdMap::with_capacity_and_hasher(
+                    property_candidate_ids.len(),
+                    Default::default(),
+                );
+                for (meta, needs_properties) in &decisions {
+                    if *needs_properties {
+                        metadata_by_edge_id.insert(meta.id, *meta);
+                    }
+                }
+                let projected = self
+                    .sources()
+                    .find_edge_properties(&property_candidate_ids, &property_keys)?;
+                for (&edge_id, props) in property_candidate_ids.iter().zip(projected.into_iter()) {
+                    let Some(props) = props else {
+                        continue;
+                    };
+                    let Some(query_meta) = metadata_by_edge_id.get(&edge_id) else {
+                        continue;
+                    };
+                    let selected = SelectedEdgeFields {
+                        meta: *query_meta,
+                        props,
+                        created_at: None,
+                    };
+                    if edge_filter_projected_matches(filter, &selected) {
+                        property_matches.insert(edge_id);
+                    }
+                }
+            }
+
+            for (meta, needs_properties) in decisions {
+                if needs_properties && !property_matches.contains(&meta.id) {
+                    continue;
+                }
+                verified.push(meta);
+            }
         }
         Ok(verified)
     }
 
-    fn pattern_edge_anchor_orientation_bindings(
-        edge: &NormalizedEdgePattern,
-        meta: EdgeMetadataCandidate,
-    ) -> Vec<(u64, u64)> {
-        match edge.direction {
-            Direction::Outgoing => vec![(meta.from, meta.to)],
-            Direction::Incoming => vec![(meta.to, meta.from)],
-            Direction::Both if meta.from == meta.to => vec![(meta.from, meta.to)],
-            Direction::Both => vec![(meta.from, meta.to), (meta.to, meta.from)],
+    fn graph_row_verified_node_ids(
+        &self,
+        node: &GraphRowRuntimeNode,
+        mut candidate_ids: Vec<u64>,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Result<NodeIdSet, EngineError> {
+        candidate_ids.sort_unstable();
+        candidate_ids.dedup();
+        let mut verified = Vec::new();
+        let mut property_keys = Vec::new();
+        collect_node_filter_property_keys(&node.query.filter, &mut property_keys);
+        for chunk in candidate_ids.chunks(QUERY_VERIFY_CHUNK) {
+            let _ = self.verify_node_candidate_chunk(
+                chunk,
+                &node.query,
+                policy_cutoffs,
+                false,
+                &property_keys,
+                &mut verified,
+                usize::MAX,
+            )?;
         }
+        Ok(verified.into_iter().collect())
     }
 
-    fn pattern_edge_anchor_states_from_verified(
+    fn hydrate_graph_rows_for_needs(
         &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        verified_edges: &[VerifiedPatternEdgeAnchor],
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<Vec<PatternExecutionState>, EngineError> {
-        let edge = &query.edges[edge_index];
-        let mut provisional = Vec::new();
-        let mut candidate_ids_by_index = vec![Vec::new(); query.nodes.len()];
-        let mut seen = HashSet::new();
-
-        for verified in verified_edges {
-            for (from_id, to_id) in Self::pattern_edge_anchor_orientation_bindings(edge, verified.meta) {
-                let mut state = PatternExecutionState {
-                    nodes: vec![None; query.nodes.len()],
-                    edges: vec![None; query.edges.len()],
-                };
-                if edge.from_index == edge.to_index {
-                    if from_id != to_id {
-                        continue;
-                    }
-                    state.nodes[edge.from_index] = Some(from_id);
-                    candidate_ids_by_index[edge.from_index].push(from_id);
-                } else {
-                    if from_id == to_id {
-                        continue;
-                    }
-                    state.nodes[edge.from_index] = Some(from_id);
-                    state.nodes[edge.to_index] = Some(to_id);
-                    candidate_ids_by_index[edge.from_index].push(from_id);
-                    candidate_ids_by_index[edge.to_index].push(to_id);
-                }
-                state.edges[edge_index] = Some(verified.meta.edge_id);
-
-                let mut edge_key = state.edges.clone();
-                if edge.alias.is_none() {
-                    edge_key[edge_index] = None;
-                }
-                if seen.insert((state.nodes.clone(), edge_key)) {
-                    provisional.push(state);
-                    if provisional.len() > PATTERN_FRONTIER_BUDGET {
-                        return Err(EngineError::InvalidOperation(format!(
-                            "pattern intermediate frontier exceeded {PATTERN_FRONTIER_BUDGET} states"
-                        )));
-                    }
-                }
-            }
-        }
-
-        let verified_targets = self.pattern_verified_target_ids_by_index(
-            query,
-            candidate_ids_by_index,
-            policy_cutoffs,
-        )?;
-        provisional.retain(|state| {
-            [edge.from_index, edge.to_index].into_iter().all(|node_index| {
-                state.nodes[node_index].is_some_and(|node_id| {
-                    verified_targets[node_index].contains(&node_id)
-                })
-            })
-        });
-        Ok(provisional)
-    }
-
-    fn pattern_node_anchor_frontier(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        node_index: usize,
-        anchor_plan: &PlannedNodeQuery,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<PatternAnchorFrontier, EngineError> {
-        let anchor = &query.nodes[node_index];
-        let mut anchor_query = anchor.query.clone();
-        anchor_query.page.limit = Some(PATTERN_FRONTIER_BUDGET);
-        let (anchor_page, followups) =
-            self.query_node_page_planned(&anchor_query, anchor_plan, false, policy_cutoffs)?;
-        if anchor_page.next_cursor.is_some() {
-            return Err(EngineError::InvalidOperation(format!(
-                "pattern intermediate frontier exceeded {PATTERN_FRONTIER_BUDGET} states"
-            )));
-        }
-        let mut states = Vec::with_capacity(anchor_page.ids.len());
-        for anchor_id in anchor_page.ids {
-            let mut state = PatternExecutionState {
-                nodes: vec![None; query.nodes.len()],
-                edges: vec![None; query.edges.len()],
+        rows: &mut [crate::graph_row::GraphBindingRow],
+        schema: &crate::graph_row::GraphBindingSchema,
+        needs: &EntityProjectionNeeds,
+    ) -> Result<(), EngineError> {
+        for (alias, node_needs) in &needs.nodes {
+            let Some(slot) = schema.slot_for_alias(alias) else {
+                continue;
             };
-            state.nodes[node_index] = Some(anchor_id);
-            states.push(state);
-            if states.len() > PATTERN_FRONTIER_BUDGET {
-                return Err(EngineError::InvalidOperation(format!(
-                    "pattern intermediate frontier exceeded {PATTERN_FRONTIER_BUDGET} states"
-                )));
+            let ids = graph_row_collect_node_ids(rows, slot)?;
+            if ids.is_empty() {
+                continue;
             }
-        }
-        Ok(PatternAnchorFrontier::Ready {
-            states,
-            followups,
-            expansion_order: Vec::new(),
-            sort_anchor_alias: String::new(),
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn pattern_edge_anchor_frontier(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        edge_index: usize,
-        edge_query: &NormalizedEdgeQuery,
-        edge_plan: PlannedEdgeQuery,
-        edge_fallback_plans: Vec<PlannedEdgeQuery>,
-        reference_time: i64,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<PatternAnchorFrontier, EngineError> {
-        let mut deferred_followups = Vec::new();
-        for plan in std::iter::once(edge_plan).chain(edge_fallback_plans.into_iter()) {
-            let PlannedEdgeQuery {
-                driver,
-                cap_context,
-                warnings: _,
-                mut followups,
-            } = plan;
-            let materialized = self.materialize_edge_physical_plan(edge_query, cap_context, &driver)?;
-            let candidate_ids = match materialized {
-                CandidateMaterializationResult::Ready {
-                    ids,
-                    followups: mut materialization_followups,
-                } => {
-                    followups.append(&mut materialization_followups);
-                    ids
+            let selected = self.sources().find_node_projected_fields(&ids, node_needs)?;
+            let mut by_id = NodeIdMap::with_capacity_and_hasher(ids.len(), Default::default());
+            for (node_id, fields) in ids.into_iter().zip(selected.into_iter()) {
+                if let Some(fields) = fields {
+                    by_id.insert(node_id, fields);
                 }
-                CandidateMaterializationResult::TooBroad {
-                    followups: mut materialization_followups,
-                } => {
-                    followups.append(&mut materialization_followups);
-                    deferred_followups.append(&mut followups);
+            }
+            for row in rows.iter_mut() {
+                let Some(node_id) = row.node_id_for_slot_if_bound(slot)? else {
                     continue;
-                }
+                };
+                let Some(fields) = by_id.get(&node_id) else {
+                    continue;
+                };
+                row.bind_node(
+                    slot,
+                    crate::graph_row::GraphBoundNode::with_element(
+                        node_id,
+                        graph_node_value_from_selected(node_id, fields, &self.label_catalog)?,
+                    ),
+                )?;
+            }
+        }
+
+        for (alias, edge_needs) in &needs.edges {
+            let Some(slot) = schema.slot_for_alias(alias) else {
+                continue;
             };
-            let verified = self.verify_pattern_edge_anchor_candidates(
-                &candidate_ids,
-                &query.edges[edge_index],
-                reference_time,
-                policy_cutoffs,
-            )?;
-            let states = self.pattern_edge_anchor_states_from_verified(
-                query,
-                edge_index,
-                &verified,
-                policy_cutoffs,
-            )?;
-            deferred_followups.append(&mut followups);
-            return Ok(PatternAnchorFrontier::Ready {
-                states,
-                followups: deferred_followups,
-                expansion_order: Vec::new(),
-                sort_anchor_alias: String::new(),
-            });
+            let ids = graph_row_collect_edge_ids(rows, slot)?;
+            if ids.is_empty() {
+                continue;
             }
-        Ok(PatternAnchorFrontier::TooBroad {
-            followups: deferred_followups,
-        })
-    }
-
-    fn pattern_anchor_frontier(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        anchor: PatternAnchorPlan,
-        reference_time: i64,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<PatternAnchorFrontier, EngineError> {
-        match anchor {
-            PatternAnchorPlan::Node {
-                node_index,
-                anchor_plan,
-                expansion_order,
-                sort_anchor_alias,
-                ..
-            } => match self.pattern_node_anchor_frontier(query, node_index, &anchor_plan, policy_cutoffs)? {
-                PatternAnchorFrontier::Ready { states, followups, .. } => {
-                    Ok(PatternAnchorFrontier::Ready {
-                        states,
-                        followups,
-                        expansion_order,
-                        sort_anchor_alias,
-                    })
-                }
-                PatternAnchorFrontier::TooBroad { followups } => {
-                    Ok(PatternAnchorFrontier::TooBroad { followups })
-                }
-            },
-            PatternAnchorPlan::Edge {
-                edge_index,
-                edge_query,
-                edge_plan,
-                edge_fallback_plans,
-                expansion_order,
-                sort_anchor_alias,
-                from_index,
-                to_index,
-                orientation_policy,
-                ..
-            } => {
-                let edge = &query.edges[edge_index];
-                debug_assert_eq!(from_index, edge.from_index);
-                debug_assert_eq!(to_index, edge.to_index);
-                debug_assert_eq!(
-                    orientation_policy,
-                    EdgeAnchorOrientationPolicy::from_direction(edge.direction)
-                );
-                match self.pattern_edge_anchor_frontier(
-                    query,
-                    edge_index,
-                    &edge_query,
-                    edge_plan,
-                    edge_fallback_plans,
-                    reference_time,
-                    policy_cutoffs,
-                )? {
-                PatternAnchorFrontier::Ready { states, followups, .. } => {
-                    Ok(PatternAnchorFrontier::Ready {
-                        states,
-                        followups,
-                        expansion_order,
-                        sort_anchor_alias,
-                    })
-                }
-                PatternAnchorFrontier::TooBroad { followups } => {
-                    Ok(PatternAnchorFrontier::TooBroad { followups })
+            let selected = self.sources().find_edge_projected_fields(&ids, edge_needs)?;
+            let mut by_id = NodeIdMap::with_capacity_and_hasher(ids.len(), Default::default());
+            for (edge_id, fields) in ids.into_iter().zip(selected.into_iter()) {
+                if let Some(fields) = fields {
+                    by_id.insert(edge_id, fields);
                 }
             }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn finish_pattern_from_frontier(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        expansion_order: &[usize],
-        mut frontier: Vec<PatternExecutionState>,
-        sort_anchor_alias: &str,
-        reference_time: i64,
-        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-        followups: Vec<SecondaryIndexReadFollowup>,
-    ) -> Result<QueryExecutionOutcome<QueryPatternResult>, EngineError> {
-        let mut matches = Vec::with_capacity(query.limit.saturating_add(1));
-        let Some((&final_edge_index, prefix_order)) = expansion_order.split_last() else {
-            for state in frontier {
-                insert_bounded_pattern_match(
-                    &mut matches,
-                    pattern_match_from_state(query, &state),
-                    query.limit,
-                    sort_anchor_alias,
-                );
-            }
-            sort_pattern_matches(&mut matches, sort_anchor_alias);
-            let truncated = matches.len() > query.limit;
-            matches.truncate(query.limit);
-            return Ok(QueryExecutionOutcome {
-                value: QueryPatternResult { matches, truncated },
-                followups,
-            });
-        };
-
-        for &edge_index in prefix_order {
-            frontier = self.execute_pattern_edge_frontier(
-                query,
-                edge_index,
-                frontier,
-                reference_time,
-                policy_cutoffs,
-            )?;
-            if frontier.is_empty() {
-                break;
+            for row in rows.iter_mut() {
+                let Some(edge_id) = row.edge_id_for_slot_if_bound(slot)? else {
+                    continue;
+                };
+                let Some(fields) = by_id.get(&edge_id) else {
+                    continue;
+                };
+                row.bind_edge(
+                    slot,
+                    crate::graph_row::GraphBoundEdge::with_element(
+                        edge_id,
+                        graph_edge_value_from_selected(edge_id, fields, &self.label_catalog)?,
+                    ),
+                )?;
             }
         }
 
-        if !frontier.is_empty() {
-            self.collect_pattern_matches_from_final_edge(
-                query,
-                final_edge_index,
-                frontier,
-                &mut matches,
-                sort_anchor_alias,
-                reference_time,
-                policy_cutoffs,
+        for (alias, path_needs) in &needs.paths {
+            if !graph_row_path_needs_require_selected_field_reads(path_needs) {
+                continue;
+            }
+            let Some(slot) = schema.slot_for_alias(alias) else {
+                continue;
+            };
+            self.hydrate_graph_path_rows_for_needs(rows, slot, path_needs)?;
+        }
+        Ok(())
+    }
+
+    fn hydrate_graph_path_rows_for_needs(
+        &self,
+        rows: &mut [crate::graph_row::GraphBindingRow],
+        slot: crate::graph_row::GraphBindingSlotRef,
+        needs: &PathSelectedFieldNeeds,
+    ) -> Result<(), EngineError> {
+        let node_needs = graph_row_path_node_hydration_needs(needs)?;
+        let edge_needs = graph_row_path_edge_hydration_needs(needs)?;
+
+        let mut nodes_by_id = NodeIdMap::default();
+        if let Some(node_needs) = node_needs.as_ref() {
+            let ids = graph_row_collect_path_node_ids(rows, slot, needs)?;
+            if !ids.is_empty() {
+                let selected = self.sources().find_node_projected_fields(&ids, node_needs)?;
+                nodes_by_id = NodeIdMap::with_capacity_and_hasher(ids.len(), Default::default());
+                for (node_id, fields) in ids.into_iter().zip(selected.into_iter()) {
+                    if let Some(fields) = fields {
+                        nodes_by_id.insert(
+                            node_id,
+                            graph_node_value_from_selected(node_id, &fields, &self.label_catalog)?,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut edges_by_id = NodeIdMap::default();
+        if let Some(edge_needs) = edge_needs.as_ref() {
+            let ids = graph_row_collect_path_edge_ids(rows, slot, needs)?;
+            if !ids.is_empty() {
+                let selected = self.sources().find_edge_projected_fields(&ids, edge_needs)?;
+                edges_by_id = NodeIdMap::with_capacity_and_hasher(ids.len(), Default::default());
+                for (edge_id, fields) in ids.into_iter().zip(selected.into_iter()) {
+                    if let Some(fields) = fields {
+                        edges_by_id.insert(
+                            edge_id,
+                            graph_edge_value_from_selected(edge_id, &fields, &self.label_catalog)?,
+                        );
+                    }
+                }
+            }
+        }
+
+        for row in rows.iter_mut() {
+            let Some(path) = row.path_for_slot_if_bound(slot)?.cloned() else {
+                continue;
+            };
+            let nodes = path
+                .path
+                .nodes
+                .iter()
+                .copied()
+                .map(|node_id| {
+                    if let Some(value) = nodes_by_id.get(&node_id) {
+                        crate::graph_row::GraphBoundNode::with_element(node_id, value.clone())
+                    } else {
+                        crate::graph_row::GraphBoundNode::id_only(node_id)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let edges = path
+                .path
+                .edges
+                .iter()
+                .copied()
+                .map(|edge_id| {
+                    if let Some(value) = edges_by_id.get(&edge_id) {
+                        crate::graph_row::GraphBoundEdge::with_element(edge_id, value.clone())
+                    } else {
+                        crate::graph_row::GraphBoundEdge::id_only(edge_id)
+                    }
+                })
+                .collect::<Vec<_>>();
+            row.bind_path(
+                slot,
+                crate::graph_row::GraphBoundPath::with_values(path.path, nodes, edges)?,
             )?;
         }
-
-        sort_pattern_matches(&mut matches, sort_anchor_alias);
-        let truncated = matches.len() > query.limit;
-        matches.truncate(query.limit);
-        Ok(QueryExecutionOutcome {
-            value: QueryPatternResult { matches, truncated },
-            followups,
-        })
+        Ok(())
     }
 
-    fn query_pattern_planned(
-        &self,
-        query: &NormalizedGraphPatternQuery,
-        planned: PlannedPatternQuery,
-    ) -> Result<QueryExecutionOutcome<QueryPatternResult>, EngineError> {
-        match query.order {
-            PatternOrder::AnchorThenAliasesAsc => {}
-        }
 
-        let policy_cutoffs = self.query_policy_cutoffs();
-        let pattern_reference_time = query.at_epoch.unwrap_or_else(now_millis);
-        let mut deferred_followups = Vec::new();
-        for anchor in std::iter::once(planned.anchor).chain(planned.fallback_anchors.into_iter()) {
-            match self.pattern_anchor_frontier(
-                query,
-                anchor,
-                pattern_reference_time,
-                policy_cutoffs.as_ref(),
-            )? {
-                PatternAnchorFrontier::Ready {
-                    states,
-                    mut followups,
-                    expansion_order,
-                    sort_anchor_alias,
-                } => {
-                    deferred_followups.append(&mut followups);
-                    return self.finish_pattern_from_frontier(
-                        query,
-                        &expansion_order,
-                        states,
-                        &sort_anchor_alias,
-                        pattern_reference_time,
-                        policy_cutoffs.as_ref(),
-                        deferred_followups,
-                    );
-                }
-                PatternAnchorFrontier::TooBroad { mut followups } => {
-                    deferred_followups.append(&mut followups);
-                }
-            }
-        }
-
-        Err(EngineError::InvalidOperation(
-            "pattern edge anchor source exceeded candidate cap".into(),
-        ))
-    }
-
-    fn query_pattern_outcome(
-        &self,
-        query: &GraphPatternQuery,
-    ) -> Result<QueryExecutionOutcome<QueryPatternResult>, EngineError> {
-        let normalized = self.normalize_pattern_query(query)?;
-        let planned = self.plan_normalized_pattern_query(&normalized)?;
-        self.query_pattern_planned(&normalized, planned)
-    }
 }

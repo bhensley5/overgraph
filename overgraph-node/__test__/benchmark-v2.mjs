@@ -23,6 +23,7 @@ function parseArgs(argv) {
     warmup: 20,
     iters: 80,
     scenarioSet: 'all',
+    scenarioIds: [],
   };
   for (let i = 2; i < argv.length; i++) {
     const token = argv[i];
@@ -34,6 +35,8 @@ function parseArgs(argv) {
       args.iters = Number(argv[++i]);
     } else if (token === '--scenario-set' && argv[i + 1]) {
       args.scenarioSet = argv[++i];
+    } else if (token === '--scenario-id' && argv[i + 1]) {
+      args.scenarioIds.push(argv[++i]);
     }
   }
   if (!['all', 'query'].includes(args.scenarioSet)) {
@@ -371,11 +374,11 @@ function queryBenchNodes(start, count) {
 
 function buildQueryBenchmarkDb(path, preloadNodes) {
   const db = OverGraph.open(path);
-  const status = db.ensureNodePropertyIndex('Person', 'status', { kind: 'equality' });
+  const status = db.ensureNodePropertyIndex('Person', 'status', 'equality');
   waitForPropertyIndexReady(db, status.indexId);
-  const tier = db.ensureNodePropertyIndex('Person', 'tier', { kind: 'equality' });
+  const tier = db.ensureNodePropertyIndex('Person', 'tier', 'equality');
   waitForPropertyIndexReady(db, tier.indexId);
-  const score = db.ensureNodePropertyIndex('Person', 'score', { kind: 'range', domain: 'int' });
+  const score = db.ensureNodePropertyIndex('Person', 'score', 'range');
   waitForPropertyIndexReady(db, score.indexId);
 
   const layout = queryBenchmarkLayout(preloadNodes);
@@ -433,16 +436,230 @@ function buildEdgeQueryBenchmarkDb(path, preloadEdges) {
 
 function buildIndexedEdgeQueryBenchmarkDb(path, preloadEdges) {
   const fixture = buildEdgeQueryBenchmarkDb(path, preloadEdges);
-  const role = fixture.db.ensureEdgePropertyIndex('WORKS_AT', 'role', { kind: 'equality' });
+  const role = fixture.db.ensureEdgePropertyIndex('WORKS_AT', 'role', 'equality');
   waitForEdgePropertyIndexReady(fixture.db, role.indexId);
-  const score = fixture.db.ensureEdgePropertyIndex('WORKS_AT', 'score', { kind: 'range', domain: 'int' });
+  const score = fixture.db.ensureEdgePropertyIndex('WORKS_AT', 'score', 'range');
   waitForEdgePropertyIndexReady(fixture.db, score.indexId);
   return fixture;
+}
+
+function buildGraphRowBenchmarkDb(path, preloadEdges) {
+  const db = OverGraph.open(path);
+  const sourceCount = 1;
+  const targetCount = Math.max(1, preloadEdges);
+  const nodes = [];
+  for (let i = 0; i < sourceCount; i += 1) {
+    nodes.push(nodeInput('Person', `edge-source-${i}`));
+  }
+  for (let i = 0; i < targetCount; i += 1) {
+    nodes.push(nodeInput('Company', `edge-target-${i}`));
+  }
+  const ids = db.batchUpsertNodes(nodes);
+  const sourceIds = ids.slice(0, sourceCount);
+  const targetIds = ids.slice(sourceCount);
+  const sourceId = sourceIds[0];
+  const segments = preloadEdges >= 2 ? 1 : 0;
+  const segmentEdges = segments === 0 ? 0 : Math.max(1, Math.floor(preloadEdges / 2));
+  const memtableTailEdges = Math.max(0, preloadEdges - segmentEdges);
+  const makeEdges = (start, count) => Array.from({ length: count }, (_, offset) => {
+    const i = start + offset;
+    return {
+      from: sourceIds[i % sourceCount],
+      to: targetIds[i % targetIds.length],
+      label: 'WORKS_AT',
+      props: { role: i % 10 === 0 ? 'lead' : 'member', score: i % 100 },
+      weight: i % 2 === 0 ? 2.0 : 0.5,
+    };
+  });
+  if (segmentEdges > 0) {
+    db.batchUpsertEdges(makeEdges(0, segmentEdges));
+    db.flush();
+  }
+  if (memtableTailEdges > 0) {
+    db.batchUpsertEdges(makeEdges(segmentEdges, memtableTailEdges));
+  }
+
+  const docs = [];
+  for (let i = 0; i < targetCount; i += 8) {
+    docs.push(nodeInput('Document', `doc-${i}`));
+  }
+  const docIds = docs.length ? db.batchUpsertNodes(docs) : [];
+  if (docIds.length) {
+    db.batchUpsertEdges(Array.from(docIds, (docId, docIndex) => ({
+      from: targetIds[docIndex * 8],
+      to: docId,
+      label: 'MENTIONS',
+      weight: 1.0,
+    })));
+  }
+
+  const role = db.ensureEdgePropertyIndex('WORKS_AT', 'role', 'equality');
+  waitForEdgePropertyIndexReady(db, role.indexId);
+  const score = db.ensureEdgePropertyIndex('WORKS_AT', 'score', 'range');
+  waitForEdgePropertyIndexReady(db, score.indexId);
+  return {
+    db,
+    sourceId,
+    layout: { segments, segment_edges: segmentEdges, memtable_tail_edges: memtableTailEdges },
+  };
+}
+
+function graphRowOptionalRequest(sourceId, limit) {
+  return {
+    nodes: [
+      { alias: 'source', labelFilter: nodeFilter('Person'), ids: [sourceId] },
+      { alias: 'target', labelFilter: nodeFilter('Company') },
+      { alias: 'doc', labelFilter: nodeFilter('Document') },
+    ],
+    pieces: [
+      {
+        kind: 'edge',
+        alias: 'edge',
+        fromAlias: 'source',
+        toAlias: 'target',
+        direction: 'outgoing',
+        labelFilter: ['WORKS_AT'],
+        filter: { property: 'role', eq: 'lead' },
+      },
+      {
+        kind: 'optional',
+        pieces: [
+          {
+            kind: 'edge',
+            alias: 'ref',
+            fromAlias: 'target',
+            toAlias: 'doc',
+            direction: 'outgoing',
+            labelFilter: ['MENTIONS'],
+          },
+        ],
+      },
+    ],
+    where: {
+      op: '=',
+      left: { property: { alias: 'edge', key: 'role' } },
+      right: { param: 'role' },
+    },
+    params: { role: 'lead' },
+    return: [
+      { expr: { binding: 'source' }, as: 'source', projection: 'id' },
+      { expr: { binding: 'edge' }, as: 'edge', projection: 'id' },
+      { expr: { binding: 'target' }, as: 'target', projection: 'id' },
+      { expr: { binding: 'ref' }, as: 'ref', projection: 'id' },
+      { expr: { binding: 'doc' }, as: 'doc', projection: 'id' },
+    ],
+    orderBy: [
+      { expr: { property: { alias: 'edge', key: 'score' } }, direction: 'desc' },
+      { expr: { nodeField: { alias: 'target', field: 'id' } }, direction: 'asc' },
+    ],
+    limit,
+  };
+}
+
+function graphRowScenarioParams(layout, preloadEdges, limit) {
+  return {
+    labels: {
+      source: 'Person',
+      target: 'Company',
+      optional: 'Document',
+    },
+    edge_labels: {
+      required: 'WORKS_AT',
+      optional: 'MENTIONS',
+    },
+    preload_edges: preloadEdges,
+    segments: layout.segments,
+    segment_edges: layout.segment_edges,
+    memtable_tail_edges: layout.memtable_tail_edges,
+    predicate: 'edge_role_eq_lead_param',
+    source_anchor: 'first_source_id',
+    optional: 'target_mentions_document_sparse',
+    row_ops: ['order_by_edge_score_desc', 'limit'],
+    limit,
+  };
+}
+
+function pushGraphRowOptionalScenario(args, scenarioContract, tmpRoot, preloadNodes, limit, scenarios) {
+  const scenarioId = 'S-QUERY-007';
+  const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+  const { db, layout, sourceId } = buildGraphRowBenchmarkDb(
+    join(tmpRoot, 'query-graph-rows-optional-edge'),
+    preloadNodes
+  );
+  try {
+    const request = graphRowOptionalRequest(sourceId, limit);
+    const s = runBench(() => db.queryGraphRows(request), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'query_graph_rows_optional_edge_traversal',
+        'query',
+        s,
+        iterCfg,
+        graphRowScenarioParams(layout, preloadNodes, limit),
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function pushGqlGraphRowOptionalScenario(args, scenarioContract, tmpRoot, preloadNodes, limit, scenarios) {
+  const scenarioId = 'S-GQL-006';
+  const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+  const { db, layout, sourceId } = buildGraphRowBenchmarkDb(
+    join(tmpRoot, 'gql-graph-row-optional-edge'),
+    preloadNodes
+  );
+  const query = `MATCH (source:Person)-[edge:WORKS_AT {role: $role}]->(target:Company)
+                 WHERE id(source) = $source
+                 OPTIONAL MATCH (target)-[ref:MENTIONS]->(doc:Document)
+                 RETURN id(source) AS source, id(edge) AS edge, id(target) AS target,
+                        id(ref) AS ref, id(doc) AS doc
+                 ORDER BY edge.score DESC, id(target) LIMIT ${limit}`;
+  try {
+    const s = runBench(
+      () => db.executeGql(query, { role: 'lead', source: sourceId }),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'execute_gql_optional_edge_traversal_graph_rows',
+        'query',
+        s,
+        iterCfg,
+        graphRowScenarioParams(layout, preloadNodes, limit),
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+  } finally {
+    db.close();
+  }
 }
 
 function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
   const preloadNodes = cfg.time_range_nodes;
   const limit = 100;
+  if (args.scenarioIds.length > 0) {
+    const selectedScenarioIds = new Set(args.scenarioIds);
+    const supportedScenarioIds = new Set(['S-QUERY-007', 'S-GQL-006']);
+    const unsupported = [...selectedScenarioIds].filter((id) => !supportedScenarioIds.has(id));
+    if (unsupported.length > 0) {
+      throw new Error(
+        `--scenario-id is currently limited to CP32.10 final scenarios; unsupported: ${unsupported.sort().join(', ')}`
+      );
+    }
+    if (selectedScenarioIds.has('S-QUERY-007')) {
+      pushGraphRowOptionalScenario(args, scenarioContract, tmpRoot, preloadNodes, limit, scenarios);
+    }
+    if (selectedScenarioIds.has('S-GQL-006')) {
+      pushGqlGraphRowOptionalScenario(args, scenarioContract, tmpRoot, preloadNodes, limit, scenarios);
+    }
+    return;
+  }
 
   {
     const scenarioId = 'S-QUERY-001';
@@ -668,34 +885,97 @@ function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
   }
 
   {
-    const scenarioId = 'S-QUERY-007';
+    pushGraphRowOptionalScenario(args, scenarioContract, tmpRoot, preloadNodes, limit, scenarios);
+  }
+
+  {
+    const scenarioId = 'S-GQL-001';
     const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
-    const { db, layout } = buildIndexedEdgeQueryBenchmarkDb(
-      join(tmpRoot, 'query-pattern-edge-property-anchor-indexed'),
-      preloadNodes
-    );
-    const request = {
-      nodes: [
-        { alias: 'source', labelFilter: nodeFilter('Person') },
-        { alias: 'target', labelFilter: nodeFilter('Company') },
-      ],
-      edges: [
-        {
-          alias: 'edge',
-          fromAlias: 'source',
-          toAlias: 'target',
-          direction: 'outgoing',
-          edgeLabelFilter: ['WORKS_AT'],
-          filter: { property: 'role', eq: 'lead' },
-        },
-      ],
-      limit,
-    };
-    const s = runBench(() => db.queryPattern(request), iterCfg.warmup, iterCfg.iters);
+    const { db, layout } = buildQueryBenchmarkDb(join(tmpRoot, 'gql-node-row-ops'), preloadNodes);
+    const params = { status: 'active' };
+    const query = `MATCH (n:Person)
+                   WHERE n.status = $status AND n.score >= 50
+                   RETURN id(n) AS id, n.score AS score
+                   ORDER BY n.score DESC LIMIT ${limit}`;
+    const s = runBench(() => db.executeGql(query, params), iterCfg.warmup, iterCfg.iters);
     scenarios.push(
       scenario(
         scenarioId,
-        'query_pattern_edge_property_anchor_indexed',
+        'execute_gql_node_residual_row_ops_object_rows',
+        'query',
+        s,
+        iterCfg,
+        {
+          label: 'Person',
+          preload_nodes: preloadNodes,
+          segments: layout.segments,
+          segment_nodes: layout.segment_nodes,
+          memtable_tail_nodes: layout.memtable_tail_nodes,
+          predicates: ['status_eq_active', 'score_gte_50'],
+          row_ops: ['order_by', 'limit'],
+          row_format: 'object',
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    pushGqlGraphRowOptionalScenario(args, scenarioContract, tmpRoot, preloadNodes, limit, scenarios);
+  }
+
+  {
+    const scenarioId = 'S-GQL-002';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout } = buildQueryBenchmarkDb(join(tmpRoot, 'gql-node-compact-row-ops'), preloadNodes);
+    const params = { status: 'active' };
+    const query = `MATCH (n:Person)
+                   WHERE n.status = $status AND n.score >= 50
+                   RETURN id(n) AS id, n.score AS score
+                   ORDER BY n.score DESC LIMIT ${limit}`;
+    const s = runBench(() => db.executeGql(query, params, { compactRows: true }), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'execute_gql_node_residual_row_ops_compact_rows',
+        'query',
+        s,
+        iterCfg,
+        {
+          label: 'Person',
+          preload_nodes: preloadNodes,
+          segments: layout.segments,
+          segment_nodes: layout.segment_nodes,
+          memtable_tail_nodes: layout.memtable_tail_nodes,
+          predicates: ['status_eq_active', 'score_gte_50'],
+          row_ops: ['order_by', 'limit'],
+          row_format: 'compact',
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    const scenarioId = 'S-GQL-003';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout } = buildIndexedEdgeQueryBenchmarkDb(
+      join(tmpRoot, 'gql-edge-property-indexed'),
+      preloadNodes
+    );
+    const query = `MATCH ()-[r:WORKS_AT]->()
+                   WHERE r.role = $role
+                   RETURN id(r) AS id, r.score AS score
+                   ORDER BY r.score DESC LIMIT ${limit}`;
+    const s = runBench(() => db.executeGql(query, { role: 'lead' }), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'execute_gql_edge_property_indexed_row_ops',
         'query',
         s,
         iterCfg,
@@ -705,7 +985,79 @@ function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
           segments: layout.segments,
           segment_edges: layout.segment_edges,
           memtable_tail_edges: layout.memtable_tail_edges,
-          filter: 'role_eq_lead',
+          predicate: 'role_eq_lead',
+          row_ops: ['order_by', 'limit'],
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    const scenarioId = 'S-GQL-004';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout } = buildIndexedEdgeQueryBenchmarkDb(
+      join(tmpRoot, 'gql-pattern-property-anchor-indexed'),
+      preloadNodes
+    );
+    const query = `MATCH (source:Person)-[edge:WORKS_AT]->(target:Company)
+                   WHERE edge.role = $role
+                   RETURN id(source) AS source, id(edge) AS edge, id(target) AS target
+                   LIMIT ${limit}`;
+    const s = runBench(() => db.executeGql(query, { role: 'lead' }), iterCfg.warmup, iterCfg.iters);
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'execute_gql_fixed_pattern_property_anchor',
+        'query',
+        s,
+        iterCfg,
+        {
+          label: 'WORKS_AT',
+          preload_edges: preloadNodes,
+          segments: layout.segments,
+          segment_edges: layout.segment_edges,
+          memtable_tail_edges: layout.memtable_tail_edges,
+          predicate: 'role_eq_lead',
+          limit,
+        },
+        scenarioComparability(scenarioContract, scenarioId)
+      )
+    );
+    db.close();
+  }
+
+  {
+    const scenarioId = 'S-GQL-005';
+    const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+    const { db, layout } = buildQueryBenchmarkDb(join(tmpRoot, 'gql-explain-profile'), preloadNodes);
+    const query = `MATCH (n:Person)
+                   WHERE n.status = $status
+                   RETURN n.score AS score
+                   ORDER BY n.score DESC LIMIT ${limit}`;
+    const s = runBench(
+      () => db.executeGql(query, { status: 'active' }, { includePlan: true, profile: true }),
+      iterCfg.warmup,
+      iterCfg.iters
+    );
+    scenarios.push(
+      scenario(
+        scenarioId,
+        'execute_gql_include_plan_profile',
+        'query',
+        s,
+        iterCfg,
+        {
+          label: 'Person',
+          preload_nodes: preloadNodes,
+          segments: layout.segments,
+          segment_nodes: layout.segment_nodes,
+          memtable_tail_nodes: layout.memtable_tail_nodes,
+          predicate: 'status_eq_active',
+          include_plan: true,
+          profile: true,
           limit,
         },
         scenarioComparability(scenarioContract, scenarioId)
@@ -726,7 +1078,7 @@ const scenarios = [];
 try {
   pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios);
 
-  if (args.scenarioSet === 'all') {
+  if (args.scenarioSet === 'all' && args.scenarioIds.length === 0) {
   // S-CRUD-001: single upsert node (growth)
   {
     const scenarioId = 'S-CRUD-001';

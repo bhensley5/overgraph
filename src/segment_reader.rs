@@ -18,6 +18,10 @@ use crate::planner_stats::{
     DeclaredIndexRuntimeCoverageState, PlannerStatsAvailability, PlannerStatsDeclaredIndexKind,
     PlannerStatsDeclaredIndexTarget,
 };
+#[cfg(test)]
+use crate::property_value_semantics::hash_prop_equality_key;
+use crate::property_value_semantics::{NumericRangeSortKey, NUMERIC_RANGE_KEY_BYTES};
+use crate::row_projection::{EdgeSelectedFieldNeeds, NodeSelectedFieldNeeds, PropertySelection};
 use crate::segment_components::{
     component_id, decode_identity_header, decode_manifest_envelope, dependency_digest,
     is_packed_core_component_kind, packed_core_container_record, secondary_declaration_dependency,
@@ -29,7 +33,9 @@ use crate::segment_components::{
     SEGMENT_COMPONENT_MANIFEST_FILENAME,
 };
 use crate::segment_writer::{
-    component_fingerprint, dense_config_fingerprint, planner_stats_component_dependencies,
+    component_fingerprint, dense_config_fingerprint, edge_property_equality_component_fingerprint,
+    edge_property_range_component_fingerprint, node_property_equality_component_fingerprint,
+    node_property_range_component_fingerprint, planner_stats_component_dependencies,
     planner_stats_component_fingerprint, NODE_VECTOR_META_ENTRY_SIZE, SEGMENT_FORMAT_VERSION,
 };
 use crate::sparse_postings::{
@@ -642,7 +648,7 @@ const TOMBSTONE_ENTRY_SIZE: usize = 25; // kind (1) + id (8) + deleted_at (8) + 
 const LABEL_POSTING_INDEX_ENTRY_SIZE: usize = 16; // label_id (4) + offset (8) + count (4)
 const EDGE_TRIPLE_ENTRY_SIZE: usize = 28; // from (8) + to (8) + label_id (4) + edge_id (8)
 const SECONDARY_EQ_ENTRY_SIZE: usize = 20; // value_hash (8) + offset (8) + count (4)
-const SECONDARY_RANGE_ENTRY_SIZE: usize = 16; // encoded_value (8) + node_id (8)
+const SECONDARY_RANGE_ENTRY_SIZE: usize = NUMERIC_RANGE_KEY_BYTES + 8; // numeric key (24) + id (8)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatchReadStrategy {
@@ -3490,30 +3496,68 @@ impl SegmentReader {
             self.node_vector_meta_at(index)?;
 
         if dense_len > 0 {
-            let mut values = Vec::with_capacity(dense_len as usize);
-            let base = dense_offset as usize;
-            for i in 0..dense_len as usize {
-                values.push(read_f32_at(
-                    &self.node_dense_vectors_mmap,
-                    base + i * DENSE_VECTOR_VALUE_SIZE,
-                )?);
-            }
-            node.dense_vector = Some(values);
+            node.dense_vector = self.read_dense_vector_from_blob(dense_offset, dense_len)?;
         }
 
         if sparse_len > 0 {
-            let mut values = Vec::with_capacity(sparse_len as usize);
-            let base = sparse_offset as usize;
-            for i in 0..sparse_len as usize {
-                let entry_off = base + i * SPARSE_VECTOR_ENTRY_SIZE;
-                let dimension_id = read_u32_at(&self.node_sparse_vectors_mmap, entry_off)?;
-                let weight = read_f32_at(&self.node_sparse_vectors_mmap, entry_off + 4)?;
-                values.push((dimension_id, weight));
-            }
-            node.sparse_vector = Some(values);
+            node.sparse_vector = self.read_sparse_vector_from_blob(sparse_offset, sparse_len)?;
         }
 
         Ok(())
+    }
+
+    fn read_node_dense_vector_at_index(
+        &self,
+        index: usize,
+    ) -> Result<Option<DenseVector>, EngineError> {
+        let (dense_offset, dense_len, _, _) = self.node_vector_meta_at(index)?;
+        self.read_dense_vector_from_blob(dense_offset, dense_len)
+    }
+
+    fn read_node_sparse_vector_at_index(
+        &self,
+        index: usize,
+    ) -> Result<Option<SparseVector>, EngineError> {
+        let (_, _, sparse_offset, sparse_len) = self.node_vector_meta_at(index)?;
+        self.read_sparse_vector_from_blob(sparse_offset, sparse_len)
+    }
+
+    fn read_dense_vector_from_blob(
+        &self,
+        dense_offset: u64,
+        dense_len: u32,
+    ) -> Result<Option<DenseVector>, EngineError> {
+        if dense_len == 0 {
+            return Ok(None);
+        }
+        let mut values = Vec::with_capacity(dense_len as usize);
+        let base = dense_offset as usize;
+        for i in 0..dense_len as usize {
+            values.push(read_f32_at(
+                &self.node_dense_vectors_mmap,
+                base + i * DENSE_VECTOR_VALUE_SIZE,
+            )?);
+        }
+        Ok(Some(values))
+    }
+
+    fn read_sparse_vector_from_blob(
+        &self,
+        sparse_offset: u64,
+        sparse_len: u32,
+    ) -> Result<Option<SparseVector>, EngineError> {
+        if sparse_len == 0 {
+            return Ok(None);
+        }
+        let mut values = Vec::with_capacity(sparse_len as usize);
+        let base = sparse_offset as usize;
+        for i in 0..sparse_len as usize {
+            let entry_off = base + i * SPARSE_VECTOR_ENTRY_SIZE;
+            let dimension_id = read_u32_at(&self.node_sparse_vectors_mmap, entry_off)?;
+            let weight = read_f32_at(&self.node_sparse_vectors_mmap, entry_off + 4)?;
+            values.push((dimension_id, weight));
+        }
+        Ok(Some(values))
     }
 
     // --- Iteration methods (for compaction) ---
@@ -5256,7 +5300,7 @@ impl SegmentReader {
             SecondaryIndexKind::Equality => {
                 self.warm_secondary_eq_runtime_coverage(entry.index_id, target)
             }
-            SecondaryIndexKind::Range { .. } => {
+            SecondaryIndexKind::Range => {
                 self.warm_secondary_range_runtime_coverage(entry.index_id, target)
             }
         }
@@ -5520,6 +5564,10 @@ impl SegmentReader {
         target: PlannerStatsDeclaredIndexTarget,
         callback: impl FnOnce(&[u8]) -> Result<T, EngineError>,
     ) -> Result<Option<T>, EngineError> {
+        // Query-time range lookup trusts current component identity and does
+        // only the fixed-width shape check needed for binary-search access.
+        // Full ordering validation is reserved for scrub, repair, and
+        // compaction source-sidecar reuse.
         let mut cache = self.secondary_range_sidecars.lock().unwrap();
         if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry((index_id, target)) {
             let component_kind = secondary_range_component_kind(index_id, target);
@@ -5623,6 +5671,7 @@ impl SegmentReader {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_secondary_eq_sidecar(&self, index_id: u64) -> Result<bool, EngineError> {
         self.validate_secondary_eq_sidecar_for_target(
             index_id,
@@ -5650,21 +5699,14 @@ impl SegmentReader {
         index_id: u64,
         target: PlannerStatsDeclaredIndexTarget,
     ) -> Result<bool, EngineError> {
-        match self.with_secondary_eq_sidecar_index_validated(index_id, target, |_| Ok(()))? {
-            Some(()) => Ok(true),
-            None => Ok(false),
-        }
-    }
-
-    pub(crate) fn validate_secondary_eq_sidecar_uncached(
-        &self,
-        index_id: u64,
-    ) -> Result<bool, EngineError> {
         self.secondary_eq_sidecars
             .lock()
             .unwrap()
-            .remove(&(index_id, PlannerStatsDeclaredIndexTarget::NodeProperty));
-        self.validate_secondary_eq_sidecar(index_id)
+            .remove(&(index_id, target));
+        match self.with_secondary_eq_sidecar_index_validated(index_id, target, |_| Ok(())) {
+            Ok(Some(())) => Ok(true),
+            Ok(None) | Err(_) => Ok(false),
+        }
     }
 
     #[cfg(test)]
@@ -5858,10 +5900,10 @@ impl SegmentReader {
     pub(crate) fn find_nodes_by_secondary_range_index_if_present(
         &self,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
-        after: Option<(u64, u64)>,
-    ) -> Result<Option<Vec<(u64, u64)>>, EngineError> {
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
+    ) -> Result<Option<Vec<(NumericRangeSortKey, u64)>>, EngineError> {
         self.find_nodes_by_secondary_range_index_if_present_limited(
             index_id, lower, upper, after, None,
         )
@@ -5870,11 +5912,11 @@ impl SegmentReader {
     pub(crate) fn find_nodes_by_secondary_range_index_if_present_limited(
         &self,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
-        after: Option<(u64, u64)>,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
         limit: Option<usize>,
-    ) -> Result<Option<Vec<(u64, u64)>>, EngineError> {
+    ) -> Result<Option<Vec<(NumericRangeSortKey, u64)>>, EngineError> {
         self.with_secondary_range_sidecar_header_validated(
             index_id,
             PlannerStatsDeclaredIndexTarget::NodeProperty,
@@ -5891,14 +5933,27 @@ impl SegmentReader {
         )
     }
 
+    pub(crate) fn count_nodes_by_secondary_range_index_if_present(
+        &self,
+        index_id: u64,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+    ) -> Result<Option<usize>, EngineError> {
+        self.with_secondary_range_sidecar_header_validated(
+            index_id,
+            PlannerStatsDeclaredIndexTarget::NodeProperty,
+            |data| count_nodes_in_secondary_range_sidecar(data, &self.deleted_nodes, lower, upper),
+        )
+    }
+
     pub(crate) fn find_edges_by_secondary_range_index_if_present_limited(
         &self,
         index_id: u64,
-        lower: Option<(u64, bool)>,
-        upper: Option<(u64, bool)>,
-        after: Option<(u64, u64)>,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+        after: Option<(NumericRangeSortKey, u64)>,
         limit: Option<usize>,
-    ) -> Result<Option<Vec<(u64, u64)>>, EngineError> {
+    ) -> Result<Option<Vec<(NumericRangeSortKey, u64)>>, EngineError> {
         self.with_secondary_range_sidecar_header_validated(
             index_id,
             PlannerStatsDeclaredIndexTarget::EdgeProperty,
@@ -5915,13 +5970,26 @@ impl SegmentReader {
         )
     }
 
+    pub(crate) fn count_edges_by_secondary_range_index_if_present(
+        &self,
+        index_id: u64,
+        lower: Option<(NumericRangeSortKey, bool)>,
+        upper: Option<(NumericRangeSortKey, bool)>,
+    ) -> Result<Option<usize>, EngineError> {
+        self.with_secondary_range_sidecar_header_validated(
+            index_id,
+            PlannerStatsDeclaredIndexTarget::EdgeProperty,
+            |data| count_nodes_in_secondary_range_sidecar(data, &self.deleted_edges, lower, upper),
+        )
+    }
+
     pub(crate) fn for_each_secondary_range_entry<F>(
         &self,
         index_id: u64,
         callback: F,
     ) -> Result<bool, EngineError>
     where
-        F: FnMut(u64, u64) -> Result<(), EngineError>,
+        F: FnMut(NumericRangeSortKey, u64) -> Result<(), EngineError>,
     {
         self.for_each_secondary_range_entry_for_target(
             index_id,
@@ -5936,7 +6004,7 @@ impl SegmentReader {
         callback: F,
     ) -> Result<bool, EngineError>
     where
-        F: FnMut(u64, u64) -> Result<(), EngineError>,
+        F: FnMut(NumericRangeSortKey, u64) -> Result<(), EngineError>,
     {
         self.for_each_secondary_range_entry_for_target(
             entry.index_id,
@@ -5952,14 +6020,14 @@ impl SegmentReader {
         mut callback: F,
     ) -> Result<bool, EngineError>
     where
-        F: FnMut(u64, u64) -> Result<(), EngineError>,
+        F: FnMut(NumericRangeSortKey, u64) -> Result<(), EngineError>,
     {
         match self.with_secondary_range_sidecar(index_id, target, |data| {
             let count = read_u64_at(data, 0)? as usize;
             for index in 0..count {
                 let entry_off = 8 + index * SECONDARY_RANGE_ENTRY_SIZE;
-                let encoded_value = read_u64_at(data, entry_off)?;
-                let node_id = read_u64_at(data, entry_off + 8)?;
+                let encoded_value = read_numeric_range_sidecar_key_at(data, entry_off)?;
+                let node_id = read_u64_at(data, entry_off + NUMERIC_RANGE_KEY_BYTES)?;
                 callback(encoded_value, node_id)?;
             }
             Ok(())
@@ -5987,18 +6055,280 @@ impl SegmentReader {
         decode_edge_property_at(&self.edges_mmap, data_offset as usize, edge_id, prop_key)
     }
 
-    pub(crate) fn edge_properties(
+    pub(crate) fn get_node_selected_fields_batch(
         &self,
-        edge_id: u64,
-        prop_keys: &[String],
-    ) -> Result<Option<BTreeMap<String, PropValue>>, EngineError> {
-        if self.is_edge_deleted(edge_id) {
-            return Ok(None);
+        lookups: &[(usize, u64)],
+        needs: &NodeSelectedFieldNeeds,
+        results: &mut [Option<SelectedNodeFields>],
+        #[cfg(test)] selected_field_read_counters: Option<&SelectedFieldReadCounters>,
+    ) -> Result<(), EngineError> {
+        if lookups.is_empty() {
+            return Ok(());
         }
-        let Some((_index, offset)) = self.binary_search_edge_index(edge_id)? else {
-            return Ok(None);
+        let data = &self.node_meta_mmap[..];
+        let Some(layout) = parse_node_meta_layout(data)? else {
+            return Ok(());
         };
-        decode_edge_properties_at(&self.edges_mmap, offset, edge_id, prop_keys).map(Some)
+        let count = layout.node_count;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let idx_start = layout.fixed_entries_offset;
+        let min_key = lookups.first().map(|&(_, id)| id).unwrap_or(0);
+        let max_key = lookups.last().map(|&(_, id)| id).unwrap_or(0);
+        let unique_keys = {
+            let mut n = 0usize;
+            let mut prev: Option<u64> = None;
+            for &(_, id) in lookups {
+                if prev != Some(id) {
+                    n += 1;
+                    prev = Some(id);
+                }
+            }
+            n
+        };
+        let strategy = choose_batch_read_strategy(
+            data,
+            idx_start,
+            count,
+            layout.fixed_entry_size,
+            0,
+            unique_keys,
+            min_key,
+            max_key,
+        )?;
+
+        if strategy == BatchReadStrategy::SeekPerKey {
+            let mut prev_id: Option<u64> = None;
+            let mut prev_fields: Option<Option<SelectedNodeFields>> = None;
+            for &(orig_idx, target_id) in lookups {
+                if self.deleted_nodes.contains_key(&target_id) {
+                    continue;
+                }
+                let fields = if prev_id == Some(target_id) {
+                    prev_fields.clone().flatten()
+                } else if let Some(index) = binary_search_node_meta_index(data, layout, target_id)?
+                {
+                    let meta = read_node_meta_entry_at(data, layout, index)?;
+                    let found = Some(self.selected_node_fields_from_meta(
+                        index,
+                        &meta,
+                        needs,
+                        #[cfg(test)]
+                        selected_field_read_counters,
+                    )?);
+                    prev_id = Some(target_id);
+                    prev_fields = Some(found.clone());
+                    found
+                } else {
+                    prev_id = Some(target_id);
+                    prev_fields = Some(None);
+                    None
+                };
+                results[orig_idx] = fields;
+            }
+        } else {
+            let mut idx_pos = 0usize;
+            for &(orig_idx, target_id) in lookups {
+                if self.deleted_nodes.contains_key(&target_id) {
+                    continue;
+                }
+                while idx_pos < count {
+                    let entry_off = idx_start + idx_pos * layout.fixed_entry_size;
+                    let id = read_u64_at(data, entry_off)?;
+                    if id < target_id {
+                        idx_pos += 1;
+                    } else if id == target_id {
+                        let meta = read_node_meta_entry_at(data, layout, idx_pos)?;
+                        results[orig_idx] = Some(self.selected_node_fields_from_meta(
+                            idx_pos,
+                            &meta,
+                            needs,
+                            #[cfg(test)]
+                            selected_field_read_counters,
+                        )?);
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn selected_node_fields_from_meta(
+        &self,
+        index: usize,
+        meta: &SegmentNodeMeta,
+        needs: &NodeSelectedFieldNeeds,
+        #[cfg(test)] selected_field_read_counters: Option<&SelectedFieldReadCounters>,
+    ) -> Result<SelectedNodeFields, EngineError> {
+        let needs_node_record =
+            needs.key || needs.created_at || !matches!(needs.props, PropertySelection::None);
+        let (key, props, created_at) = if needs_node_record {
+            let offset = usize_from_u64(meta.data_offset, "node selected-field record offset")?;
+            decode_node_selected_fields_at(&self.nodes_mmap, offset, meta.node_id, needs)?
+        } else {
+            (None, BTreeMap::new(), None)
+        };
+        #[cfg(test)]
+        let dense_vector = if needs.vectors.needs_dense() {
+            let vector = self.read_node_dense_vector_at_index(index)?;
+            if vector.is_some() {
+                if let Some(counters) = selected_field_read_counters {
+                    counters.note_node_dense_vector_projection_read();
+                }
+            }
+            vector
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        let dense_vector = if needs.vectors.needs_dense() {
+            self.read_node_dense_vector_at_index(index)?
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let sparse_vector = if needs.vectors.needs_sparse() {
+            let vector = self.read_node_sparse_vector_at_index(index)?;
+            if vector.is_some() {
+                if let Some(counters) = selected_field_read_counters {
+                    counters.note_node_sparse_vector_projection_read();
+                }
+            }
+            vector
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        let sparse_vector = if needs.vectors.needs_sparse() {
+            self.read_node_sparse_vector_at_index(index)?
+        } else {
+            None
+        };
+        Ok(SelectedNodeFields {
+            meta: NodeMetadataForQuery {
+                id: meta.node_id,
+                label_ids: meta.label_ids,
+                updated_at: meta.updated_at,
+                weight: meta.weight,
+            },
+            key,
+            props,
+            created_at,
+            dense_vector,
+            sparse_vector,
+        })
+    }
+
+    pub(crate) fn get_edge_selected_fields_batch(
+        &self,
+        lookups: &[(usize, u64)],
+        needs: &EdgeSelectedFieldNeeds,
+        results: &mut [Option<SelectedEdgeFields>],
+    ) -> Result<(), EngineError> {
+        if lookups.is_empty() {
+            return Ok(());
+        }
+        let data = &self.edges_mmap[..];
+        if data.len() < 8 {
+            return Ok(());
+        }
+        let count = read_u64_at(data, 0)? as usize;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let idx_start = 8;
+        let min_key = lookups.first().map(|&(_, id)| id).unwrap_or(0);
+        let max_key = lookups.last().map(|&(_, id)| id).unwrap_or(0);
+        let unique_keys = {
+            let mut n = 0usize;
+            let mut prev: Option<u64> = None;
+            for &(_, id) in lookups {
+                if prev != Some(id) {
+                    n += 1;
+                    prev = Some(id);
+                }
+            }
+            n
+        };
+        let strategy = choose_batch_read_strategy(
+            data,
+            idx_start,
+            count,
+            EDGE_INDEX_ENTRY_SIZE,
+            0,
+            unique_keys,
+            min_key,
+            max_key,
+        )?;
+
+        if strategy == BatchReadStrategy::SeekPerKey {
+            let mut prev_id: Option<u64> = None;
+            let mut prev_fields: Option<Option<SelectedEdgeFields>> = None;
+            for &(orig_idx, target_id) in lookups {
+                if self.deleted_edges.contains_key(&target_id) {
+                    continue;
+                }
+                let fields = if prev_id == Some(target_id) {
+                    prev_fields.clone().flatten()
+                } else if let Some((index, offset)) = self.binary_search_edge_index(target_id)? {
+                    let found = Some(self.selected_edge_fields_from_index(index, offset, needs)?);
+                    prev_id = Some(target_id);
+                    prev_fields = Some(found.clone());
+                    found
+                } else {
+                    prev_id = Some(target_id);
+                    prev_fields = Some(None);
+                    None
+                };
+                results[orig_idx] = fields;
+            }
+        } else {
+            let mut idx_pos = 0usize;
+            for &(orig_idx, target_id) in lookups {
+                if self.deleted_edges.contains_key(&target_id) {
+                    continue;
+                }
+                while idx_pos < count {
+                    let entry_off = idx_start + idx_pos * EDGE_INDEX_ENTRY_SIZE;
+                    let id = read_u64_at(data, entry_off)?;
+                    if id < target_id {
+                        idx_pos += 1;
+                    } else if id == target_id {
+                        let offset = read_u64_at(data, entry_off + 8)? as usize;
+                        results[orig_idx] =
+                            Some(self.selected_edge_fields_from_index(idx_pos, offset, needs)?);
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn selected_edge_fields_from_index(
+        &self,
+        index: usize,
+        offset: usize,
+        needs: &EdgeSelectedFieldNeeds,
+    ) -> Result<SelectedEdgeFields, EngineError> {
+        let meta = self.edge_metadata_at_index(index)?;
+        let (props, created_at) =
+            decode_edge_selected_fields_at(&self.edges_mmap, offset, meta.edge_id, needs)?;
+        Ok(SelectedEdgeFields {
+            meta: EdgeMetadataForQuery::from(meta),
+            props,
+            created_at,
+        })
     }
 
     // --- Internal binary search methods ---
@@ -7144,7 +7474,7 @@ fn warm_edge_property_sidecar_availability(
                     index_id: entry.index_id,
                 }
             }
-            (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range { .. }) => {
+            (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
                 SegmentComponentKind::EdgePropertyRangeIndex {
                     index_id: entry.index_id,
                 }
@@ -7422,14 +7752,7 @@ fn component_build_fingerprint_matches(
     use SegmentComponentKind::*;
     match kind {
         EdgePropertyEqualityIndex { index_id } => {
-            actual == component_fingerprint("flush.edge_prop_eq", &[*index_id])
-                || actual == component_fingerprint("compaction.edge_prop_eq", &[*index_id])
-                || actual == component_fingerprint("build.edge_prop_eq", &[*index_id])
-        }
-        EdgePropertyRangeIndex { index_id } => {
-            actual == component_fingerprint("flush.edge_prop_range", &[*index_id])
-                || actual == component_fingerprint("compaction.edge_prop_range", &[*index_id])
-                || actual == component_fingerprint("build.edge_prop_range", &[*index_id])
+            actual == edge_property_equality_component_fingerprint(*index_id)
         }
         _ => actual == expected_component_build_fingerprint(kind, secondary_indexes),
     }
@@ -7458,11 +7781,9 @@ fn expected_component_build_fingerprint(
         LegacyNodePropertyIndex => component_fingerprint("flush.prop_index", &[]),
         NodePropertyHashMetadata => component_fingerprint("flush.node_prop_hashes", &[]),
         NodePropertyEqualityIndex { index_id } => {
-            component_fingerprint("flush.node_prop_eq", &[*index_id])
+            node_property_equality_component_fingerprint(*index_id)
         }
-        NodePropertyRangeIndex { index_id } => {
-            component_fingerprint("flush.node_prop_range", &[*index_id])
-        }
+        NodePropertyRangeIndex { index_id } => node_property_range_component_fingerprint(*index_id),
         EdgeWeightIndex => component_fingerprint("flush.edge_weight_index", &[]),
         EdgeUpdatedAtIndex => component_fingerprint("flush.edge_updated_at_index", &[]),
         EdgeValidFromIndex => component_fingerprint("flush.edge_valid_from_index", &[]),
@@ -7477,11 +7798,9 @@ fn expected_component_build_fingerprint(
         SparsePostingIndex => component_fingerprint("flush.sparse_posting_index", &[]),
         SparsePostings => component_fingerprint("flush.sparse_postings", &[]),
         EdgePropertyEqualityIndex { index_id } => {
-            component_fingerprint("flush.edge_prop_eq", &[*index_id])
+            edge_property_equality_component_fingerprint(*index_id)
         }
-        EdgePropertyRangeIndex { index_id } => {
-            component_fingerprint("flush.edge_prop_range", &[*index_id])
-        }
+        EdgePropertyRangeIndex { index_id } => edge_property_range_component_fingerprint(*index_id),
         PackedSegmentContainer => component_fingerprint("flush.packed_segment_container", &[]),
     }
 }
@@ -8137,6 +8456,17 @@ fn secondary_eq_group_range(
     Ok(None)
 }
 
+fn read_numeric_range_sidecar_key_at(
+    data: &[u8],
+    offset: usize,
+) -> Result<NumericRangeSortKey, EngineError> {
+    let key_bytes: [u8; NUMERIC_RANGE_KEY_BYTES] =
+        read_bytes_at(data, offset, NUMERIC_RANGE_KEY_BYTES)?
+            .try_into()
+            .expect("fixed numeric range sidecar key length");
+    NumericRangeSortKey::from_sidecar_bytes(key_bytes)
+}
+
 fn validate_secondary_range_sidecar_data(data: &[u8]) -> Result<(), EngineError> {
     validate_secondary_range_sidecar_header(data)?;
     let count = read_u64_at(data, 0)? as usize;
@@ -8145,8 +8475,8 @@ fn validate_secondary_range_sidecar_data(data: &[u8]) -> Result<(), EngineError>
     for index in 0..count {
         let entry_off = 8 + index * SECONDARY_RANGE_ENTRY_SIZE;
         let current = (
-            read_u64_at(data, entry_off)?,
-            read_u64_at(data, entry_off + 8)?,
+            read_numeric_range_sidecar_key_at(data, entry_off)?,
+            read_u64_at(data, entry_off + NUMERIC_RANGE_KEY_BYTES)?,
         );
         if let Some(prev) = previous {
             if current <= prev {
@@ -8269,7 +8599,7 @@ fn secondary_eq_visible_posting_count(
 
 fn secondary_range_sidecar_lower_bound(
     data: &[u8],
-    target: (u64, u64),
+    target: (NumericRangeSortKey, u64),
     strict: bool,
 ) -> Result<usize, EngineError> {
     let count = read_u64_at(data, 0)? as usize;
@@ -8279,8 +8609,8 @@ fn secondary_range_sidecar_lower_bound(
         let mid = lo + (hi - lo) / 2;
         let entry_off = 8 + mid * SECONDARY_RANGE_ENTRY_SIZE;
         let current = (
-            read_u64_at(data, entry_off)?,
-            read_u64_at(data, entry_off + 8)?,
+            read_numeric_range_sidecar_key_at(data, entry_off)?,
+            read_u64_at(data, entry_off + NUMERIC_RANGE_KEY_BYTES)?,
         );
         let ordering = current.cmp(&target);
         if ordering == std::cmp::Ordering::Less || (strict && ordering == std::cmp::Ordering::Equal)
@@ -8296,17 +8626,17 @@ fn secondary_range_sidecar_lower_bound(
 fn find_nodes_in_secondary_range_sidecar(
     data: &[u8],
     deleted_nodes: &NodeIdMap<TombstoneEntry>,
-    lower: Option<(u64, bool)>,
-    upper: Option<(u64, bool)>,
-    after: Option<(u64, u64)>,
+    lower: Option<(NumericRangeSortKey, bool)>,
+    upper: Option<(NumericRangeSortKey, bool)>,
+    after: Option<(NumericRangeSortKey, u64)>,
     limit: Option<usize>,
-) -> Result<Vec<(u64, u64)>, EngineError> {
+) -> Result<Vec<(NumericRangeSortKey, u64)>, EngineError> {
     let count = read_u64_at(data, 0)? as usize;
     if count == 0 {
         return Ok(Vec::new());
     }
 
-    let mut start: Option<((u64, u64), bool)> = None;
+    let mut start: Option<((NumericRangeSortKey, u64), bool)> = None;
     if let Some((encoded_value, inclusive)) = lower {
         let candidate = if inclusive {
             ((encoded_value, 0), false)
@@ -8334,8 +8664,8 @@ fn find_nodes_in_secondary_range_sidecar(
     let mut results = Vec::new();
     for index in start_index..count {
         let entry_off = 8 + index * SECONDARY_RANGE_ENTRY_SIZE;
-        let encoded_value = read_u64_at(data, entry_off)?;
-        let node_id = read_u64_at(data, entry_off + 8)?;
+        let encoded_value = read_numeric_range_sidecar_key_at(data, entry_off)?;
+        let node_id = read_u64_at(data, entry_off + NUMERIC_RANGE_KEY_BYTES)?;
         if let Some((upper_value, inclusive)) = upper {
             if encoded_value > upper_value || (!inclusive && encoded_value == upper_value) {
                 break;
@@ -8350,6 +8680,83 @@ fn find_nodes_in_secondary_range_sidecar(
     }
 
     Ok(results)
+}
+
+fn secondary_range_sidecar_start_index(
+    data: &[u8],
+    lower: Option<(NumericRangeSortKey, bool)>,
+    after: Option<(NumericRangeSortKey, u64)>,
+) -> Result<usize, EngineError> {
+    let mut start: Option<((NumericRangeSortKey, u64), bool)> = None;
+    if let Some((encoded_value, inclusive)) = lower {
+        let candidate = if inclusive {
+            ((encoded_value, 0), false)
+        } else {
+            ((encoded_value, u64::MAX), true)
+        };
+        start = Some(candidate);
+    }
+    if let Some(after) = after {
+        let candidate = (after, true);
+        start = Some(match start {
+            Some(existing) if existing.0 > candidate.0 => existing,
+            Some(existing) if existing.0 < candidate.0 => candidate,
+            Some(existing) => (existing.0, existing.1 || candidate.1),
+            None => candidate,
+        });
+    }
+
+    if let Some((target, strict)) = start {
+        secondary_range_sidecar_lower_bound(data, target, strict)
+    } else {
+        Ok(0)
+    }
+}
+
+fn secondary_range_sidecar_end_index(
+    data: &[u8],
+    upper: Option<(NumericRangeSortKey, bool)>,
+) -> Result<usize, EngineError> {
+    let count = read_u64_at(data, 0)? as usize;
+    let Some((upper_value, inclusive)) = upper else {
+        return Ok(count);
+    };
+    if inclusive {
+        secondary_range_sidecar_lower_bound(data, (upper_value, u64::MAX), true)
+    } else {
+        secondary_range_sidecar_lower_bound(data, (upper_value, 0), false)
+    }
+}
+
+fn count_nodes_in_secondary_range_sidecar(
+    data: &[u8],
+    deleted_nodes: &NodeIdMap<TombstoneEntry>,
+    lower: Option<(NumericRangeSortKey, bool)>,
+    upper: Option<(NumericRangeSortKey, bool)>,
+) -> Result<usize, EngineError> {
+    let count = read_u64_at(data, 0)? as usize;
+    if count == 0 {
+        return Ok(0);
+    }
+
+    let start_index = secondary_range_sidecar_start_index(data, lower, None)?;
+    let end_index = secondary_range_sidecar_end_index(data, upper)?;
+    if end_index <= start_index {
+        return Ok(0);
+    }
+    if deleted_nodes.is_empty() {
+        return Ok(end_index - start_index);
+    }
+
+    let mut visible = 0usize;
+    for index in start_index..end_index {
+        let entry_off = 8 + index * SECONDARY_RANGE_ENTRY_SIZE;
+        let node_id = read_u64_at(data, entry_off + NUMERIC_RANGE_KEY_BYTES)?;
+        if !deleted_nodes.contains_key(&node_id) {
+            visible += 1;
+        }
+    }
+    Ok(visible)
 }
 
 struct PropLookupSeed<'a> {
@@ -8476,6 +8883,109 @@ fn decode_node_property_at(
         })
 }
 
+type DecodedNodeSelectedFields = (Option<String>, BTreeMap<String, PropValue>, Option<i64>);
+
+fn decode_node_selected_fields_at(
+    data: &[u8],
+    offset: usize,
+    id: u64,
+    needs: &NodeSelectedFieldNeeds,
+) -> Result<DecodedNodeSelectedFields, EngineError> {
+    let label_count = read_u8_at(data, offset)? as usize;
+    if label_count == 0 || label_count > MAX_NODE_LABELS_PER_NODE {
+        return Err(EngineError::CorruptRecord(format!(
+            "node {} selected-field decode has invalid label count {}",
+            id, label_count
+        )));
+    }
+    let key_len_offset = offset
+        .checked_add(1 + label_count * 4)
+        .ok_or_else(|| EngineError::CorruptRecord("node selected key offset overflow".into()))?;
+    let key_len = read_u16_at(data, key_len_offset)? as usize;
+    let key_start = key_len_offset
+        .checked_add(2)
+        .ok_or_else(|| EngineError::CorruptRecord("node selected key offset overflow".into()))?;
+    let key_end = key_start
+        .checked_add(key_len)
+        .ok_or_else(|| EngineError::CorruptRecord("node selected key offset overflow".into()))?;
+
+    let key = if needs.key {
+        let key_bytes = read_bytes_at(data, key_start, key_len)?;
+        Some(
+            std::str::from_utf8(key_bytes)
+                .map_err(|_| {
+                    EngineError::CorruptRecord(format!(
+                        "invalid UTF-8 in node key at offset {}",
+                        key_start
+                    ))
+                })?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    let created_at = if needs.created_at {
+        Some(read_i64_at(data, key_end)?)
+    } else {
+        None
+    };
+
+    let props_len_offset = key_end
+        .checked_add(20)
+        .ok_or_else(|| EngineError::CorruptRecord("node props length offset overflow".into()))?;
+    let props_offset = key_end
+        .checked_add(24)
+        .ok_or_else(|| EngineError::CorruptRecord("node props offset overflow".into()))?;
+    let props = decode_selected_props_at(
+        data,
+        props_len_offset,
+        props_offset,
+        id,
+        "node",
+        &needs.props,
+    )?;
+
+    Ok((key, props, created_at))
+}
+
+fn decode_selected_props_at(
+    data: &[u8],
+    props_len_offset: usize,
+    props_offset: usize,
+    id: u64,
+    kind: &str,
+    selection: &PropertySelection,
+) -> Result<BTreeMap<String, PropValue>, EngineError> {
+    match selection {
+        PropertySelection::None => Ok(BTreeMap::new()),
+        PropertySelection::Keys(prop_keys) if prop_keys.is_empty() => Ok(BTreeMap::new()),
+        PropertySelection::Keys(prop_keys) => {
+            let props_len = read_u32_at(data, props_len_offset)? as usize;
+            let props_bytes = read_bytes_at(data, props_offset, props_len)?;
+            let mut deserializer = rmp_serde::Deserializer::from_read_ref(props_bytes);
+            PropProjectionSeed { targets: prop_keys }
+                .deserialize(&mut deserializer)
+                .map_err(|error| {
+                    EngineError::CorruptRecord(format!(
+                        "{kind} {} projected props decode at offset {}: {}",
+                        id, props_offset, error
+                    ))
+                })
+        }
+        PropertySelection::All => {
+            let props_len = read_u32_at(data, props_len_offset)? as usize;
+            let props_bytes = read_bytes_at(data, props_offset, props_len)?;
+            rmp_serde::from_slice(props_bytes).map_err(|error| {
+                EngineError::CorruptRecord(format!(
+                    "{kind} {} full props decode at offset {}: {}",
+                    id, props_offset, error
+                ))
+            })
+        }
+    }
+}
+
 fn decode_edge_property_at(
     data: &[u8],
     offset: usize,
@@ -8497,28 +9007,19 @@ fn decode_edge_property_at(
         })
 }
 
-fn decode_edge_properties_at(
+fn decode_edge_selected_fields_at(
     data: &[u8],
     offset: usize,
     id: u64,
-    prop_keys: &[String],
-) -> Result<BTreeMap<String, PropValue>, EngineError> {
-    if prop_keys.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let props_len = read_u32_at(data, offset + 56)? as usize;
-    let props_bytes = read_bytes_at(data, offset + 60, props_len)?;
-    let mut deserializer = rmp_serde::Deserializer::from_read_ref(props_bytes);
-    PropProjectionSeed { targets: prop_keys }
-        .deserialize(&mut deserializer)
-        .map_err(|error| {
-            EngineError::CorruptRecord(format!(
-                "edge {} projected props decode at offset {}: {}",
-                id,
-                offset + 60,
-                error
-            ))
-        })
+    needs: &EdgeSelectedFieldNeeds,
+) -> Result<(BTreeMap<String, PropValue>, Option<i64>), EngineError> {
+    let created_at = if needs.created_at {
+        Some(read_i64_at(data, offset + 20)?)
+    } else {
+        None
+    };
+    let props = decode_selected_props_at(data, offset + 56, offset + 60, id, "edge", &needs.props)?;
+    Ok((props, created_at))
 }
 
 fn validate_node_vector_sidecars(
@@ -9020,7 +9521,8 @@ fn sparse_dot_score_from_blob(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::memtable::{encode_range_prop_value, Memtable};
+    use crate::memtable::Memtable;
+    use crate::property_value_semantics::numeric_range_sort_key_for_value;
     use crate::segment_writer::{
         write_segment_without_degree_sidecar_for_test as write_segment,
         write_segment_without_degree_sidecar_with_secondary_indexes_for_test as write_segment_with_secondary_indexes,
@@ -9216,6 +9718,30 @@ pub(crate) mod tests {
 
     fn write_u64_at_for_test(data: &mut [u8], offset: usize, value: u64) {
         data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_numeric_key_at_for_test(data: &mut [u8], offset: usize, value: PropValue) {
+        let key = numeric_range_sort_key_for_value(&value)
+            .expect("test numeric value must encode as range key");
+        data[offset..offset + NUMERIC_RANGE_KEY_BYTES].copy_from_slice(&key.as_bytes());
+    }
+
+    fn raw_nonzero_numeric_range_key_for_test(
+        class: u8,
+        rank: i32,
+        fraction: u128,
+    ) -> [u8; NUMERIC_RANGE_KEY_BYTES] {
+        let mut bytes = [0_u8; NUMERIC_RANGE_KEY_BYTES];
+        bytes[0] = class;
+        let mut rank_bits = (rank as u32) ^ 0x8000_0000;
+        let mut fraction_bits = fraction;
+        if class == 0 {
+            rank_bits = !rank_bits;
+            fraction_bits = !fraction_bits;
+        }
+        bytes[1..5].copy_from_slice(&rank_bits.to_be_bytes());
+        bytes[5..21].copy_from_slice(&fraction_bits.to_be_bytes());
+        bytes
     }
 
     fn reopen_test_segment_with_index(
@@ -9690,9 +10216,7 @@ pub(crate) mod tests {
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -10030,9 +10554,7 @@ pub(crate) mod tests {
                 label_id: 2,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -10042,9 +10564,7 @@ pub(crate) mod tests {
                 label_id: 3,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -10062,7 +10582,7 @@ pub(crate) mod tests {
         let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
         let reader = SegmentReader::open_with_info(&seg_dir, &info, None, &indexes).unwrap();
 
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         assert_eq!(
             reader
                 .find_nodes_by_secondary_eq_index(eq_label_1.index_id, red_hash)
@@ -10080,8 +10600,7 @@ pub(crate) mod tests {
             .unwrap()
             .is_empty());
 
-        let encoded_score =
-            encode_range_prop_value(SecondaryIndexRangeDomain::Int, &PropValue::Int(42)).unwrap();
+        let encoded_score = numeric_range_sort_key_for_value(&PropValue::Int(42)).unwrap();
         assert_eq!(
             reader
                 .find_nodes_by_secondary_range_index_if_present(
@@ -10566,8 +11085,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_secondary_eq_sidecar_roundtrip() {
-        use crate::types::hash_prop_value;
-
         let mt = Memtable::new();
 
         let mut props1 = BTreeMap::new();
@@ -10636,8 +11153,8 @@ pub(crate) mod tests {
         };
         let (_dir, reader) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
 
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
-        let green_hash = hash_prop_value(&PropValue::String("green".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
+        let green_hash = hash_prop_equality_key(&PropValue::String("green".to_string()));
         let mut reds = reader
             .find_nodes_by_secondary_eq_index(entry.index_id, red_hash)
             .unwrap();
@@ -10653,8 +11170,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_secondary_eq_sidecar_cache_reloads_after_validation_failure_and_repair() {
-        use crate::types::hash_prop_value;
-
         let mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
@@ -10689,7 +11204,7 @@ pub(crate) mod tests {
         let sidecar_path = seg_dir
             .join("secondary_indexes")
             .join(format!("node_prop_eq_{}.dat", entry.index_id));
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
 
         let corrupt_path = seg_dir.join("secondary_indexes").join(".corrupt_eq.dat");
         std::fs::write(&corrupt_path, [1u8, 2, 3]).unwrap();
@@ -10714,8 +11229,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_secondary_eq_sidecar_lookup_uses_validated_cache() {
-        use crate::types::hash_prop_value;
-
         let mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
@@ -10750,7 +11263,7 @@ pub(crate) mod tests {
         let sidecar_path = seg_dir
             .join("secondary_indexes")
             .join(format!("node_prop_eq_{}.dat", entry.index_id));
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
 
         assert_eq!(
             reader
@@ -10773,8 +11286,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_secondary_eq_lookup_does_not_full_validate_unqueried_group() {
-        use crate::types::hash_prop_value;
-
         let mt = Memtable::new();
         for (id, color) in [(1, "red"), (2, "red"), (3, "green"), (4, "green")] {
             let mut props = BTreeMap::new();
@@ -10811,8 +11322,8 @@ pub(crate) mod tests {
         let kind = SegmentComponentKind::NodePropertyEqualityIndex {
             index_id: entry.index_id,
         };
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
-        let green_hash = hash_prop_value(&PropValue::String("green".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
+        let green_hash = hash_prop_equality_key(&PropValue::String("green".to_string()));
 
         rewrite_component_payload_for_test(&seg_dir, kind.clone(), |payload| {
             let (offset, id_count) = secondary_eq_group_range(payload, green_hash)
@@ -10845,8 +11356,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_secondary_eq_lookup_latches_selected_group_malformed() {
-        use crate::types::hash_prop_value;
-
         let mt = Memtable::new();
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
@@ -10881,7 +11390,7 @@ pub(crate) mod tests {
         let kind = SegmentComponentKind::NodePropertyEqualityIndex {
             index_id: entry.index_id,
         };
-        let red_hash = hash_prop_value(&PropValue::String("red".to_string()));
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
 
         rewrite_component_payload_for_test(&seg_dir, kind.clone(), |payload| {
             let (count, _) = secondary_eq_sidecar_index_bounds(payload).unwrap();
@@ -11074,9 +11583,7 @@ pub(crate) mod tests {
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -11099,17 +11606,21 @@ pub(crate) mod tests {
             .join(".repaired_range.dat");
         crate::segment_writer::write_node_prop_range_sidecar_to_path(
             &repaired_path,
-            &[(10u64 ^ (1u64 << 63), 1)],
+            &[(
+                numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap(),
+                1,
+            )],
         )
         .unwrap();
+        let encoded_10 = numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap();
         std::fs::rename(&repaired_path, &sidecar_path).unwrap();
 
         assert_eq!(
             reader
                 .find_nodes_by_secondary_range_index_if_present(
                     entry.index_id,
-                    Some((10u64 ^ (1u64 << 63), true)),
-                    Some((10u64 ^ (1u64 << 63), true)),
+                    Some((encoded_10, true)),
+                    Some((encoded_10, true)),
                     None,
                 )
                 .unwrap(),
@@ -11131,7 +11642,11 @@ pub(crate) mod tests {
     fn test_validate_secondary_range_sidecar_rejects_length_mismatch() {
         let mut data = Vec::new();
         data.extend_from_slice(&1u64.to_le_bytes());
-        data.extend_from_slice(&(10u64 ^ (1u64 << 63)).to_le_bytes());
+        data.extend_from_slice(
+            &numeric_range_sort_key_for_value(&PropValue::Int(10))
+                .unwrap()
+                .as_bytes(),
+        );
         data.extend_from_slice(&1u64.to_le_bytes());
         data.push(0xFF);
 
@@ -11144,12 +11659,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_validate_secondary_range_sidecar_rejects_impossible_numeric_key() {
+        let significand = (1_u128 << 53) | 1;
+        let bit_length = 54_u32;
+        let exponent = -1_i32;
+        let rank = exponent + bit_length as i32 - 1;
+        let fraction = significand << (128 - bit_length);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&raw_nonzero_numeric_range_key_for_test(2, rank, fraction));
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        match validate_secondary_range_sidecar_data(&data) {
+            Err(EngineError::CorruptRecord(message)) => {
+                assert!(message.contains("canonical finite numeric key"));
+            }
+            other => panic!("expected corrupt secondary range sidecar, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_validate_secondary_range_sidecar_rejects_unsorted_entries() {
         let mut data = Vec::new();
         data.extend_from_slice(&2u64.to_le_bytes());
-        data.extend_from_slice(&(11u64 ^ (1u64 << 63)).to_le_bytes());
+        data.extend_from_slice(
+            &numeric_range_sort_key_for_value(&PropValue::Int(11))
+                .unwrap()
+                .as_bytes(),
+        );
         data.extend_from_slice(&2u64.to_le_bytes());
-        data.extend_from_slice(&(10u64 ^ (1u64 << 63)).to_le_bytes());
+        data.extend_from_slice(
+            &numeric_range_sort_key_for_value(&PropValue::Int(10))
+                .unwrap()
+                .as_bytes(),
+        );
         data.extend_from_slice(&1u64.to_le_bytes());
 
         match validate_secondary_range_sidecar_data(&data) {
@@ -11161,7 +11705,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_secondary_range_lookup_does_not_full_validate_unqueried_entry() {
+    fn test_secondary_range_query_trusts_current_identity_without_scrubbing_unvisited_entries() {
         let mt = Memtable::new();
         for (id, score) in [(1, 10), (2, 20), (3, 30)] {
             let mut props = BTreeMap::new();
@@ -11189,9 +11733,7 @@ pub(crate) mod tests {
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -11200,12 +11742,11 @@ pub(crate) mod tests {
         let kind = SegmentComponentKind::NodePropertyRangeIndex {
             index_id: entry.index_id,
         };
-        let encoded_5 = 5u64 ^ (1u64 << 63);
-        let encoded_10 = 10u64 ^ (1u64 << 63);
+        let encoded_10 = numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap();
 
         rewrite_component_payload_for_test(&seg_dir, kind.clone(), |payload| {
             let entry_off = 8 + 2 * SECONDARY_RANGE_ENTRY_SIZE;
-            write_u64_at_for_test(payload, entry_off, encoded_5);
+            write_numeric_key_at_for_test(payload, entry_off, PropValue::Int(5));
         });
 
         let payload = component_payload_bytes_for_test(&seg_dir, kind);
@@ -11259,9 +11800,7 @@ pub(crate) mod tests {
                 label_id: 1,
                 prop_key: "score".to_string(),
             },
-            kind: SecondaryIndexKind::Range {
-                domain: SecondaryIndexRangeDomain::Int,
-            },
+            kind: SecondaryIndexKind::Range,
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
@@ -11270,7 +11809,7 @@ pub(crate) mod tests {
         let kind = SegmentComponentKind::NodePropertyRangeIndex {
             index_id: entry.index_id,
         };
-        let encoded_10 = 10u64 ^ (1u64 << 63);
+        let encoded_10 = numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap();
 
         rewrite_component_payload_for_test(&seg_dir, kind.clone(), |payload| {
             write_u64_at_for_test(payload, 0, 2);
@@ -12787,6 +13326,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_node_selected_fields_metadata_only_uses_sidecar_without_node_records() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 7, "metadata-only")), 0);
+
+        let (_dir, mut reader) = write_and_open(&mt);
+        reader.nodes_mmap = MappedData::Empty;
+
+        let mut results = vec![None];
+        reader
+            .get_node_selected_fields_batch(
+                &[(0usize, 1u64)],
+                &NodeSelectedFieldNeeds::default(),
+                &mut results,
+                None,
+            )
+            .unwrap();
+
+        let selected = results[0].as_ref().unwrap();
+        assert_eq!(selected.meta.id, 1);
+        assert_eq!(selected.meta.label_ids, NodeLabelSet::single(7).unwrap());
+        assert_eq!(selected.meta.updated_at, 1001);
+        assert!((selected.meta.weight - 0.5).abs() < f32::EPSILON);
+        assert!(selected.key.is_none());
+        assert!(selected.props.is_empty());
+        assert!(selected.created_at.is_none());
+        assert!(selected.dense_vector.is_none());
+        assert!(selected.sparse_vector.is_none());
+    }
+
+    #[test]
     fn test_packed_edge_metadata_roundtrip() {
         let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 0);
@@ -12836,6 +13405,56 @@ pub(crate) mod tests {
             assert_eq!(node.label_ids, meta.label_ids);
             assert!(meta.data_len > 0);
         }
+    }
+
+    #[test]
+    fn test_node_selected_fields_batch_returns_corrupt_record_for_bad_projected_props() {
+        use std::io::Write;
+
+        let mt = Memtable::new();
+        let mut node = make_node(1, 1, "bad-props");
+        node.props.insert(
+            "status".to_string(),
+            PropValue::String("active".to_string()),
+        );
+        mt.apply_op(&WalOp::UpsertNode(node), 0);
+        let (_dir, mut reader) = write_and_open(&mt);
+
+        let mut corrupt_payload = reader.raw_nodes_mmap().to_vec();
+        let record_offset = read_u64_at(&corrupt_payload, 16).unwrap() as usize;
+        let label_count = corrupt_payload[record_offset] as usize;
+        let key_len_offset = record_offset + 1 + label_count * 4;
+        let key_len = read_u16_at(&corrupt_payload, key_len_offset).unwrap() as usize;
+        let props_offset = key_len_offset + 2 + key_len + 24;
+        corrupt_payload[props_offset] = 0xc1;
+
+        let mut corrupt_file = tempfile::NamedTempFile::new().unwrap();
+        corrupt_file.write_all(&corrupt_payload).unwrap();
+        corrupt_file.as_file().sync_all().unwrap();
+        let mmap = unsafe { Mmap::map(corrupt_file.as_file()).unwrap() };
+        reader.nodes_mmap = MappedData::Mmap {
+            mmap: Arc::new(mmap),
+            payload_offset: 0,
+            payload_len: corrupt_payload.len(),
+        };
+
+        let mut results = vec![None];
+        let err = reader
+            .get_node_selected_fields_batch(
+                &[(0, 1)],
+                &NodeSelectedFieldNeeds {
+                    props: PropertySelection::Keys(vec!["status".to_string()]),
+                    ..NodeSelectedFieldNeeds::default()
+                },
+                &mut results,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::CorruptRecord(_)));
+        assert!(
+            err.to_string().contains("projected props decode"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
