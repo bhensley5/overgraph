@@ -64,6 +64,14 @@ Rust Criterion graph-row/GQL microbenches live in `benches/query_ops.rs`:
 - `execute_gql/gql_graph_row_fixed_connected_query`
 - `execute_gql/gql_graph_row_optional_edge_traversal_query`
 
+Phase 33 adds focused Criterion smoke/proof benches for the unified GQL mutation path. These are
+compile-and-execute checks for the final docs checkpoint, not release-grade published performance
+claims:
+- `execute_gql/gql_mutation_create_smoke`
+- `execute_gql/gql_mutation_match_set_smoke`
+- `execute_gql/gql_mutation_detach_delete_smoke`
+- `execute_gql/gql_mutation_return_smoke`
+
 ## Baseline Comparison Command
 
 ```bash

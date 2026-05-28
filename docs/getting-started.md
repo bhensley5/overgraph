@@ -145,6 +145,43 @@ let node = db.get_node_by_key("User", "alice")?;
 let nodes = db.get_nodes(&[alice, bob])?;
 ```
 
+## Optional: use GQL Beta for query strings
+
+Native APIs remain the primary structured API. GQL Beta is useful when a supported read or mutation
+is clearer as a GQL/Cypher-shaped string. It is a bounded subset, not full ISO GQL or full Cypher.
+
+**Python**
+```python
+created = db.execute_gql(
+    "CREATE (u:User {key: $key, role: $role}) RETURN u.key AS key",
+    {"key": "carol", "role": "designer"},
+)
+
+rows = db.execute_gql(
+    "MATCH (u:User) WHERE u.key = $key RETURN u.key AS key, u.role AS role",
+    {"key": "carol"},
+)
+
+print(created["mutation_stats"])
+print(rows["rows"])
+```
+
+**Node.js**
+```javascript
+const created = db.executeGql(
+  'CREATE (u:User {key: $key, role: $role}) RETURN u.key AS key',
+  { key: 'carol', role: 'designer' }
+);
+
+const rows = db.executeGql(
+  'MATCH (u:User) WHERE u.key = $key RETURN u.key AS key, u.role AS role',
+  { key: 'carol' }
+);
+
+console.log(created.mutationStats);
+console.log(rows.rows);
+```
+
 ## Query neighbors
 
 **Python**

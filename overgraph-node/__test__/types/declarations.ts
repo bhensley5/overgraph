@@ -12,8 +12,10 @@ import type {
   GraphPathValue,
   GraphRowRequest,
   GraphRowResult,
-  GqlQueryOptions,
-  GqlResult,
+  GqlExecutionExplain,
+  GqlExecutionOptions,
+  GqlExecutionResult,
+  GqlValue,
   QueryEdgeRequest,
   QueryPlanNode,
 } from '../../query-types.js'
@@ -113,14 +115,22 @@ const fallbackEdgeLabelScan: QueryPlanNode = {
   kind: 'fallback_edge_label_scan',
 }
 
-const gqlOptions: GqlQueryOptions = {
+const gqlOptions: GqlExecutionOptions = {
+  mode: 'readOnly',
   allowFullScan: true,
   maxQueryBytes: 1024,
-  cursor: 'ogr32c1_cursor',
+  cursor: null,
   maxCursorBytes: 4096,
+  maxMutationRows: 10,
+  maxMutationOps: 20,
   maxParamBytes: 1024,
   maxAstDepth: 32,
   maxLiteralItems: 128,
+  maxIntermediateBindings: 256,
+  maxFrontier: 64,
+  maxPathHops: 4,
+  maxPathsPerStart: 16,
+  maxOrderMaterialization: 128,
   includePlan: true,
   profile: true,
   compactRows: false,
@@ -135,20 +145,39 @@ const gqlParams = {
   map: { nested: false },
 }
 
-const gqlResult: GqlResult = db.executeGql(
+const gqlResult: GqlExecutionResult = db.executeGql(
   'MATCH p = (n:Person {name: $name})-[:KNOWS*0..1]->(m) RETURN p',
   gqlParams,
   gqlOptions,
 )
-const gqlAsyncResult: Promise<GqlResult> = db.executeGqlAsync(
+const gqlAsyncResult: Promise<GqlExecutionResult> = db.executeGqlAsync(
   'MATCH (n:Person {name: $name}) RETURN n.name',
   gqlParams,
   { compactRows: true },
 )
-const gqlExplain = db.explainGql('MATCH (n:Person) RETURN n', null, { allowFullScan: true })
+const gqlExplain: GqlExecutionExplain = db.explainGql('MATCH (n:Person) RETURN n', null, { allowFullScan: true })
 const gqlExplainAsync = db.explainGqlAsync('MATCH (n:Person) RETURN n', null, {
   allowFullScan: true,
 })
+const gqlMutationResult: GqlExecutionResult = db.executeGql(
+  "CREATE (n:Person {key: 'new-person', name: 'New'}) RETURN n.name AS name",
+  null,
+  { maxMutationRows: 1, maxMutationOps: 1 },
+)
+const compactRows = gqlMutationResult.rows as Array<Array<GqlValue>>
+const mutationStats = gqlMutationResult.mutationStats?.nodesCreated
+const mutationExplain = db.explainGql(
+  "CREATE (n:Person {key: 'planned-person'}) RETURN n.key AS key",
+)
+const mutationOperation = mutationExplain.mutation?.operations[0]?.op
+const mutationReturnColumns = mutationExplain.mutation?.returnPlan?.columns
+
+// @ts-expect-error Old GQL options type is intentionally not exported.
+type RemovedGqlQueryOptions = QueryTypes.GqlQueryOptions
+// @ts-expect-error Old GQL result type is intentionally not exported.
+type RemovedGqlResult = QueryTypes.GqlResult
+// @ts-expect-error Old top-level read-only GQL explain type is intentionally not exported.
+type RemovedGqlExplain = QueryTypes.GqlExplain
 
 void db
 void edgeInput
@@ -170,3 +199,8 @@ void gqlResult
 void gqlAsyncResult
 void gqlExplain
 void gqlExplainAsync
+void gqlMutationResult
+void compactRows
+void mutationStats
+void mutationOperation
+void mutationReturnColumns

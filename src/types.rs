@@ -44,37 +44,63 @@ pub enum GqlParamValue {
     Map(BTreeMap<String, GqlParamValue>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GqlStatementKind {
+    Query,
+    Mutation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GqlExecutionMode {
+    Auto,
+    ReadOnly,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GqlQueryOptions {
+pub struct GqlExecutionOptions {
+    pub mode: GqlExecutionMode,
     pub allow_full_scan: bool,
     pub max_rows: usize,
     pub cursor: Option<String>,
     pub max_cursor_bytes: usize,
-    pub max_intermediate_bindings: usize,
-    pub max_skip: usize,
+    pub max_mutation_rows: usize,
+    pub max_mutation_ops: usize,
     pub max_query_bytes: usize,
     pub max_param_bytes: usize,
     pub max_ast_depth: usize,
     pub max_literal_items: usize,
+    pub max_intermediate_bindings: usize,
+    pub max_frontier: usize,
+    pub max_path_hops: u8,
+    pub max_paths_per_start: usize,
+    pub max_order_materialization: usize,
+    pub max_skip: usize,
     pub include_plan: bool,
     pub profile: bool,
     pub compact_rows: bool,
     pub include_vectors: bool,
 }
 
-impl Default for GqlQueryOptions {
+impl Default for GqlExecutionOptions {
     fn default() -> Self {
         Self {
+            mode: GqlExecutionMode::Auto,
             allow_full_scan: false,
             max_rows: 10_000,
             cursor: None,
             max_cursor_bytes: 16 * 1024,
-            max_intermediate_bindings: 65_536,
-            max_skip: 100_000,
+            max_mutation_rows: 10_000,
+            max_mutation_ops: 50_000,
             max_query_bytes: 1_048_576,
             max_param_bytes: 1_048_576,
             max_ast_depth: 256,
             max_literal_items: 10_000,
+            max_intermediate_bindings: 65_536,
+            max_frontier: 65_536,
+            max_path_hops: 16,
+            max_paths_per_start: 4_096,
+            max_order_materialization: 65_536,
+            max_skip: 100_000,
             include_plan: false,
             profile: false,
             compact_rows: false,
@@ -140,12 +166,14 @@ pub struct GqlRow {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct GqlResult {
+pub struct GqlExecutionResult {
+    pub kind: GqlStatementKind,
     pub columns: Vec<String>,
     pub rows: Vec<GqlRow>,
     pub next_cursor: Option<String>,
     pub stats: GqlExecutionStats,
-    pub plan: Option<GqlExplain>,
+    pub mutation_stats: Option<GqlMutationStats>,
+    pub plan: Option<GqlExecutionExplain>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -156,7 +184,28 @@ pub struct GqlExecutionStats {
     pub intermediate_bindings: usize,
     pub db_hits: usize,
     pub elapsed_us: Option<u64>,
-    pub truncated: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlMutationStats {
+    pub rows_matched: usize,
+    pub mutation_rows: usize,
+    pub mutation_ops: usize,
+    pub nodes_created: usize,
+    pub nodes_updated: usize,
+    pub nodes_deleted: usize,
+    pub edges_created: usize,
+    pub edges_updated: usize,
+    pub edges_deleted: usize,
+    pub labels_added: usize,
+    pub labels_removed: usize,
+    pub properties_set: usize,
+    pub properties_removed: usize,
+    pub skipped_null_targets: usize,
+    pub duplicate_targets: usize,
+    pub db_hits: usize,
+    pub elapsed_us: Option<u64>,
     pub warnings: Vec<String>,
 }
 
@@ -199,6 +248,74 @@ pub struct GqlCapSummary {
     pub max_param_bytes: usize,
     pub max_ast_depth: usize,
     pub max_literal_items: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlExecutionExplain {
+    pub kind: GqlStatementKind,
+    pub columns: Vec<String>,
+    pub read: Option<GqlExplain>,
+    pub mutation: Option<GqlMutationExplain>,
+    pub caps: GqlExecutionCapSummary,
+    pub warnings: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlMutationExplain {
+    pub read_prefix: Option<GqlMutationReadPrefixExplain>,
+    pub operations: Vec<GqlMutationOperationExplain>,
+    pub return_plan: Option<GqlMutationReturnExplain>,
+    pub would_create_node_labels: Vec<String>,
+    pub would_create_edge_labels: Vec<String>,
+    pub uses_transaction_snapshot: bool,
+    pub uses_write_txn: bool,
+    pub replacement_adapters: bool,
+    pub atomic_commit: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlMutationReadPrefixExplain {
+    pub graph_row_target: GqlExplain,
+    pub internal_columns: Vec<String>,
+    pub target_aliases: Vec<String>,
+    pub expression_columns: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GqlMutationOperationExplain {
+    pub op: String,
+    pub target_alias: Option<String>,
+    pub row_multiplicity: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GqlMutationReturnExplain {
+    pub columns: Vec<String>,
+    pub order_items: usize,
+    pub skip: usize,
+    pub limit: Option<usize>,
+    pub post_commit_hydration: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GqlExecutionCapSummary {
+    pub allow_full_scan: bool,
+    pub max_rows: usize,
+    pub max_cursor_bytes: usize,
+    pub max_mutation_rows: usize,
+    pub max_mutation_ops: usize,
+    pub max_query_bytes: usize,
+    pub max_param_bytes: usize,
+    pub max_ast_depth: usize,
+    pub max_literal_items: usize,
+    pub max_intermediate_bindings: usize,
+    pub max_frontier: usize,
+    pub max_path_hops: u8,
+    pub max_paths_per_start: usize,
+    pub max_order_materialization: usize,
+    pub max_skip: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1821,8 +1938,8 @@ pub struct GraphRowExplain {
     pub notes: Vec<String>,
 }
 
-/// Minimal graph-row explain plan node. Later checkpoints fill in richer
-/// structured details without changing the root explain contract.
+/// Minimal graph-row explain plan node. Future work can fill in richer structured
+/// details without changing the root explain contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphExplainNode {
     pub kind: String,

@@ -10,8 +10,9 @@ use eg::{
     EdgeFilterExpr, EdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
     EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
     EdgeView as CoreEdgeView, EngineError, ExportOptions, FusionMode, GqlCapSummary, GqlEdge,
-    GqlExecutionStats, GqlExplain, GqlLoweringTarget, GqlNode, GqlParamValue, GqlParams,
-    GqlQueryOptions, GqlResult, GqlRowOperation, GqlValue, GraphBinaryOp, GraphCapExplain,
+    GqlExecutionCapSummary, GqlExecutionExplain, GqlExecutionMode, GqlExecutionOptions,
+    GqlExecutionResult, GqlExecutionStats, GqlExplain, GqlLoweringTarget, GqlNode, GqlParamValue,
+    GqlParams, GqlRowOperation, GqlStatementKind, GqlValue, GraphBinaryOp, GraphCapExplain,
     GraphCursorExplain, GraphEdgePattern, GraphEdgeValue, GraphElementProjection,
     GraphExecutionSummaries, GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
     GraphNodePattern, GraphNodeValue, GraphOrderDirection, GraphOrderExplain, GraphOrderItem,
@@ -454,7 +455,7 @@ impl OverGraph {
 
     fn query_pattern(&self, _py: Python<'_>, _request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         Err(OverGraphError::new_err(
-            "query_pattern is unsupported after Phase 32; use query_graph_rows",
+            "query_pattern is unsupported; use query_graph_rows",
         ))
     }
 
@@ -476,7 +477,7 @@ impl OverGraph {
         _request: &Bound<'_, PyAny>,
     ) -> PyResult<PyObject> {
         Err(OverGraphError::new_err(
-            "explain_pattern_query is unsupported after Phase 32; use explain_graph_rows",
+            "explain_pattern_query is unsupported; use explain_graph_rows",
         ))
     }
 
@@ -493,17 +494,24 @@ impl OverGraph {
         graph_row_explain_to_py(py, explain)
     }
 
-    #[pyo3(signature = (query, params=None, *, allow_full_scan=false, max_rows=None, cursor=None, max_cursor_bytes=None, max_intermediate_bindings=None, max_skip=None, max_query_bytes=None, max_param_bytes=None, max_ast_depth=None, max_literal_items=None, include_plan=false, profile=false, compact_rows=false, include_vectors=false))]
+    #[pyo3(signature = (query, params=None, *, mode="auto", allow_full_scan=false, max_rows=None, cursor=None, max_cursor_bytes=None, max_mutation_rows=None, max_mutation_ops=None, max_intermediate_bindings=None, max_frontier=None, max_path_hops=None, max_paths_per_start=None, max_order_materialization=None, max_skip=None, max_query_bytes=None, max_param_bytes=None, max_ast_depth=None, max_literal_items=None, include_plan=false, profile=false, compact_rows=false, include_vectors=false))]
     fn execute_gql(
         &self,
         py: Python<'_>,
         query: String,
         params: Option<&Bound<'_, PyDict>>,
+        mode: &str,
         allow_full_scan: bool,
         max_rows: Option<usize>,
         cursor: Option<String>,
         max_cursor_bytes: Option<usize>,
+        max_mutation_rows: Option<usize>,
+        max_mutation_ops: Option<usize>,
         max_intermediate_bindings: Option<usize>,
+        max_frontier: Option<usize>,
+        max_path_hops: Option<u8>,
+        max_paths_per_start: Option<usize>,
+        max_order_materialization: Option<usize>,
         max_skip: Option<usize>,
         max_query_bytes: Option<usize>,
         max_param_bytes: Option<usize>,
@@ -515,11 +523,18 @@ impl OverGraph {
         include_vectors: bool,
     ) -> PyResult<PyObject> {
         let options = parse_py_gql_options(
+            mode,
             allow_full_scan,
             max_rows,
             cursor,
             max_cursor_bytes,
+            max_mutation_rows,
+            max_mutation_ops,
             max_intermediate_bindings,
+            max_frontier,
+            max_path_hops,
+            max_paths_per_start,
+            max_order_materialization,
             max_skip,
             max_query_bytes,
             max_param_bytes,
@@ -529,7 +544,7 @@ impl OverGraph {
             profile,
             compact_rows,
             include_vectors,
-        );
+        )?;
         let referenced_params = gql_referenced_param_names(&query, &options).map_err(to_py_err)?;
         let params = parse_py_gql_params(py, params, &referenced_params, &options)?;
         let result = with_engine_ref(self, py, move |eng| {
@@ -538,17 +553,24 @@ impl OverGraph {
         gql_result_to_py(py, result, compact_rows)
     }
 
-    #[pyo3(signature = (query, params=None, *, allow_full_scan=false, max_rows=None, cursor=None, max_cursor_bytes=None, max_intermediate_bindings=None, max_skip=None, max_query_bytes=None, max_param_bytes=None, max_ast_depth=None, max_literal_items=None, include_plan=false, profile=false, compact_rows=false, include_vectors=false))]
+    #[pyo3(signature = (query, params=None, *, mode="auto", allow_full_scan=false, max_rows=None, cursor=None, max_cursor_bytes=None, max_mutation_rows=None, max_mutation_ops=None, max_intermediate_bindings=None, max_frontier=None, max_path_hops=None, max_paths_per_start=None, max_order_materialization=None, max_skip=None, max_query_bytes=None, max_param_bytes=None, max_ast_depth=None, max_literal_items=None, include_plan=false, profile=false, compact_rows=false, include_vectors=false))]
     fn explain_gql(
         &self,
         py: Python<'_>,
         query: String,
         params: Option<&Bound<'_, PyDict>>,
+        mode: &str,
         allow_full_scan: bool,
         max_rows: Option<usize>,
         cursor: Option<String>,
         max_cursor_bytes: Option<usize>,
+        max_mutation_rows: Option<usize>,
+        max_mutation_ops: Option<usize>,
         max_intermediate_bindings: Option<usize>,
+        max_frontier: Option<usize>,
+        max_path_hops: Option<u8>,
+        max_paths_per_start: Option<usize>,
+        max_order_materialization: Option<usize>,
         max_skip: Option<usize>,
         max_query_bytes: Option<usize>,
         max_param_bytes: Option<usize>,
@@ -560,11 +582,18 @@ impl OverGraph {
         include_vectors: bool,
     ) -> PyResult<PyObject> {
         let options = parse_py_gql_options(
+            mode,
             allow_full_scan,
             max_rows,
             cursor,
             max_cursor_bytes,
+            max_mutation_rows,
+            max_mutation_ops,
             max_intermediate_bindings,
+            max_frontier,
+            max_path_hops,
+            max_paths_per_start,
+            max_order_materialization,
             max_skip,
             max_query_bytes,
             max_param_bytes,
@@ -574,7 +603,7 @@ impl OverGraph {
             profile,
             compact_rows,
             include_vectors,
-        );
+        )?;
         let referenced_params = gql_referenced_param_names(&query, &options).map_err(to_py_err)?;
         let params = parse_py_gql_params(py, params, &referenced_params, &options)?;
         let explain = with_engine_ref(self, py, move |eng| {
@@ -3291,11 +3320,18 @@ impl AdjacencyExport {
 // ============================================================
 
 fn parse_py_gql_options(
+    mode: &str,
     allow_full_scan: bool,
     max_rows: Option<usize>,
     cursor: Option<String>,
     max_cursor_bytes: Option<usize>,
+    max_mutation_rows: Option<usize>,
+    max_mutation_ops: Option<usize>,
     max_intermediate_bindings: Option<usize>,
+    max_frontier: Option<usize>,
+    max_path_hops: Option<u8>,
+    max_paths_per_start: Option<usize>,
+    max_order_materialization: Option<usize>,
     max_skip: Option<usize>,
     max_query_bytes: Option<usize>,
     max_param_bytes: Option<usize>,
@@ -3305,15 +3341,16 @@ fn parse_py_gql_options(
     profile: bool,
     compact_rows: bool,
     include_vectors: bool,
-) -> GqlQueryOptions {
-    let mut options = GqlQueryOptions {
+) -> PyResult<GqlExecutionOptions> {
+    let mut options = GqlExecutionOptions {
+        mode: parse_py_gql_execution_mode(mode)?,
         allow_full_scan,
         cursor,
         include_plan,
         profile,
         compact_rows,
         include_vectors,
-        ..GqlQueryOptions::default()
+        ..GqlExecutionOptions::default()
     };
     if let Some(max_rows) = max_rows {
         options.max_rows = max_rows;
@@ -3321,8 +3358,26 @@ fn parse_py_gql_options(
     if let Some(max_cursor_bytes) = max_cursor_bytes {
         options.max_cursor_bytes = max_cursor_bytes;
     }
+    if let Some(max_mutation_rows) = max_mutation_rows {
+        options.max_mutation_rows = max_mutation_rows;
+    }
+    if let Some(max_mutation_ops) = max_mutation_ops {
+        options.max_mutation_ops = max_mutation_ops;
+    }
     if let Some(max_intermediate_bindings) = max_intermediate_bindings {
         options.max_intermediate_bindings = max_intermediate_bindings;
+    }
+    if let Some(max_frontier) = max_frontier {
+        options.max_frontier = max_frontier;
+    }
+    if let Some(max_path_hops) = max_path_hops {
+        options.max_path_hops = max_path_hops;
+    }
+    if let Some(max_paths_per_start) = max_paths_per_start {
+        options.max_paths_per_start = max_paths_per_start;
+    }
+    if let Some(max_order_materialization) = max_order_materialization {
+        options.max_order_materialization = max_order_materialization;
     }
     if let Some(max_skip) = max_skip {
         options.max_skip = max_skip;
@@ -3339,7 +3394,17 @@ fn parse_py_gql_options(
     if let Some(max_literal_items) = max_literal_items {
         options.max_literal_items = max_literal_items;
     }
-    options
+    Ok(options)
+}
+
+fn parse_py_gql_execution_mode(value: &str) -> PyResult<GqlExecutionMode> {
+    match value {
+        "auto" => Ok(GqlExecutionMode::Auto),
+        "read_only" => Ok(GqlExecutionMode::ReadOnly),
+        other => Err(OverGraphError::new_err(format!(
+            "GQL mode must be 'auto' or 'read_only', got '{other}'"
+        ))),
+    }
 }
 
 struct GqlParamConversionBudget {
@@ -3351,7 +3416,7 @@ fn parse_py_gql_params(
     py: Python<'_>,
     params: Option<&Bound<'_, PyDict>>,
     referenced_params: &[String],
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> PyResult<GqlParams> {
     let mut parsed = GqlParams::new();
     if referenced_params.is_empty() {
@@ -3380,7 +3445,7 @@ fn py_to_gql_param_value(
     name: &str,
     obj: &Bound<'_, PyAny>,
     container_depth: usize,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
     budget: &mut GqlParamConversionBudget,
 ) -> PyResult<GqlParamValue> {
     if obj.is_none() {
@@ -3450,7 +3515,7 @@ fn py_to_gql_param_value(
     }
 }
 
-fn check_py_param_depth(name: &str, depth: usize, options: &GqlQueryOptions) -> PyResult<()> {
+fn check_py_param_depth(name: &str, depth: usize, options: &GqlExecutionOptions) -> PyResult<()> {
     if depth > options.max_ast_depth {
         return Err(PyValueError::new_err(format!(
             "GQL parameter '${name}' nested list/map depth exceeds max_ast_depth of {}",
@@ -3465,7 +3530,7 @@ fn add_py_param_items(
     count: usize,
     container_kind: &str,
     budget: &mut GqlParamConversionBudget,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> PyResult<()> {
     if count > options.max_literal_items {
         return Err(PyValueError::new_err(format!(
@@ -3491,7 +3556,7 @@ fn add_py_param_bytes(
     bytes: usize,
     value_kind: &str,
     budget: &mut GqlParamConversionBudget,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> PyResult<()> {
     if bytes > options.max_param_bytes {
         return Err(PyValueError::new_err(format!(
@@ -3581,8 +3646,13 @@ fn props_to_py(py: Python<'_>, props: &BTreeMap<String, PropValue>) -> PyResult<
     Ok(dict.into_any().unbind())
 }
 
-fn gql_result_to_py(py: Python<'_>, result: GqlResult, compact_rows: bool) -> PyResult<PyObject> {
+fn gql_result_to_py(
+    py: Python<'_>,
+    result: GqlExecutionResult,
+    compact_rows: bool,
+) -> PyResult<PyObject> {
     let dict = PyDict::new(py);
+    dict.set_item("kind", gql_statement_kind_to_py(result.kind))?;
     dict.set_item("columns", result.columns.clone())?;
     let rows: PyResult<Vec<PyObject>> = result
         .rows
@@ -3607,6 +3677,10 @@ fn gql_result_to_py(py: Python<'_>, result: GqlResult, compact_rows: bool) -> Py
     dict.set_item("rows", rows?)?;
     dict.set_item("next_cursor", result.next_cursor)?;
     dict.set_item("stats", gql_stats_to_py(py, result.stats)?)?;
+    match result.mutation_stats {
+        Some(stats) => dict.set_item("mutation_stats", gql_mutation_stats_to_py(py, stats)?)?,
+        None => dict.set_item("mutation_stats", py.None())?,
+    }
     match result.plan {
         Some(plan) => dict.set_item("plan", gql_explain_to_py(py, plan)?)?,
         None => dict.set_item("plan", py.None())?,
@@ -3945,12 +4019,59 @@ fn gql_stats_to_py(py: Python<'_>, stats: GqlExecutionStats) -> PyResult<PyObjec
     dict.set_item("intermediate_bindings", stats.intermediate_bindings)?;
     dict.set_item("db_hits", stats.db_hits)?;
     dict.set_item("elapsed_us", stats.elapsed_us)?;
-    dict.set_item("truncated", stats.truncated)?;
     dict.set_item("warnings", stats.warnings)?;
     Ok(dict.into_any().unbind())
 }
 
-fn gql_explain_to_py(py: Python<'_>, explain: GqlExplain) -> PyResult<PyObject> {
+fn gql_mutation_stats_to_py(py: Python<'_>, stats: eg::GqlMutationStats) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("rows_matched", stats.rows_matched)?;
+    dict.set_item("mutation_rows", stats.mutation_rows)?;
+    dict.set_item("mutation_ops", stats.mutation_ops)?;
+    dict.set_item("nodes_created", stats.nodes_created)?;
+    dict.set_item("nodes_updated", stats.nodes_updated)?;
+    dict.set_item("nodes_deleted", stats.nodes_deleted)?;
+    dict.set_item("edges_created", stats.edges_created)?;
+    dict.set_item("edges_updated", stats.edges_updated)?;
+    dict.set_item("edges_deleted", stats.edges_deleted)?;
+    dict.set_item("labels_added", stats.labels_added)?;
+    dict.set_item("labels_removed", stats.labels_removed)?;
+    dict.set_item("properties_set", stats.properties_set)?;
+    dict.set_item("properties_removed", stats.properties_removed)?;
+    dict.set_item("skipped_null_targets", stats.skipped_null_targets)?;
+    dict.set_item("duplicate_targets", stats.duplicate_targets)?;
+    dict.set_item("db_hits", stats.db_hits)?;
+    dict.set_item("elapsed_us", stats.elapsed_us)?;
+    dict.set_item("warnings", stats.warnings)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_statement_kind_to_py(kind: GqlStatementKind) -> &'static str {
+    match kind {
+        GqlStatementKind::Query => "query",
+        GqlStatementKind::Mutation => "mutation",
+    }
+}
+
+fn gql_explain_to_py(py: Python<'_>, explain: GqlExecutionExplain) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("kind", gql_statement_kind_to_py(explain.kind))?;
+    dict.set_item("columns", explain.columns)?;
+    match explain.read {
+        Some(read) => dict.set_item("read", gql_read_explain_to_py(py, read)?)?,
+        None => dict.set_item("read", py.None())?,
+    }
+    match explain.mutation {
+        Some(mutation) => dict.set_item("mutation", gql_mutation_explain_to_py(py, mutation)?)?,
+        None => dict.set_item("mutation", py.None())?,
+    }
+    dict.set_item("caps", gql_execution_caps_to_py(py, explain.caps)?)?;
+    dict.set_item("warnings", explain.warnings)?;
+    dict.set_item("notes", explain.notes)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_read_explain_to_py(py: Python<'_>, explain: GqlExplain) -> PyResult<PyObject> {
     let dict = PyDict::new(py);
     dict.set_item("columns", explain.columns)?;
     dict.set_item("target", gql_lowering_target_to_py(explain.target))?;
@@ -3971,6 +4092,80 @@ fn gql_explain_to_py(py: Python<'_>, explain: GqlExplain) -> PyResult<PyObject> 
     )?;
     dict.set_item("caps", gql_caps_to_py(py, explain.caps)?)?;
     dict.set_item("warnings", explain.warnings)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_mutation_explain_to_py(
+    py: Python<'_>,
+    explain: eg::GqlMutationExplain,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    if let Some(prefix) = explain.read_prefix {
+        let prefix_dict = PyDict::new(py);
+        prefix_dict.set_item(
+            "graph_row_target",
+            gql_read_explain_to_py(py, prefix.graph_row_target)?,
+        )?;
+        prefix_dict.set_item("internal_columns", prefix.internal_columns)?;
+        prefix_dict.set_item("target_aliases", prefix.target_aliases)?;
+        prefix_dict.set_item("expression_columns", prefix.expression_columns)?;
+        dict.set_item("read_prefix", prefix_dict)?;
+    } else {
+        dict.set_item("read_prefix", py.None())?;
+    }
+    let operations = explain
+        .operations
+        .into_iter()
+        .map(|operation| {
+            let item = PyDict::new(py);
+            item.set_item("op", operation.op)?;
+            item.set_item("target_alias", operation.target_alias)?;
+            item.set_item("row_multiplicity", operation.row_multiplicity)?;
+            item.set_item("detail", operation.detail)?;
+            Ok(item.into_any().unbind())
+        })
+        .collect::<PyResult<Vec<PyObject>>>()?;
+    dict.set_item("operations", operations)?;
+    if let Some(plan) = explain.return_plan {
+        let plan_dict = PyDict::new(py);
+        plan_dict.set_item("columns", plan.columns)?;
+        plan_dict.set_item("order_items", plan.order_items)?;
+        plan_dict.set_item("skip", plan.skip)?;
+        plan_dict.set_item("limit", plan.limit)?;
+        plan_dict.set_item("post_commit_hydration", plan.post_commit_hydration)?;
+        dict.set_item("return_plan", plan_dict)?;
+    } else {
+        dict.set_item("return_plan", py.None())?;
+    }
+    dict.set_item("would_create_node_labels", explain.would_create_node_labels)?;
+    dict.set_item("would_create_edge_labels", explain.would_create_edge_labels)?;
+    dict.set_item(
+        "uses_transaction_snapshot",
+        explain.uses_transaction_snapshot,
+    )?;
+    dict.set_item("uses_write_txn", explain.uses_write_txn)?;
+    dict.set_item("replacement_adapters", explain.replacement_adapters)?;
+    dict.set_item("atomic_commit", explain.atomic_commit)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_execution_caps_to_py(py: Python<'_>, caps: GqlExecutionCapSummary) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("allow_full_scan", caps.allow_full_scan)?;
+    dict.set_item("max_rows", caps.max_rows)?;
+    dict.set_item("max_cursor_bytes", caps.max_cursor_bytes)?;
+    dict.set_item("max_mutation_rows", caps.max_mutation_rows)?;
+    dict.set_item("max_mutation_ops", caps.max_mutation_ops)?;
+    dict.set_item("max_query_bytes", caps.max_query_bytes)?;
+    dict.set_item("max_param_bytes", caps.max_param_bytes)?;
+    dict.set_item("max_ast_depth", caps.max_ast_depth)?;
+    dict.set_item("max_literal_items", caps.max_literal_items)?;
+    dict.set_item("max_intermediate_bindings", caps.max_intermediate_bindings)?;
+    dict.set_item("max_frontier", caps.max_frontier)?;
+    dict.set_item("max_path_hops", caps.max_path_hops)?;
+    dict.set_item("max_paths_per_start", caps.max_paths_per_start)?;
+    dict.set_item("max_order_materialization", caps.max_order_materialization)?;
+    dict.set_item("max_skip", caps.max_skip)?;
     Ok(dict.into_any().unbind())
 }
 

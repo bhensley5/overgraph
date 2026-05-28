@@ -394,9 +394,9 @@ def test_query_graph_rows_explain_params_and_expression_tags(tmp_dir):
 
 def test_old_pattern_surface_is_explicitly_unsupported(db):
     seed_graph(db)
-    with pytest.raises(Exception, match="unsupported after Phase 32"):
+    with pytest.raises(Exception, match="unsupported; use query_graph_rows"):
         db.query_pattern({"nodes": [], "edges": [], "limit": 1})
-    with pytest.raises(Exception, match="unsupported after Phase 32"):
+    with pytest.raises(Exception, match="unsupported; use explain_graph_rows"):
         db.explain_pattern_query({"nodes": [], "edges": [], "limit": 1})
 
 

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::types::SourceSpan;
+use crate::types::{GqlStatementKind, SourceSpan};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Ident {
@@ -16,6 +16,102 @@ pub(crate) struct GqlQuery {
     pub(crate) skip: Option<Expr>,
     pub(crate) limit: Option<Expr>,
     pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlStatement {
+    pub(crate) kind: GqlStatementKind,
+    pub(crate) body: GqlStatementBody,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlStatementBody {
+    Query(GqlQuery),
+    Mutation(GqlMutationStatement),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlMutationStatement {
+    pub(crate) read_prefix: Vec<MatchClause>,
+    pub(crate) mutation_clauses: Vec<MutationClause>,
+    pub(crate) return_tail: Option<MutationReturnTail>,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MutationClause {
+    Create(CreateClause),
+    Set(SetClause),
+    Remove(RemoveClause),
+    Delete(DeleteClause),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateClause {
+    pub(crate) patterns: Vec<Pattern>,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SetClause {
+    pub(crate) items: Vec<SetItem>,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SetItem {
+    Property {
+        alias: Ident,
+        property: Ident,
+        value: Expr,
+        span: SourceSpan,
+    },
+    MapMerge {
+        alias: Ident,
+        value: Expr,
+        span: SourceSpan,
+    },
+    NodeLabel {
+        alias: Ident,
+        label: Ident,
+        span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RemoveClause {
+    pub(crate) items: Vec<RemoveItem>,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RemoveItem {
+    Property {
+        alias: Ident,
+        property: Ident,
+        span: SourceSpan,
+    },
+    NodeLabel {
+        alias: Ident,
+        label: Ident,
+        span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DeleteClause {
+    pub(crate) detach: bool,
+    pub(crate) targets: Vec<Expr>,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MutationReturnTail {
+    pub(crate) return_clause: ReturnClause,
+    pub(crate) order_by: Vec<OrderItem>,
+    pub(crate) skip: Option<Expr>,
+    pub(crate) limit: Option<Expr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

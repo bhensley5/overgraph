@@ -3,6 +3,9 @@ pub(crate) struct TxnCommitRequest {
     snapshot: Arc<ReadView>,
     snapshot_seq: u64,
     entries: Vec<StagedTxnIntent>,
+    record_replacements: Vec<TxnRecordReplacement>,
+    gql_return_read_set: TxnReturnReadSet,
+    graph_op_budget: Option<TxnGraphOpBudget>,
 }
 
 #[derive(Clone)]
@@ -10,6 +13,56 @@ pub(crate) struct StagedTxnIntent {
     intent: TxnIntent,
     produced_node: Option<TxnLocalRef>,
     produced_edge: Option<TxnLocalRef>,
+}
+
+#[derive(Clone)]
+pub(crate) enum TxnRecordReplacement {
+    Node(TxnNodeRecordReplacement),
+    Edge(TxnEdgeRecordReplacement),
+}
+
+#[derive(Clone)]
+pub(crate) struct TxnNodeRecordReplacement {
+    pub(crate) id: u64,
+    pub(crate) labels: Vec<String>,
+    pub(crate) key: String,
+    pub(crate) props: BTreeMap<String, PropValue>,
+    pub(crate) created_at: i64,
+    pub(crate) weight: f32,
+    pub(crate) dense_vector: Option<DenseVector>,
+    pub(crate) sparse_vector: Option<SparseVector>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TxnEdgeRecordReplacement {
+    pub(crate) id: u64,
+    pub(crate) from: u64,
+    pub(crate) to: u64,
+    pub(crate) label: String,
+    pub(crate) props: BTreeMap<String, PropValue>,
+    pub(crate) created_at: i64,
+    pub(crate) weight: f32,
+    pub(crate) valid_from: i64,
+    pub(crate) valid_to: i64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct TxnReturnReadSet {
+    pub(crate) node_ids: BTreeSet<u64>,
+    pub(crate) edge_ids: BTreeSet<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TxnGraphOpBudget {
+    scope: &'static str,
+    name: &'static str,
+    max_ops: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TxnGraphOpCounter {
+    budget: Option<TxnGraphOpBudget>,
+    ops: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -57,6 +110,9 @@ pub struct WriteTxn {
     snapshot: Arc<ReadView>,
     snapshot_seq: u64,
     entries: Vec<StagedTxnIntent>,
+    record_replacements: Vec<TxnRecordReplacement>,
+    gql_return_read_set: TxnReturnReadSet,
+    graph_op_budget: Option<TxnGraphOpBudget>,
     overlay: TxnOverlay,
     edge_uniqueness: bool,
     closed: bool,
@@ -71,6 +127,9 @@ impl DatabaseEngine {
             snapshot: Arc::clone(&published.view),
             snapshot_seq: published.view.snapshot_seq,
             entries: Vec::new(),
+            record_replacements: Vec::new(),
+            gql_return_read_set: TxnReturnReadSet::default(),
+            graph_op_budget: None,
             overlay: TxnOverlay::new(published.edge_uniqueness),
             edge_uniqueness: published.edge_uniqueness,
             closed: false,
@@ -79,7 +138,148 @@ impl DatabaseEngine {
     }
 }
 
+impl ReadView {
+    fn txn_delete_incident_edge_ids_limited(
+        &self,
+        node_ids: &[u64],
+        limit: usize,
+    ) -> Result<Vec<u64>, EngineError> {
+        self.sources()
+            .edge_ids_by_endpoints_limited(node_ids, Direction::Both, None, limit)
+    }
+}
+
+impl TxnGraphOpCounter {
+    fn new(budget: Option<TxnGraphOpBudget>) -> Self {
+        Self { budget, ops: 0 }
+    }
+
+    fn reserve(&mut self, count: usize) -> Result<(), EngineError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let next = self.ops.saturating_add(count);
+        if let Some(budget) = self.budget {
+            if next > budget.max_ops {
+                return Err(txn_graph_op_cap_error(budget, next));
+            }
+        }
+        self.ops = next;
+        Ok(())
+    }
+
+    fn limited_scan_len(&self, already_counted_matches: usize) -> usize {
+        match self.budget {
+            Some(budget) => budget
+                .max_ops
+                .saturating_sub(self.ops)
+                .saturating_add(already_counted_matches)
+                .saturating_add(1),
+            None => usize::MAX,
+        }
+    }
+
+    fn reject_if_limited_scan_filled(
+        &self,
+        returned: usize,
+        limit: usize,
+    ) -> Result<(), EngineError> {
+        let Some(budget) = self.budget else {
+            return Ok(());
+        };
+        if limit != usize::MAX && returned >= limit {
+            return Err(txn_graph_op_cap_error(
+                budget,
+                budget.max_ops.saturating_add(1),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn txn_graph_op_cap_error(budget: TxnGraphOpBudget, actual: usize) -> EngineError {
+    EngineError::InvalidOperation(format!(
+        "{} {} exceeded: attempted {}, cap {}",
+        budget.scope, budget.name, actual, budget.max_ops
+    ))
+}
+
 impl WriteTxn {
+    #[allow(dead_code)]
+    pub(crate) fn gql_snapshot(&self) -> Result<Arc<ReadView>, EngineError> {
+        self.ensure_open()?;
+        Ok(Arc::clone(&self.snapshot))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn gql_snapshot_seq(&self) -> Result<u64, EngineError> {
+        self.ensure_open()?;
+        Ok(self.snapshot_seq)
+    }
+
+    pub(crate) fn gql_edge_uniqueness(&self) -> Result<bool, EngineError> {
+        self.ensure_open()?;
+        Ok(self.edge_uniqueness)
+    }
+
+    pub(crate) fn gql_first_existing_node_key(
+        &self,
+        keys: &BTreeSet<(String, String)>,
+    ) -> Result<Option<(String, String)>, EngineError> {
+        self.ensure_open()?;
+        let mut resolved = Vec::with_capacity(keys.len());
+        for (label, key) in keys {
+            let Some(label_id) = self.snapshot.label_catalog.resolve_node_label_for_read(label)?
+            else {
+                continue;
+            };
+            resolved.push((label.clone(), key.clone(), label_id));
+        }
+        if resolved.is_empty() {
+            return Ok(None);
+        }
+        let key_refs: Vec<(u32, &str)> = resolved
+            .iter()
+            .map(|(_, key, label_id)| (*label_id, key.as_str()))
+            .collect();
+        let nodes = self.snapshot.get_nodes_by_label_keys_raw(&key_refs)?;
+        for ((label, key, _), node) in resolved.into_iter().zip(nodes) {
+            if node.is_some() {
+                return Ok(Some((label, key)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn gql_first_existing_edge_triple(
+        &self,
+        triples: &BTreeSet<(u64, u64, String)>,
+    ) -> Result<Option<(u64, u64, String)>, EngineError> {
+        self.ensure_open()?;
+        let mut resolved = Vec::with_capacity(triples.len());
+        for (from, to, label) in triples {
+            let Some(label_id) = self.snapshot.label_catalog.resolve_edge_label_for_read(label)?
+            else {
+                continue;
+            };
+            resolved.push((*from, *to, label.clone(), label_id));
+        }
+        if resolved.is_empty() {
+            return Ok(None);
+        }
+        let triple_refs: Vec<(u64, u64, u32)> = resolved
+            .iter()
+            .map(|(from, to, _, label_id)| (*from, *to, *label_id))
+            .collect();
+        let edges = self.snapshot.get_edges_by_triples_raw(&triple_refs)?;
+        for ((from, to, label, _), edge) in resolved.into_iter().zip(edges) {
+            if edge.is_some() {
+                return Ok(Some((from, to, label)));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn upsert_node<L>(
         &mut self,
         labels: L,
@@ -308,6 +508,38 @@ impl WriteTxn {
         Ok(())
     }
 
+    pub(crate) fn stage_record_replacements(
+        &mut self,
+        replacements: Vec<TxnRecordReplacement>,
+    ) -> Result<(), EngineError> {
+        self.ensure_open()?;
+        self.record_replacements.extend(replacements);
+        Ok(())
+    }
+
+    pub(crate) fn gql_validate_return_read_set(
+        &mut self,
+        read_set: TxnReturnReadSet,
+    ) -> Result<(), EngineError> {
+        self.ensure_open()?;
+        self.gql_return_read_set.node_ids.extend(read_set.node_ids);
+        self.gql_return_read_set.edge_ids.extend(read_set.edge_ids);
+        Ok(())
+    }
+
+    pub(crate) fn gql_apply_mutation_op_budget(
+        &mut self,
+        max_ops: usize,
+    ) -> Result<(), EngineError> {
+        self.ensure_open()?;
+        self.graph_op_budget = Some(TxnGraphOpBudget {
+            scope: "GQL mutation",
+            name: "max_mutation_ops",
+            max_ops,
+        });
+        Ok(())
+    }
+
     pub fn get_node(&self, target: TxnNodeRef) -> Result<Option<TxnNodeView>, EngineError> {
         self.ensure_open()?;
         self.overlay.get_node(&self.snapshot, &target)
@@ -355,14 +587,46 @@ impl WriteTxn {
             snapshot: Arc::clone(&self.snapshot),
             snapshot_seq: self.snapshot_seq,
             entries: std::mem::take(&mut self.entries),
+            record_replacements: std::mem::take(&mut self.record_replacements),
+            gql_return_read_set: std::mem::take(&mut self.gql_return_read_set),
+            graph_op_budget: self.graph_op_budget.take(),
         };
         self.overlay = TxnOverlay::new(self.edge_uniqueness);
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::TxnCommit { request })?
+            .submit_core_write(CoreWriteRequest::TxnCommit {
+                request,
+                return_read_view: false,
+            })?
         {
             CoreWriteReply::TxnCommitResult(result) => Ok(result),
             _ => unreachable!("txn commit must return transaction commit results"),
+        }
+    }
+
+    pub(crate) fn commit_with_gql_return_view(
+        &mut self,
+    ) -> Result<(TxnCommitResult, Arc<ReadView>), EngineError> {
+        self.ensure_open()?;
+        self.closed = true;
+        let request = TxnCommitRequest {
+            snapshot: Arc::clone(&self.snapshot),
+            snapshot_seq: self.snapshot_seq,
+            entries: std::mem::take(&mut self.entries),
+            record_replacements: std::mem::take(&mut self.record_replacements),
+            gql_return_read_set: std::mem::take(&mut self.gql_return_read_set),
+            graph_op_budget: self.graph_op_budget.take(),
+        };
+        self.overlay = TxnOverlay::new(self.edge_uniqueness);
+        match self
+            .runtime
+            .submit_core_write(CoreWriteRequest::TxnCommit {
+                request,
+                return_read_view: true,
+            })?
+        {
+            CoreWriteReply::TxnCommitResultWithReadView(result, view) => Ok((result, view)),
+            _ => unreachable!("txn commit with read view must return transaction commit results"),
         }
     }
 
@@ -370,6 +634,9 @@ impl WriteTxn {
         self.ensure_open()?;
         self.closed = true;
         self.entries.clear();
+        self.record_replacements.clear();
+        self.gql_return_read_set = TxnReturnReadSet::default();
+        self.graph_op_budget = None;
         self.overlay = TxnOverlay::new(self.edge_uniqueness);
         Ok(())
     }
@@ -1572,6 +1839,25 @@ fn collect_txn_intent_read_label_names<'a>(
     }
 }
 
+fn collect_txn_replacement_read_label_names<'a>(
+    replacement: &'a TxnRecordReplacement,
+    node_labels: &mut Vec<&'a str>,
+    seen_node_labels: &mut HashSet<&'a str>,
+    edge_labels: &mut Vec<&'a str>,
+    seen_edge_labels: &mut HashSet<&'a str>,
+) {
+    match replacement {
+        TxnRecordReplacement::Node(node) => {
+            for label in &node.labels {
+                push_distinct_txn_name(label, node_labels, seen_node_labels);
+            }
+        }
+        TxnRecordReplacement::Edge(edge) => {
+            push_distinct_txn_name(&edge.label, edge_labels, seen_edge_labels);
+        }
+    }
+}
+
 fn collect_txn_node_ref_read_label_names<'a>(
     target: &'a TxnNodeRef,
     node_labels: &mut Vec<&'a str>,
@@ -1633,6 +1919,30 @@ fn collect_txn_intent_cache_targets(
         }
         TxnIntent::InvalidateEdge { target, .. } => {
             collect_txn_edge_ref_cache_targets(target, label_resolution, node_keys, node_ids, edge_ids);
+        }
+    }
+}
+
+fn collect_txn_replacement_cache_targets(
+    replacement: &TxnRecordReplacement,
+    label_resolution: &TxnLabelResolution,
+    node_keys: &mut HashSet<(u32, String)>,
+    node_ids: &mut NodeIdSet,
+    edge_ids: &mut NodeIdSet,
+) {
+    match replacement {
+        TxnRecordReplacement::Node(node) => {
+            node_ids.insert(node.id);
+            for label in &node.labels {
+                if let Some(label_id) = label_resolution.node_label_id(label) {
+                    node_keys.insert((label_id, node.key.clone()));
+                }
+            }
+        }
+        TxnRecordReplacement::Edge(edge) => {
+            edge_ids.insert(edge.id);
+            node_ids.insert(edge.from);
+            node_ids.insert(edge.to);
         }
     }
 }
@@ -1863,8 +2173,28 @@ fn set_planned_edge_triple_if_current_or_absent(
     }
 }
 
+fn resolve_txn_node_replacement_label_ids(
+    label_resolution: &TxnLabelResolution,
+    replacement: &TxnNodeRecordReplacement,
+) -> Result<NodeLabelSet, EngineError> {
+    let validated_labels =
+        ValidatedNodeLabelList::new(replacement.labels.iter().map(String::as_str))?;
+    let mut label_ids = [0u32; MAX_NODE_LABELS_PER_NODE];
+    for (idx, &label) in validated_labels.as_slice().iter().enumerate() {
+        label_ids[idx] = label_resolution.node_label_id(label).ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "transaction node label '{}' was not resolved for commit",
+                label
+            ))
+        })?;
+    }
+    NodeLabelSet::from_label_ids(label_ids[..validated_labels.len()].iter().copied())
+}
+
 #[derive(Default)]
 struct TxnPlanningCache {
+    begin_nodes_by_id: NodeIdMap<Option<NodeRecord>>,
+    begin_edges_by_id: NodeIdMap<Option<EdgeRecord>>,
     begin_node_keys: HashMap<(u32, String), Option<NodeRecord>>,
     current_node_keys: HashMap<(u32, String), Option<NodeRecord>>,
     begin_edge_triples: HashMap<(u64, u64, u32), Option<EdgeRecord>>,
@@ -1906,6 +2236,7 @@ impl EngineCore {
         let mut cache = self.build_txn_planning_cache(request, &label_resolution)?;
         let mut next_node_id = self.next_node_id;
         let mut next_edge_id = self.next_edge_id;
+        let mut graph_ops = TxnGraphOpCounter::new(request.graph_op_budget);
 
         for entry in &request.entries {
             match &entry.intent {
@@ -2018,6 +2349,7 @@ impl EngineCore {
                         last_write_seq: 0,
                     };
                     state.node_records_by_id.insert(id, node.clone());
+                    graph_ops.reserve(1)?;
                     ops.push(WalOp::UpsertNode(node));
                     state.node_ids.push(id);
                 }
@@ -2087,6 +2419,7 @@ impl EngineCore {
                     };
                     state.edge_id_to_triple.insert(id, triple);
                     state.edge_records_by_id.insert(id, edge.clone());
+                    graph_ops.reserve(1)?;
                     ops.push(WalOp::UpsertEdge(edge));
                     state.edge_ids.push(id);
                 }
@@ -2097,12 +2430,26 @@ impl EngineCore {
                         continue;
                     };
                     self.validate_node_id_conflict(&mut cache, id, request.snapshot_seq)?;
-                    let incident = self.incident_edges_for_txn_delete(id)?;
-                    for entry in &incident {
-                        self.validate_edge_id_conflict(&mut cache, entry.edge_id, request.snapshot_seq)?;
-                        if state.deleted_edge_ids.insert(entry.edge_id) {
+                    graph_ops.reserve(1)?;
+                    let incident_scan_limit =
+                        graph_ops.limited_scan_len(state.deleted_edge_ids.len());
+                    let snapshot_incident = request
+                        .snapshot
+                        .txn_delete_incident_edge_ids_limited(&[id], incident_scan_limit)?;
+                    graph_ops
+                        .reject_if_limited_scan_filled(snapshot_incident.len(), incident_scan_limit)?;
+                    for edge_id in snapshot_incident {
+                        self.validate_edge_id_conflict(&mut cache, edge_id, request.snapshot_seq)?;
+                    }
+                    let incident =
+                        self.incident_edge_ids_for_txn_delete_limited(id, incident_scan_limit)?;
+                    graph_ops.reject_if_limited_scan_filled(incident.len(), incident_scan_limit)?;
+                    for edge_id in incident {
+                        self.validate_edge_id_conflict(&mut cache, edge_id, request.snapshot_seq)?;
+                        if state.deleted_edge_ids.insert(edge_id) {
+                            graph_ops.reserve(1)?;
                             ops.push(WalOp::DeleteEdge {
-                                id: entry.edge_id,
+                                id: edge_id,
                                 deleted_at: now,
                             });
                         }
@@ -2115,6 +2462,7 @@ impl EngineCore {
                         .collect();
                     for edge_id in planned_incident {
                         if state.deleted_edge_ids.insert(edge_id) {
+                            graph_ops.reserve(1)?;
                             if let Some(triple) = state.edge_id_to_triple.remove(&edge_id) {
                                 remove_planned_edge_triple_if_current(&mut state, triple, edge_id);
                             }
@@ -2139,6 +2487,7 @@ impl EngineCore {
                     };
                     self.validate_edge_id_conflict(&mut cache, id, request.snapshot_seq)?;
                     if state.deleted_edge_ids.insert(id) {
+                        graph_ops.reserve(1)?;
                         if let Some(triple) = state.edge_id_to_triple.remove(&id) {
                             remove_planned_edge_triple_if_current(&mut state, triple, id);
                         }
@@ -2163,19 +2512,20 @@ impl EngineCore {
                             updated_at: now,
                             valid_to: *valid_to,
                             ..edge
-                        };
-                        let triple = (updated.from, updated.to, updated.label_id);
-                        set_planned_edge_triple_if_current_or_absent(
-                            &mut state,
+                            };
+                            let triple = (updated.from, updated.to, updated.label_id);
+                            set_planned_edge_triple_if_current_or_absent(
+                                &mut state,
                             triple,
                             id,
                             updated.created_at,
-                        );
-                        state.edge_id_to_triple.insert(id, triple);
-                        state.edge_records_by_id.insert(id, updated.clone());
-                        ops.push(WalOp::UpsertEdge(updated));
-                    } else {
-                        self.validate_edge_id_conflict(&mut cache, id, request.snapshot_seq)?;
+                            );
+                            state.edge_id_to_triple.insert(id, triple);
+                            state.edge_records_by_id.insert(id, updated.clone());
+                            graph_ops.reserve(1)?;
+                            ops.push(WalOp::UpsertEdge(updated));
+                        } else {
+                            self.validate_edge_id_conflict(&mut cache, id, request.snapshot_seq)?;
                         if let Some(edge) = self.cached_current_edge(&mut cache, id)? {
                             let updated = EdgeRecord {
                                 updated_at: now,
@@ -2192,12 +2542,50 @@ impl EngineCore {
                             }
                             state.edge_id_to_triple.insert(id, triple);
                             state.edge_records_by_id.insert(id, updated.clone());
+                            graph_ops.reserve(1)?;
                             ops.push(WalOp::UpsertEdge(updated));
                         }
                     }
                 }
             }
         }
+
+        self.prepare_txn_node_replacement_key_state(
+            request,
+            &label_resolution,
+            &mut cache,
+            &mut state,
+        )?;
+        let replacement_order =
+            self.txn_replacement_planning_order(request, &label_resolution, &mut cache, &state)?;
+
+        for replacement_index in replacement_order {
+            let replacement = &request.record_replacements[replacement_index];
+            match replacement {
+                TxnRecordReplacement::Node(node) => self.plan_txn_node_record_replacement(
+                    request,
+                    &label_resolution,
+                    &mut cache,
+                    &mut state,
+                    &mut graph_ops,
+                    &mut ops,
+                    node,
+                    now,
+                )?,
+                TxnRecordReplacement::Edge(edge) => self.plan_txn_edge_record_replacement(
+                    request,
+                    &label_resolution,
+                    &mut cache,
+                    &mut state,
+                    &mut graph_ops,
+                    &mut ops,
+                    edge,
+                    now,
+                )?,
+            }
+        }
+
+        self.validate_gql_return_read_set(request, &state)?;
 
         self.next_node_id = next_node_id;
         self.next_edge_id = next_edge_id;
@@ -2216,6 +2604,398 @@ impl EngineCore {
             track_ids: false,
             label_catalog_changed,
         })
+    }
+
+    fn prepare_txn_node_replacement_key_state(
+        &self,
+        request: &TxnCommitRequest,
+        label_resolution: &TxnLabelResolution,
+        cache: &mut TxnPlanningCache,
+        state: &mut PlannedTxnState,
+    ) -> Result<(), EngineError> {
+        let mut final_node_key_owners: HashMap<(u32, String), u64> = HashMap::new();
+        for replacement in &request.record_replacements {
+            let TxnRecordReplacement::Node(replacement) = replacement else {
+                continue;
+            };
+            if state.deleted_node_ids.contains(&replacement.id) {
+                return Err(EngineError::InvalidOperation(format!(
+                    "transaction node {} was deleted earlier in the transaction",
+                    replacement.id
+                )));
+            }
+            let begin = self
+                .cached_begin_node(request, cache, replacement.id)?
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "transaction node {} does not exist in the transaction snapshot",
+                        replacement.id
+                    ))
+                })?;
+            self.validate_node_id_conflict(cache, replacement.id, request.snapshot_seq)?;
+            if begin.key != replacement.key {
+                return Err(EngineError::InvalidOperation(format!(
+                    "transaction node {} replacement cannot change key",
+                    replacement.id
+                )));
+            }
+            if begin.created_at != replacement.created_at {
+                return Err(EngineError::InvalidOperation(format!(
+                    "transaction node {} replacement cannot change created_at",
+                    replacement.id
+                )));
+            }
+
+            let label_ids = resolve_txn_node_replacement_label_ids(label_resolution, replacement)?;
+            let previous_labels = state
+                .node_records_by_id
+                .get(&replacement.id)
+                .map(|node| node.label_ids)
+                .unwrap_or(begin.label_ids);
+            for &old_label_id in previous_labels.as_slice() {
+                if !label_ids.contains(old_label_id) {
+                    let key_tuple = (old_label_id, replacement.key.clone());
+                    if state
+                        .nodes_by_key
+                        .get(&key_tuple)
+                        .is_some_and(|(id, _)| *id == replacement.id)
+                    {
+                        state.nodes_by_key.remove(&key_tuple);
+                    }
+                    state.removed_node_keys.insert(key_tuple);
+                }
+            }
+            for &label_id in label_ids.as_slice() {
+                let key_tuple = (label_id, replacement.key.clone());
+                if let Some(other_id) =
+                    final_node_key_owners.insert(key_tuple, replacement.id)
+                {
+                    if other_id != replacement.id {
+                        return Err(node_key_conflict_error(
+                            &replacement.key,
+                            other_id,
+                            replacement.id,
+                        ));
+                    }
+                }
+            }
+        }
+
+        for ((label_id, key), replacement_id) in final_node_key_owners {
+            let key_tuple = (label_id, key.clone());
+            if let Some(&(other_id, _)) = state.nodes_by_key.get(&key_tuple) {
+                if other_id != replacement_id {
+                    return Err(node_key_conflict_error(&key, other_id, replacement_id));
+                }
+            } else if !state.removed_node_keys.contains(&key_tuple) {
+                self.validate_node_key_conflict(request, cache, label_id, &key)?;
+                if let Some(current) = self.cached_current_node_key(cache, label_id, &key)? {
+                    if current.id != replacement_id {
+                        return Err(node_key_conflict_error(
+                            &key,
+                            current.id,
+                            replacement_id,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn txn_replacement_planning_order(
+        &self,
+        request: &TxnCommitRequest,
+        label_resolution: &TxnLabelResolution,
+        cache: &mut TxnPlanningCache,
+        state: &PlannedTxnState,
+    ) -> Result<Vec<usize>, EngineError> {
+        let mut added_keys = vec![HashSet::<(u32, String)>::new(); request.record_replacements.len()];
+        let mut key_removers: HashMap<(u32, String), Vec<usize>> = HashMap::new();
+        for (idx, replacement) in request.record_replacements.iter().enumerate() {
+            let TxnRecordReplacement::Node(replacement) = replacement else {
+                continue;
+            };
+            let begin = self
+                .cached_begin_node(request, cache, replacement.id)?
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "transaction node {} does not exist in the transaction snapshot",
+                        replacement.id
+                    ))
+                })?;
+            let label_ids = resolve_txn_node_replacement_label_ids(label_resolution, replacement)?;
+            let previous_labels = state
+                .node_records_by_id
+                .get(&replacement.id)
+                .map(|node| node.label_ids)
+                .unwrap_or(begin.label_ids);
+            for &old_label_id in previous_labels.as_slice() {
+                if !label_ids.contains(old_label_id) {
+                    key_removers
+                        .entry((old_label_id, replacement.key.clone()))
+                        .or_default()
+                        .push(idx);
+                }
+            }
+            for &new_label_id in label_ids.as_slice() {
+                if !previous_labels.contains(new_label_id) {
+                    added_keys[idx].insert((new_label_id, replacement.key.clone()));
+                }
+            }
+        }
+
+        let mut prerequisites = vec![HashSet::<usize>::new(); request.record_replacements.len()];
+        for (added_idx, keys) in added_keys.iter().enumerate() {
+            for key in keys {
+                let Some(removers) = key_removers.get(key) else {
+                    continue;
+                };
+                for &removed_idx in removers {
+                    if removed_idx != added_idx {
+                        prerequisites[added_idx].insert(removed_idx);
+                    }
+                }
+            }
+        }
+
+        let mut emitted = vec![false; request.record_replacements.len()];
+        let mut order = Vec::with_capacity(request.record_replacements.len());
+        while order.len() < request.record_replacements.len() {
+            let mut progressed = false;
+            for idx in 0..request.record_replacements.len() {
+                if emitted[idx] {
+                    continue;
+                }
+                if prerequisites[idx].iter().all(|&dependency| emitted[dependency]) {
+                    emitted[idx] = true;
+                    order.push(idx);
+                    progressed = true;
+                    break;
+                }
+            }
+            if !progressed {
+                return Err(EngineError::InvalidOperation(
+                    "cyclic node label/key replacements cannot be planned safely in one transaction"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(order)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_txn_node_record_replacement(
+        &self,
+        request: &TxnCommitRequest,
+        label_resolution: &TxnLabelResolution,
+        cache: &mut TxnPlanningCache,
+        state: &mut PlannedTxnState,
+        graph_ops: &mut TxnGraphOpCounter,
+        ops: &mut Vec<WalOp>,
+        replacement: &TxnNodeRecordReplacement,
+        now: i64,
+    ) -> Result<(), EngineError> {
+        if state.deleted_node_ids.contains(&replacement.id) {
+            return Err(EngineError::InvalidOperation(format!(
+                "transaction node {} was deleted earlier in the transaction",
+                replacement.id
+            )));
+        }
+        let begin = self
+            .cached_begin_node(request, cache, replacement.id)?
+            .ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "transaction node {} does not exist in the transaction snapshot",
+                    replacement.id
+                ))
+            })?;
+        self.validate_node_id_conflict(cache, replacement.id, request.snapshot_seq)?;
+        if begin.key != replacement.key {
+            return Err(EngineError::InvalidOperation(format!(
+                "transaction node {} replacement cannot change key",
+                replacement.id
+            )));
+        }
+        if begin.created_at != replacement.created_at {
+            return Err(EngineError::InvalidOperation(format!(
+                "transaction node {} replacement cannot change created_at",
+                replacement.id
+            )));
+        }
+
+        let label_ids = resolve_txn_node_replacement_label_ids(label_resolution, replacement)?;
+
+        let previous_labels = state
+            .node_records_by_id
+            .get(&replacement.id)
+            .map(|node| node.label_ids)
+            .unwrap_or(begin.label_ids);
+        for &old_label_id in previous_labels.as_slice() {
+            if !label_ids.contains(old_label_id) {
+                let key_tuple = (old_label_id, replacement.key.clone());
+                if state
+                    .nodes_by_key
+                    .get(&key_tuple)
+                    .is_some_and(|(id, _)| *id == replacement.id)
+                {
+                    state.nodes_by_key.remove(&key_tuple);
+                }
+                state.removed_node_keys.insert(key_tuple);
+            }
+        }
+
+        for &label_id in label_ids.as_slice() {
+            let key_tuple = (label_id, replacement.key.clone());
+            if let Some(&(other_id, _)) = state.nodes_by_key.get(&key_tuple) {
+                if other_id != replacement.id {
+                    return Err(node_key_conflict_error(
+                        &replacement.key,
+                        other_id,
+                        replacement.id,
+                    ));
+                }
+            } else if !state.removed_node_keys.contains(&key_tuple) {
+                self.validate_node_key_conflict(
+                    request,
+                    cache,
+                    label_id,
+                    &replacement.key,
+                )?;
+                if let Some(current) =
+                    self.cached_current_node_key(cache, label_id, &replacement.key)?
+                {
+                    if current.id != replacement.id {
+                        return Err(node_key_conflict_error(
+                            &replacement.key,
+                            current.id,
+                            replacement.id,
+                        ));
+                    }
+                }
+            }
+            state.removed_node_keys.remove(&key_tuple);
+            state
+                .nodes_by_key
+                .insert(key_tuple, (replacement.id, replacement.created_at));
+        }
+
+        let (dense_vector, sparse_vector) = normalize_node_vectors_for_write(
+            self.manifest.dense_vector.as_ref(),
+            replacement.dense_vector.as_ref(),
+            replacement.sparse_vector.as_ref(),
+        )?;
+        let node = NodeRecord {
+            id: replacement.id,
+            label_ids,
+            key: replacement.key.clone(),
+            props: replacement.props.clone(),
+            created_at: replacement.created_at,
+            updated_at: now,
+            weight: replacement.weight,
+            dense_vector,
+            sparse_vector,
+            last_write_seq: 0,
+        };
+        state.deleted_node_ids.remove(&replacement.id);
+        state.node_records_by_id.insert(replacement.id, node.clone());
+        graph_ops.reserve(1)?;
+        ops.push(WalOp::UpsertNode(node));
+        state.node_ids.push(replacement.id);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_txn_edge_record_replacement(
+        &self,
+        request: &TxnCommitRequest,
+        label_resolution: &TxnLabelResolution,
+        cache: &mut TxnPlanningCache,
+        state: &mut PlannedTxnState,
+        graph_ops: &mut TxnGraphOpCounter,
+        ops: &mut Vec<WalOp>,
+        replacement: &TxnEdgeRecordReplacement,
+        now: i64,
+    ) -> Result<(), EngineError> {
+        if replacement.valid_from >= replacement.valid_to {
+            return Err(EngineError::InvalidOperation(
+                "transaction edge replacement requires valid_from < valid_to".to_string(),
+            ));
+        }
+        if state.deleted_edge_ids.contains(&replacement.id) {
+            return Err(EngineError::InvalidOperation(format!(
+                "transaction edge {} was deleted earlier in the transaction",
+                replacement.id
+            )));
+        }
+        let begin = self
+            .cached_begin_edge(request, cache, replacement.id)?
+            .ok_or_else(|| {
+                EngineError::InvalidOperation(format!(
+                    "transaction edge {} does not exist in the transaction snapshot",
+                    replacement.id
+                ))
+            })?;
+        self.validate_edge_id_conflict(cache, replacement.id, request.snapshot_seq)?;
+        let label_id = label_resolution.edge_label_id(&replacement.label).ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "transaction edge label '{}' was not resolved for commit",
+                replacement.label
+            ))
+        })?;
+        if begin.from != replacement.from
+            || begin.to != replacement.to
+            || begin.label_id != label_id
+        {
+            return Err(EngineError::InvalidOperation(format!(
+                "transaction edge {} replacement cannot change endpoints or label",
+                replacement.id
+            )));
+        }
+        if begin.created_at != replacement.created_at {
+            return Err(EngineError::InvalidOperation(format!(
+                "transaction edge {} replacement cannot change created_at",
+                replacement.id
+            )));
+        }
+        self.validate_node_id_conflict(cache, replacement.from, request.snapshot_seq)?;
+        self.validate_node_id_conflict(cache, replacement.to, request.snapshot_seq)?;
+
+        let triple = (replacement.from, replacement.to, label_id);
+        if let Some(&(other_id, _)) = state.edges_by_triple.get(&triple) {
+            if self.edge_uniqueness && other_id != replacement.id {
+                return Err(EngineError::InvalidOperation(format!(
+                    "edge triple ({}, {}, {}) conflicts with staged edge {}",
+                    replacement.from, replacement.to, label_id, other_id
+                )));
+            }
+        }
+        set_planned_edge_triple_if_current_or_absent(
+            state,
+            triple,
+            replacement.id,
+            replacement.created_at,
+        );
+        state.deleted_edge_ids.remove(&replacement.id);
+        let edge = EdgeRecord {
+            id: replacement.id,
+            from: replacement.from,
+            to: replacement.to,
+            label_id,
+            props: replacement.props.clone(),
+            created_at: replacement.created_at,
+            updated_at: now,
+            weight: replacement.weight,
+            valid_from: replacement.valid_from,
+            valid_to: replacement.valid_to,
+            last_write_seq: 0,
+        };
+        state.edge_id_to_triple.insert(replacement.id, triple);
+        state.edge_records_by_id.insert(replacement.id, edge.clone());
+        graph_ops.reserve(1)?;
+        ops.push(WalOp::UpsertEdge(edge));
+        state.edge_ids.push(replacement.id);
+        Ok(())
     }
 
     fn resolve_txn_label_names(
@@ -2252,6 +3032,18 @@ impl EngineCore {
                 | TxnIntent::InvalidateEdge { .. } => {}
             }
         }
+        for replacement in &request.record_replacements {
+            if let TxnRecordReplacement::Node(node) = replacement {
+                validate_node_key_for_write(&node.key)?;
+                let labels =
+                    ValidatedNodeLabelList::new(node.labels.iter().map(String::as_str))?;
+                for &label in labels.as_slice() {
+                    if seen_write_node_labels.insert(label) {
+                        write_node_labels.push(label);
+                    }
+                }
+            }
+        }
 
         for label in write_node_labels {
             let label_id = label_plan.resolve_node_label_for_write(label)?;
@@ -2269,6 +3061,15 @@ impl EngineCore {
         for entry in &request.entries {
             collect_txn_intent_read_label_names(
                 &entry.intent,
+                &mut read_node_labels,
+                &mut seen_read_node_labels,
+                &mut read_edge_labels,
+                &mut seen_read_edge_labels,
+            );
+        }
+        for replacement in &request.record_replacements {
+            collect_txn_replacement_read_label_names(
+                replacement,
                 &mut read_node_labels,
                 &mut seen_read_node_labels,
                 &mut read_edge_labels,
@@ -2314,6 +3115,15 @@ impl EngineCore {
                 &mut edge_ids,
             );
         }
+        for replacement in &request.record_replacements {
+            collect_txn_replacement_cache_targets(
+                replacement,
+                label_resolution,
+                &mut node_keys,
+                &mut node_ids,
+                &mut edge_ids,
+            );
+        }
 
         let mut cache = TxnPlanningCache::default();
         let node_keys: Vec<(u32, String)> = node_keys.into_iter().collect();
@@ -2332,19 +3142,61 @@ impl EngineCore {
             }
         }
 
+        let node_ids: Vec<u64> = node_ids.into_iter().collect();
+        if !node_ids.is_empty() {
+            let begin_nodes = request.snapshot.get_nodes_raw(&node_ids)?;
+            for (id, node) in node_ids.iter().copied().zip(begin_nodes) {
+                cache.begin_nodes_by_id.insert(id, node);
+            }
+            for id in node_ids {
+                let opinion = self.node_id_opinion(id)?;
+                cache.node_opinions_by_id.insert(id, opinion);
+            }
+        }
+
         let edge_ids: Vec<u64> = edge_ids.into_iter().collect();
         if !edge_ids.is_empty() {
+            let begin_edges = request.snapshot.get_edges(&edge_ids)?;
+            for (id, edge) in edge_ids.iter().copied().zip(begin_edges) {
+                cache.begin_edges_by_id.insert(id, edge);
+            }
             let current_edges = self.get_edges(&edge_ids)?;
             for (id, edge) in edge_ids.into_iter().zip(current_edges) {
                 cache.current_edges_by_id.insert(id, edge);
             }
         }
-        for id in node_ids {
-            let opinion = self.node_id_opinion(id)?;
-            cache.node_opinions_by_id.insert(id, opinion);
-        }
 
         Ok(cache)
+    }
+
+    fn cached_begin_node(
+        &self,
+        request: &TxnCommitRequest,
+        cache: &mut TxnPlanningCache,
+        id: u64,
+    ) -> Result<Option<NodeRecord>, EngineError> {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            cache.begin_nodes_by_id.entry(id)
+        {
+            let mut nodes = request.snapshot.get_nodes_raw(&[id])?;
+            entry.insert(nodes.pop().unwrap_or(None));
+        }
+        Ok(cache.begin_nodes_by_id.get(&id).cloned().flatten())
+    }
+
+    fn cached_begin_edge(
+        &self,
+        request: &TxnCommitRequest,
+        cache: &mut TxnPlanningCache,
+        id: u64,
+    ) -> Result<Option<EdgeRecord>, EngineError> {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            cache.begin_edges_by_id.entry(id)
+        {
+            let mut edges = request.snapshot.get_edges(&[id])?;
+            entry.insert(edges.pop().unwrap_or(None));
+        }
+        Ok(cache.begin_edges_by_id.get(&id).cloned().flatten())
     }
 
     fn cached_begin_node_key(
@@ -2492,45 +3344,30 @@ impl EngineCore {
         }
     }
 
-    fn incident_edges_for_txn_delete(
+    fn incident_edge_ids_for_txn_delete_limited(
         &self,
         node_id: u64,
-    ) -> Result<Vec<NeighborRecord>, EngineError> {
-        let tombstones = self.collect_tombstones();
-        let deleted_edges = &tombstones.1;
-        let mut results = self
-            .memtable
-            .incident_edges_at(node_id, Direction::Both, None, self.engine_seq);
-        let mut seen_edges: IdSet = results.iter().map(|entry| entry.edge_id).collect();
-
-        for epoch in &self.immutable_epochs {
-            for entry in epoch
-                .memtable
-                .incident_edges_at(node_id, Direction::Both, None, self.engine_seq)
-            {
-                if !seen_edges.insert(entry.edge_id) {
-                    continue;
-                }
-                if deleted_edges.contains(&entry.edge_id) {
-                    continue;
-                }
-                results.push(entry);
+        limit: usize,
+    ) -> Result<Vec<u64>, EngineError> {
+        let ids = self
+            .sources()
+            .edge_ids_by_endpoints_limited(&[node_id], Direction::Both, None, limit)?;
+        #[cfg(debug_assertions)]
+        {
+            if limit == usize::MAX {
+                let active_edge_ids = self
+                    .memtable
+                    .incident_edges_at(node_id, Direction::Both, None, self.engine_seq)
+                    .into_iter()
+                    .map(|entry| entry.edge_id)
+                    .collect::<IdSet>();
+                debug_assert!(
+                    active_edge_ids.iter().all(|edge_id| ids.contains(edge_id)),
+                    "source-list transaction delete helper must include active memtable incident edges"
+                );
             }
         }
-
-        for seg in &self.segments {
-            for entry in seg.neighbors(node_id, Direction::Both, None, 0)? {
-                if !seen_edges.insert(entry.edge_id) {
-                    continue;
-                }
-                if deleted_edges.contains(&entry.edge_id) {
-                    continue;
-                }
-                results.push(entry);
-            }
-        }
-
-        Ok(results)
+        Ok(ids)
     }
 
     fn validate_edge_triple_conflict(
@@ -2612,6 +3449,63 @@ impl EngineCore {
         } else {
             Ok(())
         }
+    }
+
+    fn validate_gql_return_read_set(
+        &self,
+        request: &TxnCommitRequest,
+        state: &PlannedTxnState,
+    ) -> Result<(), EngineError> {
+        let node_ids = request
+            .gql_return_read_set
+            .node_ids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let current_nodes = self.get_nodes_raw(&node_ids)?;
+        for (id, node) in node_ids.into_iter().zip(current_nodes) {
+            if state.deleted_node_ids.contains(&id) {
+                return Err(EngineError::TxnConflict(format!(
+                    "node {id} was deleted before GQL mutation RETURN projection"
+                )));
+            }
+            let Some(node) = node else {
+                return Err(EngineError::TxnConflict(format!(
+                    "node {id} was deleted before GQL mutation RETURN projection"
+                )));
+            };
+            if node.last_write_seq > request.snapshot_seq {
+                return Err(EngineError::TxnConflict(format!(
+                    "node {id} changed after transaction begin"
+                )));
+            }
+        }
+
+        let edge_ids = request
+            .gql_return_read_set
+            .edge_ids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let current_edges = self.get_edges(&edge_ids)?;
+        for (id, edge) in edge_ids.into_iter().zip(current_edges) {
+            if state.deleted_edge_ids.contains(&id) {
+                return Err(EngineError::TxnConflict(format!(
+                    "edge {id} was deleted before GQL mutation RETURN projection"
+                )));
+            }
+            let Some(edge) = edge else {
+                return Err(EngineError::TxnConflict(format!(
+                    "edge {id} was deleted before GQL mutation RETURN projection"
+                )));
+            };
+            if edge.last_write_seq > request.snapshot_seq {
+                return Err(EngineError::TxnConflict(format!(
+                    "edge {id} changed after transaction begin"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn resolve_node_ref_required(

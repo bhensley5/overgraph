@@ -1,7 +1,7 @@
 use overgraph::{
     DatabaseEngine, DbOptions, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
-    EdgeFilterExpr, EdgeInput, EdgeQuery, ExportOptions, GqlParamValue, GqlParams, GqlQueryOptions,
-    GraphBinaryOp, GraphEdgePattern, GraphExpr, GraphNodeField, GraphNodePattern,
+    EdgeFilterExpr, EdgeInput, EdgeQuery, ExportOptions, GqlExecutionOptions, GqlParamValue,
+    GqlParams, GraphBinaryOp, GraphEdgePattern, GraphExpr, GraphNodeField, GraphNodePattern,
     GraphOrderDirection, GraphOrderItem, GraphOutputOptions, GraphPageRequest, GraphParamValue,
     GraphPatternPiece, GraphQueryOptions, GraphReturnItem, GraphReturnProjection, GraphRowQuery,
     HnswConfig, IsConnectedOptions, LabelMatchMode, NeighborOptions, NodeFilterExpr, NodeInput,
@@ -2785,7 +2785,7 @@ fn push_query_scenarios(
                 ),
                 ("source".to_string(), GqlParamValue::UInt(fixture.source_id)),
             ]);
-            let options = GqlQueryOptions::default();
+            let options = GqlExecutionOptions::default();
             let stats = run_bench(iter_cfg, |_i| {
                 fixture
                     .engine

@@ -86,9 +86,12 @@ pub use types::{
     CompactionPhase, CompactionProgress, CompactionStats, ComponentOptions, ComponentScrubFinding,
     DbOptions, DbStats, DegreeOptions, DenseMetric, DenseVector, DenseVectorConfig, Direction,
     EdgeFilterExpr, EdgeInput, EdgeLabelInfo, EdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
-    EdgeView, ExportEdge, ExportOptions, FusionMode, GqlCapSummary, GqlEdge, GqlExecutionStats,
-    GqlExplain, GqlLoweringTarget, GqlNode, GqlParamValue, GqlParams, GqlQueryOptions, GqlResult,
-    GqlRow, GqlRowOperation, GqlSemanticErrorCode, GqlValue, GraphBinaryOp, GraphCapExplain,
+    EdgeView, ExportEdge, ExportOptions, FusionMode, GqlCapSummary, GqlEdge,
+    GqlExecutionCapSummary, GqlExecutionExplain, GqlExecutionMode, GqlExecutionOptions,
+    GqlExecutionResult, GqlExecutionStats, GqlExplain, GqlLoweringTarget, GqlMutationExplain,
+    GqlMutationOperationExplain, GqlMutationReadPrefixExplain, GqlMutationReturnExplain,
+    GqlMutationStats, GqlNode, GqlParamValue, GqlParams, GqlRow, GqlRowOperation,
+    GqlSemanticErrorCode, GqlStatementKind, GqlValue, GraphBinaryOp, GraphCapExplain,
     GraphCursorExplain, GraphEdgeField, GraphEdgePattern, GraphEdgeValue, GraphElementProjection,
     GraphExecutionSummaries, GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
     GraphNodePattern, GraphNodeValue, GraphOptionalGroup, GraphOrderDirection, GraphOrderExplain,
@@ -119,7 +122,7 @@ pub use types::{
 #[doc(hidden)]
 pub fn gql_referenced_param_names(
     query: &str,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<Vec<String>, EngineError> {
     crate::gql::params::referenced_param_names_for_query(query, options)
 }
@@ -195,7 +198,7 @@ mod public_api_boundary_tests {
     }
 
     #[test]
-    fn phase32_graph_row_replacement_names_do_not_use_v2_suffixes() {
+    fn graph_row_replacement_names_do_not_use_v2_suffixes() {
         let paths = rust_source_paths();
         assert_files_do_not_contain(
             &paths,
@@ -216,7 +219,7 @@ mod public_api_boundary_tests {
     }
 
     #[test]
-    fn phase32_old_graph_pattern_public_exports_are_removed() {
+    fn old_graph_pattern_public_exports_are_removed() {
         let lib = source("src/lib.rs");
         let types = source("src/types.rs");
 
@@ -252,7 +255,7 @@ mod public_api_boundary_tests {
     }
 
     #[test]
-    fn phase32_old_graph_pattern_engine_methods_are_removed() {
+    fn old_graph_pattern_engine_methods_are_removed() {
         let engine_query = source("src/engine/query.rs");
         for forbidden in [
             concat!("pub fn ", "query", "_pattern"),

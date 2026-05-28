@@ -3017,6 +3017,8 @@ struct DbRuntime {
     write_publish_pause: Mutex<Option<RuntimePublishPauseHook>>,
     #[cfg(test)]
     read_admission_pause: Mutex<Option<RuntimeReadPauseHook>>,
+    #[cfg(test)]
+    gql_mutation_before_commit_pause: Mutex<Option<RuntimeReadPauseHook>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3176,6 +3178,7 @@ enum CoreWriteRequest {
     },
     TxnCommit {
         request: TxnCommitRequest,
+        return_read_view: bool,
     },
     Prune {
         policy: PrunePolicy,
@@ -3225,6 +3228,7 @@ enum CoreWriteReply {
     OptionEdge(Option<EdgeRecord>),
     PatchResult(PatchResult),
     TxnCommitResult(TxnCommitResult),
+    TxnCommitResultWithReadView(TxnCommitResult, Arc<ReadView>),
     PruneResult(PruneResult),
     Bool(bool),
     NodePropertyIndexInfo(NodePropertyIndexInfo),
@@ -3281,6 +3285,8 @@ impl DbRuntime {
             write_publish_pause: Mutex::new(None),
             #[cfg(test)]
             read_admission_pause: Mutex::new(None),
+            #[cfg(test)]
+            gql_mutation_before_commit_pause: Mutex::new(None),
         }
     }
 
@@ -3345,6 +3351,14 @@ impl DbRuntime {
             let _ = hook.release_rx.recv();
         }
         Ok(RuntimeReadGuard { runtime: self })
+    }
+
+    #[cfg(test)]
+    fn pause_gql_mutation_before_commit_for_test(&self) {
+        if let Some(hook) = self.gql_mutation_before_commit_pause.lock().unwrap().take() {
+            let _ = hook.ready_tx.send(());
+            let _ = hook.release_rx.recv();
+        }
     }
 
     #[cfg(test)]
@@ -3989,9 +4003,25 @@ impl DbRuntime {
         };
         publish_impact = publish_impact.combine(request_publish_impact);
         let publish_result = self.publish_locked(core, publish_impact, true);
+        let return_read_view = matches!(
+            &command.request,
+            CoreWriteRequest::TxnCommit {
+                return_read_view: true,
+                ..
+            }
+        );
+        let read_view = if return_read_view && result.is_ok() && publish_result.is_ok() {
+            Some(Arc::clone(&self.published.load_full().view))
+        } else {
+            None
+        };
         drop(core_guard);
         let result = match (result, publish_result) {
             (Err(err), _) => Err(err),
+            (Ok(CoreWriteReply::TxnCommitResult(result)), Ok(())) if return_read_view => {
+                let view = read_view.expect("published read view captured for txn commit");
+                Ok(CoreWriteReply::TxnCommitResultWithReadView(result, view))
+            }
             (Ok(reply), Ok(())) => Ok(reply),
             (Ok(_), Err(err)) => Err(err),
         };
@@ -4554,6 +4584,13 @@ impl ReadView {
         label_id: u32,
     ) -> Result<Option<EdgeRecord>, EngineError> {
         self.sources().find_edge_by_triple(from, to, label_id)
+    }
+
+    fn get_edges_by_triples_raw(
+        &self,
+        triples: &[(u64, u64, u32)],
+    ) -> Result<Vec<Option<EdgeRecord>>, EngineError> {
+        self.sources().find_edges_by_triples(triples)
     }
 
     fn get_nodes_raw(&self, ids: &[u64]) -> Result<Vec<Option<NodeRecord>>, EngineError> {
@@ -6572,6 +6609,25 @@ impl DatabaseEngine {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         *self.runtime.read_admission_pause.lock().unwrap() = Some(RuntimeReadPauseHook {
+            ready_tx,
+            release_rx,
+        });
+        (ready_rx, release_tx)
+    }
+
+    pub(crate) fn set_gql_mutation_before_commit_pause(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self
+            .runtime
+            .gql_mutation_before_commit_pause
+            .lock()
+            .unwrap() = Some(RuntimeReadPauseHook {
             ready_tx,
             release_rx,
         });

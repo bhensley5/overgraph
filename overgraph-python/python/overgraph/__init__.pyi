@@ -1,6 +1,6 @@
 """Type stubs for the overgraph Python connector."""
 
-from typing import Any, Callable, Mapping, Sequence, TypedDict
+from typing import Any, Callable, Literal, Mapping, Sequence, TypedDict
 
 IntList = list[int] | tuple[int, ...]
 StrList = list[str] | tuple[str, ...]
@@ -419,7 +419,6 @@ class GqlExecutionStats(TypedDict):
     intermediate_bindings: int
     db_hits: int
     elapsed_us: int | None
-    truncated: bool
     warnings: list[str]
 
 class GqlCapSummary(TypedDict):
@@ -432,7 +431,24 @@ class GqlCapSummary(TypedDict):
     max_ast_depth: int
     max_literal_items: int
 
-class GqlExplain(TypedDict):
+class GqlExecutionCapSummary(TypedDict):
+    allow_full_scan: bool
+    max_rows: int
+    max_cursor_bytes: int
+    max_mutation_rows: int
+    max_mutation_ops: int
+    max_query_bytes: int
+    max_param_bytes: int
+    max_ast_depth: int
+    max_literal_items: int
+    max_intermediate_bindings: int
+    max_frontier: int
+    max_path_hops: int
+    max_paths_per_start: int
+    max_order_materialization: int
+    max_skip: int
+
+class GqlReadExplain(TypedDict):
     columns: list[str]
     target: str
     native_plan: dict[str, Any] | None
@@ -443,12 +459,73 @@ class GqlExplain(TypedDict):
     caps: GqlCapSummary
     warnings: list[str]
 
-class GqlResult(TypedDict):
+class GqlMutationReadPrefixExplain(TypedDict):
+    graph_row_target: GqlReadExplain
+    internal_columns: list[str]
+    target_aliases: list[str]
+    expression_columns: int
+
+class GqlMutationOperationExplain(TypedDict):
+    op: str
+    target_alias: str | None
+    row_multiplicity: str
+    detail: str
+
+class GqlMutationReturnExplain(TypedDict):
+    columns: list[str]
+    order_items: int
+    skip: int
+    limit: int | None
+    post_commit_hydration: str
+
+class GqlMutationExplain(TypedDict):
+    read_prefix: GqlMutationReadPrefixExplain | None
+    operations: list[GqlMutationOperationExplain]
+    return_plan: GqlMutationReturnExplain | None
+    would_create_node_labels: list[str]
+    would_create_edge_labels: list[str]
+    uses_transaction_snapshot: bool
+    uses_write_txn: bool
+    replacement_adapters: bool
+    atomic_commit: bool
+
+class GqlExecutionExplain(TypedDict):
+    kind: Literal["query", "mutation"]
+    columns: list[str]
+    read: GqlReadExplain | None
+    mutation: GqlMutationExplain | None
+    caps: GqlExecutionCapSummary
+    warnings: list[str]
+    notes: list[str]
+
+class GqlMutationStats(TypedDict):
+    rows_matched: int
+    mutation_rows: int
+    mutation_ops: int
+    nodes_created: int
+    nodes_updated: int
+    nodes_deleted: int
+    edges_created: int
+    edges_updated: int
+    edges_deleted: int
+    labels_added: int
+    labels_removed: int
+    properties_set: int
+    properties_removed: int
+    skipped_null_targets: int
+    duplicate_targets: int
+    db_hits: int
+    elapsed_us: int | None
+    warnings: list[str]
+
+class GqlExecutionResult(TypedDict):
+    kind: Literal["query", "mutation"]
     columns: list[str]
     rows: list[dict[str, GqlValue]] | list[list[GqlValue]]
     next_cursor: str | None
     stats: GqlExecutionStats
-    plan: GqlExplain | None
+    mutation_stats: GqlMutationStats | None
+    plan: GqlExecutionExplain | None
 
 # ============================================================
 # Exception
@@ -540,11 +617,18 @@ class OverGraph:
         query: str,
         params: GqlParams | None = None,
         *,
+        mode: Literal["auto", "read_only"] = "auto",
         allow_full_scan: bool = False,
         max_rows: int | None = None,
         cursor: str | None = None,
         max_cursor_bytes: int | None = None,
+        max_mutation_rows: int | None = None,
+        max_mutation_ops: int | None = None,
         max_intermediate_bindings: int | None = None,
+        max_frontier: int | None = None,
+        max_path_hops: int | None = None,
+        max_paths_per_start: int | None = None,
+        max_order_materialization: int | None = None,
         max_skip: int | None = None,
         max_query_bytes: int | None = None,
         max_param_bytes: int | None = None,
@@ -554,17 +638,24 @@ class OverGraph:
         profile: bool = False,
         compact_rows: bool = False,
         include_vectors: bool = False,
-    ) -> GqlResult: ...
+    ) -> GqlExecutionResult: ...
     def explain_gql(
         self,
         query: str,
         params: GqlParams | None = None,
         *,
+        mode: Literal["auto", "read_only"] = "auto",
         allow_full_scan: bool = False,
         max_rows: int | None = None,
         cursor: str | None = None,
         max_cursor_bytes: int | None = None,
+        max_mutation_rows: int | None = None,
+        max_mutation_ops: int | None = None,
         max_intermediate_bindings: int | None = None,
+        max_frontier: int | None = None,
+        max_path_hops: int | None = None,
+        max_paths_per_start: int | None = None,
+        max_order_materialization: int | None = None,
         max_skip: int | None = None,
         max_query_bytes: int | None = None,
         max_param_bytes: int | None = None,
@@ -574,7 +665,7 @@ class OverGraph:
         profile: bool = False,
         compact_rows: bool = False,
         include_vectors: bool = False,
-    ) -> GqlExplain: ...
+    ) -> GqlExecutionExplain: ...
     def ensure_node_property_index(self, label: str, prop_key: str, kind: str) -> NodePropertyIndexInfo: ...
     def drop_node_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
     def list_node_property_indexes(self) -> list[NodePropertyIndexInfo]: ...
@@ -955,14 +1046,56 @@ class AsyncOverGraph:
         self,
         query: str,
         params: GqlParams | None = None,
-        **options: Any,
-    ) -> GqlResult: ...
+        *,
+        mode: Literal["auto", "read_only"] = "auto",
+        allow_full_scan: bool = False,
+        max_rows: int | None = None,
+        cursor: str | None = None,
+        max_cursor_bytes: int | None = None,
+        max_mutation_rows: int | None = None,
+        max_mutation_ops: int | None = None,
+        max_intermediate_bindings: int | None = None,
+        max_frontier: int | None = None,
+        max_path_hops: int | None = None,
+        max_paths_per_start: int | None = None,
+        max_order_materialization: int | None = None,
+        max_skip: int | None = None,
+        max_query_bytes: int | None = None,
+        max_param_bytes: int | None = None,
+        max_ast_depth: int | None = None,
+        max_literal_items: int | None = None,
+        include_plan: bool = False,
+        profile: bool = False,
+        compact_rows: bool = False,
+        include_vectors: bool = False,
+    ) -> GqlExecutionResult: ...
     async def explain_gql(
         self,
         query: str,
         params: GqlParams | None = None,
-        **options: Any,
-    ) -> GqlExplain: ...
+        *,
+        mode: Literal["auto", "read_only"] = "auto",
+        allow_full_scan: bool = False,
+        max_rows: int | None = None,
+        cursor: str | None = None,
+        max_cursor_bytes: int | None = None,
+        max_mutation_rows: int | None = None,
+        max_mutation_ops: int | None = None,
+        max_intermediate_bindings: int | None = None,
+        max_frontier: int | None = None,
+        max_path_hops: int | None = None,
+        max_paths_per_start: int | None = None,
+        max_order_materialization: int | None = None,
+        max_skip: int | None = None,
+        max_query_bytes: int | None = None,
+        max_param_bytes: int | None = None,
+        max_ast_depth: int | None = None,
+        max_literal_items: int | None = None,
+        include_plan: bool = False,
+        profile: bool = False,
+        compact_rows: bool = False,
+        include_vectors: bool = False,
+    ) -> GqlExecutionExplain: ...
     async def ensure_node_property_index(self, label: str, prop_key: str, kind: str) -> NodePropertyIndexInfo: ...
     async def drop_node_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
     async def list_node_property_indexes(self) -> list[NodePropertyIndexInfo]: ...

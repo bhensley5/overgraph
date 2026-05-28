@@ -94,7 +94,8 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
     - [explain_graph_rows](#explain_graph_rows)
   - [GQL Beta](#gql-beta)
     - [Overview](#overview)
-    - [Supported Syntax](#supported-syntax)
+    - [Read Syntax](#read-syntax)
+    - [Mutation Syntax](#mutation-syntax)
     - [Method Reference](#method-reference)
     - [Parameters and Options](#parameters-and-options)
     - [Results and Row Formats](#results-and-row-formats)
@@ -2346,7 +2347,7 @@ Node IDs matching the time range. Uses the timestamp index.
 
 Native query APIs combine explicit IDs, label-scoped keys, label/edge-label constraints, property filters, timestamp filters, and
 row-producing graph patterns through normal function-call and object APIs. GQL Beta, documented below, adds a
-read-only query-string API over the same graph-row substrate.
+query-string API for graph reads and mutations over the same native substrates.
 
 Native query APIs return matching IDs, hydrated records, or graph-row results with explicit columns,
 rows, optional path values, cursors, stats, and explain output.
@@ -2930,33 +2931,36 @@ Node.js and Python async APIs expose graph-row query and explain methods through
 
 #### Overview
 
-**GQL Beta** is OverGraph's read-only GQL/Cypher-style query-string interface. It is for application
-code that is easier to read as a query string than as a native request object, while still staying
-inside OverGraph's embedded Rust engine.
+**GQL Beta** is OverGraph's GQL/Cypher-style query language for graph reads and writes, running in
+OverGraph's embedded Rust engine.
 
-GQL Beta is not a second execution engine. The Rust API parses, binds, lowers, plans, and executes
-each query through the same graph-row substrate as [`query_graph_rows`](#query_graph_rows). Node.js
-and Python connectors call that Rust API directly; they do not reimplement parser, lowering,
-planning, execution, cursor handling, optional semantics, or path value conversion.
+Read statements lower into the same graph-row substrate as
+[`query_graph_rows`](#query_graph_rows). Mutation statements lower into native write transactions
+and commit through `WriteTxn` / `TxnIntent` plus crate-private replacement adapters where by-ID
+updates are required. Node.js and Python connectors call the Rust API directly; they do not
+reimplement parsing, lowering, planning, execution, cursor handling, optional semantics, mutation
+semantics, or path value conversion.
 
 What GQL Beta gives you:
 
-- familiar `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `ORDER BY`, `SKIP` / `OFFSET`, and `LIMIT` query strings
+- `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `ORDER BY`, `SKIP` / `OFFSET`, and `LIMIT` query strings
 - row-shaped graph reads over required patterns, optional groups, and bounded variable-length paths
+- keyed mutations: `CREATE`, `SET`, `REMOVE`, `DELETE r`, and `DETACH DELETE n`
+- mutation `RETURN` for `CREATE`, `SET`, and `REMOVE`
+- mutation stats and unified query/mutation result shapes
 - scalar values, node values, edge values, path values, lists, maps, bytes, and nulls
-- params, full-scan opt-in, caps, explain/profile, warnings, and stats
-- final-row continuation cursors
+- params, full-scan opt-in, caps, ReadOnly mode, explain/profile, warnings, and stats
+- read continuation cursors
 - vector omission by default, with explicit opt-in when returning node values
 - Rust, Node.js, and Python parity over the same Rust parser, binder, lowerer, planner, and executor
 
-The GQL Beta supported subset is intentionally bounded. It is read-only and not full ISO GQL or
-full Cypher. Unsupported features are listed in
-[Not Yet Supported In GQL Beta](#not-yet-supported-in-gql-beta). A compact syntax companion is also
+Features outside the current surface are listed in
+[Not Yet Supported In GQL Beta](#not-yet-supported-in-gql-beta). A compact syntax companion is
 available in [GQL Beta](gql-subset.md).
 
-#### Supported Syntax
+#### Read Syntax
 
-Supported clause order:
+Read clause order:
 
 ```gql
 MATCH <pattern> [, <pattern>...] [WHERE <predicate>]
@@ -2970,11 +2974,10 @@ LIMIT <integer-or-param>
 
 `WHERE`, `ORDER BY`, `SKIP` / `OFFSET`, and `LIMIT` are optional. Each required or optional match
 clause can have its own `WHERE`. `OPTIONAL MATCH` clauses follow an initial required `MATCH`.
-`SKIP` and `OFFSET` are synonyms in this beta subset; using both in one
-query is rejected. `LIMIT 0` validates the query and returns an empty result without running
-graph-row execution.
+`SKIP` and `OFFSET` are synonyms; using both in one query is rejected. `LIMIT 0` validates the
+query and returns an empty result without running graph-row execution.
 
-Supported pattern shapes:
+Pattern shapes:
 
 | Shape | Example |
 |-------|---------|
@@ -2994,7 +2997,7 @@ hop cap. Variable-length paths are relationship-simple: one path cannot reuse th
 Multi-hop relationship-list aliases are not supported; return the path alias and inspect
 `edge_ids`.
 
-Supported expressions:
+Expressions:
 
 | Expression | Example |
 |------------|---------|
@@ -3015,7 +3018,7 @@ Supported expressions:
 | Membership | `IN` |
 | Return all bound aliases | `RETURN *` |
 
-Supported functions:
+Functions:
 
 | Function | Valid argument |
 |----------|----------------|
@@ -3036,28 +3039,106 @@ path values are orderable. Nulls sort last. Lists, maps, and non-finite floats a
 Edge ID and edge-label metadata use `id(r)` and `type(r)`. Dot access such as `r.id` and
 `r.label` reads ordinary edge properties with those names when present.
 
+#### Mutation Syntax
+
+Mutation clause order:
+
+```gql
+MATCH <pattern> [WHERE <predicate>]
+OPTIONAL MATCH <pattern> [WHERE <predicate>]
+CREATE <pattern> [, <pattern>...]
+SET <assignment>
+REMOVE <target>
+DELETE <edge-alias>
+DETACH DELETE <node-alias>
+RETURN <items>
+ORDER BY <order-expression> [ASC|DESC], ...
+SKIP <integer-or-param>
+OFFSET <integer-or-param>
+LIMIT <integer-or-param>
+```
+
+Read prefixes are optional for create-only statements, but all `MATCH` / `OPTIONAL MATCH` clauses
+must appear before the first mutation clause. For mutation read prefixes, use repeated `MATCH`
+clauses instead of comma-separated pattern lists. GQL Beta does not support read-after-write
+pipelines, `WITH`, `UNWIND`, subqueries, or interleaved `MATCH CREATE MATCH` forms.
+
+Mutation forms:
+
+| Form | Example | Notes |
+|------|---------|-------|
+| Create node | `CREATE (n:Person {key: 'ada', name: 'Ada'})` | A created node needs at least one label and a string `key`. |
+| Create edge | `MATCH (a:Person) WHERE a.key = 'a' MATCH (b:Person) WHERE b.key = 'b' CREATE (a)-[r:KNOWS {since: 2026}]->(b)` | The edge needs exactly one relationship label. |
+| Set property | `MATCH (n:Person) WHERE n.key = 'ada' SET n.status = 'active'` | `null` removes the property. |
+| Merge property map | `MATCH (n:Person) WHERE n.key = 'ada' SET n += $props` | The right side must be a map. Null map values remove properties. |
+| Add node label | `MATCH (n:Person) WHERE n.key = 'ada' SET n:Engineer` | Label/key conflicts reject the whole statement. |
+| Remove property | `MATCH (n:Person) WHERE n.key = 'ada' REMOVE n.status` | Missing properties are no-ops. |
+| Remove node label | `MATCH (n:Person) WHERE n.key = 'ada' REMOVE n:Engineer` | Removing the last live label is rejected. |
+| Delete edge | `MATCH (a)-[r:KNOWS]->(b) DELETE r` | Node deletion requires `DETACH DELETE`. |
+| Detach delete node | `MATCH (n:Person) WHERE n.key = 'ada' DETACH DELETE n` | Incident edges are deleted through transaction cascade planning. |
+
+`CREATE` is strict. It fails if a node `(label, key)` membership already exists in the transaction
+snapshot or earlier staged creates. When `edge_uniqueness = true`, edge `CREATE` also fails if the
+same `(from, to, label)` triple already exists. With `edge_uniqueness = false`, parallel edge
+creates are allowed.
+
+Optional-null mutation targets are no-ops. Duplicate updates to the same target are deterministic:
+later mutation input rows win for updates, and duplicate deletes are idempotent.
+
+Mutation statements commit zero or one transaction. Parse, semantic, param, expression, cap,
+strict-create, staging, transaction conflict, and commit failures do not publish partial writes.
+
+##### Mutation RETURN
+
+`CREATE`, `SET`, and `REMOVE` may include `RETURN`, `ORDER BY`, `SKIP` / `OFFSET`, and `LIMIT`.
+`DELETE` and `DETACH DELETE` reject `RETURN` in Phase 33.
+
+Mutation row operations affect returned rows only. The mutation clauses still apply to every input
+row produced by the read prefix. For example, `RETURN ... LIMIT 0` performs the mutation and returns
+zero rows. Mutation statements never emit cursors.
+
+Mutation `RETURN` supports:
+
+- created and mutated aliases
+- non-mutated read-prefix aliases
+- path aliases captured by the read prefix
+- compact rows in connectors
+- vector inclusion for returned node values when `include_vectors` / `includeVectors` is true
+- `ORDER BY`, `SKIP` / `OFFSET`, and `LIMIT` over prevalidated return expressions
+
+Known Phase 33 limitation from `QPX-019`: mutation `RETURN ORDER BY` rejects keys whose final value
+cannot be proven before commit, including commit-assigned created IDs/timestamps, created-edge
+endpoint metadata, and same-mutation volatile `updated_at`. This avoids speculative ID/timestamp
+reservation and keeps failed writes leak-free.
+
 #### Method Reference
 
-| Language | Query | Explain |
-|----------|-------|---------|
-| Rust | `DatabaseEngine::execute_gql(query, params, options)` | `DatabaseEngine::explain_gql(query, params, options)` |
-| Node.js | `db.executeGql(query, params?, options?)` | `db.explainGql(query, params?, options?)` |
-| Node.js async | `db.executeGqlAsync(query, params?, options?)` | `db.explainGqlAsync(query, params?, options?)` |
-| Python | `db.execute_gql(query, params=None, **options)` | `db.explain_gql(query, params=None, **options)` |
-| Python async | `await db.execute_gql(query, params=None, **options)` | `await db.explain_gql(query, params=None, **options)` |
+| Language | Execute | Explain |
+|----------|---------|---------|
+| Rust | `DatabaseEngine::execute_gql(statement, params, options)` | `DatabaseEngine::explain_gql(statement, params, options)` |
+| Node.js | `db.executeGql(statement, params?, options?)` | `db.explainGql(statement, params?, options?)` |
+| Node.js async | `db.executeGqlAsync(statement, params?, options?)` | `db.explainGqlAsync(statement, params?, options?)` |
+| Python | `db.execute_gql(statement, params=None, **options)` | `db.explain_gql(statement, params=None, **options)` |
+| Python async | `await db.execute_gql(statement, params=None, **options)` | `await db.explain_gql(statement, params=None, **options)` |
 
 **Rust**
 ```rust
 let result = db.execute_gql(
     "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10",
     &GqlParams::new(),
-    &GqlQueryOptions::default(),
+    &GqlExecutionOptions::default(),
+)?;
+
+let created = db.execute_gql(
+    "CREATE (n:Person {key: 'ada', name: 'Ada'}) RETURN n.name AS name",
+    &GqlParams::new(),
+    &GqlExecutionOptions::default(),
 )?;
 
 let explain = db.explain_gql(
     "MATCH (n:Person) RETURN n.name AS name",
     &GqlParams::new(),
-    &GqlQueryOptions::default(),
+    &GqlExecutionOptions::default(),
 )?;
 ```
 
@@ -3069,6 +3150,10 @@ const result = db.executeGql(
 
 const asyncResult = await db.executeGqlAsync(
   'MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10'
+);
+
+const created = db.executeGql(
+  "CREATE (n:Person {key: 'ada', name: 'Ada'}) RETURN n.name AS name"
 );
 
 const explain = db.explainGql(
@@ -3086,6 +3171,10 @@ async_result = await async_db.execute_gql(
     "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name LIMIT 10"
 )
 
+created = db.execute_gql(
+    "CREATE (n:Person {key: 'ada', name: 'Ada'}) RETURN n.name AS name"
+)
+
 explain = db.explain_gql(
     "MATCH (n:Person) RETURN n.name AS name"
 )
@@ -3095,28 +3184,35 @@ explain = db.explain_gql(
 
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
-| query | `&str` | `string` | `str` | Yes | - | GQL query text. Must be one supported read-only statement. |
-| params | `&GqlParams` | `GqlParams \| null` | `GqlParams \| None` | No | empty | Named params referenced as `$name` in the query. |
-| options | `&GqlQueryOptions` | `GqlQueryOptions` | keyword options | No | default options | Execution, cap, explain/profile, row-format, and vector options. |
+| statement | `&str` | `string` | `str` | Yes | - | One GQL Beta read or mutation statement. |
+| params | `&GqlParams` | `GqlParams \| null` | `GqlParams \| None` | No | empty | Named params referenced as `$name` in the statement. |
+| options | `&GqlExecutionOptions` | `GqlExecutionOptions \| null` | keyword options | No | default options | Execution mode, caps, explain/profile, row-format, cursor, and vector options. |
 
 Option fields:
 
 | Option | Rust | Node.js | Python | Default | Description |
 |--------|------|---------|--------|---------|-------------|
+| Mode | `mode` | `mode` | `mode` | `Auto` / `"auto"` | `"auto"` permits reads and mutations. `"readOnly"` / `"read_only"` rejects mutation statements before write staging. |
 | Full-scan opt-in | `allow_full_scan` | `allowFullScan` | `allow_full_scan` | `false` | Allows legal broad node/edge scans when no bounded native anchor exists. |
-| Result row cap | `max_rows` | `maxRows` | `max_rows` | `10000` | Maximum returned rows after row operations. Also protects unbounded result materialization. |
-| Cursor | `cursor` | `cursor` | `cursor` | `None` / `null` | Continuation token from `next_cursor` / `nextCursor`. |
-| Cursor byte cap | `max_cursor_bytes` | `maxCursorBytes` | `max_cursor_bytes` | `16384` | Maximum accepted or emitted cursor token size. |
-| Intermediate cap | `max_intermediate_bindings` | `maxIntermediateBindings` | `max_intermediate_bindings` | `65536` | Maximum native/intermediate row bindings held while executing the query. |
-| Skip cap | `max_skip` | `maxSkip` | `max_skip` | `100000` | Maximum allowed `SKIP` / `OFFSET` value. |
-| Include plan | `include_plan` | `includePlan` | `include_plan` | `false` | Attaches the same explain payload to `GqlResult.plan`. |
-| Profile | `profile` | `profile` | `profile` | `false` | Adds elapsed time and best-effort work counters to stats. |
-| Compact rows | `compact_rows` | `compactRows` | `compact_rows` | `false` | Rust rows are already positional. In connectors, returns row arrays instead of row objects. Does not change execution. |
-| Include vectors | `include_vectors` | `includeVectors` | `include_vectors` | `false` | Includes dense/sparse vectors when returning node element values. |
+| Result row cap | `max_rows` | `maxRows` | `max_rows` | `10000` | Maximum returned rows after row operations. Mutations do not page with cursors, so mutation `RETURN` must fit this cap. |
+| Cursor | `cursor` | `cursor` | `cursor` | `None` / `null` | Read continuation token from `next_cursor` / `nextCursor`. Mutation statements reject cursors. |
+| Cursor byte cap | `max_cursor_bytes` | `maxCursorBytes` | `max_cursor_bytes` | `16384` | Maximum accepted or emitted read cursor token size. |
+| Mutation row cap | `max_mutation_rows` | `maxMutationRows` | `max_mutation_rows` | `10000` | Maximum input rows a mutation may write from. |
+| Mutation op cap | `max_mutation_ops` | `maxMutationOps` | `max_mutation_ops` | `50000` | Maximum staged logical mutation operations before commit, including cascaded deletes. |
 | Query byte cap | `max_query_bytes` | `maxQueryBytes` | `max_query_bytes` | `1048576` | Maximum GQL source text bytes accepted by the parser. |
 | Param byte cap | `max_param_bytes` | `maxParamBytes` | `max_param_bytes` | `1048576` | Maximum referenced param string/bytes/map-key bytes, both per value/key and total across referenced params. |
 | AST/param depth cap | `max_ast_depth` | `maxAstDepth` | `max_ast_depth` | `256` | Maximum parser AST depth and referenced runtime list/map nesting depth. |
 | Literal/param item cap | `max_literal_items` | `maxLiteralItems` | `max_literal_items` | `10000` | Maximum list/map literal items, per referenced list/map container, and total referenced list/map items. |
+| Intermediate cap | `max_intermediate_bindings` | `maxIntermediateBindings` | `max_intermediate_bindings` | `65536` | Maximum native/intermediate row bindings held while executing reads or mutation read prefixes. |
+| Frontier cap | `max_frontier` | `maxFrontier` | `max_frontier` | `65536` | Maximum graph-row frontier expansion size. |
+| Path hop cap | `max_path_hops` | `maxPathHops` | `max_path_hops` | `16` | Maximum finite upper bound for variable-length paths. |
+| Paths per start cap | `max_paths_per_start` | `maxPathsPerStart` | `max_paths_per_start` | `4096` | Maximum variable-length paths retained per start row. |
+| Order materialization cap | `max_order_materialization` | `maxOrderMaterialization` | `max_order_materialization` | `65536` | Maximum rows/materialized order keys for ordered reads and mutation returns. |
+| Skip cap | `max_skip` | `maxSkip` | `max_skip` | `100000` | Maximum allowed `SKIP` / `OFFSET` value. |
+| Include plan | `include_plan` | `includePlan` | `include_plan` | `false` | Attaches the same unified explain payload to `GqlExecutionResult.plan`. |
+| Profile | `profile` | `profile` | `profile` | `false` | Adds elapsed time and best-effort work counters to stats. |
+| Compact rows | `compact_rows` | `compactRows` | `compact_rows` | `false` | Rust rows are already positional. In connectors, returns row arrays instead of row objects. Does not change execution. |
+| Include vectors | `include_vectors` | `includeVectors` | `include_vectors` | `false` | Includes dense/sparse vectors when returning node element values. |
 
 `compactRows` / `compact_rows` is connector serialization only. It does not change parsing, lowering,
 planning, selected fields, vector policy, ordering, stats, caps, warnings, or plan truth.
@@ -3126,12 +3222,14 @@ planning, selected fields, vector policy, ordering, stats, caps, warnings, or pl
 Rust returns positional rows:
 
 ```rust
-GqlResult {
+GqlExecutionResult {
+    kind: GqlStatementKind::Query, // or Mutation
     columns: Vec<String>,
     rows: Vec<GqlRow>,          // each GqlRow has values: Vec<GqlValue>
     next_cursor: Option<String>,
     stats: GqlExecutionStats,
-    plan: Option<GqlExplain>,
+    mutation_stats: Option<GqlMutationStats>,
+    plan: Option<GqlExecutionExplain>,
 }
 ```
 
@@ -3139,6 +3237,7 @@ Node.js and Python return object rows by default:
 
 ```javascript
 {
+  kind: 'query',
   columns: ['name', 'rank'],
   rows: [
     { name: 'Ada', rank: 2 },
@@ -3152,9 +3251,9 @@ Node.js and Python return object rows by default:
     intermediateBindings: 2,
     dbHits: 2,
     elapsedUs: null,
-    truncated: false,
     warnings: [],
   },
+  mutationStats: null,
   plan: null,
 }
 ```
@@ -3181,7 +3280,21 @@ unambiguous: if multiple `RETURN` items use the same alias, clauses such as `ORD
 When a result has another page, it includes `next_cursor` / `nextCursor`. Pass that value as the
 next call's `cursor` option with the same logical query and params. GQL cursors are continuation
 tokens over final logical result rows and validate the normalized graph-row fingerprint. They are
-not pinned storage snapshots across pages.
+not pinned storage snapshots across pages. Mutation statements reject `cursor` and always return
+`next_cursor` / `nextCursor` as null.
+
+Mutation results use the same row shapes and include `mutation_stats` / `mutationStats`:
+
+```javascript
+const result = db.executeGql(
+  "MATCH (n:Person) WHERE n.key = 'ada' SET n.status = 'active' RETURN n.key AS key, n.status AS status"
+);
+
+console.log(result.kind);                    // 'mutation'
+console.log(result.nextCursor);              // null
+console.log(result.mutationStats.nodesUpdated);
+console.log(result.rows[0].status);
+```
 
 #### Nodes, Edges, Values, and Vectors
 
@@ -3271,7 +3384,7 @@ Only params referenced by the query are resource-validated. Referenced list/map 
 by `max_ast_depth` and `max_literal_items`; referenced string, bytes, and map-key payload bytes are
 bounded by `max_param_bytes`. Extra unused params are ignored by the GQL engine.
 
-Supported param values:
+Param values:
 
 | Shape | Node.js | Python | Rust |
 |-------|---------|--------|------|
@@ -3309,10 +3422,10 @@ let params = GqlParams::from([
     ("minRank".to_string(), GqlParamValue::Int(2)),
 ]);
 
-let options = GqlQueryOptions {
+let options = GqlExecutionOptions {
     include_plan: true,
     profile: true,
-    ..GqlQueryOptions::default()
+    ..GqlExecutionOptions::default()
 };
 
 let result = db.execute_gql(
@@ -3324,22 +3437,51 @@ let result = db.execute_gql(
 
 #### Explain, Profile, and Stats
 
-`explain_gql` / `explainGql` validates, binds, lowers, and plans the query without
-executing rows.
+`explain_gql` / `explainGql` validates, binds, lowers, and plans the statement without executing
+read rows or mutating data. In `Auto` mode, mutation explain is side-effect safe: it does not open,
+stage, or commit a write transaction, allocate IDs, create label tokens, append WAL records, publish
+snapshots, enqueue index work, or mutate memtables. In `ReadOnly` mode, mutation statements are
+rejected.
 
 Explain result fields:
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
+| Kind | `kind` | `kind` | `kind` | `Query` / `Mutation`, or `"query"` / `"mutation"` in connectors. |
 | Columns | `columns` | `columns` | `columns` | Output column names after `RETURN` expansion and aliases. |
-| Target | `target` | `target` | `target` | Current Phase 32 GQL lowering returns `graph_row_query`. |
-| Native plan | `native_plan` | `nativePlan` | `native_plan` | Currently null for the graph-row target. Graph-row plan details are summarized in `projection` and warnings. |
-| Pushed down | `pushed_down` | `pushedDown` | `pushed_down` | Predicates represented in the native target. |
-| Residual | `residual` | `residual` | `residual` | Predicates evaluated after native execution. |
-| Projection | `projection` | `projection` | `projection` | Output/runtime projection needs plus graph-row plan, row-op, order, cursor, cap, and note summaries. |
-| Row ops | `row_ops` | `rowOps` | `row_ops` | `residual_filter`, `sort`, `skip`, `limit`, `projection`. |
-| Caps | `caps` | `caps` | `caps` | Effective cap settings for the query. |
+| Read explain | `read` | `read` | `read` | Nested read-plan payload for read statements or mutation read prefixes. |
+| Mutation explain | `mutation` | `mutation` | `mutation` | Nested mutation plan payload for mutation statements. |
+| Caps | `caps` | `caps` | `caps` | Effective execution caps. |
 | Warnings | `warnings` | `warnings` | `warnings` | GQL/native planning warnings. |
+| Notes | `notes` | `notes` | `notes` | Human-readable execution/planning notes. |
+
+Nested read explain fields:
+
+| Field | Node.js | Python | Description |
+|-------|---------|--------|-------------|
+| `columns` | `columns` | `columns` | Output columns for the read target. |
+| `target` | `target` | `target` | Current graph-row lowering returns `graph_row_query`. |
+| `nativePlan` / `native_plan` | `nativePlan` | `native_plan` | Null for graph-row target; details are summarized in projection/warnings. |
+| `pushedDown` / `pushed_down` | `pushedDown` | `pushed_down` | Predicates represented in native target planning. |
+| `residual` | `residual` | `residual` | Predicates evaluated after native execution. |
+| `projection` | `projection` | `projection` | Projection, graph-row plan, row-op, order, cursor, cap, and note summaries. |
+| `rowOps` / `row_ops` | `rowOps` | `row_ops` | `residual_filter`, `sort`, `skip`, `limit`, `projection`. |
+| `caps` | `caps` | `caps` | Effective read cap summary. |
+| `warnings` | `warnings` | `warnings` | Read planning warnings. |
+
+Nested mutation explain fields:
+
+| Field | Node.js | Python | Description |
+|-------|---------|--------|-------------|
+| `readPrefix` / `read_prefix` | `readPrefix` | `read_prefix` | Planned graph-row read prefix, if present. |
+| `operations` | `operations` | `operations` | Mutation operation summaries with op, target alias, row multiplicity, and details. |
+| `returnPlan` / `return_plan` | `returnPlan` | `return_plan` | Mutation `RETURN` columns, order item count, skip, limit, and post-commit hydration summary. |
+| `wouldCreateNodeLabels` / `would_create_node_labels` | `wouldCreateNodeLabels` | `would_create_node_labels` | Node labels that could be created on execution. |
+| `wouldCreateEdgeLabels` / `would_create_edge_labels` | `wouldCreateEdgeLabels` | `would_create_edge_labels` | Edge labels that could be created on execution. |
+| `usesTransactionSnapshot` / `uses_transaction_snapshot` | `usesTransactionSnapshot` | `uses_transaction_snapshot` | True for mutation planning over the write transaction snapshot. |
+| `usesWriteTxn` / `uses_write_txn` | `usesWriteTxn` | `uses_write_txn` | True for executable mutations. |
+| `replacementAdapters` / `replacement_adapters` | `replacementAdapters` | `replacement_adapters` | True when SET/REMOVE may use crate-private by-ID replacement adapters. |
+| `atomicCommit` / `atomic_commit` | `atomicCommit` | `atomic_commit` | True when the plan commits as one transaction. |
 
 `includePlan` / `include_plan` attaches that same explain payload to executed results:
 
@@ -3353,8 +3495,9 @@ const result = db.executeGql(
   { includePlan: true, profile: true }
 );
 
-console.log(result.plan.target);       // 'graph_row_query'
-console.log(result.plan.rowOps);       // e.g. ['sort', 'limit', 'projection']
+console.log(result.plan.kind);         // 'query'
+console.log(result.plan.read.target);  // 'graph_row_query'
+console.log(result.plan.read.rowOps);  // e.g. ['sort', 'limit', 'projection']
 console.log(result.stats.elapsedUs);   // populated when profile is true
 ```
 
@@ -3368,8 +3511,30 @@ Stats fields:
 | Intermediate bindings | `intermediate_bindings` | `intermediateBindings` | `intermediate_bindings` | Maximum/representative intermediate row count held by execution. |
 | Work counter | `db_hits` | `dbHits` | `db_hits` | Best-effort profile work units, not a storage IO contract. |
 | Elapsed time | `elapsed_us` | `elapsedUs` | `elapsed_us` | Populated only when profile is true. |
-| Truncated | `truncated` | `truncated` | `truncated` | True when a safety cap or native cap truncated execution. |
 | Warnings | `warnings` | `warnings` | `warnings` | Cap, ordering, full-scan, and planning warnings. |
+
+Mutation stats fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Rows matched | `rows_matched` | `rowsMatched` | `rows_matched` | Read-prefix rows observed by the mutation. |
+| Mutation rows | `mutation_rows` | `mutationRows` | `mutation_rows` | Rows that contributed mutation work. |
+| Mutation ops | `mutation_ops` | `mutationOps` | `mutation_ops` | Logical mutation operations staged, including cascades. |
+| Nodes created | `nodes_created` | `nodesCreated` | `nodes_created` | Created nodes. |
+| Nodes updated | `nodes_updated` | `nodesUpdated` | `nodes_updated` | Updated nodes after coalescing. |
+| Nodes deleted | `nodes_deleted` | `nodesDeleted` | `nodes_deleted` | Deleted nodes. |
+| Edges created | `edges_created` | `edgesCreated` | `edges_created` | Created edges. |
+| Edges updated | `edges_updated` | `edgesUpdated` | `edges_updated` | Updated edges after coalescing. |
+| Edges deleted | `edges_deleted` | `edgesDeleted` | `edges_deleted` | Direct and cascaded deleted edges. |
+| Labels added | `labels_added` | `labelsAdded` | `labels_added` | Node labels added. |
+| Labels removed | `labels_removed` | `labelsRemoved` | `labels_removed` | Node labels removed. |
+| Properties set | `properties_set` | `propertiesSet` | `properties_set` | Properties or metadata fields set. |
+| Properties removed | `properties_removed` | `propertiesRemoved` | `properties_removed` | Properties removed. |
+| Skipped null targets | `skipped_null_targets` | `skippedNullTargets` | `skipped_null_targets` | Optional-null targets skipped without writes. |
+| Duplicate targets | `duplicate_targets` | `duplicateTargets` | `duplicate_targets` | Duplicate writes/deletes coalesced or deduped. |
+| Work counter | `db_hits` | `dbHits` | `db_hits` | Best-effort profile work units, not a storage IO contract. |
+| Elapsed time | `elapsed_us` | `elapsedUs` | `elapsed_us` | Populated only when profile is true. |
+| Warnings | `warnings` | `warnings` | `warnings` | Mutation planning/execution warnings. |
 
 Full scans are rejected unless explicitly allowed:
 
@@ -3384,7 +3549,72 @@ const broad = db.executeGql(
 );
 ```
 
+The same full-scan rule applies to mutation read prefixes. For example,
+`MATCH (n) SET n.seen = true` requires `allowFullScan: true` / `allow_full_scan=True`.
+
+ReadOnly mode rejects mutation statements before write staging:
+
+```javascript
+db.executeGql(
+  "CREATE (n:Person {key: 'blocked'})",
+  null,
+  { mode: 'readOnly' }
+);
+// throws: ReadOnly violation
+```
+
+Mutation cursors are rejected after statement classification and before ReadOnly policy checks,
+transaction opening, staging, or mutation explain planning:
+
+```javascript
+db.executeGql(
+  "CREATE (n:Person {key: 'bad-cursor'})",
+  null,
+  { cursor: 'opaque-read-cursor' }
+);
+// throws: GQL mutation statements do not accept cursors
+```
+
 #### Examples
+
+GQL create mutation:
+
+```javascript
+const created = db.executeGql(
+  `CREATE (p:Person {key: $key, name: $name, status: 'active'})
+   RETURN p.name AS name`,
+  { key: 'ada', name: 'Ada' }
+);
+
+console.log(created.kind);                    // 'mutation'
+console.log(created.mutationStats.nodesCreated);
+```
+
+GQL set mutation with returned rows:
+
+```javascript
+const updated = db.executeGql(
+  `MATCH (p:Person)
+   WHERE p.key = $key
+   SET p.status = 'active'
+   RETURN p.key AS key, p.status AS status`,
+  { key: 'ada' }
+);
+
+console.log(updated.rows);
+console.log(updated.mutationStats.nodesUpdated);
+```
+
+GQL delete mutation:
+
+```javascript
+db.executeGql(
+  `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
+   WHERE p.key = $key
+   DELETE r`,
+  { key: 'ada' }
+);
+```
 
 Basic node rows:
 
@@ -3536,8 +3766,9 @@ const explain = db.explainGql(
   { status: 'active' }
 );
 
-console.log(explain.target);
-console.log(explain.nativePlan?.warnings);
+console.log(explain.kind);
+console.log(explain.read?.target);
+console.log(explain.read?.warnings);
 ```
 
 Async connector calls:
@@ -3556,11 +3787,16 @@ result = await async_db.execute_gql(
 
 #### Not Yet Supported In GQL Beta
 
-GQL Beta intentionally rejects features outside the supported read-only subset:
+GQL Beta rejects:
 
 - Full ISO GQL
 - Full Cypher compatibility
-- Writes and mutations: `CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`, `FOREACH`, `LOAD`
+- `MERGE`, `ON CREATE`, `ON MATCH`, and upsert-like GQL syntax
+- `DELETE n` without `DETACH`
+- `RETURN` after `DELETE` or `DETACH DELETE`
+- Mutation cursors
+- Read-after-write graph matching such as `MATCH CREATE MATCH`
+- Vector writes or vector mutation syntax
 - Schema operations: `CREATE INDEX`, constraints, `DROP`, `ALTER`, `SHOW`
 - Aggregation
 - `DISTINCT`
@@ -3579,10 +3815,11 @@ GQL Beta intentionally rejects features outside the supported read-only subset:
 - Plan cache
 - Native multi-label edge OR in direct edge lowering
 - List/map and non-finite-float `ORDER BY` domains
+- Mutation `RETURN ORDER BY` on commit-assigned or same-mutation-volatile metadata, including created IDs/timestamps, created-edge endpoint metadata, and same-mutation `updated_at`
 
 Use native query APIs when you need request-object construction, strongly bounded pagination by ID,
-or APIs outside the GQL Beta subset. Use GQL Beta when a read-only graph query string is the
-clearest way to express the read.
+native upsert semantics, vector writes, schema/index management, or APIs outside GQL Beta. Use GQL
+Beta when a graph query or mutation reads better as text.
 
 ---
 
@@ -5990,8 +6227,8 @@ asyncio.run(main())
 | | `explain_edge_query` | Explain an edge query plan |
 | | `query_graph_rows` | Structured graph-row query |
 | | `explain_graph_rows` | Explain a graph-row query |
-| | `execute_gql` | GQL Beta read-only query-string rows |
-| | `explain_gql` | Explain a GQL Beta query |
+| | `execute_gql` | GQL Beta query-string reads and mutations |
+| | `explain_gql` | Explain a GQL Beta statement |
 | **Pagination** | `*_paged` | Paginated variants |
 | **Traversal** | `neighbors` | Immediate neighbors |
 | | `neighbors_paged` | Paginated neighbors |

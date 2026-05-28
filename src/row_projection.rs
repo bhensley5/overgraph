@@ -1,7 +1,7 @@
 //! Internal row projection value and needs substrate for future GQL output.
 //!
 //! This module deliberately stops at plan/value canonicalization. Source-backed
-//! selected-field reads and row materialization live in later checkpoints.
+//! selected-field reads and row materialization live in follow-up work.
 
 #![allow(dead_code)]
 

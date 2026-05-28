@@ -14,8 +14,9 @@ use overgraph::{
     EdgeInput as CoreEdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
     EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
     EdgeView as CoreEdgeView, EngineError, ExportOptions as CoreExportOptions, FusionMode,
-    GqlCapSummary, GqlEdge, GqlExecutionStats, GqlExplain, GqlLoweringTarget, GqlNode,
-    GqlParamValue, GqlParams, GqlQueryOptions, GqlResult, GqlRow, GqlRowOperation, GqlValue,
+    GqlCapSummary, GqlEdge, GqlExecutionCapSummary, GqlExecutionExplain, GqlExecutionMode,
+    GqlExecutionOptions, GqlExecutionResult, GqlExecutionStats, GqlExplain, GqlLoweringTarget,
+    GqlNode, GqlParamValue, GqlParams, GqlRow, GqlRowOperation, GqlStatementKind, GqlValue,
     GraphBinaryOp, GraphCapExplain, GraphCursorExplain, GraphEdgeField,
     GraphEdgePattern as CoreGraphEdgePattern, GraphEdgeValue, GraphElementProjection,
     GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
@@ -82,18 +83,19 @@ impl ToNapiValue for JsonPayload {
 pub struct GqlJsPayload(GqlJsPayloadKind);
 
 enum GqlJsPayloadKind {
-    Result(GqlResultPayload),
-    Explain(GqlExplain),
+    Result(GqlExecutionResultPayload),
+    Explain(GqlExecutionExplain),
 }
 
-pub struct GqlResultPayload {
-    result: GqlResult,
+pub struct GqlExecutionResultPayload {
+    result: GqlExecutionResult,
     compact_rows: bool,
 }
 
 struct GqlJsValue(GqlValue);
 
-struct GqlJsExplain(GqlExplain);
+struct GqlJsExplain(GqlExecutionExplain);
+struct GqlJsReadExplain(GqlExplain);
 
 pub struct GraphRowResultPayload {
     result: GraphRowResult,
@@ -118,7 +120,7 @@ impl ToNapiValue for GqlJsPayload {
     unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
         match val.0 {
             GqlJsPayloadKind::Result(payload) => unsafe {
-                GqlResultPayload::to_napi_value(env, payload)
+                GqlExecutionResultPayload::to_napi_value(env, payload)
             },
             GqlJsPayloadKind::Explain(explain) => unsafe {
                 GqlJsExplain::to_napi_value(env, GqlJsExplain(explain))
@@ -127,16 +129,24 @@ impl ToNapiValue for GqlJsPayload {
     }
 }
 
-impl ToNapiValue for GqlResultPayload {
+impl ToNapiValue for GqlExecutionResultPayload {
     unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
         let env = Env::from_raw(env);
         let mut object = Object::new(&env)?;
         object.set("columns", val.result.columns.clone())?;
+        object.set("kind", gql_statement_kind_to_js(val.result.kind))?;
         let rows =
             gql_rows_to_js_array(&env, &val.result.columns, val.result.rows, val.compact_rows)?;
         object.set("rows", rows)?;
         object.set("nextCursor", val.result.next_cursor)?;
         object.set("stats", GqlJsValue(gql_stats_to_value(val.result.stats)))?;
+        match val.result.mutation_stats {
+            Some(stats) => object.set(
+                "mutationStats",
+                GqlJsValue(gql_mutation_stats_to_value(stats)),
+            )?,
+            None => object.set("mutationStats", Option::<serde_json::Value>::None)?,
+        }
         match val.result.plan {
             Some(plan) => object.set("plan", GqlJsExplain(plan))?,
             None => object.set("plan", Option::<serde_json::Value>::None)?,
@@ -146,6 +156,27 @@ impl ToNapiValue for GqlResultPayload {
 }
 
 impl ToNapiValue for GqlJsExplain {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let mut object = Object::new(&env)?;
+        object.set("kind", gql_statement_kind_to_js(val.0.kind))?;
+        object.set("columns", val.0.columns)?;
+        match val.0.read {
+            Some(read) => object.set("read", GqlJsReadExplain(read))?,
+            None => object.set("read", Option::<serde_json::Value>::None)?,
+        }
+        match val.0.mutation {
+            Some(mutation) => object.set("mutation", gql_mutation_explain_to_json(mutation))?,
+            None => object.set("mutation", Option::<serde_json::Value>::None)?,
+        }
+        object.set("caps", GqlJsValue(gql_execution_caps_to_value(val.0.caps)))?;
+        object.set("warnings", val.0.warnings)?;
+        object.set("notes", val.0.notes)?;
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
+impl ToNapiValue for GqlJsReadExplain {
     unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
         let env = Env::from_raw(env);
         let mut object = Object::new(&env)?;
@@ -1136,35 +1167,37 @@ impl OverGraph {
     }
 
     #[napi(
-        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null",
-        ts_return_type = "import('./query-types').GqlResult"
+        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null",
+        ts_return_type = "import('./query-types').GqlExecutionResult"
     )]
     pub fn execute_gql(
         &self,
         query: String,
         params: Option<Unknown<'_>>,
-        options: Option<GqlQueryOptionsInput>,
+        options: Option<GqlExecutionOptionsInput>,
     ) -> Result<GqlJsPayload> {
         let (options, compact_rows) = parse_js_gql_options(options)?;
         let referenced_params = gql_referenced_param_names(&query, &options)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let params = parse_js_gql_params(params, &referenced_params, &options)?;
         let result = with_engine_ref(self, |eng| eng.execute_gql(&query, &params, &options))?;
-        Ok(GqlJsPayload(GqlJsPayloadKind::Result(GqlResultPayload {
-            result,
-            compact_rows,
-        })))
+        Ok(GqlJsPayload(GqlJsPayloadKind::Result(
+            GqlExecutionResultPayload {
+                result,
+                compact_rows,
+            },
+        )))
     }
 
     #[napi(
-        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null",
-        ts_return_type = "import('./query-types').GqlExplain"
+        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null",
+        ts_return_type = "import('./query-types').GqlExecutionExplain"
     )]
     pub fn explain_gql(
         &self,
         query: String,
         params: Option<Unknown<'_>>,
-        options: Option<GqlQueryOptionsInput>,
+        options: Option<GqlExecutionOptionsInput>,
     ) -> Result<GqlJsPayload> {
         let (options, _) = parse_js_gql_options(options)?;
         let referenced_params = gql_referenced_param_names(&query, &options)
@@ -2493,24 +2526,24 @@ impl OverGraph {
     }
 
     #[napi(
-        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null",
-        ts_return_type = "Promise<import('./query-types').GqlResult>"
+        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null",
+        ts_return_type = "Promise<import('./query-types').GqlExecutionResult>"
     )]
     pub fn execute_gql_async(
         &self,
         query: String,
         params: Option<Unknown<'_>>,
-        options: Option<GqlQueryOptionsInput>,
-    ) -> Result<AsyncTask<EngineReadOp<GqlResultPayload, GqlJsPayload>>> {
+        options: Option<GqlExecutionOptionsInput>,
+    ) -> Result<AsyncTask<EngineOp<GqlExecutionResultPayload, GqlJsPayload>>> {
         let (options, compact_rows) = parse_js_gql_options(options)?;
         let referenced_params = gql_referenced_param_names(&query, &options)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let params = parse_js_gql_params(params, &referenced_params, &options)?;
-        Ok(AsyncTask::new(EngineReadOp::new(
+        Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
             move |eng| {
                 let result = eng.execute_gql(&query, &params, &options)?;
-                Ok(GqlResultPayload {
+                Ok(GqlExecutionResultPayload {
                     result,
                     compact_rows,
                 })
@@ -2520,15 +2553,15 @@ impl OverGraph {
     }
 
     #[napi(
-        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null",
-        ts_return_type = "Promise<import('./query-types').GqlExplain>"
+        ts_args_type = "query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null",
+        ts_return_type = "Promise<import('./query-types').GqlExecutionExplain>"
     )]
     pub fn explain_gql_async(
         &self,
         query: String,
         params: Option<Unknown<'_>>,
-        options: Option<GqlQueryOptionsInput>,
-    ) -> Result<AsyncTask<EngineReadOp<GqlExplain, GqlJsPayload>>> {
+        options: Option<GqlExecutionOptionsInput>,
+    ) -> Result<AsyncTask<EngineReadOp<GqlExecutionExplain, GqlJsPayload>>> {
         let (options, _) = parse_js_gql_options(options)?;
         let referenced_params = gql_referenced_param_names(&query, &options)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -3958,12 +3991,19 @@ pub struct CloseOptions {
 }
 
 #[napi(object)]
-pub struct GqlQueryOptionsInput {
+pub struct GqlExecutionOptionsInput {
+    pub mode: Option<String>,
     pub allow_full_scan: Option<bool>,
     pub max_rows: Option<f64>,
     pub cursor: Option<String>,
     pub max_cursor_bytes: Option<f64>,
+    pub max_mutation_rows: Option<f64>,
+    pub max_mutation_ops: Option<f64>,
     pub max_intermediate_bindings: Option<f64>,
+    pub max_frontier: Option<f64>,
+    pub max_path_hops: Option<f64>,
+    pub max_paths_per_start: Option<f64>,
+    pub max_order_materialization: Option<f64>,
     pub max_skip: Option<f64>,
     pub max_query_bytes: Option<f64>,
     pub max_param_bytes: Option<f64>,
@@ -5710,12 +5750,211 @@ fn gql_stats_to_value(stats: GqlExecutionStats) -> GqlValue {
                 .map(GqlValue::UInt)
                 .unwrap_or(GqlValue::Null),
         ),
-        ("truncated".to_string(), GqlValue::Bool(stats.truncated)),
         (
             "warnings".to_string(),
             GqlValue::List(stats.warnings.into_iter().map(GqlValue::String).collect()),
         ),
     ]))
+}
+
+fn gql_mutation_stats_to_value(stats: overgraph::GqlMutationStats) -> GqlValue {
+    GqlValue::Map(BTreeMap::from([
+        (
+            "rowsMatched".to_string(),
+            GqlValue::UInt(stats.rows_matched as u64),
+        ),
+        (
+            "mutationRows".to_string(),
+            GqlValue::UInt(stats.mutation_rows as u64),
+        ),
+        (
+            "mutationOps".to_string(),
+            GqlValue::UInt(stats.mutation_ops as u64),
+        ),
+        (
+            "nodesCreated".to_string(),
+            GqlValue::UInt(stats.nodes_created as u64),
+        ),
+        (
+            "nodesUpdated".to_string(),
+            GqlValue::UInt(stats.nodes_updated as u64),
+        ),
+        (
+            "nodesDeleted".to_string(),
+            GqlValue::UInt(stats.nodes_deleted as u64),
+        ),
+        (
+            "edgesCreated".to_string(),
+            GqlValue::UInt(stats.edges_created as u64),
+        ),
+        (
+            "edgesUpdated".to_string(),
+            GqlValue::UInt(stats.edges_updated as u64),
+        ),
+        (
+            "edgesDeleted".to_string(),
+            GqlValue::UInt(stats.edges_deleted as u64),
+        ),
+        (
+            "labelsAdded".to_string(),
+            GqlValue::UInt(stats.labels_added as u64),
+        ),
+        (
+            "labelsRemoved".to_string(),
+            GqlValue::UInt(stats.labels_removed as u64),
+        ),
+        (
+            "propertiesSet".to_string(),
+            GqlValue::UInt(stats.properties_set as u64),
+        ),
+        (
+            "propertiesRemoved".to_string(),
+            GqlValue::UInt(stats.properties_removed as u64),
+        ),
+        (
+            "skippedNullTargets".to_string(),
+            GqlValue::UInt(stats.skipped_null_targets as u64),
+        ),
+        (
+            "duplicateTargets".to_string(),
+            GqlValue::UInt(stats.duplicate_targets as u64),
+        ),
+        ("dbHits".to_string(), GqlValue::UInt(stats.db_hits as u64)),
+        (
+            "elapsedUs".to_string(),
+            stats
+                .elapsed_us
+                .map(GqlValue::UInt)
+                .unwrap_or(GqlValue::Null),
+        ),
+        (
+            "warnings".to_string(),
+            GqlValue::List(stats.warnings.into_iter().map(GqlValue::String).collect()),
+        ),
+    ]))
+}
+
+fn gql_statement_kind_to_js(kind: GqlStatementKind) -> &'static str {
+    match kind {
+        GqlStatementKind::Query => "query",
+        GqlStatementKind::Mutation => "mutation",
+    }
+}
+
+fn gql_execution_caps_to_value(caps: GqlExecutionCapSummary) -> GqlValue {
+    GqlValue::Map(BTreeMap::from([
+        (
+            "allowFullScan".to_string(),
+            GqlValue::Bool(caps.allow_full_scan),
+        ),
+        ("maxRows".to_string(), GqlValue::UInt(caps.max_rows as u64)),
+        (
+            "maxCursorBytes".to_string(),
+            GqlValue::UInt(caps.max_cursor_bytes as u64),
+        ),
+        (
+            "maxMutationRows".to_string(),
+            GqlValue::UInt(caps.max_mutation_rows as u64),
+        ),
+        (
+            "maxMutationOps".to_string(),
+            GqlValue::UInt(caps.max_mutation_ops as u64),
+        ),
+        (
+            "maxQueryBytes".to_string(),
+            GqlValue::UInt(caps.max_query_bytes as u64),
+        ),
+        (
+            "maxParamBytes".to_string(),
+            GqlValue::UInt(caps.max_param_bytes as u64),
+        ),
+        (
+            "maxAstDepth".to_string(),
+            GqlValue::UInt(caps.max_ast_depth as u64),
+        ),
+        (
+            "maxLiteralItems".to_string(),
+            GqlValue::UInt(caps.max_literal_items as u64),
+        ),
+        (
+            "maxIntermediateBindings".to_string(),
+            GqlValue::UInt(caps.max_intermediate_bindings as u64),
+        ),
+        (
+            "maxFrontier".to_string(),
+            GqlValue::UInt(caps.max_frontier as u64),
+        ),
+        (
+            "maxPathHops".to_string(),
+            GqlValue::UInt(caps.max_path_hops as u64),
+        ),
+        (
+            "maxPathsPerStart".to_string(),
+            GqlValue::UInt(caps.max_paths_per_start as u64),
+        ),
+        (
+            "maxOrderMaterialization".to_string(),
+            GqlValue::UInt(caps.max_order_materialization as u64),
+        ),
+        ("maxSkip".to_string(), GqlValue::UInt(caps.max_skip as u64)),
+    ]))
+}
+
+fn gql_mutation_explain_to_json(explain: overgraph::GqlMutationExplain) -> serde_json::Value {
+    serde_json::json!({
+        "readPrefix": explain.read_prefix.map(|prefix| serde_json::json!({
+            "graphRowTarget": gql_read_explain_to_json(prefix.graph_row_target),
+            "internalColumns": prefix.internal_columns,
+            "targetAliases": prefix.target_aliases,
+            "expressionColumns": prefix.expression_columns,
+        })),
+        "operations": explain.operations.into_iter().map(|operation| serde_json::json!({
+            "op": operation.op,
+            "targetAlias": operation.target_alias,
+            "rowMultiplicity": operation.row_multiplicity,
+            "detail": operation.detail,
+        })).collect::<Vec<_>>(),
+        "returnPlan": explain.return_plan.map(|plan| serde_json::json!({
+            "columns": plan.columns,
+            "orderItems": plan.order_items,
+            "skip": plan.skip,
+            "limit": plan.limit,
+            "postCommitHydration": plan.post_commit_hydration,
+        })),
+        "wouldCreateNodeLabels": explain.would_create_node_labels,
+        "wouldCreateEdgeLabels": explain.would_create_edge_labels,
+        "usesTransactionSnapshot": explain.uses_transaction_snapshot,
+        "usesWriteTxn": explain.uses_write_txn,
+        "replacementAdapters": explain.replacement_adapters,
+        "atomicCommit": explain.atomic_commit,
+    })
+}
+
+fn gql_read_explain_to_json(explain: GqlExplain) -> serde_json::Value {
+    serde_json::json!({
+        "columns": explain.columns,
+        "target": gql_lowering_target_to_js(explain.target),
+        "nativePlan": explain.native_plan.map(query_plan_to_json),
+        "pushedDown": explain.pushed_down,
+        "residual": explain.residual,
+        "projection": explain.projection,
+        "rowOps": explain.row_ops.into_iter().map(gql_row_operation_to_js).collect::<Vec<_>>(),
+        "caps": gql_caps_to_json(explain.caps),
+        "warnings": explain.warnings,
+    })
+}
+
+fn gql_caps_to_json(caps: GqlCapSummary) -> serde_json::Value {
+    serde_json::json!({
+        "allowFullScan": caps.allow_full_scan,
+        "maxRows": caps.max_rows,
+        "maxIntermediateBindings": caps.max_intermediate_bindings,
+        "maxSkip": caps.max_skip,
+        "maxQueryBytes": caps.max_query_bytes,
+        "maxParamBytes": caps.max_param_bytes,
+        "maxAstDepth": caps.max_ast_depth,
+        "maxLiteralItems": caps.max_literal_items,
+    })
 }
 
 fn gql_caps_to_value(caps: GqlCapSummary) -> GqlValue {
@@ -5928,10 +6167,15 @@ fn query_plan_warning_to_js(warning: &QueryPlanWarning) -> &'static str {
     }
 }
 
-fn parse_js_gql_options(options: Option<GqlQueryOptionsInput>) -> Result<(GqlQueryOptions, bool)> {
-    let mut parsed = GqlQueryOptions::default();
+fn parse_js_gql_options(
+    options: Option<GqlExecutionOptionsInput>,
+) -> Result<(GqlExecutionOptions, bool)> {
+    let mut parsed = GqlExecutionOptions::default();
     let mut compact_rows = false;
     if let Some(options) = options {
+        if let Some(value) = options.mode {
+            parsed.mode = parse_js_gql_execution_mode(&value)?;
+        }
         if let Some(value) = options.allow_full_scan {
             parsed.allow_full_scan = value;
         }
@@ -5944,8 +6188,29 @@ fn parse_js_gql_options(options: Option<GqlQueryOptionsInput>) -> Result<(GqlQue
         if let Some(value) = options.max_cursor_bytes {
             parsed.max_cursor_bytes = f64_to_usize(value, "GQL maxCursorBytes")?;
         }
+        if let Some(value) = options.max_mutation_rows {
+            parsed.max_mutation_rows = f64_to_usize(value, "GQL maxMutationRows")?;
+        }
+        if let Some(value) = options.max_mutation_ops {
+            parsed.max_mutation_ops = f64_to_usize(value, "GQL maxMutationOps")?;
+        }
         if let Some(value) = options.max_intermediate_bindings {
             parsed.max_intermediate_bindings = f64_to_usize(value, "GQL maxIntermediateBindings")?;
+        }
+        if let Some(value) = options.max_frontier {
+            parsed.max_frontier = f64_to_usize(value, "GQL maxFrontier")?;
+        }
+        if let Some(value) = options.max_path_hops {
+            let parsed_value = f64_to_usize(value, "GQL maxPathHops")?;
+            parsed.max_path_hops = u8::try_from(parsed_value).map_err(|_| {
+                napi::Error::from_reason("GQL maxPathHops must be between 0 and 255".to_string())
+            })?;
+        }
+        if let Some(value) = options.max_paths_per_start {
+            parsed.max_paths_per_start = f64_to_usize(value, "GQL maxPathsPerStart")?;
+        }
+        if let Some(value) = options.max_order_materialization {
+            parsed.max_order_materialization = f64_to_usize(value, "GQL maxOrderMaterialization")?;
         }
         if let Some(value) = options.max_skip {
             parsed.max_skip = f64_to_usize(value, "GQL maxSkip")?;
@@ -5970,12 +6235,23 @@ fn parse_js_gql_options(options: Option<GqlQueryOptionsInput>) -> Result<(GqlQue
         }
         if let Some(value) = options.compact_rows {
             compact_rows = value;
+            parsed.compact_rows = value;
         }
         if let Some(value) = options.include_vectors {
             parsed.include_vectors = value;
         }
     }
     Ok((parsed, compact_rows))
+}
+
+fn parse_js_gql_execution_mode(value: &str) -> Result<GqlExecutionMode> {
+    match value {
+        "auto" => Ok(GqlExecutionMode::Auto),
+        "readOnly" => Ok(GqlExecutionMode::ReadOnly),
+        other => Err(napi::Error::from_reason(format!(
+            "GQL mode must be 'auto' or 'readOnly', got '{other}'"
+        ))),
+    }
 }
 
 struct GqlParamConversionBudget {
@@ -5986,7 +6262,7 @@ struct GqlParamConversionBudget {
 fn parse_js_gql_params(
     params: Option<Unknown<'_>>,
     referenced_params: &[String],
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<GqlParams> {
     if referenced_params.is_empty() {
         return Ok(GqlParams::new());
@@ -6025,7 +6301,7 @@ fn parse_js_gql_param_value(
     name: &str,
     value: Unknown<'_>,
     container_depth: usize,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
     budget: &mut GqlParamConversionBudget,
 ) -> Result<GqlParamValue> {
     match value.get_type()? {
@@ -6116,7 +6392,7 @@ fn js_object_property_names_array<'env>(object: &Object<'env>) -> Result<Array<'
     unsafe { Array::from_napi_value(value.env, value.value) }
 }
 
-fn check_js_param_depth(name: &str, depth: usize, options: &GqlQueryOptions) -> Result<()> {
+fn check_js_param_depth(name: &str, depth: usize, options: &GqlExecutionOptions) -> Result<()> {
     if depth > options.max_ast_depth {
         return Err(napi::Error::from_reason(format!(
             "GQL parameter '${name}' nested list/map depth exceeds maxAstDepth of {}",
@@ -6131,7 +6407,7 @@ fn add_js_param_items(
     count: usize,
     container_kind: &str,
     budget: &mut GqlParamConversionBudget,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<()> {
     if count > options.max_literal_items {
         return Err(napi::Error::from_reason(format!(
@@ -6157,7 +6433,7 @@ fn add_js_param_bytes(
     bytes: usize,
     value_kind: &str,
     budget: &mut GqlParamConversionBudget,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<()> {
     if bytes > options.max_param_bytes {
         return Err(napi::Error::from_reason(format!(

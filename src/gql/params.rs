@@ -1,15 +1,18 @@
 use crate::error::EngineError;
-use crate::gql::ast::{Expr, ExprKind, GqlQuery, MapLiteral, Pattern, ReturnBody};
-use crate::gql::parser::{parse_query, GqlParseOptions};
-use crate::gql::semantic::GqlSemanticPlan;
-use crate::types::{GqlParamValue, GqlParams, GqlQueryOptions, SourceSpan};
+use crate::gql::ast::{
+    Expr, ExprKind, GqlMutationStatement, GqlQuery, GqlStatementBody, MapLiteral, MutationClause,
+    Pattern, RemoveItem, ReturnBody, SetItem,
+};
+use crate::gql::parser::{parse_statement, GqlParseOptions};
+use crate::gql::semantic::{GqlMutationSemanticPlan, GqlSemanticPlan};
+use crate::types::{GqlExecutionOptions, GqlParamValue, GqlParams, SourceSpan};
 use std::collections::BTreeMap;
 
 pub(crate) fn referenced_param_names_for_query(
     query: &str,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<Vec<String>, EngineError> {
-    let ast = parse_query(
+    let statement = parse_statement(
         query,
         &GqlParseOptions {
             max_query_bytes: options.max_query_bytes,
@@ -17,19 +20,49 @@ pub(crate) fn referenced_param_names_for_query(
             max_literal_items: options.max_literal_items,
         },
     )?;
-    Ok(collect_query_parameter_spans(&ast).into_keys().collect())
+    let spans = match &statement.body {
+        GqlStatementBody::Query(query) => collect_query_parameter_spans(query),
+        GqlStatementBody::Mutation(mutation) => collect_mutation_parameter_spans(mutation),
+    };
+    Ok(spans.into_keys().collect())
 }
 
 pub(crate) fn validate_referenced_gql_params(
     semantic: &GqlSemanticPlan,
     params: &GqlParams,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
+) -> Result<(), EngineError> {
+    validate_referenced_param_set(
+        &semantic.parameters,
+        &semantic.parameter_spans,
+        params,
+        options,
+    )
+}
+
+pub(crate) fn validate_referenced_gql_mutation_params(
+    semantic: &GqlMutationSemanticPlan,
+    params: &GqlParams,
+    options: &GqlExecutionOptions,
+) -> Result<(), EngineError> {
+    validate_referenced_param_set(
+        &semantic.parameters,
+        &semantic.parameter_spans,
+        params,
+        options,
+    )
+}
+
+fn validate_referenced_param_set(
+    parameters: &[String],
+    parameter_spans: &BTreeMap<String, SourceSpan>,
+    params: &GqlParams,
+    options: &GqlExecutionOptions,
 ) -> Result<(), EngineError> {
     let mut total_items = 0usize;
     let mut total_bytes = 0usize;
-    for name in &semantic.parameters {
-        let span = semantic
-            .parameter_spans
+    for name in parameters {
+        let span = parameter_spans
             .get(name)
             .cloned()
             .unwrap_or_else(|| SourceSpan::new(0, 0, 1, 1));
@@ -74,6 +107,68 @@ fn collect_query_parameter_spans(query: &GqlQuery) -> BTreeMap<String, SourceSpa
     }
     if let Some(limit) = query.limit.as_ref() {
         collect_expr_parameter_spans(limit, &mut spans);
+    }
+    spans
+}
+
+fn collect_mutation_parameter_spans(
+    mutation: &GqlMutationStatement,
+) -> BTreeMap<String, SourceSpan> {
+    let mut spans = BTreeMap::new();
+    for clause in &mutation.read_prefix {
+        for pattern in &clause.patterns {
+            collect_pattern_parameter_spans(pattern, &mut spans);
+        }
+        if let Some(where_clause) = clause.where_clause.as_ref() {
+            collect_expr_parameter_spans(where_clause, &mut spans);
+        }
+    }
+    for clause in &mutation.mutation_clauses {
+        match clause {
+            MutationClause::Create(create) => {
+                for pattern in &create.patterns {
+                    collect_pattern_parameter_spans(pattern, &mut spans);
+                }
+            }
+            MutationClause::Set(set) => {
+                for item in &set.items {
+                    match item {
+                        SetItem::Property { value, .. } | SetItem::MapMerge { value, .. } => {
+                            collect_expr_parameter_spans(value, &mut spans);
+                        }
+                        SetItem::NodeLabel { .. } => {}
+                    }
+                }
+            }
+            MutationClause::Remove(remove) => {
+                for item in &remove.items {
+                    match item {
+                        RemoveItem::Property { .. } | RemoveItem::NodeLabel { .. } => {}
+                    }
+                }
+            }
+            MutationClause::Delete(delete) => {
+                for target in &delete.targets {
+                    collect_expr_parameter_spans(target, &mut spans);
+                }
+            }
+        }
+    }
+    if let Some(tail) = mutation.return_tail.as_ref() {
+        if let ReturnBody::Items(items) = &tail.return_clause.body {
+            for item in items {
+                collect_expr_parameter_spans(&item.expr, &mut spans);
+            }
+        }
+        for item in &tail.order_by {
+            collect_expr_parameter_spans(&item.expr, &mut spans);
+        }
+        if let Some(skip) = tail.skip.as_ref() {
+            collect_expr_parameter_spans(skip, &mut spans);
+        }
+        if let Some(limit) = tail.limit.as_ref() {
+            collect_expr_parameter_spans(limit, &mut spans);
+        }
     }
     spans
 }
@@ -132,7 +227,7 @@ fn validate_param_value(
     name: &str,
     span: &SourceSpan,
     value: &GqlParamValue,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
     total_items: &mut usize,
     total_bytes: &mut usize,
 ) -> Result<(), EngineError> {
@@ -176,7 +271,7 @@ fn check_container_depth(
     name: &str,
     span: &SourceSpan,
     depth: usize,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<(), EngineError> {
     if depth > options.max_ast_depth {
         return Err(param_resource_error(
@@ -198,7 +293,7 @@ fn add_param_items(
     count: usize,
     container_kind: &str,
     total_items: &mut usize,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<(), EngineError> {
     if count > options.max_literal_items {
         return Err(param_resource_error(
@@ -234,7 +329,7 @@ fn add_param_bytes(
     bytes: usize,
     value_kind: &str,
     total_bytes: &mut usize,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<(), EngineError> {
     if bytes > options.max_param_bytes {
         return Err(param_resource_error(

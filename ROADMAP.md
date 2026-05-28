@@ -15,7 +15,7 @@ Built-in vector search is a core part of that bet, not an add-on bolted to the s
 - Keep the core pure Rust, with no C or C++ storage dependencies.
 - Keep databases directory-scoped so they are easy to copy, back up, inspect, and rebuild.
 - Keep Rust, Node.js, and Python APIs in parity.
-- Give users a real choice between programmatic APIs and GQL. Native Rust, Node.js, and Python APIs remain first-class for code-built workflows, while GQL is becoming a first-class query-string surface for users who prefer declarative graph reads and, next, mutations.
+- Give users a real choice between programmatic APIs and GQL. Native Rust, Node.js, and Python APIs are first-class for code-built workflows. GQL is a first-class query-string surface for declarative graph reads and writes.
 - Keep both API styles on the same execution substrates. GQL should compile into the same native planners, indexes, transactions, caps, and explain machinery instead of becoming a second engine.
 - Treat vector search as graph-native: dense, sparse, hybrid, and scoped by graph structure.
 - Keep hot reads mmap-first and allocation-aware.
@@ -77,28 +77,19 @@ These are already part of the public engine.
 
 ## Now
 
-Current development is focused on expanding the GQL beta surface without weakening the API-first foundation.
+Active work expanding the GQL Beta surface, tightening numeric property semantics, and improving projection and late hydration.
 
-### Read-Only GQL
+### GQL Reads And Mutations
 
-OverGraph's GQL Beta read surface is available today and still actively evolving. It gives users a small GQL/Cypher-style query-string option for cases where `MATCH` syntax is the clearest way to describe a graph lookup, while continuing to compile into the same native graph-row planner rather than becoming a second engine.
+GQL Beta is live in Rust, Node.js, and Python. GQL/Cypher-style query strings compile into the same native read and write substrates as the structured APIs, so callers move between request objects and `MATCH` / `CREATE` strings without changing engines.
 
-- Support read-only `MATCH`, `OPTIONAL MATCH`, bounded variable-length paths, path values, row projection, parameters, `WHERE`, `RETURN`, `ORDER BY`, `SKIP`, `LIMIT`, continuation cursors, and explain output within the beta scope.
-- Lower supported queries into the shared graph-row planner and executor used by the native Rust, Node.js, and Python graph-row APIs.
-- Keep row output predictable, with late hydration, selected-field projection, compact connector rows, and vector payloads excluded unless requested.
-- Keep unsupported syntax explicit so the beta surface is honest about what it can and cannot do.
+- Reads: `MATCH`, `OPTIONAL MATCH`, bounded variable-length paths, path values, row projection, parameters, `WHERE`, `RETURN`, `ORDER BY`, `SKIP`, `LIMIT`, continuation cursors, and explain output.
+- Mutations: `CREATE`, `SET`, `REMOVE`, `DELETE r`, and `DETACH DELETE n`, with mutation `RETURN` for `CREATE`, `SET`, and `REMOVE`.
+- Reads lower into the same graph-row planner and executor as the native Rust, Node.js, and Python graph-row APIs. Mutations lower into existing write transactions and native write intents.
+- Predictable row output: late hydration, selected-field projection, compact connector rows, vector payloads excluded unless requested.
+- Unsupported syntax is explicit so callers know exactly what is in scope.
 
-The goal is convenience, not a separate query engine. More GQL Beta work is continuing on the same surface, including unified execution APIs and transactional mutations.
-
-### Unified GQL Execution And Mutations
-
-The next GQL Beta expansion is a unified `execute_gql` / `explain_gql` API that can route supported read statements and supported mutation statements through the right native substrate.
-
-- Keep reads on the Phase 32 graph-row query substrate.
-- Lower supported mutations into existing write transactions and native write intents where possible.
-- Add transactional support for bounded `CREATE`, `SET`, `REMOVE`, `DELETE`, and `DETACH DELETE` semantics.
-- Keep `explain_gql` strictly side-effect-free.
-- Preserve Rust, Node.js, and Python parity as the beta grows.
+`execute_gql` and `explain_gql` route reads and mutations through the right native substrate. `explain_gql` is side-effect-free. Rust, Node.js, and Python parity remains the bar as the beta grows.
 
 ### Numeric Property Semantics
 
@@ -193,7 +184,7 @@ Explore ontology support after RDF and SPARQL have proven demand. A practical fi
 
 ## Recently Shipped
 
-This section is intentionally short. For full release notes, see [CHANGELOG.md](CHANGELOG.md).
+Highlights below. Full release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ### 0.8.0
 

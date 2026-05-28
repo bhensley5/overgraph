@@ -3,14 +3,16 @@
 use crate::engine::GraphFixedPathBinding;
 use crate::error::EngineError;
 use crate::gql::ast::*;
-use crate::gql::params::validate_referenced_gql_params;
+use crate::gql::params::{validate_referenced_gql_mutation_params, validate_referenced_gql_params};
 use crate::gql::semantic::{
-    bind_query, gql_semantic_error, variable_name, GqlAliasKind, GqlBoundEdgePattern,
-    GqlBoundNodePattern, GqlBoundPattern, GqlReturnPlan, GqlSemanticPlan,
+    bind_mutation, bind_query, expression_output_name, gql_semantic_error, variable_name,
+    GqlAliasKind, GqlAliasOrigin, GqlBoundCreateEdge, GqlBoundCreateNode, GqlBoundEdgePattern,
+    GqlBoundMutationClause, GqlBoundNodePattern, GqlBoundPattern, GqlBoundRemoveItem,
+    GqlBoundSetItem, GqlMutationSemanticPlan, GqlReturnPlan, GqlSemanticPlan,
 };
 use crate::row_projection::{DIRECT_EDGE_ALIAS, DIRECT_NODE_ALIAS};
 use crate::types::{
-    Direction, EdgeFilterExpr, GqlParamValue, GqlParams, GqlQueryOptions, GqlSemanticErrorCode,
+    Direction, EdgeFilterExpr, GqlExecutionOptions, GqlParamValue, GqlParams, GqlSemanticErrorCode,
     GraphBinaryOp, GraphEdgeField, GraphEdgePattern, GraphElementProjection, GraphExpr,
     GraphFunction, GraphNodeField, GraphNodePattern, GraphOptionalGroup, GraphOrderDirection,
     GraphOutputMode, GraphOutputOptions, GraphPageRequest, GraphParamValue, GraphPathField,
@@ -66,20 +68,148 @@ pub(crate) struct GqlLoweredPlan {
     pub(crate) notes: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlMutationPlan {
+    pub(crate) semantic: GqlMutationSemanticPlan,
+    pub(crate) read_prefix: Option<GqlMutationReadPrefixPlan>,
+    pub(crate) clauses: Vec<GqlMutationClausePlan>,
+    pub(crate) return_plan: Option<GqlMutationReturnPlan>,
+    pub(crate) operation_exprs: Vec<GqlMutationExprPlan>,
+    pub(crate) params_used: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlMutationReadPrefixPlan {
+    pub(crate) graph_row: GraphRowQueryTarget,
+    pub(crate) lowered: Box<GqlLoweredPlan>,
+    pub(crate) internal_columns: Vec<GqlMutationInternalColumn>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlMutationInternalColumn {
+    TargetId { alias: String, kind: GqlAliasKind },
+    TargetPath { alias: String },
+    ExprValue { id: usize, expr: GraphExpr },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlMutationExprPlan {
+    pub(crate) id: usize,
+    pub(crate) expr: GraphExpr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GqlMutationExprRef {
+    pub(crate) id: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlMutationClausePlan {
+    Create(Vec<GqlCreatePatternPlan>),
+    Set(Vec<GqlSetItemPlan>),
+    Remove(Vec<GqlRemoveItemPlan>),
+    Delete {
+        detach: bool,
+        targets: Vec<GqlDeleteTargetPlan>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlCreatePatternPlan {
+    pub(crate) nodes: Vec<GqlCreateNodePlan>,
+    pub(crate) edges: Vec<GqlCreateEdgePlan>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlCreateNodePlan {
+    pub(crate) alias: String,
+    pub(crate) labels: Vec<String>,
+    pub(crate) property_keys: Vec<String>,
+    pub(crate) property_values: BTreeMap<String, GqlMutationExprRef>,
+    pub(crate) created: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlCreateEdgePlan {
+    pub(crate) alias: Option<String>,
+    pub(crate) from_alias: String,
+    pub(crate) to_alias: String,
+    pub(crate) label: String,
+    pub(crate) property_keys: Vec<String>,
+    pub(crate) property_values: BTreeMap<String, GqlMutationExprRef>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlSetItemPlan {
+    Property {
+        alias: String,
+        kind: GqlAliasKind,
+        property: String,
+        value: GqlMutationExprRef,
+    },
+    MapMerge {
+        alias: String,
+        kind: GqlAliasKind,
+        value: GqlMutationExprRef,
+    },
+    NodeLabel {
+        alias: String,
+        label: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlRemoveItemPlan {
+    Property {
+        alias: String,
+        kind: GqlAliasKind,
+        property: String,
+    },
+    NodeLabel {
+        alias: String,
+        label: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlDeleteTargetPlan {
+    pub(crate) alias: String,
+    pub(crate) kind: GqlAliasKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlMutationReturnPlan {
+    pub(crate) columns: Vec<String>,
+    pub(crate) order_items: usize,
+    pub(crate) skip: Option<Expr>,
+    pub(crate) limit: Option<Expr>,
+}
+
 pub(crate) fn lower_query(
     query: GqlQuery,
     params: &GqlParams,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<GqlLoweredPlan, EngineError> {
     let semantic = bind_query(query, params)?;
     validate_referenced_gql_params(&semantic, params, options)?;
     lower_semantic_plan(semantic, params, options)
 }
 
+pub(crate) fn lower_mutation(
+    mutation: GqlMutationStatement,
+    params: &GqlParams,
+    options: &GqlExecutionOptions,
+) -> Result<GqlMutationPlan, EngineError> {
+    let semantic = bind_mutation(mutation, params)?;
+    validate_referenced_gql_mutation_params(&semantic, params, options)?;
+    lower_mutation_semantic_plan(semantic, params, options)
+}
+
 pub(crate) fn lower_semantic_plan(
     semantic: GqlSemanticPlan,
     params: &GqlParams,
-    options: &GqlQueryOptions,
+    options: &GqlExecutionOptions,
 ) -> Result<GqlLoweredPlan, EngineError> {
     let mut state = LoweringState::new(params, &semantic);
     let mut graph_nodes = Vec::new();
@@ -92,8 +222,7 @@ pub(crate) fn lower_semantic_plan(
         if clause.patterns.len() != 1 {
             return Err(EngineError::GqlUnsupported {
                 feature: "multiple MATCH patterns".to_string(),
-                message: "multiple comma-separated MATCH patterns are not supported in CP32.8.5"
-                    .to_string(),
+                message: "multiple comma-separated MATCH patterns are not supported".to_string(),
                 span: clause.span.clone(),
             });
         }
@@ -181,6 +310,577 @@ pub(crate) fn lower_semantic_plan(
         warnings: state.warnings,
         notes: state.notes,
     })
+}
+
+pub(crate) fn lower_mutation_semantic_plan(
+    semantic: GqlMutationSemanticPlan,
+    params: &GqlParams,
+    options: &GqlExecutionOptions,
+) -> Result<GqlMutationPlan, EngineError> {
+    let operation_exprs = mutation_operation_exprs(&semantic);
+    let alias_kinds = semantic
+        .aliases
+        .iter()
+        .map(|(alias, binding)| (alias.clone(), binding.kind))
+        .collect::<BTreeMap<_, _>>();
+    let operation_expr_plans = operation_exprs
+        .iter()
+        .enumerate()
+        .map(|(id, expr)| {
+            Ok(GqlMutationExprPlan {
+                id,
+                expr: gql_expr_to_graph_expr(expr, &alias_kinds)?,
+            })
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    let mut expr_cursor = 0;
+    let clauses = semantic
+        .clauses
+        .iter()
+        .map(|clause| lower_mutation_clause(clause, &mut expr_cursor))
+        .collect::<Vec<_>>();
+    debug_assert_eq!(expr_cursor, operation_expr_plans.len());
+    let internal_columns =
+        mutation_internal_columns(&semantic, &operation_exprs, &operation_expr_plans);
+
+    let read_prefix = lower_mutation_read_prefix(
+        &semantic,
+        &operation_exprs,
+        internal_columns,
+        params,
+        options,
+    )?;
+    let return_plan = semantic
+        .statement
+        .return_tail
+        .as_ref()
+        .map(|tail| GqlMutationReturnPlan {
+            columns: mutation_return_columns(&semantic),
+            order_items: tail.order_by.len(),
+            skip: tail.skip.clone(),
+            limit: tail.limit.clone(),
+        });
+    let mut warnings = Vec::new();
+    if let Some(read_prefix) = read_prefix.as_ref() {
+        warnings.extend(read_prefix.lowered.warnings.iter().cloned());
+    }
+    warnings.sort();
+    warnings.dedup();
+    Ok(GqlMutationPlan {
+        params_used: semantic.parameters.clone(),
+        semantic,
+        read_prefix,
+        clauses,
+        return_plan,
+        operation_exprs: operation_expr_plans,
+        warnings,
+    })
+}
+
+fn lower_mutation_read_prefix(
+    semantic: &GqlMutationSemanticPlan,
+    operation_exprs: &[Expr],
+    internal_columns: Vec<GqlMutationInternalColumn>,
+    params: &GqlParams,
+    options: &GqlExecutionOptions,
+) -> Result<Option<GqlMutationReadPrefixPlan>, EngineError> {
+    if semantic.statement.read_prefix.is_empty() {
+        return Ok(None);
+    }
+    let read_query = mutation_read_prefix_query(semantic, operation_exprs, &internal_columns);
+    let read_semantic = bind_query(read_query, params)?;
+    validate_referenced_gql_params(&read_semantic, params, options)?;
+    let mut read_options = options.clone();
+    read_options.cursor = None;
+    read_options.max_rows = options.max_mutation_rows.saturating_add(1).max(1);
+    let lowered = lower_semantic_plan(read_semantic, params, &read_options)?;
+    let GqlNativeTarget::GraphRows { query } = &lowered.native_target;
+    Ok(Some(GqlMutationReadPrefixPlan {
+        graph_row: query.clone(),
+        lowered: Box::new(lowered),
+        internal_columns,
+    }))
+}
+
+fn mutation_read_prefix_query(
+    semantic: &GqlMutationSemanticPlan,
+    operation_exprs: &[Expr],
+    internal_columns: &[GqlMutationInternalColumn],
+) -> GqlQuery {
+    let mut items = Vec::new();
+    for column in internal_columns {
+        match column {
+            GqlMutationInternalColumn::TargetId { alias, .. } => {
+                let Some(binding) = semantic.aliases.get(alias) else {
+                    continue;
+                };
+                items.push(internal_return_item(
+                    id_function_expr(alias, &binding.span),
+                    format!("_gql_mut_id_{alias}"),
+                    &binding.span,
+                ));
+            }
+            GqlMutationInternalColumn::TargetPath { alias } => {
+                let Some(binding) = semantic.aliases.get(alias) else {
+                    continue;
+                };
+                items.push(internal_return_item(
+                    path_function_expr("node_ids", alias, &binding.span),
+                    format!("_gql_mut_path_nodes_{alias}"),
+                    &binding.span,
+                ));
+                items.push(internal_return_item(
+                    path_function_expr("edge_ids", alias, &binding.span),
+                    format!("_gql_mut_path_edges_{alias}"),
+                    &binding.span,
+                ));
+            }
+            GqlMutationInternalColumn::ExprValue { id, .. } => {
+                let expr = &operation_exprs[*id];
+                items.push(internal_return_item(
+                    expr.clone(),
+                    format!("_gql_mut_expr_{id}"),
+                    &expr.span,
+                ));
+            }
+        };
+    }
+    if items.is_empty() {
+        items.push(internal_return_item(
+            Expr {
+                kind: ExprKind::Literal(Literal::Int(1)),
+                span: semantic.statement.span.clone(),
+            },
+            "_gql_mut_row".to_string(),
+            &semantic.statement.span,
+        ));
+    }
+    GqlQuery {
+        match_clauses: semantic.statement.read_prefix.clone(),
+        return_clause: ReturnClause {
+            body: ReturnBody::Items(items),
+            span: semantic.statement.span.clone(),
+        },
+        order_by: Vec::new(),
+        skip: None,
+        limit: None,
+        span: semantic.statement.span.clone(),
+    }
+}
+
+fn internal_return_item(expr: Expr, alias: String, span: &SourceSpan) -> ReturnItem {
+    ReturnItem {
+        span: expr.span.clone(),
+        expr,
+        alias: Some(Ident {
+            name: alias,
+            span: span.clone(),
+        }),
+    }
+}
+
+fn id_function_expr(alias: &str, span: &SourceSpan) -> Expr {
+    Expr {
+        kind: ExprKind::FunctionCall {
+            name: Ident {
+                name: "id".to_string(),
+                span: span.clone(),
+            },
+            args: vec![Expr {
+                kind: ExprKind::Variable(alias.to_string()),
+                span: span.clone(),
+            }],
+        },
+        span: span.clone(),
+    }
+}
+
+fn path_function_expr(function: &str, alias: &str, span: &SourceSpan) -> Expr {
+    Expr {
+        kind: ExprKind::FunctionCall {
+            name: Ident {
+                name: function.to_string(),
+                span: span.clone(),
+            },
+            args: vec![Expr {
+                kind: ExprKind::Variable(alias.to_string()),
+                span: span.clone(),
+            }],
+        },
+        span: span.clone(),
+    }
+}
+
+fn mutation_internal_columns(
+    semantic: &GqlMutationSemanticPlan,
+    operation_exprs: &[Expr],
+    lowered_exprs: &[GqlMutationExprPlan],
+) -> Vec<GqlMutationInternalColumn> {
+    let mut required_aliases = BTreeSet::new();
+    collect_mutation_target_aliases(semantic, &mut required_aliases);
+    collect_return_identity_aliases(semantic, &mut required_aliases);
+
+    let mut columns = Vec::new();
+    for alias in semantic.user_order.iter() {
+        if !required_aliases.contains(alias) {
+            continue;
+        }
+        let Some(binding) = semantic.aliases.get(alias) else {
+            continue;
+        };
+        if binding.origin != GqlAliasOrigin::ReadPrefix {
+            continue;
+        }
+        match binding.kind {
+            GqlAliasKind::Node | GqlAliasKind::Edge => {
+                columns.push(GqlMutationInternalColumn::TargetId {
+                    alias: alias.clone(),
+                    kind: binding.kind,
+                });
+            }
+            GqlAliasKind::Path => {
+                columns.push(GqlMutationInternalColumn::TargetPath {
+                    alias: alias.clone(),
+                });
+            }
+        }
+    }
+
+    for (id, expr) in operation_exprs.iter().enumerate() {
+        if expr_references_read_prefix_alias(expr, semantic) {
+            columns.push(GqlMutationInternalColumn::ExprValue {
+                id,
+                expr: lowered_exprs[id].expr.clone(),
+            });
+        }
+    }
+
+    columns
+}
+
+fn collect_mutation_target_aliases(
+    semantic: &GqlMutationSemanticPlan,
+    required_aliases: &mut BTreeSet<String>,
+) {
+    for clause in &semantic.clauses {
+        match clause {
+            GqlBoundMutationClause::Create(create) => {
+                for pattern in &create.patterns {
+                    for node in &pattern.nodes {
+                        if !node.created {
+                            maybe_insert_read_prefix_alias(semantic, &node.alias, required_aliases);
+                        }
+                    }
+                }
+            }
+            GqlBoundMutationClause::Set(set) => {
+                for item in &set.items {
+                    match item {
+                        GqlBoundSetItem::Property { alias, .. }
+                        | GqlBoundSetItem::MapMerge { alias, .. }
+                        | GqlBoundSetItem::NodeLabel { alias, .. } => {
+                            maybe_insert_read_prefix_alias(semantic, alias, required_aliases);
+                        }
+                    }
+                }
+            }
+            GqlBoundMutationClause::Remove(remove) => {
+                for item in &remove.items {
+                    match item {
+                        GqlBoundRemoveItem::Property { alias, .. }
+                        | GqlBoundRemoveItem::NodeLabel { alias, .. } => {
+                            maybe_insert_read_prefix_alias(semantic, alias, required_aliases);
+                        }
+                    }
+                }
+            }
+            GqlBoundMutationClause::Delete(delete) => {
+                for target in &delete.targets {
+                    maybe_insert_read_prefix_alias(semantic, &target.alias, required_aliases);
+                }
+            }
+        }
+    }
+}
+
+fn collect_return_identity_aliases(
+    semantic: &GqlMutationSemanticPlan,
+    required_aliases: &mut BTreeSet<String>,
+) {
+    if let Some(returns) = semantic.returns.as_ref() {
+        match returns {
+            GqlReturnPlan::Star {
+                expanded_aliases, ..
+            } => {
+                for alias in expanded_aliases {
+                    maybe_insert_read_prefix_alias(semantic, alias, required_aliases);
+                }
+            }
+            GqlReturnPlan::Items(items) => {
+                for item in items {
+                    collect_read_prefix_aliases_from_expr(semantic, &item.expr, required_aliases);
+                }
+            }
+        }
+    }
+    if let Some(tail) = semantic.statement.return_tail.as_ref() {
+        for item in &tail.order_by {
+            collect_read_prefix_aliases_from_expr(semantic, &item.expr, required_aliases);
+        }
+        if let Some(skip) = tail.skip.as_ref() {
+            collect_read_prefix_aliases_from_expr(semantic, skip, required_aliases);
+        }
+        if let Some(limit) = tail.limit.as_ref() {
+            collect_read_prefix_aliases_from_expr(semantic, limit, required_aliases);
+        }
+    }
+}
+
+fn collect_read_prefix_aliases_from_expr(
+    semantic: &GqlMutationSemanticPlan,
+    expr: &Expr,
+    aliases: &mut BTreeSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Variable(alias) => {
+            maybe_insert_read_prefix_alias(semantic, alias, aliases);
+        }
+        ExprKind::PropertyAccess { object, .. } => {
+            collect_read_prefix_aliases_from_expr(semantic, object, aliases);
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } => {
+            collect_read_prefix_aliases_from_expr(semantic, expr, aliases);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_read_prefix_aliases_from_expr(semantic, left, aliases);
+            collect_read_prefix_aliases_from_expr(semantic, right, aliases);
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => {
+            for arg in args {
+                collect_read_prefix_aliases_from_expr(semantic, arg, aliases);
+            }
+        }
+        ExprKind::Map(map) => {
+            for entry in &map.entries {
+                collect_read_prefix_aliases_from_expr(semantic, &entry.value, aliases);
+            }
+        }
+        ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
+    }
+}
+
+fn maybe_insert_read_prefix_alias(
+    semantic: &GqlMutationSemanticPlan,
+    alias: &str,
+    aliases: &mut BTreeSet<String>,
+) {
+    if semantic
+        .aliases
+        .get(alias)
+        .is_some_and(|binding| binding.origin == GqlAliasOrigin::ReadPrefix)
+    {
+        aliases.insert(alias.to_string());
+    }
+}
+
+fn expr_references_read_prefix_alias(expr: &Expr, semantic: &GqlMutationSemanticPlan) -> bool {
+    let mut aliases = BTreeSet::new();
+    collect_read_prefix_aliases_from_expr(semantic, expr, &mut aliases);
+    !aliases.is_empty()
+}
+
+fn mutation_operation_exprs(semantic: &GqlMutationSemanticPlan) -> Vec<Expr> {
+    let mut exprs = Vec::new();
+    for clause in &semantic.clauses {
+        match clause {
+            GqlBoundMutationClause::Create(create) => {
+                for pattern in &create.patterns {
+                    for node in &pattern.nodes {
+                        collect_map_value_exprs(node.properties.as_ref(), &mut exprs);
+                    }
+                    for edge in &pattern.edges {
+                        collect_map_value_exprs(edge.properties.as_ref(), &mut exprs);
+                    }
+                }
+            }
+            GqlBoundMutationClause::Set(set) => {
+                for item in &set.items {
+                    match item {
+                        GqlBoundSetItem::Property { value, .. }
+                        | GqlBoundSetItem::MapMerge { value, .. } => exprs.push(value.clone()),
+                        GqlBoundSetItem::NodeLabel { .. } => {}
+                    }
+                }
+            }
+            GqlBoundMutationClause::Remove(_) | GqlBoundMutationClause::Delete(_) => {}
+        }
+    }
+    exprs
+}
+
+fn collect_map_value_exprs(map: Option<&MapLiteral>, exprs: &mut Vec<Expr>) {
+    if let Some(map) = map {
+        exprs.extend(map.entries.iter().map(|entry| entry.value.clone()));
+    }
+}
+
+fn lower_mutation_clause(
+    clause: &GqlBoundMutationClause,
+    expr_cursor: &mut usize,
+) -> GqlMutationClausePlan {
+    match clause {
+        GqlBoundMutationClause::Create(create) => GqlMutationClausePlan::Create(
+            create
+                .patterns
+                .iter()
+                .map(|pattern| GqlCreatePatternPlan {
+                    nodes: pattern
+                        .nodes
+                        .iter()
+                        .map(|node| lower_create_node(node, expr_cursor))
+                        .collect(),
+                    edges: pattern
+                        .edges
+                        .iter()
+                        .map(|edge| lower_create_edge(edge, expr_cursor))
+                        .collect(),
+                })
+                .collect(),
+        ),
+        GqlBoundMutationClause::Set(set) => GqlMutationClausePlan::Set(
+            set.items
+                .iter()
+                .map(|item| lower_set_item(item, expr_cursor))
+                .collect(),
+        ),
+        GqlBoundMutationClause::Remove(remove) => {
+            GqlMutationClausePlan::Remove(remove.items.iter().map(lower_remove_item).collect())
+        }
+        GqlBoundMutationClause::Delete(delete) => GqlMutationClausePlan::Delete {
+            detach: delete.detach,
+            targets: delete
+                .targets
+                .iter()
+                .map(|target| GqlDeleteTargetPlan {
+                    alias: target.alias.clone(),
+                    kind: target.kind,
+                })
+                .collect(),
+        },
+    }
+}
+
+fn lower_create_node(node: &GqlBoundCreateNode, expr_cursor: &mut usize) -> GqlCreateNodePlan {
+    GqlCreateNodePlan {
+        alias: node.alias.clone(),
+        labels: node.labels.iter().map(|label| label.name.clone()).collect(),
+        property_keys: map_property_keys(node.properties.as_ref()),
+        property_values: map_property_values(node.properties.as_ref(), expr_cursor),
+        created: node.created,
+    }
+}
+
+fn lower_create_edge(edge: &GqlBoundCreateEdge, expr_cursor: &mut usize) -> GqlCreateEdgePlan {
+    GqlCreateEdgePlan {
+        alias: edge.alias.clone(),
+        from_alias: edge.from_alias.clone(),
+        to_alias: edge.to_alias.clone(),
+        label: edge.rel_type.name.clone(),
+        property_keys: map_property_keys(edge.properties.as_ref()),
+        property_values: map_property_values(edge.properties.as_ref(), expr_cursor),
+    }
+}
+
+fn lower_set_item(item: &GqlBoundSetItem, expr_cursor: &mut usize) -> GqlSetItemPlan {
+    match item {
+        GqlBoundSetItem::Property {
+            alias,
+            target_kind,
+            property,
+            ..
+        } => GqlSetItemPlan::Property {
+            alias: alias.clone(),
+            kind: *target_kind,
+            property: property.name.clone(),
+            value: next_expr_ref(expr_cursor),
+        },
+        GqlBoundSetItem::MapMerge {
+            alias, target_kind, ..
+        } => GqlSetItemPlan::MapMerge {
+            alias: alias.clone(),
+            kind: *target_kind,
+            value: next_expr_ref(expr_cursor),
+        },
+        GqlBoundSetItem::NodeLabel { alias, label, .. } => GqlSetItemPlan::NodeLabel {
+            alias: alias.clone(),
+            label: label.name.clone(),
+        },
+    }
+}
+
+fn lower_remove_item(item: &GqlBoundRemoveItem) -> GqlRemoveItemPlan {
+    match item {
+        GqlBoundRemoveItem::Property {
+            alias,
+            target_kind,
+            property,
+            ..
+        } => GqlRemoveItemPlan::Property {
+            alias: alias.clone(),
+            kind: *target_kind,
+            property: property.name.clone(),
+        },
+        GqlBoundRemoveItem::NodeLabel { alias, label, .. } => GqlRemoveItemPlan::NodeLabel {
+            alias: alias.clone(),
+            label: label.name.clone(),
+        },
+    }
+}
+
+fn map_property_keys(map: Option<&MapLiteral>) -> Vec<String> {
+    map.map(|map| {
+        map.entries
+            .iter()
+            .map(|entry| entry.key.name.clone())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn map_property_values(
+    map: Option<&MapLiteral>,
+    expr_cursor: &mut usize,
+) -> BTreeMap<String, GqlMutationExprRef> {
+    map.map(|map| {
+        map.entries
+            .iter()
+            .map(|entry| (entry.key.name.clone(), next_expr_ref(expr_cursor)))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn next_expr_ref(expr_cursor: &mut usize) -> GqlMutationExprRef {
+    let id = *expr_cursor;
+    *expr_cursor += 1;
+    GqlMutationExprRef { id }
+}
+
+fn mutation_return_columns(semantic: &GqlMutationSemanticPlan) -> Vec<String> {
+    match semantic.returns.as_ref() {
+        None => Vec::new(),
+        Some(GqlReturnPlan::Star {
+            expanded_aliases, ..
+        }) => expanded_aliases.clone(),
+        Some(GqlReturnPlan::Items(items)) => items
+            .iter()
+            .map(|item| {
+                item.explicit_alias
+                    .clone()
+                    .unwrap_or_else(|| expression_output_name(&item.expr))
+            })
+            .collect(),
+    }
 }
 
 struct LoweringState<'a> {
@@ -438,7 +1138,7 @@ impl<'a> LoweringState<'a> {
         &self,
         nodes: Vec<GraphNodePattern>,
         pieces: Vec<GraphPatternPiece>,
-        options: &GqlQueryOptions,
+        options: &GqlExecutionOptions,
     ) -> GraphRowQuery {
         let execution_limit = options.max_intermediate_bindings.max(1);
         GraphRowQuery {
@@ -462,11 +1162,11 @@ impl<'a> LoweringState<'a> {
             options: GraphQueryOptions {
                 allow_full_scan: options.allow_full_scan,
                 max_intermediate_bindings: execution_limit,
-                max_frontier: execution_limit,
-                max_path_hops: GraphQueryOptions::default().max_path_hops,
-                max_paths_per_start: GraphQueryOptions::default().max_paths_per_start,
+                max_frontier: options.max_frontier,
+                max_path_hops: options.max_path_hops,
+                max_paths_per_start: options.max_paths_per_start,
                 max_page_limit: execution_limit,
-                max_order_materialization: execution_limit,
+                max_order_materialization: options.max_order_materialization,
                 max_cursor_bytes: options.max_cursor_bytes,
                 max_query_bytes: options.max_query_bytes,
                 include_plan: options.include_plan,
@@ -478,7 +1178,7 @@ impl<'a> LoweringState<'a> {
     fn finalize_graph_row_target(
         &self,
         semantic: &GqlSemanticPlan,
-        options: &GqlQueryOptions,
+        options: &GqlExecutionOptions,
         target: &mut GqlNativeTarget,
     ) -> Result<(), EngineError> {
         let GqlNativeTarget::GraphRows { query } = target;
@@ -2904,7 +3604,7 @@ fn parameter_or_semantic_type_error(name: &str, message: &str, span: SourceSpan)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gql::parser::{parse_query, GqlParseOptions};
+    use crate::gql::parser::{parse_query, parse_statement, GqlParseOptions};
     use crate::{DatabaseEngine, DbOptions};
     use tempfile::TempDir;
 
@@ -2921,28 +3621,36 @@ mod tests {
     }
 
     fn lower(source: &str) -> Result<GqlLoweredPlan, EngineError> {
-        lower_query(parse(source), &params(), &GqlQueryOptions::default())
+        lower_query(parse(source), &params(), &GqlExecutionOptions::default())
     }
 
-    fn lower_with_options(source: &str, options: GqlQueryOptions) -> GqlLoweredPlan {
+    fn lower_with_options(source: &str, options: GqlExecutionOptions) -> GqlLoweredPlan {
         lower_query(parse(source), &params(), &options).unwrap()
     }
 
     fn lower_result_with_options(
         source: &str,
-        options: GqlQueryOptions,
+        options: GqlExecutionOptions,
     ) -> Result<GqlLoweredPlan, EngineError> {
         lower_query(parse(source), &params(), &options)
     }
 
     fn lower_with_params(source: &str, params: GqlParams) -> Result<GqlLoweredPlan, EngineError> {
-        lower_query(parse(source), &params, &GqlQueryOptions::default())
+        lower_query(parse(source), &params, &GqlExecutionOptions::default())
     }
 
-    fn allow_full_scan() -> GqlQueryOptions {
-        GqlQueryOptions {
+    fn lower_mut(source: &str) -> Result<GqlMutationPlan, EngineError> {
+        let statement = parse_statement(source, &GqlParseOptions::default()).unwrap();
+        let GqlStatementBody::Mutation(mutation) = statement.body else {
+            panic!("expected mutation statement");
+        };
+        lower_mutation(mutation, &params(), &allow_full_scan())
+    }
+
+    fn allow_full_scan() -> GqlExecutionOptions {
+        GqlExecutionOptions {
             allow_full_scan: true,
-            ..GqlQueryOptions::default()
+            ..GqlExecutionOptions::default()
         }
     }
 
@@ -2996,6 +3704,63 @@ mod tests {
             GraphPatternPiece::VariableLength(path) => path,
             other => panic!("expected variable-length piece, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lowers_create_only_mutation_without_read_prefix() {
+        let plan = lower_mut("CREATE (n:Person {key: 'ada', name: 'Ada'}) RETURN n").unwrap();
+        assert!(plan.read_prefix.is_none());
+        assert_eq!(plan.return_plan.as_ref().unwrap().columns, vec!["n"]);
+        let [GqlMutationClausePlan::Create(patterns)] = plan.clauses.as_slice() else {
+            panic!("expected CREATE plan");
+        };
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].nodes[0].alias, "n");
+        assert_eq!(patterns[0].nodes[0].labels, vec!["Person"]);
+        assert_eq!(
+            patterns[0].nodes[0].property_keys,
+            vec!["key".to_string(), "name".to_string()]
+        );
+        assert_eq!(plan.operation_exprs.len(), 2);
+        assert_eq!(patterns[0].nodes[0].property_values["key"].id, 0);
+        assert_eq!(patterns[0].nodes[0].property_values["name"].id, 1);
+    }
+
+    #[test]
+    fn lowers_match_backed_mutation_read_prefix_to_graph_rows() {
+        let plan = lower_mut(
+            "MATCH (n:Person {key: 'ada'}) OPTIONAL MATCH p = (n)-[r:KNOWS*1..1]->(m) SET n.name = m.name RETURN n, p",
+        )
+        .unwrap();
+        let read = plan.read_prefix.as_ref().expect("read prefix should lower");
+        assert!(matches!(
+            read.internal_columns[0],
+            GqlMutationInternalColumn::TargetId {
+                ref alias,
+                kind: GqlAliasKind::Node
+            } if alias == "n"
+        ));
+        assert!(read.internal_columns.iter().any(|column| {
+            matches!(column, GqlMutationInternalColumn::TargetPath { alias } if alias == "p")
+        }));
+        assert!(read
+            .internal_columns
+            .iter()
+            .any(|column| { matches!(column, GqlMutationInternalColumn::ExprValue { .. }) }));
+        assert_eq!(read.graph_row.query.return_items.as_ref().unwrap().len(), 4);
+        assert_eq!(plan.operation_exprs.len(), 1);
+        let [GqlMutationClausePlan::Set(items)] = plan.clauses.as_slice() else {
+            panic!("expected SET plan");
+        };
+        assert!(matches!(
+            &items[0],
+            GqlSetItemPlan::Property {
+                alias,
+                kind: GqlAliasKind::Node,
+                property,
+                value,
+            } if alias == "n" && property == "name" && value.id == 0
+        ));
     }
 
     #[test]
@@ -3123,10 +3888,12 @@ mod tests {
     fn graph_row_target_inherits_gql_intermediate_cap_without_max_rows_inflation() {
         let plan = lower_with_options(
             "MATCH (n:Person) RETURN n",
-            GqlQueryOptions {
+            GqlExecutionOptions {
                 max_rows: 100,
                 max_intermediate_bindings: 3,
-                ..GqlQueryOptions::default()
+                max_frontier: 3,
+                max_order_materialization: 3,
+                ..GqlExecutionOptions::default()
             },
         );
         let options = &graph_target(&plan).query.options;
@@ -3865,11 +4632,14 @@ mod tests {
 
     #[test]
     fn relationship_label_filter_intersection_preserves_existing_order() {
-        let pattern_labels = (0..128)
+        const PATTERN_LABEL_COUNT: usize = 128;
+        const OVERLAP_START: usize = 34;
+        const INCOMING_LABEL_END: usize = 160;
+        let pattern_labels = (0..PATTERN_LABEL_COUNT)
             .map(|idx| format!("REL_{idx}"))
             .collect::<Vec<_>>()
             .join("|");
-        let incoming_labels = (32..160)
+        let incoming_labels = (OVERLAP_START..INCOMING_LABEL_END)
             .rev()
             .flat_map(|idx| [format!("'REL_{idx}'"), format!("'REL_{idx}'")])
             .collect::<Vec<_>>()
@@ -3879,8 +4649,12 @@ mod tests {
         );
         let plan = lower(&source).unwrap();
         let edge = graph_edge(&graph_target(&plan).query, 0);
-        assert_eq!(edge.label_filter.len(), 96);
-        assert_eq!(edge.label_filter[0], "REL_32");
-        assert_eq!(edge.label_filter[95], "REL_127");
+        let expected_len = PATTERN_LABEL_COUNT - OVERLAP_START;
+        assert_eq!(edge.label_filter.len(), expected_len);
+        assert_eq!(edge.label_filter[0], format!("REL_{OVERLAP_START}"));
+        assert_eq!(
+            edge.label_filter[expected_len - 1],
+            format!("REL_{}", PATTERN_LABEL_COUNT - 1)
+        );
     }
 }

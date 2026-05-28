@@ -413,7 +413,7 @@ impl EngineCore {
             #[cfg(test)]
             CoreWriteRequest::WriteOpBatch { ops } => self.plan_write_op_batch(ops),
             CoreWriteRequest::GraphPatch { patch } => self.plan_graph_patch(patch),
-            CoreWriteRequest::TxnCommit { request } => self.plan_txn_commit(request),
+            CoreWriteRequest::TxnCommit { request, .. } => self.plan_txn_commit(request),
             CoreWriteRequest::Prune { policy } => self.plan_prune(policy),
             CoreWriteRequest::SetPrunePolicy { .. }
             | CoreWriteRequest::RemovePrunePolicy { .. }

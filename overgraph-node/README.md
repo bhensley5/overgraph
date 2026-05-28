@@ -20,7 +20,7 @@
 
 OverGraph is a graph database that runs inside your process. No server, no network calls, no Docker containers. You open a directory, and you have a full graph database with temporal edges, weighted relationships, sub-microsecond lookups, and built-in vector search.
 
-It's built to feel like a library, not a service you have to operate. Drive it with function calls when you're building in code, or with GQL if you want a declarative query language. Both are first-class and run on the same engine, so you're picking syntax, not implementations. And it's genuinely fast. Not "fast for a database," but fast enough that you forget it's there. Node lookups land in tens of nanoseconds and batch writes push past a million nodes per second, so the engine stays out of the way of the rest of your stack.
+It's built to feel like a library, not a service you have to operate. Drive it with function calls when you're building in code, or with GQL if you want a familiar query language. Both are first-class and run on the same engine, so you're picking syntax, not implementations. And it's genuinely fast. Not "fast for a database," but fast enough that you forget it's there. Node lookups land in tens of nanoseconds and batch writes push past a million nodes per second, so the engine stays out of the way of the rest of your stack.
 
 Graph structure and vector similarity can live in the same engine, so you can ask things like "find similar nodes within 2 hops of X" without bolting a second database onto the side. The core is pure Rust, with native connectors for Node.js and Python so you can call it from whatever you're building in.
 
@@ -43,7 +43,7 @@ Graph structure and vector similarity can live in the same engine, so you can as
 - **Explicit write transactions.** Stage ordered node and edge mutations locally, read your own staged writes, then commit atomically with optimistic conflict detection through the Node.js API.
 - **Native Node.js, one engine.** Rust core with napi-rs bindings. Not a wrapper around a REST API. Actual FFI into the same Rust engine with minimal overhead.
 - **Full queries as functions.** Use regular APIs for direct lookups, full boolean node/edge queries, and `queryGraphRows` for row-shaped graph patterns, optional matches, and bounded paths.
-- **GQL Beta.** Use `executeGql` / `executeGqlAsync` for familiar read-only `MATCH` / `OPTIONAL MATCH` syntax when the query-string form is the more ergonomic fit.
+- **GQL Beta.** Use `executeGql` / `executeGqlAsync` for GQL/Cypher-style graph reads and writes. `MATCH` reads and keyed `CREATE`, `SET`, `REMOVE`, `DELETE r`, and `DETACH DELETE n` mutations run on the same native substrates.
 
 ## Performance
 
@@ -107,9 +107,15 @@ db.close();
 
 ## GQL Beta
 
-The Node.js connector includes **GQL Beta**: a read-only GQL/Cypher-style interface backed by the same graph-row executor as `queryGraphRows`. It is not full ISO GQL or full Cypher yet, but it supports required matches, `OPTIONAL MATCH`, bounded variable-length paths, path values, continuation cursors, and familiar row results while still running through OverGraph's Rust parser, planner, indexes, caps, and explain output.
+The Node.js connector includes **GQL Beta**: a GQL/Cypher-style query language for graph reads and writes, backed by the same graph-row read executor and write-transaction machinery as the native APIs. Use it when a query is easier to read as text; keep native APIs such as `queryGraphRows` and explicit write transactions when structured request objects give you better control.
 
 ```javascript
+const created = db.executeGql(
+  `CREATE (p:Person {key: $key, name: $name, status: 'active'})
+   RETURN p.name AS name`,
+  { key: 'ada', name: 'Ada' }
+);
+
 const result = db.executeGql(
   `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
    WHERE p.status = $status AND r.since >= $minSince
@@ -120,12 +126,19 @@ const result = db.executeGql(
   { includePlan: true, profile: true }
 );
 
+console.log(created.kind);          // 'mutation'
+console.log(created.mutationStats); // created/updated/deleted counters
+console.log(result.nextCursor);     // read cursors use nextCursor
 console.log(result.rows);
 console.log(result.stats);
-console.log(result.plan?.rowOps);
+console.log(result.plan?.read?.rowOps);
+
+const asyncResult = await db.executeGqlAsync(
+  'MATCH (p:Person) RETURN p.name AS name ORDER BY p.name LIMIT 10'
+);
 ```
 
-GQL Beta supports `MATCH`, `OPTIONAL MATCH`, bounded paths, path functions, `WHERE`, `RETURN`, `ORDER BY`, `SKIP` / `OFFSET`, `LIMIT`, params, compact rows, cursors, explain/profile, full-scan opt-in, and vector opt-in for returned node values. See the full [GQL Beta API reference](../docs/api-reference.md#gql-beta) for supported syntax, result shapes, options, examples, and unsupported beta features.
+`mode: 'readOnly'` rejects mutation statements, and mutation statements do not accept or return cursors. GQL Beta supports `MATCH`, `OPTIONAL MATCH`, bounded paths, path functions, `WHERE`, `RETURN`, `ORDER BY`, `SKIP` / `OFFSET`, `LIMIT`, params, read cursors, compact rows, vector opt-in, explain/profile, `CREATE`, `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, mutation stats, and mutation `RETURN` for `CREATE` / `SET` / `REMOVE`. See the full [GQL Beta API reference](../docs/api-reference.md#gql-beta) for syntax, result shapes, options, examples, and current limitations.
 
 ### Async support
 
@@ -162,7 +175,7 @@ The Node.js connector includes `Async` suffixed variants for every API, such as 
 - **Degree counts.** Count edges, sum weights, and compute averages without materializing neighbor lists. Batch `degrees` for bulk analysis.
 - **Direct property queries.** `findNodes` and `findNodesPaged` do focused equality lookups with semantic numeric equality for finite scalars. `findNodesRange` and `findNodesRangePaged` do domainless numeric range scans with exact bound and cursor semantics.
 - **Optional property indexes.** Declare node or edge equality/range indexes only where they pay off. Range indexes cover finite scalar numeric values across signed integers, unsigned integers, and finite floats; non-finite floats and non-numeric values are excluded. Use `ensureNodePropertyIndex` / `ensureEdgePropertyIndex`, list APIs, and drop APIs to manage them. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
-- **Full query APIs.** `queryNodeIds`, `queryNodes`, `queryEdgeIds`, `queryEdges`, `queryGraphRows`, and explain APIs combine IDs, keys, node label filters (`{ labels, mode: 'any' | 'all' }`), edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths. `executeGql` adds GQL Beta for read-only query strings over the same graph-row substrate. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
+- **Full query APIs.** `queryNodeIds`, `queryNodes`, `queryEdgeIds`, `queryEdges`, `queryGraphRows`, and explain APIs combine IDs, keys, node label filters (`{ labels, mode: 'any' | 'all' }`), edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths. `executeGql` adds GQL Beta for query-string reads and mutations over the same native substrates. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
 - **Time-range queries.** Find nodes created or updated within a time window. Sorted timestamp index for efficient range scans.
 
 ### Pagination
