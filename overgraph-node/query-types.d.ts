@@ -625,12 +625,21 @@ export type GqlParam =
 
 export type GqlParams = Record<string, GqlParam>
 
-export interface GqlQueryOptions {
+export type GqlExecutionMode = 'auto' | 'readOnly'
+
+export interface GqlExecutionOptions {
+  mode?: GqlExecutionMode
   allowFullScan?: boolean
   maxRows?: number
-  cursor?: string
+  cursor?: string | null
   maxCursorBytes?: number
+  maxMutationRows?: number
+  maxMutationOps?: number
   maxIntermediateBindings?: number
+  maxFrontier?: number
+  maxPathHops?: number
+  maxPathsPerStart?: number
+  maxOrderMaterialization?: number
   maxSkip?: number
   maxQueryBytes?: number
   maxParamBytes?: number
@@ -691,7 +700,6 @@ export interface GqlExecutionStats {
   intermediateBindings: number
   dbHits: number
   elapsedUs: number | null
-  truncated: boolean
   warnings: Array<string>
 }
 
@@ -706,11 +714,29 @@ export interface GqlCapSummary {
   maxLiteralItems: number
 }
 
+export interface GqlExecutionCapSummary {
+  allowFullScan: boolean
+  maxRows: number
+  maxCursorBytes: number
+  maxMutationRows: number
+  maxMutationOps: number
+  maxQueryBytes: number
+  maxParamBytes: number
+  maxAstDepth: number
+  maxLiteralItems: number
+  maxIntermediateBindings: number
+  maxFrontier: number
+  maxPathHops: number
+  maxPathsPerStart: number
+  maxOrderMaterialization: number
+  maxSkip: number
+}
+
 export type GqlLoweringTarget = 'node_query' | 'edge_query' | 'graph_row_query'
 
 export type GqlRowOperation = 'residual_filter' | 'projection' | 'sort' | 'skip' | 'limit'
 
-export interface GqlExplain {
+export interface GqlReadExplain {
   columns: Array<string>
   target: GqlLoweringTarget
   nativePlan: QueryPlan | null
@@ -722,20 +748,89 @@ export interface GqlExplain {
   warnings: Array<string>
 }
 
-export interface GqlObjectRowsResult {
+export interface GqlMutationReadPrefixExplain {
+  graphRowTarget: GqlReadExplain
+  internalColumns: Array<string>
+  targetAliases: Array<string>
+  expressionColumns: number
+}
+
+export interface GqlMutationOperationExplain {
+  op: string
+  targetAlias: string | null
+  rowMultiplicity: string
+  detail: string
+}
+
+export interface GqlMutationReturnExplain {
+  columns: Array<string>
+  orderItems: number
+  skip: number
+  limit: number | null
+  postCommitHydration: string
+}
+
+export interface GqlMutationExplain {
+  readPrefix: GqlMutationReadPrefixExplain | null
+  operations: Array<GqlMutationOperationExplain>
+  returnPlan: GqlMutationReturnExplain | null
+  wouldCreateNodeLabels: Array<string>
+  wouldCreateEdgeLabels: Array<string>
+  usesTransactionSnapshot: boolean
+  usesWriteTxn: boolean
+  replacementAdapters: boolean
+  atomicCommit: boolean
+}
+
+export interface GqlExecutionExplain {
+  kind: 'query' | 'mutation'
+  columns: Array<string>
+  read: GqlReadExplain | null
+  mutation: GqlMutationExplain | null
+  caps: GqlExecutionCapSummary
+  warnings: Array<string>
+  notes: Array<string>
+}
+
+export interface GqlMutationStats {
+  rowsMatched: number
+  mutationRows: number
+  mutationOps: number
+  nodesCreated: number
+  nodesUpdated: number
+  nodesDeleted: number
+  edgesCreated: number
+  edgesUpdated: number
+  edgesDeleted: number
+  labelsAdded: number
+  labelsRemoved: number
+  propertiesSet: number
+  propertiesRemoved: number
+  skippedNullTargets: number
+  duplicateTargets: number
+  dbHits: number
+  elapsedUs: number | null
+  warnings: Array<string>
+}
+
+export interface GqlObjectRowsExecutionResult {
+  kind: 'query' | 'mutation'
   columns: Array<string>
   rows: Array<Record<string, GqlValue>>
   nextCursor: string | null
   stats: GqlExecutionStats
-  plan: GqlExplain | null
+  mutationStats: GqlMutationStats | null
+  plan: GqlExecutionExplain | null
 }
 
-export interface GqlCompactRowsResult {
+export interface GqlCompactRowsExecutionResult {
+  kind: 'query' | 'mutation'
   columns: Array<string>
   rows: Array<Array<GqlValue>>
   nextCursor: string | null
   stats: GqlExecutionStats
-  plan: GqlExplain | null
+  mutationStats: GqlMutationStats | null
+  plan: GqlExecutionExplain | null
 }
 
-export type GqlResult = GqlObjectRowsResult | GqlCompactRowsResult
+export type GqlExecutionResult = GqlObjectRowsExecutionResult | GqlCompactRowsExecutionResult

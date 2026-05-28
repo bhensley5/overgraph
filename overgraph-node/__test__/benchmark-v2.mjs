@@ -649,7 +649,7 @@ function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
     const unsupported = [...selectedScenarioIds].filter((id) => !supportedScenarioIds.has(id));
     if (unsupported.length > 0) {
       throw new Error(
-        `--scenario-id is currently limited to CP32.10 final scenarios; unsupported: ${unsupported.sort().join(', ')}`
+        `--scenario-id is currently limited to final graph-row scenarios; unsupported: ${unsupported.sort().join(', ')}`
       );
     }
     if (selectedScenarioIds.has('S-QUERY-007')) {

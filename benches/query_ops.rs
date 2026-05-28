@@ -1,11 +1,12 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, EdgeFilterExpr, EdgeInput, EdgeQuery, GqlParamValue,
-    GqlParams, GqlQueryOptions, GraphBinaryOp, GraphEdgePattern, GraphExpr, GraphNodeField,
-    GraphNodePattern, GraphOrderDirection, GraphOrderItem, GraphOutputOptions, GraphPageRequest,
-    GraphParamValue, GraphPatternPiece, GraphQueryOptions, GraphReturnItem, GraphReturnProjection,
-    LabelMatchMode, NodeFilterExpr, NodeInput, NodeLabelFilter, NodeQuery, PageRequest, PropValue,
-    PropertyRangeBound, SecondaryIndexKind, SecondaryIndexState,
+    DatabaseEngine, DbOptions, Direction, EdgeFilterExpr, EdgeInput, EdgeQuery,
+    GqlExecutionOptions, GqlParamValue, GqlParams, GqlStatementKind, GraphBinaryOp,
+    GraphEdgePattern, GraphExpr, GraphNodeField, GraphNodePattern, GraphOrderDirection,
+    GraphOrderItem, GraphOutputOptions, GraphPageRequest, GraphParamValue, GraphPatternPiece,
+    GraphQueryOptions, GraphReturnItem, GraphReturnProjection, LabelMatchMode, NodeFilterExpr,
+    NodeInput, NodeLabelFilter, NodeQuery, PageRequest, PropValue, PropertyRangeBound,
+    SecondaryIndexKind, SecondaryIndexState,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1355,7 +1356,8 @@ fn build_fanout_anchor_choice_engine() -> (tempfile::TempDir, DatabaseEngine) {
         })
         .collect();
     let mids = engine.batch_upsert_nodes(mid_inputs.clone()).unwrap();
-    let anchor_inputs: Vec<_> = (0..32)
+    const OPTIONAL_ANCHOR_COUNT: usize = 34;
+    let anchor_inputs: Vec<_> = (0..OPTIONAL_ANCHOR_COUNT)
         .map(|index| NodeInput {
             labels: vec![bench_node_label(2)],
             key: format!("anchor-{index:02}"),
@@ -1702,6 +1704,110 @@ fn assert_graph_row_result_count(
     result
 }
 
+fn temp_gql_mutation_bench_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        ..DbOptions::default()
+    };
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    (dir, engine)
+}
+
+fn gql_bench_node(label: &str, key: &str, props: BTreeMap<String, PropValue>) -> NodeInput {
+    NodeInput {
+        labels: vec![label.to_string()],
+        key: key.to_string(),
+        props,
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }
+}
+
+fn gql_bench_props(values: &[(&str, PropValue)]) -> BTreeMap<String, PropValue> {
+    values
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.clone()))
+        .collect()
+}
+
+fn setup_gql_set_smoke_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_gql_mutation_bench_db();
+    engine
+        .batch_upsert_nodes(vec![gql_bench_node(
+            "GqlBenchSet",
+            "n",
+            gql_bench_props(&[("status", PropValue::String("old".to_string()))]),
+        )])
+        .unwrap();
+    (dir, engine)
+}
+
+fn setup_gql_detach_delete_smoke_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_gql_mutation_bench_db();
+    let node_ids = engine
+        .batch_upsert_nodes(vec![
+            gql_bench_node("GqlBenchDetach", "hub", BTreeMap::new()),
+            gql_bench_node("GqlBenchDetach", "left", BTreeMap::new()),
+            gql_bench_node("GqlBenchDetach", "right", BTreeMap::new()),
+        ])
+        .unwrap();
+    engine
+        .batch_upsert_edges(vec![
+            EdgeInput {
+                from: node_ids[0],
+                to: node_ids[1],
+                label: "GQL_BENCH_DETACH".to_string(),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+            },
+            EdgeInput {
+                from: node_ids[2],
+                to: node_ids[0],
+                label: "GQL_BENCH_DETACH".to_string(),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+            },
+        ])
+        .unwrap();
+    (dir, engine)
+}
+
+fn setup_gql_mutation_return_smoke_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_gql_mutation_bench_db();
+    let nodes: Vec<NodeInput> = (0..3)
+        .map(|i| {
+            gql_bench_node(
+                "GqlBenchReturn",
+                &format!("n{i}"),
+                gql_bench_props(&[
+                    ("rank", PropValue::Int(i as i64)),
+                    ("status", PropValue::String("old".to_string())),
+                ]),
+            )
+        })
+        .collect();
+    engine.batch_upsert_nodes(nodes).unwrap();
+    (dir, engine)
+}
+
+fn assert_gql_mutation_result(
+    result: overgraph::GqlExecutionResult,
+    expected_rows: usize,
+) -> overgraph::GqlExecutionResult {
+    assert_eq!(result.kind, GqlStatementKind::Mutation);
+    assert_eq!(result.rows.len(), expected_rows);
+    assert_eq!(result.stats.rows_returned, expected_rows);
+    assert!(result.next_cursor.is_none());
+    assert!(result.mutation_stats.is_some());
+    result
+}
+
 fn bench_gql_queries(c: &mut Criterion) {
     let mut graph_group = c.benchmark_group("graph_row_query");
     graph_group.sample_size(20);
@@ -1731,14 +1837,14 @@ fn bench_gql_queries(c: &mut Criterion) {
 
     group.bench_function("native_query_node_ids_indexed_property_baseline", |b| {
         let (_dir, engine) = build_indexed_query_engine();
-        let query = status_active_query(Some(GqlQueryOptions::default().max_rows));
+        let query = status_active_query(Some(GqlExecutionOptions::default().max_rows));
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
 
     group.bench_function("gql_explain_parse_lower_plan_ordered", |b| {
         let (_dir, engine) = build_indexed_query_engine();
         let params = GqlParams::new();
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query =
             "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n.tenant ORDER BY n.score LIMIT 25";
         b.iter(|| {
@@ -1753,7 +1859,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_return_id_indexed_property", |b| {
         let (_dir, engine) = build_indexed_query_engine();
         let params = GqlParams::new();
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN id(n)";
         b.iter(|| {
             black_box(
@@ -1767,7 +1873,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_return_property_no_hydration", |b| {
         let (_dir, engine) = build_indexed_query_engine();
         let params = GqlParams::new();
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n.tenant";
         b.iter(|| {
             black_box(
@@ -1781,7 +1887,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_return_node_element_without_vectors", |b| {
         let (_dir, engine) = build_indexed_query_engine();
         let params = GqlParams::new();
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n LIMIT 25";
         b.iter(|| {
             black_box(
@@ -1795,7 +1901,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_order_by_limit", |b| {
         let (_dir, engine) = build_indexed_query_engine();
         let params = GqlParams::new();
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query =
             "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n.tenant ORDER BY n.score LIMIT 25";
         b.iter(|| {
@@ -1810,9 +1916,9 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_full_scan_opt_in", |b| {
         let (_dir, engine) = build_fallback_query_engine();
         let params = GqlParams::new();
-        let options = GqlQueryOptions {
+        let options = GqlExecutionOptions {
             allow_full_scan: true,
-            ..GqlQueryOptions::default()
+            ..GqlExecutionOptions::default()
         };
         let query = "MATCH (n) WHERE n.region = 'r03' RETURN id(n) LIMIT 100";
         b.iter(|| {
@@ -1830,7 +1936,7 @@ fn bench_gql_queries(c: &mut Criterion) {
             "role".to_string(),
             GqlParamValue::String("lead".to_string()),
         )]);
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query = "MATCH ()-[r:BenchEdge10]->() WHERE r.role = $role RETURN id(r), r.score ORDER BY r.score DESC LIMIT 100";
         b.iter(|| {
             black_box(
@@ -1844,10 +1950,10 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_include_plan_profile", |b| {
         let (_dir, engine) = build_indexed_query_engine();
         let params = GqlParams::new();
-        let options = GqlQueryOptions {
+        let options = GqlExecutionOptions {
             include_plan: true,
             profile: true,
-            ..GqlQueryOptions::default()
+            ..GqlExecutionOptions::default()
         };
         let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN n.tenant ORDER BY n.score LIMIT 25";
         b.iter(|| {
@@ -1862,7 +1968,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_fixed_one_hop_pattern", |b| {
         let (_dir, engine, _company_id) = build_pattern_engine();
         let params = GqlParams::new();
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query =
             "MATCH (p:BenchNode1)-[r:BenchEdge10]->(c:BenchNode2) RETURN id(p), id(r), id(c)";
         b.iter(|| {
@@ -1877,7 +1983,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_fixed_branching_pattern", |b| {
         let (_dir, engine, _company_id) = build_pattern_engine();
         let params = GqlParams::new();
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query = "MATCH (p:BenchNode1)-[:BenchEdge10]->(c:BenchNode2)<-[:BenchEdge10]-(peer:BenchNode1) RETURN id(p), id(c), id(peer) LIMIT 100";
         b.iter(|| {
             black_box(
@@ -1897,7 +2003,7 @@ fn bench_gql_queries(c: &mut Criterion) {
             ),
             ("source".to_string(), GqlParamValue::UInt(source_id)),
         ]);
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query =
             "MATCH (source:BenchNode1)-[edge:BenchEdge10 {role: $role}]->(target:BenchNode2) \
                      WHERE id(source) = $source \
@@ -1921,7 +2027,7 @@ fn bench_gql_queries(c: &mut Criterion) {
             ),
             ("source".to_string(), GqlParamValue::UInt(source_id)),
         ]);
-        let options = GqlQueryOptions::default();
+        let options = GqlExecutionOptions::default();
         let query =
             "MATCH (source:BenchNode1)-[edge:BenchEdge10 {role: $role}]->(target:BenchNode2) \
                      WHERE id(source) = $source \
@@ -1936,6 +2042,86 @@ fn bench_gql_queries(c: &mut Criterion) {
             assert_eq!(result.rows.len(), QUERY_LIMIT);
             black_box(result)
         });
+    });
+
+    group.bench_function("gql_mutation_create_smoke", |b| {
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query = "CREATE (n:GqlBenchCreate {key: 'n', status: 'new'})";
+        b.iter_batched(
+            temp_gql_mutation_bench_db,
+            |(_dir, engine)| {
+                let result = engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap();
+                let result = assert_gql_mutation_result(result, 0);
+                let stats = result.mutation_stats.as_ref().unwrap();
+                assert_eq!(stats.nodes_created, 1);
+                assert_eq!(stats.mutation_ops, 1);
+                black_box(result)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("gql_mutation_match_set_smoke", |b| {
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query = "MATCH (n:GqlBenchSet) WHERE n.key = 'n' SET n.status = 'new'";
+        b.iter_batched(
+            setup_gql_set_smoke_db,
+            |(_dir, engine)| {
+                let result = engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap();
+                let result = assert_gql_mutation_result(result, 0);
+                let stats = result.mutation_stats.as_ref().unwrap();
+                assert_eq!(stats.nodes_updated, 1);
+                assert_eq!(stats.properties_set, 1);
+                black_box(result)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("gql_mutation_detach_delete_smoke", |b| {
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query = "MATCH (n:GqlBenchDetach) WHERE n.key = 'hub' DETACH DELETE n";
+        b.iter_batched(
+            setup_gql_detach_delete_smoke_db,
+            |(_dir, engine)| {
+                let result = engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap();
+                let result = assert_gql_mutation_result(result, 0);
+                let stats = result.mutation_stats.as_ref().unwrap();
+                assert_eq!(stats.nodes_deleted, 1);
+                assert_eq!(stats.edges_deleted, 2);
+                black_box(result)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("gql_mutation_return_smoke", |b| {
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query = "MATCH (n:GqlBenchReturn) SET n.touched = true RETURN n.key AS key ORDER BY n.rank LIMIT 2";
+        b.iter_batched(
+            setup_gql_mutation_return_smoke_db,
+            |(_dir, engine)| {
+                let result = engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap();
+                let result = assert_gql_mutation_result(result, 2);
+                let stats = result.mutation_stats.as_ref().unwrap();
+                assert_eq!(stats.mutation_rows, 3);
+                assert_eq!(stats.nodes_updated, 3);
+                black_box(result)
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();

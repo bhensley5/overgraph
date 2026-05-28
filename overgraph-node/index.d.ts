@@ -132,8 +132,8 @@ export declare class OverGraph {
   explainNodeQuery(request: import('./query-types').QueryNodeRequest): import('./query-types').QueryPlan
   explainEdgeQuery(request: import('./query-types').QueryEdgeRequest): import('./query-types').QueryPlan
   explainGraphRows(request: import('./query-types').GraphRowRequest): import('./query-types').GraphRowExplain
-  executeGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null): import('./query-types').GqlResult
-  explainGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null): import('./query-types').GqlExplain
+  executeGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): import('./query-types').GqlExecutionResult
+  explainGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): import('./query-types').GqlExecutionExplain
   ensureNodePropertyIndex(label: string, propKey: string, kind: string): NodePropertyIndexInfo
   dropNodePropertyIndex(label: string, propKey: string, kind: string): boolean
   listNodePropertyIndexes(): Array<NodePropertyIndexInfo>
@@ -224,8 +224,8 @@ export declare class OverGraph {
   explainNodeQueryAsync(request: import('./query-types').QueryNodeRequest): Promise<import('./query-types').QueryPlan>
   explainEdgeQueryAsync(request: import('./query-types').QueryEdgeRequest): Promise<import('./query-types').QueryPlan>
   explainGraphRowsAsync(request: import('./query-types').GraphRowRequest): Promise<import('./query-types').GraphRowExplain>
-  executeGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null): Promise<import('./query-types').GqlResult>
-  explainGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlQueryOptions | null): Promise<import('./query-types').GqlExplain>
+  executeGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): Promise<import('./query-types').GqlExecutionResult>
+  explainGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): Promise<import('./query-types').GqlExecutionExplain>
   ensureNodePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<NodePropertyIndexInfo>
   dropNodePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<boolean>
   listNodePropertyIndexesAsync(): Promise<Array<NodePropertyIndexInfo>>
@@ -516,12 +516,19 @@ export interface FindNodesRangePagedOptions {
   after?: PropertyRangeCursor
 }
 
-export interface GqlQueryOptionsInput {
+export interface GqlExecutionOptionsInput {
+  mode?: string
   allowFullScan?: boolean
   maxRows?: number
   cursor?: string
   maxCursorBytes?: number
+  maxMutationRows?: number
+  maxMutationOps?: number
   maxIntermediateBindings?: number
+  maxFrontier?: number
+  maxPathHops?: number
+  maxPathsPerStart?: number
+  maxOrderMaterialization?: number
   maxSkip?: number
   maxQueryBytes?: number
   maxParamBytes?: number

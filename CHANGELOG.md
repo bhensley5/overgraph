@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-27
+
+### Added
+
+#### GQL Beta Mutations
+- **Executable GQL writes across Rust, Node.js, and Python.** Added keyed `CREATE`, `SET`, `REMOVE`, `DELETE r`, and `DETACH DELETE n` execution to `execute_gql` / `executeGql`, using the same write-transaction machinery and durability path as the structured APIs.
+- **Mutation `RETURN` support.** `CREATE`, `SET`, and `REMOVE` statements can now return object rows or compact rows with aliases, scalar expressions, ordering, `SKIP` / `OFFSET`, `LIMIT`, vector opt-in, and embedded explain/profile output.
+- **Mutation result and explain surfaces.** GQL execution now returns unified mutation result payloads with `mutation_stats`, and `explain_gql` can describe mutation plans without side effects.
+
+### Changed
+
+#### GQL Execution
+- **Reads and writes now share one public GQL surface.** GQL Beta is no longer limited to read queries; read prefixes, mutation staging, caps, and result shaping now flow through one execution contract across all three language connectors.
+- **Connector docs and getting-started guidance now cover writes.** README, getting-started, API reference, and `docs/gql-subset.md` now document mutation syntax, limits, `ReadOnly` mode, and the supported mutation `RETURN` behavior.
+
+### Fixed
+
+- **Mutation planner and runtime parity.** GQL mutations now preserve native semantics for cap enforcement, optional-null handling, delete deduplication, replacement ordering, conflict detection, cursor rejection, and truthful profiling.
+- **Connector parity and validation.** Node.js and Python now match the Rust core for mutation options, error surfaces, compact-row output, vector opt-in, and mutation `RETURN ORDER BY` guardrails.
+
 ## [0.9.0] - 2026-05-26
 
 ### Added
@@ -356,6 +376,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.10.0]: https://github.com/bhensley5/overgraph/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/bhensley5/overgraph/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/bhensley5/overgraph/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/bhensley5/overgraph/compare/v0.6.0...v0.7.0

@@ -78,6 +78,7 @@ pub(crate) enum TokenKind {
     Star,
     Pipe,
     Plus,
+    PlusEquals,
     Slash,
     Eof,
 }
@@ -132,7 +133,7 @@ impl<'a> Lexer<'a> {
                 ';' => self.single(TokenKind::Semicolon),
                 '*' => self.single(TokenKind::Star),
                 '|' => self.single(TokenKind::Pipe),
-                '+' => self.single(TokenKind::Plus),
+                '+' => self.lex_plus(),
                 '/' => self.single(TokenKind::Slash),
                 '-' => self.lex_dash(),
                 '<' => self.lex_less(),
@@ -173,6 +174,17 @@ impl<'a> Lexer<'a> {
             self.push(TokenKind::RightArrow, start);
         } else {
             self.push(TokenKind::Dash, start);
+        }
+    }
+
+    fn lex_plus(&mut self) {
+        let start = self.mark();
+        self.advance_char();
+        if self.peek_char() == Some('=') {
+            self.advance_char();
+            self.push(TokenKind::PlusEquals, start);
+        } else {
+            self.push(TokenKind::Plus, start);
         }
     }
 

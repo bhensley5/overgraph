@@ -1,4 +1,4 @@
-// Internal CP31P projection tests.
+// Internal projection tests.
 
 use crate::row_projection::{
     EdgeOutputProjection, EdgeProjectionField, NodeOutputProjection, NodeProjectionField,

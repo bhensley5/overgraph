@@ -3,7 +3,7 @@
 use crate::error::EngineError;
 use crate::gql::ast::*;
 use crate::gql::lexer::{lex, Keyword, Token, TokenKind};
-use crate::types::SourceSpan;
+use crate::types::{GqlStatementKind, SourceSpan};
 
 #[derive(Clone, Debug)]
 pub(crate) struct GqlParseOptions {
@@ -47,6 +47,34 @@ pub(crate) fn parse_query(query: &str, options: &GqlParseOptions) -> Result<GqlQ
     Parser::new(query, tokens, options).parse_query()
 }
 
+pub(crate) fn parse_statement(
+    source: &str,
+    options: &GqlParseOptions,
+) -> Result<GqlStatement, EngineError> {
+    if options.max_ast_depth == 0 {
+        return Err(EngineError::GqlParse {
+            message: "max_ast_depth must be at least 1".to_string(),
+            span: span_at_offset(source, 0, source.chars().next().map_or(0, char::len_utf8)),
+        });
+    }
+    if source.len() > options.max_query_bytes {
+        return Err(EngineError::GqlParse {
+            message: format!(
+                "query exceeds max_query_bytes of {} bytes",
+                options.max_query_bytes
+            ),
+            span: span_at_offset(
+                source,
+                options.max_query_bytes,
+                source.len() - options.max_query_bytes,
+            ),
+        });
+    }
+
+    let tokens = lex(source)?;
+    Parser::new(source, tokens, options).parse_statement()
+}
+
 struct Parser<'a> {
     query: &'a str,
     tokens: Vec<Token>,
@@ -81,6 +109,37 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_statement(&mut self) -> Result<GqlStatement, EngineError> {
+        if self.at_mutation_clause_start() {
+            return self.parse_mutation_statement(Vec::new());
+        }
+
+        if self.at_match_clause_start() {
+            let mut match_clauses = Vec::new();
+            match_clauses.push(self.parse_match_clause()?);
+            while self.at_match_clause_start() {
+                match_clauses.push(self.parse_match_clause()?);
+            }
+            if self.at_mutation_clause_start() {
+                return self.parse_mutation_statement(match_clauses);
+            }
+            let query = self.parse_query_tail(match_clauses)?;
+            return Ok(GqlStatement {
+                kind: GqlStatementKind::Query,
+                span: query.span.clone(),
+                body: GqlStatementBody::Query(query),
+            });
+        }
+
+        self.reject_unsupported_clause()?;
+        let query = self.parse_query()?;
+        Ok(GqlStatement {
+            kind: GqlStatementKind::Query,
+            span: query.span.clone(),
+            body: GqlStatementBody::Query(query),
+        })
+    }
+
     fn parse_query(&mut self) -> Result<GqlQuery, EngineError> {
         self.reject_unsupported_clause()?;
         let mut match_clauses = Vec::new();
@@ -89,6 +148,13 @@ impl<'a> Parser<'a> {
             match_clauses.push(self.parse_match_clause()?);
         }
 
+        self.parse_query_tail(match_clauses)
+    }
+
+    fn parse_query_tail(
+        &mut self,
+        match_clauses: Vec<MatchClause>,
+    ) -> Result<GqlQuery, EngineError> {
         self.reject_unsupported_clause()?;
         let return_clause = self.parse_return_clause()?;
         let order_by = if self.at_keyword(Keyword::Order) {
@@ -137,6 +203,292 @@ impl<'a> Parser<'a> {
             skip,
             limit,
             span,
+        })
+    }
+
+    fn parse_mutation_statement(
+        &mut self,
+        read_prefix: Vec<MatchClause>,
+    ) -> Result<GqlStatement, EngineError> {
+        for clause in &read_prefix {
+            if clause.patterns.len() != 1 {
+                return Err(EngineError::GqlUnsupported {
+                    feature: "comma-separated mutation read-prefix pattern lists".to_string(),
+                    message: "mutation read-prefix MATCH clauses support exactly one pattern; use repeated MATCH clauses instead".to_string(),
+                    span: clause.span.clone(),
+                });
+            }
+        }
+
+        let start_span = read_prefix
+            .first()
+            .map(|clause| clause.span.clone())
+            .unwrap_or_else(|| self.current().span.clone());
+        let mut mutation_clauses = Vec::new();
+        while self.at_mutation_clause_start() {
+            mutation_clauses.push(self.parse_mutation_clause()?);
+            if self.at_match_clause_start() {
+                return Err(EngineError::GqlUnsupported {
+                    feature: "read-after-write matching".to_string(),
+                    message: "MATCH and OPTIONAL MATCH clauses must appear before mutation clauses"
+                        .to_string(),
+                    span: self.current().span.clone(),
+                });
+            }
+        }
+        if mutation_clauses.is_empty() {
+            return Err(self.parse_error_current("expected mutation clause"));
+        }
+
+        let return_tail = if self.at_keyword(Keyword::Return) {
+            Some(self.parse_mutation_return_tail()?)
+        } else {
+            if self.at_keyword(Keyword::Order)
+                || self.at_keyword(Keyword::Skip)
+                || self.at_keyword(Keyword::Offset)
+                || self.at_keyword(Keyword::Limit)
+            {
+                return Err(EngineError::GqlUnsupported {
+                    feature: "mutation row operations without RETURN".to_string(),
+                    message: "mutation ORDER BY, SKIP/OFFSET, and LIMIT require a RETURN tail"
+                        .to_string(),
+                    span: self.current().span.clone(),
+                });
+            }
+            None
+        };
+
+        if let Some(semicolon) = self.consume_if(|kind| matches!(kind, TokenKind::Semicolon)) {
+            if !self.at_eof() {
+                return Err(EngineError::GqlParse {
+                    message: "multiple statements are not supported".to_string(),
+                    span: semicolon.span,
+                });
+            }
+        }
+
+        self.reject_unsupported_clause()?;
+        if self.at_match_clause_start() {
+            return Err(EngineError::GqlUnsupported {
+                feature: "read-after-write matching".to_string(),
+                message: "MATCH and OPTIONAL MATCH clauses must appear before mutation clauses"
+                    .to_string(),
+                span: self.current().span.clone(),
+            });
+        }
+        if !self.at_eof() {
+            return Err(self.parse_error_current("unexpected token after mutation statement"));
+        }
+
+        let span = self.span_between(&start_span, &self.previous_non_eof_span());
+        let mutation = GqlMutationStatement {
+            read_prefix,
+            mutation_clauses,
+            return_tail,
+            span,
+        };
+        Ok(GqlStatement {
+            kind: GqlStatementKind::Mutation,
+            span: mutation.span.clone(),
+            body: GqlStatementBody::Mutation(mutation),
+        })
+    }
+
+    fn parse_mutation_clause(&mut self) -> Result<MutationClause, EngineError> {
+        if self.at_keyword(Keyword::Create) {
+            Ok(MutationClause::Create(self.parse_create_clause()?))
+        } else if self.at_keyword(Keyword::Set) {
+            Ok(MutationClause::Set(self.parse_set_clause()?))
+        } else if self.at_keyword(Keyword::Remove) {
+            Ok(MutationClause::Remove(self.parse_remove_clause()?))
+        } else if self.at_keyword(Keyword::Delete) || self.at_keyword(Keyword::Detach) {
+            Ok(MutationClause::Delete(self.parse_delete_clause()?))
+        } else {
+            Err(self.parse_error_current("expected mutation clause"))
+        }
+    }
+
+    fn parse_create_clause(&mut self) -> Result<CreateClause, EngineError> {
+        if self.create_clause_is_schema_ddl() {
+            return Err(self
+                .unsupported_current("schema/DDL", "schema and DDL statements are not supported"));
+        }
+        let start = self.expect_keyword(Keyword::Create, "expected CREATE clause")?;
+        let mut patterns = Vec::new();
+        patterns.push(self.parse_pattern()?);
+        while self
+            .consume_if(|kind| matches!(kind, TokenKind::Comma))
+            .is_some()
+        {
+            patterns.push(self.parse_pattern()?);
+        }
+        let end = patterns
+            .last()
+            .map(|pattern| pattern.span.clone())
+            .unwrap_or_else(|| start.span.clone());
+        Ok(CreateClause {
+            patterns,
+            span: self.span_between(&start.span, &end),
+        })
+    }
+
+    fn parse_set_clause(&mut self) -> Result<SetClause, EngineError> {
+        let start = self.expect_keyword(Keyword::Set, "expected SET clause")?;
+        let mut items = Vec::new();
+        items.push(self.parse_set_item()?);
+        while self
+            .consume_if(|kind| matches!(kind, TokenKind::Comma))
+            .is_some()
+        {
+            items.push(self.parse_set_item()?);
+        }
+        let end = set_item_span(items.last().expect("at least one SET item")).clone();
+        Ok(SetClause {
+            items,
+            span: self.span_between(&start.span, &end),
+        })
+    }
+
+    fn parse_set_item(&mut self) -> Result<SetItem, EngineError> {
+        let alias = self.parse_ident("expected alias in SET item")?;
+        if self
+            .consume_if(|kind| matches!(kind, TokenKind::PlusEquals))
+            .is_some()
+        {
+            let value = self.parse_expression(0)?.expr;
+            let span = self.span_between(&alias.span, &value.span);
+            return Ok(SetItem::MapMerge { alias, value, span });
+        }
+        if self
+            .consume_if(|kind| matches!(kind, TokenKind::Colon))
+            .is_some()
+        {
+            if self.at_kind(|kind| matches!(kind, TokenKind::Dollar)) {
+                return Err(self.unsupported_current(
+                    "dynamic labels",
+                    "dynamic node labels are not supported",
+                ));
+            }
+            let label = self.parse_ident("expected node label after ':'")?;
+            let span = self.span_between(&alias.span, &label.span);
+            return Ok(SetItem::NodeLabel { alias, label, span });
+        }
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::Dot),
+            "expected '.', ':', or '+=' in SET item",
+        )?;
+        let property = self.parse_property_ident("expected property name after '.'")?;
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::Equals),
+            "expected '=' in SET property item",
+        )?;
+        let value = self.parse_expression(0)?.expr;
+        let span = self.span_between(&alias.span, &value.span);
+        Ok(SetItem::Property {
+            alias,
+            property,
+            value,
+            span,
+        })
+    }
+
+    fn parse_remove_clause(&mut self) -> Result<RemoveClause, EngineError> {
+        let start = self.expect_keyword(Keyword::Remove, "expected REMOVE clause")?;
+        let mut items = Vec::new();
+        items.push(self.parse_remove_item()?);
+        while self
+            .consume_if(|kind| matches!(kind, TokenKind::Comma))
+            .is_some()
+        {
+            items.push(self.parse_remove_item()?);
+        }
+        let end = remove_item_span(items.last().expect("at least one REMOVE item")).clone();
+        Ok(RemoveClause {
+            items,
+            span: self.span_between(&start.span, &end),
+        })
+    }
+
+    fn parse_remove_item(&mut self) -> Result<RemoveItem, EngineError> {
+        let alias = self.parse_ident("expected alias in REMOVE item")?;
+        if self
+            .consume_if(|kind| matches!(kind, TokenKind::Colon))
+            .is_some()
+        {
+            if self.at_kind(|kind| matches!(kind, TokenKind::Dollar)) {
+                return Err(self.unsupported_current(
+                    "dynamic labels",
+                    "dynamic node labels are not supported",
+                ));
+            }
+            let label = self.parse_ident("expected node label after ':'")?;
+            let span = self.span_between(&alias.span, &label.span);
+            return Ok(RemoveItem::NodeLabel { alias, label, span });
+        }
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::Dot),
+            "expected '.' or ':' in REMOVE item",
+        )?;
+        let property = self.parse_property_ident("expected property name after '.'")?;
+        let span = self.span_between(&alias.span, &property.span);
+        Ok(RemoveItem::Property {
+            alias,
+            property,
+            span,
+        })
+    }
+
+    fn parse_delete_clause(&mut self) -> Result<DeleteClause, EngineError> {
+        let (detach, start) = if let Some(detach) = self.consume_keyword(Keyword::Detach) {
+            self.expect_keyword(Keyword::Delete, "expected DELETE after DETACH")?;
+            (true, detach.span)
+        } else {
+            let delete = self.expect_keyword(Keyword::Delete, "expected DELETE clause")?;
+            (false, delete.span)
+        };
+        let mut targets = Vec::new();
+        targets.push(self.parse_expression(0)?.expr);
+        while self
+            .consume_if(|kind| matches!(kind, TokenKind::Comma))
+            .is_some()
+        {
+            targets.push(self.parse_expression(0)?.expr);
+        }
+        let end = targets
+            .last()
+            .map(|target| target.span.clone())
+            .unwrap_or_else(|| start.clone());
+        Ok(DeleteClause {
+            detach,
+            targets,
+            span: self.span_between(&start, &end),
+        })
+    }
+
+    fn parse_mutation_return_tail(&mut self) -> Result<MutationReturnTail, EngineError> {
+        let return_clause = self.parse_return_clause()?;
+        let order_by = if self.at_keyword(Keyword::Order) {
+            self.parse_order_by()?
+        } else {
+            Vec::new()
+        };
+        let mut skip = None;
+        if self.at_keyword(Keyword::Skip) || self.at_keyword(Keyword::Offset) {
+            skip = Some(self.parse_skip_or_offset()?);
+        }
+        if self.at_keyword(Keyword::Skip) || self.at_keyword(Keyword::Offset) {
+            return Err(self.parse_error_current("SKIP and OFFSET cannot both be specified"));
+        }
+        let limit = if self.consume_keyword(Keyword::Limit).is_some() {
+            Some(self.parse_expression(0)?.expr)
+        } else {
+            None
+        };
+        Ok(MutationReturnTail {
+            return_clause,
+            order_by,
+            skip,
+            limit,
         })
     }
 
@@ -1302,6 +1654,16 @@ impl<'a> Parser<'a> {
             || (self.at_keyword(Keyword::Optional) && self.next_keyword_is(Keyword::Match))
     }
 
+    fn at_mutation_clause_start(&self) -> bool {
+        match self.current().kind {
+            TokenKind::Keyword(Keyword::Create) => !self.create_clause_is_schema_ddl(),
+            TokenKind::Keyword(
+                Keyword::Set | Keyword::Remove | Keyword::Delete | Keyword::Detach,
+            ) => true,
+            _ => false,
+        }
+    }
+
     fn next_keyword_is(&self, keyword: Keyword) -> bool {
         matches!(
             self.tokens.get(self.pos + 1).map(|token| &token.kind),
@@ -1429,6 +1791,20 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn set_item_span(item: &SetItem) -> &SourceSpan {
+    match item {
+        SetItem::Property { span, .. }
+        | SetItem::MapMerge { span, .. }
+        | SetItem::NodeLabel { span, .. } => span,
+    }
+}
+
+fn remove_item_span(item: &RemoveItem) -> &SourceSpan {
+    match item {
+        RemoveItem::Property { span, .. } | RemoveItem::NodeLabel { span, .. } => span,
+    }
+}
+
 fn span_at_offset(query: &str, offset: usize, length: usize) -> SourceSpan {
     let mut line = 1u32;
     let mut column = 1u32;
@@ -1500,6 +1876,16 @@ mod tests {
 
     fn parse_err(query: &str) -> EngineError {
         parse_query(query, &GqlParseOptions::default()).expect_err("query should fail")
+    }
+
+    fn parse_statement_ok(source: &str) -> GqlStatement {
+        parse_statement(source, &GqlParseOptions::default()).unwrap_or_else(|err| {
+            panic!("expected statement to parse, got {err:?}");
+        })
+    }
+
+    fn parse_statement_err(source: &str) -> EngineError {
+        parse_statement(source, &GqlParseOptions::default()).expect_err("statement should fail")
     }
 
     fn expect_unsupported(query: &str, expected_feature: &str) -> SourceSpan {
@@ -2116,5 +2502,159 @@ mod tests {
         assert!(matches!(items[1].expr.kind, ExprKind::FunctionCall { .. }));
         assert!(matches!(items[2].expr.kind, ExprKind::FunctionCall { .. }));
         assert!(matches!(items[3].expr.kind, ExprKind::Map(_)));
+    }
+
+    #[test]
+    fn parse_statement_classifies_reads_as_query() {
+        let statement = parse_statement_ok("MATCH (n:Person) RETURN n ORDER BY n.name LIMIT 10");
+        assert_eq!(statement.kind, GqlStatementKind::Query);
+        let GqlStatementBody::Query(query) = statement.body else {
+            panic!("expected query statement");
+        };
+        assert_eq!(query.match_clauses.len(), 1);
+        assert_eq!(query.order_by.len(), 1);
+        assert!(query.limit.is_some());
+    }
+
+    #[test]
+    fn parse_statement_accepts_basic_mutation_skeletons() {
+        let cases = [
+            "CREATE (n:Person {key: $key}) RETURN n",
+            "MATCH (n:Person) SET n.name = $name RETURN n",
+            "MATCH (n:Person) SET n += $map RETURN n",
+            "MATCH (n:Person) REMOVE n.name RETURN n",
+            "MATCH (n:Person) REMOVE n:Old RETURN n",
+            "MATCH ()-[r:LIKES]->() DELETE r",
+            "MATCH (n:Person) DETACH DELETE n",
+        ];
+        for source in cases {
+            let statement = parse_statement_ok(source);
+            assert_eq!(
+                statement.kind,
+                GqlStatementKind::Mutation,
+                "source: {source}"
+            );
+            let GqlStatementBody::Mutation(mutation) = statement.body else {
+                panic!("expected mutation statement for {source}");
+            };
+            assert!(
+                !mutation.mutation_clauses.is_empty(),
+                "expected mutation clauses for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_statement_parses_set_map_merge_item() {
+        let statement = parse_statement_ok("MATCH (n:Person) SET n += $map RETURN n");
+        let GqlStatementBody::Mutation(mutation) = statement.body else {
+            panic!("expected mutation statement");
+        };
+        let MutationClause::Set(set) = &mutation.mutation_clauses[0] else {
+            panic!("expected SET clause");
+        };
+        assert!(matches!(
+            &set.items[0],
+            SetItem::MapMerge { alias, value, .. }
+                if alias.name == "n" && matches!(value.kind, ExprKind::Parameter(ref name) if name == "map")
+        ));
+    }
+
+    #[test]
+    fn parse_statement_rejects_mutation_row_ops_without_return() {
+        for source in [
+            "MATCH (n) SET n.name = 'Ada' ORDER BY n.name",
+            "MATCH (n) SET n.name = 'Ada' SKIP 1",
+            "MATCH (n) SET n.name = 'Ada' LIMIT 1",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlUnsupported { feature, span, .. } => {
+                    assert_eq!(feature, "mutation row operations without RETURN");
+                    assert!(span.length > 0);
+                }
+                err => panic!("expected unsupported mutation row op for {source}, got {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_read_after_write_matching() {
+        match parse_statement_err("MATCH (n) CREATE (m:Person {key: 'm'}) MATCH (m) RETURN m") {
+            EngineError::GqlUnsupported { feature, span, .. } => {
+                assert_eq!(feature, "read-after-write matching");
+                assert!(span.length > 0);
+            }
+            err => panic!("expected read-after-write unsupported error, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_comma_separated_mutation_read_prefix_patterns() {
+        match parse_statement_err("MATCH (a:Person), (b:Person) SET a.name = b.name RETURN a") {
+            EngineError::GqlUnsupported { feature, span, .. } => {
+                assert_eq!(
+                    feature,
+                    "comma-separated mutation read-prefix pattern lists"
+                );
+                assert!(span.length > 0);
+            }
+            err => panic!("expected comma-separated read-prefix unsupported error, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_mutation_multistatement_scripts() {
+        match parse_statement_err("CREATE (n:Person {key: 'n'}); CREATE (m:Person {key: 'm'})") {
+            EngineError::GqlParse { message, span } => {
+                assert_eq!(message, "multiple statements are not supported");
+                assert!(span.length > 0);
+            }
+            err => panic!("expected parse error for mutation multistatement, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_unsupported_mutation_clauses() {
+        for (source, expected_feature) in [
+            ("WITH 1 AS n CREATE (m:Person {key: 'm'})", "WITH"),
+            ("MATCH (n) MERGE (m:Person {key: 'm'})", "write clauses"),
+            ("UNWIND [1] AS n CREATE (m:Person {key: 'm'})", "UNWIND"),
+            ("CALL db.labels()", "CALL"),
+            (
+                "CREATE TEXT INDEX node_status FOR (n:User) ON (n.status)",
+                "schema/DDL",
+            ),
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlUnsupported { feature, span, .. } => {
+                    assert_eq!(feature, expected_feature, "source: {source}");
+                    assert!(span.length > 0);
+                }
+                err => panic!("expected unsupported error for {source}, got {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_statement_preserves_read_arithmetic_rejection() {
+        let source = "MATCH (n) RETURN 1 + 2";
+        let read_err = parse_err(source);
+        let statement_err = parse_statement_err(source);
+        match (read_err, statement_err) {
+            (
+                EngineError::GqlParse {
+                    message: read_message,
+                    span: read_span,
+                },
+                EngineError::GqlParse {
+                    message: statement_message,
+                    span: statement_span,
+                },
+            ) => {
+                assert_eq!(read_message, statement_message);
+                assert_eq!(read_span, statement_span);
+            }
+            other => panic!("expected matching parse errors, got {other:?}"),
+        }
     }
 }

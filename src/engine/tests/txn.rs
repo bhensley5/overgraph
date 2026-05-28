@@ -1349,6 +1349,61 @@ fn test_write_txn_same_node_update_conflicts() {
 }
 
 #[test]
+fn test_write_txn_gql_return_read_set_node_update_conflicts_without_partial_writes() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let id = engine
+        .upsert_node(
+            "TxnReturnReadSetNode",
+            "target",
+            UpsertNodeOptions {
+                props: query_test_props(&[("status", PropValue::String("old".to_string()))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut txn = engine.begin_write_txn().unwrap();
+    txn.gql_validate_return_read_set(TxnReturnReadSet {
+        node_ids: BTreeSet::from([id]),
+        edge_ids: BTreeSet::new(),
+    })
+    .unwrap();
+    txn.upsert_node("TxnReturnReadSetMarker", "node", UpsertNodeOptions::default())
+        .unwrap();
+    engine
+        .upsert_node(
+            "TxnReturnReadSetNode",
+            "target",
+            UpsertNodeOptions {
+                props: query_test_props(&[("status", PropValue::String("outside".to_string()))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let seq_before = engine.engine_seq_for_test();
+
+    let err = txn.commit().unwrap_err();
+    assert!(matches!(err, EngineError::TxnConflict(_)), "{err:?}");
+    assert_eq!(engine.engine_seq_for_test(), seq_before);
+    assert!(engine
+        .get_node_by_key("TxnReturnReadSetMarker", "node")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        engine
+            .get_node(id)
+            .unwrap()
+            .unwrap()
+            .props
+            .get("status"),
+        Some(&PropValue::String("outside".to_string()))
+    );
+    engine.close().unwrap();
+}
+
+#[test]
 fn test_write_txn_same_triple_edge_conflicts() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
@@ -1369,6 +1424,43 @@ fn test_write_txn_same_triple_edge_conflicts() {
 
     let err = txn.commit().unwrap_err();
     assert!(matches!(err, EngineError::TxnConflict(_)));
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_write_txn_gql_return_read_set_edge_delete_conflicts_without_partial_writes() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let a = engine
+        .upsert_node("TxnReturnReadSetEdge", "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node("TxnReturnReadSetEdge", "b", UpsertNodeOptions::default())
+        .unwrap();
+    let edge = engine
+        .upsert_edge(a, b, "TXN_RETURN_READ_SET_EDGE", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let mut txn = engine.begin_write_txn().unwrap();
+    txn.gql_validate_return_read_set(TxnReturnReadSet {
+        node_ids: BTreeSet::new(),
+        edge_ids: BTreeSet::from([edge]),
+    })
+    .unwrap();
+    txn.upsert_node("TxnReturnReadSetMarker", "edge", UpsertNodeOptions::default())
+        .unwrap();
+    engine.delete_edge(edge).unwrap();
+    let seq_before = engine.engine_seq_for_test();
+
+    let err = txn.commit().unwrap_err();
+    assert!(matches!(err, EngineError::TxnConflict(_)), "{err:?}");
+    assert_eq!(engine.engine_seq_for_test(), seq_before);
+    assert!(engine
+        .get_node_by_key("TxnReturnReadSetMarker", "edge")
+        .unwrap()
+        .is_none());
+    assert!(engine.get_edge(edge).unwrap().is_none());
     engine.close().unwrap();
 }
 
@@ -1460,6 +1552,35 @@ fn test_write_txn_delete_node_conflicts_on_future_incident_edge() {
     assert!(matches!(err, EngineError::TxnConflict(_)));
     assert_eq!(engine.engine_seq_for_test(), seq_before);
     assert!(engine.get_edge(edge).unwrap().is_some());
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_write_txn_delete_node_conflicts_on_snapshot_incident_edge_deleted_after_begin() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let a = engine
+        .upsert_node("Person", "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node("Person", "b", UpsertNodeOptions::default())
+        .unwrap();
+    let edge = engine
+        .upsert_edge(a, b, "FRIENDS_WITH", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let mut txn = engine.begin_write_txn().unwrap();
+    txn.delete_node(TxnNodeRef::Id(a)).unwrap();
+    engine.delete_edge(edge).unwrap();
+    let seq_before = engine.engine_seq_for_test();
+
+    let err = txn.commit().unwrap_err();
+    assert!(matches!(err, EngineError::TxnConflict(_)));
+    assert_eq!(engine.engine_seq_for_test(), seq_before);
+    assert!(engine.get_node(a).unwrap().is_some());
+    assert!(engine.get_node(b).unwrap().is_some());
+    assert!(engine.get_edge(edge).unwrap().is_none());
     engine.close().unwrap();
 }
 

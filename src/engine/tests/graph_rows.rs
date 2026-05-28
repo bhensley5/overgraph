@@ -1,4 +1,4 @@
-// CP32.1/CP32.2 graph-row DTO, normalizer, binding, and evaluator tests.
+// Graph-row DTO, normalizer, binding, and evaluator tests.
 
 use crate::graph_row::{
     bind_graph_expr, compare_graph_sort_atoms, eval_bound_graph_expr, eval_graph_expr,
@@ -2495,7 +2495,7 @@ fn graph_row_normalization_binds_expressions_to_slots_for_hot_path_eval() {
 }
 
 #[test]
-fn graph_output_and_query_options_defaults_match_phase32_spec() {
+fn graph_output_and_query_options_defaults_match_spec() {
     let output = GraphOutputOptions::default();
     assert_eq!(output.mode, GraphOutputMode::Ids);
     assert!(!output.compact_rows);
@@ -2584,7 +2584,7 @@ fn graph_row_path_alias_collision_with_node_or_edge_is_rejected() {
 }
 
 #[test]
-fn graph_row_unknown_aliases_are_rejected_in_all_cp32_1_surfaces() {
+fn graph_row_unknown_aliases_are_rejected_in_all_public_surfaces() {
     let edge_piece = graph_query(&["a"], vec![graph_edge(Some("e"), "a", "missing")]);
     assert_graph_row_invalid(&edge_piece, "unknown node alias 'missing'");
 
@@ -8059,7 +8059,8 @@ fn graph_row_planner_fanout_cost_can_choose_larger_lower_expansion_anchor() {
 fn graph_row_planner_required_segments_do_not_cross_optional_or_vlp_barriers() {
     let (_dir, engine) = graph_row_test_engine();
     let source = insert_graph_row_node(&engine, "GRAPH_ROW_BARRIER", "barrier-source", &[]);
-    for index in 0..32 {
+    const HIGH_FANOUT_COUNT: usize = 34;
+    for index in 0..HIGH_FANOUT_COUNT {
         let high = insert_graph_row_node(
             &engine,
             "GRAPH_ROW_BARRIER_HIGH",

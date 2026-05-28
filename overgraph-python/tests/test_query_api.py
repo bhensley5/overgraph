@@ -459,7 +459,7 @@ def test_query_validation_errors(db):
         db.query_node_ids({"label_filter": node_lf("Person"), "filter": {"property": "score", "gt": 1, "gte": 2}})
     with pytest.raises(Exception, match="use filter"):
         db.query_node_ids({"label_filter": node_lf("Person"), "where": {"status": {"eq": "active"}}})
-    with pytest.raises(Exception, match="unsupported after Phase 32"):
+    with pytest.raises(Exception, match="unsupported; use query_graph_rows"):
         db.query_pattern({"nodes": [], "edges": [], "limit": 1})
     with pytest.raises(Exception, match="full scan|anchor|allow_full_scan"):
         db.query_edge_ids({"filter": {"property": "role", "eq": "engineer"}})

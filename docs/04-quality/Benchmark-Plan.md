@@ -107,6 +107,10 @@ Graph shapes for each profile:
 | `S-ADV-005` | `export_adjacency` | required | required | required |
 | `S-MAIN-001` | `flush` | required | required | required |
 
+Phase 33 mutation GQL Criterion cases are intentionally not added to the shared scenario matrix yet.
+`gql_mutation_create_smoke`, `gql_mutation_match_set_smoke`, `gql_mutation_detach_delete_smoke`,
+and `gql_mutation_return_smoke` are focused Rust smoke/proof benches for CP33.8 only.
+
 ## Measurement Policy
 
 ### Timing

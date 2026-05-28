@@ -3,7 +3,7 @@
 //! Run: cargo run --example gql_readonly
 
 use overgraph::{
-    DatabaseEngine, DbOptions, GqlParamValue, GqlParams, GqlQueryOptions, PropValue,
+    DatabaseEngine, DbOptions, GqlExecutionOptions, GqlParamValue, GqlParams, PropValue,
     UpsertEdgeOptions, UpsertNodeOptions,
 };
 use std::collections::BTreeMap;
@@ -97,10 +97,10 @@ fn run_example(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "status".to_string(),
             GqlParamValue::String("active".to_string()),
         )]),
-        &GqlQueryOptions {
+        &GqlExecutionOptions {
             include_plan: true,
             profile: true,
-            ..GqlQueryOptions::default()
+            ..GqlExecutionOptions::default()
         },
     )?;
 
