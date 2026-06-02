@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-02
+
+### Added
+
+#### GQL Beta Language Expansion
+- **Composable GQL read pipelines.** Added `WITH` pipelines, scalar aliases, projection-local row operations, and seeded later `MATCH` / `OPTIONAL MATCH` execution over the native graph pipeline substrate.
+- **Richer scalar expressions and functions.** Added arithmetic, string predicates, `CASE`, scalar functions, and shared expression evaluation for GQL reads, mutations, and graph-row-backed execution.
+- **`DISTINCT` and aggregation.** Added `RETURN DISTINCT`, `WITH DISTINCT`, `count`, `sum`, `avg`, `min`, `max`, `collect`, aggregate `DISTINCT`, grouping, aggregate row operations, and compact-row output support.
+- **Read-only set and subquery constructs.** Added read-only `UNION`, `UNION ALL`, `EXISTS {}` predicates, and `CALL {}` subqueries with deterministic ordering, cursors, cap enforcement, correlation caching, and explain output.
+- **Shortest-path GQL syntax.** Added constrained `shortestPath` and `allShortestPaths` path assignments backed by the native shortest-path algorithms, including path helper return values.
+- **Keyed `MERGE`.** Added keyed node and relationship `MERGE` with `ON CREATE SET` / `ON MATCH SET`, mutation stats, mutation `RETURN DISTINCT`, and transaction-backed atomic execution.
+- **Native graph pipeline connector APIs.** Added Rust, Node.js, and Python access to structured graph pipeline execution and explain surfaces, including async connector parity.
+
+### Changed
+
+#### GQL Execution
+- **GQL lowering now targets a reusable native graph pipeline substrate.** Multi-stage reads, aggregation, unions, subqueries, shortest paths, and keyed merge reuse existing graph-row, graph algorithm, and transaction machinery instead of adding parser-owned execution paths.
+- **Connector GQL coverage now includes the Phase 34 feature set.** Node.js TypeScript declarations, Python stubs, async wrappers, compact rows, cap forwarding, nested graph/path value conversion, and explain fields now cover the expanded GQL Beta subset.
+- **Docs now present GQL Beta as a composable query surface.** README, getting-started, API reference, and GQL subset docs now cover pipelines, aggregation, unions, subqueries, shortest paths, and keyed merge while preserving the native API-first positioning.
+
+### Fixed
+
+- **Pipeline correctness hardening.** Fixed edge cases around scalar alias scope, mixed graph/scalar rows, cursor shape validation, selected-field projection preservation, final-page hydration, null semantics, aggregation caps, and deterministic `UNION` de-duplication.
+- **Subquery and shortest-path guardrails.** Fixed correlated subquery cache behavior, nested invocation budgeting, `CALL` row cap handling, optional `EXISTS` semantics, shortest-path endpoint resolution, row-cap enforcement, and truthful explain output.
+- **MERGE and mutation parity.** Fixed keyed `MERGE` row counting, mutation profiling, late `SET` evaluation over created or matched aliases, deterministic mutation `RETURN DISTINCT`, and transaction-local overlay/coalescing behavior.
+
 ## [0.10.0] - 2026-05-27
 
 ### Added
@@ -376,6 +402,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.11.0]: https://github.com/bhensley5/overgraph/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/bhensley5/overgraph/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/bhensley5/overgraph/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/bhensley5/overgraph/compare/v0.7.0...v0.8.0

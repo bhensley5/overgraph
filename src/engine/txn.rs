@@ -52,6 +52,81 @@ pub(crate) struct TxnReturnReadSet {
     pub(crate) edge_ids: BTreeSet<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TxnMergeLocalNodeRef(pub(crate) usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TxnMergeLocalEdgeRef(pub(crate) usize);
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TxnMergeEndpointKey {
+    Id(u64),
+    Local(TxnLocalRef),
+    Key(String, String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TxnKeyedNodeMergeRowOutcome {
+    Existing(u64),
+    MatchedLocal(TxnMergeLocalNodeRef),
+    Create(TxnMergeLocalNodeRef),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TxnKeyedNodeMergeBatchOutcome {
+    pub(crate) rows: Vec<TxnKeyedNodeMergeRowOutcome>,
+    pub(crate) existing_ids: BTreeSet<u64>,
+    pub(crate) snapshot_lookup_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TxnUniqueEdgeMergeInput {
+    pub(crate) from: TxnNodeRef,
+    pub(crate) to: TxnNodeRef,
+    pub(crate) label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TxnUniqueEdgeMergeRowOutcome {
+    SkippedNull,
+    Existing(u64),
+    MatchedLocal(TxnMergeLocalEdgeRef),
+    Create {
+        local: TxnMergeLocalEdgeRef,
+        from: TxnNodeRef,
+        to: TxnNodeRef,
+        label: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TxnUniqueEdgeMergeBatchOutcome {
+    pub(crate) rows: Vec<TxnUniqueEdgeMergeRowOutcome>,
+    pub(crate) existing_ids: BTreeSet<u64>,
+    pub(crate) snapshot_lookup_count: usize,
+    pub(crate) missing_committed_triples: BTreeSet<(u64, u64, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TxnMergeNodeTarget {
+    Existing(u64),
+    Created(TxnMergeLocalNodeRef),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TxnMergeEdgeTarget {
+    Existing(u64),
+    Created(TxnMergeLocalEdgeRef),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TxnMergeOverlay {
+    node_keys: BTreeMap<(String, String), TxnMergeNodeTarget>,
+    edge_triples: BTreeMap<(TxnMergeEndpointKey, TxnMergeEndpointKey, String), TxnMergeEdgeTarget>,
+    next_node: usize,
+    next_edge: usize,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct TxnGraphOpBudget {
     scope: &'static str,
@@ -204,6 +279,39 @@ fn txn_graph_op_cap_error(budget: TxnGraphOpBudget, actual: usize) -> EngineErro
     ))
 }
 
+impl TxnMergeOverlay {
+    fn allocate_node(&mut self) -> TxnMergeLocalNodeRef {
+        let local = TxnMergeLocalNodeRef(self.next_node);
+        self.next_node = self.next_node.saturating_add(1);
+        local
+    }
+
+    fn allocate_edge(&mut self) -> TxnMergeLocalEdgeRef {
+        let local = TxnMergeLocalEdgeRef(self.next_edge);
+        self.next_edge = self.next_edge.saturating_add(1);
+        local
+    }
+}
+
+fn txn_merge_endpoint_key(node: &TxnNodeRef) -> TxnMergeEndpointKey {
+    match node {
+        TxnNodeRef::Id(id) => TxnMergeEndpointKey::Id(*id),
+        TxnNodeRef::Key { label, key } => TxnMergeEndpointKey::Key(label.clone(), key.clone()),
+        TxnNodeRef::Local(local) => TxnMergeEndpointKey::Local(local.clone()),
+    }
+}
+
+fn txn_committed_edge_merge_triple(
+    from: &TxnNodeRef,
+    to: &TxnNodeRef,
+    label: &str,
+) -> Option<(u64, u64, String)> {
+    match (from, to) {
+        (TxnNodeRef::Id(from), TxnNodeRef::Id(to)) => Some((*from, *to, label.to_string())),
+        _ => None,
+    }
+}
+
 impl WriteTxn {
     #[allow(dead_code)]
     pub(crate) fn gql_snapshot(&self) -> Result<Arc<ReadView>, EngineError> {
@@ -220,6 +328,158 @@ impl WriteTxn {
     pub(crate) fn gql_edge_uniqueness(&self) -> Result<bool, EngineError> {
         self.ensure_open()?;
         Ok(self.edge_uniqueness)
+    }
+
+    pub(crate) fn plan_keyed_node_merge_batch(
+        &self,
+        overlay: &mut TxnMergeOverlay,
+        keys: &[(String, String)],
+    ) -> Result<TxnKeyedNodeMergeBatchOutcome, EngineError> {
+        self.ensure_open()?;
+        let lookup_keys = keys
+            .iter()
+            .filter(|key| !overlay.node_keys.contains_key(*key))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let snapshot_matches = self.gql_lookup_node_merge_keys(&lookup_keys)?;
+        let existing_ids = snapshot_matches.values().copied().collect::<BTreeSet<_>>();
+        let mut existing_ids = existing_ids;
+        let mut rows = Vec::with_capacity(keys.len());
+
+        for merge_key in keys {
+            if let Some(target) = overlay.node_keys.get(merge_key).cloned() {
+                rows.push(match target {
+                    TxnMergeNodeTarget::Existing(id) => {
+                        existing_ids.insert(id);
+                        TxnKeyedNodeMergeRowOutcome::Existing(id)
+                    }
+                    TxnMergeNodeTarget::Created(local) => {
+                        TxnKeyedNodeMergeRowOutcome::MatchedLocal(local)
+                    }
+                });
+                continue;
+            }
+
+            if let Some(&id) = snapshot_matches.get(merge_key) {
+                overlay
+                    .node_keys
+                    .insert(merge_key.clone(), TxnMergeNodeTarget::Existing(id));
+                rows.push(TxnKeyedNodeMergeRowOutcome::Existing(id));
+                continue;
+            }
+
+            let local = overlay.allocate_node();
+            overlay
+                .node_keys
+                .insert(merge_key.clone(), TxnMergeNodeTarget::Created(local));
+            rows.push(TxnKeyedNodeMergeRowOutcome::Create(local));
+        }
+
+        Ok(TxnKeyedNodeMergeBatchOutcome {
+            rows,
+            existing_ids,
+            snapshot_lookup_count: lookup_keys.len(),
+        })
+    }
+
+    pub(crate) fn plan_unique_edge_merge_batch(
+        &self,
+        overlay: &mut TxnMergeOverlay,
+        inputs: &[Option<TxnUniqueEdgeMergeInput>],
+    ) -> Result<TxnUniqueEdgeMergeBatchOutcome, EngineError> {
+        self.ensure_open()?;
+        if !self.edge_uniqueness {
+            return Err(EngineError::InvalidOperation(
+                "GQL relationship MERGE requires edge_uniqueness=true".to_string(),
+            ));
+        }
+        for input in inputs.iter().flatten() {
+            if matches!(&input.from, TxnNodeRef::Key { .. })
+                || matches!(&input.to, TxnNodeRef::Key { .. })
+            {
+                return Err(EngineError::InvalidOperation(
+                    "transaction relationship MERGE planner requires resolved node IDs or local refs"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let committed_triples = inputs
+            .iter()
+            .filter_map(|input| {
+                let input = input.as_ref()?;
+                let merge_key = (
+                    txn_merge_endpoint_key(&input.from),
+                    txn_merge_endpoint_key(&input.to),
+                    input.label.clone(),
+                );
+                if overlay.edge_triples.contains_key(&merge_key) {
+                    return None;
+                }
+                txn_committed_edge_merge_triple(&input.from, &input.to, &input.label)
+            })
+            .collect::<BTreeSet<_>>();
+        let snapshot_matches = self.gql_lookup_edge_merge_triples(&committed_triples)?;
+        let existing_ids = snapshot_matches.values().copied().collect::<BTreeSet<_>>();
+        let mut existing_ids = existing_ids;
+        let mut missing_committed_triples = BTreeSet::new();
+        let mut rows = Vec::with_capacity(inputs.len());
+
+        for input in inputs {
+            let Some(input) = input else {
+                rows.push(TxnUniqueEdgeMergeRowOutcome::SkippedNull);
+                continue;
+            };
+            let merge_key = (
+                txn_merge_endpoint_key(&input.from),
+                txn_merge_endpoint_key(&input.to),
+                input.label.clone(),
+            );
+
+            if let Some(target) = overlay.edge_triples.get(&merge_key).cloned() {
+                rows.push(match target {
+                    TxnMergeEdgeTarget::Existing(id) => {
+                        existing_ids.insert(id);
+                        TxnUniqueEdgeMergeRowOutcome::Existing(id)
+                    }
+                    TxnMergeEdgeTarget::Created(local) => {
+                        TxnUniqueEdgeMergeRowOutcome::MatchedLocal(local)
+                    }
+                });
+                continue;
+            }
+
+            if let Some(triple) =
+                txn_committed_edge_merge_triple(&input.from, &input.to, &input.label)
+            {
+                if let Some(&id) = snapshot_matches.get(&triple) {
+                    overlay
+                        .edge_triples
+                        .insert(merge_key, TxnMergeEdgeTarget::Existing(id));
+                    rows.push(TxnUniqueEdgeMergeRowOutcome::Existing(id));
+                    continue;
+                }
+                missing_committed_triples.insert(triple);
+            }
+
+            let local = overlay.allocate_edge();
+            overlay
+                .edge_triples
+                .insert(merge_key, TxnMergeEdgeTarget::Created(local));
+            rows.push(TxnUniqueEdgeMergeRowOutcome::Create {
+                local,
+                from: input.from.clone(),
+                to: input.to.clone(),
+                label: input.label.clone(),
+            });
+        }
+
+        Ok(TxnUniqueEdgeMergeBatchOutcome {
+            rows,
+            existing_ids,
+            snapshot_lookup_count: committed_triples.len(),
+            missing_committed_triples,
+        })
     }
 
     pub(crate) fn gql_first_existing_node_key(
@@ -251,6 +511,36 @@ impl WriteTxn {
         Ok(None)
     }
 
+    pub(crate) fn gql_lookup_node_merge_keys(
+        &self,
+        keys: &BTreeSet<(String, String)>,
+    ) -> Result<BTreeMap<(String, String), u64>, EngineError> {
+        self.ensure_open()?;
+        let mut resolved = Vec::with_capacity(keys.len());
+        for (label, key) in keys {
+            let Some(label_id) = self.snapshot.label_catalog.resolve_node_label_for_read(label)?
+            else {
+                continue;
+            };
+            resolved.push((label.clone(), key.clone(), label_id));
+        }
+        if resolved.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let key_refs: Vec<(u32, &str)> = resolved
+            .iter()
+            .map(|(_, key, label_id)| (*label_id, key.as_str()))
+            .collect();
+        let nodes = self.snapshot.get_nodes_by_label_keys_raw(&key_refs)?;
+        let mut out = BTreeMap::new();
+        for ((label, key, _), node) in resolved.into_iter().zip(nodes) {
+            if let Some(node) = node {
+                out.insert((label, key), node.id);
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn gql_first_existing_edge_triple(
         &self,
         triples: &BTreeSet<(u64, u64, String)>,
@@ -278,6 +568,36 @@ impl WriteTxn {
             }
         }
         Ok(None)
+    }
+
+    pub(crate) fn gql_lookup_edge_merge_triples(
+        &self,
+        triples: &BTreeSet<(u64, u64, String)>,
+    ) -> Result<BTreeMap<(u64, u64, String), u64>, EngineError> {
+        self.ensure_open()?;
+        let mut resolved = Vec::with_capacity(triples.len());
+        for (from, to, label) in triples {
+            let Some(label_id) = self.snapshot.label_catalog.resolve_edge_label_for_read(label)?
+            else {
+                continue;
+            };
+            resolved.push((*from, *to, label.clone(), label_id));
+        }
+        if resolved.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let triple_refs: Vec<(u64, u64, u32)> = resolved
+            .iter()
+            .map(|(from, to, _, label_id)| (*from, *to, *label_id))
+            .collect();
+        let edges = self.snapshot.get_edges_by_triples_raw(&triple_refs)?;
+        let mut out = BTreeMap::new();
+        for ((from, to, label, _), edge) in resolved.into_iter().zip(edges) {
+            if let Some(edge) = edge {
+                out.insert((from, to, label), edge.id);
+            }
+        }
+        Ok(out)
     }
 
     pub fn upsert_node<L>(

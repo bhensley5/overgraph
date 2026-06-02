@@ -11,6 +11,8 @@ pub(crate) enum Keyword {
     Asc,
     By,
     Call,
+    Case,
+    Contains,
     Constraint,
     Create,
     Delete,
@@ -18,6 +20,9 @@ pub(crate) enum Keyword {
     Detach,
     Distinct,
     Drop,
+    Else,
+    End,
+    Ends,
     Exists,
     False,
     Foreach,
@@ -32,6 +37,7 @@ pub(crate) enum Keyword {
     Not,
     Null,
     Offset,
+    On,
     Optional,
     Or,
     Order,
@@ -40,11 +46,14 @@ pub(crate) enum Keyword {
     Set,
     Show,
     Skip,
+    Starts,
     True,
+    Then,
     Union,
     Unwind,
     Use,
     Where,
+    When,
     With,
 }
 
@@ -534,6 +543,10 @@ fn keyword(raw: &str) -> Option<Keyword> {
         Keyword::By
     } else if raw.eq_ignore_ascii_case("CALL") {
         Keyword::Call
+    } else if raw.eq_ignore_ascii_case("CASE") {
+        Keyword::Case
+    } else if raw.eq_ignore_ascii_case("CONTAINS") {
+        Keyword::Contains
     } else if raw.eq_ignore_ascii_case("CONSTRAINT") {
         Keyword::Constraint
     } else if raw.eq_ignore_ascii_case("CREATE") {
@@ -548,6 +561,12 @@ fn keyword(raw: &str) -> Option<Keyword> {
         Keyword::Distinct
     } else if raw.eq_ignore_ascii_case("DROP") {
         Keyword::Drop
+    } else if raw.eq_ignore_ascii_case("ELSE") {
+        Keyword::Else
+    } else if raw.eq_ignore_ascii_case("END") {
+        Keyword::End
+    } else if raw.eq_ignore_ascii_case("ENDS") {
+        Keyword::Ends
     } else if raw.eq_ignore_ascii_case("EXISTS") {
         Keyword::Exists
     } else if raw.eq_ignore_ascii_case("FALSE") {
@@ -576,6 +595,8 @@ fn keyword(raw: &str) -> Option<Keyword> {
         Keyword::Null
     } else if raw.eq_ignore_ascii_case("OFFSET") {
         Keyword::Offset
+    } else if raw.eq_ignore_ascii_case("ON") {
+        Keyword::On
     } else if raw.eq_ignore_ascii_case("OPTIONAL") {
         Keyword::Optional
     } else if raw.eq_ignore_ascii_case("OR") {
@@ -592,8 +613,12 @@ fn keyword(raw: &str) -> Option<Keyword> {
         Keyword::Show
     } else if raw.eq_ignore_ascii_case("SKIP") {
         Keyword::Skip
+    } else if raw.eq_ignore_ascii_case("STARTS") {
+        Keyword::Starts
     } else if raw.eq_ignore_ascii_case("TRUE") {
         Keyword::True
+    } else if raw.eq_ignore_ascii_case("THEN") {
+        Keyword::Then
     } else if raw.eq_ignore_ascii_case("UNION") {
         Keyword::Union
     } else if raw.eq_ignore_ascii_case("UNWIND") {
@@ -602,6 +627,8 @@ fn keyword(raw: &str) -> Option<Keyword> {
         Keyword::Use
     } else if raw.eq_ignore_ascii_case("WHERE") {
         Keyword::Where
+    } else if raw.eq_ignore_ascii_case("WHEN") {
+        Keyword::When
     } else if raw.eq_ignore_ascii_case("WITH") {
         Keyword::With
     } else {

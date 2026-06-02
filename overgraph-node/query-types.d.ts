@@ -329,11 +329,73 @@ export type GraphExpr =
   | { nodeField: { alias: string; field: 'id' | 'labels' | 'key' | 'weight' | 'createdAt' | 'updatedAt' } }
   | { edgeField: { alias: string; field: 'id' | 'from' | 'to' | 'label' | 'weight' | 'createdAt' | 'updatedAt' | 'validFrom' | 'validTo' } }
   | { pathField: { alias: string; field: 'nodeIds' | 'edgeIds' | 'length' } }
-  | { fn: 'id' | 'labels' | 'type' | 'length' | 'startNode' | 'endNode' | 'nodes' | 'relationships' | 'nodeIds' | 'edgeIds'; args: Array<GraphExpr> }
-  | { op: 'and' | 'or' | '=' | '==' | 'eq' | '<>' | '!=' | 'neq' | '<' | 'lt' | '<=' | 'lte' | '>' | 'gt' | '>=' | 'gte' | 'in'; left: GraphExpr; right: GraphExpr }
-  | { op: 'not'; expr: GraphExpr }
+  | { fn: GraphFunctionName; args: Array<GraphExpr> }
+  | { aggregate: { function: GraphAggregateFunction; distinct?: boolean; arg?: GraphExpr | null } }
+  | { exists: GraphPipelineCallPayload }
+  | { op: GraphBinaryOperator; left: GraphExpr; right: GraphExpr }
+  | { op: 'not' | 'neg' | '-'; expr: GraphExpr }
+  | { case: { operand?: GraphExpr | null; branches: Array<{ when: GraphExpr; then: GraphExpr }>; else?: GraphExpr | null } }
   | { isNull: GraphExpr }
   | { isNotNull: GraphExpr }
+
+export type GraphFunctionName =
+  | 'id'
+  | 'labels'
+  | 'type'
+  | 'length'
+  | 'startNode'
+  | 'endNode'
+  | 'nodes'
+  | 'relationships'
+  | 'nodeIds'
+  | 'edgeIds'
+  | 'coalesce'
+  | 'toString'
+  | 'toInteger'
+  | 'toFloat'
+  | 'abs'
+  | 'floor'
+  | 'ceil'
+  | 'round'
+  | 'lower'
+  | 'upper'
+  | 'trim'
+  | 'substring'
+  | 'size'
+  | 'head'
+  | 'last'
+
+export type GraphAggregateFunction = 'count' | 'sum' | 'avg' | 'min' | 'max' | 'collect'
+
+export type GraphBinaryOperator =
+  | 'and'
+  | 'or'
+  | '='
+  | '=='
+  | 'eq'
+  | '<>'
+  | '!='
+  | 'neq'
+  | '<'
+  | 'lt'
+  | '<='
+  | 'lte'
+  | '>'
+  | 'gt'
+  | '>='
+  | 'gte'
+  | 'in'
+  | '+'
+  | 'add'
+  | '-'
+  | 'sub'
+  | '*'
+  | 'mul'
+  | '/'
+  | 'div'
+  | 'startsWith'
+  | 'endsWith'
+  | 'contains'
 
 export type GraphElementProjection = 'idOnly' | 'compact' | 'full'
 export type GraphPropertySelection = boolean | 'all' | 'none' | Array<string>
@@ -539,6 +601,201 @@ export interface GraphCompactRowsResult {
 
 export type GraphRowResult = GraphObjectRowsResult | GraphCompactRowsResult
 
+export interface GraphPipelineMatchStage {
+  kind: 'match'
+  optional?: boolean
+  nodes?: Array<GraphRowNodePattern>
+  pieces?: Array<GraphRowPatternPiece>
+  where?: GraphExpr | null
+  optionalCandidateWhere?: GraphExpr | null
+}
+
+export type GraphProjectionItems = 'star' | '*' | Array<GraphProjectItem>
+
+export interface GraphProjectItem {
+  expr: GraphExpr
+  as?: string
+  projection?: GraphReturnProjection
+}
+
+export interface GraphPipelineProjectStage {
+  kind: 'project' | 'with' | 'return'
+  projectKind?: 'with' | 'return'
+  items?: GraphProjectionItems
+  distinct?: boolean
+  where?: GraphExpr | null
+  orderBy?: Array<GraphOrderItem>
+  skip?: GraphExpr | null
+  limit?: GraphExpr | null
+}
+
+export type GraphShortestPathEndpoint =
+  | string
+  | number
+  | { alias: string }
+  | { nodeId: number }
+  | { nodeKey: { label: string; key: string } }
+  | { expr: GraphExpr }
+
+export interface GraphPipelineShortestPathStage {
+  kind: 'shortestPath' | 'shortest_path'
+  optional?: boolean
+  outputPathAlias: string
+  mode?: 'one' | 'all'
+  from: GraphShortestPathEndpoint
+  to: GraphShortestPathEndpoint
+  direction?: 'outgoing' | 'incoming' | 'both'
+  edgeLabelFilter?: Array<string>
+  minHops: number
+  maxHops: number
+  weightField?: string | null
+  maxCost?: number | null
+  maxPaths?: number | null
+}
+
+export interface GraphPipelineCallPayload {
+  query: GraphPipelineRequest
+  importAliases?: Array<string>
+}
+
+export interface GraphPipelineCallStage extends GraphPipelineCallPayload {
+  kind: 'call'
+}
+
+export interface GraphPipelineUnionStage {
+  kind: 'union'
+  branches: Array<GraphPipelineRequest>
+  all?: boolean
+}
+
+export type GraphPipelineStage =
+  | GraphPipelineMatchStage
+  | GraphPipelineProjectStage
+  | GraphPipelineShortestPathStage
+  | GraphPipelineCallStage
+  | GraphPipelineUnionStage
+
+export interface GraphPipelineOptions {
+  allowFullScan?: boolean
+  maxRows?: number
+  maxPipelineRows?: number
+  maxGroups?: number
+  maxCollectItems?: number
+  maxUnionBranches?: number
+  maxSubqueryInvocations?: number
+  maxSubqueryDepth?: number
+  maxShortestPathPairs?: number
+  maxIntermediateBindings?: number
+  maxFrontier?: number
+  maxPathHops?: number
+  maxPathsPerStart?: number
+  maxOrderMaterialization?: number
+  maxSkip?: number
+  maxCursorBytes?: number
+  maxQueryBytes?: number
+  maxParamBytes?: number
+  maxAstDepth?: number
+  maxLiteralItems?: number
+  includePlan?: boolean
+  profile?: boolean
+}
+
+export interface GraphPipelineRequest {
+  stages: Array<GraphPipelineStage>
+  params?: Record<string, GraphParamValue>
+  atEpoch?: number | null
+  skip?: number
+  limit?: number
+  cursor?: string | null
+  output?: GraphOutputOptions
+  options?: GraphPipelineOptions
+}
+
+export interface GraphPipelineStats {
+  rowsReturned: number
+  rowsEnteredPipeline: number
+  rowsAfterFilter: number
+  intermediateRows: number
+  pipelineRowsMaterialized: number
+  groups: number
+  collectItems: number
+  unionBranches: number
+  unionDedupKeys: number
+  subqueryInvocations: number
+  subqueryCacheHits: number
+  shortestPathPairs: number
+  shortestPathCacheHits: number
+  dbHits: number
+  elapsedUs: number | null
+  effectiveAtEpoch: number
+  warnings: Array<string>
+}
+
+export interface GraphPipelineStageExplain {
+  index: number
+  kind: string
+  detail: string
+  columns: Array<string>
+  graphRow: GraphRowExplain | null
+  warnings: Array<string>
+  notes: Array<string>
+}
+
+export interface GraphPipelineExplain {
+  columns: Array<string>
+  effectiveAtEpoch: number | null
+  fingerprint: string
+  stages: Array<GraphPipelineStageExplain>
+  rowOps: Array<GraphRowOperationExplain>
+  order: { explicit: boolean; items: number; stableLogicalRowKey: boolean }
+  cursor: { supplied: boolean; codecImplemented: boolean; message: string | null }
+  projection: { columns: Array<string>; outputMode: 'ids' | 'elements' | 'projected'; includeVectors: boolean; compactRows: boolean }
+  caps: {
+    allowFullScan: boolean
+    maxRows: number
+    maxPipelineRows: number
+    maxGroups: number
+    maxCollectItems: number
+    maxUnionBranches: number
+    maxSubqueryInvocations: number
+    maxSubqueryDepth: number
+    maxShortestPathPairs: number
+    maxIntermediateBindings: number
+    maxFrontier: number
+    maxPathHops: number
+    maxPathsPerStart: number
+    maxOrderMaterialization: number
+    maxSkip: number
+    maxCursorBytes: number
+    maxQueryBytes: number
+    maxParamBytes: number
+    maxAstDepth: number
+    maxLiteralItems: number
+  }
+  summaries: { validationOnly: boolean; rowsPlanned: number; warnings: Array<string> }
+  stats: GraphPipelineStats
+  warnings: Array<string>
+  notes: Array<string>
+}
+
+export interface GraphPipelineObjectRowsResult {
+  columns: Array<string>
+  rows: Array<Record<string, GraphValue>>
+  nextCursor: string | null
+  stats: GraphPipelineStats
+  plan: GraphPipelineExplain | null
+}
+
+export interface GraphPipelineCompactRowsResult {
+  columns: Array<string>
+  rows: Array<Array<GraphValue>>
+  nextCursor: string | null
+  stats: GraphPipelineStats
+  plan: GraphPipelineExplain | null
+}
+
+export type GraphPipelineResult = GraphPipelineObjectRowsResult | GraphPipelineCompactRowsResult
+
 export type QueryPlanKind = 'node_query' | 'edge_query'
 
 export type QueryPlanWarning =
@@ -635,6 +892,13 @@ export interface GqlExecutionOptions {
   maxCursorBytes?: number
   maxMutationRows?: number
   maxMutationOps?: number
+  maxPipelineRows?: number
+  maxGroups?: number
+  maxCollectItems?: number
+  maxUnionBranches?: number
+  maxSubqueryInvocations?: number
+  maxSubqueryDepth?: number
+  maxShortestPathPairs?: number
   maxIntermediateBindings?: number
   maxFrontier?: number
   maxPathHops?: number
@@ -720,6 +984,13 @@ export interface GqlExecutionCapSummary {
   maxCursorBytes: number
   maxMutationRows: number
   maxMutationOps: number
+  maxPipelineRows: number
+  maxGroups: number
+  maxCollectItems: number
+  maxUnionBranches: number
+  maxSubqueryInvocations: number
+  maxSubqueryDepth: number
+  maxShortestPathPairs: number
   maxQueryBytes: number
   maxParamBytes: number
   maxAstDepth: number
@@ -732,7 +1003,7 @@ export interface GqlExecutionCapSummary {
   maxSkip: number
 }
 
-export type GqlLoweringTarget = 'node_query' | 'edge_query' | 'graph_row_query'
+export type GqlLoweringTarget = 'node_query' | 'edge_query' | 'graph_row_query' | 'graph_pipeline_query'
 
 export type GqlRowOperation = 'residual_filter' | 'projection' | 'sort' | 'skip' | 'limit'
 

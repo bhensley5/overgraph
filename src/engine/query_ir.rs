@@ -119,6 +119,7 @@ struct NormalizedEdgeQuery {
 #[derive(Clone, Debug)]
 pub(crate) struct NormalizedGraphRowQuery {
     pub(crate) binding_schema: crate::graph_row::GraphBindingSchema,
+    pub(crate) initial_bound_slots: Vec<crate::graph_row::GraphBindingSlotRef>,
     pub(crate) nodes: Vec<GraphNodePattern>,
     pub(crate) pieces: Vec<GraphPatternPiece>,
     pub(crate) fixed_paths: Vec<GraphFixedPathBinding>,
@@ -161,6 +162,8 @@ struct GraphRowAliasState {
     node_aliases: HashSet<String>,
     edge_aliases: HashSet<String>,
     path_aliases: HashSet<String>,
+    scalar_aliases: HashSet<String>,
+    external_node_aliases: HashSet<String>,
     node_first_scope: HashMap<String, GraphAliasScope>,
     edge_first_scope: HashMap<String, GraphAliasScope>,
     path_first_scope: HashMap<String, GraphAliasScope>,
@@ -168,6 +171,7 @@ struct GraphRowAliasState {
     required_edge_order: Vec<String>,
     optional_alias_order: Vec<String>,
     path_order: Vec<String>,
+    scalar_order: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -218,16 +222,51 @@ pub(crate) fn normalize_graph_row_query_with_gql_fixed_paths(
     )
 }
 
+pub(crate) fn normalize_graph_row_query_with_pipeline_input(
+    query: &GraphRowQuery,
+    edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+    logical_limit: Option<usize>,
+    fixed_paths: &[GraphFixedPathBinding],
+    input_schema: &crate::graph_row::GraphBindingSchema,
+) -> Result<NormalizedGraphRowQuery, EngineError> {
+    normalize_graph_row_query_with_internal_limits_and_input(
+        query,
+        edge_id_constraints,
+        logical_limit,
+        fixed_paths,
+        Some(input_schema),
+    )
+}
+
 fn normalize_graph_row_query_with_internal_limits(
     query: &GraphRowQuery,
     edge_id_constraints: &BTreeMap<String, Vec<u64>>,
     logical_limit: Option<usize>,
     fixed_paths: &[GraphFixedPathBinding],
 ) -> Result<NormalizedGraphRowQuery, EngineError> {
+    normalize_graph_row_query_with_internal_limits_and_input(
+        query,
+        edge_id_constraints,
+        logical_limit,
+        fixed_paths,
+        None,
+    )
+}
+
+fn normalize_graph_row_query_with_internal_limits_and_input(
+    query: &GraphRowQuery,
+    edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+    logical_limit: Option<usize>,
+    fixed_paths: &[GraphFixedPathBinding],
+    input_schema: Option<&crate::graph_row::GraphBindingSchema>,
+) -> Result<NormalizedGraphRowQuery, EngineError> {
     validate_graph_row_page(&query.page, &query.options)?;
     let referenced_params = collect_graph_row_referenced_params(query)?;
 
     let mut aliases = GraphRowAliasState::default();
+    if let Some(input_schema) = input_schema {
+        seed_graph_row_aliases_from_input_schema(input_schema, &mut aliases)?;
+    }
     collect_graph_row_node_aliases(query, &mut aliases)?;
     for piece in &query.pieces {
         collect_graph_row_piece_aliases(piece, GraphAliasScope::Required, &mut aliases)?;
@@ -241,7 +280,7 @@ fn normalize_graph_row_query_with_internal_limits(
             .or_insert(GraphAliasScope::Required);
     }
 
-    validate_graph_row_anchors(query, edge_id_constraints)?;
+    validate_graph_row_anchors(query, edge_id_constraints, &aliases.external_node_aliases)?;
     validate_graph_row_optional_filters(&query.pieces, fixed_paths, &aliases, &query.params)?;
     if let Some(expr) = query.where_.as_ref() {
         validate_graph_expr_aliases(expr, &aliases, &query.params)?;
@@ -249,7 +288,7 @@ fn normalize_graph_row_query_with_internal_limits(
     for order in &query.order_by {
         validate_graph_order_expr(order, &aliases, &query.params)?;
     }
-    validate_graph_row_required_connectivity(query)?;
+    validate_graph_row_required_connectivity(query, &aliases.external_node_aliases)?;
 
     let mut return_items = match query.return_items.as_ref() {
         Some(items) => {
@@ -298,7 +337,10 @@ fn normalize_graph_row_query_with_internal_limits(
         validate_graph_return_projection(&item.projection, &query.output, expr_kind)?;
         columns.push(graph_return_column_name(item)?);
     }
-    let binding_schema = build_graph_row_binding_schema(&aliases, &query.pieces)?;
+    let binding_schema =
+        build_graph_row_binding_schema(&aliases, &query.pieces, input_schema)?;
+    let initial_bound_slots =
+        graph_row_initial_bound_slots(input_schema, &binding_schema);
     let bound_return_items = crate::graph_row::bind_graph_return_items(&binding_schema, &return_items)?;
     let bound_order_by = crate::graph_row::bind_graph_order_items(&binding_schema, &resolved_order_by)?;
     let bound_where = resolved_where
@@ -322,6 +364,7 @@ fn normalize_graph_row_query_with_internal_limits(
 
     Ok(NormalizedGraphRowQuery {
         binding_schema,
+        initial_bound_slots,
         nodes: query.nodes.clone(),
         pieces: resolved_pieces,
         fixed_paths: fixed_paths.to_vec(),
@@ -342,6 +385,51 @@ fn normalize_graph_row_query_with_internal_limits(
         options: query.options.clone(),
         projection_needs,
         referenced_params,
+    })
+}
+
+fn graph_row_initial_bound_slots(
+    input_schema: Option<&crate::graph_row::GraphBindingSchema>,
+    binding_schema: &crate::graph_row::GraphBindingSchema,
+) -> Vec<crate::graph_row::GraphBindingSlotRef> {
+    let Some(input_schema) = input_schema else {
+        return Vec::new();
+    };
+    let mut slots = input_schema
+        .slots()
+        .iter()
+        .filter_map(|slot| {
+            if let Some(alias) = slot.user_alias.as_ref() {
+                binding_schema.slot_for_alias(alias)
+            } else {
+                graph_row_internal_scalar_slot(binding_schema, slot)
+            }
+        })
+        .collect::<Vec<_>>();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+fn graph_row_internal_scalar_slot(
+    schema: &crate::graph_row::GraphBindingSchema,
+    source: &crate::graph_row::GraphBindingSlot,
+) -> Option<crate::graph_row::GraphBindingSlotRef> {
+    if source.kind != crate::graph_row::GraphBindingSlotKind::Scalar || source.user_alias.is_some() {
+        return None;
+    }
+    schema.slots().iter().find_map(|slot| {
+        if slot.kind == crate::graph_row::GraphBindingSlotKind::Scalar
+            && slot.user_alias.is_none()
+            && slot.name == source.name
+        {
+            Some(crate::graph_row::GraphBindingSlotRef {
+                kind: slot.kind,
+                index: slot.index,
+            })
+        } else {
+            None
+        }
     })
 }
 
@@ -409,12 +497,38 @@ fn collect_graph_expr_param_names(expr: &GraphExpr, names: &mut BTreeSet<String>
                 collect_graph_expr_param_names(arg, names);
             }
         }
+        GraphExpr::AggregateCall { arg, .. } => {
+            if let Some(arg) = arg {
+                collect_graph_expr_param_names(arg, names);
+            }
+        }
+        GraphExpr::ExistsSubquery(stage) => {
+            for stage in &stage.query.stages {
+                collect_graph_pipeline_stage_param_names(stage, names);
+            }
+        }
         GraphExpr::Unary { expr, .. } | GraphExpr::IsNull(expr) | GraphExpr::IsNotNull(expr) => {
             collect_graph_expr_param_names(expr, names);
         }
         GraphExpr::Binary { left, right, .. } => {
             collect_graph_expr_param_names(left, names);
             collect_graph_expr_param_names(right, names);
+        }
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_graph_expr_param_names(operand, names);
+            }
+            for branch in branches {
+                collect_graph_expr_param_names(&branch.when, names);
+                collect_graph_expr_param_names(&branch.then, names);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_graph_expr_param_names(else_expr, names);
+            }
         }
         GraphExpr::Null
         | GraphExpr::Bool(_)
@@ -431,7 +545,10 @@ fn collect_graph_expr_param_names(expr: &GraphExpr, names: &mut BTreeSet<String>
     }
 }
 
-fn validate_graph_row_required_connectivity(query: &GraphRowQuery) -> Result<(), EngineError> {
+fn validate_graph_row_required_connectivity(
+    query: &GraphRowQuery,
+    external_bound_nodes: &HashSet<String>,
+) -> Result<(), EngineError> {
     let required_edges = query
         .pieces
         .iter()
@@ -483,6 +600,9 @@ fn validate_graph_row_required_connectivity(query: &GraphRowQuery) -> Result<(),
     }
 
     for node in &query.nodes {
+        if external_bound_nodes.contains(&node.alias) {
+            continue;
+        }
         if !visited.contains(node.alias.as_str()) {
             return Err(EngineError::InvalidOperation(
                 "graph row required fixed patterns must be connected".to_string(),
@@ -550,6 +670,26 @@ fn resolve_graph_expr_params(
                 .map(|arg| resolve_graph_expr_params(arg, params))
                 .collect::<Result<Vec<_>, _>>()?,
         },
+        GraphExpr::AggregateCall {
+            function,
+            distinct,
+            arg,
+        } => GraphExpr::AggregateCall {
+            function: *function,
+            distinct: *distinct,
+            arg: arg
+                .as_ref()
+                .map(|arg| resolve_graph_expr_params(arg, params).map(Box::new))
+                .transpose()?,
+        },
+        GraphExpr::ExistsSubquery(stage) => {
+            let mut query = (*stage.query).clone();
+            query.params = params.clone();
+            GraphExpr::ExistsSubquery(GraphSubqueryStage {
+                query: Box::new(query),
+                import_aliases: stage.import_aliases.clone(),
+            })
+        }
         GraphExpr::Unary { op, expr } => GraphExpr::Unary {
             op: *op,
             expr: Box::new(resolve_graph_expr_params(expr, params)?),
@@ -558,6 +698,29 @@ fn resolve_graph_expr_params(
             left: Box::new(resolve_graph_expr_params(left, params)?),
             op: *op,
             right: Box::new(resolve_graph_expr_params(right, params)?),
+        },
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => GraphExpr::Case {
+            operand: operand
+                .as_ref()
+                .map(|operand| resolve_graph_expr_params(operand, params).map(Box::new))
+                .transpose()?,
+            branches: branches
+                .iter()
+                .map(|branch| {
+                    Ok(GraphCaseBranch {
+                        when: resolve_graph_expr_params(&branch.when, params)?,
+                        then: resolve_graph_expr_params(&branch.then, params)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?,
+            else_expr: else_expr
+                .as_ref()
+                .map(|else_expr| resolve_graph_expr_params(else_expr, params).map(Box::new))
+                .transpose()?,
         },
         GraphExpr::IsNull(inner) => {
             GraphExpr::IsNull(Box::new(resolve_graph_expr_params(inner, params)?))
@@ -637,9 +800,10 @@ pub(crate) fn validate_graph_row_page(
 fn validate_graph_row_anchors(
     query: &GraphRowQuery,
     edge_id_constraints: &BTreeMap<String, Vec<u64>>,
+    external_bound_nodes: &HashSet<String>,
 ) -> Result<(), EngineError> {
     if query.pieces.is_empty() {
-        return validate_graph_row_no_piece_anchors(query);
+        return validate_graph_row_no_piece_anchors(query, external_bound_nodes);
     }
 
     if query.options.allow_full_scan {
@@ -651,7 +815,9 @@ fn validate_graph_row_anchors(
         .iter()
         .map(|node| (node.alias.as_str(), node))
         .collect();
-    let mut anchors = GraphRowAnchorState::default();
+    let mut anchors = GraphRowAnchorState {
+        bound_nodes: external_bound_nodes.clone(),
+    };
     for node in &query.nodes {
         if graph_node_pattern_has_structural_anchor(node) {
             anchors.bound_nodes.insert(node.alias.clone());
@@ -664,17 +830,25 @@ fn validate_graph_row_anchors(
     Ok(())
 }
 
-fn validate_graph_row_no_piece_anchors(query: &GraphRowQuery) -> Result<(), EngineError> {
-    if query.nodes.len() > 1 {
+fn validate_graph_row_no_piece_anchors(
+    query: &GraphRowQuery,
+    external_bound_nodes: &HashSet<String>,
+) -> Result<(), EngineError> {
+    let unbound_nodes = query
+        .nodes
+        .iter()
+        .filter(|node| !external_bound_nodes.contains(&node.alias))
+        .collect::<Vec<_>>();
+    if unbound_nodes.len() > 1 {
         return Err(EngineError::InvalidOperation(
             "graph row queries with multiple unconnected node aliases are out of scope"
                 .to_string(),
         ));
     }
-    if query.options.allow_full_scan || query.nodes.is_empty() {
+    if query.options.allow_full_scan || unbound_nodes.is_empty() {
         return Ok(());
     }
-    let Some(node) = query.nodes.first() else {
+    let Some(node) = unbound_nodes.first() else {
         return Ok(());
     };
     if graph_node_pattern_has_structural_anchor(node) {
@@ -874,8 +1048,27 @@ fn collect_graph_row_node_aliases(
     query: &GraphRowQuery,
     aliases: &mut GraphRowAliasState,
 ) -> Result<(), EngineError> {
+    let mut query_seen = HashSet::new();
     for node in &query.nodes {
         validate_graph_alias("node", &node.alias)?;
+        if !query_seen.insert(node.alias.clone()) {
+            return Err(EngineError::InvalidOperation(format!(
+                "graph row node alias '{}' is introduced more than once",
+                node.alias
+            )));
+        }
+        if aliases.edge_aliases.contains(&node.alias)
+            || aliases.path_aliases.contains(&node.alias)
+            || aliases.scalar_aliases.contains(&node.alias)
+        {
+            return Err(EngineError::InvalidOperation(format!(
+                "graph row node alias '{}' collides with an existing non-node alias",
+                node.alias
+            )));
+        }
+        if aliases.external_node_aliases.contains(&node.alias) {
+            continue;
+        }
         if !aliases.node_aliases.insert(node.alias.clone()) {
             return Err(EngineError::InvalidOperation(format!(
                 "graph row node alias '{}' is introduced more than once",
@@ -883,6 +1076,70 @@ fn collect_graph_row_node_aliases(
             )));
         }
         aliases.node_order.push(node.alias.clone());
+    }
+    Ok(())
+}
+
+fn seed_graph_row_aliases_from_input_schema(
+    input_schema: &crate::graph_row::GraphBindingSchema,
+    aliases: &mut GraphRowAliasState,
+) -> Result<(), EngineError> {
+    for slot in input_schema.slots() {
+        let Some(alias) = slot.user_alias.as_ref() else {
+            continue;
+        };
+        match slot.kind {
+            crate::graph_row::GraphBindingSlotKind::Node => {
+                validate_graph_alias("node", alias)?;
+                aliases.node_aliases.insert(alias.clone());
+                aliases.external_node_aliases.insert(alias.clone());
+                aliases.node_first_scope.insert(
+                    alias.clone(),
+                    if slot.nullable {
+                        GraphAliasScope::Optional
+                    } else {
+                        GraphAliasScope::Required
+                    },
+                );
+                aliases.node_order.push(alias.clone());
+            }
+            crate::graph_row::GraphBindingSlotKind::Edge => {
+                validate_graph_alias("edge", alias)?;
+                aliases.edge_aliases.insert(alias.clone());
+                aliases.edge_first_scope.insert(
+                    alias.clone(),
+                    if slot.nullable {
+                        GraphAliasScope::Optional
+                    } else {
+                        GraphAliasScope::Required
+                    },
+                );
+                if slot.nullable {
+                    aliases.optional_alias_order.push(alias.clone());
+                } else {
+                    aliases.required_edge_order.push(alias.clone());
+                }
+            }
+            crate::graph_row::GraphBindingSlotKind::Path => {
+                validate_graph_alias("path", alias)?;
+                aliases.path_aliases.insert(alias.clone());
+                aliases.path_first_scope.insert(
+                    alias.clone(),
+                    if slot.nullable {
+                        GraphAliasScope::Optional
+                    } else {
+                        GraphAliasScope::Required
+                    },
+                );
+                aliases.path_order.push(alias.clone());
+            }
+            crate::graph_row::GraphBindingSlotKind::Scalar => {
+                validate_graph_alias("scalar", alias)?;
+                aliases.scalar_aliases.insert(alias.clone());
+                aliases.scalar_order.push(alias.clone());
+            }
+            crate::graph_row::GraphBindingSlotKind::HiddenOccurrence => {}
+        }
     }
     Ok(())
 }
@@ -984,6 +1241,11 @@ fn collect_graph_row_edge_alias(
             "graph row edge alias '{alias}' collides with a node alias"
         )));
     }
+    if aliases.scalar_aliases.contains(alias) {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row edge alias '{alias}' collides with a scalar alias"
+        )));
+    }
     if aliases.path_aliases.contains(alias) {
         return Err(EngineError::InvalidOperation(format!(
             "graph row edge alias '{alias}' collides with a path alias"
@@ -1010,9 +1272,12 @@ fn collect_graph_row_path_alias(
     aliases: &mut GraphRowAliasState,
 ) -> Result<(), EngineError> {
     validate_graph_alias("path", alias)?;
-    if aliases.node_aliases.contains(alias) || aliases.edge_aliases.contains(alias) {
+    if aliases.node_aliases.contains(alias)
+        || aliases.edge_aliases.contains(alias)
+        || aliases.scalar_aliases.contains(alias)
+    {
         return Err(EngineError::InvalidOperation(format!(
-            "graph row path alias '{alias}' collides with a node or edge alias"
+            "graph row path alias '{alias}' collides with a node, edge, or scalar alias"
         )));
     }
     if !aliases.path_aliases.insert(alias.to_string()) {
@@ -1228,6 +1493,8 @@ impl GraphRowVisibleAliases {
             node_aliases: self.node_aliases.clone(),
             edge_aliases: self.edge_aliases.clone(),
             path_aliases: self.path_aliases.clone(),
+            scalar_aliases: HashSet::new(),
+            external_node_aliases: HashSet::new(),
             node_first_scope: HashMap::new(),
             edge_first_scope: HashMap::new(),
             path_first_scope: HashMap::new(),
@@ -1235,6 +1502,7 @@ impl GraphRowVisibleAliases {
             required_edge_order: Vec::new(),
             optional_alias_order: Vec::new(),
             path_order: Vec::new(),
+            scalar_order: Vec::new(),
         }
     }
 }
@@ -1301,6 +1569,10 @@ fn graph_expr_kind(
                 Err(EngineError::InvalidOperation(format!(
                     "graph row property expression cannot reference path alias '{alias}'"
                 )))
+            } else if aliases.scalar_aliases.contains(alias) {
+                Err(EngineError::InvalidOperation(format!(
+                    "graph row property expression requires a node or edge alias, got scalar alias '{alias}'"
+                )))
             } else {
                 Err(unknown_graph_alias(alias))
             }
@@ -1315,7 +1587,10 @@ fn graph_expr_kind(
                     | GraphNodeField::CreatedAt
                     | GraphNodeField::UpdatedAt => GraphExprKind::Scalar,
                 })
-            } else if aliases.edge_aliases.contains(alias) || aliases.path_aliases.contains(alias) {
+            } else if aliases.edge_aliases.contains(alias)
+                || aliases.path_aliases.contains(alias)
+                || aliases.scalar_aliases.contains(alias)
+            {
                 Err(EngineError::InvalidOperation(format!(
                     "graph row node field references non-node alias '{alias}'"
                 )))
@@ -1326,7 +1601,10 @@ fn graph_expr_kind(
         GraphExpr::EdgeField { alias, .. } => {
             if aliases.edge_aliases.contains(alias) {
                 Ok(GraphExprKind::Scalar)
-            } else if aliases.node_aliases.contains(alias) || aliases.path_aliases.contains(alias) {
+            } else if aliases.node_aliases.contains(alias)
+                || aliases.path_aliases.contains(alias)
+                || aliases.scalar_aliases.contains(alias)
+            {
                 Err(EngineError::InvalidOperation(format!(
                     "graph row edge field references non-edge alias '{alias}'"
                 )))
@@ -1340,7 +1618,10 @@ fn graph_expr_kind(
                     GraphPathField::NodeIds | GraphPathField::EdgeIds => GraphExprKind::List,
                     GraphPathField::Length => GraphExprKind::Scalar,
                 })
-            } else if aliases.node_aliases.contains(alias) || aliases.edge_aliases.contains(alias) {
+            } else if aliases.node_aliases.contains(alias)
+                || aliases.edge_aliases.contains(alias)
+                || aliases.scalar_aliases.contains(alias)
+            {
                 Err(EngineError::InvalidOperation(format!(
                     "graph row path field references non-path alias '{alias}'"
                 )))
@@ -1349,18 +1630,58 @@ fn graph_expr_kind(
             }
         }
         GraphExpr::Function { name, args } => graph_function_expr_kind(*name, args, aliases, params),
-        GraphExpr::Unary { expr, .. } => {
-            graph_expr_kind(expr, aliases, params)?;
+        GraphExpr::AggregateCall { .. } => Err(EngineError::InvalidOperation(
+            "aggregate expressions require graph pipeline projection execution".to_string(),
+        )),
+        GraphExpr::ExistsSubquery(_) => Err(EngineError::InvalidOperation(
+            "EXISTS subqueries require graph pipeline predicate execution".to_string(),
+        )),
+        GraphExpr::Unary { op, expr } => {
+            let kind = graph_expr_kind(expr, aliases, params)?;
+            graph_require_scalar_operand(graph_unary_operator_name(*op), kind)?;
             Ok(GraphExprKind::Scalar)
         }
         GraphExpr::IsNull(expr) | GraphExpr::IsNotNull(expr) => {
             graph_expr_kind(expr, aliases, params)?;
             Ok(GraphExprKind::Scalar)
         }
-        GraphExpr::Binary { left, right, .. } => {
-            graph_expr_kind(left, aliases, params)?;
-            graph_expr_kind(right, aliases, params)?;
+        GraphExpr::Binary { left, op, right } => {
+            let left_kind = graph_expr_kind(left, aliases, params)?;
+            let right_kind = graph_expr_kind(right, aliases, params)?;
+            validate_graph_binary_operand_kinds(*op, left_kind, right_kind)?;
             Ok(GraphExprKind::Scalar)
+        }
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                graph_expr_kind(operand, aliases, params)?;
+            }
+            let mut result_kind = None;
+            for branch in branches {
+                let when_kind = graph_expr_kind(&branch.when, aliases, params)?;
+                if operand.is_none() {
+                    graph_require_scalar_operand("CASE WHEN", when_kind)?;
+                }
+                result_kind = Some(graph_merge_case_result_kind(
+                    result_kind,
+                    graph_expr_kind(&branch.then, aliases, params)?,
+                ));
+            }
+            if let Some(else_expr) = else_expr {
+                result_kind = Some(graph_merge_case_result_kind(
+                    result_kind,
+                    graph_expr_kind(else_expr, aliases, params)?,
+                ));
+            } else {
+                result_kind = Some(graph_merge_case_result_kind(
+                    result_kind,
+                    GraphExprKind::Scalar,
+                ));
+            }
+            Ok(result_kind.unwrap_or(GraphExprKind::Scalar))
         }
     }
 }
@@ -1385,6 +1706,34 @@ fn graph_function_expr_kind(
     aliases: &GraphRowAliasState,
     params: &BTreeMap<String, GraphParamValue>,
 ) -> Result<GraphExprKind, EngineError> {
+    if is_scalar_graph_function(name) {
+        validate_graph_scalar_function_arity(name, args.len())?;
+        for arg in args {
+            let arg_kind = graph_expr_kind(arg, aliases, params)?;
+            let invalid_arg = match name {
+                GraphFunction::Size => matches!(
+                    arg_kind,
+                    GraphExprKind::Node | GraphExprKind::Edge | GraphExprKind::Path
+                ),
+                _ => matches!(
+                    arg_kind,
+                    GraphExprKind::Node
+                        | GraphExprKind::Edge
+                        | GraphExprKind::Path
+                        | GraphExprKind::NodeList
+                        | GraphExprKind::EdgeList
+                ),
+            };
+            if invalid_arg {
+                return Err(graph_function_kind_error(
+                    name,
+                    "scalar, list, map, or null input",
+                    arg_kind,
+                ));
+            }
+        }
+        return Ok(GraphExprKind::Scalar);
+    }
     if args.len() != 1 {
         return Err(EngineError::InvalidOperation(format!(
             "graph row function {} expects exactly one argument",
@@ -1416,7 +1765,68 @@ fn graph_function_expr_kind(
         | GraphFunction::Relationships => {
             Err(graph_function_kind_error(name, "a path", arg_kind))
         }
+        _ => Err(EngineError::InvalidOperation(format!(
+            "graph row function {} is not supported in graph-row single-block expressions",
+            graph_function_name(name)
+        ))),
     }
+}
+
+fn validate_graph_scalar_function_arity(
+    name: GraphFunction,
+    arg_count: usize,
+) -> Result<(), EngineError> {
+    let valid = match name {
+        GraphFunction::Coalesce => arg_count >= 1,
+        GraphFunction::Substring => matches!(arg_count, 2 | 3),
+        GraphFunction::ToString
+        | GraphFunction::ToInteger
+        | GraphFunction::ToFloat
+        | GraphFunction::Abs
+        | GraphFunction::Floor
+        | GraphFunction::Ceil
+        | GraphFunction::Round
+        | GraphFunction::Lower
+        | GraphFunction::Upper
+        | GraphFunction::Trim
+        | GraphFunction::Size
+        | GraphFunction::Head
+        | GraphFunction::Last => arg_count == 1,
+        _ => false,
+    };
+    if valid {
+        return Ok(());
+    }
+    let expected = match name {
+        GraphFunction::Coalesce => "at least one argument",
+        GraphFunction::Substring => "two or three arguments",
+        _ => "exactly one argument",
+    };
+    Err(EngineError::InvalidOperation(format!(
+        "graph row function {} expects {expected}",
+        graph_function_name(name)
+    )))
+}
+
+fn is_scalar_graph_function(name: GraphFunction) -> bool {
+    matches!(
+        name,
+        GraphFunction::Coalesce
+            | GraphFunction::ToString
+            | GraphFunction::ToInteger
+            | GraphFunction::ToFloat
+            | GraphFunction::Abs
+            | GraphFunction::Floor
+            | GraphFunction::Ceil
+            | GraphFunction::Round
+            | GraphFunction::Lower
+            | GraphFunction::Upper
+            | GraphFunction::Trim
+            | GraphFunction::Substring
+            | GraphFunction::Size
+            | GraphFunction::Head
+            | GraphFunction::Last
+    )
 }
 
 fn graph_list_expr_kind(item_kinds: Vec<GraphExprKind>) -> Result<GraphExprKind, EngineError> {
@@ -1445,6 +1855,93 @@ fn graph_expr_kind_is_list_or_map(kind: GraphExprKind) -> bool {
     )
 }
 
+fn validate_graph_binary_operand_kinds(
+    op: GraphBinaryOp,
+    left: GraphExprKind,
+    right: GraphExprKind,
+) -> Result<(), EngineError> {
+    match op {
+        GraphBinaryOp::And
+        | GraphBinaryOp::Or
+        | GraphBinaryOp::Lt
+        | GraphBinaryOp::Le
+        | GraphBinaryOp::Gt
+        | GraphBinaryOp::Ge
+        | GraphBinaryOp::Add
+        | GraphBinaryOp::Sub
+        | GraphBinaryOp::Mul
+        | GraphBinaryOp::Div
+        | GraphBinaryOp::StartsWith
+        | GraphBinaryOp::EndsWith
+        | GraphBinaryOp::Contains => {
+            let operator = graph_binary_operator_name(op);
+            graph_require_scalar_operand(operator, left)?;
+            graph_require_scalar_operand(operator, right)
+        }
+        GraphBinaryOp::Eq | GraphBinaryOp::Neq | GraphBinaryOp::In => Ok(()),
+    }
+}
+
+fn graph_require_scalar_operand(operator: &str, actual: GraphExprKind) -> Result<(), EngineError> {
+    if actual == GraphExprKind::Scalar {
+        return Ok(());
+    }
+    Err(EngineError::InvalidOperation(format!(
+        "graph row operator {operator} expects scalar operands, got {}",
+        graph_expr_kind_name(actual)
+    )))
+}
+
+fn graph_merge_case_result_kind(
+    current: Option<GraphExprKind>,
+    next: GraphExprKind,
+) -> GraphExprKind {
+    let Some(current) = current else {
+        return next;
+    };
+    if current == next {
+        return current;
+    }
+    if graph_expr_kind_is_list_or_map(current) {
+        return current;
+    }
+    if graph_expr_kind_is_list_or_map(next) {
+        return next;
+    }
+    if current != GraphExprKind::Scalar {
+        return current;
+    }
+    next
+}
+
+fn graph_unary_operator_name(op: GraphUnaryOp) -> &'static str {
+    match op {
+        GraphUnaryOp::Not => "NOT",
+        GraphUnaryOp::Neg => "-",
+    }
+}
+
+fn graph_binary_operator_name(op: GraphBinaryOp) -> &'static str {
+    match op {
+        GraphBinaryOp::Or => "OR",
+        GraphBinaryOp::And => "AND",
+        GraphBinaryOp::Eq => "=",
+        GraphBinaryOp::Neq => "<>",
+        GraphBinaryOp::Lt => "<",
+        GraphBinaryOp::Le => "<=",
+        GraphBinaryOp::Gt => ">",
+        GraphBinaryOp::Ge => ">=",
+        GraphBinaryOp::In => "IN",
+        GraphBinaryOp::Add => "+",
+        GraphBinaryOp::Sub => "-",
+        GraphBinaryOp::Mul => "*",
+        GraphBinaryOp::Div => "/",
+        GraphBinaryOp::StartsWith => "STARTS WITH",
+        GraphBinaryOp::EndsWith => "ENDS WITH",
+        GraphBinaryOp::Contains => "CONTAINS",
+    }
+}
+
 fn graph_function_kind_error(
     name: GraphFunction,
     expected: &str,
@@ -1468,6 +1965,21 @@ fn graph_function_name(name: GraphFunction) -> &'static str {
         GraphFunction::EndNode => "end_node",
         GraphFunction::Nodes => "nodes",
         GraphFunction::Relationships => "relationships",
+        GraphFunction::Coalesce => "coalesce",
+        GraphFunction::ToString => "to_string",
+        GraphFunction::ToInteger => "to_integer",
+        GraphFunction::ToFloat => "to_float",
+        GraphFunction::Abs => "abs",
+        GraphFunction::Floor => "floor",
+        GraphFunction::Ceil => "ceil",
+        GraphFunction::Round => "round",
+        GraphFunction::Lower => "lower",
+        GraphFunction::Upper => "upper",
+        GraphFunction::Trim => "trim",
+        GraphFunction::Substring => "substring",
+        GraphFunction::Size => "size",
+        GraphFunction::Head => "head",
+        GraphFunction::Last => "last",
     }
 }
 
@@ -1494,6 +2006,8 @@ fn graph_binding_alias_kind(
         Ok(GraphExprKind::Edge)
     } else if aliases.path_aliases.contains(alias) {
         Ok(GraphExprKind::Path)
+    } else if aliases.scalar_aliases.contains(alias) {
+        Ok(GraphExprKind::Scalar)
     } else {
         Err(unknown_graph_alias(alias))
     }
@@ -1521,6 +2035,9 @@ fn expand_graph_row_return_star(
     for alias in &aliases.optional_alias_order {
         items.push(graph_return_binding(alias));
     }
+    for alias in &aliases.scalar_order {
+        items.push(graph_return_binding(alias));
+    }
     if items.is_empty() {
         return Err(EngineError::InvalidOperation(
             "graph row RETURN * requires at least one user-visible alias".to_string(),
@@ -1532,23 +2049,63 @@ fn expand_graph_row_return_star(
 fn build_graph_row_binding_schema(
     aliases: &GraphRowAliasState,
     pieces: &[GraphPatternPiece],
+    input_schema: Option<&crate::graph_row::GraphBindingSchema>,
 ) -> Result<crate::graph_row::GraphBindingSchema, EngineError> {
     let mut schema = crate::graph_row::GraphBindingSchema::new();
+    if let Some(input_schema) = input_schema {
+        for slot in input_schema.slots() {
+            match (slot.user_alias.as_ref(), slot.kind) {
+                (Some(alias), crate::graph_row::GraphBindingSlotKind::Node) => {
+                    schema.add_node_alias(alias.clone(), slot.nullable)?;
+                }
+                (Some(alias), crate::graph_row::GraphBindingSlotKind::Edge) => {
+                    schema.add_edge_alias(alias.clone(), slot.nullable)?;
+                }
+                (Some(alias), crate::graph_row::GraphBindingSlotKind::Path) => {
+                    schema.add_path_alias(alias.clone(), slot.nullable)?;
+                }
+                (Some(alias), crate::graph_row::GraphBindingSlotKind::Scalar) => {
+                    schema.add_scalar_alias(alias.clone(), slot.nullable)?;
+                }
+                (None, crate::graph_row::GraphBindingSlotKind::Scalar) => {
+                    schema.add_internal_scalar(slot.name.clone(), slot.nullable)?;
+                }
+                (_, crate::graph_row::GraphBindingSlotKind::HiddenOccurrence) | (None, _) => {}
+            }
+        }
+    }
     for alias in &aliases.node_order {
+        if schema.slot_for_alias(alias).is_some() {
+            continue;
+        }
         let nullable = aliases.node_first_scope.get(alias) == Some(&GraphAliasScope::Optional);
         schema.add_node_alias(alias.clone(), nullable)?;
     }
     for alias in &aliases.required_edge_order {
+        if schema.slot_for_alias(alias).is_some() {
+            continue;
+        }
         schema.add_edge_alias(alias.clone(), false)?;
     }
     for alias in &aliases.optional_alias_order {
+        if schema.slot_for_alias(alias).is_some() {
+            continue;
+        }
         if aliases.edge_aliases.contains(alias) {
             schema.add_edge_alias(alias.clone(), true)?;
         }
     }
     for alias in &aliases.path_order {
+        if schema.slot_for_alias(alias).is_some() {
+            continue;
+        }
         let nullable = aliases.path_first_scope.get(alias) == Some(&GraphAliasScope::Optional);
         schema.add_path_alias(alias.clone(), nullable)?;
+    }
+    for alias in &aliases.scalar_order {
+        if schema.slot_for_alias(alias).is_none() {
+            schema.add_scalar_alias(alias.clone(), true)?;
+        }
     }
     add_hidden_occurrence_slots(pieces, &mut schema, &mut 0, false)?;
     Ok(schema)

@@ -1,6 +1,10 @@
 use crate::error::EngineError;
 use crate::gql::ast::{BinaryOp, Expr, ExprKind, Literal, MapLiteral, UnaryOp};
 use crate::gql::semantic::{gql_semantic_error, GqlAliasKind, GqlReturnPlan, GqlSemanticPlan};
+use crate::graph_row::{
+    eval_graph_binary_values, eval_graph_scalar_function_values, eval_graph_unary_value,
+    GraphEvalValue,
+};
 use crate::property_value_semantics::{
     compare_numeric_keys, numeric_key_from_f64, numeric_key_from_i64, numeric_key_from_u64,
     NumericScalarKey,
@@ -11,7 +15,9 @@ use crate::row_projection::{
     EdgeOutputProjection, EdgeProjectionField, NodeOutputProjection, NodeProjectionField,
     ProjectedRow, ProjectedValue, ProjectionColumn, ProjectionNeedClass, RowProjectionPlan,
 };
-use crate::types::{GqlParamValue, GqlParams, GqlSemanticErrorCode};
+use crate::types::{
+    GqlParamValue, GqlParams, GqlSemanticErrorCode, GraphBinaryOp, GraphFunction, GraphUnaryOp,
+};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -425,6 +431,18 @@ fn collect_expr_refs(
                 )?;
             }
         }
+        ExprKind::AggregateCall { arg, .. } => {
+            if let Some(arg) = arg.as_ref() {
+                collect_expr_refs(
+                    arg,
+                    plan,
+                    alias_projection,
+                    include_variable_elements,
+                    include_vectors,
+                    refs,
+                )?;
+            }
+        }
         ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } => collect_expr_refs(
             expr,
             plan,
@@ -451,6 +469,50 @@ fn collect_expr_refs(
                 refs,
             )?;
         }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_refs(
+                    operand,
+                    plan,
+                    alias_projection,
+                    include_variable_elements,
+                    include_vectors,
+                    refs,
+                )?;
+            }
+            for branch in branches {
+                collect_expr_refs(
+                    &branch.when,
+                    plan,
+                    alias_projection,
+                    include_variable_elements,
+                    include_vectors,
+                    refs,
+                )?;
+                collect_expr_refs(
+                    &branch.then,
+                    plan,
+                    alias_projection,
+                    include_variable_elements,
+                    include_vectors,
+                    refs,
+                )?;
+            }
+            if let Some(else_expr) = else_expr {
+                collect_expr_refs(
+                    else_expr,
+                    plan,
+                    alias_projection,
+                    include_variable_elements,
+                    include_vectors,
+                    refs,
+                )?;
+            }
+        }
         ExprKind::List(items) => {
             for item in items {
                 collect_expr_refs(
@@ -475,6 +537,7 @@ fn collect_expr_refs(
                 )?;
             }
         }
+        ExprKind::ExistsSubquery(_) => {}
         ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
     }
     Ok(())
@@ -515,7 +578,7 @@ fn add_element_ref(
                     output_name: internal_output_name(alias, "edge"),
                 });
         }
-        GqlAliasKind::Path => {}
+        GqlAliasKind::Path | GqlAliasKind::Scalar => {}
     }
     Ok(())
 }
@@ -561,7 +624,7 @@ fn add_property_ref(
                     });
             }
         }
-        GqlAliasKind::Path => {}
+        GqlAliasKind::Path | GqlAliasKind::Scalar => {}
     }
     Ok(())
 }
@@ -582,7 +645,7 @@ fn add_function_ref(
             GqlAliasKind::Edge => {
                 add_edge_metadata_ref(alias, projection_alias, EdgeProjectionField::Id, refs)
             }
-            GqlAliasKind::Path => {}
+            GqlAliasKind::Path | GqlAliasKind::Scalar => {}
         },
         "labels" => {
             add_node_metadata_ref(alias, projection_alias, NodeProjectionField::Labels, refs)
@@ -653,7 +716,7 @@ fn eval_expr(expr: &Expr, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, 
                     GqlAliasKind::Edge => GqlRuntimeValueKey::EdgeElement {
                         alias: alias.clone(),
                     },
-                    GqlAliasKind::Path => {
+                    GqlAliasKind::Path | GqlAliasKind::Scalar => {
                         return Ok(RuntimeValue::Binding {
                             alias: alias.clone(),
                             kind,
@@ -701,21 +764,20 @@ fn eval_expr(expr: &Expr, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, 
                 ),
             }
         }
-        ExprKind::Unary {
-            op: UnaryOp::Not,
-            expr,
-        } => match eval_expr(expr, context)? {
-            RuntimeValue::Value(ProjectedValue::Bool(value)) => {
-                Ok(RuntimeValue::Value(ProjectedValue::Bool(!value)))
-            }
-            RuntimeValue::Value(ProjectedValue::Null) => {
-                Ok(RuntimeValue::Value(ProjectedValue::Null))
-            }
-            RuntimeValue::Value(_) | RuntimeValue::Binding { .. } => Err(invalid_expression_error(
-                expr,
-                "NOT requires a boolean or null operand",
-            )),
-        },
+        ExprKind::Unary { op, expr } => {
+            let value = value_only(expr, eval_expr(expr, context)?)?;
+            let graph_value = projected_value_to_graph_eval_scalar(&value)?.ok_or_else(|| {
+                invalid_expression_error(expr, "unary expression requires scalar or null input")
+            })?;
+            let graph_op = match op {
+                UnaryOp::Not => GraphUnaryOp::Not,
+                UnaryOp::Neg => GraphUnaryOp::Neg,
+            };
+            Ok(RuntimeValue::Value(graph_eval_to_projected_scalar(
+                eval_graph_unary_value(graph_op, &graph_value)?,
+                &expr.span,
+            )?))
+        }
         ExprKind::Binary { op, left, right } => eval_binary(*op, left, right, context),
         ExprKind::IsNull { expr, negated } => {
             let value = eval_expr(expr, context)?;
@@ -727,6 +789,10 @@ fn eval_expr(expr: &Expr, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, 
             })))
         }
         ExprKind::FunctionCall { name, args } => {
+            let lower = name.name.to_ascii_lowercase();
+            if let Some(function) = gql_eval_scalar_function_name(&lower) {
+                return eval_scalar_function(function, &name.name, args, context, &expr.span);
+            }
             if args.len() != 1 {
                 return Err(invalid_expression_error(
                     expr,
@@ -761,6 +827,12 @@ fn eval_expr(expr: &Expr, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, 
                             "id() expects a node or edge alias",
                         ));
                     }
+                    GqlAliasKind::Scalar => {
+                        return Err(invalid_expression_error(
+                            expr,
+                            "id() expects a node or edge alias",
+                        ));
+                    }
                 },
                 "labels" => context.value(GqlRuntimeValueKey::NodeMetadata {
                     alias: alias.clone(),
@@ -779,6 +851,25 @@ fn eval_expr(expr: &Expr, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, 
             };
             Ok(RuntimeValue::Value(value))
         }
+        ExprKind::AggregateCall { .. } => Err(invalid_expression_error(
+            expr,
+            "aggregate functions require projection pipeline evaluation",
+        )),
+        ExprKind::ExistsSubquery(_) => Err(invalid_expression_error(
+            expr,
+            "EXISTS subqueries require native pipeline evaluation",
+        )),
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => eval_case(
+            operand.as_deref(),
+            branches,
+            else_expr.as_deref(),
+            context,
+            &expr.span,
+        ),
         ExprKind::List(items) => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {
@@ -805,9 +896,37 @@ fn eval_binary(
         | BinaryOp::Le
         | BinaryOp::Gt
         | BinaryOp::Ge
+        | BinaryOp::Add
+        | BinaryOp::Sub
+        | BinaryOp::Mul
+        | BinaryOp::Div
+        | BinaryOp::StartsWith
+        | BinaryOp::EndsWith
+        | BinaryOp::Contains
         | BinaryOp::In => {
             let left_value = value_only(left, eval_expr(left, context)?)?;
             let right_value = value_only(right, eval_expr(right, context)?)?;
+            if matches!(
+                op,
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::StartsWith
+                    | BinaryOp::EndsWith
+                    | BinaryOp::Contains
+            ) {
+                return Ok(RuntimeValue::Value(eval_shared_binary(
+                    op,
+                    &left_value,
+                    &right_value,
+                    &left.span,
+                )?));
+            }
+            if let Some(value) = try_eval_shared_binary(op, &left_value, &right_value, &left.span)?
+            {
+                return Ok(RuntimeValue::Value(value));
+            }
             Ok(RuntimeValue::Value(compare_values(
                 op,
                 left_value,
@@ -849,6 +968,275 @@ fn eval_or(
         (Some(false), Some(false)) => ProjectedValue::Bool(false),
         _ => ProjectedValue::Null,
     }))
+}
+
+fn eval_case(
+    operand: Option<&Expr>,
+    branches: &[crate::gql::ast::CaseBranch],
+    else_expr: Option<&Expr>,
+    context: &GqlEvalContext<'_>,
+    span: &crate::types::SourceSpan,
+) -> Result<RuntimeValue, EngineError> {
+    if let Some(operand) = operand {
+        let operand_value = value_only(operand, eval_expr(operand, context)?)?;
+        for branch in branches {
+            let when_value = value_only(&branch.when, eval_expr(&branch.when, context)?)?;
+            if let Some(value) =
+                try_eval_shared_binary(BinaryOp::Eq, &operand_value, &when_value, span)?
+            {
+                match value {
+                    ProjectedValue::Bool(true) => return eval_expr(&branch.then, context),
+                    ProjectedValue::Bool(false) | ProjectedValue::Null => {}
+                    _ => unreachable!("equality returns bool or null"),
+                }
+            } else if matches!(
+                compare_values(BinaryOp::Eq, operand_value.clone(), when_value),
+                ProjectedValue::Bool(true)
+            ) {
+                return eval_expr(&branch.then, context);
+            }
+        }
+    } else {
+        for branch in branches {
+            if let Some(true) = bool_or_null(&branch.when, eval_expr(&branch.when, context)?)? {
+                return eval_expr(&branch.then, context);
+            }
+        }
+    }
+    else_expr
+        .map(|expr| eval_expr(expr, context))
+        .unwrap_or(Ok(RuntimeValue::Value(ProjectedValue::Null)))
+}
+
+fn eval_scalar_function(
+    function: GraphFunction,
+    display: &str,
+    args: &[Expr],
+    context: &GqlEvalContext<'_>,
+    span: &crate::types::SourceSpan,
+) -> Result<RuntimeValue, EngineError> {
+    validate_eval_scalar_function_arity(&display.to_ascii_lowercase(), display, args.len(), span)?;
+    if function == GraphFunction::Coalesce {
+        for arg in args {
+            let value = value_only(arg, eval_expr(arg, context)?)?;
+            let graph_value = projected_value_to_graph_eval_scalar(&value)?.ok_or_else(|| {
+                invalid_expression_error(
+                    arg,
+                    "scalar function expects scalar, list, map, or null input",
+                )
+            })?;
+            if !graph_value.is_null() {
+                let checked = eval_graph_scalar_function_values(
+                    GraphFunction::Coalesce,
+                    std::slice::from_ref(&graph_value),
+                )?;
+                return Ok(RuntimeValue::Value(graph_eval_to_projected_scalar(
+                    checked, &arg.span,
+                )?));
+            }
+        }
+        return Ok(RuntimeValue::Value(ProjectedValue::Null));
+    }
+    let values = args
+        .iter()
+        .map(|arg| {
+            let value = value_only(arg, eval_expr(arg, context)?)?;
+            projected_value_to_graph_eval_scalar(&value)?.ok_or_else(|| {
+                invalid_expression_error(
+                    arg,
+                    "scalar function expects scalar, list, map, or null input",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    Ok(RuntimeValue::Value(graph_eval_to_projected_scalar(
+        eval_graph_scalar_function_values(function, &values)?,
+        span,
+    )?))
+}
+
+fn eval_shared_binary(
+    op: BinaryOp,
+    left: &ProjectedValue,
+    right: &ProjectedValue,
+    span: &crate::types::SourceSpan,
+) -> Result<ProjectedValue, EngineError> {
+    let left = projected_value_to_graph_eval_scalar(left)?.ok_or_else(|| {
+        gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "scalar operator requires scalar, list, map, or null operands".to_string(),
+            span.clone(),
+        )
+    })?;
+    let right = projected_value_to_graph_eval_scalar(right)?.ok_or_else(|| {
+        gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "scalar operator requires scalar, list, map, or null operands".to_string(),
+            span.clone(),
+        )
+    })?;
+    graph_eval_to_projected_scalar(
+        eval_graph_binary_values(gql_eval_binary_op_to_graph_op(op), &left, &right)?,
+        span,
+    )
+}
+
+fn try_eval_shared_binary(
+    op: BinaryOp,
+    left: &ProjectedValue,
+    right: &ProjectedValue,
+    span: &crate::types::SourceSpan,
+) -> Result<Option<ProjectedValue>, EngineError> {
+    let Some(left) = projected_value_to_graph_eval_scalar(left)? else {
+        return Ok(None);
+    };
+    let Some(right) = projected_value_to_graph_eval_scalar(right)? else {
+        return Ok(None);
+    };
+    graph_eval_to_projected_scalar(
+        eval_graph_binary_values(gql_eval_binary_op_to_graph_op(op), &left, &right)?,
+        span,
+    )
+    .map(Some)
+}
+
+fn gql_eval_binary_op_to_graph_op(op: BinaryOp) -> GraphBinaryOp {
+    match op {
+        BinaryOp::Or => GraphBinaryOp::Or,
+        BinaryOp::And => GraphBinaryOp::And,
+        BinaryOp::Add => GraphBinaryOp::Add,
+        BinaryOp::Sub => GraphBinaryOp::Sub,
+        BinaryOp::Mul => GraphBinaryOp::Mul,
+        BinaryOp::Div => GraphBinaryOp::Div,
+        BinaryOp::Eq => GraphBinaryOp::Eq,
+        BinaryOp::Neq => GraphBinaryOp::Neq,
+        BinaryOp::Lt => GraphBinaryOp::Lt,
+        BinaryOp::Le => GraphBinaryOp::Le,
+        BinaryOp::Gt => GraphBinaryOp::Gt,
+        BinaryOp::Ge => GraphBinaryOp::Ge,
+        BinaryOp::In => GraphBinaryOp::In,
+        BinaryOp::StartsWith => GraphBinaryOp::StartsWith,
+        BinaryOp::EndsWith => GraphBinaryOp::EndsWith,
+        BinaryOp::Contains => GraphBinaryOp::Contains,
+    }
+}
+
+fn gql_eval_scalar_function_name(lower: &str) -> Option<GraphFunction> {
+    match lower {
+        "coalesce" => Some(GraphFunction::Coalesce),
+        "to_string" => Some(GraphFunction::ToString),
+        "to_integer" => Some(GraphFunction::ToInteger),
+        "to_float" => Some(GraphFunction::ToFloat),
+        "abs" => Some(GraphFunction::Abs),
+        "floor" => Some(GraphFunction::Floor),
+        "ceil" => Some(GraphFunction::Ceil),
+        "round" => Some(GraphFunction::Round),
+        "lower" => Some(GraphFunction::Lower),
+        "upper" => Some(GraphFunction::Upper),
+        "trim" => Some(GraphFunction::Trim),
+        "substring" => Some(GraphFunction::Substring),
+        "size" => Some(GraphFunction::Size),
+        "head" => Some(GraphFunction::Head),
+        "last" => Some(GraphFunction::Last),
+        _ => None,
+    }
+}
+
+fn validate_eval_scalar_function_arity(
+    lower: &str,
+    display: &str,
+    arg_count: usize,
+    span: &crate::types::SourceSpan,
+) -> Result<(), EngineError> {
+    let valid = match lower {
+        "coalesce" => arg_count >= 1,
+        "substring" => matches!(arg_count, 2 | 3),
+        "to_string" | "to_integer" | "to_float" | "abs" | "floor" | "ceil" | "round" | "lower"
+        | "upper" | "trim" | "size" | "head" | "last" => arg_count == 1,
+        _ => false,
+    };
+    if valid {
+        return Ok(());
+    }
+    let expected = match lower {
+        "coalesce" => "at least one argument",
+        "substring" => "two or three arguments",
+        _ => "exactly one argument",
+    };
+    Err(gql_semantic_error(
+        GqlSemanticErrorCode::InvalidReturnExpression,
+        format!("function '{display}' expects {expected}"),
+        span.clone(),
+    ))
+}
+
+fn projected_value_to_graph_eval_scalar(
+    value: &ProjectedValue,
+) -> Result<Option<GraphEvalValue>, EngineError> {
+    Ok(match value {
+        ProjectedValue::Null => Some(GraphEvalValue::Null),
+        ProjectedValue::Bool(value) => Some(GraphEvalValue::Bool(*value)),
+        ProjectedValue::Int(value) => Some(GraphEvalValue::Int(*value)),
+        ProjectedValue::UInt(value) => Some(GraphEvalValue::UInt(*value)),
+        ProjectedValue::Float(value) => Some(GraphEvalValue::Float(*value)),
+        ProjectedValue::String(value) => Some(GraphEvalValue::String(value.clone())),
+        ProjectedValue::Bytes(value) => Some(GraphEvalValue::Bytes(value.clone())),
+        ProjectedValue::List(values) => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(value) = projected_value_to_graph_eval_scalar(value)? else {
+                    return Ok(None);
+                };
+                out.push(value);
+            }
+            Some(GraphEvalValue::List(out))
+        }
+        ProjectedValue::Map(values) => {
+            let mut out = BTreeMap::new();
+            for (key, value) in values {
+                let Some(value) = projected_value_to_graph_eval_scalar(value)? else {
+                    return Ok(None);
+                };
+                out.insert(key.clone(), value);
+            }
+            Some(GraphEvalValue::Map(out))
+        }
+        ProjectedValue::Node(_) | ProjectedValue::Edge(_) | ProjectedValue::Path(_) => None,
+    })
+}
+
+fn graph_eval_to_projected_scalar(
+    value: GraphEvalValue,
+    span: &crate::types::SourceSpan,
+) -> Result<ProjectedValue, EngineError> {
+    Ok(match value {
+        GraphEvalValue::Null => ProjectedValue::Null,
+        GraphEvalValue::Bool(value) => ProjectedValue::Bool(value),
+        GraphEvalValue::Int(value) => ProjectedValue::Int(value),
+        GraphEvalValue::UInt(value) => ProjectedValue::UInt(value),
+        GraphEvalValue::Float(value) => ProjectedValue::Float(value),
+        GraphEvalValue::String(value) => ProjectedValue::String(value),
+        GraphEvalValue::Bytes(value) => ProjectedValue::Bytes(value),
+        GraphEvalValue::List(values) => ProjectedValue::List(
+            values
+                .into_iter()
+                .map(|value| graph_eval_to_projected_scalar(value, span))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        GraphEvalValue::Map(values) => ProjectedValue::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| Ok((key, graph_eval_to_projected_scalar(value, span)?)))
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()?,
+        ),
+        GraphEvalValue::Node(_) | GraphEvalValue::Edge(_) | GraphEvalValue::Path(_) => {
+            return Err(gql_semantic_error(
+                GqlSemanticErrorCode::InvalidReturnExpression,
+                "scalar expression produced a graph element value".to_string(),
+                span.clone(),
+            ));
+        }
+    })
 }
 
 fn eval_map(map: &MapLiteral, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, EngineError> {
@@ -895,7 +1283,7 @@ fn property_value_for_alias(
                 })
             }
         }
-        GqlAliasKind::Path => ProjectedValue::Null,
+        GqlAliasKind::Path | GqlAliasKind::Scalar => ProjectedValue::Null,
     }
 }
 
@@ -936,7 +1324,15 @@ fn compare_values(op: BinaryOp, left: ProjectedValue, right: ProjectedValue) -> 
             }
             _ => ProjectedValue::Null,
         },
-        BinaryOp::And | BinaryOp::Or => unreachable!(),
+        BinaryOp::And
+        | BinaryOp::Or
+        | BinaryOp::Add
+        | BinaryOp::Sub
+        | BinaryOp::Mul
+        | BinaryOp::Div
+        | BinaryOp::StartsWith
+        | BinaryOp::EndsWith
+        | BinaryOp::Contains => unreachable!(),
     }
 }
 
@@ -1228,5 +1624,37 @@ mod tests {
             ),
             ProjectedValue::Bool(false)
         );
+    }
+
+    #[test]
+    fn lazy_coalesce_uses_shared_scalar_domain_validation() {
+        let params = GqlParams::from([("bad".to_string(), GqlParamValue::Float(f64::NAN))]);
+        let plan = bind_query(
+            parse_query(
+                "MATCH (n:Person) RETURN coalesce($bad, 1)",
+                &GqlParseOptions::default(),
+            )
+            .unwrap(),
+            &params,
+        )
+        .unwrap();
+        let expr = return_exprs(&plan).pop().unwrap().expr;
+        let projection = build_runtime_projection(
+            std::slice::from_ref(&expr),
+            &plan,
+            &BTreeMap::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        let row = ProjectedRow { values: Vec::new() };
+        let context = GqlEvalContext::new(&projection, &row, &plan, &params);
+
+        let err = eval_expr_against_context(&expr, &context).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::InvalidOperation(message)
+                if message.contains("scalar function result must be finite")
+        ));
     }
 }

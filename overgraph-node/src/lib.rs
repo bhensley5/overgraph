@@ -4,7 +4,7 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi::JsString;
 use napi_derive::napi;
-use overgraph::types::GqlPath;
+use overgraph::types::{GqlPath, GraphAggregateFunction};
 use overgraph::{
     gql_referenced_param_names, AdjacencyExport as CoreAdjacencyExport,
     AllShortestPathsOptions as CoreAllShortestPathsOptions, CompactionPhase,
@@ -17,29 +17,33 @@ use overgraph::{
     GqlCapSummary, GqlEdge, GqlExecutionCapSummary, GqlExecutionExplain, GqlExecutionMode,
     GqlExecutionOptions, GqlExecutionResult, GqlExecutionStats, GqlExplain, GqlLoweringTarget,
     GqlNode, GqlParamValue, GqlParams, GqlRow, GqlRowOperation, GqlStatementKind, GqlValue,
-    GraphBinaryOp, GraphCapExplain, GraphCursorExplain, GraphEdgeField,
+    GraphBinaryOp, GraphCapExplain, GraphCaseBranch, GraphCursorExplain, GraphEdgeField,
     GraphEdgePattern as CoreGraphEdgePattern, GraphEdgeValue, GraphElementProjection,
     GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
     GraphNodePattern as CoreGraphNodePattern, GraphNodeValue, GraphOptionalGroup,
     GraphOrderDirection, GraphOrderExplain, GraphOrderItem, GraphOutputMode, GraphOutputOptions,
     GraphPageRequest, GraphParamValue, GraphPatch as CoreGraphPatch, GraphPathField,
-    GraphPathValue, GraphPatternPiece, GraphProjectionExplain, GraphPropertySelection,
-    GraphQueryOptions, GraphReturnItem, GraphReturnProjection, GraphRow, GraphRowExplain,
-    GraphRowOperationExplain, GraphRowQuery, GraphRowResult, GraphRowStats,
+    GraphPathValue, GraphPatternPiece, GraphPipelineCapExplain, GraphPipelineExplain,
+    GraphPipelineMatchStage, GraphPipelineOptions, GraphPipelineQuery, GraphPipelineResult,
+    GraphPipelineStage, GraphPipelineStageExplain, GraphPipelineStats, GraphProjectItem,
+    GraphProjectKind, GraphProjectStage, GraphProjectionExplain, GraphProjectionItems,
+    GraphPropertySelection, GraphQueryOptions, GraphReturnItem, GraphReturnProjection, GraphRow,
+    GraphRowExplain, GraphRowOperationExplain, GraphRowQuery, GraphRowResult, GraphRowStats,
     GraphSelectedEdgeProjection, GraphSelectedNodeProjection, GraphSelectedPathProjection,
-    GraphSelectedProjection, GraphUnaryOp, GraphValue, GraphVariableLengthPattern,
-    GraphVectorSelection, HnswConfig, IsConnectedOptions as CoreIsConnectedOptions,
-    LabelMatchMode as CoreLabelMatchMode, NeighborEntry as CoreNeighborEntry, NeighborOptions,
-    NodeFilterExpr, NodeIdMap, NodeInput as CoreNodeInput, NodeKeyQuery,
-    NodeLabelFilter as CoreNodeLabelFilter, NodeLabelInfo as CoreNodeLabelInfo,
-    NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
-    NodeView as CoreNodeView, PageRequest, PageResult, PprAlgorithm, PprOptions,
-    PprResult as CorePprResult, PropValue, PropertyRangeBound as CorePropertyRangeBound,
-    PropertyRangeCursor as CorePropertyRangeCursor, PropertyRangePageRequest,
-    PropertyRangePageResult as CorePropertyRangePageResult, PrunePolicy as CorePrunePolicy,
-    PrunePolicyInfo, PruneResult as CorePruneResult, QueryEdgeIdsResult, QueryEdgesResult,
-    QueryNodeIdsResult, QueryNodesResult, QueryPlan, QueryPlanKind, QueryPlanNode,
-    QueryPlanWarning, ScoringMode, ScrubReport as CoreScrubReport,
+    GraphSelectedProjection, GraphShortestPathEndpoint, GraphShortestPathMode,
+    GraphShortestPathStage, GraphSubqueryStage, GraphUnaryOp, GraphUnionStage, GraphValue,
+    GraphVariableLengthPattern, GraphVectorSelection, HnswConfig,
+    IsConnectedOptions as CoreIsConnectedOptions, LabelMatchMode as CoreLabelMatchMode,
+    NeighborEntry as CoreNeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap,
+    NodeInput as CoreNodeInput, NodeKeyQuery, NodeLabelFilter as CoreNodeLabelFilter,
+    NodeLabelInfo as CoreNodeLabelInfo, NodePropertyIndexInfo as CoreNodePropertyIndexInfo,
+    NodeQuery, NodeQueryOrder, NodeView as CoreNodeView, PageRequest, PageResult, PprAlgorithm,
+    PprOptions, PprResult as CorePprResult, PropValue,
+    PropertyRangeBound as CorePropertyRangeBound, PropertyRangeCursor as CorePropertyRangeCursor,
+    PropertyRangePageRequest, PropertyRangePageResult as CorePropertyRangePageResult,
+    PrunePolicy as CorePrunePolicy, PrunePolicyInfo, PruneResult as CorePruneResult,
+    QueryEdgeIdsResult, QueryEdgesResult, QueryNodeIdsResult, QueryNodesResult, QueryPlan,
+    QueryPlanKind, QueryPlanNode, QueryPlanWarning, ScoringMode, ScrubReport as CoreScrubReport,
     SecondaryIndexKind as CoreSecondaryIndexKind, SecondaryIndexState,
     ShortestPath as CoreShortestPath, ShortestPathOptions as CoreShortestPathOptions, Subgraph,
     SubgraphOptions, TopKOptions, TraversalCursor as CoreTraversalCursor,
@@ -102,9 +106,15 @@ pub struct GraphRowResultPayload {
     compact_rows: bool,
 }
 
+pub struct GraphPipelineResultPayload {
+    result: GraphPipelineResult,
+    compact_rows: bool,
+}
+
 struct GraphJsValue(GraphValue);
 
 pub struct GraphJsExplain(GraphRowExplain);
+pub struct GraphPipelineJsExplain(GraphPipelineExplain);
 
 impl TypeName for GqlJsPayload {
     fn type_name() -> &'static str {
@@ -240,6 +250,37 @@ impl ToNapiValue for GraphRowResultPayload {
     }
 }
 
+impl TypeName for GraphPipelineResultPayload {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for GraphPipelineResultPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let mut object = Object::new(&env)?;
+        object.set("columns", val.result.columns.clone())?;
+        let rows =
+            graph_rows_to_js_array(&env, &val.result.columns, val.result.rows, val.compact_rows)?;
+        object.set("rows", rows)?;
+        object.set("nextCursor", val.result.next_cursor)?;
+        object.set(
+            "stats",
+            GraphJsValue(graph_pipeline_stats_to_value(val.result.stats)),
+        )?;
+        match val.result.plan {
+            Some(plan) => object.set("plan", GraphPipelineJsExplain(plan))?,
+            None => object.set("plan", Option::<serde_json::Value>::None)?,
+        }
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
 impl TypeName for GraphJsExplain {
     fn type_name() -> &'static str {
         "Object"
@@ -254,6 +295,24 @@ impl ToNapiValue for GraphJsExplain {
     unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
         let env = Env::from_raw(env);
         let json = graph_explain_to_json(val.0)?;
+        unsafe { serde_json::Value::to_napi_value(env.raw(), json) }
+    }
+}
+
+impl TypeName for GraphPipelineJsExplain {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for GraphPipelineJsExplain {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let json = graph_pipeline_explain_to_json(val.0)?;
         unsafe { serde_json::Value::to_napi_value(env.raw(), json) }
     }
 }
@@ -1137,6 +1196,23 @@ impl OverGraph {
     }
 
     #[napi(
+        ts_args_type = "request: import('./query-types').GraphPipelineRequest",
+        ts_return_type = "import('./query-types').GraphPipelineResult"
+    )]
+    pub fn query_graph_pipeline(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<GraphPipelineResultPayload> {
+        let query = parse_js_graph_pipeline_query(&request)?;
+        let compact_rows = query.output.compact_rows;
+        let result = with_engine_ref(self, |eng| eng.query_graph_pipeline(&query))?;
+        Ok(GraphPipelineResultPayload {
+            result,
+            compact_rows,
+        })
+    }
+
+    #[napi(
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
         ts_return_type = "import('./query-types').QueryPlan"
     )]
@@ -1164,6 +1240,19 @@ impl OverGraph {
         let query = parse_js_graph_row_query(&request)?;
         let explain = with_engine_ref(self, |eng| eng.explain_graph_rows(&query))?;
         Ok(GraphJsExplain(explain))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').GraphPipelineRequest",
+        ts_return_type = "import('./query-types').GraphPipelineExplain"
+    )]
+    pub fn explain_graph_pipeline(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<GraphPipelineJsExplain> {
+        let query = parse_js_graph_pipeline_query(&request)?;
+        let explain = with_engine_ref(self, |eng| eng.explain_graph_pipeline(&query))?;
+        Ok(GraphPipelineJsExplain(explain))
     }
 
     #[napi(
@@ -2478,6 +2567,30 @@ impl OverGraph {
     }
 
     #[napi(
+        ts_args_type = "request: import('./query-types').GraphPipelineRequest",
+        ts_return_type = "Promise<import('./query-types').GraphPipelineResult>"
+    )]
+    pub fn query_graph_pipeline_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<GraphPipelineResultPayload, GraphPipelineResultPayload>>>
+    {
+        let query = parse_js_graph_pipeline_query(&request)?;
+        let compact_rows = query.output.compact_rows;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| {
+                let result = eng.query_graph_pipeline(&query)?;
+                Ok(GraphPipelineResultPayload {
+                    result,
+                    compact_rows,
+                })
+            },
+            napi_identity,
+        )))
+    }
+
+    #[napi(
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
         ts_return_type = "Promise<import('./query-types').QueryPlan>"
     )]
@@ -2522,6 +2635,22 @@ impl OverGraph {
             self.inner.clone(),
             move |eng| eng.explain_graph_rows(&query),
             |explain| Ok(GraphJsExplain(explain)),
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "request: import('./query-types').GraphPipelineRequest",
+        ts_return_type = "Promise<import('./query-types').GraphPipelineExplain>"
+    )]
+    pub fn explain_graph_pipeline_async(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<AsyncTask<EngineReadOp<GraphPipelineExplain, GraphPipelineJsExplain>>> {
+        let query = parse_js_graph_pipeline_query(&request)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.explain_graph_pipeline(&query),
+            |explain| Ok(GraphPipelineJsExplain(explain)),
         )))
     }
 
@@ -3999,6 +4128,13 @@ pub struct GqlExecutionOptionsInput {
     pub max_cursor_bytes: Option<f64>,
     pub max_mutation_rows: Option<f64>,
     pub max_mutation_ops: Option<f64>,
+    pub max_pipeline_rows: Option<f64>,
+    pub max_groups: Option<f64>,
+    pub max_collect_items: Option<f64>,
+    pub max_union_branches: Option<f64>,
+    pub max_subquery_invocations: Option<f64>,
+    pub max_subquery_depth: Option<f64>,
+    pub max_shortest_path_pairs: Option<f64>,
     pub max_intermediate_bindings: Option<f64>,
     pub max_frontier: Option<f64>,
     pub max_path_hops: Option<f64>,
@@ -5601,6 +5737,76 @@ fn graph_stats_to_value(stats: GraphRowStats) -> GraphValue {
     ]))
 }
 
+fn graph_pipeline_stats_to_value(stats: GraphPipelineStats) -> GraphValue {
+    GraphValue::Map(BTreeMap::from([
+        (
+            "rowsReturned".to_string(),
+            GraphValue::UInt(stats.rows_returned as u64),
+        ),
+        (
+            "rowsEnteredPipeline".to_string(),
+            GraphValue::UInt(stats.rows_entered_pipeline as u64),
+        ),
+        (
+            "rowsAfterFilter".to_string(),
+            GraphValue::UInt(stats.rows_after_filter as u64),
+        ),
+        (
+            "intermediateRows".to_string(),
+            GraphValue::UInt(stats.intermediate_rows as u64),
+        ),
+        (
+            "pipelineRowsMaterialized".to_string(),
+            GraphValue::UInt(stats.pipeline_rows_materialized as u64),
+        ),
+        ("groups".to_string(), GraphValue::UInt(stats.groups as u64)),
+        (
+            "collectItems".to_string(),
+            GraphValue::UInt(stats.collect_items as u64),
+        ),
+        (
+            "unionBranches".to_string(),
+            GraphValue::UInt(stats.union_branches as u64),
+        ),
+        (
+            "unionDedupKeys".to_string(),
+            GraphValue::UInt(stats.union_dedup_keys as u64),
+        ),
+        (
+            "subqueryInvocations".to_string(),
+            GraphValue::UInt(stats.subquery_invocations as u64),
+        ),
+        (
+            "subqueryCacheHits".to_string(),
+            GraphValue::UInt(stats.subquery_cache_hits as u64),
+        ),
+        (
+            "shortestPathPairs".to_string(),
+            GraphValue::UInt(stats.shortest_path_pairs as u64),
+        ),
+        (
+            "shortestPathCacheHits".to_string(),
+            GraphValue::UInt(stats.shortest_path_cache_hits as u64),
+        ),
+        ("dbHits".to_string(), GraphValue::UInt(stats.db_hits as u64)),
+        (
+            "elapsedUs".to_string(),
+            stats
+                .elapsed_us
+                .map(GraphValue::UInt)
+                .unwrap_or(GraphValue::Null),
+        ),
+        (
+            "effectiveAtEpoch".to_string(),
+            GraphValue::Int(stats.effective_at_epoch),
+        ),
+        (
+            "warnings".to_string(),
+            GraphValue::List(stats.warnings.into_iter().map(GraphValue::String).collect()),
+        ),
+    ]))
+}
+
 fn graph_explain_to_json(explain: GraphRowExplain) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
         "columns": explain.columns,
@@ -5616,6 +5822,58 @@ fn graph_explain_to_json(explain: GraphRowExplain) -> Result<serde_json::Value> 
         "warnings": explain.warnings,
         "notes": explain.notes,
     }))
+}
+
+fn graph_pipeline_explain_to_json(explain: GraphPipelineExplain) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "columns": explain.columns,
+        "effectiveAtEpoch": explain.effective_at_epoch,
+        "fingerprint": explain.fingerprint,
+        "stages": explain.stages.into_iter().map(graph_pipeline_stage_explain_to_json).collect::<Vec<_>>(),
+        "rowOps": explain.row_ops.into_iter().map(graph_row_op_to_json).collect::<Vec<_>>(),
+        "order": graph_order_explain_to_json(explain.order),
+        "cursor": graph_cursor_explain_to_json(explain.cursor),
+        "projection": graph_projection_explain_to_json(explain.projection),
+        "caps": graph_pipeline_caps_to_json(explain.caps),
+        "summaries": graph_summaries_to_json(explain.summaries),
+        "stats": graph_pipeline_stats_to_json(explain.stats),
+        "warnings": explain.warnings,
+        "notes": explain.notes,
+    }))
+}
+
+fn graph_pipeline_stage_explain_to_json(stage: GraphPipelineStageExplain) -> serde_json::Value {
+    serde_json::json!({
+        "index": stage.index,
+        "kind": stage.kind,
+        "detail": stage.detail,
+        "columns": stage.columns,
+        "graphRow": stage.graph_row.map(|explain| graph_explain_to_json(*explain)).transpose().ok().flatten(),
+        "warnings": stage.warnings,
+        "notes": stage.notes,
+    })
+}
+
+fn graph_pipeline_stats_to_json(stats: GraphPipelineStats) -> serde_json::Value {
+    serde_json::json!({
+        "rowsReturned": stats.rows_returned,
+        "rowsEnteredPipeline": stats.rows_entered_pipeline,
+        "rowsAfterFilter": stats.rows_after_filter,
+        "intermediateRows": stats.intermediate_rows,
+        "pipelineRowsMaterialized": stats.pipeline_rows_materialized,
+        "groups": stats.groups,
+        "collectItems": stats.collect_items,
+        "unionBranches": stats.union_branches,
+        "unionDedupKeys": stats.union_dedup_keys,
+        "subqueryInvocations": stats.subquery_invocations,
+        "subqueryCacheHits": stats.subquery_cache_hits,
+        "shortestPathPairs": stats.shortest_path_pairs,
+        "shortestPathCacheHits": stats.shortest_path_cache_hits,
+        "dbHits": stats.db_hits,
+        "elapsedUs": stats.elapsed_us,
+        "effectiveAtEpoch": stats.effective_at_epoch,
+        "warnings": stats.warnings,
+    })
 }
 
 fn graph_explain_node_to_json(node: GraphExplainNode) -> serde_json::Value {
@@ -5669,6 +5927,31 @@ fn graph_caps_to_json(caps: GraphCapExplain) -> serde_json::Value {
         "maxOrderMaterialization": caps.max_order_materialization,
         "maxCursorBytes": caps.max_cursor_bytes,
         "maxQueryBytes": caps.max_query_bytes,
+    })
+}
+
+fn graph_pipeline_caps_to_json(caps: GraphPipelineCapExplain) -> serde_json::Value {
+    serde_json::json!({
+        "allowFullScan": caps.allow_full_scan,
+        "maxRows": caps.max_rows,
+        "maxPipelineRows": caps.max_pipeline_rows,
+        "maxGroups": caps.max_groups,
+        "maxCollectItems": caps.max_collect_items,
+        "maxUnionBranches": caps.max_union_branches,
+        "maxSubqueryInvocations": caps.max_subquery_invocations,
+        "maxSubqueryDepth": caps.max_subquery_depth,
+        "maxShortestPathPairs": caps.max_shortest_path_pairs,
+        "maxIntermediateBindings": caps.max_intermediate_bindings,
+        "maxFrontier": caps.max_frontier,
+        "maxPathHops": caps.max_path_hops,
+        "maxPathsPerStart": caps.max_paths_per_start,
+        "maxOrderMaterialization": caps.max_order_materialization,
+        "maxSkip": caps.max_skip,
+        "maxCursorBytes": caps.max_cursor_bytes,
+        "maxQueryBytes": caps.max_query_bytes,
+        "maxParamBytes": caps.max_param_bytes,
+        "maxAstDepth": caps.max_ast_depth,
+        "maxLiteralItems": caps.max_literal_items,
     })
 }
 
@@ -5861,6 +6144,34 @@ fn gql_execution_caps_to_value(caps: GqlExecutionCapSummary) -> GqlValue {
             GqlValue::UInt(caps.max_mutation_ops as u64),
         ),
         (
+            "maxPipelineRows".to_string(),
+            GqlValue::UInt(caps.max_pipeline_rows as u64),
+        ),
+        (
+            "maxGroups".to_string(),
+            GqlValue::UInt(caps.max_groups as u64),
+        ),
+        (
+            "maxCollectItems".to_string(),
+            GqlValue::UInt(caps.max_collect_items as u64),
+        ),
+        (
+            "maxUnionBranches".to_string(),
+            GqlValue::UInt(caps.max_union_branches as u64),
+        ),
+        (
+            "maxSubqueryInvocations".to_string(),
+            GqlValue::UInt(caps.max_subquery_invocations as u64),
+        ),
+        (
+            "maxSubqueryDepth".to_string(),
+            GqlValue::UInt(caps.max_subquery_depth as u64),
+        ),
+        (
+            "maxShortestPathPairs".to_string(),
+            GqlValue::UInt(caps.max_shortest_path_pairs as u64),
+        ),
+        (
             "maxQueryBytes".to_string(),
             GqlValue::UInt(caps.max_query_bytes as u64),
         ),
@@ -5993,6 +6304,7 @@ fn gql_lowering_target_to_js(target: GqlLoweringTarget) -> &'static str {
         GqlLoweringTarget::NodeQuery => "node_query",
         GqlLoweringTarget::EdgeQuery => "edge_query",
         GqlLoweringTarget::GraphRowQuery => "graph_row_query",
+        GqlLoweringTarget::GraphPipelineQuery => "graph_pipeline_query",
     }
 }
 
@@ -6193,6 +6505,27 @@ fn parse_js_gql_options(
         }
         if let Some(value) = options.max_mutation_ops {
             parsed.max_mutation_ops = f64_to_usize(value, "GQL maxMutationOps")?;
+        }
+        if let Some(value) = options.max_pipeline_rows {
+            parsed.max_pipeline_rows = f64_to_usize(value, "GQL maxPipelineRows")?;
+        }
+        if let Some(value) = options.max_groups {
+            parsed.max_groups = f64_to_usize(value, "GQL maxGroups")?;
+        }
+        if let Some(value) = options.max_collect_items {
+            parsed.max_collect_items = f64_to_usize(value, "GQL maxCollectItems")?;
+        }
+        if let Some(value) = options.max_union_branches {
+            parsed.max_union_branches = f64_to_usize(value, "GQL maxUnionBranches")?;
+        }
+        if let Some(value) = options.max_subquery_invocations {
+            parsed.max_subquery_invocations = f64_to_usize(value, "GQL maxSubqueryInvocations")?;
+        }
+        if let Some(value) = options.max_subquery_depth {
+            parsed.max_subquery_depth = f64_to_usize(value, "GQL maxSubqueryDepth")?;
+        }
+        if let Some(value) = options.max_shortest_path_pairs {
+            parsed.max_shortest_path_pairs = f64_to_usize(value, "GQL maxShortestPathPairs")?;
         }
         if let Some(value) = options.max_intermediate_bindings {
             parsed.max_intermediate_bindings = f64_to_usize(value, "GQL maxIntermediateBindings")?;
@@ -6637,6 +6970,550 @@ fn parse_js_graph_row_query(value: &serde_json::Value) -> Result<GraphRowQuery> 
         output,
         options,
     })
+}
+
+fn parse_js_graph_pipeline_query(value: &serde_json::Value) -> Result<GraphPipelineQuery> {
+    let object = js_object(value, "graph pipeline request")?;
+    ensure_only_js_fields(
+        object,
+        &[
+            "stages", "params", "atEpoch", "skip", "limit", "cursor", "output", "options",
+        ],
+        "graph pipeline request",
+    )?;
+    let options = parse_js_graph_pipeline_options(js_non_null_field(object, "options"))?;
+    let output = parse_js_graph_output_options(js_non_null_field(object, "output"))?;
+    let limit = match js_non_null_field(object, "limit") {
+        Some(value) => {
+            let parsed = js_number_to_u64(value, "graph pipeline limit")?;
+            if parsed == 0 {
+                return Err(napi::Error::from_reason(
+                    "graph pipeline limit must be > 0".to_string(),
+                ));
+            }
+            usize::try_from(parsed).map_err(|_| {
+                napi::Error::from_reason("graph pipeline limit is too large".to_string())
+            })?
+        }
+        None => options.max_rows,
+    };
+    let stages_value = js_non_null_field(object, "stages").ok_or_else(|| {
+        napi::Error::from_reason("graph pipeline request requires stages".to_string())
+    })?;
+    let stages = js_array(stages_value, "graph pipeline stages")?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            parse_js_graph_pipeline_stage(value, &format!("graph pipeline stages[{index}]"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GraphPipelineQuery {
+        stages,
+        params: parse_js_graph_params(js_non_null_field(object, "params"))?,
+        at_epoch: parse_js_optional_i64_field(object, "atEpoch", "graph pipeline atEpoch")?,
+        page: GraphPageRequest {
+            skip: js_non_null_field(object, "skip")
+                .map(|value| js_number_to_usize(value, "graph pipeline skip"))
+                .transpose()?
+                .unwrap_or(0),
+            limit,
+            cursor: parse_js_optional_string_field(object, "cursor", "graph pipeline cursor")?,
+        },
+        output,
+        options,
+    })
+}
+
+fn parse_js_graph_pipeline_stage(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<GraphPipelineStage> {
+    let object = js_object(value, context)?;
+    let kind = parse_js_required_string_field(object, "kind", &format!("{context} kind"))?;
+    match kind.as_str() {
+        "match" => parse_js_graph_pipeline_match_stage(object, context).map(GraphPipelineStage::Match),
+        "project" | "with" | "return" => parse_js_graph_pipeline_project_stage(object, &kind, context)
+            .map(GraphPipelineStage::Project),
+        "shortestPath" | "shortest_path" => parse_js_graph_pipeline_shortest_path_stage(object, context)
+            .map(GraphPipelineStage::ShortestPath),
+        "call" => parse_js_graph_pipeline_call_stage(object, context).map(GraphPipelineStage::Call),
+        "union" => parse_js_graph_pipeline_union_stage(object, context).map(GraphPipelineStage::Union),
+        other => Err(napi::Error::from_reason(format!(
+            "{context} kind must be 'match', 'project', 'with', 'return', 'shortestPath', 'call', or 'union', got '{other}'"
+        ))),
+    }
+}
+
+fn parse_js_graph_pipeline_match_stage(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<GraphPipelineMatchStage> {
+    ensure_only_js_fields(
+        object,
+        &[
+            "kind",
+            "optional",
+            "nodes",
+            "pieces",
+            "where",
+            "optionalCandidateWhere",
+        ],
+        context,
+    )?;
+    let nodes = match js_non_null_field(object, "nodes") {
+        Some(value) => js_array(value, &format!("{context} nodes"))?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_js_graph_node_pattern(value, &format!("{context} nodes[{index}]"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    let pieces = match js_non_null_field(object, "pieces") {
+        Some(value) => js_array(value, &format!("{context} pieces"))?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_js_graph_piece(value, &format!("{context} pieces[{index}]"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    Ok(GraphPipelineMatchStage {
+        optional: parse_js_optional_bool_field(object, "optional", &format!("{context} optional"))?
+            .unwrap_or(false),
+        nodes,
+        pieces,
+        where_: js_non_null_field(object, "where")
+            .map(|value| parse_js_graph_expr(value, &format!("{context} where")))
+            .transpose()?,
+        optional_candidate_where: js_non_null_field(object, "optionalCandidateWhere")
+            .map(|value| parse_js_graph_expr(value, &format!("{context} optionalCandidateWhere")))
+            .transpose()?,
+    })
+}
+
+fn parse_js_graph_pipeline_project_stage(
+    object: &serde_json::Map<String, serde_json::Value>,
+    kind: &str,
+    context: &str,
+) -> Result<GraphProjectStage> {
+    ensure_only_js_fields(
+        object,
+        &[
+            "kind",
+            "projectKind",
+            "items",
+            "distinct",
+            "where",
+            "orderBy",
+            "skip",
+            "limit",
+        ],
+        context,
+    )?;
+    let project_kind = match kind {
+        "with" => GraphProjectKind::With,
+        "return" => GraphProjectKind::Return,
+        _ => match parse_js_optional_string_field(
+            object,
+            "projectKind",
+            &format!("{context} projectKind"),
+        )?
+        .as_deref()
+        {
+            None | Some("return") => GraphProjectKind::Return,
+            Some("with") => GraphProjectKind::With,
+            Some(other) => {
+                return Err(napi::Error::from_reason(format!(
+                    "{context} projectKind must be 'with' or 'return', got '{other}'"
+                )));
+            }
+        },
+    };
+    let items = js_non_null_field(object, "items")
+        .map(|value| parse_js_graph_projection_items(value, &format!("{context} items")))
+        .transpose()?
+        .unwrap_or(GraphProjectionItems::Star);
+    let order_by = match js_non_null_field(object, "orderBy") {
+        Some(value) => js_array(value, &format!("{context} orderBy"))?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_js_graph_order_item(value, &format!("{context} orderBy[{index}]"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    Ok(GraphProjectStage {
+        kind: project_kind,
+        items,
+        distinct: parse_js_optional_bool_field(object, "distinct", &format!("{context} distinct"))?
+            .unwrap_or(false),
+        where_: js_non_null_field(object, "where")
+            .map(|value| parse_js_graph_expr(value, &format!("{context} where")))
+            .transpose()?,
+        order_by,
+        skip: js_non_null_field(object, "skip")
+            .map(|value| parse_js_graph_expr(value, &format!("{context} skip")))
+            .transpose()?,
+        limit: js_non_null_field(object, "limit")
+            .map(|value| parse_js_graph_expr(value, &format!("{context} limit")))
+            .transpose()?,
+    })
+}
+
+fn parse_js_graph_projection_items(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<GraphProjectionItems> {
+    if matches!(value.as_str(), Some("star" | "*")) {
+        return Ok(GraphProjectionItems::Star);
+    }
+    Ok(GraphProjectionItems::Items(
+        js_array(value, context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_js_graph_project_item(value, &format!("{context}[{index}]"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+fn parse_js_graph_project_item(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<GraphProjectItem> {
+    let object = js_object(value, context)?;
+    ensure_only_js_fields(object, &["expr", "as", "projection"], context)?;
+    let expr_value = js_non_null_field(object, "expr")
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} expr is required")))?;
+    Ok(GraphProjectItem {
+        expr: parse_js_graph_expr(expr_value, &format!("{context} expr"))?,
+        alias: parse_js_optional_string_field(object, "as", &format!("{context} as"))?,
+        projection: parse_js_graph_return_projection(
+            js_non_null_field(object, "projection"),
+            context,
+        )?,
+    })
+}
+
+fn parse_js_graph_pipeline_union_stage(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<GraphUnionStage> {
+    ensure_only_js_fields(object, &["kind", "branches", "all"], context)?;
+    let branches_value = js_non_null_field(object, "branches")
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} requires branches")))?;
+    let branches = js_array(branches_value, &format!("{context} branches"))?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            parse_js_graph_pipeline_query(value).map_err(|err| {
+                napi::Error::from_reason(format!("{context} branches[{index}]: {}", err.reason))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GraphUnionStage {
+        branches,
+        all: parse_js_optional_bool_field(object, "all", &format!("{context} all"))?
+            .unwrap_or(false),
+    })
+}
+
+fn parse_js_graph_pipeline_call_stage(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<GraphSubqueryStage> {
+    ensure_only_js_fields(object, &["kind", "query", "importAliases"], context)?;
+    let query_value = js_non_null_field(object, "query")
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} requires query")))?;
+    Ok(GraphSubqueryStage {
+        query: Box::new(parse_js_graph_pipeline_query(query_value)?),
+        import_aliases: parse_js_optional_string_array_field(
+            object,
+            "importAliases",
+            &format!("{context} importAliases"),
+        )?,
+    })
+}
+
+fn parse_js_graph_pipeline_shortest_path_stage(
+    object: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<GraphShortestPathStage> {
+    ensure_only_js_fields(
+        object,
+        &[
+            "kind",
+            "optional",
+            "outputPathAlias",
+            "mode",
+            "from",
+            "to",
+            "direction",
+            "edgeLabelFilter",
+            "minHops",
+            "maxHops",
+            "weightField",
+            "maxCost",
+            "maxPaths",
+        ],
+        context,
+    )?;
+    let mode = match parse_js_optional_string_field(object, "mode", &format!("{context} mode"))?
+        .as_deref()
+    {
+        None | Some("one") => GraphShortestPathMode::One,
+        Some("all") => GraphShortestPathMode::All,
+        Some(other) => {
+            return Err(napi::Error::from_reason(format!(
+                "{context} mode must be 'one' or 'all', got '{other}'"
+            )));
+        }
+    };
+    let direction = match js_non_null_field(object, "direction") {
+        None => Direction::Outgoing,
+        Some(value) => parse_direction(Some(value.as_str().ok_or_else(|| {
+            napi::Error::from_reason(format!("{context} direction must be a string"))
+        })?))?,
+    };
+    let max_cost = match js_non_null_field(object, "maxCost") {
+        Some(value) => {
+            let cost = value.as_f64().ok_or_else(|| {
+                napi::Error::from_reason(format!("{context} maxCost must be a number"))
+            })?;
+            if !cost.is_finite() {
+                return Err(napi::Error::from_reason(format!(
+                    "{context} maxCost must be finite"
+                )));
+            }
+            Some(cost)
+        }
+        None => None,
+    };
+    Ok(GraphShortestPathStage {
+        optional: parse_js_optional_bool_field(object, "optional", &format!("{context} optional"))?
+            .unwrap_or(false),
+        output_path_alias: parse_js_required_string_field(
+            object,
+            "outputPathAlias",
+            &format!("{context} outputPathAlias"),
+        )?,
+        mode,
+        from: parse_js_shortest_path_endpoint(
+            js_non_null_field(object, "from")
+                .ok_or_else(|| napi::Error::from_reason(format!("{context} requires from")))?,
+            &format!("{context} from"),
+        )?,
+        to: parse_js_shortest_path_endpoint(
+            js_non_null_field(object, "to")
+                .ok_or_else(|| napi::Error::from_reason(format!("{context} requires to")))?,
+            &format!("{context} to"),
+        )?,
+        direction,
+        edge_label_filter: parse_js_optional_string_array_field(
+            object,
+            "edgeLabelFilter",
+            &format!("{context} edgeLabelFilter"),
+        )?,
+        min_hops: parse_js_required_u8_field(object, "minHops", &format!("{context} minHops"))?,
+        max_hops: parse_js_required_u8_field(object, "maxHops", &format!("{context} maxHops"))?,
+        weight_field: parse_js_optional_string_field(
+            object,
+            "weightField",
+            &format!("{context} weightField"),
+        )?,
+        max_cost,
+        max_paths: js_non_null_field(object, "maxPaths")
+            .map(|value| js_number_to_usize(value, &format!("{context} maxPaths")))
+            .transpose()?,
+    })
+}
+
+fn parse_js_shortest_path_endpoint(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<GraphShortestPathEndpoint> {
+    if let Some(alias) = value.as_str() {
+        return Ok(GraphShortestPathEndpoint::Alias(alias.to_string()));
+    }
+    if value.is_number() {
+        return Ok(GraphShortestPathEndpoint::NodeId(js_number_to_u64(
+            value, context,
+        )?));
+    }
+    let object = js_object(value, context)?;
+    let tags = ["alias", "nodeId", "nodeKey", "expr"]
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .count();
+    if tags != 1 {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must contain exactly one of alias, nodeId, nodeKey, or expr"
+        )));
+    }
+    if let Some(value) = js_non_null_field(object, "alias") {
+        ensure_only_js_fields(object, &["alias"], context)?;
+        return Ok(GraphShortestPathEndpoint::Alias(
+            value.as_str().map(ToString::to_string).ok_or_else(|| {
+                napi::Error::from_reason(format!("{context} alias must be a string"))
+            })?,
+        ));
+    }
+    if let Some(value) = js_non_null_field(object, "nodeId") {
+        ensure_only_js_fields(object, &["nodeId"], context)?;
+        return Ok(GraphShortestPathEndpoint::NodeId(js_number_to_u64(
+            value, context,
+        )?));
+    }
+    if let Some(value) = js_non_null_field(object, "nodeKey") {
+        ensure_only_js_fields(object, &["nodeKey"], context)?;
+        let payload = js_object(value, &format!("{context} nodeKey"))?;
+        ensure_only_js_fields(payload, &["label", "key"], &format!("{context} nodeKey"))?;
+        return Ok(GraphShortestPathEndpoint::NodeKey {
+            label: parse_js_required_string_field(
+                payload,
+                "label",
+                &format!("{context} nodeKey label"),
+            )?,
+            key: parse_js_required_string_field(payload, "key", &format!("{context} nodeKey key"))?,
+        });
+    }
+    ensure_only_js_fields(object, &["expr"], context)?;
+    Ok(GraphShortestPathEndpoint::Expr(parse_js_graph_expr(
+        js_non_null_field(object, "expr")
+            .ok_or_else(|| napi::Error::from_reason(format!("{context} requires expr")))?,
+        &format!("{context} expr"),
+    )?))
+}
+
+fn parse_js_graph_pipeline_options(
+    value: Option<&serde_json::Value>,
+) -> Result<GraphPipelineOptions> {
+    let Some(value) = value else {
+        return Ok(GraphPipelineOptions::default());
+    };
+    let object = js_object(value, "graph pipeline options")?;
+    ensure_only_js_fields(
+        object,
+        &[
+            "allowFullScan",
+            "maxRows",
+            "maxPipelineRows",
+            "maxGroups",
+            "maxCollectItems",
+            "maxUnionBranches",
+            "maxSubqueryInvocations",
+            "maxSubqueryDepth",
+            "maxShortestPathPairs",
+            "maxIntermediateBindings",
+            "maxFrontier",
+            "maxPathHops",
+            "maxPathsPerStart",
+            "maxOrderMaterialization",
+            "maxSkip",
+            "maxCursorBytes",
+            "maxQueryBytes",
+            "maxParamBytes",
+            "maxAstDepth",
+            "maxLiteralItems",
+            "includePlan",
+            "profile",
+        ],
+        "graph pipeline options",
+    )?;
+    let mut options = GraphPipelineOptions::default();
+    if let Some(value) = parse_js_optional_bool_field(
+        object,
+        "allowFullScan",
+        "graph pipeline options allowFullScan",
+    )? {
+        options.allow_full_scan = value;
+    }
+    if let Some(value) = js_non_null_field(object, "maxRows") {
+        options.max_rows = js_number_to_usize(value, "graph pipeline options maxRows")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxPipelineRows") {
+        options.max_pipeline_rows =
+            js_number_to_usize(value, "graph pipeline options maxPipelineRows")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxGroups") {
+        options.max_groups = js_number_to_usize(value, "graph pipeline options maxGroups")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxCollectItems") {
+        options.max_collect_items =
+            js_number_to_usize(value, "graph pipeline options maxCollectItems")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxUnionBranches") {
+        options.max_union_branches =
+            js_number_to_usize(value, "graph pipeline options maxUnionBranches")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxSubqueryInvocations") {
+        options.max_subquery_invocations =
+            js_number_to_usize(value, "graph pipeline options maxSubqueryInvocations")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxSubqueryDepth") {
+        options.max_subquery_depth =
+            js_number_to_usize(value, "graph pipeline options maxSubqueryDepth")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxShortestPathPairs") {
+        options.max_shortest_path_pairs =
+            js_number_to_usize(value, "graph pipeline options maxShortestPathPairs")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxIntermediateBindings") {
+        options.max_intermediate_bindings =
+            js_number_to_usize(value, "graph pipeline options maxIntermediateBindings")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxFrontier") {
+        options.max_frontier = js_number_to_usize(value, "graph pipeline options maxFrontier")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxPathHops") {
+        options.max_path_hops = parse_js_u8_number(value, "graph pipeline options maxPathHops")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxPathsPerStart") {
+        options.max_paths_per_start =
+            js_number_to_usize(value, "graph pipeline options maxPathsPerStart")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxOrderMaterialization") {
+        options.max_order_materialization =
+            js_number_to_usize(value, "graph pipeline options maxOrderMaterialization")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxSkip") {
+        options.max_skip = js_number_to_usize(value, "graph pipeline options maxSkip")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxCursorBytes") {
+        options.max_cursor_bytes =
+            js_number_to_usize(value, "graph pipeline options maxCursorBytes")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxQueryBytes") {
+        options.max_query_bytes =
+            js_number_to_usize(value, "graph pipeline options maxQueryBytes")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxParamBytes") {
+        options.max_param_bytes =
+            js_number_to_usize(value, "graph pipeline options maxParamBytes")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxAstDepth") {
+        options.max_ast_depth = js_number_to_usize(value, "graph pipeline options maxAstDepth")?;
+    }
+    if let Some(value) = js_non_null_field(object, "maxLiteralItems") {
+        options.max_literal_items =
+            js_number_to_usize(value, "graph pipeline options maxLiteralItems")?;
+    }
+    if let Some(value) =
+        parse_js_optional_bool_field(object, "includePlan", "graph pipeline options includePlan")?
+    {
+        options.include_plan = value;
+    }
+    if let Some(value) =
+        parse_js_optional_bool_field(object, "profile", "graph pipeline options profile")?
+    {
+        options.profile = value;
+    }
+    Ok(options)
 }
 
 fn parse_js_graph_node_pattern(
@@ -7184,7 +8061,10 @@ fn parse_js_graph_expr_object(
         "edgeField",
         "pathField",
         "fn",
+        "aggregate",
+        "exists",
         "op",
+        "case",
         "isNull",
         "isNotNull",
     ];
@@ -7288,9 +8168,23 @@ fn parse_js_graph_expr_object(
         ensure_only_js_fields(object, &["fn", "args"], context)?;
         return parse_js_graph_function_expr(object, context);
     }
+    if let Some(value) = object.get("aggregate") {
+        ensure_only_js_fields(object, &["aggregate"], context)?;
+        return parse_js_graph_aggregate_expr(value, context);
+    }
+    if let Some(value) = object.get("exists") {
+        ensure_only_js_fields(object, &["exists"], context)?;
+        let payload = js_object(value, &format!("{context} exists"))?;
+        let stage = parse_js_graph_pipeline_call_stage(payload, &format!("{context} exists"))?;
+        return Ok(GraphExpr::ExistsSubquery(stage));
+    }
     if object.contains_key("op") {
         ensure_only_js_fields(object, &["op", "left", "right", "expr"], context)?;
         return parse_js_graph_op_expr(object, context);
+    }
+    if let Some(value) = object.get("case") {
+        ensure_only_js_fields(object, &["case"], context)?;
+        return parse_js_graph_case_expr(value, context);
     }
     if let Some(value) = object.get("isNull") {
         ensure_only_js_fields(object, &["isNull"], context)?;
@@ -7368,6 +8262,21 @@ fn parse_js_graph_function_expr(
             "endNode" | "end_node" => GraphFunction::EndNode,
             "nodes" => GraphFunction::Nodes,
             "relationships" => GraphFunction::Relationships,
+            "coalesce" => GraphFunction::Coalesce,
+            "toString" | "to_string" => GraphFunction::ToString,
+            "toInteger" | "to_integer" => GraphFunction::ToInteger,
+            "toFloat" | "to_float" => GraphFunction::ToFloat,
+            "abs" => GraphFunction::Abs,
+            "floor" => GraphFunction::Floor,
+            "ceil" => GraphFunction::Ceil,
+            "round" => GraphFunction::Round,
+            "lower" => GraphFunction::Lower,
+            "upper" => GraphFunction::Upper,
+            "trim" => GraphFunction::Trim,
+            "substring" => GraphFunction::Substring,
+            "size" => GraphFunction::Size,
+            "head" => GraphFunction::Head,
+            "last" => GraphFunction::Last,
             other => {
                 return Err(napi::Error::from_reason(format!(
                     "{context} unsupported graph function '{other}'"
@@ -7375,6 +8284,90 @@ fn parse_js_graph_function_expr(
             }
         },
         args,
+    })
+}
+
+fn parse_js_graph_aggregate_expr(value: &serde_json::Value, context: &str) -> Result<GraphExpr> {
+    let payload = js_object(value, &format!("{context} aggregate"))?;
+    ensure_only_js_fields(
+        payload,
+        &["function", "distinct", "arg"],
+        &format!("{context} aggregate"),
+    )?;
+    let function = parse_js_required_string_field(
+        payload,
+        "function",
+        &format!("{context} aggregate function"),
+    )?;
+    let function = match function.as_str() {
+        "count" => GraphAggregateFunction::Count,
+        "sum" => GraphAggregateFunction::Sum,
+        "avg" => GraphAggregateFunction::Avg,
+        "min" => GraphAggregateFunction::Min,
+        "max" => GraphAggregateFunction::Max,
+        "collect" => GraphAggregateFunction::Collect,
+        other => {
+            return Err(napi::Error::from_reason(format!(
+                "{context} aggregate function is unsupported: '{other}'"
+            )));
+        }
+    };
+    Ok(GraphExpr::AggregateCall {
+        function,
+        distinct: parse_js_optional_bool_field(
+            payload,
+            "distinct",
+            &format!("{context} aggregate distinct"),
+        )?
+        .unwrap_or(false),
+        arg: js_non_null_field(payload, "arg")
+            .map(|value| parse_js_graph_expr(value, &format!("{context} aggregate arg")))
+            .transpose()?
+            .map(Box::new),
+    })
+}
+
+fn parse_js_graph_case_expr(value: &serde_json::Value, context: &str) -> Result<GraphExpr> {
+    let payload = js_object(value, &format!("{context} case"))?;
+    ensure_only_js_fields(
+        payload,
+        &["operand", "branches", "else"],
+        &format!("{context} case"),
+    )?;
+    let branches_value = js_non_null_field(payload, "branches")
+        .ok_or_else(|| napi::Error::from_reason(format!("{context} case requires branches")))?;
+    let branches = js_array(branches_value, &format!("{context} case branches"))?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let item = js_object(value, &format!("{context} case branches[{index}]"))?;
+            ensure_only_js_fields(
+                item,
+                &["when", "then"],
+                &format!("{context} case branches[{index}]"),
+            )?;
+            let when = js_non_null_field(item, "when").ok_or_else(|| {
+                napi::Error::from_reason(format!("{context} case branches[{index}] requires when"))
+            })?;
+            let then = js_non_null_field(item, "then").ok_or_else(|| {
+                napi::Error::from_reason(format!("{context} case branches[{index}] requires then"))
+            })?;
+            Ok(GraphCaseBranch {
+                when: parse_js_graph_expr(when, &format!("{context} case branches[{index}] when"))?,
+                then: parse_js_graph_expr(then, &format!("{context} case branches[{index}] then"))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GraphExpr::Case {
+        operand: js_non_null_field(payload, "operand")
+            .map(|value| parse_js_graph_expr(value, &format!("{context} case operand")))
+            .transpose()?
+            .map(Box::new),
+        branches,
+        else_expr: js_non_null_field(payload, "else")
+            .map(|value| parse_js_graph_expr(value, &format!("{context} case else")))
+            .transpose()?
+            .map(Box::new),
     })
 }
 
@@ -7397,6 +8390,20 @@ fn parse_js_graph_op_expr(
         }
         return Ok(GraphExpr::Unary {
             op: GraphUnaryOp::Not,
+            expr: Box::new(parse_js_graph_expr(expr, &format!("{context} expr"))?),
+        });
+    }
+    if op == "neg" || op == "-" && object.contains_key("expr") {
+        let expr = object
+            .get("expr")
+            .ok_or_else(|| napi::Error::from_reason(format!("{context} neg expr is required")))?;
+        if object.contains_key("left") || object.contains_key("right") {
+            return Err(napi::Error::from_reason(format!(
+                "{context} neg expression must not contain left or right"
+            )));
+        }
+        return Ok(GraphExpr::Unary {
+            op: GraphUnaryOp::Neg,
             expr: Box::new(parse_js_graph_expr(expr, &format!("{context} expr"))?),
         });
     }
@@ -7423,6 +8430,13 @@ fn parse_js_graph_op_expr(
             ">" | "gt" => GraphBinaryOp::Gt,
             ">=" | "gte" => GraphBinaryOp::Ge,
             "in" => GraphBinaryOp::In,
+            "+" | "add" => GraphBinaryOp::Add,
+            "-" | "sub" => GraphBinaryOp::Sub,
+            "*" | "mul" => GraphBinaryOp::Mul,
+            "/" | "div" => GraphBinaryOp::Div,
+            "startsWith" | "starts_with" => GraphBinaryOp::StartsWith,
+            "endsWith" | "ends_with" => GraphBinaryOp::EndsWith,
+            "contains" => GraphBinaryOp::Contains,
             other => {
                 return Err(napi::Error::from_reason(format!(
                     "{context} unsupported graph binary op '{other}'"

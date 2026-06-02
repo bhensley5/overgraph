@@ -103,6 +103,206 @@ fn test_write_txn_unknown_read_only_lookups_do_not_create_tokens() {
 }
 
 #[test]
+fn test_write_txn_merge_batch_planner_coalesces_node_keys() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let existing_id = engine
+        .upsert_node(
+            "TxnMergePlanNode",
+            "existing",
+            UpsertNodeOptions::default(),
+        )
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let mut overlay = TxnMergeOverlay::default();
+    let batch = txn
+        .plan_keyed_node_merge_batch(
+            &mut overlay,
+            &[
+                ("TxnMergePlanNode".to_string(), "new".to_string()),
+                ("TxnMergePlanNode".to_string(), "existing".to_string()),
+                ("TxnMergePlanNode".to_string(), "new".to_string()),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(batch.snapshot_lookup_count, 2);
+    assert_eq!(batch.existing_ids, BTreeSet::from([existing_id]));
+    let local = match &batch.rows[0] {
+        TxnKeyedNodeMergeRowOutcome::Create(local) => *local,
+        other => panic!("expected first row to create, got {other:?}"),
+    };
+    assert_eq!(batch.rows[1], TxnKeyedNodeMergeRowOutcome::Existing(existing_id));
+    assert_eq!(batch.rows[2], TxnKeyedNodeMergeRowOutcome::MatchedLocal(local));
+
+    let repeat = txn
+        .plan_keyed_node_merge_batch(
+            &mut overlay,
+            &[("TxnMergePlanNode".to_string(), "new".to_string())],
+        )
+        .unwrap();
+    assert_eq!(repeat.snapshot_lookup_count, 0);
+    assert_eq!(repeat.rows, vec![TxnKeyedNodeMergeRowOutcome::MatchedLocal(local)]);
+    assert!(engine
+        .get_node_by_key("TxnMergePlanNode", "new")
+        .unwrap()
+        .is_none());
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_write_txn_merge_batch_planner_coalesces_unique_edge_triples() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(
+        &db_path,
+        &DbOptions {
+            edge_uniqueness: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let a = engine
+        .upsert_node("TxnMergePlanEndpoint", "a", UpsertNodeOptions::default())
+        .unwrap();
+    let b = engine
+        .upsert_node("TxnMergePlanEndpoint", "b", UpsertNodeOptions::default())
+        .unwrap();
+    let existing_edge = engine
+        .upsert_edge(a, b, "TXN_MERGE_PLAN_EDGE", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let mut overlay = TxnMergeOverlay::default();
+    let local_endpoint = TxnNodeRef::Local(TxnLocalRef::Alias("planned-local".to_string()));
+    let batch = txn
+        .plan_unique_edge_merge_batch(
+            &mut overlay,
+            &[
+                Some(TxnUniqueEdgeMergeInput {
+                    from: TxnNodeRef::Id(a),
+                    to: TxnNodeRef::Id(b),
+                    label: "TXN_MERGE_PLAN_EDGE".to_string(),
+                }),
+                Some(TxnUniqueEdgeMergeInput {
+                    from: TxnNodeRef::Id(b),
+                    to: TxnNodeRef::Id(a),
+                    label: "TXN_MERGE_PLAN_EDGE".to_string(),
+                }),
+                Some(TxnUniqueEdgeMergeInput {
+                    from: TxnNodeRef::Id(b),
+                    to: TxnNodeRef::Id(a),
+                    label: "TXN_MERGE_PLAN_EDGE".to_string(),
+                }),
+                Some(TxnUniqueEdgeMergeInput {
+                    from: local_endpoint.clone(),
+                    to: TxnNodeRef::Id(b),
+                    label: "TXN_MERGE_PLAN_EDGE".to_string(),
+                }),
+                Some(TxnUniqueEdgeMergeInput {
+                    from: local_endpoint,
+                    to: TxnNodeRef::Id(b),
+                    label: "TXN_MERGE_PLAN_EDGE".to_string(),
+                }),
+                None,
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(batch.snapshot_lookup_count, 2);
+    assert_eq!(batch.existing_ids, BTreeSet::from([existing_edge]));
+    assert_eq!(
+        batch.missing_committed_triples,
+        BTreeSet::from([(b, a, "TXN_MERGE_PLAN_EDGE".to_string())])
+    );
+    assert_eq!(
+        batch.rows[0],
+        TxnUniqueEdgeMergeRowOutcome::Existing(existing_edge)
+    );
+    let committed_local = match &batch.rows[1] {
+        TxnUniqueEdgeMergeRowOutcome::Create { local, .. } => *local,
+        other => panic!("expected missing committed triple to create, got {other:?}"),
+    };
+    assert_eq!(
+        batch.rows[2],
+        TxnUniqueEdgeMergeRowOutcome::MatchedLocal(committed_local)
+    );
+    let staged_endpoint_local = match &batch.rows[3] {
+        TxnUniqueEdgeMergeRowOutcome::Create { local, .. } => *local,
+        other => panic!("expected local endpoint triple to create, got {other:?}"),
+    };
+    assert_eq!(
+        batch.rows[4],
+        TxnUniqueEdgeMergeRowOutcome::MatchedLocal(staged_endpoint_local)
+    );
+    assert_eq!(batch.rows[5], TxnUniqueEdgeMergeRowOutcome::SkippedNull);
+
+    let repeat_existing = txn
+        .plan_unique_edge_merge_batch(
+            &mut overlay,
+            &[Some(TxnUniqueEdgeMergeInput {
+                from: TxnNodeRef::Id(a),
+                to: TxnNodeRef::Id(b),
+                label: "TXN_MERGE_PLAN_EDGE".to_string(),
+            })],
+        )
+        .unwrap();
+    assert_eq!(repeat_existing.snapshot_lookup_count, 0);
+    assert_eq!(repeat_existing.existing_ids, BTreeSet::from([existing_edge]));
+    assert_eq!(
+        repeat_existing.rows,
+        vec![TxnUniqueEdgeMergeRowOutcome::Existing(existing_edge)]
+    );
+
+    let repeat_created = txn
+        .plan_unique_edge_merge_batch(
+            &mut overlay,
+            &[Some(TxnUniqueEdgeMergeInput {
+                from: TxnNodeRef::Id(b),
+                to: TxnNodeRef::Id(a),
+                label: "TXN_MERGE_PLAN_EDGE".to_string(),
+            })],
+        )
+        .unwrap();
+    assert_eq!(repeat_created.snapshot_lookup_count, 0);
+    assert_eq!(
+        repeat_created.rows,
+        vec![TxnUniqueEdgeMergeRowOutcome::MatchedLocal(committed_local)]
+    );
+
+    let keyed_endpoint = txn
+        .plan_unique_edge_merge_batch(
+            &mut overlay,
+            &[Some(TxnUniqueEdgeMergeInput {
+                from: TxnNodeRef::Key {
+                    label: "TxnMergePlanEndpoint".to_string(),
+                    key: "a".to_string(),
+                },
+                to: TxnNodeRef::Id(b),
+                label: "TXN_MERGE_PLAN_EDGE".to_string(),
+            })],
+        )
+        .unwrap_err();
+    assert!(matches!(
+        keyed_endpoint,
+        EngineError::InvalidOperation(message)
+            if message.contains("resolved node IDs or local refs")
+    ));
+
+    let non_unique = DatabaseEngine::open(&dir.path().join("non_unique"), &DbOptions::default())
+        .unwrap();
+    let non_unique_txn = non_unique.begin_write_txn().unwrap();
+    assert!(matches!(
+        non_unique_txn.plan_unique_edge_merge_batch(&mut TxnMergeOverlay::default(), &[]),
+        Err(EngineError::InvalidOperation(message)) if message.contains("edge_uniqueness=true")
+    ));
+    non_unique.close().unwrap();
+    engine.close().unwrap();
+}
+
+#[test]
 fn test_write_txn_lifecycle_closed_db_and_finished_txn_rules() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");

@@ -92,6 +92,15 @@ struct ParsedMapLiteral {
     ast_depth: usize,
 }
 
+struct ParsedReadBranch {
+    clauses: Vec<GqlPipelineClause>,
+    return_clause: ReturnClause,
+    order_by: Vec<OrderItem>,
+    skip: Option<Expr>,
+    limit: Option<Expr>,
+    span: SourceSpan,
+}
+
 type RelationshipDetail = (
     Option<Ident>,
     Vec<Ident>,
@@ -111,19 +120,32 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<GqlStatement, EngineError> {
         if self.at_mutation_clause_start() {
-            return self.parse_mutation_statement(Vec::new());
+            return self.parse_mutation_statement(Vec::new(), None);
+        }
+
+        if self.at_mutation_read_prefix_start() && self.has_top_level_mutation_before_return() {
+            let (read_prefix, read_prefix_pipeline) = self.parse_mutation_read_prefix_pipeline()?;
+            return self.parse_mutation_statement(read_prefix, Some(read_prefix_pipeline));
         }
 
         if self.at_match_clause_start() {
             let mut match_clauses = Vec::new();
-            match_clauses.push(self.parse_match_clause()?);
-            while self.at_match_clause_start() {
+            while self.at_regular_match_clause_start() {
                 match_clauses.push(self.parse_match_clause()?);
             }
             if self.at_mutation_clause_start() {
-                return self.parse_mutation_statement(match_clauses);
+                return self.parse_mutation_statement(match_clauses, None);
             }
             let query = self.parse_query_tail(match_clauses)?;
+            return Ok(GqlStatement {
+                kind: GqlStatementKind::Query,
+                span: query.span.clone(),
+                body: GqlStatementBody::Query(query),
+            });
+        }
+
+        if self.at_call_subquery_start() {
+            let query = self.parse_query_tail(Vec::new())?;
             return Ok(GqlStatement {
                 kind: GqlStatementKind::Query,
                 span: query.span.clone(),
@@ -143,8 +165,10 @@ impl<'a> Parser<'a> {
     fn parse_query(&mut self) -> Result<GqlQuery, EngineError> {
         self.reject_unsupported_clause()?;
         let mut match_clauses = Vec::new();
-        match_clauses.push(self.parse_match_clause()?);
-        while self.at_match_clause_start() {
+        if !self.at_match_clause_start() {
+            return Err(self.parse_error_current("expected MATCH clause"));
+        }
+        while self.at_regular_match_clause_start() {
             match_clauses.push(self.parse_match_clause()?);
         }
 
@@ -155,25 +179,32 @@ impl<'a> Parser<'a> {
         &mut self,
         match_clauses: Vec<MatchClause>,
     ) -> Result<GqlQuery, EngineError> {
-        self.reject_unsupported_clause()?;
-        let return_clause = self.parse_return_clause()?;
-        let order_by = if self.at_keyword(Keyword::Order) {
-            self.parse_order_by()?
-        } else {
-            Vec::new()
-        };
-        let mut skip = None;
-        if self.at_keyword(Keyword::Skip) || self.at_keyword(Keyword::Offset) {
-            skip = Some(self.parse_skip_or_offset()?);
+        let first_branch = self.parse_read_branch_tail(match_clauses.clone())?;
+        let mut union_branches = Vec::new();
+        while self.at_keyword(Keyword::Union) {
+            let union = self.advance();
+            let modifier = if self.token_word_eq(self.pos, "all") {
+                self.advance();
+                GqlUnionModifier::All
+            } else {
+                GqlUnionModifier::Distinct
+            };
+            self.reject_unsupported_clause()?;
+            if !self.at_match_clause_start() {
+                return Err(self.parse_error_current("expected MATCH after UNION"));
+            }
+            let mut branch_matches = Vec::new();
+            while self.at_regular_match_clause_start() {
+                branch_matches.push(self.parse_match_clause()?);
+            }
+            let branch = self.parse_read_branch_tail(branch_matches)?;
+            union_branches.push(GqlUnionBranch {
+                modifier,
+                clauses: branch.clauses,
+                span: branch.span,
+                union_span: union.span,
+            });
         }
-        if self.at_keyword(Keyword::Skip) || self.at_keyword(Keyword::Offset) {
-            return Err(self.parse_error_current("SKIP and OFFSET cannot both be specified"));
-        }
-        let limit = if self.consume_keyword(Keyword::Limit).is_some() {
-            Some(self.parse_expression(0)?.expr)
-        } else {
-            None
-        };
 
         if let Some(semicolon) = self.consume_if(|kind| matches!(kind, TokenKind::Semicolon)) {
             if !self.at_eof() {
@@ -190,14 +221,67 @@ impl<'a> Parser<'a> {
         }
 
         let span = self.span_between(
-            &match_clauses
+            &first_branch
+                .clauses
                 .first()
-                .map(|clause| clause.span.clone())
+                .map(gql_pipeline_clause_span)
+                .unwrap_or_else(|| first_branch.return_clause.span.clone()),
+            &self.previous_non_eof_span(),
+        );
+        let pipeline = GqlReadPipeline {
+            clauses: first_branch.clauses,
+            union_branches,
+            span: span.clone(),
+        };
+        Ok(GqlQuery {
+            match_clauses,
+            return_clause: first_branch.return_clause,
+            order_by: first_branch.order_by,
+            skip: first_branch.skip,
+            limit: first_branch.limit,
+            pipeline,
+            span,
+        })
+    }
+
+    fn parse_read_branch_tail(
+        &mut self,
+        match_clauses: Vec<MatchClause>,
+    ) -> Result<ParsedReadBranch, EngineError> {
+        let mut clauses = Vec::new();
+        if !match_clauses.is_empty() {
+            clauses.push(GqlPipelineClause::Match(match_clauses.clone()));
+        }
+        self.parse_read_stage_sequence(&mut clauses)?;
+        while self.at_keyword(Keyword::With) {
+            clauses.push(GqlPipelineClause::Projection(
+                self.parse_projection_clause(GqlProjectionKind::With)?,
+            ));
+            self.parse_read_stage_sequence(&mut clauses)?;
+        }
+
+        self.reject_unsupported_clause()?;
+        let return_projection = self.parse_projection_clause(GqlProjectionKind::Return)?;
+        let return_clause = ReturnClause {
+            body: return_projection.body.clone(),
+            distinct: return_projection.distinct,
+            distinct_span: return_projection.distinct_span.clone(),
+            span: return_projection.span.clone(),
+        };
+        let order_by = return_projection.order_by.clone();
+        let skip = return_projection.skip.clone();
+        let limit = return_projection.limit.clone();
+        clauses.push(GqlPipelineClause::Projection(return_projection));
+
+        let span = self.span_between(
+            &clauses
+                .first()
+                .map(gql_pipeline_clause_span)
                 .unwrap_or_else(|| return_clause.span.clone()),
             &self.previous_non_eof_span(),
         );
-        Ok(GqlQuery {
-            match_clauses,
+        Ok(ParsedReadBranch {
+            clauses,
             return_clause,
             order_by,
             skip,
@@ -206,9 +290,92 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_read_stage_sequence(
+        &mut self,
+        clauses: &mut Vec<GqlPipelineClause>,
+    ) -> Result<(), EngineError> {
+        loop {
+            if self.at_call_subquery_start() {
+                clauses.push(GqlPipelineClause::Call(self.parse_call_subquery()?));
+                continue;
+            }
+            if self.at_shortest_path_match_clause_start() {
+                clauses.push(GqlPipelineClause::ShortestPath(
+                    self.parse_shortest_path_clause()?,
+                ));
+                continue;
+            }
+            if self.at_regular_match_clause_start() {
+                let mut matches = Vec::new();
+                while self.at_regular_match_clause_start() {
+                    matches.push(self.parse_match_clause()?);
+                }
+                if !matches.is_empty() {
+                    clauses.push(GqlPipelineClause::Match(matches));
+                }
+                continue;
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    fn parse_call_subquery(&mut self) -> Result<GqlCallSubquery, EngineError> {
+        let start = self.expect_keyword(Keyword::Call, "expected CALL")?;
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LBrace),
+            "expected '{' after CALL",
+        )?;
+        let pipeline = self.parse_nested_read_pipeline()?;
+        let end = self.expect_kind(
+            |kind| matches!(kind, TokenKind::RBrace),
+            "expected '}' to close CALL subquery",
+        )?;
+        Ok(GqlCallSubquery {
+            pipeline: Box::new(pipeline),
+            span: self.span_between(&start.span, &end.span),
+        })
+    }
+
+    fn parse_nested_read_pipeline(&mut self) -> Result<GqlReadPipeline, EngineError> {
+        let first_branch = self.parse_read_branch_tail(Vec::new())?;
+        let mut union_branches = Vec::new();
+        while self.at_keyword(Keyword::Union) {
+            let union = self.advance();
+            let modifier = if self.token_word_eq(self.pos, "all") {
+                self.advance();
+                GqlUnionModifier::All
+            } else {
+                GqlUnionModifier::Distinct
+            };
+            self.reject_unsupported_clause()?;
+            let branch = self.parse_read_branch_tail(Vec::new())?;
+            union_branches.push(GqlUnionBranch {
+                modifier,
+                clauses: branch.clauses,
+                span: branch.span,
+                union_span: union.span,
+            });
+        }
+        let span = self.span_between(
+            &first_branch
+                .clauses
+                .first()
+                .map(gql_pipeline_clause_span)
+                .unwrap_or_else(|| first_branch.return_clause.span.clone()),
+            &self.previous_non_eof_span(),
+        );
+        Ok(GqlReadPipeline {
+            clauses: first_branch.clauses,
+            union_branches,
+            span,
+        })
+    }
+
     fn parse_mutation_statement(
         &mut self,
         read_prefix: Vec<MatchClause>,
+        read_prefix_pipeline: Option<GqlReadPipeline>,
     ) -> Result<GqlStatement, EngineError> {
         for clause in &read_prefix {
             if clause.patterns.len() != 1 {
@@ -227,10 +394,10 @@ impl<'a> Parser<'a> {
         let mut mutation_clauses = Vec::new();
         while self.at_mutation_clause_start() {
             mutation_clauses.push(self.parse_mutation_clause()?);
-            if self.at_match_clause_start() {
+            if self.at_read_after_write_clause_start() {
                 return Err(EngineError::GqlUnsupported {
-                    feature: "read-after-write matching".to_string(),
-                    message: "MATCH and OPTIONAL MATCH clauses must appear before mutation clauses"
+                    feature: "read-after-write clauses".to_string(),
+                    message: "MATCH, WITH, CALL, UNION, and subquery read stages must appear before mutation clauses"
                         .to_string(),
                     span: self.current().span.clone(),
                 });
@@ -268,10 +435,10 @@ impl<'a> Parser<'a> {
         }
 
         self.reject_unsupported_clause()?;
-        if self.at_match_clause_start() {
+        if self.at_read_after_write_clause_start() {
             return Err(EngineError::GqlUnsupported {
-                feature: "read-after-write matching".to_string(),
-                message: "MATCH and OPTIONAL MATCH clauses must appear before mutation clauses"
+                feature: "read-after-write clauses".to_string(),
+                message: "MATCH, WITH, CALL, UNION, and subquery read stages must appear before mutation clauses"
                     .to_string(),
                 span: self.current().span.clone(),
             });
@@ -283,6 +450,7 @@ impl<'a> Parser<'a> {
         let span = self.span_between(&start_span, &self.previous_non_eof_span());
         let mutation = GqlMutationStatement {
             read_prefix,
+            read_prefix_pipeline,
             mutation_clauses,
             return_tail,
             span,
@@ -297,6 +465,8 @@ impl<'a> Parser<'a> {
     fn parse_mutation_clause(&mut self) -> Result<MutationClause, EngineError> {
         if self.at_keyword(Keyword::Create) {
             Ok(MutationClause::Create(self.parse_create_clause()?))
+        } else if self.at_keyword(Keyword::Merge) {
+            Ok(MutationClause::Merge(self.parse_merge_clause()?))
         } else if self.at_keyword(Keyword::Set) {
             Ok(MutationClause::Set(self.parse_set_clause()?))
         } else if self.at_keyword(Keyword::Remove) {
@@ -306,6 +476,36 @@ impl<'a> Parser<'a> {
         } else {
             Err(self.parse_error_current("expected mutation clause"))
         }
+    }
+
+    fn parse_mutation_read_prefix_pipeline(
+        &mut self,
+    ) -> Result<(Vec<MatchClause>, GqlReadPipeline), EngineError> {
+        let start = self.current().span.clone();
+        let mut clauses = Vec::new();
+        self.parse_read_stage_sequence(&mut clauses)?;
+        while self.at_keyword(Keyword::With) {
+            clauses.push(GqlPipelineClause::Projection(
+                self.parse_projection_clause(GqlProjectionKind::With)?,
+            ));
+            self.parse_read_stage_sequence(&mut clauses)?;
+        }
+        if clauses.is_empty() {
+            return Err(self.parse_error_current("expected read stage before mutation clause"));
+        }
+        if !self.at_mutation_clause_start() {
+            return Err(self.parse_error_current("expected mutation clause after read prefix"));
+        }
+        let legacy_read_prefix = legacy_match_only_read_prefix(&clauses).unwrap_or_default();
+        let span = self.span_between(&start, &self.previous_non_eof_span());
+        Ok((
+            legacy_read_prefix,
+            GqlReadPipeline {
+                clauses,
+                union_branches: Vec::new(),
+                span,
+            },
+        ))
     }
 
     fn parse_create_clause(&mut self) -> Result<CreateClause, EngineError> {
@@ -328,6 +528,48 @@ impl<'a> Parser<'a> {
             .unwrap_or_else(|| start.span.clone());
         Ok(CreateClause {
             patterns,
+            span: self.span_between(&start.span, &end),
+        })
+    }
+
+    fn parse_merge_clause(&mut self) -> Result<MergeClause, EngineError> {
+        let start = self.expect_keyword(Keyword::Merge, "expected MERGE clause")?;
+        let pattern = self.parse_pattern()?;
+        let mut on_create = None;
+        let mut on_match = None;
+        let mut end = pattern.span.clone();
+        while self.at_keyword(Keyword::On) {
+            let on = self.advance();
+            if self.at_keyword(Keyword::Create) {
+                if on_create.is_some() {
+                    return Err(EngineError::GqlParse {
+                        message: "MERGE supports at most one ON CREATE SET action".to_string(),
+                        span: on.span,
+                    });
+                }
+                self.expect_keyword(Keyword::Create, "expected CREATE after ON")?;
+                let set = self.parse_set_clause()?;
+                end = set.span.clone();
+                on_create = Some(set);
+            } else if self.at_keyword(Keyword::Match) {
+                if on_match.is_some() {
+                    return Err(EngineError::GqlParse {
+                        message: "MERGE supports at most one ON MATCH SET action".to_string(),
+                        span: on.span,
+                    });
+                }
+                self.expect_keyword(Keyword::Match, "expected MATCH after ON")?;
+                let set = self.parse_set_clause()?;
+                end = set.span.clone();
+                on_match = Some(set);
+            } else {
+                return Err(self.parse_error_current("expected CREATE or MATCH after ON"));
+            }
+        }
+        Ok(MergeClause {
+            pattern,
+            on_create,
+            on_match,
             span: self.span_between(&start.span, &end),
         })
     }
@@ -525,6 +767,67 @@ impl<'a> Parser<'a> {
             patterns,
             where_clause,
             span: self.span_between(&clause_start, &end),
+        })
+    }
+
+    fn parse_shortest_path_clause(&mut self) -> Result<GqlShortestPathClause, EngineError> {
+        let optional = self.consume_keyword(Keyword::Optional);
+        let start = self.expect_keyword(Keyword::Match, "expected MATCH clause")?;
+        let clause_start = optional
+            .as_ref()
+            .map(|token| token.span.clone())
+            .unwrap_or_else(|| start.span.clone());
+        let output_path_alias =
+            if self.current_is_ident() && self.next_is(|kind| matches!(kind, TokenKind::Equals)) {
+                let ident = self.parse_ident("expected shortest-path alias")?;
+                self.expect_kind(
+                    |kind| matches!(kind, TokenKind::Equals),
+                    "expected '=' after shortest-path alias",
+                )?;
+                ident
+            } else {
+                return Err(EngineError::GqlParse {
+                    message: "shortest-path MATCH requires a path alias before '='".to_string(),
+                    span: self.current().span.clone(),
+                });
+            };
+
+        let function = self.parse_ident("expected shortest-path function")?;
+        let mode = if function.name.eq_ignore_ascii_case("shortestPath") {
+            GqlShortestPathMode::One
+        } else if function.name.eq_ignore_ascii_case("allShortestPaths") {
+            GqlShortestPathMode::All
+        } else if is_shortest_path_function(&function.name) {
+            return Err(EngineError::GqlUnsupported {
+                feature: "shortest-path syntax".to_string(),
+                message: format!(
+                    "shortest-path function '{}' is not supported in the current GQL subset",
+                    function.name
+                ),
+                span: function.span,
+            });
+        } else {
+            return Err(EngineError::GqlParse {
+                message: "expected shortestPath or allShortestPaths".to_string(),
+                span: function.span,
+            });
+        };
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LParen),
+            "expected '(' after shortest-path function",
+        )?;
+        let pattern = self.parse_pattern()?;
+        let close = self.expect_kind(
+            |kind| matches!(kind, TokenKind::RParen),
+            "expected ')' after shortest-path pattern",
+        )?;
+        validate_shortest_path_pattern(self, &pattern)?;
+        Ok(GqlShortestPathClause {
+            optional: optional.is_some(),
+            output_path_alias,
+            mode,
+            pattern,
+            span: self.span_between(&clause_start, &close.span),
         })
     }
 
@@ -839,18 +1142,111 @@ impl<'a> Parser<'a> {
 
     fn parse_return_clause(&mut self) -> Result<ReturnClause, EngineError> {
         let start = self.expect_keyword(Keyword::Return, "expected RETURN clause")?;
-        if self.at_keyword(Keyword::Distinct) {
-            return Err(
-                self.unsupported_current("DISTINCT", "DISTINCT is not supported in Phase 31")
-            );
-        }
-        if let Some(star) = self.consume_if(|kind| matches!(kind, TokenKind::Star)) {
-            return Ok(ReturnClause {
-                body: ReturnBody::All(star.span.clone()),
-                span: self.span_between(&start.span, &star.span),
-            });
-        }
+        let distinct_span = self
+            .consume_keyword(Keyword::Distinct)
+            .map(|token| token.span);
+        let distinct = distinct_span.is_some();
+        let body = self.parse_projection_body(false)?;
+        let end = projection_body_end(&body).clone();
+        Ok(ReturnClause {
+            body,
+            distinct,
+            distinct_span,
+            span: self.span_between(&start.span, &end),
+        })
+    }
 
+    fn parse_projection_clause(
+        &mut self,
+        kind: GqlProjectionKind,
+    ) -> Result<GqlProjectionClause, EngineError> {
+        let start = match kind {
+            GqlProjectionKind::With => {
+                self.expect_keyword(Keyword::With, "expected WITH clause")?
+            }
+            GqlProjectionKind::Return => {
+                self.expect_keyword(Keyword::Return, "expected RETURN clause")?
+            }
+        };
+        let distinct_span = self
+            .consume_keyword(Keyword::Distinct)
+            .map(|token| token.span);
+        let distinct = distinct_span.is_some();
+        let body = self.parse_projection_body(kind == GqlProjectionKind::With)?;
+        let mut end = projection_body_end(&body).clone();
+        let order_by = if self.at_keyword(Keyword::Order) {
+            let order_by = self.parse_order_by()?;
+            if let Some(last) = order_by.last() {
+                end = last.span.clone();
+            }
+            order_by
+        } else {
+            Vec::new()
+        };
+        let mut skip = None;
+        if self.at_keyword(Keyword::Skip) || self.at_keyword(Keyword::Offset) {
+            let expr = self.parse_skip_or_offset()?;
+            end = expr.span.clone();
+            skip = Some(expr);
+        }
+        if self.at_keyword(Keyword::Skip) || self.at_keyword(Keyword::Offset) {
+            return Err(self.parse_error_current("SKIP and OFFSET cannot both be specified"));
+        }
+        let limit = if self.consume_keyword(Keyword::Limit).is_some() {
+            let expr = self.parse_expression(0)?.expr;
+            end = expr.span.clone();
+            Some(expr)
+        } else {
+            None
+        };
+        let where_clause =
+            if kind == GqlProjectionKind::With && self.consume_keyword(Keyword::Where).is_some() {
+                let expr = self.parse_expression(0)?.expr;
+                end = expr.span.clone();
+                Some(expr)
+            } else {
+                None
+            };
+
+        Ok(GqlProjectionClause {
+            kind,
+            distinct,
+            distinct_span,
+            body,
+            where_clause,
+            order_by,
+            skip,
+            limit,
+            span: self.span_between(&start.span, &end),
+        })
+    }
+
+    fn parse_projection_body(&mut self, allow_mixed_star: bool) -> Result<ReturnBody, EngineError> {
+        if let Some(star) = self.consume_if(|kind| matches!(kind, TokenKind::Star)) {
+            if self
+                .consume_if(|kind| matches!(kind, TokenKind::Comma))
+                .is_some()
+            {
+                if !allow_mixed_star {
+                    return Err(EngineError::GqlUnsupported {
+                        feature: "RETURN * with additional projection items".to_string(),
+                        message:
+                            "RETURN * with additional projection items is deferred until a later phase"
+                                .to_string(),
+                        span: star.span,
+                    });
+                }
+                return Ok(ReturnBody::AllAndItems {
+                    star_span: star.span,
+                    items: self.parse_projection_items()?,
+                });
+            }
+            return Ok(ReturnBody::All(star.span));
+        }
+        Ok(ReturnBody::Items(self.parse_projection_items()?))
+    }
+
+    fn parse_projection_items(&mut self) -> Result<Vec<ReturnItem>, EngineError> {
         let mut items = Vec::new();
         loop {
             let expr = self.parse_expression(0)?.expr;
@@ -872,14 +1268,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let end = items
-            .last()
-            .map(|item| item.span.clone())
-            .unwrap_or_else(|| start.span.clone());
-        Ok(ReturnClause {
-            body: ReturnBody::Items(items),
-            span: self.span_between(&start.span, &end),
-        })
+        Ok(items)
     }
 
     fn parse_order_by(&mut self) -> Result<Vec<OrderItem>, EngineError> {
@@ -967,7 +1356,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_comparison(&mut self, depth: usize) -> Result<ParsedExpr, EngineError> {
-        let mut expr = self.parse_not(depth)?;
+        let mut expr = self.parse_additive(depth)?;
         loop {
             let op = if self
                 .consume_if(|kind| matches!(kind, TokenKind::Equals))
@@ -1001,11 +1390,19 @@ impl<'a> Parser<'a> {
                 Some(BinaryOp::Ge)
             } else if self.consume_keyword(Keyword::In).is_some() {
                 Some(BinaryOp::In)
+            } else if self.consume_keyword(Keyword::Starts).is_some() {
+                self.expect_keyword(Keyword::With, "expected WITH after STARTS")?;
+                Some(BinaryOp::StartsWith)
+            } else if self.consume_keyword(Keyword::Ends).is_some() {
+                self.expect_keyword(Keyword::With, "expected WITH after ENDS")?;
+                Some(BinaryOp::EndsWith)
+            } else if self.consume_keyword(Keyword::Contains).is_some() {
+                Some(BinaryOp::Contains)
             } else {
                 None
             };
             if let Some(op) = op {
-                let right = self.parse_not(depth)?;
+                let right = self.parse_additive(depth)?;
                 expr = self.binary_expr(op, expr, right)?;
                 continue;
             }
@@ -1033,10 +1430,56 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    fn parse_not(&mut self, depth: usize) -> Result<ParsedExpr, EngineError> {
+    fn parse_additive(&mut self, depth: usize) -> Result<ParsedExpr, EngineError> {
+        let mut expr = self.parse_multiplicative(depth)?;
+        loop {
+            let op = if self
+                .consume_if(|kind| matches!(kind, TokenKind::Plus))
+                .is_some()
+            {
+                Some(BinaryOp::Add)
+            } else if self
+                .consume_if(|kind| matches!(kind, TokenKind::Dash))
+                .is_some()
+            {
+                Some(BinaryOp::Sub)
+            } else {
+                None
+            };
+            let Some(op) = op else { break };
+            let right = self.parse_multiplicative(depth)?;
+            expr = self.binary_expr(op, expr, right)?;
+        }
+        Ok(expr)
+    }
+
+    fn parse_multiplicative(&mut self, depth: usize) -> Result<ParsedExpr, EngineError> {
+        let mut expr = self.parse_unary(depth)?;
+        loop {
+            let op = if self
+                .consume_if(|kind| matches!(kind, TokenKind::Star))
+                .is_some()
+            {
+                Some(BinaryOp::Mul)
+            } else if self
+                .consume_if(|kind| matches!(kind, TokenKind::Slash))
+                .is_some()
+            {
+                Some(BinaryOp::Div)
+            } else {
+                None
+            };
+            let Some(op) = op else { break };
+            let right = self.parse_unary(depth)?;
+            expr = self.binary_expr(op, expr, right)?;
+        }
+        Ok(expr)
+    }
+
+    fn parse_unary(&mut self, depth: usize) -> Result<ParsedExpr, EngineError> {
         if let Some(not) = self.consume_keyword(Keyword::Not) {
             self.check_depth(depth + 1, &not.span)?;
-            let expr = self.parse_not(depth + 1)?;
+            let expr = self.parse_unary(depth + 1)?;
             let span = self.span_between(&not.span, &expr.expr.span);
             let ast_depth = expr.ast_depth + 1;
             self.check_depth(ast_depth, &span)?;
@@ -1044,6 +1487,22 @@ impl<'a> Parser<'a> {
                 expr: Expr {
                     kind: ExprKind::Unary {
                         op: UnaryOp::Not,
+                        expr: Box::new(expr.expr),
+                    },
+                    span,
+                },
+                ast_depth,
+            })
+        } else if let Some(dash) = self.consume_if(|kind| matches!(kind, TokenKind::Dash)) {
+            self.check_depth(depth + 1, &dash.span)?;
+            let expr = self.parse_unary(depth + 1)?;
+            let span = self.span_between(&dash.span, &expr.expr.span);
+            let ast_depth = expr.ast_depth + 1;
+            self.check_depth(ast_depth, &span)?;
+            Ok(ParsedExpr {
+                expr: Expr {
+                    kind: ExprKind::Unary {
+                        op: UnaryOp::Neg,
                         expr: Box::new(expr.expr),
                     },
                     span,
@@ -1140,8 +1599,20 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Exists)
                 if self.next_is(|kind| matches!(kind, TokenKind::LBrace)) =>
             {
-                Err(self
-                    .unsupported_current("subqueries", "subqueries are not supported in Phase 31"))
+                let start = self.advance();
+                self.expect_kind(
+                    |kind| matches!(kind, TokenKind::LBrace),
+                    "expected '{' after EXISTS",
+                )?;
+                let pipeline = self.parse_nested_read_pipeline()?;
+                let end = self.expect_kind(
+                    |kind| matches!(kind, TokenKind::RBrace),
+                    "expected '}' to close EXISTS subquery",
+                )?;
+                Ok(Self::leaf_expr(Expr {
+                    kind: ExprKind::ExistsSubquery(Box::new(pipeline)),
+                    span: self.span_between(&start.span, &end.span),
+                }))
             }
             TokenKind::Keyword(Keyword::Exists)
                 if self.next_is(|kind| matches!(kind, TokenKind::LParen)) =>
@@ -1164,36 +1635,66 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LBracket => self.parse_list_literal(depth),
             TokenKind::LBrace => self.parse_map_expr(depth),
-            TokenKind::Dash if self.next_is(|kind| matches!(kind, TokenKind::Int(_))) => {
-                let start = self.advance();
-                let next = self.advance();
-                let TokenKind::Int(value) = next.kind else {
-                    unreachable!("checked above")
-                };
-                let Some(value) = value.checked_neg() else {
-                    return Err(EngineError::GqlParse {
-                        message: "integer literal is out of range".to_string(),
-                        span: self.span_between(&start.span, &next.span),
-                    });
-                };
-                Ok(Self::leaf_expr(Expr {
-                    kind: ExprKind::Literal(Literal::Int(value)),
-                    span: self.span_between(&start.span, &next.span),
-                }))
-            }
-            TokenKind::Dash if self.next_is(|kind| matches!(kind, TokenKind::Float(_))) => {
-                let start = self.advance();
-                let next = self.advance();
-                let TokenKind::Float(value) = next.kind else {
-                    unreachable!("checked above")
-                };
-                Ok(Self::leaf_expr(Expr {
-                    kind: ExprKind::Literal(Literal::Float(-value)),
-                    span: self.span_between(&start.span, &next.span),
-                }))
-            }
+            TokenKind::Keyword(Keyword::Case) => self.parse_case_expr(depth),
             _ => Err(self.parse_error_current("expected expression")),
         }
+    }
+
+    fn parse_case_expr(&mut self, depth: usize) -> Result<ParsedExpr, EngineError> {
+        let start = self.expect_keyword(Keyword::Case, "expected CASE")?;
+        self.check_depth(depth + 1, &start.span)?;
+
+        let mut max_depth = 0usize;
+        let operand = if self.at_keyword(Keyword::When) {
+            None
+        } else {
+            let operand = self.parse_expression(depth + 1)?;
+            max_depth = max_depth.max(operand.ast_depth);
+            Some(Box::new(operand.expr))
+        };
+
+        let mut branches = Vec::new();
+        while self.consume_keyword(Keyword::When).is_some() {
+            let when = self.parse_expression(depth + 1)?;
+            max_depth = max_depth.max(when.ast_depth);
+            self.expect_keyword(Keyword::Then, "expected THEN after CASE WHEN expression")?;
+            let then = self.parse_expression(depth + 1)?;
+            max_depth = max_depth.max(then.ast_depth);
+            branches.push(CaseBranch {
+                when: when.expr,
+                then: then.expr,
+            });
+        }
+
+        if branches.is_empty() {
+            return Err(EngineError::GqlParse {
+                message: "CASE requires at least one WHEN branch".to_string(),
+                span: start.span,
+            });
+        }
+
+        let else_expr = if self.consume_keyword(Keyword::Else).is_some() {
+            let expr = self.parse_expression(depth + 1)?;
+            max_depth = max_depth.max(expr.ast_depth);
+            Some(Box::new(expr.expr))
+        } else {
+            None
+        };
+        let end = self.expect_keyword(Keyword::End, "expected END to close CASE expression")?;
+        let span = self.span_between(&start.span, &end.span);
+        let ast_depth = max_depth + 1;
+        self.check_depth(ast_depth, &span)?;
+        Ok(ParsedExpr {
+            expr: Expr {
+                kind: ExprKind::Case {
+                    operand,
+                    branches,
+                    else_expr,
+                },
+                span,
+            },
+            ast_depth,
+        })
     }
 
     fn parse_function_call(
@@ -1206,14 +1707,18 @@ impl<'a> Parser<'a> {
         if is_shortest_path_function(&name) {
             return Err(EngineError::GqlUnsupported {
                 feature: "shortest-path syntax".to_string(),
-                message: "shortest-path functions are not supported in Phase 31".to_string(),
+                message: "shortest-path functions are only supported in MATCH path clauses"
+                    .to_string(),
                 span: name_span,
             });
+        }
+        if let Some(function) = aggregate_function_from_name(&lower) {
+            return self.parse_aggregate_call(function, name, name_span, depth);
         }
         if is_aggregation_function(&lower) {
             return Err(EngineError::GqlUnsupported {
                 feature: "aggregation".to_string(),
-                message: "aggregation functions are not supported in Phase 31".to_string(),
+                message: format!("aggregation function '{}' is not supported", name),
                 span: name_span,
             });
         }
@@ -1263,6 +1768,73 @@ impl<'a> Parser<'a> {
         Ok(ParsedExpr {
             expr: Expr {
                 kind: ExprKind::FunctionCall { name: ident, args },
+                span,
+            },
+            ast_depth,
+        })
+    }
+
+    fn parse_aggregate_call(
+        &mut self,
+        function: AggregateFunction,
+        name: String,
+        name_span: SourceSpan,
+        depth: usize,
+    ) -> Result<ParsedExpr, EngineError> {
+        self.check_depth(depth + 1, &name_span)?;
+        self.advance();
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LParen),
+            "expected '(' after aggregate function name",
+        )?;
+        let distinct_span = self
+            .consume_keyword(Keyword::Distinct)
+            .map(|token| token.span);
+        let distinct = distinct_span.is_some();
+        let (arg, max_arg_depth, end) =
+            if let Some(star) = self.consume_if(|kind| matches!(kind, TokenKind::Star)) {
+                if function != AggregateFunction::Count {
+                    return Err(EngineError::GqlParse {
+                        message: format!("aggregate function '{}' does not accept '*'", name),
+                        span: star.span,
+                    });
+                }
+                if distinct {
+                    return Err(EngineError::GqlParse {
+                        message: "count(DISTINCT *) is not supported".to_string(),
+                        span: distinct_span.unwrap_or(star.span.clone()),
+                    });
+                }
+                let end = self.expect_kind(
+                    |kind| matches!(kind, TokenKind::RParen),
+                    "expected ')' after aggregate arguments",
+                )?;
+                (None, 0, end)
+            } else {
+                if self.at_kind(|kind| matches!(kind, TokenKind::RParen)) {
+                    return Err(EngineError::GqlParse {
+                        message: format!("aggregate function '{}' expects an argument", name),
+                        span: name_span.clone(),
+                    });
+                }
+                let parsed = self.parse_expression(depth + 1)?;
+                let end = self.expect_kind(
+                    |kind| matches!(kind, TokenKind::RParen),
+                    "expected ')' after aggregate arguments",
+                )?;
+                (Some(Box::new(parsed.expr)), parsed.ast_depth, end)
+            };
+        let span = self.span_between(&name_span, &end.span);
+        let ast_depth = max_arg_depth + 1;
+        self.check_depth(ast_depth, &span)?;
+        Ok(ParsedExpr {
+            expr: Expr {
+                kind: ExprKind::AggregateCall {
+                    function,
+                    distinct,
+                    arg,
+                    name_span,
+                },
                 span,
             },
             ast_depth,
@@ -1495,12 +2067,10 @@ impl<'a> Parser<'a> {
                         self.unsupported_current("WITH", "WITH is not supported in Phase 31")
                     );
                 }
-                Keyword::Union => {
-                    return Err(
-                        self.unsupported_current("UNION", "UNION is not supported in Phase 31")
-                    );
-                }
                 Keyword::Call => {
+                    if self.next_is(|kind| matches!(kind, TokenKind::LBrace)) {
+                        return Ok(());
+                    }
                     let (feature, message) =
                         if self.next_is(|kind| matches!(kind, TokenKind::LBrace)) {
                             ("subqueries", "subqueries are not supported in Phase 31")
@@ -1555,9 +2125,7 @@ impl<'a> Parser<'a> {
         if self.at_keyword(Keyword::Exists)
             && self.next_is(|kind| matches!(kind, TokenKind::LBrace))
         {
-            return Err(
-                self.unsupported_current("subqueries", "subqueries are not supported in Phase 31")
-            );
+            return Ok(());
         }
         Ok(())
     }
@@ -1654,14 +2222,101 @@ impl<'a> Parser<'a> {
             || (self.at_keyword(Keyword::Optional) && self.next_keyword_is(Keyword::Match))
     }
 
+    fn at_regular_match_clause_start(&self) -> bool {
+        self.at_match_clause_start() && !self.at_shortest_path_match_clause_start()
+    }
+
+    fn at_call_subquery_start(&self) -> bool {
+        self.at_keyword(Keyword::Call) && self.next_is(|kind| matches!(kind, TokenKind::LBrace))
+    }
+
+    fn at_shortest_path_match_clause_start(&self) -> bool {
+        let mut index = self.pos;
+        if self.token_word_eq(index, "optional") {
+            index += 1;
+        }
+        if !self.token_word_eq(index, "match") {
+            return false;
+        }
+        index += 1;
+
+        if self
+            .tokens
+            .get(index)
+            .is_some_and(|token| matches!(token.kind, TokenKind::Ident(_)))
+            && self
+                .tokens
+                .get(index + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Equals))
+        {
+            return self
+                .tokens
+                .get(index + 2)
+                .and_then(|token| match &token.kind {
+                    TokenKind::Ident(name) => Some(name.as_str()),
+                    _ => None,
+                })
+                .is_some_and(is_shortest_path_function);
+        }
+
+        self.tokens
+            .get(index)
+            .and_then(|token| match &token.kind {
+                TokenKind::Ident(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .is_some_and(is_shortest_path_function)
+    }
+
     fn at_mutation_clause_start(&self) -> bool {
         match self.current().kind {
             TokenKind::Keyword(Keyword::Create) => !self.create_clause_is_schema_ddl(),
+            TokenKind::Keyword(Keyword::Merge) => true,
             TokenKind::Keyword(
                 Keyword::Set | Keyword::Remove | Keyword::Delete | Keyword::Detach,
             ) => true,
             _ => false,
         }
+    }
+
+    fn at_mutation_read_prefix_start(&self) -> bool {
+        self.at_match_clause_start()
+            || self.at_call_subquery_start()
+            || self.at_keyword(Keyword::With)
+    }
+
+    fn at_read_after_write_clause_start(&self) -> bool {
+        self.at_match_clause_start()
+            || self.at_call_subquery_start()
+            || self.at_keyword(Keyword::With)
+            || self.at_keyword(Keyword::Union)
+    }
+
+    fn has_top_level_mutation_before_return(&self) -> bool {
+        let mut depth = 0usize;
+        for token in self.tokens.iter().skip(self.pos) {
+            match &token.kind {
+                TokenKind::Eof | TokenKind::Semicolon => return false,
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
+                    depth = depth.saturating_add(1);
+                }
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    depth = depth.saturating_sub(1);
+                }
+                TokenKind::Keyword(keyword) if depth == 0 => match keyword {
+                    Keyword::Return => return false,
+                    Keyword::Create
+                    | Keyword::Merge
+                    | Keyword::Set
+                    | Keyword::Remove
+                    | Keyword::Delete
+                    | Keyword::Detach => return true,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        false
     }
 
     fn next_keyword_is(&self, keyword: Keyword) -> bool {
@@ -1805,6 +2460,103 @@ fn remove_item_span(item: &RemoveItem) -> &SourceSpan {
     }
 }
 
+fn gql_pipeline_clause_span(clause: &GqlPipelineClause) -> SourceSpan {
+    match clause {
+        GqlPipelineClause::Match(clauses) => clauses
+            .first()
+            .map(|clause| clause.span.clone())
+            .unwrap_or_else(|| SourceSpan::new(0, 0, 1, 1)),
+        GqlPipelineClause::ShortestPath(shortest) => shortest.span.clone(),
+        GqlPipelineClause::Call(call) => call.span.clone(),
+        GqlPipelineClause::Projection(projection) => projection.span.clone(),
+    }
+}
+
+fn legacy_match_only_read_prefix(clauses: &[GqlPipelineClause]) -> Option<Vec<MatchClause>> {
+    let mut matches = Vec::new();
+    for clause in clauses {
+        match clause {
+            GqlPipelineClause::Match(clauses) => matches.extend(clauses.iter().cloned()),
+            GqlPipelineClause::ShortestPath(_)
+            | GqlPipelineClause::Call(_)
+            | GqlPipelineClause::Projection(_) => return None,
+        }
+    }
+    Some(matches)
+}
+
+fn validate_shortest_path_pattern(
+    parser: &Parser<'_>,
+    pattern: &Pattern,
+) -> Result<(), EngineError> {
+    if let Some(path_variable) = pattern.path_variable.as_ref() {
+        return Err(EngineError::GqlUnsupported {
+            feature: "shortest-path syntax".to_string(),
+            message:
+                "shortest-path MATCH uses the alias before '='; nested path aliases are not supported"
+                    .to_string(),
+            span: path_variable.span.clone(),
+        });
+    }
+    if pattern.chains.len() != 1 {
+        return Err(EngineError::GqlUnsupported {
+            feature: "shortest-path syntax".to_string(),
+            message: "shortest-path MATCH supports exactly one relationship pattern".to_string(),
+            span: pattern.span.clone(),
+        });
+    }
+    let relationship = &pattern.chains[0].relationship;
+    if let Some(variable) = relationship.variable.as_ref() {
+        return Err(EngineError::GqlUnsupported {
+            feature: "shortest-path relationship alias".to_string(),
+            message: "relationship aliases are not supported inside shortest-path MATCH"
+                .to_string(),
+            span: variable.span.clone(),
+        });
+    }
+    if relationship.properties.is_some() {
+        return Err(EngineError::GqlUnsupported {
+            feature: "weighted GQL shortest path syntax".to_string(),
+            message:
+                "relationship properties and weighted shortest-path syntax are not supported in GQL"
+                    .to_string(),
+            span: relationship.span.clone(),
+        });
+    }
+    let Some(quantifier) = relationship.quantifier.as_ref() else {
+        return Err(EngineError::GqlParse {
+            message: "shortest-path relationship patterns require '*min..max' hop bounds"
+                .to_string(),
+            span: relationship.span.clone(),
+        });
+    };
+    let quantifier_source = parser.source_for_span(&quantifier.span);
+    if !quantifier_source.contains("..")
+        || quantifier_source
+            .strip_prefix('*')
+            .is_some_and(|rest| rest.starts_with(".."))
+    {
+        return Err(EngineError::GqlParse {
+            message: "shortest-path relationship patterns require both min and max hop bounds"
+                .to_string(),
+            span: quantifier.span.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn projection_body_end(body: &ReturnBody) -> &SourceSpan {
+    match body {
+        ReturnBody::All(span) => span,
+        ReturnBody::AllAndItems { items, .. } | ReturnBody::Items(items) => {
+            &items
+                .last()
+                .expect("projection items must be non-empty")
+                .span
+        }
+    }
+}
+
 fn span_at_offset(query: &str, offset: usize, length: usize) -> SourceSpan {
     let mut line = 1u32;
     let mut column = 1u32;
@@ -1837,6 +2589,18 @@ fn is_aggregation_function(lower: &str) -> bool {
     )
 }
 
+fn aggregate_function_from_name(lower: &str) -> Option<AggregateFunction> {
+    Some(match lower {
+        "count" => AggregateFunction::Count,
+        "sum" => AggregateFunction::Sum,
+        "avg" => AggregateFunction::Avg,
+        "min" => AggregateFunction::Min,
+        "max" => AggregateFunction::Max,
+        "collect" => AggregateFunction::Collect,
+        _ => return None,
+    })
+}
+
 fn is_supported_function(lower: &str) -> bool {
     matches!(
         lower,
@@ -1849,6 +2613,21 @@ fn is_supported_function(lower: &str) -> bool {
             | "relationships"
             | "node_ids"
             | "edge_ids"
+            | "coalesce"
+            | "to_string"
+            | "to_integer"
+            | "to_float"
+            | "abs"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "lower"
+            | "upper"
+            | "trim"
+            | "substring"
+            | "size"
+            | "head"
+            | "last"
     )
 }
 
@@ -2018,6 +2797,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_supported_shortest_path_clauses() {
+        let one = parse_ok("MATCH p = shortestPath((a)-[:TYPE*1..5]->(b)) RETURN p");
+        assert!(matches!(
+            &one.pipeline.clauses[0],
+            GqlPipelineClause::ShortestPath(GqlShortestPathClause {
+                mode: GqlShortestPathMode::One,
+                output_path_alias,
+                ..
+            }) if output_path_alias.name == "p"
+        ));
+
+        let all = parse_ok("MATCH p = allShortestPaths((a)-[:TYPE*1..5]-(b)) RETURN p");
+        assert!(matches!(
+            &all.pipeline.clauses[0],
+            GqlPipelineClause::ShortestPath(GqlShortestPathClause {
+                mode: GqlShortestPathMode::All,
+                pattern,
+                ..
+            }) if pattern.chains[0].relationship.direction == RelationshipDirection::Undirected
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_shortest_path_clause_shapes() {
+        let missing_alias = parse_err("MATCH shortestPath((a)-[:TYPE*1..5]->(b)) RETURN *");
+        assert!(matches!(missing_alias, EngineError::GqlParse { .. }));
+
+        let exact_bound = parse_err("MATCH p = shortestPath((a)-[:TYPE*1]->(b)) RETURN p");
+        assert!(matches!(exact_bound, EngineError::GqlParse { .. }));
+
+        let missing_min = parse_err("MATCH p = shortestPath((a)-[:TYPE*..5]->(b)) RETURN p");
+        assert!(matches!(missing_min, EngineError::GqlParse { .. }));
+
+        let weighted = parse_err("MATCH p = shortestPath((a)-[:TYPE*1..5 {w: 1}]->(b)) RETURN p");
+        assert!(matches!(
+            weighted,
+            EngineError::GqlUnsupported { feature, .. } if feature == "weighted GQL shortest path syntax"
+        ));
+    }
+
+    #[test]
     fn parses_property_maps_in_node_and_relationship_patterns() {
         let query = parse_ok(
             r#"MATCH (a:User {id: $id})-[r:BOUGHT {sku: "sku-1", qty: 2}]->(b:Item) RETURN r"#,
@@ -2080,6 +2900,83 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_arithmetic_precedence_and_unary_minus() {
+        let query = parse_ok("MATCH (n) RETURN 1 + 2 * 3, (1 + 2) * 3, -n.age, -(1 + 2)");
+        let ReturnBody::Items(items) = &query.return_clause.body else {
+            panic!("expected return items");
+        };
+        assert!(matches!(
+            items[0].expr.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+        let ExprKind::Binary {
+            op: BinaryOp::Add,
+            right,
+            ..
+        } = &items[0].expr.kind
+        else {
+            panic!("expected addition");
+        };
+        assert!(matches!(
+            right.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
+        assert!(matches!(
+            items[1].expr.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
+        assert!(matches!(
+            items[2].expr.kind,
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                ..
+            }
+        ));
+        assert!(matches!(
+            items[3].expr.kind,
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_string_predicates_case_and_scalar_functions() {
+        let query = parse_ok(
+            "MATCH (n) WHERE lower(n.name) STARTS WITH 'a' AND n.name ENDS WITH 'z' AND n.name CONTAINS 'd' RETURN CASE WHEN n.age > 1 THEN upper(n.name) ELSE trim(' x ') END AS generic, CASE n.status WHEN 'a' THEN to_string(1) END AS simple, substring(n.name, 1, 2) AS sub",
+        );
+        let where_expr = query.match_clauses[0].where_clause.as_ref().unwrap();
+        assert!(format!("{:?}", where_expr.kind).contains("StartsWith"));
+        assert!(format!("{:?}", where_expr.kind).contains("EndsWith"));
+        assert!(format!("{:?}", where_expr.kind).contains("Contains"));
+        let ReturnBody::Items(items) = &query.return_clause.body else {
+            panic!("expected return items");
+        };
+        assert!(matches!(
+            items[0].expr.kind,
+            ExprKind::Case { operand: None, .. }
+        ));
+        assert!(matches!(
+            items[1].expr.kind,
+            ExprKind::Case {
+                operand: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(items[2].expr.kind, ExprKind::FunctionCall { .. }));
     }
 
     #[test]
@@ -2146,6 +3043,218 @@ mod tests {
             offset.limit.as_ref().unwrap().kind,
             ExprKind::Literal(Literal::Int(20))
         ));
+    }
+
+    #[test]
+    fn parses_with_pipeline_projection_stages() {
+        let query = parse_ok("MATCH (n) WITH n RETURN n");
+        assert_eq!(query.pipeline.clauses.len(), 3);
+        assert!(matches!(
+            query.pipeline.clauses[0],
+            GqlPipelineClause::Match(_)
+        ));
+        let GqlPipelineClause::Projection(with) = &query.pipeline.clauses[1] else {
+            panic!("expected WITH projection");
+        };
+        assert_eq!(with.kind, GqlProjectionKind::With);
+        assert!(!with.distinct);
+        assert_eq!(with.span.offset, "MATCH (n) ".len());
+        let ReturnBody::Items(items) = &with.body else {
+            panic!("expected WITH item body");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].expr.kind, ExprKind::Variable(ref name) if name == "n"));
+        let GqlPipelineClause::Projection(ret) = &query.pipeline.clauses[2] else {
+            panic!("expected RETURN projection");
+        };
+        assert_eq!(ret.kind, GqlProjectionKind::Return);
+    }
+
+    #[test]
+    fn parses_repeated_with_star_and_distinct() {
+        let repeated = parse_ok("MATCH (n) WITH n WITH n AS x RETURN x");
+        assert_eq!(
+            repeated
+                .pipeline
+                .clauses
+                .iter()
+                .filter(|clause| matches!(
+                    clause,
+                    GqlPipelineClause::Projection(GqlProjectionClause {
+                        kind: GqlProjectionKind::With,
+                        ..
+                    })
+                ))
+                .count(),
+            2
+        );
+
+        let star = parse_ok("MATCH (n) WITH * RETURN n");
+        let GqlPipelineClause::Projection(with_star) = &star.pipeline.clauses[1] else {
+            panic!("expected WITH projection");
+        };
+        assert!(matches!(with_star.body, ReturnBody::All(_)));
+
+        let distinct_star = parse_ok("MATCH (n) WITH DISTINCT * RETURN n");
+        let GqlPipelineClause::Projection(with_distinct_star) = &distinct_star.pipeline.clauses[1]
+        else {
+            panic!("expected WITH projection");
+        };
+        assert!(with_distinct_star.distinct);
+        assert!(matches!(with_distinct_star.body, ReturnBody::All(_)));
+
+        let mixed_star = parse_ok("MATCH (n) WITH *, n.name AS name RETURN name");
+        let GqlPipelineClause::Projection(with_mixed_star) = &mixed_star.pipeline.clauses[1] else {
+            panic!("expected WITH projection");
+        };
+        assert!(matches!(
+            with_mixed_star.body,
+            ReturnBody::AllAndItems { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_return_mixed_star_projections_for_reads_and_mutations() {
+        for source in [
+            "MATCH (n) RETURN *, n",
+            "CREATE (n:Person {key: 'n'}) RETURN *, n",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlUnsupported { feature, span, .. } => {
+                    assert_eq!(feature, "RETURN * with additional projection items");
+                    assert!(span.length > 0, "source: {source}");
+                }
+                err => panic!("expected mixed-star unsupported error for {source}, got {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_with_where_and_string_predicates() {
+        let source = "MATCH (n) WITH n.name AS name WHERE name STARTS WITH 'a' AND name ENDS WITH 'z' RETURN name";
+        let query = parse_ok(source);
+        let GqlPipelineClause::Projection(with) = &query.pipeline.clauses[1] else {
+            panic!("expected WITH projection");
+        };
+        let where_clause = with.where_clause.as_ref().expect("WITH WHERE");
+        assert!(format!("{:?}", where_clause.kind).contains("StartsWith"));
+        assert!(format!("{:?}", where_clause.kind).contains("EndsWith"));
+        assert_eq!(
+            where_clause.span.offset,
+            source.find("name STARTS").unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_with_projection_local_row_ops() {
+        let source = "MATCH (n) WITH n ORDER BY n.name SKIP 1 LIMIT 2 WHERE n.active RETURN n";
+        let query = parse_ok(source);
+        let GqlPipelineClause::Projection(with) = &query.pipeline.clauses[1] else {
+            panic!("expected WITH projection");
+        };
+        assert_eq!(with.order_by.len(), 1);
+        assert!(with.where_clause.is_some());
+        assert!(matches!(
+            with.skip.as_ref().unwrap().kind,
+            ExprKind::Literal(Literal::Int(1))
+        ));
+        assert!(matches!(
+            with.limit.as_ref().unwrap().kind,
+            ExprKind::Literal(Literal::Int(2))
+        ));
+        assert_eq!(with.order_by[0].span.offset, source.find("n.name").unwrap());
+        assert_eq!(
+            with.skip.as_ref().unwrap().span.offset,
+            source.find("1").unwrap()
+        );
+        assert_eq!(
+            with.limit.as_ref().unwrap().span.offset,
+            source.find("2").unwrap()
+        );
+        assert_eq!(
+            with.where_clause.as_ref().unwrap().span.offset,
+            source.find("n.active").unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_with_where_before_projection_local_row_ops() {
+        let err = parse_statement_err("MATCH (n) WITH n WHERE n.active ORDER BY n.name RETURN n");
+        assert!(matches!(err, EngineError::GqlParse { .. }));
+    }
+
+    #[test]
+    fn parses_later_match_and_optional_match_after_with() {
+        let query = parse_ok("MATCH (n) WITH n MATCH (n)-[:R]->(m) RETURN m");
+        assert_eq!(query.pipeline.clauses.len(), 4);
+        let GqlPipelineClause::Match(later_match) = &query.pipeline.clauses[2] else {
+            panic!("expected later MATCH");
+        };
+        assert!(!later_match[0].optional);
+        assert_eq!(
+            later_match[0].patterns[0]
+                .start
+                .variable
+                .as_ref()
+                .unwrap()
+                .name,
+            "n"
+        );
+
+        let optional = parse_ok("MATCH (n) WITH n OPTIONAL MATCH (n)-[:R]->(m) RETURN m");
+        let GqlPipelineClause::Match(later_optional) = &optional.pipeline.clauses[2] else {
+            panic!("expected later OPTIONAL MATCH");
+        };
+        assert!(later_optional[0].optional);
+    }
+
+    #[test]
+    fn parses_return_distinct_projection_shape() {
+        let query = parse_ok("MATCH (n) RETURN DISTINCT n");
+        assert!(query.return_clause.distinct);
+        let GqlPipelineClause::Projection(ret) = query.pipeline.clauses.last().unwrap() else {
+            panic!("expected RETURN projection");
+        };
+        assert!(ret.distinct);
+    }
+
+    #[test]
+    fn parses_union_and_union_all_branches() {
+        let distinct = parse_ok("MATCH (n) RETURN n AS x UNION MATCH (m) RETURN m AS x");
+        assert_eq!(distinct.pipeline.union_branches.len(), 1);
+        assert_eq!(
+            distinct.pipeline.union_branches[0].modifier,
+            GqlUnionModifier::Distinct
+        );
+        assert_eq!(distinct.pipeline.union_branches[0].clauses.len(), 2);
+
+        let all = parse_ok(
+            "MATCH (n) WITH n RETURN n.name AS name UNION ALL MATCH (m) RETURN m.name AS name",
+        );
+        assert_eq!(all.pipeline.union_branches.len(), 1);
+        assert_eq!(
+            all.pipeline.union_branches[0].modifier,
+            GqlUnionModifier::All
+        );
+        assert!(matches!(
+            all.pipeline.union_branches[0].clauses[0],
+            GqlPipelineClause::Match(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_union_branch_without_terminal_return() {
+        let err = parse_err("MATCH (n) RETURN n UNION MATCH (m) WITH m");
+        match err {
+            EngineError::GqlParse { message, span } => {
+                assert!(message.contains("expected RETURN"), "{message}");
+                assert_eq!(
+                    span.offset,
+                    "MATCH (n) RETURN n UNION MATCH (m) WITH m".len()
+                );
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2338,12 +3447,8 @@ mod tests {
                 "graph catalog/session selection syntax",
             ),
             ("MATCH (n)-[*]->(m) RETURN n", "unbounded VLP"),
-            ("MATCH (n) RETURN count(n)", "aggregation"),
-            ("MATCH (n) RETURN DISTINCT n", "DISTINCT"),
-            ("MATCH (n) WITH n RETURN n", "WITH"),
-            ("MATCH (n) RETURN n UNION MATCH (m) RETURN m", "UNION"),
+            ("MATCH (n) RETURN stdev(n)", "aggregation"),
             ("CALL db.labels()", "CALL"),
-            ("CALL { MATCH (n) RETURN n } RETURN n", "subqueries"),
             ("MATCH (n:$(label)) RETURN n", "dynamic labels"),
             (
                 "MATCH (n)-[r:$(rel_label)]->(m) RETURN r",
@@ -2362,14 +3467,6 @@ mod tests {
                 "variable-length relationship syntax",
             ),
             ("MATCH (n)--(m){1,3} RETURN n", "Graph Pattern v2"),
-            (
-                "MATCH shortestPath((a)--(b)) RETURN *",
-                "shortest-path syntax",
-            ),
-            (
-                "MATCH p = shortestPath((a)--(b)) RETURN p",
-                "shortest-path syntax",
-            ),
             ("MATCH SHORTEST (a)--(b) RETURN *", "shortest-path syntax"),
             (
                 "MATCH ANY SHORTEST (a)--(b) RETURN *",
@@ -2505,6 +3602,71 @@ mod tests {
     }
 
     #[test]
+    fn parses_aggregate_calls_in_projection_and_order_expressions() {
+        let query = parse_ok(
+            "MATCH (n) RETURN count(*) + 1 AS total, collect(DISTINCT n.kind) AS kinds ORDER BY count(*) DESC",
+        );
+        let ReturnBody::Items(items) = &query.return_clause.body else {
+            panic!("expected return items");
+        };
+        let ExprKind::Binary { left, .. } = &items[0].expr.kind else {
+            panic!("expected scalar expression containing aggregate");
+        };
+        assert!(matches!(
+            &left.kind,
+            ExprKind::AggregateCall {
+                function: AggregateFunction::Count,
+                distinct: false,
+                arg: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &items[1].expr.kind,
+            ExprKind::AggregateCall {
+                function: AggregateFunction::Collect,
+                distinct: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &query.order_by[0].expr.kind,
+            ExprKind::AggregateCall {
+                function: AggregateFunction::Count,
+                arg: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_count_star_and_rejects_invalid_aggregate_star_forms() {
+        let query = parse_ok("MATCH (n) RETURN count(*)");
+        let ReturnBody::Items(items) = &query.return_clause.body else {
+            panic!("expected return items");
+        };
+        assert!(matches!(
+            &items[0].expr.kind,
+            ExprKind::AggregateCall {
+                function: AggregateFunction::Count,
+                arg: None,
+                ..
+            }
+        ));
+
+        for source in [
+            "MATCH (n) RETURN count(DISTINCT *)",
+            "MATCH (n) RETURN sum(*)",
+            "MATCH (n) RETURN collect()",
+        ] {
+            assert!(
+                matches!(parse_err(source), EngineError::GqlParse { .. }),
+                "expected parse error for {source}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_statement_classifies_reads_as_query() {
         let statement = parse_statement_ok("MATCH (n:Person) RETURN n ORDER BY n.name LIMIT 10");
         assert_eq!(statement.kind, GqlStatementKind::Query);
@@ -2517,9 +3679,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_statement_accepts_read_only_exists_and_call_subqueries() {
+        let exists = parse_statement_ok(
+            "MATCH (n) WHERE EXISTS { MATCH (n)-[:KNOWS]->(m) RETURN m } RETURN n",
+        );
+        let GqlStatementBody::Query(query) = exists.body else {
+            panic!("expected query statement");
+        };
+        let GqlPipelineClause::Match(match_groups) = &query.pipeline.clauses[0] else {
+            panic!("expected leading MATCH");
+        };
+        assert!(matches!(
+            match_groups[0].where_clause.as_ref().map(|expr| &expr.kind),
+            Some(ExprKind::ExistsSubquery(_))
+        ));
+
+        let call = parse_statement_ok("CALL { MATCH (n) RETURN n } RETURN n");
+        let GqlStatementBody::Query(query) = call.body else {
+            panic!("expected query statement");
+        };
+        assert!(matches!(
+            query.pipeline.clauses.first(),
+            Some(GqlPipelineClause::Call(_))
+        ));
+    }
+
+    #[test]
     fn parse_statement_accepts_basic_mutation_skeletons() {
         let cases = [
             "CREATE (n:Person {key: $key}) RETURN n",
+            "MERGE (n:Person {key: $key}) RETURN n",
+            "MATCH (a:Person) MATCH (b:Person) MERGE (a)-[r:KNOWS]->(b) RETURN r",
             "MATCH (n:Person) SET n.name = $name RETURN n",
             "MATCH (n:Person) SET n += $map RETURN n",
             "MATCH (n:Person) REMOVE n.name RETURN n",
@@ -2542,6 +3732,29 @@ mod tests {
                 "expected mutation clauses for {source}"
             );
         }
+    }
+
+    #[test]
+    fn parse_statement_parses_merge_actions() {
+        let statement = parse_statement_ok(
+            "MERGE (n:Person {key: $key}) ON CREATE SET n.created = true ON MATCH SET n.seen = $seen RETURN n",
+        );
+        let GqlStatementBody::Mutation(mutation) = statement.body else {
+            panic!("expected mutation statement");
+        };
+        let [MutationClause::Merge(merge)] = mutation.mutation_clauses.as_slice() else {
+            panic!("expected one MERGE clause");
+        };
+        assert_eq!(merge.pattern.start.variable.as_ref().unwrap().name, "n");
+        assert_eq!(merge.pattern.start.labels[0].name, "Person");
+        assert_eq!(
+            merge.pattern.start.properties.as_ref().unwrap().entries[0]
+                .key
+                .name,
+            "key"
+        );
+        assert_eq!(merge.on_create.as_ref().unwrap().items.len(), 1);
+        assert_eq!(merge.on_match.as_ref().unwrap().items.len(), 1);
     }
 
     #[test]
@@ -2581,7 +3794,7 @@ mod tests {
     fn parse_statement_rejects_read_after_write_matching() {
         match parse_statement_err("MATCH (n) CREATE (m:Person {key: 'm'}) MATCH (m) RETURN m") {
             EngineError::GqlUnsupported { feature, span, .. } => {
-                assert_eq!(feature, "read-after-write matching");
+                assert_eq!(feature, "read-after-write clauses");
                 assert!(span.length > 0);
             }
             err => panic!("expected read-after-write unsupported error, got {err:?}"),
@@ -2616,8 +3829,6 @@ mod tests {
     #[test]
     fn parse_statement_rejects_unsupported_mutation_clauses() {
         for (source, expected_feature) in [
-            ("WITH 1 AS n CREATE (m:Person {key: 'm'})", "WITH"),
-            ("MATCH (n) MERGE (m:Person {key: 'm'})", "write clauses"),
             ("UNWIND [1] AS n CREATE (m:Person {key: 'm'})", "UNWIND"),
             ("CALL db.labels()", "CALL"),
             (
@@ -2636,25 +3847,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_statement_preserves_read_arithmetic_rejection() {
+    fn parse_statement_accepts_read_arithmetic() {
         let source = "MATCH (n) RETURN 1 + 2";
-        let read_err = parse_err(source);
-        let statement_err = parse_statement_err(source);
-        match (read_err, statement_err) {
-            (
-                EngineError::GqlParse {
-                    message: read_message,
-                    span: read_span,
-                },
-                EngineError::GqlParse {
-                    message: statement_message,
-                    span: statement_span,
-                },
-            ) => {
-                assert_eq!(read_message, statement_message);
-                assert_eq!(read_span, statement_span);
-            }
-            other => panic!("expected matching parse errors, got {other:?}"),
-        }
+        let read = parse_ok(source);
+        let statement = parse_statement_ok(source);
+        let GqlStatementBody::Query(statement_query) = statement.body else {
+            panic!("expected query statement");
+        };
+        assert_eq!(read, statement_query);
     }
 }

@@ -55,6 +55,58 @@ async def seed_async(db):
     return {"ada": ada, "ben": ben, "cy": cy, "acme": acme, "works_at": works_at}
 
 
+def seed_phase34(db, person_label="PyPhase34Person"):
+    ada = db.upsert_node(
+        person_label,
+        "ada",
+        props={
+            "name": "Ada",
+            "status": "active",
+            "rank": 2,
+            "group": "core",
+            "age": 37,
+            "target": "acct-a",
+        },
+    )
+    ben = db.upsert_node(
+        person_label,
+        "ben",
+        props={
+            "name": "Ben",
+            "status": "active",
+            "rank": 1,
+            "group": "core",
+            "age": 29,
+            "target": "acct-a",
+        },
+    )
+    cy = db.upsert_node(
+        person_label,
+        "cy",
+        props={
+            "name": "Cy",
+            "status": "inactive",
+            "rank": 3,
+            "group": "ops",
+            "age": 41,
+            "target": "acct-c",
+        },
+    )
+    acme = db.upsert_node("PyPhase34Company", "acme", props={"name": "Acme"})
+    knows_ab = db.upsert_edge(ada, ben, "PY34_KNOWS", props={"weight": 1})
+    knows_bc = db.upsert_edge(ben, cy, "PY34_KNOWS", props={"weight": 1})
+    works_at = db.upsert_edge(ada, acme, "PY34_WORKS_AT", props={"role": "engineer"})
+    return {
+        "ada": ada,
+        "ben": ben,
+        "cy": cy,
+        "acme": acme,
+        "knows_ab": knows_ab,
+        "knows_bc": knows_bc,
+        "works_at": works_at,
+    }
+
+
 def open_vector_db(tmp_dir):
     return OverGraph.open(os.path.join(tmp_dir, "gql_vector_db"), dense_vector_dimension=3)
 
@@ -179,11 +231,25 @@ def test_gql_caps_full_scan_row_ops_and_profile(db):
         max_param_bytes=9,
         max_ast_depth=4,
         max_literal_items=3,
+        max_pipeline_rows=11,
+        max_groups=12,
+        max_collect_items=13,
+        max_union_branches=2,
+        max_subquery_invocations=14,
+        max_subquery_depth=1,
+        max_shortest_path_pairs=15,
     )
     assert capped_explain["caps"]["max_query_bytes"] == 128
     assert capped_explain["caps"]["max_param_bytes"] == 9
     assert capped_explain["caps"]["max_ast_depth"] == 4
     assert capped_explain["caps"]["max_literal_items"] == 3
+    assert capped_explain["caps"]["max_pipeline_rows"] == 11
+    assert capped_explain["caps"]["max_groups"] == 12
+    assert capped_explain["caps"]["max_collect_items"] == 13
+    assert capped_explain["caps"]["max_union_branches"] == 2
+    assert capped_explain["caps"]["max_subquery_invocations"] == 14
+    assert capped_explain["caps"]["max_subquery_depth"] == 1
+    assert capped_explain["caps"]["max_shortest_path_pairs"] == 15
 
     unused_oversized = db.execute_gql(
         "MATCH (n:Person) RETURN id(n) LIMIT 1",
@@ -258,6 +324,298 @@ async def test_gql_explain_async(async_db):
     assert explain["read"]["target"] == "graph_row_query"
     assert explain["mutation"] is None
     assert explain["columns"] == ["n.name"]
+
+
+def test_gql_phase34_with_distinct_aggregation_and_compact_rows(db):
+    seed_phase34(db)
+
+    rich = db.execute_gql(
+        """
+        MATCH (n:PyPhase34Person)
+        WITH n.name AS name,
+             lower(n.name) AS slug,
+             n.rank + 10 AS adjusted,
+             CASE WHEN n.age > 35 THEN upper(n.name) ELSE 'young' END AS bucket
+        WHERE slug STARTS WITH 'a'
+        RETURN name, slug, adjusted, bucket
+        """,
+        include_plan=True,
+    )
+    assert rich["rows"] == [
+        {"name": "Ada", "slug": "ada", "adjusted": 12, "bucket": "ADA"}
+    ]
+    assert rich["plan"]["read"]["target"] == "graph_pipeline_query"
+    assert any("Project(With)" in item for item in rich["plan"]["read"]["projection"])
+
+    distinct = db.execute_gql(
+        """
+        MATCH (n:PyPhase34Person)
+        WITH DISTINCT n.group AS grp
+        RETURN grp
+        ORDER BY grp
+        """
+    )
+    assert distinct["rows"] == [{"grp": "core"}, {"grp": "ops"}]
+
+    aggregate = db.execute_gql(
+        """
+        MATCH (n:PyPhase34Person)
+        RETURN n.group AS grp,
+               count(*) AS count,
+               sum(n.rank) AS total,
+               avg(n.rank) AS avg,
+               collect(n.name) AS names
+        ORDER BY grp
+        """,
+        include_plan=True,
+    )
+    assert aggregate["columns"] == ["grp", "count", "total", "avg", "names"]
+    assert aggregate["rows"][0]["grp"] == "core"
+    assert aggregate["rows"][0]["count"] == 2
+    assert aggregate["rows"][0]["total"] == 3
+    assert aggregate["rows"][0]["avg"] == 1.5
+    assert sorted(aggregate["rows"][0]["names"]) == ["Ada", "Ben"]
+    assert aggregate["rows"][1] == {
+        "grp": "ops",
+        "count": 1,
+        "total": 3,
+        "avg": 3.0,
+        "names": ["Cy"],
+    }
+    assert any("Aggregate" in item for item in aggregate["plan"]["read"]["projection"])
+
+    nulls = db.execute_gql(
+        """
+        MATCH (n:PyPhase34Person)
+        WHERE n.missing IS NULL
+        RETURN count(n.missing) AS count,
+               sum(n.missing) AS total,
+               avg(n.missing) AS avg,
+               collect(n.missing) AS values
+        """
+    )
+    assert nulls["rows"] == [{"count": 0, "total": None, "avg": None, "values": []}]
+
+    compact = db.execute_gql(
+        """
+        MATCH (n:PyPhase34Person)
+        WITH n.group AS grp, count(*) AS count
+        WHERE count > 1
+        RETURN grp, count
+        """,
+        compact_rows=True,
+    )
+    assert compact["columns"] == ["grp", "count"]
+    assert compact["rows"] == [["core", 2]]
+
+
+def test_gql_phase34_union_and_read_only_subqueries(db):
+    seed_phase34(db)
+
+    union_all = db.execute_gql(
+        """
+        MATCH (n:PyPhase34Person)
+        WHERE n.group = 'core'
+        RETURN n.name AS name
+        ORDER BY name
+        UNION ALL
+        MATCH (n:PyPhase34Person)
+        WHERE n.group = 'ops'
+        RETURN n.name AS name
+        """
+    )
+    assert union_all["rows"] == [{"name": "Ada"}, {"name": "Ben"}, {"name": "Cy"}]
+
+    union = db.execute_gql(
+        """
+        MATCH (n:PyPhase34Person)
+        WHERE n.group = 'core'
+        RETURN n.group AS grp
+        UNION
+        MATCH (n:PyPhase34Person)
+        RETURN n.group AS grp
+        ORDER BY grp
+        """,
+        include_plan=True,
+    )
+    assert union["rows"] == [{"grp": "core"}, {"grp": "ops"}]
+    assert any("Union" in item for item in union["plan"]["read"]["projection"])
+
+    subquery = db.execute_gql(
+        """
+        MATCH (n:PyPhase34Person)
+        WHERE EXISTS {
+          MATCH (n)-[:PY34_WORKS_AT]->(c:PyPhase34Company)
+          RETURN c
+        }
+        WITH n
+        CALL {
+          MATCH (n)-[:PY34_WORKS_AT]->(c:PyPhase34Company)
+          RETURN c.name AS company
+        }
+        RETURN n.name AS name, company
+        """,
+        include_plan=True,
+    )
+    assert subquery["rows"] == [{"name": "Ada", "company": "Acme"}]
+    assert any("EXISTS subquery" in note for note in subquery["plan"]["notes"])
+    assert any("CallSubquery" in item for item in subquery["plan"]["read"]["projection"])
+
+
+def test_gql_phase34_shortest_path_and_nested_value_conversion(db):
+    ids = seed_phase34(db)
+
+    path_result = db.execute_gql(
+        f"""
+        MATCH (a:PyPhase34Person)
+        WHERE id(a) = {ids["ada"]}
+        WITH a
+        MATCH (b:PyPhase34Person)
+        WHERE id(b) = {ids["cy"]}
+        WITH a, b
+        MATCH p = shortestPath((a)-[:PY34_KNOWS*1..3]->(b))
+        RETURN p,
+               node_ids(p) AS node_ids,
+               edge_ids(p) AS edge_ids,
+               length(p) AS length,
+               nodes(p) AS nodes,
+               relationships(p) AS relationships,
+               [p] AS path_list,
+               {{path: p, nested: [node_ids(p), {{edges: edge_ids(p)}}]}} AS wrapped
+        """,
+        include_plan=True,
+    )
+    row = path_result["rows"][0]
+    assert row["p"]["node_ids"] == [ids["ada"], ids["ben"], ids["cy"]]
+    assert row["p"]["edge_ids"] == [ids["knows_ab"], ids["knows_bc"]]
+    assert row["p"]["nodes"][0]["props"]["name"] == "Ada"
+    assert row["p"]["edges"][0]["label"] == "PY34_KNOWS"
+    assert row["node_ids"] == [ids["ada"], ids["ben"], ids["cy"]]
+    assert row["edge_ids"] == [ids["knows_ab"], ids["knows_bc"]]
+    assert row["length"] == 2
+    assert row["nodes"] == [ids["ada"], ids["ben"], ids["cy"]]
+    assert row["relationships"] == [ids["knows_ab"], ids["knows_bc"]]
+    assert row["path_list"][0]["node_ids"] == [ids["ada"], ids["ben"], ids["cy"]]
+    assert row["wrapped"]["path"]["edge_ids"] == [ids["knows_ab"], ids["knows_bc"]]
+    assert row["wrapped"]["nested"][1]["edges"] == [ids["knows_ab"], ids["knows_bc"]]
+    assert any("ShortestPath" in item for item in path_result["plan"]["read"]["projection"])
+
+    collected = db.execute_gql("MATCH (n:PyPhase34Person) RETURN collect(n) AS people")
+    assert sorted(collected["rows"][0]["people"]) == sorted([ids["ada"], ids["ben"], ids["cy"]])
+
+
+def test_gql_phase34_keyed_merge_on_create_on_match_stats(db):
+    db.upsert_node("PyPhase34MergeSource", "source", props={"target": "acct-a"})
+
+    query = """
+        MATCH (s:PyPhase34MergeSource)
+        WITH s.target AS target
+        MERGE (a:PyPhase34Account {key: target})
+        ON CREATE SET a.status = 'created', a.count = 1
+        ON MATCH SET a.status = 'matched', a.count = coalesce(a.count, 0) + 1
+        RETURN a.key AS key, a.status AS status, a.count AS count
+        """
+    created = db.execute_gql(query, include_plan=True)
+    assert created["kind"] == "mutation"
+    assert created["rows"] == [{"key": "acct-a", "status": "created", "count": 1}]
+    assert created["mutation_stats"]["nodes_created"] == 1
+    assert created["mutation_stats"]["nodes_updated"] == 0
+    assert created["mutation_stats"]["mutation_rows"] == 1
+    assert created["plan"]["mutation"]["uses_write_txn"] is True
+    assert any(op["op"] == "MERGE NODE" for op in created["plan"]["mutation"]["operations"])
+
+    matched = db.execute_gql(query)
+    assert matched["rows"] == [{"key": "acct-a", "status": "matched", "count": 2}]
+    assert matched["mutation_stats"]["nodes_created"] == 0
+    assert matched["mutation_stats"]["nodes_updated"] == 1
+    assert matched["mutation_stats"]["properties_set"] == 2
+
+
+def test_gql_phase34_cap_forwarding_and_explain_fields(db):
+    seed_phase34(db, person_label="PyPhase34CapPerson")
+    explain = db.explain_gql(
+        """
+        MATCH (n:PyPhase34CapPerson)
+        WITH n.group AS grp, count(*) AS count
+        WHERE count > 1
+        RETURN grp, count
+        """,
+        max_pipeline_rows=7,
+        max_groups=8,
+        max_collect_items=9,
+        max_union_branches=10,
+        max_subquery_invocations=11,
+        max_subquery_depth=1,
+        max_shortest_path_pairs=12,
+    )
+    assert explain["read"]["target"] == "graph_pipeline_query"
+    assert explain["caps"]["max_pipeline_rows"] == 7
+    assert explain["caps"]["max_groups"] == 8
+    assert explain["caps"]["max_collect_items"] == 9
+    assert explain["caps"]["max_union_branches"] == 10
+    assert explain["caps"]["max_subquery_invocations"] == 11
+    assert explain["caps"]["max_subquery_depth"] == 1
+    assert explain["caps"]["max_shortest_path_pairs"] == 12
+    assert any("Aggregate" in item for item in explain["read"]["projection"])
+
+    with pytest.raises(Exception, match="cap 1|max_intermediate_bindings|max_pipeline"):
+        db.execute_gql(
+            "MATCH (n:PyPhase34CapPerson) WITH n RETURN n",
+            max_pipeline_rows=1,
+        )
+    with pytest.raises(Exception, match="max_groups"):
+        db.execute_gql(
+            "MATCH (n:PyPhase34CapPerson) RETURN n.group AS grp, count(*) AS count",
+            max_groups=1,
+        )
+    with pytest.raises(Exception, match="max_collect_items"):
+        db.execute_gql(
+            "MATCH (n:PyPhase34CapPerson) RETURN collect(n.name) AS names",
+            max_collect_items=1,
+        )
+    with pytest.raises(Exception, match="max_union_branches"):
+        db.execute_gql(
+            """
+            MATCH (n:PyPhase34CapPerson) RETURN n.name AS name
+            UNION ALL
+            MATCH (n:PyPhase34CapPerson) RETURN n.name AS name
+            """,
+            max_union_branches=1,
+        )
+    with pytest.raises(Exception, match="max_subquery_invocations"):
+        db.execute_gql(
+            """
+            MATCH (n:PyPhase34CapPerson)
+            WHERE EXISTS {
+              MATCH (m:PyPhase34CapPerson)
+              WHERE m.group = n.group
+              RETURN m
+            }
+            RETURN n.name AS name
+            """,
+            max_subquery_invocations=1,
+        )
+    with pytest.raises(Exception, match="max_subquery_depth"):
+        db.execute_gql(
+            """
+            MATCH (n:PyPhase34CapPerson)
+            WHERE EXISTS { MATCH (m:PyPhase34CapPerson) RETURN m }
+            RETURN n.name AS name
+            """,
+            max_subquery_depth=0,
+        )
+    with pytest.raises(Exception, match="max_shortest_path_pairs"):
+        db.execute_gql(
+            f"""
+            MATCH (a:PyPhase34CapPerson)
+            WITH a
+            MATCH (b:PyPhase34CapPerson)
+            WITH a, b
+            MATCH p = shortestPath((a)-[:PY34_KNOWS*1..3]->(b))
+            RETURN p
+            """,
+            max_shortest_path_pairs=1,
+        )
 
 
 def test_gql_sync_create_return_mutation_stats_bytes_and_plan(db):
@@ -585,10 +943,22 @@ def test_gql_stub_and_signature_smoke():
     assert "cursor: str | None" in text
     assert "max_cursor_bytes: int | None" in text
     assert "max_mutation_rows: int | None" in text
+    assert "max_pipeline_rows: int | None" in text
+    assert "max_groups: int | None" in text
+    assert "max_collect_items: int | None" in text
+    assert "max_union_branches: int | None" in text
+    assert "max_subquery_invocations: int | None" in text
+    assert "max_subquery_depth: int | None" in text
+    assert "max_shortest_path_pairs: int | None" in text
     assert "class GqlExecutionResult" in text
     assert "class GqlExecutionExplain" in text
     assert "class GqlMutationStats" in text
     assert "async def execute_gql" in text
+    assert "def query_graph_pipeline" in text
+    assert "def explain_graph_pipeline" in text
+    assert "async def query_graph_pipeline" in text
+    assert hasattr(OverGraph, "query_graph_pipeline")
+    assert hasattr(OverGraph, "explain_graph_pipeline")
     assert "gql_query" not in text
     assert "explain_gql_query" not in text
     assert "class GqlResult" not in text

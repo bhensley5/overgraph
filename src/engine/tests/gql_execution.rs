@@ -139,6 +139,25 @@ fn gql_string_column(result: &GqlExecutionResult, index: usize) -> Vec<String> {
         .collect()
 }
 
+fn gql_u64_or_i64_values(result: &GqlExecutionResult, index: usize) -> Vec<String> {
+    result
+        .rows
+        .iter()
+        .map(|row| match &row.values[index] {
+            GqlValue::Int(value) => value.to_string(),
+            GqlValue::UInt(value) => value.to_string(),
+            GqlValue::Float(value) => value.to_string(),
+            other => panic!("expected numeric column, got {other:?}"),
+        })
+        .collect()
+}
+
+fn return_star_id_rows(a: u64, b: u64) -> Vec<GqlRow> {
+    vec![GqlRow {
+        values: vec![GqlValue::UInt(a), GqlValue::UInt(b)],
+    }]
+}
+
 fn gql_single_node(value: &GqlValue) -> &GqlNode {
     match value {
         GqlValue::Node(node) => node,
@@ -170,6 +189,13 @@ fn gql_execution_options_default_matches_spec() {
     assert_eq!(options.max_cursor_bytes, 16 * 1024);
     assert_eq!(options.max_mutation_rows, 10_000);
     assert_eq!(options.max_mutation_ops, 50_000);
+    assert_eq!(options.max_pipeline_rows, 65_536);
+    assert_eq!(options.max_groups, 65_536);
+    assert_eq!(options.max_collect_items, 65_536);
+    assert_eq!(options.max_union_branches, 16);
+    assert_eq!(options.max_subquery_invocations, 4_096);
+    assert_eq!(options.max_subquery_depth, 2);
+    assert_eq!(options.max_shortest_path_pairs, 4_096);
     assert_eq!(options.max_query_bytes, 1_048_576);
     assert_eq!(options.max_param_bytes, 1_048_576);
     assert_eq!(options.max_ast_depth, 256);
@@ -379,6 +405,7 @@ fn mutation_errors_surface_before_execution_validation() {
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
+                profile: true,
                 ..gql_opts()
             },
         )
@@ -569,6 +596,611 @@ fn gql_create_node_properties_are_visible_to_gql_indexed_reads() {
         .unwrap();
     assert_eq!(gql_u64_column(&read, 0), vec![created_id]);
     assert_eq!(read.rows[0].values[1], GqlValue::Int(7));
+}
+
+#[test]
+fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
+    let (_dir, engine) = query_test_engine();
+
+    let created = engine
+        .execute_gql(
+            "MERGE (n:GqlMergeNode {key: 'n'}) ON CREATE SET n.status = 'created' ON MATCH SET n.status = 'matched' RETURN id(n), n.status",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                profile: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    let created_id = gql_u64_column(&created, 0)[0];
+    assert_eq!(created.rows[0].values[1], GqlValue::String("created".to_string()));
+    let stats = created.mutation_stats.as_ref().unwrap();
+    assert_eq!(stats.nodes_created, 1);
+    assert_eq!(stats.nodes_updated, 0);
+    assert!(stats.db_hits >= 1);
+
+    let matched = engine
+        .execute_gql(
+            "MERGE (n:GqlMergeNode {key: 'n'}) ON CREATE SET n.status = 'created-again' ON MATCH SET n.status = 'matched' RETURN id(n), n.status",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert_eq!(gql_u64_column(&matched, 0), vec![created_id]);
+    assert_eq!(matched.rows[0].values[1], GqlValue::String("matched".to_string()));
+    let stats = matched.mutation_stats.as_ref().unwrap();
+    assert_eq!(stats.nodes_created, 0);
+    assert_eq!(stats.nodes_updated, 1);
+
+    insert_query_node(
+        &engine,
+        "GqlMergeCounter",
+        "n",
+        &[("count", PropValue::Int(1))],
+        1.0,
+    );
+    let incremented = engine
+        .execute_gql(
+            "MERGE (n:GqlMergeCounter {key: 'n'}) ON MATCH SET n.count = n.count + 1 RETURN n.count",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert_eq!(incremented.rows[0].values[0], GqlValue::Int(2));
+    let stored_counter = engine
+        .get_node_by_key("GqlMergeCounter", "n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_counter.props.get("count"), Some(&PropValue::Int(2)));
+
+    insert_query_node(
+        &engine,
+        "GqlMergeSource",
+        "a",
+        &[
+            ("target", PropValue::String("dup".to_string())),
+            ("rank", PropValue::Int(1)),
+        ],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlMergeSource",
+        "b",
+        &[
+            ("target", PropValue::String("dup".to_string())),
+            ("rank", PropValue::Int(2)),
+        ],
+        1.0,
+    );
+    let duplicate = engine
+        .execute_gql(
+            "MATCH (s:GqlMergeSource) MERGE (n:GqlMergeDupNode {key: s.target}) \
+             ON CREATE SET n.status = 'created', n.rank = s.rank \
+             ON MATCH SET n.status = 'matched', n.rank = s.rank \
+             RETURN n.status, n.rank ORDER BY s.rank",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                profile: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(duplicate.rows.len(), 2);
+    let stats = duplicate.mutation_stats.as_ref().unwrap();
+    assert_eq!(stats.nodes_created, 1);
+    assert_eq!(stats.mutation_rows, 2);
+    assert_eq!(stats.duplicate_targets, 3);
+    assert!(stats.db_hits >= 1);
+    let stored = engine
+        .get_node_by_key("GqlMergeDupNode", "dup")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.props.get("status"),
+        Some(&PropValue::String("matched".to_string()))
+    );
+    assert_eq!(stored.props.get("rank"), Some(&PropValue::Int(2)));
+
+    let distinct = engine
+        .execute_gql(
+            "MATCH (s:GqlMergeSource) MERGE (n:GqlMergeDistinctNode {key: s.target}) RETURN DISTINCT n",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                profile: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(distinct.rows.len(), 1);
+    match &distinct.rows[0].values[0] {
+        GqlValue::Node(node) => assert_eq!(node.key.as_deref(), Some("dup")),
+        other => panic!("expected distinct MERGE node return, got {other:?}"),
+    }
+    let stats = distinct.mutation_stats.as_ref().unwrap();
+    assert_eq!(stats.nodes_created, 1);
+    assert_eq!(stats.mutation_rows, 1);
+
+    let local_counter = engine
+        .execute_gql(
+            "MATCH (s:GqlMergeSource) WITH s, s.rank AS delta \
+             MERGE (n:GqlMergeLocalCounter {key: s.target}) \
+             ON CREATE SET n.count = delta \
+             ON MATCH SET n.count = n.count + delta \
+             RETURN n.count ORDER BY s.rank",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(local_counter.rows.len(), 2);
+    let stored_counter = engine
+        .get_node_by_key("GqlMergeLocalCounter", "dup")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_counter.props.get("count"), Some(&PropValue::Int(3)));
+
+    let empty_key = engine
+        .execute_gql(
+            "MERGE (n:GqlMergeEmptyKey {key: ''})",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(empty_key, EngineError::InvalidOperation(message) if message.contains("non-empty string"))
+    );
+
+    let bad_action = engine
+        .execute_gql(
+            "MERGE (n:GqlMergeBadAction {key: 'n'}) ON CREATE SET n.bad = $bad",
+            &GqlParams::from([("bad".to_string(), GqlParamValue::Float(f64::NAN))]),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(bad_action, EngineError::InvalidOperation(message) if message.contains("finite")));
+    assert!(engine
+        .get_node_by_key("GqlMergeBadAction", "n")
+        .unwrap()
+        .is_none());
+
+    let bad_local_metadata = engine
+        .execute_gql(
+            "MERGE (n:GqlMergeBadMetadata {key: 'n'}) ON CREATE SET n.source_id = id(n)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        bad_local_metadata,
+        EngineError::GqlSemantic { .. }
+    ));
+    assert!(engine
+        .get_node_by_key("GqlMergeBadMetadata", "n")
+        .unwrap()
+        .is_none());
+
+    let bad_match_metadata = engine
+        .execute_gql(
+            "MERGE (n:GqlMergeBadMatchMetadata {key: 'n'}) ON MATCH SET n.source_id = id(n)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(bad_match_metadata, EngineError::GqlSemantic { .. }));
+    assert!(engine
+        .get_node_by_key("GqlMergeBadMatchMetadata", "n")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn gql_merge_node_caps_explain_indexes_and_reopen_preserve_atomicity() {
+    let (dir, engine) = query_test_engine();
+    let db_path = dir.path().join("db");
+    for key in ["a", "b"] {
+        insert_query_node(&engine, "GqlMergeCapSource", key, &[], 1.0);
+    }
+    let cap = engine
+        .execute_gql(
+            "MATCH (s:GqlMergeCapSource) MERGE (n:GqlMergeCapTarget {key: s.key})",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_mutation_ops: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(cap, EngineError::InvalidOperation(message) if message.contains("max_mutation_ops")));
+    for key in ["a", "b"] {
+        assert!(engine
+            .get_node_by_key("GqlMergeCapTarget", key)
+            .unwrap()
+            .is_none());
+    }
+
+    let wal_path = wal_generation_path(&db_path, 0);
+    let before_wal_len = std::fs::metadata(&wal_path).map(|metadata| metadata.len()).unwrap_or(0);
+    let explain = engine
+        .explain_gql(
+            "MERGE (n:GqlMergeExplain {key: 'n'}) ON CREATE SET n.status = 'planned' RETURN n",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert!(explain
+        .mutation
+        .as_ref()
+        .is_some_and(|mutation| mutation.uses_transaction_snapshot));
+    let after_wal_len = std::fs::metadata(&wal_path).map(|metadata| metadata.len()).unwrap_or(0);
+    assert_eq!(after_wal_len, before_wal_len);
+    assert_eq!(engine.get_node_label_id("GqlMergeExplain").unwrap(), None);
+    assert!(engine
+        .get_node_by_key("GqlMergeExplain", "n")
+        .unwrap()
+        .is_none());
+
+    engine
+        .ensure_node_property_index("GqlMergeIndexed", "status", SecondaryIndexKind::Equality)
+        .unwrap();
+    let inserted = execute_gql_ok(
+        &engine,
+        "MERGE (n:GqlMergeIndexed {key: 'n'}) ON CREATE SET n.status = 'ready' RETURN id(n)",
+    );
+    let node_id = gql_u64_column(&inserted, 0)[0];
+    execute_gql_ok(
+        &engine,
+        "MERGE (n:GqlMergeIndexed {key: 'n'}) ON MATCH SET n.status = 'updated' RETURN n",
+    );
+    let updated = execute_gql_ok(
+        &engine,
+        "MATCH (n:GqlMergeIndexed {status: 'updated'}) RETURN id(n)",
+    );
+    assert_eq!(gql_u64_column(&updated, 0), vec![node_id]);
+    let ready = execute_gql_ok(
+        &engine,
+        "MATCH (n:GqlMergeIndexed {status: 'ready'}) RETURN id(n)",
+    );
+    assert!(ready.rows.is_empty());
+
+    engine.flush().unwrap();
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened_read = execute_gql_ok(
+        &reopened,
+        "MATCH (n:GqlMergeIndexed {status: 'updated'}) RETURN id(n)",
+    );
+    assert_eq!(gql_u64_column(&reopened_read, 0), vec![node_id]);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn gql_merge_relationship_creates_matches_duplicates_and_skips_null_endpoints() {
+    let (_dir, engine) = gql_create_test_engine_with_options(DbOptions {
+        edge_uniqueness: true,
+        ..DbOptions::default()
+    });
+    let a = insert_query_node(&engine, "GqlMergeRelNode", "a", &[], 1.0);
+    let b = insert_query_node(&engine, "GqlMergeRelNode", "b", &[], 1.0);
+
+    let created = engine
+        .execute_gql(
+            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+             MERGE (a)-[r:Gql_MERGE_REL]->(b) ON CREATE SET r.status = 'created' RETURN id(r), r.status",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    let edge_id = gql_u64_column(&created, 0)[0];
+    assert_eq!(created.rows[0].values[1], GqlValue::String("created".to_string()));
+    assert_eq!(created.mutation_stats.as_ref().unwrap().edges_created, 1);
+
+    let matched = engine
+        .execute_gql(
+            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+             MERGE (a)-[r:Gql_MERGE_REL]->(b) ON MATCH SET r.status = 'matched' RETURN id(r), r.status",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert_eq!(gql_u64_column(&matched, 0), vec![edge_id]);
+    assert_eq!(matched.rows[0].values[1], GqlValue::String("matched".to_string()));
+    assert_eq!(matched.mutation_stats.as_ref().unwrap().edges_updated, 1);
+
+    let incremented = engine
+        .execute_gql(
+            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+             MERGE (a)-[r:Gql_MERGE_REL]->(b) ON MATCH SET r.visits = coalesce(r.visits, 0) + 1 RETURN r.visits",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert_eq!(incremented.rows[0].values[0], GqlValue::Int(1));
+
+    insert_query_node(&engine, "GqlMergeRelSource", "a", &[], 1.0);
+    insert_query_node(&engine, "GqlMergeRelSource", "b", &[], 1.0);
+    let duplicate = engine
+        .execute_gql(
+            "MATCH (s:GqlMergeRelSource) MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+             MERGE (a)-[r:Gql_MERGE_REL_DUP]->(b) ON CREATE SET r.status = 'created' ON MATCH SET r.status = 'matched' \
+             RETURN r.status ORDER BY s.key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                profile: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(duplicate.rows.len(), 2);
+    let stats = duplicate.mutation_stats.as_ref().unwrap();
+    assert_eq!(stats.edges_created, 1);
+    assert_eq!(stats.mutation_rows, 2);
+    assert_eq!(stats.duplicate_targets, 1);
+    assert!(stats.db_hits >= 1);
+    let dup_edges = engine
+        .query_edges(&EdgeQuery {
+            from_ids: vec![a],
+            to_ids: vec![b],
+            label: Some("Gql_MERGE_REL_DUP".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(dup_edges.edges.len(), 1);
+    assert_eq!(
+        dup_edges.edges[0].props.get("status"),
+        Some(&PropValue::String("matched".to_string()))
+    );
+
+    let duplicate_counter = engine
+        .execute_gql(
+            "MATCH (s:GqlMergeRelSource) MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+             MERGE (a)-[r:Gql_MERGE_REL_COUNT]->(b) ON CREATE SET r.count = 1 ON MATCH SET r.count = r.count + 1 \
+             RETURN r.count ORDER BY s.key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(duplicate_counter.rows.len(), 2);
+    let counted_edges = engine
+        .query_edges(&EdgeQuery {
+            from_ids: vec![a],
+            to_ids: vec![b],
+            label: Some("Gql_MERGE_REL_COUNT".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(counted_edges.edges.len(), 1);
+    assert_eq!(
+        counted_edges.edges[0].props.get("count"),
+        Some(&PropValue::Int(2))
+    );
+
+    let skipped = engine
+        .execute_gql(
+            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' OPTIONAL MATCH (a)-[:Gql_MISSING_REL]->(b) \
+             MERGE (a)-[r:Gql_MERGE_NULL]->(b) RETURN r",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert_eq!(skipped.rows.len(), 1);
+    assert_eq!(skipped.rows[0].values[0], GqlValue::Null);
+    let stats = skipped.mutation_stats.as_ref().unwrap();
+    assert_eq!(stats.skipped_null_targets, 1);
+    assert_eq!(stats.edges_created, 0);
+
+    let bad_local_metadata = engine
+        .execute_gql(
+            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+             MERGE (a)-[r:Gql_MERGE_REL_BAD_META]->(b) ON CREATE SET r.source_id = id(r)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        bad_local_metadata,
+        EngineError::GqlSemantic { .. }
+    ));
+    let bad_edges = engine
+        .query_edges(&EdgeQuery {
+            from_ids: vec![a],
+            to_ids: vec![b],
+            label: Some("Gql_MERGE_REL_BAD_META".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(bad_edges.edges.is_empty());
+
+    let bad_endpoint_metadata = engine
+        .execute_gql(
+            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+             MERGE (a)-[r:Gql_MERGE_REL_BAD_FROM]->(b) ON MATCH SET r.source_from = r.from",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        bad_endpoint_metadata,
+        EngineError::GqlSemantic { .. }
+    ));
+    let bad_from_edges = engine
+        .query_edges(&EdgeQuery {
+            from_ids: vec![a],
+            to_ids: vec![b],
+            label: Some("Gql_MERGE_REL_BAD_FROM".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(bad_from_edges.edges.is_empty());
+}
+
+#[test]
+fn gql_merge_relationship_rejects_without_edge_uniqueness() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(&engine, "GqlMergeNoUnique", "a", &[], 1.0);
+    insert_query_node(&engine, "GqlMergeNoUnique", "b", &[], 1.0);
+    let err = engine
+        .execute_gql(
+            "MATCH (a:GqlMergeNoUnique) WHERE a.key = 'a' MATCH (b:GqlMergeNoUnique) WHERE b.key = 'b' MERGE (a)-[r:Gql_NO_UNIQUE]->(b)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidOperation(message) if message.contains("edge_uniqueness=true")));
+}
+
+#[test]
+fn gql_merge_commit_conflicts_for_node_keys_and_edge_triples() {
+    let (_dir, engine) = gql_create_test_engine_with_options(DbOptions {
+        edge_uniqueness: true,
+        ..DbOptions::default()
+    });
+
+    let worker = DatabaseEngine {
+        runtime: std::sync::Arc::clone(&engine.runtime),
+    };
+    let (ready_rx, release_tx) = engine.set_gql_mutation_before_commit_pause();
+    let node_handle = std::thread::spawn(move || {
+        worker.execute_gql(
+            "MERGE (n:GqlMergeNodeConflict {key: 'n'}) ON CREATE SET n.status = 'worker'",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("node MERGE did not pause before commit");
+    engine
+        .upsert_node(
+            "GqlMergeNodeConflict",
+            "n",
+            UpsertNodeOptions {
+                props: query_test_props(&[(
+                    "status",
+                    PropValue::String("outside".to_string()),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    release_tx.send(()).unwrap();
+    let node_err = node_handle.join().unwrap().unwrap_err();
+    assert!(matches!(node_err, EngineError::TxnConflict { .. }));
+    let stored = engine
+        .get_node_by_key("GqlMergeNodeConflict", "n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.props.get("status"),
+        Some(&PropValue::String("outside".to_string()))
+    );
+
+    let a = insert_query_node(&engine, "GqlMergeEdgeConflictNode", "a", &[], 1.0);
+    let b = insert_query_node(&engine, "GqlMergeEdgeConflictNode", "b", &[], 1.0);
+    let worker = DatabaseEngine {
+        runtime: std::sync::Arc::clone(&engine.runtime),
+    };
+    let (ready_rx, release_tx) = engine.set_gql_mutation_before_commit_pause();
+    let edge_handle = std::thread::spawn(move || {
+        worker.execute_gql(
+            "MATCH (a:GqlMergeEdgeConflictNode) WHERE a.key = 'a' MATCH (b:GqlMergeEdgeConflictNode) WHERE b.key = 'b' \
+             MERGE (a)-[r:Gql_MERGE_EDGE_CONFLICT]->(b) ON CREATE SET r.status = 'worker'",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("edge MERGE did not pause before commit");
+    let outside = engine
+        .upsert_edge(
+            a,
+            b,
+            "Gql_MERGE_EDGE_CONFLICT",
+            UpsertEdgeOptions {
+                props: query_test_props(&[(
+                    "status",
+                    PropValue::String("outside".to_string()),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    release_tx.send(()).unwrap();
+    let edge_err = edge_handle.join().unwrap().unwrap_err();
+    assert!(matches!(edge_err, EngineError::TxnConflict { .. }));
+    let edges = engine
+        .query_edges(&EdgeQuery {
+            from_ids: vec![a],
+            to_ids: vec![b],
+            label: Some("Gql_MERGE_EDGE_CONFLICT".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(edges.edges.len(), 1);
+    assert_eq!(edges.edges[0].id, outside);
+    assert_eq!(
+        edges.edges[0].props.get("status"),
+        Some(&PropValue::String("outside".to_string()))
+    );
+}
+
+#[test]
+fn gql_merge_read_prefix_pipelines_support_with_call_union_and_exists() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(&engine, "GqlMergePrefixSeed", "with", &[], 1.0);
+    let with_prefix = engine
+        .execute_gql(
+            "MATCH (s:GqlMergePrefixSeed) WITH s MERGE (n:GqlMergeWithPrefix {key: s.key}) RETURN n.key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&with_prefix, 0), vec!["with".to_string()]);
+
+    insert_query_node(&engine, "GqlMergeExistsSeed", "exists", &[], 1.0);
+    insert_query_node(&engine, "GqlMergeExistsMarker", "marker", &[], 1.0);
+    let exists_prefix = engine
+        .execute_gql(
+            "MATCH (s:GqlMergeExistsSeed) WHERE EXISTS { MATCH (m:GqlMergeExistsMarker) RETURN m } \
+             MERGE (n:GqlMergeExistsPrefix {key: s.key}) RETURN n.key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&exists_prefix, 0), vec!["exists".to_string()]);
+
+    insert_query_node(&engine, "GqlMergeCallA", "a", &[], 1.0);
+    insert_query_node(&engine, "GqlMergeCallB", "b", &[], 1.0);
+    let call_union_prefix = engine
+        .execute_gql(
+            "CALL { MATCH (x:GqlMergeCallA) RETURN x.key AS k UNION MATCH (x:GqlMergeCallB) RETURN x.key AS k } \
+             MERGE (n:GqlMergeCallPrefix {key: k}) RETURN n.key ORDER BY n.key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&call_union_prefix, 0),
+        vec!["a".to_string(), "b".to_string()]
+    );
 }
 
 #[test]
@@ -1627,13 +2259,14 @@ fn gql_set_remove_errors_leave_database_unchanged() {
         )
         .unwrap_err();
     assert!(matches!(cap, EngineError::InvalidOperation(message) if message.contains("max_mutation_ops")));
-    assert!(engine
-        .get_node_by_key("GqlSetCap", "a")
-        .unwrap()
-        .unwrap()
-        .props
-        .get("flag")
-        .is_none());
+    assert!(
+        !engine
+            .get_node_by_key("GqlSetCap", "a")
+            .unwrap()
+            .unwrap()
+            .props
+            .contains_key("flag")
+    );
 }
 
 #[test]
@@ -2312,6 +2945,135 @@ fn gql_mutation_return_caps_and_order_errors_are_atomic() {
             Some(&PropValue::String("old".to_string()))
         );
     }
+}
+
+#[test]
+fn gql_mutation_return_distinct_caps_are_precommit_atomic() {
+    let (_dir, engine) = query_test_engine();
+    for key in ["a", "b"] {
+        insert_query_node(&engine, "GqlReturnDistinctCapSeed", key, &[], 1.0);
+    }
+    let options = GqlExecutionOptions {
+        allow_full_scan: true,
+        max_groups: 1,
+        ..gql_opts()
+    };
+
+    let cap_err = engine
+        .execute_gql(
+            "MATCH (s:GqlReturnDistinctCapSeed) \
+             CREATE (n:GqlReturnDistinctCap {key: s.key}) \
+             RETURN DISTINCT n.key AS key",
+            &GqlParams::new(),
+            &options,
+        )
+        .unwrap_err();
+    assert!(
+        cap_err.to_string().contains("max_groups"),
+        "unexpected error: {cap_err:?}"
+    );
+    for key in ["a", "b"] {
+        assert!(engine
+            .get_node_by_key("GqlReturnDistinctCap", key)
+            .unwrap()
+            .is_none());
+    }
+
+    let same = engine
+        .execute_gql(
+            "MATCH (s:GqlReturnDistinctCapSeed) \
+             CREATE (n:GqlReturnDistinctSame {key: s.key}) \
+             RETURN DISTINCT 'same' AS key",
+            &GqlParams::new(),
+            &options,
+        )
+        .unwrap();
+    assert_eq!(same.rows.len(), 1);
+    assert_eq!(same.rows[0].values[0], GqlValue::String("same".to_string()));
+    for key in ["a", "b"] {
+        assert!(engine
+            .get_node_by_key("GqlReturnDistinctSame", key)
+            .unwrap()
+            .is_some());
+    }
+
+    for key in ["left", "right"] {
+        insert_query_node(
+            &engine,
+            "GqlReturnDistinctGraphSeed",
+            key,
+            &[("target", PropValue::String("shared".to_string()))],
+            1.0,
+        );
+    }
+    let nested_graph = engine
+        .execute_gql(
+            "MATCH (s:GqlReturnDistinctGraphSeed) \
+             MERGE (n:GqlReturnDistinctGraph {key: s.target}) \
+             RETURN DISTINCT [n] AS bucket",
+            &GqlParams::new(),
+            &options,
+        )
+        .unwrap();
+    assert_eq!(nested_graph.rows.len(), 1);
+    match &nested_graph.rows[0].values[0] {
+        GqlValue::List(values) => assert_eq!(values.len(), 1),
+        other => panic!("expected nested graph list, got {other:?}"),
+    }
+}
+
+#[test]
+fn gql_mutation_return_distinct_rejects_commit_assigned_metadata_before_write() {
+    let (_dir, engine) = query_test_engine();
+    let err = engine
+        .execute_gql(
+            "CREATE (n:GqlReturnDistinctMetadata {key: 'n'}) RETURN DISTINCT id(n)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::GqlSemantic { .. }),
+        "unexpected error: {err:?}"
+    );
+    assert!(engine
+        .get_node_by_key("GqlReturnDistinctMetadata", "n")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn gql_mutation_return_distinct_rejects_volatile_updated_at_before_write() {
+    let (_dir, engine) = query_test_engine();
+    let node = insert_query_node(
+        &engine,
+        "GqlReturnDistinctUpdatedAt",
+        "n",
+        &[("status", PropValue::String("old".to_string()))],
+        1.0,
+    );
+
+    let err = engine
+        .execute_gql(
+            "MATCH (n:GqlReturnDistinctUpdatedAt) WHERE n.key = 'n' \
+             SET n.status = 'new' RETURN DISTINCT n.updated_at",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("RETURN DISTINCT"),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        engine
+            .get_node(node)
+            .unwrap()
+            .unwrap()
+            .props
+            .get("status"),
+        Some(&PropValue::String("old".to_string()))
+    );
 }
 
 #[test]
@@ -4739,6 +5501,346 @@ fn gql_bounded_vlp_path_assignment_functions_and_cursors_match_graph_row() {
 }
 
 #[test]
+fn gql_shortest_path_executes_native_stage_and_projects_path() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "ShortestStart", "gql-sp-a", &[], 1.0);
+    let mid = insert_query_node(&engine, "ShortestMid", "gql-sp-mid", &[], 1.0);
+    let b = insert_query_node(&engine, "ShortestEnd", "gql-sp-b", &[], 1.0);
+    engine
+        .upsert_edge(a, b, "GQL_SP_OTHER", UpsertEdgeOptions::default())
+        .unwrap();
+    let first = engine
+        .upsert_edge(a, mid, "GQL_SP", UpsertEdgeOptions::default())
+        .unwrap();
+    let second = engine
+        .upsert_edge(mid, b, "GQL_SP", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let source = format!(
+        "MATCH (a:ShortestStart) WHERE id(a) = {a} \
+         WITH a \
+         MATCH (b:ShortestEnd) WHERE id(b) = {b} \
+         WITH a, b \
+         MATCH p = shortestPath((a)-[:GQL_SP*1..5]->(b)) \
+         RETURN p, node_ids(p), edge_ids(p), length(p), nodes(p), relationships(p)"
+    );
+    let result = execute_gql_with_options(
+        &engine,
+        &source,
+        GqlExecutionOptions {
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+    assert_eq!(result.rows.len(), 1);
+    let values = &result.rows[0].values;
+    let path = gql_single_path(&values[0]);
+    assert_eq!(path.node_ids, vec![a, mid, b]);
+    assert_eq!(path.edge_ids, vec![first, second]);
+    assert_eq!(
+        values[1],
+        GqlValue::List(vec![GqlValue::UInt(a), GqlValue::UInt(mid), GqlValue::UInt(b)])
+    );
+    assert_eq!(
+        values[2],
+        GqlValue::List(vec![GqlValue::UInt(first), GqlValue::UInt(second)])
+    );
+    assert_eq!(values[3], GqlValue::UInt(2));
+    assert_eq!(
+        values[4],
+        GqlValue::List(vec![GqlValue::UInt(a), GqlValue::UInt(mid), GqlValue::UInt(b)])
+    );
+    assert_eq!(
+        values[5],
+        GqlValue::List(vec![GqlValue::UInt(first), GqlValue::UInt(second)])
+    );
+    let read = gql_read_explain(result.plan.as_ref().expect("include_plan should return plan"));
+    assert!(read.projection.iter().any(|line| {
+        line.contains("ShortestPath")
+            && line.contains("algorithm=bidirectional_bfs")
+            && line.contains("distinct_pair_count=1")
+            && line.contains("emitted_path_count=1")
+    }));
+}
+
+#[test]
+fn gql_all_shortest_paths_direction_and_min_hops() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "AllShortestStart", "gql-asp-a", &[], 1.0);
+    let m1 = insert_query_node(&engine, "AllShortestMid", "gql-asp-m1", &[], 1.0);
+    let m2 = insert_query_node(&engine, "AllShortestMid", "gql-asp-m2", &[], 1.0);
+    let b = insert_query_node(&engine, "AllShortestEnd", "gql-asp-b", &[], 1.0);
+    let am1 = engine
+        .upsert_edge(a, m1, "GQL_ASP", UpsertEdgeOptions::default())
+        .unwrap();
+    let m1b = engine
+        .upsert_edge(m1, b, "GQL_ASP", UpsertEdgeOptions::default())
+        .unwrap();
+    let am2 = engine
+        .upsert_edge(a, m2, "GQL_ASP", UpsertEdgeOptions::default())
+        .unwrap();
+    let m2b = engine
+        .upsert_edge(m2, b, "GQL_ASP", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let all = execute_gql_with_options(
+        &engine,
+        &format!(
+            "MATCH (a:AllShortestStart) WHERE id(a) = {a} \
+             WITH a \
+             MATCH (b:AllShortestEnd) WHERE id(b) = {b} \
+             WITH a, b \
+             MATCH p = allShortestPaths((a)-[:GQL_ASP*1..3]->(b)) \
+             RETURN p"
+        ),
+        GqlExecutionOptions {
+            include_plan: true,
+            max_paths_per_start: 2,
+            ..gql_opts()
+        },
+    );
+    let mut paths = all
+        .rows
+        .iter()
+        .map(|row| {
+            let path = gql_single_path(&row.values[0]);
+            (path.node_ids.clone(), path.edge_ids.clone())
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![(vec![a, m1, b], vec![am1, m1b]), (vec![a, m2, b], vec![am2, m2b])]
+    );
+    let read = gql_read_explain(all.plan.as_ref().expect("include_plan should return plan"));
+    assert!(read.projection.iter().any(|line| {
+        line.contains("ShortestPath")
+            && line.contains("max_paths=2")
+            && line.contains("emitted_path_count=2")
+    }));
+
+    let row_cap_err = engine
+        .execute_gql(
+            &format!(
+                "MATCH (a:AllShortestStart) WHERE id(a) = {a} \
+                 WITH a \
+                 MATCH (d:AllShortestMid) \
+                 WITH a \
+                 MATCH (b:AllShortestEnd) WHERE id(b) = {b} \
+                 WITH a, b \
+                 MATCH p = allShortestPaths((a)-[:GQL_ASP*1..3]->(b)) \
+                 RETURN p"
+            ),
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_pipeline_rows: 3,
+                max_paths_per_start: 2,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(row_cap_err, EngineError::InvalidOperation(message) if message.contains("max_pipeline_rows"))
+    );
+
+    let incoming = execute_gql_ok(
+        &engine,
+        &format!(
+            "MATCH (a:AllShortestStart) WHERE id(a) = {a} \
+             WITH a \
+             MATCH (m:AllShortestMid) WHERE id(m) = {m1} \
+             WITH a, m \
+             MATCH p = shortestPath((m)<-[:GQL_ASP*1..1]-(a)) \
+             RETURN p"
+        ),
+    );
+    let incoming_path = gql_single_path(&incoming.rows[0].values[0]);
+    assert_eq!(incoming_path.node_ids, vec![m1, a]);
+    assert_eq!(incoming_path.edge_ids, vec![am1]);
+
+    let undirected = execute_gql_ok(
+        &engine,
+        &format!(
+            "MATCH (a:AllShortestStart) WHERE id(a) = {a} \
+             WITH a \
+             MATCH (m:AllShortestMid) WHERE id(m) = {m1} \
+             WITH a, m \
+             MATCH p = shortestPath((m)-[:GQL_ASP*1..1]-(a)) \
+             RETURN p"
+        ),
+    );
+    let undirected_path = gql_single_path(&undirected.rows[0].values[0]);
+    assert_eq!(undirected_path.node_ids, vec![m1, a]);
+    assert_eq!(undirected_path.edge_ids, vec![am1]);
+
+    let min_filtered = execute_gql_ok(
+        &engine,
+        &format!(
+            "MATCH (a:AllShortestStart) WHERE id(a) = {a} \
+             WITH a \
+             MATCH (b:AllShortestEnd) WHERE id(b) = {b} \
+             WITH a, b \
+             MATCH p = shortestPath((a)-[:GQL_ASP*3..3]->(b)) \
+             RETURN p"
+        ),
+    );
+    assert!(min_filtered.rows.is_empty());
+}
+
+#[test]
+fn gql_shortest_path_optional_cache_and_pair_cap_semantics() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "ShortestCapStart", "gql-sp-cap-a", &[], 1.0);
+    let a2 = insert_query_node(&engine, "ShortestCapStart", "gql-sp-cap-a2", &[], 1.0);
+    let b = insert_query_node(&engine, "ShortestCapEnd", "gql-sp-cap-b", &[], 1.0);
+    let duplicate_1 = insert_query_node(&engine, "ShortestDup", "gql-sp-dup-1", &[], 1.0);
+    let duplicate_2 = insert_query_node(&engine, "ShortestDup", "gql-sp-dup-2", &[], 1.0);
+    let edge = engine
+        .upsert_edge(a, b, "GQL_SP_CACHE", UpsertEdgeOptions::default())
+        .unwrap();
+    assert_ne!(duplicate_1, duplicate_2);
+
+    let required_miss = execute_gql_ok(
+        &engine,
+        &format!(
+            "MATCH (a:ShortestCapStart) WHERE id(a) = {a2} \
+             WITH a \
+             MATCH (b:ShortestCapEnd) WHERE id(b) = {b} \
+             WITH a, b \
+             MATCH p = shortestPath((a)-[:GQL_SP_CACHE*1..2]->(b)) \
+             RETURN p"
+        ),
+    );
+    assert!(required_miss.rows.is_empty());
+
+    let optional_miss = execute_gql_ok(
+        &engine,
+        &format!(
+            "MATCH (a:ShortestCapStart) WHERE id(a) = {a2} \
+             WITH a \
+             MATCH (b:ShortestCapEnd) WHERE id(b) = {b} \
+             WITH a, b \
+             OPTIONAL MATCH p = shortestPath((a)-[:GQL_SP_CACHE*1..2]->(b)) \
+             RETURN id(a), p"
+        ),
+    );
+    assert_eq!(optional_miss.rows.len(), 1);
+    assert_eq!(optional_miss.rows[0].values, vec![GqlValue::UInt(a2), GqlValue::Null]);
+
+    let cached = execute_gql_with_options(
+        &engine,
+        &format!(
+            "MATCH (a:ShortestCapStart) WHERE id(a) = {a} \
+             WITH a \
+             MATCH (d:ShortestDup) \
+             WITH a \
+             MATCH (b:ShortestCapEnd) WHERE id(b) = {b} \
+             WITH a, b \
+             MATCH p = shortestPath((a)-[:GQL_SP_CACHE*1..2]->(b)) \
+             RETURN p"
+        ),
+        GqlExecutionOptions {
+            allow_full_scan: true,
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+    assert_eq!(cached.rows.len(), 2);
+    for row in &cached.rows {
+        let path = gql_single_path(&row.values[0]);
+        assert_eq!(path.node_ids, vec![a, b]);
+        assert_eq!(path.edge_ids, vec![edge]);
+    }
+    let read = gql_read_explain(cached.plan.as_ref().expect("include_plan should return plan"));
+    assert!(read.projection.iter().any(|line| {
+        line.contains("ShortestPath")
+            && line.contains("distinct_pair_count=1")
+            && line.contains("cache_hits=1")
+    }));
+
+    let cap_err = engine
+        .execute_gql(
+            &format!(
+                "MATCH (a:ShortestCapStart) \
+                 WITH a \
+                 MATCH (b:ShortestCapEnd) WHERE id(b) = {b} \
+                 WITH a, b \
+                 MATCH p = shortestPath((a)-[:GQL_SP_CACHE*1..2]->(b)) \
+                 RETURN p"
+            ),
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_shortest_path_pairs: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(cap_err, EngineError::InvalidOperation(message) if message.contains("max_shortest_path_pairs"))
+    );
+
+    let hop_cap_err = engine
+        .execute_gql(
+            &format!(
+                "MATCH (a:ShortestCapStart) WHERE id(a) = {a} \
+                 WITH a \
+                 MATCH (b:ShortestCapEnd) WHERE id(b) = {b} \
+                 WITH a, b \
+                 MATCH p = shortestPath((a)-[:GQL_SP_CACHE*1..2]->(b)) \
+                 RETURN p"
+            ),
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_path_hops: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(hop_cap_err, EngineError::InvalidOperation(message) if message.contains("max_path_hops"))
+    );
+}
+
+#[test]
+fn gql_shortest_path_survives_flush_reopen_and_compact() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let a = insert_query_node(&engine, "ShortestLifecycle", "gql-sp-life-a", &[], 1.0);
+    let b = insert_query_node(&engine, "ShortestLifecycle", "gql-sp-life-b", &[], 1.0);
+    let c = insert_query_node(&engine, "ShortestLifecycle", "gql-sp-life-c", &[], 1.0);
+    let ab = engine
+        .upsert_edge(a, b, "GQL_SP_LIFE", UpsertEdgeOptions::default())
+        .unwrap();
+    engine.flush().unwrap();
+    let bc = engine
+        .upsert_edge(b, c, "GQL_SP_LIFE", UpsertEdgeOptions::default())
+        .unwrap();
+    engine.flush().unwrap();
+    engine.compact().unwrap();
+    engine.close().unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let result = execute_gql_ok(
+        &reopened,
+        &format!(
+            "MATCH (a:ShortestLifecycle) WHERE id(a) = {a} \
+             WITH a \
+             MATCH (c:ShortestLifecycle) WHERE id(c) = {c} \
+             WITH a, c \
+             MATCH p = shortestPath((a)-[:GQL_SP_LIFE*1..3]->(c)) \
+             RETURN p"
+        ),
+    );
+    let path = gql_single_path(&result.rows[0].values[0]);
+    assert_eq!(path.node_ids, vec![a, b, c]);
+    assert_eq!(path.edge_ids, vec![ab, bc]);
+    reopened.close().unwrap();
+}
+
+#[test]
 fn gql_fixed_multi_hop_path_assignment_composes_after_fixed_matching() {
     let (_dir, engine) = query_test_engine();
     let a = insert_query_node(&engine, "FixedPathStart", "gql-fixed-path-a", &[], 1.0);
@@ -5731,6 +6833,205 @@ fn gql_residual_where_filters_with_null_semantics_after_pushdown() {
 }
 
 #[test]
+fn gql_execution_rich_expressions_in_read_surfaces_use_graph_row_semantics() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(
+        &engine,
+        "GqlRichRead",
+        "ada",
+        &[
+            ("status", PropValue::String("active".to_string())),
+            ("name", PropValue::String("Ada".to_string())),
+            ("age", PropValue::Int(37)),
+        ],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlRichRead",
+        "bob",
+        &[
+            ("status", PropValue::String("active".to_string())),
+            ("name", PropValue::String("Bob".to_string())),
+            ("age", PropValue::Int(29)),
+        ],
+        1.0,
+    );
+
+    let result = execute_gql_ok(
+        &engine,
+        "MATCH (n:GqlRichRead) \
+         WHERE n.status = 'active' AND lower(n.name) STARTS WITH 'a' \
+         RETURN n.name AS name, n.age + 5 AS adjusted, \
+                CASE WHEN n.age > 30 THEN upper(n.name) ELSE 'young' END AS bucket \
+         ORDER BY n.age / 2 DESC",
+    );
+    assert_eq!(result.columns, vec!["name", "adjusted", "bucket"]);
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[0], GqlValue::String("Ada".to_string()));
+    assert_eq!(result.rows[0].values[1], GqlValue::Int(42));
+    assert_eq!(result.rows[0].values[2], GqlValue::String("ADA".to_string()));
+}
+
+#[test]
+fn gql_execution_rich_residual_preserves_simple_pushdown_and_narrow_needs() {
+    let (_dir, engine) = query_test_engine();
+    engine
+        .ensure_node_property_index("GqlRichPushdown", "status", SecondaryIndexKind::Equality)
+        .unwrap();
+    insert_query_node(
+        &engine,
+        "GqlRichPushdown",
+        "ada",
+        &[
+            ("status", PropValue::String("active".to_string())),
+            ("name", PropValue::String("Ada".to_string())),
+        ],
+        1.0,
+    );
+
+    let explain = engine
+        .explain_gql(
+            "MATCH (n:GqlRichPushdown) \
+             WHERE n.status = 'active' AND lower(n.name) STARTS WITH 'a' \
+             RETURN id(n)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    let explain = gql_read_explain(&explain);
+    assert!(explain
+        .pushed_down
+        .iter()
+        .any(|item| item.contains("n.status")));
+    assert!(explain
+        .residual
+        .iter()
+        .any(|item| item.contains("STARTS WITH")));
+
+    let lowered = lowered_gql_for_projection_test(
+        "MATCH (n:GqlRichPushdown) \
+         WHERE n.status = 'active' AND lower(n.name) STARTS WITH 'a' \
+         RETURN id(n)",
+    );
+    let alias_projection = gql_alias_projection_map(&lowered);
+    let projection_alias = alias_projection.get("n").unwrap();
+    let residual_projection = crate::gql::eval::build_runtime_projection_for_need_class(
+        &lowered.residual_predicates,
+        &lowered.semantic,
+        &alias_projection,
+        false,
+        false,
+        crate::row_projection::ProjectionNeedClass::Residual,
+    )
+    .unwrap();
+    assert_node_need_props(
+        &residual_projection.plan.needs.residual,
+        projection_alias,
+        &["name"],
+    );
+    assert_entity_needs_do_not_request_all_properties(&residual_projection.plan.needs.residual);
+}
+
+#[test]
+fn gql_execution_rich_mutation_set_return_and_error_prevalidation() {
+    let (_dir, engine) = query_test_engine();
+    let node = insert_query_node(
+        &engine,
+        "GqlRichMutation",
+        "n",
+        &[
+            ("name", PropValue::String(" Ada ".to_string())),
+            ("score", PropValue::Int(40)),
+        ],
+        1.0,
+    );
+
+    let result = engine
+        .execute_gql(
+            "MATCH (n:GqlRichMutation) WHERE n.key = 'n' \
+             SET n.score = n.score + 2 SET n.slug = lower(trim(n.name)) \
+             RETURN n.score + 1 AS next_score, n.slug, \
+                    CASE n.slug WHEN 'ada' THEN 'ok' ELSE 'bad' END AS status",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[0], GqlValue::Int(43));
+    assert_eq!(result.rows[0].values[1], GqlValue::String("ada".to_string()));
+    assert_eq!(result.rows[0].values[2], GqlValue::String("ok".to_string()));
+
+    let err = engine
+        .execute_gql(
+            "MATCH (n:GqlRichMutation) WHERE n.key = 'n' SET n.score = n.score / 0 RETURN n",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidOperation(message) if message.contains("division by zero")));
+    let stored = engine.get_node(node).unwrap().unwrap();
+    assert_eq!(stored.props.get("score"), Some(&PropValue::Int(42)));
+
+    let direct_id = engine
+        .execute_gql(
+            "CREATE (n:GqlRichCreatedId {key: 'ok'}) RETURN id(n) AS id",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert!(matches!(direct_id.rows[0].values[0], GqlValue::UInt(_)));
+
+    let err = engine
+        .execute_gql(
+            "CREATE (n:GqlRichCreatedIdError {key: 'bad'}) \
+             RETURN 1 / (id(n) - id(n)) AS unsafe",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::GqlSemantic { message, .. } if message.contains("commit-assigned created alias metadata")));
+    let committed = execute_gql_ok(
+        &engine,
+        "MATCH (n:GqlRichCreatedIdError) RETURN id(n)",
+    );
+    assert!(committed.rows.is_empty());
+
+    let err = engine
+        .execute_gql(
+            "CREATE (n:GqlRichCreatedOrderIdError {key: 'bad'}) \
+             RETURN n ORDER BY 1 / (id(n) - id(n))",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::GqlSemantic { message, .. } if message.contains("commit-assigned created alias metadata")));
+    let committed = execute_gql_ok(
+        &engine,
+        "MATCH (n:GqlRichCreatedOrderIdError) RETURN id(n)",
+    );
+    assert!(committed.rows.is_empty());
+
+    let err = engine
+        .execute_gql(
+            "CREATE (n:GqlRichCoalesceNan {key: 'bad'}) RETURN coalesce($bad, 1)",
+            &GqlParams::from([("bad".to_string(), GqlParamValue::Float(f64::NAN))]),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::InvalidOperation(message)
+            if message.contains("scalar function result must be finite")
+    ));
+    let committed = execute_gql_ok(
+        &engine,
+        "MATCH (n:GqlRichCoalesceNan) RETURN id(n)",
+    );
+    assert!(committed.rows.is_empty());
+}
+
+#[test]
 fn gql_return_scalars_missing_null_params_and_duplicate_columns() {
     let (_dir, engine) = query_test_engine();
     let node = insert_query_node_with_labels(
@@ -6566,7 +7867,6 @@ fn gql_explain_enforces_referenced_param_caps_like_query() {
 fn gql_beta_unsupported_features_are_rejected_by_execution_api() {
     let (_dir, engine) = query_test_engine();
     let cases = [
-        ("MERGE (n:Person {key: 'ada'}) RETURN n", "write clauses", "MERGE"),
         (
             "CREATE INDEX node_status FOR (n:User) ON (n.status)",
             "schema/DDL",
@@ -6578,13 +7878,10 @@ fn gql_beta_unsupported_features_are_rejected_by_execution_api() {
             "unbounded VLP",
             "*",
         ),
-        ("MATCH (n:Person) RETURN DISTINCT n", "DISTINCT", "DISTINCT"),
-        ("MATCH (n:Person) RETURN count(n)", "aggregation", "count"),
-        ("MATCH (n:Person) WITH n RETURN n", "WITH", "WITH"),
         (
-            "MATCH (n:Person) RETURN n UNION MATCH (m:Person) RETURN m",
-            "UNION",
-            "UNION",
+            "MATCH (n:Person) RETURN n UNION CREATE (m:Person {key: 'm'}) RETURN m",
+            "write clauses",
+            "CREATE",
         ),
         ("CALL db.labels()", "CALL", "CALL"),
     ];
@@ -6610,12 +7907,8 @@ fn gql_beta_unsupported_features_are_rejected_by_execution_api() {
 #[test]
 fn gql_deferred_features_remain_rejected_after_row_ops() {
     let (_dir, engine) = query_test_engine();
-    for source in [
-        "MATCH (n:Person)-[*]->(m) RETURN n",
-        "MATCH (n:Person) RETURN DISTINCT n",
-        "MATCH (n:Person) RETURN count(n)",
-        "MATCH (n:Person) WITH n RETURN n",
-    ] {
+    {
+        let source = "MATCH (n:Person)-[*]->(m) RETURN n";
         let err = engine
             .execute_gql(source, &GqlParams::new(), &gql_opts())
             .unwrap_err();
@@ -6633,6 +7926,2481 @@ fn gql_deferred_features_remain_rejected_after_row_ops() {
         )
         .unwrap_err();
     assert!(matches!(skip_offset, EngineError::GqlParse { .. }));
+}
+
+#[test]
+fn gql_read_only_exists_subqueries_execute_with_correlation_and_cache() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(
+        &engine,
+        "GqlSubExists",
+        "a",
+        &[("status", PropValue::String("active".to_string()))],
+        1.0,
+    );
+    let b = insert_query_node(
+        &engine,
+        "GqlSubExists",
+        "b",
+        &[("status", PropValue::String("active".to_string()))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlSubExists",
+        "c",
+        &[("status", PropValue::String("stale".to_string()))],
+        1.0,
+    );
+    engine
+        .upsert_edge(a, b, "GQL_SUB_EXISTS_REL", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let options = GqlExecutionOptions {
+        allow_full_scan: true,
+        include_plan: true,
+        ..gql_opts()
+    };
+    let correlated = engine
+        .execute_gql(
+            "MATCH (n:GqlSubExists) \
+             WHERE EXISTS { MATCH (n)-[:GQL_SUB_EXISTS_REL]->(m) RETURN m } \
+             RETURN n.key AS key ORDER BY key",
+            &GqlParams::new(),
+            &options,
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&correlated, 0), vec!["a"]);
+    let plan = gql_read_explain(correlated.plan.as_ref().expect("plan"));
+    assert_eq!(plan.target, GqlLoweringTarget::GraphPipelineQuery);
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("exists_predicates=1")));
+
+    let pushed_conjunct = engine
+        .execute_gql(
+            "MATCH (n:GqlSubExists) \
+             WHERE n.status = 'active' AND EXISTS { MATCH (n)-[:GQL_SUB_EXISTS_REL]->(m) RETURN m } \
+             RETURN n.key AS key ORDER BY key",
+            &GqlParams::new(),
+            &options,
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&pushed_conjunct, 0), vec!["a"]);
+    let plan = gql_read_explain(pushed_conjunct.plan.as_ref().expect("plan"));
+    assert!(
+        plan.pushed_down.iter().any(|item| item.contains("n.status")),
+        "expected subquery-free conjunct to stay pushdown-capable, got {:?}",
+        plan.pushed_down
+    );
+
+    let zero_visible = engine
+        .execute_gql(
+            "MATCH (:GqlSubExists) \
+             WHERE EXISTS { MATCH (m:GqlSubExists) RETURN m } \
+             RETURN 1 AS one",
+            &GqlParams::new(),
+            &options,
+        )
+        .unwrap();
+    assert_eq!(zero_visible.rows.len(), 3);
+    assert!(zero_visible
+        .rows
+        .iter()
+        .all(|row| row.values == vec![GqlValue::Int(1)]));
+
+    let repeated_key = engine
+        .execute_gql(
+            "MATCH (n:GqlSubExists) \
+             WITH n.status AS status \
+             WHERE EXISTS { MATCH (m:GqlSubExists) WHERE m.status = status RETURN m } \
+             RETURN status ORDER BY status",
+            &GqlParams::new(),
+            &options,
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&repeated_key, 0),
+        vec![
+            "active".to_string(),
+            "active".to_string(),
+            "stale".to_string()
+        ]
+    );
+    let plan = gql_read_explain(repeated_key.plan.as_ref().expect("plan"));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("subquery_invocations=2")));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("subquery_cache_hits=1")));
+
+    let uncorrelated = engine
+        .execute_gql(
+             "MATCH (n:GqlSubExists) \
+             WHERE EXISTS { MATCH (m:GqlSubExists) RETURN m } \
+             RETURN n.key AS key ORDER BY key",
+            &GqlParams::new(),
+            &options,
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&uncorrelated, 0),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+    let plan = gql_read_explain(uncorrelated.plan.as_ref().expect("plan"));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("subquery_invocations=1")));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("subquery_cache_hits=2")));
+
+    insert_query_node(&engine, "GqlSubNullMarker", "marker", &[], 1.0);
+    let null_key = engine
+        .execute_gql(
+            "MATCH (n:GqlSubExists) \
+             WITH n.missing AS missing \
+             WHERE EXISTS { MATCH (marker:GqlSubNullMarker) WHERE missing IS NULL RETURN marker } \
+             RETURN missing",
+            &GqlParams::new(),
+            &options,
+        )
+        .unwrap();
+    assert_eq!(null_key.rows.len(), 3);
+    assert!(null_key
+        .rows
+        .iter()
+        .all(|row| row.values == vec![GqlValue::Null]));
+    let plan = gql_read_explain(null_key.plan.as_ref().expect("plan"));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("subquery_invocations=1")));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("subquery_cache_hits=2")));
+
+    let epoch_a = insert_query_node(&engine, "GqlSubEpoch", "a", &[], 1.0);
+    let epoch_b = insert_query_node(&engine, "GqlSubEpoch", "b", &[], 1.0);
+    let epoch_c = insert_query_node(&engine, "GqlSubEpoch", "c", &[], 1.0);
+    engine
+        .upsert_edge(
+            epoch_a,
+            epoch_b,
+            "GQL_SUB_EPOCH_REL",
+            UpsertEdgeOptions::default(),
+        )
+        .unwrap();
+    engine
+        .upsert_edge(
+            epoch_b,
+            epoch_a,
+            "GQL_SUB_EPOCH_REL",
+            UpsertEdgeOptions::default(),
+        )
+        .unwrap();
+    let epoch_source = "MATCH (n:GqlSubEpoch) \
+                        WHERE EXISTS { MATCH (n)-[:GQL_SUB_EPOCH_REL]->(m) RETURN m } \
+                        RETURN n.key AS key ORDER BY key";
+    let first_epoch_page = engine
+        .execute_gql(
+            epoch_source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_rows: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&first_epoch_page, 0), vec!["a"]);
+    let cursor = first_epoch_page
+        .next_cursor
+        .clone()
+        .expect("first epoch page should return cursor");
+    let cursor_epoch =
+        graph_pipeline_decode_logical_cursor(&cursor, GraphPipelineOptions::default().max_cursor_bytes)
+            .unwrap()
+            .effective_at_epoch;
+    engine
+        .upsert_edge(
+            epoch_c,
+            epoch_a,
+            "GQL_SUB_EPOCH_REL",
+            UpsertEdgeOptions {
+                valid_from: Some(cursor_epoch.saturating_add(1)),
+                ..UpsertEdgeOptions::default()
+            },
+        )
+        .unwrap();
+    while now_millis() <= cursor_epoch.saturating_add(1) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let fresh_epoch_page = engine
+        .execute_gql(
+            epoch_source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_rows: 10,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&fresh_epoch_page, 0),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+    let second_epoch_page = engine
+        .execute_gql(
+            epoch_source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_rows: 10,
+                cursor: Some(cursor),
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&second_epoch_page, 0), vec!["b"]);
+}
+
+#[test]
+fn gql_exists_subquery_uses_physical_probe_for_simple_matches() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(&engine, "GqlSubExistsProbeOuter", "outer", &[], 1.0);
+    for index in 0..8 {
+        insert_query_node(
+            &engine,
+            "GqlSubExistsProbeInner",
+            &format!("inner-{index}"),
+            &[],
+            1.0,
+        );
+    }
+
+    let probe_options = GqlExecutionOptions {
+        allow_full_scan: true,
+        include_plan: true,
+        max_intermediate_bindings: 1,
+        ..gql_opts()
+    };
+    let broad_true = engine
+        .execute_gql(
+            "MATCH (outer:GqlSubExistsProbeOuter) \
+             WHERE EXISTS { MATCH (inner:GqlSubExistsProbeInner) RETURN inner } \
+             RETURN outer.key",
+            &GqlParams::new(),
+            &probe_options,
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&broad_true, 0), vec!["outer"]);
+    let plan = gql_read_explain(broad_true.plan.as_ref().expect("plan"));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("physical_exists_probe=true")));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("subquery_invocations=1")));
+
+    let broad_false = engine
+        .execute_gql(
+            "MATCH (outer:GqlSubExistsProbeOuter) \
+             WHERE EXISTS { MATCH (missing:GqlSubExistsProbeMissing) RETURN missing } \
+             RETURN outer.key",
+            &GqlParams::new(),
+            &probe_options,
+        )
+        .unwrap();
+    assert!(broad_false.rows.is_empty());
+
+    for projection in [
+        "inner.key AS key",
+        "id(inner) AS inner_id",
+        "{key: inner.key, id: id(inner)} AS payload",
+        "[inner.key, id(inner)] AS payload",
+    ] {
+        let projected_true = engine
+            .execute_gql(
+                &format!(
+                    "MATCH (outer:GqlSubExistsProbeOuter) \
+                     WHERE EXISTS {{ MATCH (inner:GqlSubExistsProbeInner) RETURN {projection} }} \
+                     RETURN outer.key"
+                ),
+                &GqlParams::new(),
+                &probe_options,
+            )
+            .unwrap();
+        assert_eq!(gql_string_column(&projected_true, 0), vec!["outer"]);
+        let plan = gql_read_explain(projected_true.plan.as_ref().expect("plan"));
+        assert!(
+            plan.projection
+                .iter()
+                .any(|item| item.contains("physical_exists_probe=true")),
+            "expected physical probe for projection {projection}, got {:?}",
+            plan.projection
+        );
+    }
+
+    let limit_zero = engine
+        .execute_gql(
+            "MATCH (outer:GqlSubExistsProbeOuter) \
+             WHERE EXISTS { MATCH (inner:GqlSubExistsProbeInner) RETURN inner LIMIT 0 } \
+             RETURN outer.key",
+            &GqlParams::new(),
+            &probe_options,
+        )
+        .unwrap();
+    assert!(limit_zero.rows.is_empty());
+
+    let unsafe_projection = engine
+        .execute_gql(
+            "MATCH (outer:GqlSubExistsProbeOuter) \
+             WHERE EXISTS { MATCH (inner:GqlSubExistsProbeInner) RETURN 1 / 0 AS boom } \
+             RETURN outer.key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                include_plan: true,
+                max_intermediate_bindings: 64,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        unsafe_projection.to_string().contains("division by zero")
+            || unsafe_projection.to_string().contains("divide by zero"),
+        "unexpected unsafe projection error: {unsafe_projection:?}"
+    );
+}
+
+#[test]
+fn gql_exists_subquery_probe_does_not_cap_raw_edge_candidates() {
+    let (_dir, engine) = query_test_engine();
+    let source = insert_query_node(&engine, "GqlSubExistsProbeEdgeSource", "source", &[], 1.0);
+    let miss = insert_query_node(&engine, "GqlSubExistsProbeEdgeMiss", "miss", &[], 1.0);
+    let hit = insert_query_node(&engine, "GqlSubExistsProbeEdgeHit", "hit", &[], 1.0);
+    engine
+        .upsert_edge(
+            source,
+            miss,
+            "GQL_SUB_EXISTS_PROBE_EDGE",
+            UpsertEdgeOptions::default(),
+        )
+        .unwrap();
+    engine
+        .upsert_edge(
+            source,
+            hit,
+            "GQL_SUB_EXISTS_PROBE_EDGE",
+            UpsertEdgeOptions::default(),
+        )
+        .unwrap();
+
+    let result = engine
+        .execute_gql(
+            "MATCH (source:GqlSubExistsProbeEdgeSource) \
+             WHERE EXISTS { \
+               MATCH (source)-[:GQL_SUB_EXISTS_PROBE_EDGE]->(target:GqlSubExistsProbeEdgeHit) \
+               RETURN target \
+             } \
+             RETURN source.key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_intermediate_bindings: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&result, 0), vec!["source"]);
+}
+
+#[test]
+fn gql_optional_match_where_exists_preserves_left_outer_semantics() {
+    let (_dir, engine) = query_test_engine();
+    let pass = insert_query_node(&engine, "GqlOptExistsOuter", "pass", &[], 1.0);
+    let pass_match = insert_query_node(&engine, "GqlOptExistsInner", "ok", &[], 1.0);
+    let fail = insert_query_node(&engine, "GqlOptExistsOuter", "fail", &[], 1.0);
+    let fail_match = insert_query_node(&engine, "GqlOptExistsInner", "bad", &[], 1.0);
+    let _miss = insert_query_node(&engine, "GqlOptExistsOuter", "miss", &[], 1.0);
+    let partial = insert_query_node(&engine, "GqlOptExistsOuter", "partial", &[], 1.0);
+    let partial_good = insert_query_node(&engine, "GqlOptExistsInner", "good", &[], 1.0);
+    let partial_bad = insert_query_node(&engine, "GqlOptExistsInner", "drop", &[], 1.0);
+    let marker = insert_query_node(&engine, "GqlOptExistsMarker", "marker", &[], 1.0);
+
+    for (from, to) in [
+        (pass, pass_match),
+        (fail, fail_match),
+        (partial, partial_good),
+        (partial, partial_bad),
+    ] {
+        engine
+            .upsert_edge(from, to, "GQL_OPT_EXISTS_REL", UpsertEdgeOptions::default())
+            .unwrap();
+    }
+    for from in [pass_match, partial_good] {
+        engine
+            .upsert_edge(
+                from,
+                marker,
+                "GQL_OPT_EXISTS_MARK",
+                UpsertEdgeOptions::default(),
+            )
+            .unwrap();
+    }
+
+    let result = engine
+        .execute_gql(
+            "MATCH (n:GqlOptExistsOuter) \
+             OPTIONAL MATCH (n)-[:GQL_OPT_EXISTS_REL]->(m:GqlOptExistsInner) \
+             WHERE EXISTS { MATCH (m)-[:GQL_OPT_EXISTS_MARK]->(marker:GqlOptExistsMarker) RETURN marker } \
+             RETURN n.key AS outer_key, m.key AS inner_key \
+             ORDER BY outer_key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    let rows = result
+        .rows
+        .iter()
+        .map(|row| row.values.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            vec![GqlValue::String("fail".to_string()), GqlValue::Null],
+            vec![GqlValue::String("miss".to_string()), GqlValue::Null],
+            vec![
+                GqlValue::String("partial".to_string()),
+                GqlValue::String("good".to_string())
+            ],
+            vec![
+                GqlValue::String("pass".to_string()),
+                GqlValue::String("ok".to_string())
+            ],
+        ]
+    );
+    let plan = gql_read_explain(result.plan.as_ref().expect("plan"));
+    assert!(plan.projection.iter().any(|item| {
+        item.contains("optional_candidate_filter=true")
+            && item.contains("optional_candidate_exists_predicates=1")
+    }));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("synthesized_miss_rows=1")));
+
+    let post_optional_filter = engine
+        .execute_gql(
+            "MATCH (n:GqlOptExistsOuter) \
+             OPTIONAL MATCH (n)-[:GQL_OPT_EXISTS_REL]->(m:GqlOptExistsInner) \
+             WITH n, m \
+             WHERE EXISTS { MATCH (m)-[:GQL_OPT_EXISTS_MARK]->(marker:GqlOptExistsMarker) RETURN marker } \
+             RETURN n.key AS outer_key, m.key AS inner_key \
+             ORDER BY outer_key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        post_optional_filter
+            .rows
+            .iter()
+            .map(|row| row.values.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                GqlValue::String("partial".to_string()),
+                GqlValue::String("good".to_string())
+            ],
+            vec![
+                GqlValue::String("pass".to_string()),
+                GqlValue::String("ok".to_string())
+            ],
+        ]
+    );
+}
+
+#[test]
+fn gql_optional_match_where_exists_reuses_canonical_candidate_cache() {
+    let (_dir, engine) = query_test_engine();
+    let outer = insert_query_node(&engine, "GqlOptExistsCacheOuter", "outer", &[], 1.0);
+    let first = insert_query_node(
+        &engine,
+        "GqlOptExistsCacheInner",
+        "first",
+        &[("bucket", PropValue::String("hit".to_string()))],
+        1.0,
+    );
+    let second = insert_query_node(
+        &engine,
+        "GqlOptExistsCacheInner",
+        "second",
+        &[("bucket", PropValue::String("hit".to_string()))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlOptExistsCacheMarker",
+        "marker",
+        &[("bucket", PropValue::String("hit".to_string()))],
+        1.0,
+    );
+    for target in [first, second] {
+        engine
+            .upsert_edge(
+                outer,
+                target,
+                "GQL_OPT_EXISTS_CACHE_REL",
+                UpsertEdgeOptions::default(),
+            )
+            .unwrap();
+    }
+
+    let result = engine
+        .execute_gql(
+            "MATCH (n:GqlOptExistsCacheOuter) \
+             WITH n, 'hit' AS bucket \
+             OPTIONAL MATCH (n)-[:GQL_OPT_EXISTS_CACHE_REL]->(m:GqlOptExistsCacheInner) \
+             WHERE EXISTS { \
+               MATCH (marker:GqlOptExistsCacheMarker) \
+               WHERE marker.bucket = bucket \
+               RETURN marker \
+             } \
+             RETURN m.key AS inner_key \
+             ORDER BY inner_key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&result, 0),
+        vec!["first".to_string(), "second".to_string()]
+    );
+    let plan = gql_read_explain(result.plan.as_ref().expect("plan"));
+    assert!(plan.projection.iter().any(|item| {
+        item.contains("optional candidate filter")
+            && item.contains("subquery_invocations=1")
+            && item.contains("subquery_cache_hits=1")
+    }));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("optional EXISTS subquery")));
+}
+
+#[test]
+fn gql_read_only_call_subqueries_inner_apply_and_cursor() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "GqlSubCall", "a", &[], 1.0);
+    let b = insert_query_node(&engine, "GqlSubCall", "b", &[], 1.0);
+    let c = insert_query_node(&engine, "GqlSubCall", "c", &[], 1.0);
+    engine
+        .upsert_edge(a, b, "GQL_SUB_CALL_REL", UpsertEdgeOptions::default())
+        .unwrap();
+    engine
+        .upsert_edge(a, c, "GQL_SUB_CALL_REL", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let source = "MATCH (n:GqlSubCall) \
+                  CALL { MATCH (n)-[:GQL_SUB_CALL_REL]->(m) RETURN m, m.key AS friend } \
+                  RETURN n.key AS source, friend, id(m) AS mid \
+                  ORDER BY source, friend";
+    let options = GqlExecutionOptions {
+        allow_full_scan: true,
+        include_plan: true,
+        ..gql_opts()
+    };
+    let result = engine
+        .execute_gql(source, &GqlParams::new(), &options)
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&result, 0),
+        vec!["a".to_string(), "a".to_string()]
+    );
+    assert_eq!(
+        gql_string_column(&result, 1),
+        vec!["b".to_string(), "c".to_string()]
+    );
+    assert_eq!(gql_u64_column(&result, 2), vec![b, c]);
+    let plan = gql_read_explain(result.plan.as_ref().expect("plan"));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("graph pipeline stage") && item.contains("Call")));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("invocations=3")));
+
+    let no_order_source = "MATCH (n:GqlSubCall) WHERE n.key = 'a' \
+                           CALL { \
+                             MATCH (n)-[:GQL_SUB_CALL_REL]->(m) \
+                             RETURN m.key AS friend ORDER BY friend DESC \
+                           } \
+                           RETURN friend";
+    let no_order = engine
+        .execute_gql(no_order_source, &GqlParams::new(), &options)
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&no_order, 0),
+        vec!["c".to_string(), "b".to_string()]
+    );
+    let first_no_order = engine
+        .execute_gql(
+            no_order_source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_rows: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&first_no_order, 0), vec!["c"]);
+    let no_order_cursor = first_no_order
+        .next_cursor
+        .expect("first no-order CALL page should return cursor");
+    let second_no_order = engine
+        .execute_gql(
+            no_order_source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_rows: 1,
+                cursor: Some(no_order_cursor),
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&second_no_order, 0), vec!["b"]);
+
+    let first = engine
+        .execute_gql(
+            source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_rows: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&first, 1), vec!["b"]);
+    let cursor = first.next_cursor.expect("first page should return cursor");
+    let second = engine
+        .execute_gql(
+            source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_rows: 1,
+                cursor: Some(cursor),
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&second, 1), vec!["c"]);
+    assert!(second.next_cursor.is_none());
+}
+
+#[test]
+fn gql_call_subquery_does_not_truncate_inner_rows_to_outer_page_cap() {
+    let (_dir, engine) = query_test_engine();
+    let outer = insert_query_node(&engine, "GqlSubCallPageOuter", "outer", &[], 1.0);
+    for key in ["a", "b", "c"] {
+        let inner = insert_query_node(&engine, "GqlSubCallPageInner", key, &[], 1.0);
+        engine
+            .upsert_edge(
+                outer,
+                inner,
+                "GQL_SUB_CALL_PAGE_REL",
+                UpsertEdgeOptions::default(),
+            )
+            .unwrap();
+    }
+
+    let source = "MATCH (n:GqlSubCallPageOuter) WHERE n.key = 'outer' \
+                  CALL { \
+                    MATCH (n)-[:GQL_SUB_CALL_PAGE_REL]->(m:GqlSubCallPageInner) \
+                    RETURN m.key AS friend ORDER BY friend \
+                  } \
+                  RETURN friend ORDER BY friend";
+    let first = engine
+        .execute_gql(
+            source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_rows: 2,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&first, 0),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    let cursor = first
+        .next_cursor
+        .expect("CALL rows beyond the outer page cap should remain pageable");
+    let second = engine
+        .execute_gql(
+            source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_rows: 2,
+                cursor: Some(cursor),
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&second, 0), vec!["c".to_string()]);
+    assert!(second.next_cursor.is_none());
+}
+
+#[test]
+fn gql_call_subquery_enforces_joined_cache_materialization_cap() {
+    let (_dir, engine) = query_test_engine();
+    for outer_key in ["outer-a", "outer-b", "outer-c"] {
+        insert_query_node(
+            &engine,
+            "GqlSubCallCapOuter",
+            outer_key,
+            &[("bucket", PropValue::String("hit".to_string()))],
+            1.0,
+        );
+    }
+    for inner_key in ["inner-a", "inner-b"] {
+        insert_query_node(
+            &engine,
+            "GqlSubCallCapInner",
+            inner_key,
+            &[("bucket", PropValue::String("hit".to_string()))],
+            1.0,
+        );
+    }
+
+    let err = engine
+        .execute_gql(
+            "MATCH (n:GqlSubCallCapOuter) \
+             WITH n.bucket AS bucket, n.key AS source \
+             CALL { \
+               MATCH (m:GqlSubCallCapInner) \
+               WHERE m.bucket = bucket \
+               RETURN m.key AS friend ORDER BY friend \
+             } \
+             RETURN source, friend \
+             ORDER BY source, friend",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_pipeline_rows: 5,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("max_pipeline_rows"),
+        "unexpected CALL materialization cap error: {err:?}"
+    );
+}
+
+#[test]
+fn gql_exists_subquery_union_branches_see_correlated_imports_and_cache() {
+    let (_dir, engine) = query_test_engine();
+    for (key, bucket) in [
+        ("left-a", "left"),
+        ("left-b", "left"),
+        ("right-a", "right"),
+        ("miss-a", "miss"),
+    ] {
+        insert_query_node(
+            &engine,
+            "GqlSubUnionExistsOuter",
+            key,
+            &[("bucket", PropValue::String(bucket.to_string()))],
+            1.0,
+        );
+    }
+    insert_query_node(
+        &engine,
+        "GqlSubUnionExistsLeft",
+        "left-marker",
+        &[("bucket", PropValue::String("left".to_string()))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlSubUnionExistsRight",
+        "right-marker",
+        &[("bucket", PropValue::String("right".to_string()))],
+        1.0,
+    );
+
+    let result = engine
+        .execute_gql(
+            "MATCH (n:GqlSubUnionExistsOuter) \
+             WITH n.bucket AS bucket, n.key AS key \
+             WHERE EXISTS { \
+               MATCH (left:GqlSubUnionExistsLeft) WHERE left.bucket = bucket RETURN left AS hit \
+               UNION \
+               MATCH (right:GqlSubUnionExistsRight) WHERE right.bucket = bucket RETURN right AS hit \
+             } \
+             RETURN key ORDER BY key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&result, 0),
+        vec![
+            "left-a".to_string(),
+            "left-b".to_string(),
+            "right-a".to_string()
+        ]
+    );
+    let plan = gql_read_explain(result.plan.as_ref().expect("plan"));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("subquery_invocations=3")));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("subquery_cache_hits=1")));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("internal_limit=true")));
+}
+
+#[test]
+fn gql_call_subquery_union_branches_see_correlated_imports_and_dedupe() {
+    let (_dir, engine) = query_test_engine();
+    let one = insert_query_node(&engine, "GqlSubUnionCallOuter", "one", &[], 1.0);
+    let two = insert_query_node(&engine, "GqlSubUnionCallOuter", "two", &[], 1.0);
+    insert_query_node(&engine, "GqlSubUnionCallOuter", "none", &[], 1.0);
+    let alpha = insert_query_node(&engine, "GqlSubUnionCallInner", "alpha", &[], 1.0);
+    let beta = insert_query_node(&engine, "GqlSubUnionCallInner", "beta", &[], 1.0);
+    let gamma = insert_query_node(&engine, "GqlSubUnionCallInner", "gamma", &[], 1.0);
+
+    for (from, to, label) in [
+        (one, alpha, "GQL_SUB_UNION_CALL_A"),
+        (one, alpha, "GQL_SUB_UNION_CALL_B"),
+        (one, beta, "GQL_SUB_UNION_CALL_B"),
+        (two, gamma, "GQL_SUB_UNION_CALL_B"),
+    ] {
+        engine
+            .upsert_edge(from, to, label, UpsertEdgeOptions::default())
+            .unwrap();
+    }
+
+    let result = engine
+        .execute_gql(
+            "MATCH (n:GqlSubUnionCallOuter) \
+             CALL { \
+               MATCH (n)-[:GQL_SUB_UNION_CALL_A]->(m:GqlSubUnionCallInner) \
+               RETURN m.key AS friend, m AS friend_node \
+               UNION \
+               MATCH (n)-[:GQL_SUB_UNION_CALL_B]->(m:GqlSubUnionCallInner) \
+               RETURN m.key AS friend, m AS friend_node \
+             } \
+             RETURN n.key AS source, friend, id(friend_node) AS friend_id \
+             ORDER BY source, friend",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        result
+            .rows
+            .iter()
+            .map(|row| row.values.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                GqlValue::String("one".to_string()),
+                GqlValue::String("alpha".to_string()),
+                GqlValue::UInt(alpha),
+            ],
+            vec![
+                GqlValue::String("one".to_string()),
+                GqlValue::String("beta".to_string()),
+                GqlValue::UInt(beta),
+            ],
+            vec![
+                GqlValue::String("two".to_string()),
+                GqlValue::String("gamma".to_string()),
+                GqlValue::UInt(gamma),
+            ],
+        ]
+    );
+    let plan = gql_read_explain(result.plan.as_ref().expect("plan"));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("graph pipeline stage") && item.contains("Call")));
+    assert!(plan
+        .projection
+        .iter()
+        .any(|item| item.contains("Union")));
+}
+
+#[test]
+fn gql_call_subquery_mixed_union_output_cursor_resumes() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(&engine, "GqlSubUnionMixedCursorOuter", "outer", &[], 1.0);
+    let source = insert_query_node(&engine, "GqlSubUnionMixedCursor", "node", &[], 1.0);
+    let target = insert_query_node(&engine, "GqlSubUnionMixedCursor", "target", &[], 1.0);
+    let edge = engine
+        .upsert_edge(
+            source,
+            target,
+            "GQL_SUB_UNION_MIXED_CURSOR_REL",
+            UpsertEdgeOptions::default(),
+        )
+        .unwrap();
+
+    for query in [
+        "MATCH (outer:GqlSubUnionMixedCursorOuter) \
+         CALL { \
+           MATCH (m:GqlSubUnionMixedCursor) WHERE m.key = 'node' RETURN m AS mixed \
+           UNION \
+           MATCH (a:GqlSubUnionMixedCursor)-[r:GQL_SUB_UNION_MIXED_CURSOR_REL]->(b:GqlSubUnionMixedCursor) RETURN r AS mixed \
+         } \
+         RETURN mixed ORDER BY mixed",
+        "MATCH (outer:GqlSubUnionMixedCursorOuter) \
+         CALL { \
+           MATCH (a:GqlSubUnionMixedCursor)-[r:GQL_SUB_UNION_MIXED_CURSOR_REL]->(b:GqlSubUnionMixedCursor) RETURN r AS mixed \
+           UNION \
+           MATCH (m:GqlSubUnionMixedCursor) WHERE m.key = 'node' RETURN m AS mixed \
+         } \
+         RETURN mixed ORDER BY mixed",
+    ] {
+        let first = engine
+            .execute_gql(
+                query,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    allow_full_scan: true,
+                    max_rows: 1,
+                    ..gql_opts()
+                },
+        )
+        .unwrap();
+        assert_eq!(first.rows.len(), 1);
+        assert_eq!(first.rows[0].values[0], GqlValue::UInt(source));
+        let cursor = first
+            .next_cursor
+            .clone()
+            .expect("mixed CALL UNION first page should return cursor");
+        let second = engine
+            .execute_gql(
+                query,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    allow_full_scan: true,
+                    max_rows: 1,
+                    cursor: Some(cursor),
+                    ..gql_opts()
+                },
+        )
+        .unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.rows[0].values[0], GqlValue::UInt(edge));
+        assert!(second.next_cursor.is_none());
+    }
+}
+
+#[test]
+fn gql_read_only_subqueries_reject_mutation_collision_depth_and_caps() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(&engine, "GqlSubReject", "a", &[], 1.0);
+    insert_query_node(&engine, "GqlSubReject", "b", &[], 1.0);
+
+    for source in [
+        "MATCH (n:GqlSubReject) WHERE EXISTS { CREATE (m) RETURN m } RETURN n",
+        "MATCH (n:GqlSubReject) CALL { CREATE (m) RETURN m } RETURN n",
+        "CREATE (n:GqlSubReject {key: 'x'}) CALL { MATCH (m) RETURN m } RETURN n",
+    ] {
+        let err = engine
+            .execute_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    allow_full_scan: true,
+                    ..gql_opts()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::GqlUnsupported { .. }
+                    | EngineError::GqlParse { .. }
+                    | EngineError::GqlSemantic { .. }
+            ),
+            "expected subquery reject for {source}, got {err:?}"
+        );
+    }
+
+    let collision = engine
+        .execute_gql(
+            "MATCH (n:GqlSubReject) \
+             CALL { MATCH (n) RETURN n } \
+             RETURN n",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        collision.to_string().contains("collides"),
+        "unexpected collision error: {collision:?}"
+    );
+
+    let branch_local_leak = engine
+        .execute_gql(
+            "MATCH (n:GqlSubReject) \
+             WHERE EXISTS { \
+               MATCH (m:GqlSubReject) RETURN m AS item \
+               UNION \
+               MATCH (x:GqlSubReject) WHERE x.key = m.key RETURN x AS item \
+             } \
+             RETURN n",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        branch_local_leak.to_string().contains("unknown variable 'm'"),
+        "unexpected branch-local alias leak error: {branch_local_leak:?}"
+    );
+
+    let left = insert_query_node(&engine, "GqlSubRejectMixedUnion", "left", &[], 1.0);
+    let right = insert_query_node(&engine, "GqlSubRejectMixedUnion", "right", &[], 1.0);
+    engine
+        .upsert_edge(
+            left,
+            right,
+            "GQL_SUB_REJECT_MIXED_UNION_REL",
+            UpsertEdgeOptions::default(),
+        )
+        .unwrap();
+    for source in [
+        "MATCH (n:GqlSubReject) \
+         CALL { \
+           MATCH (m:GqlSubRejectMixedUnion) RETURN m AS mixed \
+           UNION \
+           MATCH (a:GqlSubRejectMixedUnion)-[r:GQL_SUB_REJECT_MIXED_UNION_REL]->(b:GqlSubRejectMixedUnion) RETURN r AS mixed \
+         } \
+         RETURN id(mixed)",
+        "MATCH (n:GqlSubReject) \
+         CALL { \
+           MATCH (a:GqlSubRejectMixedUnion)-[r:GQL_SUB_REJECT_MIXED_UNION_REL]->(b:GqlSubRejectMixedUnion) RETURN r AS mixed \
+           UNION \
+           MATCH (m:GqlSubRejectMixedUnion) RETURN m AS mixed \
+         } \
+         RETURN id(mixed)",
+    ] {
+        let mixed_union_err = engine
+            .execute_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    allow_full_scan: true,
+                    ..gql_opts()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            mixed_union_err
+                .to_string()
+                .contains("expects a node or edge alias"),
+            "unexpected mixed union kind error: {mixed_union_err:?}"
+        );
+    }
+
+    let nested = "MATCH (n:GqlSubReject) \
+                  WHERE EXISTS { \
+                    MATCH (m:GqlSubReject) \
+                    WHERE EXISTS { MATCH (x:GqlSubReject) RETURN x } \
+                    RETURN m \
+                  } \
+                  RETURN n.key AS key ORDER BY key";
+    let ok = engine
+        .execute_gql(
+            nested,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_subquery_depth: 2,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&ok, 0),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    let depth_err = engine
+        .execute_gql(
+            nested,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_subquery_depth: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        depth_err.to_string().contains("max_subquery_depth"),
+        "unexpected depth error: {depth_err:?}"
+    );
+
+    let cap_err = engine
+        .execute_gql(
+            "MATCH (n:GqlSubReject) \
+             WHERE EXISTS { MATCH (n) RETURN n } \
+             RETURN n.key",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_subquery_invocations: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        cap_err.to_string().contains("max_subquery_invocations"),
+        "unexpected cap error: {cap_err:?}"
+    );
+
+    let nested_cap_err = engine
+        .execute_gql(
+            nested,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                allow_full_scan: true,
+                max_subquery_depth: 2,
+                max_subquery_invocations: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        nested_cap_err
+            .to_string()
+            .contains("max_subquery_invocations"),
+        "unexpected nested cap error: {nested_cap_err:?}"
+    );
+}
+
+#[test]
+fn gql_with_pipeline_executes_projection_and_seeded_match_stages() {
+    let (_dir, engine) = query_test_engine();
+    let ada = insert_query_node(
+        &engine,
+        "WithPerson",
+        "with-pipeline-ada",
+        &[
+            ("name", PropValue::String("Ada".to_string())),
+            ("rank", PropValue::Int(1)),
+        ],
+        1.0,
+    );
+    let bob = insert_query_node(
+        &engine,
+        "WithPerson",
+        "with-pipeline-bob",
+        &[
+            ("name", PropValue::String("Bob".to_string())),
+            ("rank", PropValue::Int(2)),
+        ],
+        1.0,
+    );
+    let carol = insert_query_node(
+        &engine,
+        "WithPerson",
+        "with-pipeline-carol",
+        &[
+            ("name", PropValue::String("Carol".to_string())),
+            ("rank", PropValue::Int(3)),
+        ],
+        1.0,
+    );
+    let ada_topic = insert_query_node(
+        &engine,
+        "WithTopic",
+        "with-pipeline-ada-topic",
+        &[("name", PropValue::String("Graph".to_string()))],
+        1.0,
+    );
+    let bob_topic = insert_query_node(
+        &engine,
+        "WithTopic",
+        "with-pipeline-bob-topic",
+        &[("name", PropValue::String("Rust".to_string()))],
+        1.0,
+    );
+    engine
+        .upsert_edge(ada, ada_topic, "WITH_PIPELINE_REL", UpsertEdgeOptions::default())
+        .unwrap();
+    engine
+        .upsert_edge(bob, bob_topic, "WITH_PIPELINE_REL", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let passthrough = execute_gql_ok(
+        &engine,
+        "MATCH (n:WithPerson) WITH n RETURN n ORDER BY id(n)",
+    );
+    let passthrough_ids = passthrough
+        .rows
+        .iter()
+        .map(|row| gql_single_node(&row.values[0]).id.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(passthrough_ids, vec![ada, bob, carol]);
+
+    let renamed = execute_gql_ok(
+        &engine,
+        "MATCH (n:WithPerson) WITH n AS x RETURN id(x) AS id ORDER BY id",
+    );
+    assert_eq!(gql_u64_column(&renamed, 0), vec![ada, bob, carol]);
+
+    let scalar = execute_gql_ok(
+        &engine,
+        "MATCH (n:WithPerson) WITH n.name AS name \
+         WHERE name STARTS WITH 'A' RETURN name ORDER BY name",
+    );
+    assert_eq!(gql_string_column(&scalar, 0), vec!["Ada".to_string()]);
+
+    let repeated_star = execute_gql_ok(
+        &engine,
+        "MATCH (n:WithPerson) WITH n WITH * RETURN n.name AS name ORDER BY name",
+    );
+    assert_eq!(
+        gql_string_column(&repeated_star, 0),
+        vec!["Ada".to_string(), "Bob".to_string(), "Carol".to_string()]
+    );
+
+    let seeded_required = execute_gql_ok(
+        &engine,
+        "MATCH (n:WithPerson) WITH n ORDER BY n.rank SKIP 1 LIMIT 1 \
+         MATCH (n)-[:WITH_PIPELINE_REL]->(m:WithTopic) \
+         RETURN n.name AS person, m.name AS topic",
+    );
+    assert_eq!(
+        seeded_required.rows[0].values,
+        vec![
+            GqlValue::String("Bob".to_string()),
+            GqlValue::String("Rust".to_string())
+        ]
+    );
+
+    let seeded_optional = execute_gql_ok(
+        &engine,
+        &format!(
+            "MATCH (n:WithPerson) WHERE id(n) = {carol} WITH n \
+             OPTIONAL MATCH (n)-[r:WITH_PIPELINE_REL]->(m:WithTopic) \
+             RETURN id(n) AS n, id(r) AS r, id(m) AS m"
+        ),
+    );
+    assert_eq!(
+        seeded_optional.rows[0].values,
+        vec![GqlValue::UInt(carol), GqlValue::Null, GqlValue::Null]
+    );
+
+    let null_seeded_required = execute_gql_ok(
+        &engine,
+        &format!(
+            "MATCH (n:WithPerson) WHERE id(n) = {carol} \
+             OPTIONAL MATCH (n)-[:WITH_PIPELINE_REL]->(m:WithTopic) \
+             WITH m MATCH (m)-[:WITH_PIPELINE_REL]->(x) RETURN id(x) AS x"
+        ),
+    );
+    assert!(null_seeded_required.rows.is_empty());
+}
+
+#[test]
+fn gql_with_where_filters_after_projection_row_ops() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(
+        &engine,
+        "WithWhereBarrier",
+        "with-where-top-inactive",
+        &[
+            ("name", PropValue::String("top-inactive".to_string())),
+            ("score", PropValue::Int(100)),
+            ("active", PropValue::Bool(false)),
+        ],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "WithWhereBarrier",
+        "with-where-second-active",
+        &[
+            ("name", PropValue::String("second-active".to_string())),
+            ("score", PropValue::Int(90)),
+            ("active", PropValue::Bool(true)),
+        ],
+        1.0,
+    );
+
+    let top_then_filter = execute_gql_ok(
+        &engine,
+        "MATCH (n:WithWhereBarrier) \
+         WITH n ORDER BY n.score DESC LIMIT 1 WHERE n.active \
+         RETURN n.name AS name",
+    );
+    assert!(top_then_filter.rows.is_empty());
+
+    let filter_then_top = execute_gql_ok(
+        &engine,
+        "MATCH (n:WithWhereBarrier) WHERE n.active \
+         WITH n ORDER BY n.score DESC LIMIT 1 \
+         RETURN n.name AS name",
+    );
+    assert_eq!(
+        gql_string_column(&filter_then_top, 0),
+        vec!["second-active".to_string()]
+    );
+}
+
+#[test]
+fn gql_with_pipeline_explain_reports_native_match_and_project_stages() {
+    let (_dir, engine) = query_test_engine();
+    let n = insert_query_node(
+        &engine,
+        "WithExplain",
+        "with-explain-n",
+        &[("name", PropValue::String("Ada".to_string()))],
+        1.0,
+    );
+    let result = engine
+        .execute_gql(
+            "MATCH (n:WithExplain) WITH n.name AS name RETURN name ORDER BY name",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                profile: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(result.rows[0].values, vec![GqlValue::String("Ada".to_string())]);
+    let plan = result.plan.as_ref().expect("include_plan should return plan");
+    let read = gql_read_explain(plan);
+    assert_eq!(read.target, GqlLoweringTarget::GraphPipelineQuery);
+    assert!(read
+        .projection
+        .iter()
+        .any(|item| item.contains("graph pipeline stage 0: Match")));
+    assert!(read
+        .projection
+        .iter()
+        .any(|item| item.contains("Project(With)")));
+    assert!(read
+        .projection
+        .iter()
+        .any(|item| item.contains("nested graph row plan")));
+    assert_eq!(gql_string_column(&result, 0), vec!["Ada".to_string()]);
+
+    let explain = engine
+        .explain_gql(
+            &format!("MATCH (n:WithExplain) WHERE id(n) = {n} WITH n RETURN id(n) AS id"),
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    let read = gql_read_explain(&explain);
+    assert_eq!(read.target, GqlLoweringTarget::GraphPipelineQuery);
+    assert!(read
+        .projection
+        .iter()
+        .any(|item| item.contains("graph pipeline stage")));
+}
+
+#[test]
+fn gql_distinct_projection_deduplicates_scalars_and_visible_star_rows() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(
+        &engine,
+        "DistinctScalar",
+        "int-one",
+        &[
+            ("score", PropValue::Int(1)),
+            ("flag", PropValue::Bool(true)),
+            ("name", PropValue::String("Ada".to_string())),
+            ("bytes", PropValue::Bytes(vec![1, 2])),
+        ],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "DistinctScalar",
+        "uint-one",
+        &[("score", PropValue::UInt(1)), ("flag", PropValue::Bool(true))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "DistinctScalar",
+        "float-one",
+        &[("score", PropValue::Float(1.0)), ("flag", PropValue::Bool(false))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "DistinctScalar",
+        "two",
+        &[("score", PropValue::Int(2)), ("flag", PropValue::Bool(false))],
+        1.0,
+    );
+
+    let exact_numeric = execute_gql_ok(
+        &engine,
+        "MATCH (n:DistinctScalar) RETURN DISTINCT n.score AS score ORDER BY score",
+    );
+    assert_eq!(
+        gql_u64_or_i64_values(&exact_numeric, 0),
+        vec!["1".to_string(), "2".to_string()]
+    );
+
+    let scalar_domains = execute_gql_ok(
+        &engine,
+        "MATCH (n:DistinctScalar) RETURN DISTINCT n.flag AS flag ORDER BY flag",
+    );
+    assert_eq!(
+        scalar_domains
+            .rows
+            .iter()
+            .map(|row| row.values[0].clone())
+            .collect::<Vec<_>>(),
+        vec![GqlValue::Bool(false), GqlValue::Bool(true)]
+    );
+    let bytes = execute_gql_ok(
+        &engine,
+        "MATCH (n:DistinctScalar) RETURN DISTINCT n.bytes AS bytes",
+    );
+    assert!(bytes
+        .rows
+        .iter()
+        .any(|row| row.values[0] == GqlValue::Bytes(vec![1, 2])));
+    assert!(bytes.rows.iter().any(|row| row.values[0] == GqlValue::Null));
+
+    let list_key = execute_gql_ok(
+        &engine,
+        "MATCH (n:DistinctScalar) RETURN DISTINCT [n.score] AS bucket",
+    );
+    assert_eq!(list_key.rows.len(), 2);
+    let map_key = execute_gql_ok(
+        &engine,
+        "MATCH (n:DistinctScalar) RETURN DISTINCT {score: n.score} AS bucket",
+    );
+    assert_eq!(map_key.rows.len(), 2);
+
+    let a = insert_query_node(&engine, "DistinctStar", "a", &[], 1.0);
+    let b = insert_query_node(&engine, "DistinctStar", "b", &[], 1.0);
+    engine
+        .upsert_edge(a, b, "DISTINCT_STAR_A", UpsertEdgeOptions::default())
+        .unwrap();
+    engine
+        .upsert_edge(a, b, "DISTINCT_STAR_B", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let return_star = execute_gql_ok(&engine, "MATCH (a:DistinctStar)-[]->(b) RETURN DISTINCT *");
+    assert_eq!(return_star.rows.len(), 1);
+    assert_eq!(return_star.rows, return_star_id_rows(a, b));
+
+    let with_star = execute_gql_ok(
+        &engine,
+        "MATCH (a:DistinctStar)-[]->(b) WITH DISTINCT * RETURN id(a), id(b)",
+    );
+    assert_eq!(with_star.rows, return_star_id_rows(a, b));
+}
+
+#[test]
+fn gql_distinct_projection_handles_graph_identity_values_and_caps() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "DistinctGraph", "a", &[], 1.0);
+    let b = insert_query_node(&engine, "DistinctGraph", "b", &[], 1.0);
+    let c = insert_query_node(&engine, "DistinctGraph", "c", &[], 1.0);
+    let ab = engine
+        .upsert_edge(a, b, "DISTINCT_GRAPH_A", UpsertEdgeOptions::default())
+        .unwrap();
+    let ac = engine
+        .upsert_edge(a, c, "DISTINCT_GRAPH_B", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let graph_identity_options = GqlExecutionOptions {
+        allow_full_scan: true,
+        ..gql_opts()
+    };
+    let nodes = execute_gql_with_options(
+        &engine,
+        &format!("MATCH (a:DistinctGraph)-[]->(b) WHERE id(a) = {a} RETURN DISTINCT a"),
+        graph_identity_options.clone(),
+    );
+    assert_eq!(nodes.rows.len(), 1);
+    assert_eq!(gql_single_node(&nodes.rows[0].values[0]).id, Some(a));
+
+    let edges = execute_gql_with_options(
+        &engine,
+        &format!(
+            "MATCH (a:DistinctGraph)-[r]->(b) WHERE id(a) = {a} RETURN DISTINCT r ORDER BY id(r)"
+        ),
+        graph_identity_options.clone(),
+    );
+    assert_eq!(
+        edges
+            .rows
+            .iter()
+            .map(|row| gql_single_edge(&row.values[0]).id.unwrap())
+            .collect::<Vec<_>>(),
+        vec![ab, ac]
+    );
+
+    let paths = execute_gql_with_options(
+        &engine,
+        &format!("MATCH p = (a:DistinctGraph)-[]->(b) WHERE id(a) = {a} RETURN DISTINCT p ORDER BY p"),
+        graph_identity_options,
+    );
+    assert_eq!(
+        paths
+            .rows
+            .iter()
+            .map(|row| gql_single_path(&row.values[0]).edge_ids.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![ab], vec![ac]]
+    );
+
+    let err = engine
+        .execute_gql(
+            "MATCH (n:DistinctGraph) RETURN DISTINCT n",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_groups: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("max_groups"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn gql_aggregate_projection_executes_grouped_global_and_null_semantics() {
+    let (_dir, engine) = query_test_engine();
+    for (key, kind, score, name) in [
+        ("a", "x", PropValue::Int(1), "Ada"),
+        ("b", "x", PropValue::UInt(2), "Bob"),
+        ("c", "y", PropValue::Float(3.5), "Cy"),
+        ("d", "y", PropValue::Null, "Dee"),
+        ("e", "z", PropValue::Int(-1), "Eve"),
+    ] {
+        insert_query_node(
+            &engine,
+            "AggPerson",
+            key,
+            &[
+                ("kind", PropValue::String(kind.to_string())),
+                ("score", score),
+                ("name", PropValue::String(name.to_string())),
+            ],
+            1.0,
+        );
+    }
+
+    let grouped = execute_gql_ok(
+        &engine,
+        "MATCH (n:AggPerson) RETURN n.kind AS k, count(*) AS c ORDER BY k",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            GqlRow {
+                values: vec![GqlValue::String("x".to_string()), GqlValue::UInt(2)]
+            },
+            GqlRow {
+                values: vec![GqlValue::String("y".to_string()), GqlValue::UInt(2)]
+            },
+            GqlRow {
+                values: vec![GqlValue::String("z".to_string()), GqlValue::UInt(1)]
+            },
+        ]
+    );
+
+    let global = execute_gql_ok(
+        &engine,
+        "MATCH (n:AggPerson) RETURN count(*) AS rows, count(n.score) AS scored, sum(n.score) AS sum, avg(n.score) AS avg, min(n.score) AS min, max(n.score) AS max",
+    );
+    assert_eq!(global.rows.len(), 1);
+    assert_eq!(global.rows[0].values[0], GqlValue::UInt(5));
+    assert_eq!(global.rows[0].values[1], GqlValue::UInt(4));
+    assert_eq!(global.rows[0].values[2], GqlValue::Float(5.5));
+    assert_eq!(global.rows[0].values[3], GqlValue::Float(1.375));
+    assert_eq!(global.rows[0].values[4], GqlValue::Int(-1));
+    assert_eq!(global.rows[0].values[5], GqlValue::Float(3.5));
+
+    let zero_global = execute_gql_ok(
+        &engine,
+        "MATCH (n:AggMissing) RETURN count(*) AS rows, count(n.score) AS scored, sum(n.score) AS sum, avg(n.score) AS avg, min(n.score) AS min, max(n.score) AS max, collect(n.score) AS values",
+    );
+    assert_eq!(
+        zero_global.rows[0].values,
+        vec![
+            GqlValue::UInt(0),
+            GqlValue::UInt(0),
+            GqlValue::Null,
+            GqlValue::Null,
+            GqlValue::Null,
+            GqlValue::Null,
+            GqlValue::List(Vec::new()),
+        ]
+    );
+
+    let zero_grouped = execute_gql_ok(
+        &engine,
+        "MATCH (n:AggMissing) RETURN n.kind AS k, count(*) AS rows",
+    );
+    assert!(zero_grouped.rows.is_empty());
+
+    let only_nulls = execute_gql_ok(
+        &engine,
+        "MATCH (n:AggPerson) WHERE n.score IS NULL RETURN count(n.score), sum(n.score), avg(n.score), min(n.score), max(n.score), collect(n.score)",
+    );
+    assert_eq!(
+        only_nulls.rows[0].values,
+        vec![
+            GqlValue::UInt(0),
+            GqlValue::Null,
+            GqlValue::Null,
+            GqlValue::Null,
+            GqlValue::Null,
+            GqlValue::List(Vec::new()),
+        ]
+    );
+}
+
+#[test]
+fn gql_aggregate_projection_supports_distinct_collect_alias_filter_and_order() {
+    let (_dir, engine) = query_test_engine();
+    for (key, kind, name) in [
+        ("a", "x", "Ada"),
+        ("b", "x", "Bob"),
+        ("c", "x", "Ada"),
+        ("d", "y", "Cy"),
+        ("e", "y", "Cy"),
+        ("f", "z", "Zed"),
+    ] {
+        insert_query_node(
+            &engine,
+            "AggCollect",
+            key,
+            &[
+                ("kind", PropValue::String(kind.to_string())),
+                ("name", PropValue::String(name.to_string())),
+            ],
+            1.0,
+        );
+    }
+
+    let collect = execute_gql_ok(
+        &engine,
+        "MATCH (n:AggCollect) RETURN collect(n.name) AS names, collect(DISTINCT n.name) AS unique_names, count(DISTINCT n.name) AS unique_count",
+    );
+    assert_eq!(
+        collect.rows[0].values,
+        vec![
+            GqlValue::List(vec![
+                GqlValue::String("Ada".to_string()),
+                GqlValue::String("Bob".to_string()),
+                GqlValue::String("Ada".to_string()),
+                GqlValue::String("Cy".to_string()),
+                GqlValue::String("Cy".to_string()),
+                GqlValue::String("Zed".to_string()),
+            ]),
+            GqlValue::List(vec![
+                GqlValue::String("Ada".to_string()),
+                GqlValue::String("Bob".to_string()),
+                GqlValue::String("Cy".to_string()),
+                GqlValue::String("Zed".to_string()),
+            ]),
+            GqlValue::UInt(4),
+        ]
+    );
+
+    let alias_filter = execute_gql_ok(
+        &engine,
+        "MATCH (n:AggCollect) WITH n.kind AS k, count(*) AS c WHERE c > 1 RETURN k, c ORDER BY k",
+    );
+    assert_eq!(
+        alias_filter.rows,
+        vec![
+            GqlRow {
+                values: vec![GqlValue::String("x".to_string()), GqlValue::UInt(3)]
+            },
+            GqlRow {
+                values: vec![GqlValue::String("y".to_string()), GqlValue::UInt(2)]
+            },
+        ]
+    );
+
+    let ordered = execute_gql_ok(
+        &engine,
+        "MATCH (n:AggCollect) RETURN n.kind AS k, count(*) AS c ORDER BY count(*) DESC, k ASC",
+    );
+    assert_eq!(
+        ordered
+            .rows
+            .iter()
+            .map(|row| row.values.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![GqlValue::String("x".to_string()), GqlValue::UInt(3)],
+            vec![GqlValue::String("y".to_string()), GqlValue::UInt(2)],
+            vec![GqlValue::String("z".to_string()), GqlValue::UInt(1)],
+        ]
+    );
+
+    let scalar_expr = execute_gql_ok(
+        &engine,
+        "MATCH (n:AggCollect) RETURN count(*) + 1 AS total",
+    );
+    assert_eq!(scalar_expr.rows[0].values[0], GqlValue::Int(7));
+
+    let max_collect = engine
+        .execute_gql(
+            "MATCH (n:AggCollect) RETURN collect(n.name)",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_collect_items: 2,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        max_collect.to_string().contains("max_collect_items"),
+        "unexpected error: {max_collect:?}"
+    );
+}
+
+#[test]
+fn gql_aggregate_projection_enforces_numeric_domain_and_group_caps() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(
+        &engine,
+        "AggOverflow",
+        "a",
+        &[("score", PropValue::Int(i64::MAX))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "AggOverflow",
+        "b",
+        &[("score", PropValue::Int(1))],
+        1.0,
+    );
+    let overflow = engine
+        .execute_gql(
+            "MATCH (n:AggOverflow) RETURN sum(n.score)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(overflow.to_string().contains("overflow"));
+
+    insert_query_node(
+        &engine,
+        "AggTooLargeUnsigned",
+        "a",
+        &[("score", PropValue::UInt(i64::MAX as u64 + 1))],
+        1.0,
+    );
+    let unsigned = engine
+        .execute_gql(
+            "MATCH (n:AggTooLargeUnsigned) RETURN sum(n.score)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(unsigned.to_string().contains("unsigned value"));
+
+    insert_query_node(
+        &engine,
+        "AggTooLargeUnsignedAfterFloat",
+        "a",
+        &[("score", PropValue::Float(1.0))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "AggTooLargeUnsignedAfterFloat",
+        "b",
+        &[("score", PropValue::UInt(i64::MAX as u64 + 1))],
+        1.0,
+    );
+    let unsigned_after_float = engine
+        .execute_gql(
+            "MATCH (n:AggTooLargeUnsignedAfterFloat) RETURN sum(n.score)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(unsigned_after_float
+        .to_string()
+        .contains("unsigned value"));
+
+    insert_query_node(
+        &engine,
+        "AggTooLargeUnsignedBeforeFloat",
+        "a",
+        &[("score", PropValue::UInt(i64::MAX as u64 + 1))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "AggTooLargeUnsignedBeforeFloat",
+        "b",
+        &[("score", PropValue::Float(1.0))],
+        1.0,
+    );
+    let unsigned_before_float = engine
+        .execute_gql(
+            "MATCH (n:AggTooLargeUnsignedBeforeFloat) RETURN sum(n.score)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(unsigned_before_float
+        .to_string()
+        .contains("unsigned value"));
+
+    insert_query_node(
+        &engine,
+        "AggNonFinite",
+        "a",
+        &[("score", PropValue::Float(f64::NAN))],
+        1.0,
+    );
+    let non_finite = engine
+        .execute_gql(
+            "MATCH (n:AggNonFinite) RETURN avg(n.score)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(non_finite.to_string().contains("finite"));
+
+    insert_query_node(
+        &engine,
+        "AggNonExactAvg",
+        "a",
+        &[("score", PropValue::UInt(9_007_199_254_740_993))],
+        1.0,
+    );
+    let non_exact_avg = engine
+        .execute_gql(
+            "MATCH (n:AggNonExactAvg) RETURN avg(n.score)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(
+        non_exact_avg.to_string().contains("exactly as float"),
+        "unexpected error: {non_exact_avg:?}"
+    );
+
+    insert_query_node(
+        &engine,
+        "AggNonExactMixedSum",
+        "a",
+        &[("score", PropValue::Float(0.5))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "AggNonExactMixedSum",
+        "b",
+        &[("score", PropValue::Int(9_007_199_254_740_993))],
+        1.0,
+    );
+    let non_exact_mixed_sum = engine
+        .execute_gql(
+            "MATCH (n:AggNonExactMixedSum) RETURN sum(n.score)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(
+        non_exact_mixed_sum.to_string().contains("exactly as float"),
+        "unexpected error: {non_exact_mixed_sum:?}"
+    );
+
+    insert_query_node(
+        &engine,
+        "AggMinMaxMixed",
+        "a",
+        &[("value", PropValue::Bool(true))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "AggMinMaxMixed",
+        "b",
+        &[("value", PropValue::String("x".to_string()))],
+        1.0,
+    );
+    let mixed = engine
+        .execute_gql(
+            "MATCH (n:AggMinMaxMixed) RETURN min(n.value)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(mixed.to_string().contains("incompatible"));
+
+    for (key, group) in [("a", "x"), ("b", "y")] {
+        insert_query_node(
+            &engine,
+            "AggGroupCap",
+            key,
+            &[("group", PropValue::String(group.to_string()))],
+            1.0,
+        );
+    }
+    let grouped_cap = engine
+        .execute_gql(
+            "MATCH (n:AggGroupCap) RETURN n.group, count(*)",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_groups: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(grouped_cap.to_string().contains("max_groups"));
+}
+
+#[test]
+fn gql_union_all_and_union_execute_with_branch_order_and_explain() {
+    let (_dir, engine) = query_test_engine();
+    for (key, side, name) in [
+        ("left-a", "left", "a"),
+        ("left-b", "left", "b"),
+        ("right-b", "right", "b"),
+        ("right-c", "right", "c"),
+        ("right-d", "right", "d"),
+    ] {
+        insert_query_node(
+            &engine,
+            "GqlUnionRows",
+            key,
+            &[
+                ("side", PropValue::String(side.to_string())),
+                ("name", PropValue::String(name.to_string())),
+            ],
+            1.0,
+        );
+    }
+
+    let all_query = "\
+        MATCH (n:GqlUnionRows) WHERE n.side = 'left' RETURN n.name AS name ORDER BY name DESC \
+        UNION ALL \
+        MATCH (m:GqlUnionRows) WHERE m.side = 'right' RETURN m.name AS name ORDER BY name ASC SKIP 1 LIMIT 2";
+    let all = engine
+        .execute_gql(
+            all_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&all, 0),
+        vec!["b".to_string(), "a".to_string(), "c".to_string(), "d".to_string()]
+    );
+    let read = all.plan.as_ref().map(gql_read_explain).unwrap();
+    assert!(read
+        .projection
+        .iter()
+        .any(|entry| entry.contains("UnionAll") && entry.contains("branches=2")));
+    assert!(read
+        .projection
+        .iter()
+        .any(|entry| entry.contains("branch 1 stages: Match")));
+    assert!(read
+        .projection
+        .iter()
+        .any(|entry| entry.contains("branch 2 row op: Sort")));
+    assert!(read
+        .projection
+        .iter()
+        .any(|entry| entry.contains("branch 2 row op: Skip")));
+    assert!(read
+        .projection
+        .iter()
+        .any(|entry| entry.contains("branch 2 row op: Limit")));
+
+    let dedupe_query = "\
+        MATCH (n:GqlUnionRows) WHERE n.side = 'left' RETURN n.name AS name ORDER BY name DESC \
+        UNION \
+        MATCH (m:GqlUnionRows) WHERE m.side = 'right' RETURN m.name AS name ORDER BY name ASC";
+    let dedupe = execute_gql_ok(&engine, dedupe_query);
+    assert_eq!(
+        gql_string_column(&dedupe, 0),
+        vec!["b".to_string(), "a".to_string(), "c".to_string(), "d".to_string()]
+    );
+
+    let mixed_node = insert_query_node(
+        &engine,
+        "GqlUnionMixed",
+        "node",
+        &[("name", PropValue::String("node".to_string()))],
+        1.0,
+    );
+    let mixed_node_two = insert_query_node(
+        &engine,
+        "GqlUnionMixed",
+        "node-two",
+        &[("name", PropValue::String("node-two".to_string()))],
+        1.0,
+    );
+    let mixed = execute_gql_ok(
+        &engine,
+        "\
+        MATCH (n:GqlUnionMixed) RETURN 'literal' AS value LIMIT 1 \
+        UNION ALL \
+        MATCH (m:GqlUnionMixed) RETURN m AS value",
+    );
+    assert_eq!(mixed.rows[0].values[0], GqlValue::String("literal".to_string()));
+    assert_eq!(gql_single_node(&mixed.rows[1].values[0]).id, Some(mixed_node));
+
+    for mixed_query in [
+        "\
+        MATCH (n:GqlUnionMixed) RETURN 'literal' AS value LIMIT 1 \
+        UNION ALL \
+        MATCH (m:GqlUnionMixed) RETURN m AS value",
+        "\
+        MATCH (n:GqlUnionMixed) RETURN 'literal' AS value LIMIT 1 \
+        UNION \
+        MATCH (m:GqlUnionMixed) RETURN m AS value",
+    ] {
+        let first = engine
+            .execute_gql(
+                mixed_query,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    max_rows: 2,
+                    ..gql_opts()
+                },
+            )
+            .unwrap();
+        assert_eq!(first.rows.len(), 2);
+        assert!(first.next_cursor.is_some());
+        assert_eq!(gql_single_node(&first.rows[1].values[0]).id, Some(mixed_node));
+        let second = engine
+            .execute_gql(
+                mixed_query,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    max_rows: 2,
+                    cursor: first.next_cursor.clone(),
+                    ..gql_opts()
+                },
+            )
+            .unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(
+            gql_single_node(&second.rows[0].values[0]).id,
+            Some(mixed_node_two)
+        );
+    }
+}
+
+#[test]
+fn gql_union_caps_cursors_snapshot_and_branch_failure_are_deterministic() {
+    let (_dir, engine) = query_test_engine();
+    for (key, label, name) in [
+        ("left-a", "GqlUnionCursorLeft", "a"),
+        ("left-b", "GqlUnionCursorLeft", "b"),
+        ("right-b", "GqlUnionCursorRight", "b"),
+        ("right-c", "GqlUnionCursorRight", "c"),
+    ] {
+        insert_query_node(
+            &engine,
+            label,
+            key,
+            &[("name", PropValue::String(name.to_string()))],
+            1.0,
+        );
+    }
+
+    let all_query = "\
+        MATCH (n:GqlUnionCursorLeft) RETURN n.name AS name ORDER BY name \
+        UNION ALL \
+        MATCH (m:GqlUnionCursorRight) RETURN m.name AS name ORDER BY name";
+    let first = engine
+        .execute_gql(
+            all_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 2,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&first, 0),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert!(first.next_cursor.is_some());
+    let second = engine
+        .execute_gql(
+            all_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 2,
+                cursor: first.next_cursor.clone(),
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&second, 0),
+        vec!["b".to_string(), "c".to_string()]
+    );
+    let union_all_cursor = first.next_cursor.clone().unwrap();
+    for changed_query in [
+        "\
+        MATCH (n:GqlUnionCursorLeft) RETURN n.name AS name ORDER BY name \
+        UNION \
+        MATCH (m:GqlUnionCursorRight) RETURN m.name AS name ORDER BY name",
+        "\
+        MATCH (m:GqlUnionCursorRight) RETURN m.name AS name ORDER BY name \
+        UNION ALL \
+        MATCH (n:GqlUnionCursorLeft) RETURN n.name AS name ORDER BY name",
+        "\
+        MATCH (n:GqlUnionCursorLeft) RETURN n.name AS other ORDER BY other \
+        UNION ALL \
+        MATCH (m:GqlUnionCursorRight) RETURN m.name AS other ORDER BY other",
+        "\
+        MATCH (n:GqlUnionCursorLeft) WHERE n.name <> 'z' RETURN n.name AS name ORDER BY name \
+        UNION ALL \
+        MATCH (m:GqlUnionCursorRight) RETURN m.name AS name ORDER BY name",
+    ] {
+        let err = engine
+            .execute_gql(
+                changed_query,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    max_rows: 2,
+                    cursor: Some(union_all_cursor.clone()),
+                    ..gql_opts()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidCursor { .. }),
+            "expected invalid cursor for changed union query, got {err:?}"
+        );
+    }
+
+    let param_query = "\
+        MATCH (n:GqlUnionCursorLeft) WHERE n.name >= $min RETURN n.name AS name ORDER BY name \
+        UNION ALL \
+        MATCH (m:GqlUnionCursorRight) WHERE m.name >= $min RETURN m.name AS name ORDER BY name";
+    let param_first = engine
+        .execute_gql(
+            param_query,
+            &GqlParams::from([("min".to_string(), GqlParamValue::String("a".to_string()))]),
+            &GqlExecutionOptions {
+                max_rows: 2,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    let param_err = engine
+        .execute_gql(
+            param_query,
+            &GqlParams::from([("min".to_string(), GqlParamValue::String("b".to_string()))]),
+            &GqlExecutionOptions {
+                max_rows: 2,
+                cursor: param_first.next_cursor.clone(),
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(param_err, EngineError::InvalidCursor { .. }),
+        "expected invalid cursor for changed union params, got {param_err:?}"
+    );
+
+    let dedupe_query = "\
+        MATCH (n:GqlUnionCursorLeft) RETURN n.name AS name ORDER BY name \
+        UNION \
+        MATCH (m:GqlUnionCursorRight) RETURN m.name AS name ORDER BY name";
+    let dedupe_first = engine
+        .execute_gql(
+            dedupe_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 2,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        gql_string_column(&dedupe_first, 0),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert!(dedupe_first.next_cursor.is_some());
+    let dedupe_second = engine
+        .execute_gql(
+            dedupe_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 2,
+                cursor: dedupe_first.next_cursor.clone(),
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&dedupe_second, 0), vec!["c".to_string()]);
+
+    let branch_cap = engine
+        .execute_gql(
+            "\
+            MATCH (n:GqlUnionCursorLeft) RETURN n.name AS name \
+            UNION ALL MATCH (m:GqlUnionCursorRight) RETURN m.name AS name \
+            UNION ALL MATCH (x:GqlUnionCursorLeft) RETURN x.name AS name",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_union_branches: 2,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(branch_cap.to_string().contains("max_union_branches"));
+
+    let dedupe_cap = engine
+        .execute_gql(
+            dedupe_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_groups: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(dedupe_cap.to_string().contains("max_groups"));
+
+    let failure = engine
+        .execute_gql(
+            "\
+            MATCH (n:GqlUnionCursorLeft) RETURN n.name AS name \
+            UNION ALL \
+            MATCH (m:GqlUnionCursorRight) RETURN 1 / 0 AS name",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(failure.to_string().contains("division by zero"));
+}
+
+#[test]
+fn gql_distinct_and_aggregate_cursors_are_shape_checked() {
+    let (_dir, engine) = query_test_engine();
+    for (key, group) in [("a", "a"), ("b", "b"), ("c", "c")] {
+        insert_query_node(
+            &engine,
+            "AggCursor",
+            key,
+            &[("group", PropValue::String(group.to_string()))],
+            1.0,
+        );
+    }
+
+    let distinct_query = "MATCH (n:AggCursor) RETURN DISTINCT n.group AS g ORDER BY g";
+    let distinct_first = engine
+        .execute_gql(
+            distinct_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 1,
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(distinct_first.rows[0].values[0], GqlValue::String("a".to_string()));
+    let distinct_cursor = distinct_first.next_cursor.clone().unwrap();
+    let distinct_second = engine
+        .execute_gql(
+            distinct_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                cursor: Some(distinct_cursor.clone()),
+                max_rows: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(distinct_second.rows[0].values[0], GqlValue::String("b".to_string()));
+    assert!(distinct_first
+        .plan
+        .as_ref()
+        .map(gql_read_explain)
+        .unwrap()
+        .projection
+        .iter()
+        .any(|item| item.contains("distinct=true")));
+    let distinct_shape_err = engine
+        .execute_gql(
+            "MATCH (n:AggCursor) RETURN DISTINCT n.group AS g ORDER BY g DESC",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                cursor: Some(distinct_cursor),
+                max_rows: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(distinct_shape_err, EngineError::InvalidCursor { .. }));
+
+    let aggregate_query =
+        "MATCH (n:AggCursor) RETURN n.group AS g, count(*) AS c ORDER BY g";
+    let aggregate_first = engine
+        .execute_gql(
+            aggregate_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 1,
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(aggregate_first.rows[0].values[0], GqlValue::String("a".to_string()));
+    let aggregate_cursor = aggregate_first.next_cursor.clone().unwrap();
+    let aggregate_second = engine
+        .execute_gql(
+            aggregate_query,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                cursor: Some(aggregate_cursor.clone()),
+                max_rows: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(aggregate_second.rows[0].values[0], GqlValue::String("b".to_string()));
+    let read = aggregate_first
+        .plan
+        .as_ref()
+        .map(gql_read_explain)
+        .unwrap();
+    assert!(read
+        .projection
+        .iter()
+        .any(|item| item.contains("aggregate=true")));
+    assert!(read
+        .projection
+        .iter()
+        .any(|item| item.contains("aggregate calls")));
+    let aggregate_shape_err = engine
+        .execute_gql(
+            "MATCH (n:AggCursor) RETURN n.group AS g, count(*) AS c ORDER BY c",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                cursor: Some(aggregate_cursor),
+                max_rows: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(aggregate_shape_err, EngineError::InvalidCursor { .. }));
+}
+
+#[test]
+fn gql_mutation_return_aggregation_is_rejected() {
+    let (_dir, engine) = query_test_engine();
+    let err = engine
+        .execute_gql(
+            "CREATE (n:GqlAggregationRejected {key: 'n'}) RETURN count(*)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::GqlSemantic { .. }),
+        "expected semantic rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn gql_mutation_read_after_write_stages_remain_rejected() {
+    let (_dir, engine) = query_test_engine();
+    for source in [
+        "CREATE (n:Person {key: 'with-after-write'}) WITH n RETURN n",
+        "CREATE (n:Person {key: 'match-after-write'}) MATCH (n) RETURN n",
+        "CREATE (n:Person {key: 'call-after-write'}) CALL { MATCH (m) RETURN m } RETURN n",
+    ] {
+        let err = engine
+            .execute_gql(source, &GqlParams::new(), &gql_opts())
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::GqlUnsupported { .. }),
+            "expected unsupported read-after-write mutation form for {source}, got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -7365,6 +11133,13 @@ fn gql_explain_reports_targets_row_ops_caps_and_does_not_execute_rows() {
 
     let cap_options = GqlExecutionOptions {
         max_rows: 7,
+        max_pipeline_rows: 11,
+        max_groups: 13,
+        max_collect_items: 15,
+        max_union_branches: 3,
+        max_subquery_invocations: 23,
+        max_subquery_depth: 2,
+        max_shortest_path_pairs: 29,
         max_intermediate_bindings: 17,
         max_skip: 19,
         max_query_bytes: 1_024,
@@ -7382,6 +11157,13 @@ fn gql_explain_reports_targets_row_ops_caps_and_does_not_execute_rows() {
         .unwrap()
         .caps;
     assert_eq!(cap_summary.max_rows, 7);
+    assert_eq!(cap_summary.max_pipeline_rows, 11);
+    assert_eq!(cap_summary.max_groups, 13);
+    assert_eq!(cap_summary.max_collect_items, 15);
+    assert_eq!(cap_summary.max_union_branches, 3);
+    assert_eq!(cap_summary.max_subquery_invocations, 23);
+    assert_eq!(cap_summary.max_subquery_depth, 2);
+    assert_eq!(cap_summary.max_shortest_path_pairs, 29);
     assert_eq!(cap_summary.max_intermediate_bindings, 17);
     assert_eq!(cap_summary.max_skip, 19);
     assert_eq!(cap_summary.max_query_bytes, 1_024);

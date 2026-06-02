@@ -38,6 +38,10 @@ function approxArray(actual, expected) {
   }
 }
 
+function byName(row) {
+  return row.name;
+}
+
 describe('GQL connector API', () => {
   let tmpDir;
   let db;
@@ -171,12 +175,26 @@ describe('GQL connector API', () => {
         maxParamBytes: 9,
         maxAstDepth: 4,
         maxLiteralItems: 3,
+        maxPipelineRows: 11,
+        maxGroups: 12,
+        maxCollectItems: 13,
+        maxUnionBranches: 2,
+        maxSubqueryInvocations: 14,
+        maxSubqueryDepth: 1,
+        maxShortestPathPairs: 15,
       }
     );
     assert.equal(cappedExplain.caps.maxQueryBytes, 128);
     assert.equal(cappedExplain.caps.maxParamBytes, 9);
     assert.equal(cappedExplain.caps.maxAstDepth, 4);
     assert.equal(cappedExplain.caps.maxLiteralItems, 3);
+    assert.equal(cappedExplain.caps.maxPipelineRows, 11);
+    assert.equal(cappedExplain.caps.maxGroups, 12);
+    assert.equal(cappedExplain.caps.maxCollectItems, 13);
+    assert.equal(cappedExplain.caps.maxUnionBranches, 2);
+    assert.equal(cappedExplain.caps.maxSubqueryInvocations, 14);
+    assert.equal(cappedExplain.caps.maxSubqueryDepth, 1);
+    assert.equal(cappedExplain.caps.maxShortestPathPairs, 15);
 
     const unusedOversized = db.executeGql(
       'MATCH (n:Person) RETURN id(n) LIMIT 1',
@@ -246,6 +264,240 @@ describe('GQL connector API', () => {
     assert.deepEqual(asyncExplain.columns, ['n.name']);
     assert.equal(asyncExplain.kind, 'query');
     assert.equal(asyncExplain.read.target, 'graph_row_query');
+  });
+
+  it('executes Phase 34 WITH, rich expressions, DISTINCT, aggregation, and compact rows', () => {
+    const rich = db.executeGql(
+      `MATCH (n:Person)
+       WITH n,
+            lower(trim(n.name)) AS slug,
+            n.rank + 2 AS boosted,
+            -n.rank AS negRank,
+            CASE WHEN n.rank > 1 THEN upper(n.status) ELSE 'LOW' END AS bucket,
+            {name: n.name, scores: [n.rank, n.rank + 1], active: n.status = 'active'} AS payload
+       WHERE slug STARTS WITH 'a'
+       RETURN n.name AS name, slug, boosted, negRank, bucket, payload`
+    );
+    assert.deepEqual(rich.columns, ['name', 'slug', 'boosted', 'negRank', 'bucket', 'payload']);
+    assert.deepEqual(rich.rows, [{
+      name: 'Ada',
+      slug: 'ada',
+      boosted: 4,
+      negRank: -2,
+      bucket: 'ACTIVE',
+      payload: { active: true, name: 'Ada', scores: [2, 3] },
+    }]);
+
+    const distinct = db.executeGql(
+      'MATCH (n:Person) RETURN DISTINCT n.group AS group ORDER BY group'
+    );
+    assert.deepEqual(distinct.rows, [{ group: 'core' }, { group: 'ops' }]);
+
+    const compactAgg = db.executeGql(
+      `MATCH (n:Person)
+       WITH n.group AS group, count(*) AS total, sum(n.rank) AS sumRank,
+            avg(n.rank) AS avgRank, collect(n.name) AS names
+       RETURN group, total, sumRank, avgRank, names
+       ORDER BY group`,
+      null,
+      { compactRows: true }
+    );
+    assert.deepEqual(compactAgg.columns, ['group', 'total', 'sumRank', 'avgRank', 'names']);
+    assert.equal(compactAgg.kind, 'query');
+    assert.deepEqual(compactAgg.rows[0].slice(0, 4), ['core', 2, 3, 1.5]);
+    assert.deepEqual([...compactAgg.rows[0][4]].sort(), ['Ada', 'Ben']);
+    assert.deepEqual(compactAgg.rows[1], ['ops', 1, 3, 3, ['Cy']]);
+
+    const collectedNodeIds = db.executeGql(
+      'MATCH (n:Person) RETURN collect(n) AS people',
+      null,
+      { includeVectors: true }
+    ).rows[0].people;
+    assert.deepEqual(
+      [...collectedNodeIds].sort((a, b) => a - b),
+      [ids.ada, ids.ben, ids.cy].sort((a, b) => a - b)
+    );
+  });
+
+  it('executes Phase 34 UNION variants and read-only subqueries', () => {
+    const unionAll = db.executeGql(
+      `MATCH (n:Person) WHERE n.group = 'core' RETURN n.name AS name ORDER BY name
+       UNION ALL
+       MATCH (m:Person) WHERE m.status = 'active' RETURN m.name AS name ORDER BY name`
+    );
+    assert.deepEqual(unionAll.rows.map(byName), ['Ada', 'Ben', 'Ada', 'Ben']);
+
+    const union = db.executeGql(
+      `MATCH (n:Person) WHERE n.group = 'core' RETURN n.name AS name ORDER BY name
+       UNION
+       MATCH (m:Person) WHERE m.status = 'active' RETURN m.name AS name ORDER BY name`
+    );
+    assert.deepEqual(union.rows.map(byName), ['Ada', 'Ben']);
+
+    const exists = db.executeGql(
+      `MATCH (n:Person)
+       WHERE EXISTS { MATCH (n)-[:WORKS_AT]->(c:Company) RETURN c }
+       RETURN n.name AS name`
+    );
+    assert.deepEqual(exists.rows, [{ name: 'Ada' }]);
+
+    const call = db.executeGql(
+      `MATCH (n:Person)
+       CALL { MATCH (n)-[:WORKS_AT]->(c:Company) RETURN c.name AS company }
+       RETURN n.name AS name, company`
+    );
+    assert.deepEqual(call.rows, [{ name: 'Ada', company: 'Acme' }]);
+  });
+
+  it('returns shortest path objects and helper values through Node', () => {
+    const result = db.executeGql(
+      `MATCH (a:Person) WHERE a.name = 'Ada'
+       WITH a
+       MATCH (c:Company) WHERE c.name = 'Acme'
+       WITH a, c
+       MATCH p = shortestPath((a)-[:WORKS_AT*1..1]->(c))
+       RETURN p,
+              node_ids(p) AS nodeIds,
+              edge_ids(p) AS edgeIds,
+              length(p) AS hops,
+              nodes(p) AS nodeHelper,
+              relationships(p) AS relationshipHelper,
+              [p] AS pathList,
+              {path: p, nodes: nodes(p), relationships: relationships(p)} AS nested`,
+      null,
+      { includePlan: true }
+    );
+
+    assert.equal(result.rows.length, 1);
+    assert.equal(result.plan.read.target, 'graph_pipeline_query');
+    assert.ok(result.plan.read.projection.some(item => item.includes('ShortestPath')));
+    const row = result.rows[0];
+    assert.deepEqual(row.p.nodeIds, [ids.ada, ids.acme]);
+    assert.deepEqual(row.p.edgeIds, [ids.worksAt]);
+    assert.deepEqual(row.p.nodes.map(node => node.id), [ids.ada, ids.acme]);
+    assert.equal(row.p.edges[0].id, ids.worksAt);
+    assert.deepEqual(row.nodeIds, [ids.ada, ids.acme]);
+    assert.deepEqual(row.edgeIds, [ids.worksAt]);
+    assert.equal(row.hops, 1);
+    assert.deepEqual(row.nodeHelper, [ids.ada, ids.acme]);
+    assert.deepEqual(row.relationshipHelper, [ids.worksAt]);
+    assert.deepEqual(row.pathList[0].nodeIds, [ids.ada, ids.acme]);
+    assert.deepEqual(row.pathList[0].edgeIds, [ids.worksAt]);
+    assert.deepEqual(row.nested.path.nodeIds, [ids.ada, ids.acme]);
+    assert.deepEqual(row.nested.path.edgeIds, [ids.worksAt]);
+    assert.deepEqual(row.nested.nodes, [ids.ada, ids.acme]);
+    assert.deepEqual(row.nested.relationships, [ids.worksAt]);
+  });
+
+  it('executes keyed MERGE actions with mutation stats and result shape', () => {
+    const created = db.executeGql(
+      `MERGE (n:NodeMergeParity {key: 'node'})
+       ON CREATE SET n.status = 'created', n.count = 1
+       ON MATCH SET n.status = 'matched', n.count = n.count + 1
+       RETURN n.key AS key, n.status AS status, n.count AS count`,
+      null,
+      { includePlan: true, profile: true }
+    );
+    assert.equal(created.kind, 'mutation');
+    assert.deepEqual(created.rows, [{ key: 'node', status: 'created', count: 1 }]);
+    assert.equal(created.mutationStats.nodesCreated, 1);
+    assert.equal(created.mutationStats.nodesUpdated, 0);
+    assert.equal(created.mutationStats.mutationRows, 1);
+    assert.equal(created.plan.mutation.usesWriteTxn, true);
+
+    const matched = db.executeGql(
+      `MERGE (n:NodeMergeParity {key: 'node'})
+       ON CREATE SET n.status = 'created-again', n.count = 1
+       ON MATCH SET n.status = 'matched', n.count = n.count + 1
+       RETURN n.key AS key, n.status AS status, n.count AS count`
+    );
+    assert.equal(matched.kind, 'mutation');
+    assert.deepEqual(matched.rows, [{ key: 'node', status: 'matched', count: 2 }]);
+    assert.equal(matched.mutationStats.nodesCreated, 0);
+    assert.equal(matched.mutationStats.nodesUpdated, 1);
+    assert.equal(matched.mutationStats.propertiesSet, 2);
+  });
+
+  it('forwards Phase 34 caps and graph-pipeline explain fields through sync and async GQL', async () => {
+    const options = {
+      maxPipelineRows: 64,
+      maxGroups: 8,
+      maxCollectItems: 8,
+      maxUnionBranches: 4,
+      maxSubqueryInvocations: 16,
+      maxSubqueryDepth: 2,
+      maxShortestPathPairs: 8,
+      includePlan: true,
+      profile: true,
+    };
+    const query = `MATCH (n:Person)
+                   WITH n.group AS group, count(*) AS total
+                   RETURN group, total
+                   ORDER BY group`;
+
+    const result = db.executeGql(query, null, options);
+    assert.equal(result.plan.read.target, 'graph_pipeline_query');
+    assert.equal(result.plan.caps.maxPipelineRows, 64);
+    assert.equal(result.plan.caps.maxGroups, 8);
+    assert.equal(result.plan.caps.maxCollectItems, 8);
+    assert.equal(result.plan.caps.maxUnionBranches, 4);
+    assert.equal(result.plan.caps.maxSubqueryInvocations, 16);
+    assert.equal(result.plan.caps.maxSubqueryDepth, 2);
+    assert.equal(result.plan.caps.maxShortestPathPairs, 8);
+    assert.equal(result.stats.rowsReturned, 2);
+    assert.equal(typeof result.stats.dbHits, 'number');
+    assert.equal(typeof result.stats.elapsedUs, 'number');
+    assert.ok(result.plan.read.projection.some(item => item.includes('graph pipeline stage')));
+
+    const explain = db.explainGql(query, null, options);
+    assert.equal(explain.read.target, 'graph_pipeline_query');
+    assert.equal(explain.caps.maxPipelineRows, 64);
+    assert.equal(explain.caps.maxGroups, 8);
+    assert.equal(explain.caps.maxCollectItems, 8);
+    assert.equal(explain.caps.maxUnionBranches, 4);
+    assert.equal(explain.caps.maxSubqueryInvocations, 16);
+    assert.equal(explain.caps.maxSubqueryDepth, 2);
+    assert.equal(explain.caps.maxShortestPathPairs, 8);
+
+    const asyncRows = await db.executeGqlAsync(query, null, { ...options, compactRows: true });
+    assert.deepEqual(asyncRows.rows, [['core', 2], ['ops', 1]]);
+    const asyncExplain = await db.explainGqlAsync(query, null, options);
+    assert.equal(asyncExplain.read.target, 'graph_pipeline_query');
+    assert.equal(asyncExplain.caps.maxPipelineRows, 64);
+    assert.equal(asyncExplain.caps.maxGroups, 8);
+    assert.equal(asyncExplain.caps.maxCollectItems, 8);
+    assert.equal(asyncExplain.caps.maxUnionBranches, 4);
+    assert.equal(asyncExplain.caps.maxSubqueryInvocations, 16);
+    assert.equal(asyncExplain.caps.maxSubqueryDepth, 2);
+    assert.equal(asyncExplain.caps.maxShortestPathPairs, 8);
+
+    assert.throws(
+      () => db.executeGql('MATCH (n:Person) RETURN collect(n.name) AS names', null, { maxCollectItems: 1 }),
+      /maxCollectItems|max_collect_items/i
+    );
+    assert.throws(
+      () => db.executeGql(
+        `MATCH (n:Person) RETURN n.name AS name
+         UNION ALL
+         MATCH (m:Company) RETURN m.name AS name`,
+        null,
+        { maxUnionBranches: 1 }
+      ),
+      /maxUnionBranches|max_union_branches/i
+    );
+    assert.throws(
+      () => db.executeGql(
+        `MATCH (a:Person) WHERE a.name = 'Ada'
+         WITH a
+         MATCH (c:Company) WHERE c.name = 'Acme'
+         WITH a, c
+         MATCH p = shortestPath((a)-[:WORKS_AT*1..1]->(c))
+         RETURN p`,
+        null,
+        { maxShortestPathPairs: 0 }
+      ),
+      /maxShortestPathPairs|max_shortest_path_pairs|path caps/i
+    );
   });
 
   it('executes sync CREATE RETURN with mutation stats, bytes, and embedded plan', () => {

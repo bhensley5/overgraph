@@ -2,8 +2,9 @@
 
 use crate::error::EngineError;
 use crate::property_value_semantics::{
-    compare_numeric_keys, numeric_key_from_f64, numeric_key_from_i64, numeric_key_from_u64,
-    numeric_range_sort_key, NumericRangeSortKey, NumericScalarKey,
+    compare_numeric_keys, exact_i64_to_f64, exact_u64_to_f64, numeric_key_from_f64,
+    numeric_key_from_i64, numeric_key_from_u64, numeric_range_sort_key, NumericRangeSortKey,
+    NumericScalarKey,
 };
 use crate::row_projection::{
     EdgeSelectedFieldNeeds, EntityProjectionNeeds, NodeSelectedFieldNeeds, PathSelectedFieldNeeds,
@@ -96,6 +97,14 @@ impl GraphBindingSchema {
         nullable: bool,
     ) -> Result<GraphBindingSlotRef, EngineError> {
         self.add_aliased_slot(alias.into(), GraphBindingSlotKind::Scalar, nullable)
+    }
+
+    pub(crate) fn add_internal_scalar(
+        &mut self,
+        label: impl Into<String>,
+        nullable: bool,
+    ) -> Result<GraphBindingSlotRef, EngineError> {
+        self.add_unaliased_scalar_slot(label.into(), nullable)
     }
 
     pub(crate) fn add_hidden_occurrence(
@@ -200,6 +209,32 @@ impl GraphBindingSchema {
             user_alias: Some(alias),
             kind,
             index,
+            nullable,
+        });
+        Ok(slot)
+    }
+
+    fn add_unaliased_scalar_slot(
+        &mut self,
+        label: String,
+        nullable: bool,
+    ) -> Result<GraphBindingSlotRef, EngineError> {
+        if label.is_empty() {
+            return Err(EngineError::InvalidOperation(
+                "graph row internal scalar slot label must be non-empty".to_string(),
+            ));
+        }
+        let slot = GraphBindingSlotRef {
+            kind: GraphBindingSlotKind::Scalar,
+            index: next_index(&mut self.scalar_slots),
+        };
+        let slot_position = self.slots.len();
+        self.scalar_slot_positions.push(slot_position);
+        self.slots.push(GraphBindingSlot {
+            name: label,
+            user_alias: None,
+            kind: slot.kind,
+            index: slot.index,
             nullable,
         });
         Ok(slot)
@@ -648,7 +683,7 @@ impl GraphBindingRow {
                         return Err(unbound_logical_key_error(&slot.name));
                     }
                 },
-                GraphBindingSlotKind::Scalar => graph_sort_atom_for_value(
+                GraphBindingSlotKind::Scalar => graph_logical_sort_atom_for_value(
                     &self
                         .scalars
                         .get(slot.index)
@@ -729,7 +764,7 @@ impl GraphBindingRow {
                 GraphSlotState::Null => GraphSortAtom::Null,
                 GraphSlotState::Unbound => return Err(unbound_logical_key_error(name)),
             },
-            GraphBindingSlotKind::Scalar => graph_sort_atom_for_value(
+            GraphBindingSlotKind::Scalar => graph_logical_sort_atom_for_value(
                 &self
                     .scalars
                     .get(slot.index)
@@ -1293,9 +1328,165 @@ pub(crate) enum GraphEvalValue {
 }
 
 impl GraphEvalValue {
-    fn is_null(&self) -> bool {
+    pub(crate) fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GraphCanonicalKey {
+    Null,
+    Bool(bool),
+    Number(NumericRangeSortKey),
+    String(Vec<u8>),
+    Bytes(Vec<u8>),
+    Node(u64),
+    Edge(u64),
+    Path { nodes: Vec<u64>, edges: Vec<u64> },
+    List(Vec<GraphCanonicalKey>),
+    Map(Vec<(String, GraphCanonicalKey)>),
+}
+
+pub(crate) fn graph_canonical_key_for_value(
+    value: &GraphEvalValue,
+) -> Result<GraphCanonicalKey, EngineError> {
+    Ok(match value {
+        GraphEvalValue::Null => GraphCanonicalKey::Null,
+        GraphEvalValue::Bool(value) => GraphCanonicalKey::Bool(*value),
+        GraphEvalValue::Int(value) => {
+            GraphCanonicalKey::Number(numeric_range_sort_key(numeric_key_from_i64(*value)))
+        }
+        GraphEvalValue::UInt(value) => {
+            GraphCanonicalKey::Number(numeric_range_sort_key(numeric_key_from_u64(*value)))
+        }
+        GraphEvalValue::Float(value) => GraphCanonicalKey::Number(numeric_range_sort_key(
+            numeric_key_from_f64(*value).ok_or_else(|| {
+                EngineError::InvalidOperation(
+                    "graph pipeline non-finite floats are not valid in canonical keys".to_string(),
+                )
+            })?,
+        )),
+        GraphEvalValue::String(value) => GraphCanonicalKey::String(value.as_bytes().to_vec()),
+        GraphEvalValue::Bytes(value) => GraphCanonicalKey::Bytes(value.clone()),
+        GraphEvalValue::Node(node) => GraphCanonicalKey::Node(node.id),
+        GraphEvalValue::Edge(edge) => GraphCanonicalKey::Edge(edge.id),
+        GraphEvalValue::Path(path) => GraphCanonicalKey::Path {
+            nodes: path.path.nodes.clone(),
+            edges: path.path.edges.clone(),
+        },
+        GraphEvalValue::List(values) => GraphCanonicalKey::List(
+            values
+                .iter()
+                .map(graph_canonical_key_for_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        GraphEvalValue::Map(values) => GraphCanonicalKey::Map(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), graph_canonical_key_for_value(value)?)))
+                .collect::<Result<Vec<_>, EngineError>>()?,
+        ),
+    })
+}
+
+pub(crate) fn graph_canonical_key_for_row_slots(
+    row: &GraphBindingRow,
+    slots: &[GraphBindingSlotRef],
+) -> Result<Vec<GraphCanonicalKey>, EngineError> {
+    slots
+        .iter()
+        .map(|slot| {
+            row.value_for_slot(*slot)
+                .and_then(|value| graph_canonical_key_for_value(&value))
+        })
+        .collect()
+}
+
+pub(crate) fn encode_graph_canonical_keys(
+    keys: &[GraphCanonicalKey],
+) -> Result<Vec<u8>, EngineError> {
+    let mut bytes = Vec::new();
+    push_canonical_len(&mut bytes, keys.len())?;
+    for key in keys {
+        encode_graph_canonical_key(&mut bytes, key)?;
+    }
+    Ok(bytes)
+}
+
+fn encode_graph_canonical_key(
+    bytes: &mut Vec<u8>,
+    key: &GraphCanonicalKey,
+) -> Result<(), EngineError> {
+    match key {
+        GraphCanonicalKey::Null => bytes.push(0),
+        GraphCanonicalKey::Bool(value) => {
+            bytes.push(1);
+            bytes.push(u8::from(*value));
+        }
+        GraphCanonicalKey::Number(value) => {
+            bytes.push(2);
+            bytes.extend_from_slice(&value.as_bytes());
+        }
+        GraphCanonicalKey::String(value) => {
+            bytes.push(3);
+            push_canonical_bytes(bytes, value)?;
+        }
+        GraphCanonicalKey::Bytes(value) => {
+            bytes.push(4);
+            push_canonical_bytes(bytes, value)?;
+        }
+        GraphCanonicalKey::Node(value) => {
+            bytes.push(5);
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        GraphCanonicalKey::Edge(value) => {
+            bytes.push(6);
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        GraphCanonicalKey::Path { nodes, edges } => {
+            bytes.push(7);
+            push_canonical_u64_vec(bytes, nodes)?;
+            push_canonical_u64_vec(bytes, edges)?;
+        }
+        GraphCanonicalKey::List(values) => {
+            bytes.push(8);
+            push_canonical_len(bytes, values.len())?;
+            for value in values {
+                encode_graph_canonical_key(bytes, value)?;
+            }
+        }
+        GraphCanonicalKey::Map(values) => {
+            bytes.push(9);
+            push_canonical_len(bytes, values.len())?;
+            for (key, value) in values {
+                push_canonical_bytes(bytes, key.as_bytes())?;
+                encode_graph_canonical_key(bytes, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_canonical_len(bytes: &mut Vec<u8>, len: usize) -> Result<(), EngineError> {
+    let len = u32::try_from(len).map_err(|_| {
+        EngineError::InvalidOperation("graph canonical key is too large".to_string())
+    })?;
+    bytes.extend_from_slice(&len.to_be_bytes());
+    Ok(())
+}
+
+fn push_canonical_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), EngineError> {
+    push_canonical_len(bytes, value.len())?;
+    bytes.extend_from_slice(value);
+    Ok(())
+}
+
+fn push_canonical_u64_vec(bytes: &mut Vec<u8>, values: &[u64]) -> Result<(), EngineError> {
+    push_canonical_len(bytes, values.len())?;
+    for value in values {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    Ok(())
 }
 
 pub(crate) struct GraphEvalContext<'a> {
@@ -1345,8 +1536,19 @@ pub(crate) enum BoundGraphExpr {
         op: GraphBinaryOp,
         right: Box<BoundGraphExpr>,
     },
+    Case {
+        operand: Option<Box<BoundGraphExpr>>,
+        branches: Vec<BoundGraphCaseBranch>,
+        else_expr: Option<Box<BoundGraphExpr>>,
+    },
     IsNull(Box<BoundGraphExpr>),
     IsNotNull(Box<BoundGraphExpr>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BoundGraphCaseBranch {
+    when: BoundGraphExpr,
+    then: BoundGraphExpr,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1479,6 +1681,16 @@ fn bind_graph_expr_with_params(
                 .map(|arg| bind_graph_expr_with_params(schema, arg, params))
                 .collect::<Result<Vec<_>, _>>()?,
         },
+        GraphExpr::AggregateCall { .. } => {
+            return Err(EngineError::InvalidOperation(
+                "aggregate expressions require graph pipeline projection execution".to_string(),
+            ));
+        }
+        GraphExpr::ExistsSubquery(_) => {
+            return Err(EngineError::InvalidOperation(
+                "EXISTS subqueries require graph pipeline predicate execution".to_string(),
+            ));
+        }
         GraphExpr::Unary { op, expr } => BoundGraphExpr::Unary {
             op: *op,
             expr: Box::new(bind_graph_expr_with_params(schema, expr, params)?),
@@ -1487,6 +1699,31 @@ fn bind_graph_expr_with_params(
             left: Box::new(bind_graph_expr_with_params(schema, left, params)?),
             op: *op,
             right: Box::new(bind_graph_expr_with_params(schema, right, params)?),
+        },
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => BoundGraphExpr::Case {
+            operand: operand
+                .as_ref()
+                .map(|operand| bind_graph_expr_with_params(schema, operand, params).map(Box::new))
+                .transpose()?,
+            branches: branches
+                .iter()
+                .map(|branch| {
+                    Ok(BoundGraphCaseBranch {
+                        when: bind_graph_expr_with_params(schema, &branch.when, params)?,
+                        then: bind_graph_expr_with_params(schema, &branch.then, params)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?,
+            else_expr: else_expr
+                .as_ref()
+                .map(|else_expr| {
+                    bind_graph_expr_with_params(schema, else_expr, params).map(Box::new)
+                })
+                .transpose()?,
         },
         GraphExpr::IsNull(expr) => {
             BoundGraphExpr::IsNull(Box::new(bind_graph_expr_with_params(schema, expr, params)?))
@@ -1599,14 +1836,22 @@ pub(crate) fn eval_graph_expr(
         GraphExpr::EdgeField { alias, field } => eval_graph_edge_field(alias, *field, context),
         GraphExpr::PathField { alias, field } => eval_graph_path_field(alias, *field, context),
         GraphExpr::Function { name, args } => eval_graph_function(*name, args, context),
-        GraphExpr::Unary {
-            op: GraphUnaryOp::Not,
-            expr,
-        } => match bool_or_null(&eval_graph_expr(expr, context)?)? {
-            Some(value) => Ok(GraphEvalValue::Bool(!value)),
-            None => Ok(GraphEvalValue::Null),
-        },
+        GraphExpr::AggregateCall { .. } => Err(EngineError::InvalidOperation(
+            "aggregate expressions require graph pipeline projection execution".to_string(),
+        )),
+        GraphExpr::ExistsSubquery(_) => Err(EngineError::InvalidOperation(
+            "EXISTS subqueries require graph pipeline predicate execution".to_string(),
+        )),
+        GraphExpr::Unary { op, expr } => {
+            let value = eval_graph_expr(expr, context)?;
+            eval_graph_unary_value(*op, &value)
+        }
         GraphExpr::Binary { left, op, right } => eval_graph_binary(left, *op, right, context),
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => eval_graph_case(operand.as_deref(), branches, else_expr.as_deref(), context),
         GraphExpr::IsNull(expr) => Ok(GraphEvalValue::Bool(
             eval_graph_expr(expr, context)?.is_null(),
         )),
@@ -1667,16 +1912,18 @@ pub(crate) fn eval_bound_graph_expr(
             eval_bound_graph_path_field(*slot, *field, context)
         }
         BoundGraphExpr::Function { name, args } => eval_bound_graph_function(*name, args, context),
-        BoundGraphExpr::Unary {
-            op: GraphUnaryOp::Not,
-            expr,
-        } => match bool_or_null(&eval_bound_graph_expr(expr, context)?)? {
-            Some(value) => Ok(GraphEvalValue::Bool(!value)),
-            None => Ok(GraphEvalValue::Null),
-        },
+        BoundGraphExpr::Unary { op, expr } => {
+            let value = eval_bound_graph_expr(expr, context)?;
+            eval_graph_unary_value(*op, &value)
+        }
         BoundGraphExpr::Binary { left, op, right } => {
             eval_bound_graph_binary(left, *op, right, context)
         }
+        BoundGraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => eval_bound_graph_case(operand.as_deref(), branches, else_expr.as_deref(), context),
         BoundGraphExpr::IsNull(expr) => Ok(GraphEvalValue::Bool(
             eval_bound_graph_expr(expr, context)?.is_null(),
         )),
@@ -1790,6 +2037,9 @@ fn eval_bound_graph_function(
     args: &[BoundGraphExpr],
     context: &BoundGraphEvalContext<'_>,
 ) -> Result<GraphEvalValue, EngineError> {
+    if is_scalar_graph_function(name) {
+        return eval_bound_graph_scalar_function(name, args, context);
+    }
     if args.len() != 1 {
         return Err(EngineError::InvalidOperation(format!(
             "graph row function {} expects exactly one argument",
@@ -1900,11 +2150,9 @@ fn eval_bound_graph_slot_function(
             let Some(path) = context.row.path_for_slot(slot)? else {
                 return Ok(GraphEvalValue::Null);
             };
-            path.path
-                .nodes
+            path.nodes
                 .first()
-                .copied()
-                .map(GraphBoundNode::id_only)
+                .cloned()
                 .map(GraphEvalValue::Node)
                 .ok_or_else(|| invalid_path_shape("start_node"))
         }
@@ -1912,11 +2160,9 @@ fn eval_bound_graph_slot_function(
             let Some(path) = context.row.path_for_slot(slot)? else {
                 return Ok(GraphEvalValue::Null);
             };
-            path.path
-                .nodes
+            path.nodes
                 .last()
-                .copied()
-                .map(GraphBoundNode::id_only)
+                .cloned()
                 .map(GraphEvalValue::Node)
                 .ok_or_else(|| invalid_path_shape("end_node"))
         }
@@ -1925,11 +2171,9 @@ fn eval_bound_graph_slot_function(
                 return Ok(GraphEvalValue::Null);
             };
             Ok(GraphEvalValue::List(
-                path.path
-                    .nodes
+                path.nodes
                     .iter()
-                    .copied()
-                    .map(GraphBoundNode::id_only)
+                    .cloned()
                     .map(GraphEvalValue::Node)
                     .collect(),
             ))
@@ -1939,11 +2183,9 @@ fn eval_bound_graph_slot_function(
                 return Ok(GraphEvalValue::Null);
             };
             Ok(GraphEvalValue::List(
-                path.path
-                    .edges
+                path.edges
                     .iter()
-                    .copied()
-                    .map(GraphBoundEdge::id_only)
+                    .cloned()
                     .map(GraphEvalValue::Edge)
                     .collect(),
             ))
@@ -1959,6 +2201,24 @@ fn eval_bound_graph_slot_function(
             | GraphFunction::Relationships,
             _,
         ) => Err(function_input_error(name, "a path")),
+        (
+            GraphFunction::Coalesce
+            | GraphFunction::ToString
+            | GraphFunction::ToInteger
+            | GraphFunction::ToFloat
+            | GraphFunction::Abs
+            | GraphFunction::Floor
+            | GraphFunction::Ceil
+            | GraphFunction::Round
+            | GraphFunction::Lower
+            | GraphFunction::Upper
+            | GraphFunction::Trim
+            | GraphFunction::Substring
+            | GraphFunction::Size
+            | GraphFunction::Head
+            | GraphFunction::Last,
+            _,
+        ) => Err(function_input_error(name, "a scalar expression")),
     }
 }
 
@@ -1982,38 +2242,22 @@ fn eval_graph_function_value(
             Ok(GraphEvalValue::UInt(path.path.edges.len() as u64))
         }
         (GraphFunction::StartNode, GraphEvalValue::Path(path)) => path
-            .path
             .nodes
-            .first()
-            .copied()
-            .map(GraphBoundNode::id_only)
+            .into_iter()
+            .next()
             .map(GraphEvalValue::Node)
             .ok_or_else(|| invalid_path_shape("start_node")),
         (GraphFunction::EndNode, GraphEvalValue::Path(path)) => path
-            .path
             .nodes
+            .into_iter()
             .last()
-            .copied()
-            .map(GraphBoundNode::id_only)
             .map(GraphEvalValue::Node)
             .ok_or_else(|| invalid_path_shape("end_node")),
         (GraphFunction::Nodes, GraphEvalValue::Path(path)) => Ok(GraphEvalValue::List(
-            path.path
-                .nodes
-                .iter()
-                .copied()
-                .map(GraphBoundNode::id_only)
-                .map(GraphEvalValue::Node)
-                .collect(),
+            path.nodes.into_iter().map(GraphEvalValue::Node).collect(),
         )),
         (GraphFunction::Relationships, GraphEvalValue::Path(path)) => Ok(GraphEvalValue::List(
-            path.path
-                .edges
-                .iter()
-                .copied()
-                .map(GraphBoundEdge::id_only)
-                .map(GraphEvalValue::Edge)
-                .collect(),
+            path.edges.into_iter().map(GraphEvalValue::Edge).collect(),
         )),
         (GraphFunction::Id, _) => Err(function_input_error(name, "a node or edge")),
         (GraphFunction::Labels, _) => Err(function_input_error(name, "a node")),
@@ -2026,6 +2270,161 @@ fn eval_graph_function_value(
             | GraphFunction::Relationships,
             _,
         ) => Err(function_input_error(name, "a path")),
+        (
+            GraphFunction::Coalesce
+            | GraphFunction::ToString
+            | GraphFunction::ToInteger
+            | GraphFunction::ToFloat
+            | GraphFunction::Abs
+            | GraphFunction::Floor
+            | GraphFunction::Ceil
+            | GraphFunction::Round
+            | GraphFunction::Lower
+            | GraphFunction::Upper
+            | GraphFunction::Trim
+            | GraphFunction::Substring
+            | GraphFunction::Size
+            | GraphFunction::Head
+            | GraphFunction::Last,
+            _,
+        ) => Err(function_input_error(name, "a scalar expression")),
+    }
+}
+
+fn eval_bound_graph_case(
+    operand: Option<&BoundGraphExpr>,
+    branches: &[BoundGraphCaseBranch],
+    else_expr: Option<&BoundGraphExpr>,
+    context: &BoundGraphEvalContext<'_>,
+) -> Result<GraphEvalValue, EngineError> {
+    if let Some(operand) = operand {
+        let operand_value = eval_bound_graph_expr(operand, context)?;
+        for branch in branches {
+            let when_value = eval_bound_graph_expr(&branch.when, context)?;
+            match eval_graph_binary_values(GraphBinaryOp::Eq, &operand_value, &when_value)? {
+                GraphEvalValue::Bool(true) => return eval_bound_graph_expr(&branch.then, context),
+                GraphEvalValue::Bool(false) | GraphEvalValue::Null => {}
+                _ => unreachable!("equality always returns bool or null"),
+            }
+        }
+    } else {
+        for branch in branches {
+            if let Some(true) = bool_or_null(&eval_bound_graph_expr(&branch.when, context)?)? {
+                return eval_bound_graph_expr(&branch.then, context);
+            }
+        }
+    }
+    else_expr
+        .map(|expr| eval_bound_graph_expr(expr, context))
+        .unwrap_or(Ok(GraphEvalValue::Null))
+}
+
+fn eval_graph_case(
+    operand: Option<&GraphExpr>,
+    branches: &[crate::types::GraphCaseBranch],
+    else_expr: Option<&GraphExpr>,
+    context: &GraphEvalContext<'_>,
+) -> Result<GraphEvalValue, EngineError> {
+    if let Some(operand) = operand {
+        let operand_value = eval_graph_expr(operand, context)?;
+        for branch in branches {
+            let when_value = eval_graph_expr(&branch.when, context)?;
+            match eval_graph_binary_values(GraphBinaryOp::Eq, &operand_value, &when_value)? {
+                GraphEvalValue::Bool(true) => return eval_graph_expr(&branch.then, context),
+                GraphEvalValue::Bool(false) | GraphEvalValue::Null => {}
+                _ => unreachable!("equality always returns bool or null"),
+            }
+        }
+    } else {
+        for branch in branches {
+            if let Some(true) = bool_or_null(&eval_graph_expr(&branch.when, context)?)? {
+                return eval_graph_expr(&branch.then, context);
+            }
+        }
+    }
+    else_expr
+        .map(|expr| eval_graph_expr(expr, context))
+        .unwrap_or(Ok(GraphEvalValue::Null))
+}
+
+pub(crate) fn eval_graph_unary_value(
+    op: GraphUnaryOp,
+    value: &GraphEvalValue,
+) -> Result<GraphEvalValue, EngineError> {
+    match op {
+        GraphUnaryOp::Not => match bool_or_null(value)? {
+            Some(value) => Ok(GraphEvalValue::Bool(!value)),
+            None => Ok(GraphEvalValue::Null),
+        },
+        GraphUnaryOp::Neg => eval_graph_numeric_neg(value),
+    }
+}
+
+pub(crate) fn eval_graph_binary_values(
+    op: GraphBinaryOp,
+    left: &GraphEvalValue,
+    right: &GraphEvalValue,
+) -> Result<GraphEvalValue, EngineError> {
+    match op {
+        GraphBinaryOp::And => {
+            let left = bool_or_null(left)?;
+            let right = bool_or_null(right)?;
+            Ok(graph_and_truth_value(left, right))
+        }
+        GraphBinaryOp::Or => {
+            let left = bool_or_null(left)?;
+            let right = bool_or_null(right)?;
+            Ok(graph_or_truth_value(left, right))
+        }
+        GraphBinaryOp::Eq
+        | GraphBinaryOp::Neq
+        | GraphBinaryOp::Lt
+        | GraphBinaryOp::Le
+        | GraphBinaryOp::Gt
+        | GraphBinaryOp::Ge => compare_graph_binary_values(op, left, right),
+        GraphBinaryOp::In => eval_graph_in(left, right),
+        GraphBinaryOp::Add | GraphBinaryOp::Sub | GraphBinaryOp::Mul | GraphBinaryOp::Div => {
+            eval_graph_arithmetic(op, left, right)
+        }
+        GraphBinaryOp::StartsWith | GraphBinaryOp::EndsWith | GraphBinaryOp::Contains => {
+            eval_graph_string_predicate(op, left, right)
+        }
+    }
+}
+
+pub(crate) fn eval_graph_scalar_function_values(
+    name: GraphFunction,
+    args: &[GraphEvalValue],
+) -> Result<GraphEvalValue, EngineError> {
+    validate_graph_scalar_function_arity(name, args.len())?;
+    match name {
+        GraphFunction::Coalesce => {
+            for value in args {
+                if !value.is_null() {
+                    ensure_graph_eval_scalar_domain(name, value)?;
+                    return Ok(value.clone());
+                }
+            }
+            Ok(GraphEvalValue::Null)
+        }
+        GraphFunction::ToString => eval_to_string(&args[0]),
+        GraphFunction::ToInteger => eval_to_integer(&args[0]),
+        GraphFunction::ToFloat => eval_to_float(&args[0]),
+        GraphFunction::Abs => eval_numeric_abs(&args[0]),
+        GraphFunction::Floor => eval_numeric_rounding(name, &args[0]),
+        GraphFunction::Ceil => eval_numeric_rounding(name, &args[0]),
+        GraphFunction::Round => eval_numeric_rounding(name, &args[0]),
+        GraphFunction::Lower => eval_string_unary(name, &args[0]),
+        GraphFunction::Upper => eval_string_unary(name, &args[0]),
+        GraphFunction::Trim => eval_string_unary(name, &args[0]),
+        GraphFunction::Substring => eval_substring(args),
+        GraphFunction::Size => eval_size(&args[0]),
+        GraphFunction::Head => eval_head_or_last(name, &args[0]),
+        GraphFunction::Last => eval_head_or_last(name, &args[0]),
+        _ => Err(EngineError::InvalidOperation(format!(
+            "graph row function {} is not a scalar function",
+            graph_function_name(name)
+        ))),
     }
 }
 
@@ -2043,10 +2442,17 @@ fn eval_bound_graph_binary(
         | GraphBinaryOp::Lt
         | GraphBinaryOp::Le
         | GraphBinaryOp::Gt
-        | GraphBinaryOp::Ge => {
+        | GraphBinaryOp::Ge
+        | GraphBinaryOp::Add
+        | GraphBinaryOp::Sub
+        | GraphBinaryOp::Mul
+        | GraphBinaryOp::Div
+        | GraphBinaryOp::StartsWith
+        | GraphBinaryOp::EndsWith
+        | GraphBinaryOp::Contains => {
             let left_value = eval_bound_graph_expr(left, context)?;
             let right_value = eval_bound_graph_expr(right, context)?;
-            compare_graph_binary_values(op, &left_value, &right_value)
+            eval_graph_binary_values(op, &left_value, &right_value)
         }
         GraphBinaryOp::In => {
             let left_value = eval_bound_graph_expr(left, context)?;
@@ -2175,6 +2581,9 @@ fn eval_graph_function(
     args: &[GraphExpr],
     context: &GraphEvalContext<'_>,
 ) -> Result<GraphEvalValue, EngineError> {
+    if is_scalar_graph_function(name) {
+        return eval_graph_scalar_function(name, args, context);
+    }
     if args.len() != 1 {
         return Err(EngineError::InvalidOperation(format!(
             "graph row function {} expects exactly one argument",
@@ -2186,6 +2595,52 @@ fn eval_graph_function(
     }
     let value = eval_graph_expr(&args[0], context)?;
     eval_graph_function_value(name, value)
+}
+
+fn eval_bound_graph_scalar_function(
+    name: GraphFunction,
+    args: &[BoundGraphExpr],
+    context: &BoundGraphEvalContext<'_>,
+) -> Result<GraphEvalValue, EngineError> {
+    validate_graph_scalar_function_arity(name, args.len())?;
+    if name == GraphFunction::Coalesce {
+        for arg in args {
+            let value = eval_bound_graph_expr(arg, context)?;
+            if !value.is_null() {
+                ensure_graph_eval_scalar_domain(name, &value)?;
+                return Ok(value);
+            }
+        }
+        return Ok(GraphEvalValue::Null);
+    }
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(eval_bound_graph_expr(arg, context)?);
+    }
+    eval_graph_scalar_function_values(name, &values)
+}
+
+fn eval_graph_scalar_function(
+    name: GraphFunction,
+    args: &[GraphExpr],
+    context: &GraphEvalContext<'_>,
+) -> Result<GraphEvalValue, EngineError> {
+    validate_graph_scalar_function_arity(name, args.len())?;
+    if name == GraphFunction::Coalesce {
+        for arg in args {
+            let value = eval_graph_expr(arg, context)?;
+            if !value.is_null() {
+                ensure_graph_eval_scalar_domain(name, &value)?;
+                return Ok(value);
+            }
+        }
+        return Ok(GraphEvalValue::Null);
+    }
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(eval_graph_expr(arg, context)?);
+    }
+    eval_graph_scalar_function_values(name, &values)
 }
 
 fn eval_graph_path_derived_function(
@@ -2271,10 +2726,17 @@ fn eval_graph_binary(
         | GraphBinaryOp::Lt
         | GraphBinaryOp::Le
         | GraphBinaryOp::Gt
-        | GraphBinaryOp::Ge => {
+        | GraphBinaryOp::Ge
+        | GraphBinaryOp::Add
+        | GraphBinaryOp::Sub
+        | GraphBinaryOp::Mul
+        | GraphBinaryOp::Div
+        | GraphBinaryOp::StartsWith
+        | GraphBinaryOp::EndsWith
+        | GraphBinaryOp::Contains => {
             let left_value = eval_graph_expr(left, context)?;
             let right_value = eval_graph_expr(right, context)?;
-            compare_graph_binary_values(op, &left_value, &right_value)
+            eval_graph_binary_values(op, &left_value, &right_value)
         }
         GraphBinaryOp::In => {
             let left_value = eval_graph_expr(left, context)?;
@@ -2357,7 +2819,16 @@ fn compare_graph_binary_values(
                 _ => unreachable!(),
             }))
         }
-        GraphBinaryOp::And | GraphBinaryOp::Or | GraphBinaryOp::In => unreachable!(),
+        GraphBinaryOp::And
+        | GraphBinaryOp::Or
+        | GraphBinaryOp::In
+        | GraphBinaryOp::Add
+        | GraphBinaryOp::Sub
+        | GraphBinaryOp::Mul
+        | GraphBinaryOp::Div
+        | GraphBinaryOp::StartsWith
+        | GraphBinaryOp::EndsWith
+        | GraphBinaryOp::Contains => unreachable!(),
     }
 }
 
@@ -2395,6 +2866,547 @@ fn bool_or_null(value: &GraphEvalValue) -> Result<Option<bool>, EngineError> {
         _ => Err(EngineError::InvalidOperation(
             "graph row boolean operators require boolean or null operands".to_string(),
         )),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NumericEvalOperand {
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+}
+
+fn numeric_operand(value: &GraphEvalValue) -> Result<Option<NumericEvalOperand>, EngineError> {
+    Ok(match value {
+        GraphEvalValue::Null => None,
+        GraphEvalValue::Int(value) => Some(NumericEvalOperand::Int(*value)),
+        GraphEvalValue::UInt(value) => Some(NumericEvalOperand::UInt(*value)),
+        GraphEvalValue::Float(value) => Some(NumericEvalOperand::Float(checked_finite_float(
+            *value,
+            "graph row numeric expression",
+        )?)),
+        _ => {
+            return Err(EngineError::InvalidOperation(
+                "graph row numeric operators require numeric or null operands".to_string(),
+            ));
+        }
+    })
+}
+
+fn eval_graph_numeric_neg(value: &GraphEvalValue) -> Result<GraphEvalValue, EngineError> {
+    let Some(value) = numeric_operand(value)? else {
+        return Ok(GraphEvalValue::Null);
+    };
+    match value {
+        NumericEvalOperand::Int(value) => value
+            .checked_neg()
+            .map(GraphEvalValue::Int)
+            .ok_or_else(|| integer_overflow_error("negation")),
+        NumericEvalOperand::UInt(0) => Ok(GraphEvalValue::Int(0)),
+        NumericEvalOperand::UInt(value) => {
+            if value == (i64::MAX as u64) + 1 {
+                return Ok(GraphEvalValue::Int(i64::MIN));
+            }
+            let signed = i64::try_from(value).map_err(|_| integer_overflow_error("negation"))?;
+            signed
+                .checked_neg()
+                .map(GraphEvalValue::Int)
+                .ok_or_else(|| integer_overflow_error("negation"))
+        }
+        NumericEvalOperand::Float(value) => {
+            let result = -value;
+            checked_finite_float(result, "graph row numeric negation result")
+                .map(GraphEvalValue::Float)
+        }
+    }
+}
+
+fn eval_graph_arithmetic(
+    op: GraphBinaryOp,
+    left: &GraphEvalValue,
+    right: &GraphEvalValue,
+) -> Result<GraphEvalValue, EngineError> {
+    let Some(left) = numeric_operand(left)? else {
+        return Ok(GraphEvalValue::Null);
+    };
+    let Some(right) = numeric_operand(right)? else {
+        return Ok(GraphEvalValue::Null);
+    };
+
+    if matches!(op, GraphBinaryOp::Div) {
+        if numeric_operand_is_zero(right) {
+            return Err(EngineError::InvalidOperation(
+                "graph row division by zero".to_string(),
+            ));
+        }
+        let result = numeric_operand_to_f64(left)? / numeric_operand_to_f64(right)?;
+        return checked_finite_float(result, "graph row division result")
+            .map(GraphEvalValue::Float);
+    }
+
+    if matches!(left, NumericEvalOperand::Float(_)) || matches!(right, NumericEvalOperand::Float(_))
+    {
+        let left = numeric_operand_to_f64(left)?;
+        let right = numeric_operand_to_f64(right)?;
+        let result = match op {
+            GraphBinaryOp::Add => left + right,
+            GraphBinaryOp::Sub => left - right,
+            GraphBinaryOp::Mul => left * right,
+            _ => unreachable!("non-arithmetic operator in arithmetic evaluator"),
+        };
+        return checked_finite_float(result, "graph row arithmetic result")
+            .map(GraphEvalValue::Float);
+    }
+
+    eval_graph_integer_arithmetic(op, left, right)
+}
+
+fn eval_graph_integer_arithmetic(
+    op: GraphBinaryOp,
+    left: NumericEvalOperand,
+    right: NumericEvalOperand,
+) -> Result<GraphEvalValue, EngineError> {
+    match (op, left, right) {
+        (GraphBinaryOp::Add, NumericEvalOperand::Int(left), NumericEvalOperand::Int(right)) => left
+            .checked_add(right)
+            .map(GraphEvalValue::Int)
+            .ok_or_else(|| integer_overflow_error("addition")),
+        (GraphBinaryOp::Add, NumericEvalOperand::UInt(left), NumericEvalOperand::UInt(right)) => {
+            left.checked_add(right)
+                .map(GraphEvalValue::UInt)
+                .ok_or_else(|| integer_overflow_error("addition"))
+        }
+        (GraphBinaryOp::Sub, NumericEvalOperand::Int(left), NumericEvalOperand::Int(right)) => left
+            .checked_sub(right)
+            .map(GraphEvalValue::Int)
+            .ok_or_else(|| integer_overflow_error("subtraction")),
+        (GraphBinaryOp::Sub, NumericEvalOperand::UInt(left), NumericEvalOperand::UInt(right)) => {
+            if left >= right {
+                Ok(GraphEvalValue::UInt(left - right))
+            } else {
+                integer_result_from_mixed_i128(i128::from(left) - i128::from(right), true)
+            }
+        }
+        (GraphBinaryOp::Mul, NumericEvalOperand::Int(left), NumericEvalOperand::Int(right)) => left
+            .checked_mul(right)
+            .map(GraphEvalValue::Int)
+            .ok_or_else(|| integer_overflow_error("multiplication")),
+        (GraphBinaryOp::Mul, NumericEvalOperand::UInt(left), NumericEvalOperand::UInt(right)) => {
+            left.checked_mul(right)
+                .map(GraphEvalValue::UInt)
+                .ok_or_else(|| integer_overflow_error("multiplication"))
+        }
+        (op @ (GraphBinaryOp::Add | GraphBinaryOp::Sub | GraphBinaryOp::Mul), left, right) => {
+            let left = numeric_integer_to_i128(left);
+            let right = numeric_integer_to_i128(right);
+            let result = match op {
+                GraphBinaryOp::Add => left.checked_add(right),
+                GraphBinaryOp::Sub => left.checked_sub(right),
+                GraphBinaryOp::Mul => left.checked_mul(right),
+                _ => unreachable!(),
+            }
+            .ok_or_else(|| integer_overflow_error(arithmetic_name(op)))?;
+            integer_result_from_mixed_i128(result, true)
+        }
+        _ => unreachable!("non-integer arithmetic passed to integer evaluator"),
+    }
+}
+
+fn numeric_integer_to_i128(value: NumericEvalOperand) -> i128 {
+    match value {
+        NumericEvalOperand::Int(value) => i128::from(value),
+        NumericEvalOperand::UInt(value) => i128::from(value),
+        NumericEvalOperand::Float(_) => unreachable!("float passed to integer evaluator"),
+    }
+}
+
+fn integer_result_from_mixed_i128(
+    value: i128,
+    prefer_signed: bool,
+) -> Result<GraphEvalValue, EngineError> {
+    if value < 0 {
+        return i64::try_from(value)
+            .map(GraphEvalValue::Int)
+            .map_err(|_| integer_overflow_error("integer arithmetic"));
+    }
+    if prefer_signed && value <= i128::from(i64::MAX) {
+        return Ok(GraphEvalValue::Int(value as i64));
+    }
+    u64::try_from(value)
+        .map(GraphEvalValue::UInt)
+        .map_err(|_| integer_overflow_error("integer arithmetic"))
+}
+
+fn numeric_operand_to_f64(value: NumericEvalOperand) -> Result<f64, EngineError> {
+    let value = match value {
+        NumericEvalOperand::Int(value) => {
+            exact_i64_to_f64(value, "graph row float arithmetic input")?
+        }
+        NumericEvalOperand::UInt(value) => {
+            exact_u64_to_f64(value, "graph row float arithmetic input")?
+        }
+        NumericEvalOperand::Float(value) => value,
+    };
+    checked_finite_float(value, "graph row float arithmetic input")
+}
+
+fn numeric_operand_is_zero(value: NumericEvalOperand) -> bool {
+    match value {
+        NumericEvalOperand::Int(value) => value == 0,
+        NumericEvalOperand::UInt(value) => value == 0,
+        NumericEvalOperand::Float(value) => value == 0.0,
+    }
+}
+
+fn arithmetic_name(op: GraphBinaryOp) -> &'static str {
+    match op {
+        GraphBinaryOp::Add => "addition",
+        GraphBinaryOp::Sub => "subtraction",
+        GraphBinaryOp::Mul => "multiplication",
+        GraphBinaryOp::Div => "division",
+        _ => "arithmetic",
+    }
+}
+
+fn integer_overflow_error(operation: &str) -> EngineError {
+    EngineError::InvalidOperation(format!("graph row integer {operation} overflowed"))
+}
+
+fn checked_finite_float(value: f64, context: &str) -> Result<f64, EngineError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(EngineError::InvalidOperation(format!(
+            "{context} must be finite"
+        )))
+    }
+}
+
+fn eval_graph_string_predicate(
+    op: GraphBinaryOp,
+    left: &GraphEvalValue,
+    right: &GraphEvalValue,
+) -> Result<GraphEvalValue, EngineError> {
+    if left.is_null() || right.is_null() {
+        return Ok(GraphEvalValue::Null);
+    }
+    let (GraphEvalValue::String(left), GraphEvalValue::String(right)) = (left, right) else {
+        return Err(EngineError::InvalidOperation(
+            "graph row string predicates require string or null operands".to_string(),
+        ));
+    };
+    Ok(GraphEvalValue::Bool(match op {
+        GraphBinaryOp::StartsWith => left.starts_with(right),
+        GraphBinaryOp::EndsWith => left.ends_with(right),
+        GraphBinaryOp::Contains => left.contains(right),
+        _ => unreachable!("non-string predicate operator"),
+    }))
+}
+
+fn validate_graph_scalar_function_arity(
+    name: GraphFunction,
+    arg_count: usize,
+) -> Result<(), EngineError> {
+    let valid = match name {
+        GraphFunction::Coalesce => arg_count >= 1,
+        GraphFunction::Substring => matches!(arg_count, 2 | 3),
+        GraphFunction::ToString
+        | GraphFunction::ToInteger
+        | GraphFunction::ToFloat
+        | GraphFunction::Abs
+        | GraphFunction::Floor
+        | GraphFunction::Ceil
+        | GraphFunction::Round
+        | GraphFunction::Lower
+        | GraphFunction::Upper
+        | GraphFunction::Trim
+        | GraphFunction::Size
+        | GraphFunction::Head
+        | GraphFunction::Last => arg_count == 1,
+        _ => false,
+    };
+    if valid {
+        return Ok(());
+    }
+    let expected = match name {
+        GraphFunction::Coalesce => "at least one argument",
+        GraphFunction::Substring => "two or three arguments",
+        _ => "exactly one argument",
+    };
+    Err(EngineError::InvalidOperation(format!(
+        "graph row function {} expects {expected}",
+        graph_function_name(name)
+    )))
+}
+
+fn is_scalar_graph_function(name: GraphFunction) -> bool {
+    matches!(
+        name,
+        GraphFunction::Coalesce
+            | GraphFunction::ToString
+            | GraphFunction::ToInteger
+            | GraphFunction::ToFloat
+            | GraphFunction::Abs
+            | GraphFunction::Floor
+            | GraphFunction::Ceil
+            | GraphFunction::Round
+            | GraphFunction::Lower
+            | GraphFunction::Upper
+            | GraphFunction::Trim
+            | GraphFunction::Substring
+            | GraphFunction::Size
+            | GraphFunction::Head
+            | GraphFunction::Last
+    )
+}
+
+fn eval_to_string(value: &GraphEvalValue) -> Result<GraphEvalValue, EngineError> {
+    Ok(match value {
+        GraphEvalValue::Null => GraphEvalValue::Null,
+        GraphEvalValue::Bool(value) => GraphEvalValue::String(value.to_string()),
+        GraphEvalValue::Int(value) => GraphEvalValue::String(value.to_string()),
+        GraphEvalValue::UInt(value) => GraphEvalValue::String(value.to_string()),
+        GraphEvalValue::Float(value) => GraphEvalValue::String(
+            checked_finite_float(*value, "to_string float input")?.to_string(),
+        ),
+        GraphEvalValue::String(value) => GraphEvalValue::String(value.clone()),
+        _ => {
+            return Err(EngineError::InvalidOperation(
+                "graph row function to_string expects a scalar numeric, boolean, string, or null value"
+                    .to_string(),
+            ));
+        }
+    })
+}
+
+fn eval_to_integer(value: &GraphEvalValue) -> Result<GraphEvalValue, EngineError> {
+    Ok(match value {
+        GraphEvalValue::Null => GraphEvalValue::Null,
+        GraphEvalValue::Int(value) => GraphEvalValue::Int(*value),
+        GraphEvalValue::UInt(value) => {
+            GraphEvalValue::Int(i64::try_from(*value).map_err(|_| {
+                EngineError::InvalidOperation(
+                    "graph row function to_integer cannot represent uint value as int".to_string(),
+                )
+            })?)
+        }
+        GraphEvalValue::Float(value) => GraphEvalValue::Int(float_to_i64_checked(*value)?),
+        GraphEvalValue::String(value) => {
+            GraphEvalValue::Int(value.parse::<i64>().map_err(|_| {
+                EngineError::InvalidOperation(
+                    "graph row function to_integer expects a base-10 integer string".to_string(),
+                )
+            })?)
+        }
+        _ => {
+            return Err(EngineError::InvalidOperation(
+                "graph row function to_integer expects numeric, string, or null input".to_string(),
+            ));
+        }
+    })
+}
+
+fn eval_to_float(value: &GraphEvalValue) -> Result<GraphEvalValue, EngineError> {
+    Ok(match value {
+        GraphEvalValue::Null => GraphEvalValue::Null,
+        GraphEvalValue::Int(value) => {
+            GraphEvalValue::Float(exact_i64_to_f64(*value, "to_float integer input")?)
+        }
+        GraphEvalValue::UInt(value) => {
+            GraphEvalValue::Float(exact_u64_to_f64(*value, "to_float unsigned integer input")?)
+        }
+        GraphEvalValue::Float(value) => {
+            GraphEvalValue::Float(checked_finite_float(*value, "to_float float input")?)
+        }
+        GraphEvalValue::String(value) => GraphEvalValue::Float(checked_finite_float(
+            value.parse::<f64>().map_err(|_| {
+                EngineError::InvalidOperation(
+                    "graph row function to_float expects a finite float string".to_string(),
+                )
+            })?,
+            "to_float string result",
+        )?),
+        _ => {
+            return Err(EngineError::InvalidOperation(
+                "graph row function to_float expects numeric, string, or null input".to_string(),
+            ));
+        }
+    })
+}
+
+fn float_to_i64_checked(value: f64) -> Result<i64, EngineError> {
+    let value = checked_finite_float(value, "to_integer float input")?;
+    if value.fract() != 0.0 || value < i64::MIN as f64 || value >= 9_223_372_036_854_775_808.0 {
+        return Err(EngineError::InvalidOperation(
+            "graph row function to_integer expects an integral float in i64 range".to_string(),
+        ));
+    }
+    Ok(value as i64)
+}
+
+fn eval_numeric_abs(value: &GraphEvalValue) -> Result<GraphEvalValue, EngineError> {
+    let Some(value) = numeric_operand(value)? else {
+        return Ok(GraphEvalValue::Null);
+    };
+    match value {
+        NumericEvalOperand::Int(value) => value
+            .checked_abs()
+            .map(GraphEvalValue::Int)
+            .ok_or_else(|| integer_overflow_error("absolute value")),
+        NumericEvalOperand::UInt(value) => Ok(GraphEvalValue::UInt(value)),
+        NumericEvalOperand::Float(value) => {
+            checked_finite_float(value.abs(), "graph row abs result").map(GraphEvalValue::Float)
+        }
+    }
+}
+
+fn eval_numeric_rounding(
+    name: GraphFunction,
+    value: &GraphEvalValue,
+) -> Result<GraphEvalValue, EngineError> {
+    let Some(value) = numeric_operand(value)? else {
+        return Ok(GraphEvalValue::Null);
+    };
+    match value {
+        NumericEvalOperand::Int(value) => Ok(GraphEvalValue::Int(value)),
+        NumericEvalOperand::UInt(value) => Ok(GraphEvalValue::UInt(value)),
+        NumericEvalOperand::Float(value) => {
+            let result = match name {
+                GraphFunction::Floor => value.floor(),
+                GraphFunction::Ceil => value.ceil(),
+                GraphFunction::Round => value.round(),
+                _ => unreachable!("non-rounding function"),
+            };
+            checked_finite_float(result, "graph row numeric rounding result")
+                .map(GraphEvalValue::Float)
+        }
+    }
+}
+
+fn eval_string_unary(
+    name: GraphFunction,
+    value: &GraphEvalValue,
+) -> Result<GraphEvalValue, EngineError> {
+    if value.is_null() {
+        return Ok(GraphEvalValue::Null);
+    }
+    let GraphEvalValue::String(value) = value else {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row function {} expects string or null input",
+            graph_function_name(name)
+        )));
+    };
+    Ok(GraphEvalValue::String(match name {
+        GraphFunction::Lower => value.to_lowercase(),
+        GraphFunction::Upper => value.to_uppercase(),
+        GraphFunction::Trim => value.trim().to_string(),
+        _ => unreachable!("non-string function"),
+    }))
+}
+
+fn eval_substring(args: &[GraphEvalValue]) -> Result<GraphEvalValue, EngineError> {
+    if args.iter().any(GraphEvalValue::is_null) {
+        return Ok(GraphEvalValue::Null);
+    }
+    let GraphEvalValue::String(value) = &args[0] else {
+        return Err(EngineError::InvalidOperation(
+            "graph row function substring expects a string value".to_string(),
+        ));
+    };
+    let start = nonnegative_usize_arg(&args[1], "substring start")?;
+    let length = args
+        .get(2)
+        .map(|value| nonnegative_usize_arg(value, "substring length"))
+        .transpose()?;
+    let chars = value.chars().collect::<Vec<_>>();
+    if start >= chars.len() {
+        return Ok(GraphEvalValue::String(String::new()));
+    }
+    let end = length
+        .map(|length| start.saturating_add(length).min(chars.len()))
+        .unwrap_or(chars.len());
+    Ok(GraphEvalValue::String(chars[start..end].iter().collect()))
+}
+
+fn nonnegative_usize_arg(value: &GraphEvalValue, context: &str) -> Result<usize, EngineError> {
+    match value {
+        GraphEvalValue::Int(value) if *value >= 0 => usize::try_from(*value).map_err(|_| {
+            EngineError::InvalidOperation(format!("graph row function {context} is out of range"))
+        }),
+        GraphEvalValue::UInt(value) => usize::try_from(*value).map_err(|_| {
+            EngineError::InvalidOperation(format!("graph row function {context} is out of range"))
+        }),
+        _ => Err(EngineError::InvalidOperation(format!(
+            "graph row function {context} expects a non-negative integer"
+        ))),
+    }
+}
+
+fn eval_size(value: &GraphEvalValue) -> Result<GraphEvalValue, EngineError> {
+    Ok(match value {
+        GraphEvalValue::Null => GraphEvalValue::Null,
+        GraphEvalValue::String(value) => GraphEvalValue::UInt(value.chars().count() as u64),
+        GraphEvalValue::List(value) => GraphEvalValue::UInt(value.len() as u64),
+        GraphEvalValue::Map(value) => GraphEvalValue::UInt(value.len() as u64),
+        _ => {
+            return Err(EngineError::InvalidOperation(
+                "graph row function size expects string, list, map, or null input".to_string(),
+            ));
+        }
+    })
+}
+
+fn eval_head_or_last(
+    name: GraphFunction,
+    value: &GraphEvalValue,
+) -> Result<GraphEvalValue, EngineError> {
+    if value.is_null() {
+        return Ok(GraphEvalValue::Null);
+    }
+    let GraphEvalValue::List(values) = value else {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph row function {} expects list or null input",
+            graph_function_name(name)
+        )));
+    };
+    let value = match name {
+        GraphFunction::Head => values.first().cloned().unwrap_or(GraphEvalValue::Null),
+        GraphFunction::Last => values.last().cloned().unwrap_or(GraphEvalValue::Null),
+        _ => unreachable!("non-list endpoint function"),
+    };
+    ensure_graph_eval_scalar_domain(name, &value)?;
+    Ok(value)
+}
+
+fn ensure_graph_eval_scalar_domain(
+    name: GraphFunction,
+    value: &GraphEvalValue,
+) -> Result<(), EngineError> {
+    match value {
+        GraphEvalValue::Null
+        | GraphEvalValue::Bool(_)
+        | GraphEvalValue::Int(_)
+        | GraphEvalValue::UInt(_)
+        | GraphEvalValue::String(_)
+        | GraphEvalValue::Bytes(_) => Ok(()),
+        GraphEvalValue::Float(value) => {
+            checked_finite_float(*value, "graph row scalar function result").map(|_| ())
+        }
+        GraphEvalValue::List(values) => {
+            for value in values {
+                ensure_graph_eval_scalar_domain(name, value)?;
+            }
+            Ok(())
+        }
+        GraphEvalValue::Map(values) => {
+            for value in values.values() {
+                ensure_graph_eval_scalar_domain(name, value)?;
+            }
+            Ok(())
+        }
+        GraphEvalValue::Node(_) | GraphEvalValue::Edge(_) | GraphEvalValue::Path(_) => Err(
+            function_input_error(name, "scalar, list, map, or null input"),
+        ),
     }
 }
 
@@ -2509,6 +3521,8 @@ pub(crate) enum GraphSortAtom {
         nodes: Vec<u64>,
         edges: Vec<u64>,
     },
+    List(Vec<GraphSortAtom>),
+    Map(Vec<(String, GraphSortAtom)>),
 }
 
 pub(crate) fn graph_sort_atom_for_value(
@@ -2547,6 +3561,26 @@ pub(crate) fn graph_sort_atom_for_value(
     })
 }
 
+pub(crate) fn graph_logical_sort_atom_for_value(
+    value: &GraphEvalValue,
+) -> Result<GraphSortAtom, EngineError> {
+    Ok(match value {
+        GraphEvalValue::List(values) => GraphSortAtom::List(
+            values
+                .iter()
+                .map(graph_logical_sort_atom_for_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        GraphEvalValue::Map(values) => GraphSortAtom::Map(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), graph_logical_sort_atom_for_value(value)?)))
+                .collect::<Result<Vec<_>, EngineError>>()?,
+        ),
+        _ => graph_sort_atom_for_value(value)?,
+    })
+}
+
 pub(crate) fn compare_graph_sort_atoms(left: &GraphSortAtom, right: &GraphSortAtom) -> Ordering {
     match (left, right) {
         (GraphSortAtom::Null, GraphSortAtom::Null) => Ordering::Equal,
@@ -2568,6 +3602,8 @@ fn graph_sort_atom_rank(value: &GraphSortAtom) -> u8 {
         GraphSortAtom::Node(_) => 4,
         GraphSortAtom::Edge(_) => 5,
         GraphSortAtom::Path { .. } => 6,
+        GraphSortAtom::List(_) => 7,
+        GraphSortAtom::Map(_) => 8,
     }
 }
 
@@ -2594,6 +3630,22 @@ fn graph_sort_atom_payload_cmp(left: &GraphSortAtom, right: &GraphSortAtom) -> O
             .cmp(right_hops)
             .then_with(|| left_nodes.cmp(right_nodes))
             .then_with(|| left_edges.cmp(right_edges)),
+        (GraphSortAtom::List(left), GraphSortAtom::List(right)) => left
+            .iter()
+            .zip(right.iter())
+            .map(|(left, right)| compare_graph_sort_atoms(left, right))
+            .find(|ordering| !ordering.is_eq())
+            .unwrap_or_else(|| left.len().cmp(&right.len())),
+        (GraphSortAtom::Map(left), GraphSortAtom::Map(right)) => left
+            .iter()
+            .zip(right.iter())
+            .map(|((left_key, left_value), (right_key, right_value))| {
+                left_key
+                    .cmp(right_key)
+                    .then_with(|| compare_graph_sort_atoms(left_value, right_value))
+            })
+            .find(|ordering| !ordering.is_eq())
+            .unwrap_or_else(|| left.len().cmp(&right.len())),
         _ => Ordering::Equal,
     }
 }
@@ -2643,11 +3695,13 @@ fn bound_expr_to_output_value(
 ) -> Result<GraphValue, EngineError> {
     match expr {
         BoundGraphExpr::Function { name, args } if args.len() == 1 => {
-            if let BoundGraphExpr::Binding(slot) = &args[0] {
-                if slot.kind == GraphBindingSlotKind::Path {
-                    return bound_path_function_to_output_value(
-                        *name, *slot, projection, output, context,
-                    );
+            if path_output_graph_function(*name) {
+                if let BoundGraphExpr::Binding(slot) = &args[0] {
+                    if slot.kind == GraphBindingSlotKind::Path {
+                        return bound_path_function_to_output_value(
+                            *name, *slot, projection, output, context,
+                        );
+                    }
                 }
             }
         }
@@ -2717,7 +3771,25 @@ fn bound_path_function_to_output_value(
             let value = eval_bound_graph_slot_function(name, slot, context)?;
             graph_eval_to_output_value(&value, projection, output)
         }
+        _ => Err(EngineError::InvalidOperation(format!(
+            "graph row function {} does not produce path output",
+            graph_function_name(name)
+        ))),
     }
+}
+
+fn path_output_graph_function(name: GraphFunction) -> bool {
+    matches!(
+        name,
+        GraphFunction::StartNode
+            | GraphFunction::EndNode
+            | GraphFunction::Nodes
+            | GraphFunction::Relationships
+            | GraphFunction::Length
+            | GraphFunction::Id
+            | GraphFunction::Labels
+            | GraphFunction::Type
+    )
 }
 
 fn graph_bound_node_to_output_value(
@@ -2736,7 +3808,7 @@ fn graph_bound_edge_to_output_value(
     graph_eval_to_output_value(&GraphEvalValue::Edge(edge.clone()), projection, output)
 }
 
-fn graph_eval_to_output_value(
+pub(crate) fn graph_eval_to_output_value(
     value: &GraphEvalValue,
     projection: &GraphReturnProjection,
     output: &GraphOutputOptions,
@@ -3616,6 +4688,13 @@ fn collect_expr_output_needs(
         GraphExpr::Function { name, args } => {
             collect_function_output_needs(schema, *name, args, projection, output, needs)
         }
+        GraphExpr::AggregateCall { arg, .. } => {
+            if let Some(arg) = arg {
+                collect_expr_output_needs(schema, arg, projection, output, needs)?;
+            }
+            Ok(())
+        }
+        GraphExpr::ExistsSubquery(_) => Ok(()),
         GraphExpr::List(items) => {
             for item in items {
                 collect_expr_output_needs(schema, item, projection, output, needs)?;
@@ -3625,6 +4704,19 @@ fn collect_expr_output_needs(
         GraphExpr::Map(items) => {
             for item in items.values() {
                 collect_expr_output_needs(schema, item, projection, output, needs)?;
+            }
+            Ok(())
+        }
+        GraphExpr::Case {
+            branches,
+            else_expr,
+            ..
+        } => {
+            for branch in branches {
+                collect_expr_output_needs(schema, &branch.then, projection, output, needs)?;
+            }
+            if let Some(else_expr) = else_expr {
+                collect_expr_output_needs(schema, else_expr, projection, output, needs)?;
             }
             Ok(())
         }
@@ -3688,6 +4780,7 @@ fn collect_function_output_needs(
         GraphFunction::Id | GraphFunction::Labels | GraphFunction::Type | GraphFunction::Length => {
             Ok(())
         }
+        _ => Ok(()),
     }
 }
 
@@ -3935,12 +5028,34 @@ fn collect_expr_projection_needs(
             }
             collect_function_projection_needs(*name, args, needs, need_class)?;
         }
+        GraphExpr::AggregateCall { arg, .. } => {
+            if let Some(arg) = arg {
+                collect_expr_projection_needs(arg, schema, needs, need_class)?;
+            }
+        }
+        GraphExpr::ExistsSubquery(_) => {}
         GraphExpr::Unary { expr, .. } | GraphExpr::IsNull(expr) | GraphExpr::IsNotNull(expr) => {
             collect_expr_projection_needs(expr, schema, needs, need_class)?
         }
         GraphExpr::Binary { left, right, .. } => {
             collect_expr_projection_needs(left, schema, needs, need_class)?;
             collect_expr_projection_needs(right, schema, needs, need_class)?;
+        }
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_projection_needs(operand, schema, needs, need_class)?;
+            }
+            for branch in branches {
+                collect_expr_projection_needs(&branch.when, schema, needs, need_class)?;
+                collect_expr_projection_needs(&branch.then, schema, needs, need_class)?;
+            }
+            if let Some(else_expr) = else_expr {
+                collect_expr_projection_needs(else_expr, schema, needs, need_class)?;
+            }
         }
         GraphExpr::List(items) => {
             for item in items {
@@ -4015,6 +5130,7 @@ fn collect_function_projection_needs(
             GraphFunction::Nodes => merge_path_node_need(alias, None, needs, need_class)?,
             GraphFunction::Relationships => merge_path_edge_need(alias, None, needs, need_class)?,
             GraphFunction::Id | GraphFunction::Length => {}
+            _ => {}
         }
         return Ok(());
     }
@@ -4047,6 +5163,7 @@ fn collect_function_projection_needs(
         | GraphFunction::EndNode
         | GraphFunction::Nodes
         | GraphFunction::Relationships => {}
+        _ => {}
     }
     Ok(())
 }
@@ -4251,7 +5368,7 @@ fn path_needs_from_element(
     }
 }
 
-fn node_source_needs_from_element(
+pub(crate) fn node_source_needs_from_element(
     projection: GraphElementProjection,
     include_vectors: bool,
 ) -> Option<NodeSelectedFieldNeeds> {
@@ -4263,7 +5380,7 @@ fn node_source_needs_from_element(
     }
 }
 
-fn edge_source_needs_from_element(
+pub(crate) fn edge_source_needs_from_element(
     projection: GraphElementProjection,
 ) -> Option<EdgeSelectedFieldNeeds> {
     match projection {
@@ -4274,7 +5391,7 @@ fn edge_source_needs_from_element(
     }
 }
 
-fn path_source_needs_from_element(
+pub(crate) fn path_source_needs_from_element(
     projection: GraphElementProjection,
     include_vectors: bool,
 ) -> Option<PathSelectedFieldNeeds> {
@@ -4295,7 +5412,7 @@ fn node_needs_from_selected(selected: &GraphSelectedNodeProjection) -> NodeSelec
     }
 }
 
-fn node_source_needs_from_selected(
+pub(crate) fn node_source_needs_from_selected(
     selected: &GraphSelectedNodeProjection,
 ) -> Option<NodeSelectedFieldNeeds> {
     if selected.labels
@@ -4319,7 +5436,7 @@ fn edge_needs_from_selected(selected: &GraphSelectedEdgeProjection) -> EdgeSelec
     }
 }
 
-fn edge_source_needs_from_selected(
+pub(crate) fn edge_source_needs_from_selected(
     selected: &GraphSelectedEdgeProjection,
 ) -> Option<EdgeSelectedFieldNeeds> {
     if selected.from
@@ -4348,7 +5465,7 @@ fn path_needs_from_selected(selected: &GraphSelectedPathProjection) -> PathSelec
     }
 }
 
-fn path_source_needs_from_selected(
+pub(crate) fn path_source_needs_from_selected(
     selected: &GraphSelectedPathProjection,
 ) -> Option<PathSelectedFieldNeeds> {
     let nodes = selected
@@ -4628,6 +5745,21 @@ fn graph_function_name(name: GraphFunction) -> &'static str {
         GraphFunction::EndNode => "end_node",
         GraphFunction::Nodes => "nodes",
         GraphFunction::Relationships => "relationships",
+        GraphFunction::Coalesce => "coalesce",
+        GraphFunction::ToString => "to_string",
+        GraphFunction::ToInteger => "to_integer",
+        GraphFunction::ToFloat => "to_float",
+        GraphFunction::Abs => "abs",
+        GraphFunction::Floor => "floor",
+        GraphFunction::Ceil => "ceil",
+        GraphFunction::Round => "round",
+        GraphFunction::Lower => "lower",
+        GraphFunction::Upper => "upper",
+        GraphFunction::Trim => "trim",
+        GraphFunction::Substring => "substring",
+        GraphFunction::Size => "size",
+        GraphFunction::Head => "head",
+        GraphFunction::Last => "last",
     }
 }
 
@@ -4649,5 +5781,415 @@ impl GraphVectorSelectionExt for GraphVectorSelection {
             self,
             GraphVectorSelection::Sparse | GraphVectorSelection::Both
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{GraphCaseBranch, GraphExpr};
+
+    fn eval(expr: GraphExpr) -> Result<GraphEvalValue, EngineError> {
+        let schema = GraphBindingSchema::new();
+        let row = schema.empty_row();
+        let params = BTreeMap::new();
+        eval_graph_expr(
+            &expr,
+            &GraphEvalContext {
+                schema: &schema,
+                row: &row,
+                params: &params,
+            },
+        )
+    }
+
+    fn binary(op: GraphBinaryOp, left: GraphExpr, right: GraphExpr) -> GraphExpr {
+        GraphExpr::Binary {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    }
+
+    fn function(name: GraphFunction, args: Vec<GraphExpr>) -> GraphExpr {
+        GraphExpr::Function { name, args }
+    }
+
+    #[test]
+    fn canonical_keys_cover_scalar_numeric_and_nested_domains() {
+        let int_key = graph_canonical_key_for_value(&GraphEvalValue::Int(1)).unwrap();
+        let uint_key = graph_canonical_key_for_value(&GraphEvalValue::UInt(1)).unwrap();
+        let float_key = graph_canonical_key_for_value(&GraphEvalValue::Float(1.0)).unwrap();
+        assert_eq!(int_key, uint_key);
+        assert_eq!(uint_key, float_key);
+
+        assert_eq!(
+            graph_canonical_key_for_value(&GraphEvalValue::List(vec![
+                GraphEvalValue::Null,
+                GraphEvalValue::Bool(true),
+                GraphEvalValue::String("a".to_string()),
+                GraphEvalValue::Bytes(vec![1, 2]),
+            ]))
+            .unwrap(),
+            GraphCanonicalKey::List(vec![
+                GraphCanonicalKey::Null,
+                GraphCanonicalKey::Bool(true),
+                GraphCanonicalKey::String(b"a".to_vec()),
+                GraphCanonicalKey::Bytes(vec![1, 2]),
+            ])
+        );
+        assert_eq!(
+            graph_canonical_key_for_value(&GraphEvalValue::Map(BTreeMap::from([
+                ("z".to_string(), GraphEvalValue::UInt(2)),
+                ("a".to_string(), GraphEvalValue::String("x".to_string())),
+            ])))
+            .unwrap(),
+            GraphCanonicalKey::Map(vec![
+                ("a".to_string(), GraphCanonicalKey::String(b"x".to_vec())),
+                (
+                    "z".to_string(),
+                    GraphCanonicalKey::Number(numeric_range_sort_key(numeric_key_from_u64(2)))
+                ),
+            ])
+        );
+        assert!(graph_canonical_key_for_value(&GraphEvalValue::Float(f64::NAN)).is_err());
+    }
+
+    #[test]
+    fn canonical_keys_use_graph_identity_without_hydrated_elements() {
+        let path = GraphBoundPath::id_only(GraphPath {
+            nodes: vec![1, 2],
+            edges: vec![9],
+        })
+        .unwrap();
+        assert_eq!(
+            graph_canonical_key_for_value(&GraphEvalValue::Node(GraphBoundNode::id_only(7)))
+                .unwrap(),
+            GraphCanonicalKey::Node(7)
+        );
+        assert_eq!(
+            graph_canonical_key_for_value(&GraphEvalValue::Edge(GraphBoundEdge::id_only(8)))
+                .unwrap(),
+            GraphCanonicalKey::Edge(8)
+        );
+        assert_eq!(
+            graph_canonical_key_for_value(&GraphEvalValue::Path(path)).unwrap(),
+            GraphCanonicalKey::Path {
+                nodes: vec![1, 2],
+                edges: vec![9],
+            }
+        );
+
+        let mut schema = GraphBindingSchema::new();
+        let n = schema.add_node_alias("n", false).unwrap();
+        let e = schema.add_edge_alias("e", false).unwrap();
+        let v = schema.add_scalar_alias("v", false).unwrap();
+        let mut row = schema.empty_row();
+        row.bind_node(n, GraphBoundNode::id_only(7)).unwrap();
+        row.bind_edge(e, GraphBoundEdge::id_only(8)).unwrap();
+        row.bind_scalar(v, GraphEvalValue::Int(1)).unwrap();
+        assert_eq!(
+            graph_canonical_key_for_row_slots(&row, &[n, e, v]).unwrap(),
+            vec![
+                GraphCanonicalKey::Node(7),
+                GraphCanonicalKey::Edge(8),
+                GraphCanonicalKey::Number(numeric_range_sort_key(numeric_key_from_i64(1))),
+            ]
+        );
+    }
+
+    #[test]
+    fn rich_graph_expr_checked_numeric_arithmetic() {
+        assert_eq!(
+            eval(binary(
+                GraphBinaryOp::Add,
+                GraphExpr::Int(1),
+                GraphExpr::UInt(2)
+            ))
+            .unwrap(),
+            GraphEvalValue::Int(3)
+        );
+        assert_eq!(
+            eval(binary(
+                GraphBinaryOp::Div,
+                GraphExpr::UInt(7),
+                GraphExpr::Int(2)
+            ))
+            .unwrap(),
+            GraphEvalValue::Float(3.5)
+        );
+        assert_eq!(
+            eval(GraphExpr::Unary {
+                op: GraphUnaryOp::Neg,
+                expr: Box::new(GraphExpr::UInt((i64::MAX as u64) + 1)),
+            })
+            .unwrap(),
+            GraphEvalValue::Int(i64::MIN)
+        );
+        assert_eq!(
+            eval(GraphExpr::Function {
+                name: GraphFunction::ToFloat,
+                args: vec![GraphExpr::UInt(9_007_199_254_740_992)],
+            })
+            .unwrap(),
+            GraphEvalValue::Float(9_007_199_254_740_992.0)
+        );
+        assert!(eval(GraphExpr::Function {
+            name: GraphFunction::ToFloat,
+            args: vec![GraphExpr::UInt(9_007_199_254_740_993)],
+        })
+        .is_err());
+        assert!(eval(binary(
+            GraphBinaryOp::Add,
+            GraphExpr::UInt(u64::MAX),
+            GraphExpr::Float(1.0)
+        ))
+        .is_err());
+        assert!(eval(binary(
+            GraphBinaryOp::Add,
+            GraphExpr::Int(i64::MAX),
+            GraphExpr::Int(1)
+        ))
+        .is_err());
+        assert!(eval(binary(
+            GraphBinaryOp::Mul,
+            GraphExpr::UInt(u64::MAX),
+            GraphExpr::UInt(2)
+        ))
+        .is_err());
+        assert!(eval(binary(
+            GraphBinaryOp::Div,
+            GraphExpr::Int(1),
+            GraphExpr::Int(0)
+        ))
+        .is_err());
+        assert!(eval(GraphExpr::Unary {
+            op: GraphUnaryOp::Neg,
+            expr: Box::new(GraphExpr::UInt((i64::MAX as u64) + 2)),
+        })
+        .is_err());
+        assert!(eval(binary(
+            GraphBinaryOp::Add,
+            GraphExpr::Float(f64::INFINITY),
+            GraphExpr::Float(1.0)
+        ))
+        .is_err());
+        assert!(eval(binary(
+            GraphBinaryOp::Mul,
+            GraphExpr::Float(f64::MAX),
+            GraphExpr::Float(2.0)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn rich_graph_expr_string_predicates_and_nulls() {
+        assert_eq!(
+            eval(binary(
+                GraphBinaryOp::StartsWith,
+                GraphExpr::String("Ada".to_string()),
+                GraphExpr::String("A".to_string())
+            ))
+            .unwrap(),
+            GraphEvalValue::Bool(true)
+        );
+        assert_eq!(
+            eval(binary(
+                GraphBinaryOp::EndsWith,
+                GraphExpr::String("Ada".to_string()),
+                GraphExpr::String("z".to_string())
+            ))
+            .unwrap(),
+            GraphEvalValue::Bool(false)
+        );
+        assert_eq!(
+            eval(binary(
+                GraphBinaryOp::Contains,
+                GraphExpr::Null,
+                GraphExpr::String("d".to_string())
+            ))
+            .unwrap(),
+            GraphEvalValue::Null
+        );
+        assert!(eval(binary(
+            GraphBinaryOp::Contains,
+            GraphExpr::Int(1),
+            GraphExpr::String("d".to_string())
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn rich_graph_expr_case_semantics() {
+        let generic = GraphExpr::Case {
+            operand: None,
+            branches: vec![
+                GraphCaseBranch {
+                    when: GraphExpr::Bool(false),
+                    then: GraphExpr::String("no".to_string()),
+                },
+                GraphCaseBranch {
+                    when: GraphExpr::Bool(true),
+                    then: GraphExpr::String("yes".to_string()),
+                },
+            ],
+            else_expr: Some(Box::new(GraphExpr::String("else".to_string()))),
+        };
+        assert_eq!(
+            eval(generic).unwrap(),
+            GraphEvalValue::String("yes".to_string())
+        );
+
+        let simple = GraphExpr::Case {
+            operand: Some(Box::new(GraphExpr::String("b".to_string()))),
+            branches: vec![GraphCaseBranch {
+                when: GraphExpr::String("a".to_string()),
+                then: GraphExpr::Int(1),
+            }],
+            else_expr: None,
+        };
+        assert_eq!(eval(simple).unwrap(), GraphEvalValue::Null);
+    }
+
+    #[test]
+    fn rich_graph_expr_scalar_functions() {
+        assert_eq!(
+            eval(function(
+                GraphFunction::Coalesce,
+                vec![GraphExpr::Null, GraphExpr::String("x".to_string())]
+            ))
+            .unwrap(),
+            GraphEvalValue::String("x".to_string())
+        );
+        assert_eq!(
+            eval(function(
+                GraphFunction::ToInteger,
+                vec![GraphExpr::String("42".to_string())]
+            ))
+            .unwrap(),
+            GraphEvalValue::Int(42)
+        );
+        assert_eq!(
+            eval(function(GraphFunction::Abs, vec![GraphExpr::Int(-7)])).unwrap(),
+            GraphEvalValue::Int(7)
+        );
+        assert_eq!(
+            eval(function(
+                GraphFunction::Substring,
+                vec![
+                    GraphExpr::String("abcdef".to_string()),
+                    GraphExpr::Int(1),
+                    GraphExpr::Int(3),
+                ],
+            ))
+            .unwrap(),
+            GraphEvalValue::String("bcd".to_string())
+        );
+        assert_eq!(
+            eval(function(
+                GraphFunction::Size,
+                vec![GraphExpr::Map(BTreeMap::from([(
+                    "a".to_string(),
+                    GraphExpr::Int(1),
+                )]))],
+            ))
+            .unwrap(),
+            GraphEvalValue::UInt(1)
+        );
+        assert_eq!(
+            eval(function(
+                GraphFunction::Head,
+                vec![GraphExpr::List(vec![GraphExpr::Int(1), GraphExpr::Int(2)])],
+            ))
+            .unwrap(),
+            GraphEvalValue::Int(1)
+        );
+        assert_eq!(
+            eval(function(
+                GraphFunction::Last,
+                vec![GraphExpr::List(vec![]),]
+            ))
+            .unwrap(),
+            GraphEvalValue::Null
+        );
+    }
+
+    #[test]
+    fn rich_graph_expr_value_passing_scalar_functions_reject_graph_elements() {
+        let mut schema = GraphBindingSchema::new();
+        let node = schema.add_node_alias("n", false).unwrap();
+        let mut row = schema.empty_row();
+        row.bind_node(node, GraphBoundNode::id_only(7)).unwrap();
+        let params = BTreeMap::new();
+        let eval_with_node = |expr: GraphExpr| {
+            eval_graph_expr(
+                &expr,
+                &GraphEvalContext {
+                    schema: &schema,
+                    row: &row,
+                    params: &params,
+                },
+            )
+        };
+
+        let element_case = GraphExpr::Case {
+            operand: None,
+            branches: vec![GraphCaseBranch {
+                when: GraphExpr::Bool(true),
+                then: GraphExpr::Binding("n".to_string()),
+            }],
+            else_expr: Some(Box::new(GraphExpr::String("fallback".to_string()))),
+        };
+        assert!(eval_with_node(function(
+            GraphFunction::Coalesce,
+            vec![GraphExpr::Null, element_case]
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("coalesce expects scalar, list, map, or null input"));
+
+        assert!(eval_with_node(function(
+            GraphFunction::Coalesce,
+            vec![GraphExpr::Map(BTreeMap::from([(
+                "n".to_string(),
+                GraphExpr::Binding("n".to_string()),
+            )]))]
+        ))
+        .is_err());
+
+        assert!(eval_with_node(function(
+            GraphFunction::Head,
+            vec![GraphExpr::List(vec![GraphExpr::Binding("n".to_string())])]
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("head expects scalar, list, map, or null input"));
+
+        assert!(eval_with_node(function(
+            GraphFunction::Coalesce,
+            vec![GraphExpr::Float(f64::NAN), GraphExpr::Int(1)]
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("scalar function result must be finite"));
+
+        assert!(eval_with_node(function(
+            GraphFunction::Head,
+            vec![GraphExpr::List(vec![GraphExpr::Float(f64::INFINITY)])]
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("scalar function result must be finite"));
+
+        assert!(eval_with_node(function(
+            GraphFunction::Coalesce,
+            vec![GraphExpr::Map(BTreeMap::from([(
+                "bad".to_string(),
+                GraphExpr::Float(f64::NEG_INFINITY),
+            )]))]
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("scalar function result must be finite"));
     }
 }

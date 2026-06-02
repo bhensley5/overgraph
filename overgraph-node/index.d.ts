@@ -129,9 +129,11 @@ export declare class OverGraph {
   queryEdgeIds(request: import('./query-types').QueryEdgeRequest): IdPageResult
   queryEdges(request: import('./query-types').QueryEdgeRequest): EdgePageResult
   queryGraphRows(request: import('./query-types').GraphRowRequest): import('./query-types').GraphRowResult
+  queryGraphPipeline(request: import('./query-types').GraphPipelineRequest): import('./query-types').GraphPipelineResult
   explainNodeQuery(request: import('./query-types').QueryNodeRequest): import('./query-types').QueryPlan
   explainEdgeQuery(request: import('./query-types').QueryEdgeRequest): import('./query-types').QueryPlan
   explainGraphRows(request: import('./query-types').GraphRowRequest): import('./query-types').GraphRowExplain
+  explainGraphPipeline(request: import('./query-types').GraphPipelineRequest): import('./query-types').GraphPipelineExplain
   executeGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): import('./query-types').GqlExecutionResult
   explainGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): import('./query-types').GqlExecutionExplain
   ensureNodePropertyIndex(label: string, propKey: string, kind: string): NodePropertyIndexInfo
@@ -221,9 +223,11 @@ export declare class OverGraph {
   queryEdgeIdsAsync(request: import('./query-types').QueryEdgeRequest): Promise<IdPageResult>
   queryEdgesAsync(request: import('./query-types').QueryEdgeRequest): Promise<EdgePageResult>
   queryGraphRowsAsync(request: import('./query-types').GraphRowRequest): Promise<import('./query-types').GraphRowResult>
+  queryGraphPipelineAsync(request: import('./query-types').GraphPipelineRequest): Promise<import('./query-types').GraphPipelineResult>
   explainNodeQueryAsync(request: import('./query-types').QueryNodeRequest): Promise<import('./query-types').QueryPlan>
   explainEdgeQueryAsync(request: import('./query-types').QueryEdgeRequest): Promise<import('./query-types').QueryPlan>
   explainGraphRowsAsync(request: import('./query-types').GraphRowRequest): Promise<import('./query-types').GraphRowExplain>
+  explainGraphPipelineAsync(request: import('./query-types').GraphPipelineRequest): Promise<import('./query-types').GraphPipelineExplain>
   executeGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): Promise<import('./query-types').GqlExecutionResult>
   explainGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): Promise<import('./query-types').GqlExecutionExplain>
   ensureNodePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<NodePropertyIndexInfo>
@@ -524,6 +528,13 @@ export interface GqlExecutionOptionsInput {
   maxCursorBytes?: number
   maxMutationRows?: number
   maxMutationOps?: number
+  maxPipelineRows?: number
+  maxGroups?: number
+  maxCollectItems?: number
+  maxUnionBranches?: number
+  maxSubqueryInvocations?: number
+  maxSubqueryDepth?: number
+  maxShortestPathPairs?: number
   maxIntermediateBindings?: number
   maxFrontier?: number
   maxPathHops?: number

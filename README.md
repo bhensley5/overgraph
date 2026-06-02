@@ -43,7 +43,7 @@ Graph structure and vector similarity can live in the same engine, so you can as
 - **Explicit write transactions.** Stage ordered node and edge mutations locally, read your own staged writes, then commit atomically with optimistic conflict detection. Available in Rust, Node.js, and Python.
 - **Three languages, one engine.** Rust core with native bindings for Node.js (napi-rs) and Python (PyO3). Not a wrapper around a REST API. Actual FFI into the same Rust engine with minimal overhead.
 - **Full queries as functions.** Use regular APIs for everything: `find_nodes` for direct property lookups, `query_node_ids` / `query_nodes` for full boolean node queries, and `query_graph_rows` for row-shaped graph patterns, optional matches, and bounded paths.
-- **GQL Beta.** Write graph reads and writes as GQL/Cypher-style strings when that is easier to read than building request objects. `MATCH` reads and keyed `CREATE`, `SET`, `REMOVE`, `DELETE r`, and `DETACH DELETE n` mutations run on the same native substrates.
+- **GQL Beta.** Write graph reads and writes as GQL/Cypher-style strings when that is easier than building request objects. Use `MATCH`, `WITH`, `DISTINCT`, aggregation, `UNION`, read-only subqueries, constrained shortest paths, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, and mutation returns.
 
 ## Performance
 
@@ -81,7 +81,7 @@ cargo add overgraph
 
 ## Quick start
 
-The vector variables in these snippets are placeholders from your embedding model. Replace them with dense arrays that match the configured dimension and sparse `(dimension, weight)` entries from your sparse encoder.
+These snippets intentionally show different parts of the same engine. Each workflow is available across Rust, Node.js, and Python; each block uses the language where that workflow reads cleanest.
 
 ### Python
 
@@ -114,105 +114,78 @@ with OverGraph.open("./my-graph", dense_vector_dimension=384) as db:
         print(f"node {hit.node_id} score {hit.score:.4f}")
 ```
 
+Vector search is available across Rust, Node.js, and Python; this snippet shows the Python surface. The vector variables are placeholders from your embedding model.
+
 ### Node.js
 
 ```javascript
 import { OverGraph } from 'overgraph';
 
-const db = OverGraph.open('./my-graph', {
-  denseVector: { dimension: 384 },
+const db = OverGraph.open('./my-graph');
+
+const [alice, bob, carol, project] = db.batchUpsertNodes([
+  { labels: 'User', key: 'alice', props: { name: 'Alice' } },
+  { labels: 'User', key: 'bob', props: { name: 'Bob' } },
+  { labels: 'User', key: 'carol', props: { name: 'Carol' } },
+  { labels: 'Project', key: 'atlas', props: { name: 'Atlas' } },
+]);
+
+db.batchUpsertEdges([
+  { from: alice, to: bob, label: 'KNOWS' },
+  { from: bob, to: carol, label: 'KNOWS' },
+  { from: carol, to: project, label: 'WORKS_ON' },
+]);
+
+const neighbors = db.neighbors(alice, {
+  direction: 'outgoing',
+  edgeLabelFilter: ['KNOWS'],
 });
 
-// Embeddings come from your model. Dense vectors must match the configured dimension.
-// Sparse vectors use { dimension, value } entries from your sparse encoder.
-// Also accepts multiple labels: ['User', 'Engineer']
-const alice = db.upsertNode('User', 'alice', {
-  props: { name: 'Alice' },
-  denseVector: aliceEmbedding,
-  sparseVector: aliceSparse,
+const twoHop = db.traverse(alice, 2, {
+  direction: 'outgoing',
+  minDepth: 1,
 });
 
-const project = db.upsertNode('Project', 'overgraph', {
-  denseVector: projectEmbedding,
-  sparseVector: projectSparse,
+const path = db.shortestPath(alice, project, {
+  direction: 'outgoing',
+  maxDepth: 3,
 });
 
-db.upsertEdge(alice, project, 'CREATED');
-
-// Hybrid vector search scoped to a graph neighborhood
-const hits = db.vectorSearch('hybrid', {
-  k: 10,
-  denseQuery: queryEmbedding,
-  sparseQuery: querySparse,
-  scope: { startNodeId: alice, maxDepth: 3 },
-});
-
-hits.forEach(h => console.log(`node ${h.nodeId} score ${h.score.toFixed(4)}`));
+console.log(neighbors.map(n => n.nodeId));
+console.log(twoHop.items.map(hit => [hit.nodeId, hit.depth]));
+console.log(path?.nodes ?? []);
 db.close();
 ```
+
+Neighbor expansion, bounded traversal, and shortest paths are available across Rust, Node.js, and Python; this snippet shows the Node.js surface.
 
 ### Rust
 
 ```rust
 use overgraph::*;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let opts = DbOptions {
-        dense_vector: Some(DenseVectorConfig {
-            dimension: 384,
-            metric: DenseMetric::Cosine,
-            hnsw: HnswConfig::default(),
-        }),
-        ..Default::default()
-    };
-    let mut db = DatabaseEngine::open(Path::new("./my-graph"), &opts)?;
+    let mut db = DatabaseEngine::open(Path::new("./my-graph"), &DbOptions::default())?;
 
-    // Embeddings come from your model. Dense vectors must match the configured dimension.
-    // Sparse vectors use (dimension, weight) pairs from your sparse encoder.
-    let mut props = BTreeMap::new();
-    props.insert("name".into(), PropValue::String("Alice".into()));
-    // Also accepts multiple labels: &["User", "Engineer"]
-    let alice = db.upsert_node("User", "alice", UpsertNodeOptions {
-        props,
-        dense_vector: Some(alice_embedding),
-        sparse_vector: Some(alice_sparse),
+    let alice = db.upsert_node("User", "alice", UpsertNodeOptions::default())?;
+    let bob = db.upsert_node("User", "bob", UpsertNodeOptions::default())?;
+    let carol = db.upsert_node("User", "carol", UpsertNodeOptions::default())?;
+    let project = db.upsert_node("Project", "atlas", UpsertNodeOptions::default())?;
+
+    db.upsert_edge(alice, bob, "FOLLOWS", UpsertEdgeOptions::default())?;
+    db.upsert_edge(bob, carol, "FOLLOWS", UpsertEdgeOptions::default())?;
+    db.upsert_edge(carol, project, "WORKS_ON", UpsertEdgeOptions::default())?;
+
+    let ranks = db.personalized_pagerank(&[alice], &PprOptions {
+        algorithm: PprAlgorithm::ApproxForwardPush,
+        edge_label_filter: Some(vec!["FOLLOWS".into(), "WORKS_ON".into()]),
+        max_results: Some(5),
         ..Default::default()
     })?;
 
-    let project = db.upsert_node("Project", "overgraph", UpsertNodeOptions {
-        dense_vector: Some(project_embedding),
-        sparse_vector: Some(project_sparse),
-        ..Default::default()
-    })?;
-
-    db.upsert_edge(alice, project, "CREATED", UpsertEdgeOptions::default())?;
-
-    // Hybrid vector search: dense + sparse with graph scoping
-    let hits = db.vector_search(&VectorSearchRequest {
-        mode: VectorSearchMode::Hybrid,
-        dense_query: Some(query_embedding),
-        sparse_query: Some(query_sparse),
-        k: 10,                                              // required: 0 returns empty
-        label_filter: Some(NodeLabelFilter {
-            labels: vec!["User".into(), "Project".into()],
-            mode: LabelMatchMode::Any,
-        }),                                                     // default: None
-        ef_search: Some(200),                                // default: 128
-        scope: Some(VectorSearchScope {                       // default: None (search all nodes)
-            start_node_id: alice,
-            max_depth: 3,
-            direction: Direction::Outgoing,                  // default: Outgoing
-            edge_label_filter: Some(vec!["CREATED".into()]),   // default: None (all edge labels)
-            at_epoch: None,                                  // default: None (current time)
-        }),
-        dense_weight: Some(0.7),                             // default: 1.0
-        sparse_weight: Some(0.3),                            // default: 1.0
-        fusion_mode: Some(FusionMode::ReciprocalRankFusion), // default: WeightedRankFusion
-    })?;
-    for hit in &hits {
-        println!("node {} score {:.4}", hit.node_id, hit.score);
+    for (node_id, score) in ranks.scores {
+        println!("node {node_id} rank {score:.4}");
     }
 
     db.close()?;
@@ -220,34 +193,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Personalized PageRank is available across Rust, Node.js, and Python; this snippet shows the Rust surface.
+
 ## GQL Beta
 
-OverGraph includes **GQL Beta**: a GQL/Cypher-style query language for graph reads and writes, running in the embedded Rust engine. Reads use the same graph-row executor as the native APIs, and mutations use the same write-transaction machinery. Use it when a query is easier to read as text; keep the native APIs when you want structured request objects or the full public API surface.
+OverGraph includes **GQL Beta**: a GQL/Cypher-style query language for graph reads and writes. Use it when a graph operation is easier to read as text: create records, match patterns, shape rows with `WITH`, aggregate, combine branches with `UNION`, run read-only subqueries, use constrained shortest paths, and return mutation results.
 
-```javascript
-const created = db.executeGql(
-  `CREATE (p:Person {key: $key, name: $name, status: 'active'})
-   RETURN p.name AS name`,
-  { key: 'ada', name: 'Ada' }
-);
+```python
+db.execute_gql(
+    """
+    CREATE (p:Person {key: 'gql-ada', name: 'Ada', status: 'active'})
+           -[r:WORKS_AT {role: 'engineer', since: 2026}]->
+           (c:Company {key: 'gql-overgraph', name: 'OverGraph'})
+    RETURN p.name AS person, c.name AS company, r.role AS role
+    """
+)
 
-const result = db.executeGql(
-  `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
-   WHERE p.status = $status AND r.since >= $minSince
-   RETURN p.name AS person, r.role AS role, c.name AS company
-   ORDER BY r.since DESC
-   LIMIT 10`,
-  { status: 'active', minSince: 2020 },
-  { includePlan: true, profile: true }
-);
+result = db.execute_gql(
+    """
+    MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
+    WHERE p.status = 'active' AND r.since >= 2020
+    RETURN p.name AS person, r.role AS role, c.name AS company
+    ORDER BY r.since DESC
+    LIMIT 10
+    """,
+    include_plan=True,
+    profile=True,
+)
 
-console.log(created.mutationStats);
-console.log(result.rows);
-console.log(result.stats);
-console.log(result.plan?.read?.rowOps);
+print(result["rows"])
+print(result["stats"])
+print(result["plan"]["read"]["row_ops"])
 ```
 
-GQL Beta is available in Rust (`execute_gql`), Node.js (`executeGql` / `executeGqlAsync`), and Python (`execute_gql`, including `AsyncOverGraph`). It supports `MATCH`, `OPTIONAL MATCH`, bounded paths, path functions, `WHERE`, `RETURN`, `ORDER BY`, `SKIP` / `OFFSET`, `LIMIT`, params, read cursors, compact rows, vector opt-in for returned node values, explain/profile, ReadOnly mode, `CREATE`, `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, mutation stats, and mutation `RETURN` for `CREATE` / `SET` / `REMOVE`. Unsupported features include `MERGE`, schema DDL, aggregation, `DISTINCT`, `WITH` / `UNION` / `CALL` / subqueries, vector mutation syntax, and full ISO GQL/Cypher compatibility. See the full [GQL Beta API reference](docs/api-reference.md#gql-beta) for syntax, result shapes, options, examples, and current limitations.
+GQL Beta is available across Rust, Node.js, and Python. It supports params, read cursors, compact rows, vector opt-in for returned node values, explain/profile, read-only execution, mutation stats, async connector calls, and consistent result shapes across languages. See the full [GQL Beta API reference](docs/api-reference.md#gql-beta) for syntax, result shapes, options, and examples.
 
 ### Async support
 
@@ -284,7 +263,7 @@ Both Python and Node.js connectors include full async variants of every API. Pyt
 - **Degree counts.** Count edges, sum weights, and compute averages without materializing neighbor lists. Batch `degrees` for bulk analysis.
 - **Direct property queries.** `find_nodes` and `find_nodes_paged` do focused equality lookups with semantic numeric equality for finite scalars. `find_nodes_range` and `find_nodes_range_paged` do domainless numeric range scans with exact bound and cursor semantics.
 - **Optional property indexes.** Declare node or edge equality/range indexes only where they pay off. Range indexes cover finite scalar numeric values across signed integers, unsigned integers, and finite floats; non-finite floats and non-numeric values are excluded. Use `ensure_node_property_index` / `ensure_edge_property_index`, list APIs, and drop APIs to manage them. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
-- **Full query APIs.** `query_node_ids`, `query_nodes`, `query_edge_ids`, `query_edges`, `query_graph_rows`, and explain APIs combine IDs, keys, labels, edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths without a query string. `execute_gql` / `executeGql` adds GQL Beta for query-string reads and mutations over the same native substrates. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
+- **Full query APIs.** `query_node_ids`, `query_nodes`, `query_edge_ids`, `query_edges`, `query_graph_rows`, and explain APIs combine IDs, keys, labels, edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths without a query string. `execute_gql` / `executeGql` adds GQL Beta for query-string reads and mutations. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
 - **Time-range queries.** Find nodes created or updated within a time window. Sorted timestamp index for efficient range scans.
 
 ### Pagination

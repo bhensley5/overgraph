@@ -348,6 +348,48 @@ class TestAsyncQueries:
         assert len(ids) == 1
 
     @pytest.mark.asyncio
+    async def test_gql_phase34_options_and_compact_rows(self, async_db):
+        await async_db.upsert_node(
+            "PyAsyncPhase34",
+            "ada",
+            props={"name": "Ada", "group": "core", "rank": 2},
+        )
+        await async_db.upsert_node(
+            "PyAsyncPhase34",
+            "ben",
+            props={"name": "Ben", "group": "core", "rank": 1},
+        )
+        await async_db.upsert_node(
+            "PyAsyncPhase34",
+            "cy",
+            props={"name": "Cy", "group": "ops", "rank": 3},
+        )
+
+        options = {
+            "max_pipeline_rows": 16,
+            "max_groups": 8,
+            "max_collect_items": 8,
+            "max_union_branches": 4,
+            "max_subquery_invocations": 8,
+            "max_subquery_depth": 1,
+            "max_shortest_path_pairs": 8,
+        }
+        query = """
+            MATCH (n:PyAsyncPhase34)
+            WITH n.group AS grp, count(*) AS count, collect(n.name) AS names
+            WHERE count > 1
+            RETURN grp, count, names
+            """
+        result = await async_db.execute_gql(query, compact_rows=True, **options)
+        assert result["columns"] == ["grp", "count", "names"]
+        assert result["rows"] == [["core", 2, ["Ada", "Ben"]]]
+
+        explain = await async_db.explain_gql(query, **options)
+        assert explain["read"]["target"] == "graph_pipeline_query"
+        for name, value in options.items():
+            assert explain["caps"][name] == value
+
+    @pytest.mark.asyncio
     async def test_count_by_type(self, async_db):
         for i in range(3):
             await async_db.upsert_node("Person", f"n{i}")

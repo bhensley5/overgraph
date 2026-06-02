@@ -351,6 +351,7 @@ QueryEdgeRequest = EdgeQueryRequest
 GraphParamValue = None | bool | int | float | str | bytes | list["GraphParamValue"] | dict[str, "GraphParamValue"]
 GraphExpr = Any
 GraphRowRequest = Mapping[str, Any]
+GraphPipelineRequest = dict[str, Any]
 
 class GraphPathValue(TypedDict, total=False):
     node_ids: list[int]
@@ -380,6 +381,34 @@ class GraphRowResult(TypedDict):
     plan: dict[str, Any] | None
 
 GraphRowExplain = dict[str, Any]
+
+class GraphPipelineStats(TypedDict):
+    rows_returned: int
+    rows_entered_pipeline: int
+    rows_after_filter: int
+    intermediate_rows: int
+    pipeline_rows_materialized: int
+    groups: int
+    collect_items: int
+    union_branches: int
+    union_dedup_keys: int
+    subquery_invocations: int
+    subquery_cache_hits: int
+    shortest_path_pairs: int
+    shortest_path_cache_hits: int
+    db_hits: int
+    elapsed_us: int | None
+    effective_at_epoch: int
+    warnings: list[str]
+
+class GraphPipelineResult(TypedDict):
+    columns: list[str]
+    rows: list[dict[str, GraphValue]] | list[list[GraphValue]]
+    next_cursor: str | None
+    stats: GraphPipelineStats
+    plan: dict[str, Any] | None
+
+GraphPipelineExplain = dict[str, Any]
 
 class GqlNode(TypedDict, total=False):
     id: int
@@ -437,6 +466,13 @@ class GqlExecutionCapSummary(TypedDict):
     max_cursor_bytes: int
     max_mutation_rows: int
     max_mutation_ops: int
+    max_pipeline_rows: int
+    max_groups: int
+    max_collect_items: int
+    max_union_branches: int
+    max_subquery_invocations: int
+    max_subquery_depth: int
+    max_shortest_path_pairs: int
     max_query_bytes: int
     max_param_bytes: int
     max_ast_depth: int
@@ -609,9 +645,11 @@ class OverGraph:
     def query_edge_ids(self, request: dict[str, Any] | EdgeQueryRequest) -> IdPageResult: ...
     def query_edges(self, request: dict[str, Any] | EdgeQueryRequest) -> EdgePageResult: ...
     def query_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowResult: ...
+    def query_graph_pipeline(self, request: GraphPipelineRequest) -> GraphPipelineResult: ...
     def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> dict[str, Any]: ...
     def explain_edge_query(self, request: dict[str, Any] | EdgeQueryRequest) -> dict[str, Any]: ...
     def explain_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowExplain: ...
+    def explain_graph_pipeline(self, request: GraphPipelineRequest) -> GraphPipelineExplain: ...
     def execute_gql(
         self,
         query: str,
@@ -624,6 +662,13 @@ class OverGraph:
         max_cursor_bytes: int | None = None,
         max_mutation_rows: int | None = None,
         max_mutation_ops: int | None = None,
+        max_pipeline_rows: int | None = None,
+        max_groups: int | None = None,
+        max_collect_items: int | None = None,
+        max_union_branches: int | None = None,
+        max_subquery_invocations: int | None = None,
+        max_subquery_depth: int | None = None,
+        max_shortest_path_pairs: int | None = None,
         max_intermediate_bindings: int | None = None,
         max_frontier: int | None = None,
         max_path_hops: int | None = None,
@@ -651,6 +696,13 @@ class OverGraph:
         max_cursor_bytes: int | None = None,
         max_mutation_rows: int | None = None,
         max_mutation_ops: int | None = None,
+        max_pipeline_rows: int | None = None,
+        max_groups: int | None = None,
+        max_collect_items: int | None = None,
+        max_union_branches: int | None = None,
+        max_subquery_invocations: int | None = None,
+        max_subquery_depth: int | None = None,
+        max_shortest_path_pairs: int | None = None,
         max_intermediate_bindings: int | None = None,
         max_frontier: int | None = None,
         max_path_hops: int | None = None,
@@ -1039,9 +1091,11 @@ class AsyncOverGraph:
     async def query_edge_ids(self, request: dict[str, Any] | EdgeQueryRequest) -> IdPageResult: ...
     async def query_edges(self, request: dict[str, Any] | EdgeQueryRequest) -> EdgePageResult: ...
     async def query_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowResult: ...
+    async def query_graph_pipeline(self, request: GraphPipelineRequest) -> GraphPipelineResult: ...
     async def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> dict[str, Any]: ...
     async def explain_edge_query(self, request: dict[str, Any] | EdgeQueryRequest) -> dict[str, Any]: ...
     async def explain_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowExplain: ...
+    async def explain_graph_pipeline(self, request: GraphPipelineRequest) -> GraphPipelineExplain: ...
     async def execute_gql(
         self,
         query: str,
@@ -1054,6 +1108,13 @@ class AsyncOverGraph:
         max_cursor_bytes: int | None = None,
         max_mutation_rows: int | None = None,
         max_mutation_ops: int | None = None,
+        max_pipeline_rows: int | None = None,
+        max_groups: int | None = None,
+        max_collect_items: int | None = None,
+        max_union_branches: int | None = None,
+        max_subquery_invocations: int | None = None,
+        max_subquery_depth: int | None = None,
+        max_shortest_path_pairs: int | None = None,
         max_intermediate_bindings: int | None = None,
         max_frontier: int | None = None,
         max_path_hops: int | None = None,
@@ -1081,6 +1142,13 @@ class AsyncOverGraph:
         max_cursor_bytes: int | None = None,
         max_mutation_rows: int | None = None,
         max_mutation_ops: int | None = None,
+        max_pipeline_rows: int | None = None,
+        max_groups: int | None = None,
+        max_collect_items: int | None = None,
+        max_union_branches: int | None = None,
+        max_subquery_invocations: int | None = None,
+        max_subquery_depth: int | None = None,
+        max_shortest_path_pairs: int | None = None,
         max_intermediate_bindings: int | None = None,
         max_frontier: int | None = None,
         max_path_hops: int | None = None,

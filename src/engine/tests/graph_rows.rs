@@ -219,6 +219,2693 @@ fn decoded_cursor_payload_len(cursor: &str) -> usize {
     base64url_no_pad_decode(encoded).unwrap().len()
 }
 
+fn graph_pipeline_from_row_query(query: &GraphRowQuery) -> GraphPipelineQuery {
+    let items = match query.return_items.clone() {
+        Some(items) => GraphProjectionItems::Items(
+            items
+                .into_iter()
+                .map(|item| GraphProjectItem {
+                    expr: item.expr,
+                    alias: item.alias,
+                    projection: item.projection,
+                })
+                .collect(),
+        ),
+        None => GraphProjectionItems::Star,
+    };
+    GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: query.nodes.clone(),
+                pieces: query.pieces.clone(),
+                optional_candidate_where: None,
+                where_: query.where_.clone(),
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items,
+                distinct: false,
+                where_: None,
+                order_by: query.order_by.clone(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: query.params.clone(),
+        at_epoch: query.at_epoch,
+        page: query.page.clone(),
+        output: query.output.clone(),
+        options: GraphPipelineOptions {
+            allow_full_scan: query.options.allow_full_scan,
+            max_rows: query.options.max_page_limit,
+            max_intermediate_bindings: query.options.max_intermediate_bindings,
+            max_frontier: query.options.max_frontier,
+            max_path_hops: query.options.max_path_hops,
+            max_paths_per_start: query.options.max_paths_per_start,
+            max_order_materialization: query.options.max_order_materialization,
+            max_cursor_bytes: query.options.max_cursor_bytes,
+            max_query_bytes: query.options.max_query_bytes,
+            include_plan: query.options.include_plan,
+            profile: query.options.profile,
+            ..GraphPipelineOptions::default()
+        },
+    }
+}
+
+fn assert_graph_pipeline_invalid(
+    engine: &DatabaseEngine,
+    query: &GraphPipelineQuery,
+    expected: &str,
+) {
+    let err = engine.query_graph_pipeline(query).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains(expected),
+        "expected error containing {expected:?}, got {message:?}"
+    );
+}
+
+#[test]
+fn graph_pipeline_stats_merge_preserves_owner_row_count() {
+    let mut owner = empty_graph_pipeline_stats(7);
+    owner.rows_after_filter = 5;
+    owner.intermediate_rows = 3;
+    let mut nested = empty_graph_pipeline_stats(7);
+    nested.rows_after_filter = 99;
+    nested.intermediate_rows = 11;
+    nested.pipeline_rows_materialized = 13;
+    nested.groups = 2;
+    nested.subquery_invocations = 1;
+
+    owner.merge_from(&nested);
+
+    assert_eq!(owner.rows_after_filter, 5);
+    assert_eq!(owner.intermediate_rows, 11);
+    assert_eq!(owner.pipeline_rows_materialized, 13);
+    assert_eq!(owner.groups, 2);
+    assert_eq!(owner.subquery_invocations, 1);
+}
+
+#[test]
+fn graph_pipeline_options_default_matches_spec() {
+    let options = GraphPipelineOptions::default();
+    assert!(!options.allow_full_scan);
+    assert_eq!(options.max_rows, 10_000);
+    assert_eq!(options.max_pipeline_rows, 65_536);
+    assert_eq!(options.max_groups, 65_536);
+    assert_eq!(options.max_collect_items, 65_536);
+    assert_eq!(options.max_union_branches, 16);
+    assert_eq!(options.max_subquery_invocations, 4_096);
+    assert_eq!(options.max_subquery_depth, 2);
+    assert_eq!(options.max_shortest_path_pairs, 4_096);
+    assert_eq!(options.max_intermediate_bindings, 65_536);
+    assert_eq!(options.max_frontier, 65_536);
+    assert_eq!(options.max_path_hops, 16);
+    assert_eq!(options.max_paths_per_start, 4_096);
+    assert_eq!(options.max_order_materialization, 65_536);
+    assert_eq!(options.max_skip, 100_000);
+    assert_eq!(options.max_cursor_bytes, 16 * 1024);
+    assert_eq!(options.max_query_bytes, 1_048_576);
+    assert_eq!(options.max_param_bytes, 1_048_576);
+    assert_eq!(options.max_ast_depth, 256);
+    assert_eq!(options.max_literal_items, 10_000);
+    assert!(!options.include_plan);
+    assert!(!options.profile);
+}
+
+#[test]
+fn graph_pipeline_one_stage_matches_graph_row_result_and_cursor() {
+    let (_dir, engine) = graph_row_test_engine();
+    insert_graph_row_node(
+        &engine,
+        "PipelinePerson",
+        "ada",
+        &[("name", PropValue::String("Ada".to_string()))],
+    );
+    insert_graph_row_node(
+        &engine,
+        "PipelinePerson",
+        "ben",
+        &[("name", PropValue::String("Ben".to_string()))],
+    );
+    let epoch = now_millis();
+    let mut graph_query = GraphRowQuery {
+        nodes: vec![graph_node_with_label("n", "PipelinePerson")],
+        pieces: Vec::new(),
+        where_: None,
+        return_items: Some(vec![graph_return_expr(graph_prop("n", "name"), "name")]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 1,
+            cursor: None,
+        },
+        at_epoch: Some(epoch),
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: false,
+            include_plan: true,
+            ..GraphQueryOptions::default()
+        },
+    };
+    let mut pipeline_query = graph_pipeline_from_row_query(&graph_query);
+
+    let graph_first = engine.query_graph_rows(&graph_query).unwrap();
+    let pipeline_first = engine.query_graph_pipeline(&pipeline_query).unwrap();
+    assert_eq!(pipeline_first.columns, graph_first.columns);
+    assert_eq!(pipeline_first.rows, graph_first.rows);
+    assert!(graph_first.next_cursor.is_some());
+    assert!(pipeline_first.next_cursor.is_some());
+    assert_ne!(pipeline_first.next_cursor, graph_first.next_cursor);
+    assert!(pipeline_first
+        .next_cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.starts_with(GRAPH_PIPELINE_CURSOR_PREFIX)));
+    assert_eq!(pipeline_first.stats.rows_returned, graph_first.stats.rows_returned);
+    assert_eq!(pipeline_first.stats.rows_after_filter, graph_first.stats.rows_after_filter);
+    assert!(pipeline_first.plan.is_some());
+
+    let raw_graph_cursor = graph_first.next_cursor.clone().unwrap();
+    let pipeline_cursor = pipeline_first.next_cursor.clone().unwrap();
+    pipeline_query.page.cursor = Some(raw_graph_cursor.clone());
+    assert_graph_pipeline_invalid(
+        &engine,
+        &pipeline_query,
+        "invalid graph pipeline cursor prefix",
+    );
+    graph_query.page.cursor = Some(pipeline_cursor.clone());
+    let graph_cursor_err = engine.query_graph_rows(&graph_query).unwrap_err();
+    assert!(
+        graph_cursor_err
+            .to_string()
+            .contains("invalid graph row cursor prefix"),
+        "unexpected graph-row cursor error: {graph_cursor_err:?}"
+    );
+
+    graph_query.page.cursor = Some(raw_graph_cursor);
+    pipeline_query.page.cursor = Some(pipeline_cursor);
+    let graph_second = engine.query_graph_rows(&graph_query).unwrap();
+    let pipeline_second = engine.query_graph_pipeline(&pipeline_query).unwrap();
+    assert_eq!(pipeline_second.columns, graph_second.columns);
+    assert_eq!(pipeline_second.rows, graph_second.rows);
+    assert_eq!(pipeline_second.next_cursor, None);
+    assert_eq!(graph_second.next_cursor, None);
+}
+
+#[test]
+fn graph_pipeline_multistage_caps_and_cursor_namespaces_are_enforced() {
+    let (_dir, engine) = graph_row_test_engine();
+    for key in ["a", "b", "c"] {
+        insert_graph_row_node(
+            &engine,
+            "PipelineWithCaps",
+            key,
+            &[("name", PropValue::String(key.to_string()))],
+        );
+    }
+    let mut query = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineWithCaps")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::With,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: graph_prop("n", "name"),
+                    alias: Some("name".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("name".to_string()),
+                    alias: Some("name".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: vec![GraphOrderItem {
+                    expr: GraphExpr::Binding("name".to_string()),
+                    direction: GraphOrderDirection::Asc,
+                }],
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 1,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: false,
+            ..GraphPipelineOptions::default()
+        },
+    };
+
+    let first = engine.query_graph_pipeline(&query).unwrap();
+    assert_eq!(
+        graph_pipeline_value_rows(first.clone()),
+        vec![vec![GraphValue::String("a".to_string())]]
+    );
+    assert!(first.next_cursor.is_some());
+
+    let pipeline_cursor = first.next_cursor.clone();
+    query.page.cursor = pipeline_cursor.clone();
+    let second = engine.query_graph_pipeline(&query).unwrap();
+    assert_eq!(
+        graph_pipeline_value_rows(second),
+        vec![vec![GraphValue::String("b".to_string())]]
+    );
+
+    let graph_query = GraphRowQuery {
+        nodes: vec![graph_node_with_label("n", "PipelineWithCaps")],
+        pieces: Vec::new(),
+        where_: None,
+        return_items: Some(vec![graph_return_expr(graph_prop("n", "name"), "name")]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 1,
+            cursor: None,
+        },
+        at_epoch: query.at_epoch,
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: false,
+            ..GraphQueryOptions::default()
+        },
+    };
+    let raw_graph_cursor = engine
+        .query_graph_rows(&graph_query)
+        .unwrap()
+        .next_cursor
+        .unwrap();
+    query.page.cursor = Some(raw_graph_cursor);
+    assert_graph_pipeline_invalid(&engine, &query, "invalid graph pipeline cursor prefix");
+
+    query.page.cursor = pipeline_cursor;
+    let mut tiny_cursor_cap = query.clone();
+    tiny_cursor_cap.options.max_cursor_bytes = 4;
+    assert_graph_pipeline_invalid(&engine, &tiny_cursor_cap, "max_cursor_bytes 4");
+
+    let mut order_cap = query.clone();
+    order_cap.page.cursor = None;
+    order_cap.options.max_order_materialization = 1;
+    assert_graph_pipeline_invalid(&engine, &order_cap, "max_order_materialization");
+
+    let mut row_cap = query.clone();
+    row_cap.page.cursor = None;
+    row_cap.options.max_pipeline_rows = 1;
+    assert_graph_pipeline_invalid(&engine, &row_cap, "max_intermediate_bindings");
+
+    let mut max_rows = query.clone();
+    max_rows.page.cursor = None;
+    max_rows.page.limit = 2;
+    max_rows.options.max_rows = 1;
+    assert_graph_pipeline_invalid(&engine, &max_rows, "max_rows");
+
+    let mut max_skip = query;
+    max_skip.page.cursor = None;
+    max_skip.page.skip = 2;
+    max_skip.options.max_skip = 1;
+    assert_graph_pipeline_invalid(&engine, &max_skip, "max_skip");
+}
+
+#[test]
+fn graph_pipeline_terminal_projection_uses_final_row_cap() {
+    let (_dir, engine) = graph_row_test_engine();
+    for key in ["a", "b", "c"] {
+        insert_graph_row_node(
+            &engine,
+            "PipelineTerminalCap",
+            key,
+            &[("name", PropValue::String(key.to_string()))],
+        );
+    }
+
+    let query = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineTerminalCap")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: graph_prop("n", "name"),
+                    alias: Some("name".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: vec![GraphOrderItem {
+                    expr: graph_prop("n", "name"),
+                    direction: GraphOrderDirection::Asc,
+                }],
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 1,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: false,
+            max_pipeline_rows: 3,
+            max_rows: 1,
+            ..GraphPipelineOptions::default()
+        },
+    };
+
+    let result = engine.query_graph_pipeline(&query).unwrap();
+    assert_eq!(
+        graph_pipeline_value_rows(result.clone()),
+        vec![vec![GraphValue::String("a".to_string())]]
+    );
+    assert_eq!(result.stats.rows_after_filter, 3);
+    assert_eq!(result.stats.rows_returned, 1);
+    assert!(result.next_cursor.is_some());
+
+    let mut low_pipeline_cap = query;
+    low_pipeline_cap.options.max_pipeline_rows = 2;
+    assert_graph_pipeline_invalid(&engine, &low_pipeline_cap, "max_intermediate_bindings");
+}
+
+#[test]
+fn graph_pipeline_terminal_aggregate_uses_group_and_final_row_caps() {
+    let (_dir, engine) = graph_row_test_engine();
+    for key in ["a", "b", "c"] {
+        insert_graph_row_node(
+            &engine,
+            "PipelineTerminalAggCap",
+            key,
+            &[("group", PropValue::String(key.to_string()))],
+        );
+    }
+
+    let query = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineTerminalAggCap")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![
+                    GraphProjectItem {
+                        expr: graph_prop("n", "group"),
+                        alias: Some("group".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    },
+                    GraphProjectItem {
+                        expr: GraphExpr::AggregateCall {
+                            function: GraphAggregateFunction::Count,
+                            distinct: false,
+                            arg: None,
+                        },
+                        alias: Some("count".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    },
+                ]),
+                distinct: false,
+                where_: None,
+                order_by: vec![GraphOrderItem {
+                    expr: GraphExpr::Binding("group".to_string()),
+                    direction: GraphOrderDirection::Asc,
+                }],
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 1,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: false,
+            max_pipeline_rows: 3,
+            max_groups: 3,
+            max_rows: 1,
+            ..GraphPipelineOptions::default()
+        },
+    };
+
+    let result = engine.query_graph_pipeline(&query).unwrap();
+    assert_eq!(
+        graph_pipeline_value_rows(result.clone()),
+        vec![vec![GraphValue::String("a".to_string()), GraphValue::UInt(1)]]
+    );
+    assert_eq!(result.stats.groups, 3);
+    assert_eq!(result.stats.rows_after_filter, 3);
+    assert_eq!(result.stats.rows_returned, 1);
+    assert!(result.next_cursor.is_some());
+
+    let mut low_group_cap = query;
+    low_group_cap.options.max_groups = 2;
+    assert_graph_pipeline_invalid(&engine, &low_group_cap, "max_groups");
+}
+
+#[test]
+fn graph_pipeline_executes_distinct_and_aggregate_project_stages() {
+    let (_dir, engine) = graph_row_test_engine();
+    for (key, group, score) in [
+        ("a", "x", PropValue::Int(1)),
+        ("b", "x", PropValue::Int(2)),
+        ("c", "y", PropValue::Int(3)),
+    ] {
+        insert_graph_row_node(
+            &engine,
+            "PipelineAgg",
+            key,
+            &[
+                ("group", PropValue::String(group.to_string())),
+                ("score", score),
+            ],
+        );
+    }
+
+    let distinct = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineAgg")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: graph_prop("n", "group"),
+                    alias: Some("group".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: true,
+                where_: None,
+                order_by: vec![GraphOrderItem {
+                    expr: GraphExpr::Binding("group".to_string()),
+                    direction: GraphOrderDirection::Asc,
+                }],
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: false,
+            include_plan: true,
+            ..GraphPipelineOptions::default()
+        },
+    };
+    let distinct_result = engine.query_graph_pipeline(&distinct).unwrap();
+    assert_eq!(
+        graph_pipeline_value_rows(distinct_result.clone()),
+        vec![
+            vec![GraphValue::String("x".to_string())],
+            vec![GraphValue::String("y".to_string())],
+        ]
+    );
+    assert!(distinct_result
+        .plan
+        .unwrap()
+        .row_ops
+        .iter()
+        .any(|op| op.kind == "Distinct"));
+
+    let aggregate = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineAgg")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![
+                    GraphProjectItem {
+                        expr: graph_prop("n", "group"),
+                        alias: Some("group".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    },
+                    GraphProjectItem {
+                        expr: GraphExpr::AggregateCall {
+                            function: GraphAggregateFunction::Count,
+                            distinct: false,
+                            arg: None,
+                        },
+                        alias: Some("count".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    },
+                    GraphProjectItem {
+                        expr: GraphExpr::AggregateCall {
+                            function: GraphAggregateFunction::Sum,
+                            distinct: false,
+                            arg: Some(Box::new(graph_prop("n", "score"))),
+                        },
+                        alias: Some("sum".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    },
+                    GraphProjectItem {
+                        expr: GraphExpr::AggregateCall {
+                            function: GraphAggregateFunction::Count,
+                            distinct: true,
+                            arg: Some(Box::new(graph_prop("n", "score"))),
+                        },
+                        alias: Some("distinct_scores".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    },
+                ]),
+                distinct: false,
+                where_: None,
+                order_by: vec![GraphOrderItem {
+                    expr: GraphExpr::Binding("group".to_string()),
+                    direction: GraphOrderDirection::Asc,
+                }],
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: false,
+            include_plan: true,
+            ..GraphPipelineOptions::default()
+        },
+    };
+    let aggregate_result = engine.query_graph_pipeline(&aggregate).unwrap();
+    assert_eq!(
+        graph_pipeline_value_rows(aggregate_result.clone()),
+        vec![
+            vec![
+                GraphValue::String("x".to_string()),
+                GraphValue::UInt(2),
+                GraphValue::Int(3),
+                GraphValue::UInt(2),
+            ],
+            vec![
+                GraphValue::String("y".to_string()),
+                GraphValue::UInt(1),
+                GraphValue::Int(3),
+                GraphValue::UInt(1),
+            ],
+        ]
+    );
+    assert_eq!(aggregate_result.stats.groups, 2);
+    let aggregate_plan = aggregate_result.plan.unwrap();
+    assert!(aggregate_plan
+        .row_ops
+        .iter()
+        .any(|op| op.kind == "Aggregate"));
+    assert!(aggregate_plan.stages.iter().any(|stage| {
+        stage.detail.contains("aggregate_distinct_keys=3")
+            && stage
+                .notes
+                .iter()
+                .any(|note| note.contains("aggregate DISTINCT"))
+    }));
+
+    let count_distinct_star = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Project(GraphProjectStage {
+            kind: GraphProjectKind::Return,
+            items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                expr: GraphExpr::AggregateCall {
+                    function: GraphAggregateFunction::Count,
+                    distinct: true,
+                    arg: None,
+                },
+                alias: Some("bad".to_string()),
+                projection: GraphReturnProjection::Auto,
+            }]),
+            distinct: false,
+            where_: None,
+            order_by: Vec::new(),
+            skip: None,
+            limit: None,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    assert_graph_pipeline_invalid(
+        &engine,
+        &count_distinct_star,
+        "DISTINCT requires an argument",
+    );
+
+    let sum_star = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Project(GraphProjectStage {
+            kind: GraphProjectKind::Return,
+            items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                expr: GraphExpr::AggregateCall {
+                    function: GraphAggregateFunction::Sum,
+                    distinct: false,
+                    arg: None,
+                },
+                alias: Some("bad".to_string()),
+                projection: GraphReturnProjection::Auto,
+            }]),
+            distinct: false,
+            where_: None,
+            order_by: Vec::new(),
+            skip: None,
+            limit: None,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    assert_graph_pipeline_invalid(&engine, &sum_star, "sum aggregate requires an argument");
+
+    let zero_groups = GraphPipelineQuery {
+        options: GraphPipelineOptions {
+            max_groups: 0,
+            ..GraphPipelineOptions::default()
+        },
+        ..sum_star
+    };
+    assert_graph_pipeline_invalid(&engine, &zero_groups, "greater than zero");
+
+    let reserved_project_alias = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Project(GraphProjectStage {
+            kind: GraphProjectKind::Return,
+            items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                expr: GraphExpr::Int(1),
+                alias: Some("__gql_bad".to_string()),
+                projection: GraphReturnProjection::Auto,
+            }]),
+            distinct: false,
+            where_: None,
+            order_by: Vec::new(),
+            skip: None,
+            limit: None,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    assert_graph_pipeline_invalid(&engine, &reserved_project_alias, "reserved internal");
+
+    let reserved_match_alias = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("__gql_bad", "PipelineAgg")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Star,
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: false,
+            ..GraphPipelineOptions::default()
+        },
+    };
+    assert_graph_pipeline_invalid(&engine, &reserved_match_alias, "reserved internal");
+}
+
+#[test]
+fn graph_pipeline_aggregate_collect_hydrates_nested_graph_values_at_output() {
+    let (_dir, engine) = graph_row_test_engine();
+    let a = insert_graph_row_node(
+        &engine,
+        "PipelineCollectElement",
+        "a",
+        &[("name", PropValue::String("a".to_string()))],
+    );
+    let b = insert_graph_row_node(
+        &engine,
+        "PipelineCollectElement",
+        "b",
+        &[("name", PropValue::String("b".to_string()))],
+    );
+    let edge = insert_graph_row_edge(
+        &engine,
+        a,
+        b,
+        "PIPELINE_COLLECT_ELEMENT",
+        &[("rank", PropValue::Int(1))],
+    );
+
+    let mut start = graph_node_with_label("a", "PipelineCollectElement");
+    start.ids = vec![a];
+    let mut end = graph_node_with_label("b", "PipelineCollectElement");
+    end.ids = vec![b];
+    let mut path = graph_vlp(Some("p"), Some("r"), "a", "b", 1, 1);
+    if let GraphPatternPiece::VariableLength(path) = &mut path {
+        path.label_filter = vec!["PIPELINE_COLLECT_ELEMENT".to_string()];
+    }
+    let query = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![start, end],
+                pieces: vec![path],
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![
+                    GraphProjectItem {
+                        expr: GraphExpr::AggregateCall {
+                            function: GraphAggregateFunction::Collect,
+                            distinct: false,
+                            arg: Some(Box::new(GraphExpr::Binding("a".to_string()))),
+                        },
+                        alias: Some("nodes".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    },
+                    GraphProjectItem {
+                        expr: GraphExpr::AggregateCall {
+                            function: GraphAggregateFunction::Collect,
+                            distinct: false,
+                            arg: Some(Box::new(GraphExpr::Binding("r".to_string()))),
+                        },
+                        alias: Some("edges".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    },
+                    GraphProjectItem {
+                        expr: GraphExpr::AggregateCall {
+                            function: GraphAggregateFunction::Collect,
+                            distinct: false,
+                            arg: Some(Box::new(GraphExpr::Binding("p".to_string()))),
+                        },
+                        alias: Some("paths".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    },
+                ]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions {
+            mode: GraphOutputMode::Elements,
+            include_vectors: false,
+            compact_rows: false,
+        },
+        options: GraphPipelineOptions {
+            allow_full_scan: false,
+            ..GraphPipelineOptions::default()
+        },
+    };
+
+    let result = engine.query_graph_pipeline(&query).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let row = &result.rows[0].values;
+
+    let GraphValue::List(nodes) = &row[0] else {
+        panic!("expected collected nodes");
+    };
+    let GraphValue::Node(node) = &nodes[0] else {
+        panic!("expected collected node element");
+    };
+    assert_eq!(node.id, Some(a));
+    assert_eq!(node.key.as_deref(), Some("a"));
+    assert_eq!(
+        node.props.as_ref().unwrap().get("name"),
+        Some(&GraphValue::String("a".to_string()))
+    );
+
+    let GraphValue::List(edges) = &row[1] else {
+        panic!("expected collected edges");
+    };
+    let GraphValue::Edge(collected_edge) = &edges[0] else {
+        panic!("expected collected edge element");
+    };
+    assert_eq!(collected_edge.id, Some(edge));
+    assert_eq!(
+        collected_edge.label.as_deref(),
+        Some("PIPELINE_COLLECT_ELEMENT")
+    );
+    assert_eq!(
+        collected_edge.props.as_ref().unwrap().get("rank"),
+        Some(&GraphValue::Int(1))
+    );
+
+    let GraphValue::List(paths) = &row[2] else {
+        panic!("expected collected paths");
+    };
+    let GraphValue::Path(path) = &paths[0] else {
+        panic!("expected collected path element");
+    };
+    assert_eq!(path.node_ids, vec![a, b]);
+    assert_eq!(path.edge_ids, vec![edge]);
+    assert_eq!(path.nodes.as_ref().unwrap()[0].key.as_deref(), Some("a"));
+    assert_eq!(
+        path.edges.as_ref().unwrap()[0].label.as_deref(),
+        Some("PIPELINE_COLLECT_ELEMENT")
+    );
+}
+
+#[test]
+fn graph_pipeline_seeded_bound_node_alias_verifies_later_match_constraints() {
+    let (_dir, engine) = graph_row_test_engine();
+    let active = insert_graph_row_node_with_labels(
+        &engine,
+        &["PipelineSeedSource", "PipelineSeedRequired"],
+        "active",
+        &[("status", PropValue::String("active".to_string()))],
+    );
+    let inactive = insert_graph_row_node_with_labels(
+        &engine,
+        &["PipelineSeedSource"],
+        "inactive",
+        &[("status", PropValue::String("inactive".to_string()))],
+    );
+    let active_target = insert_graph_row_node(&engine, "PipelineSeedTarget", "active-target", &[]);
+    let inactive_target =
+        insert_graph_row_node(&engine, "PipelineSeedTarget", "inactive-target", &[]);
+    insert_graph_row_edge(
+        &engine,
+        active,
+        active_target,
+        "PIPELINE_SEED_REQUIRED_REL",
+        &[],
+    );
+    insert_graph_row_edge(
+        &engine,
+        inactive,
+        inactive_target,
+        "PIPELINE_SEED_REQUIRED_REL",
+        &[],
+    );
+
+    let query = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineSeedSource")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::With,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("n".to_string()),
+                    alias: Some("n".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![GraphNodePattern {
+                    alias: "n".to_string(),
+                    label_filter: Some(NodeLabelFilter {
+                        labels: vec!["PipelineSeedRequired".to_string()],
+                        mode: LabelMatchMode::All,
+                    }),
+                    ids: Vec::new(),
+                    keys: Vec::new(),
+                    filter: Some(NodeFilterExpr::PropertyEquals {
+                        key: "status".to_string(),
+                        value: PropValue::String("active".to_string()),
+                    }),
+                }, graph_node_with_label("m", "PipelineSeedTarget")],
+                pieces: vec![graph_edge_with_label(
+                    Some("r"),
+                    "n",
+                    "m",
+                    "PIPELINE_SEED_REQUIRED_REL",
+                )],
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("n".to_string()),
+                    alias: Some("n".to_string()),
+                    projection: GraphReturnProjection::IdOnly,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: false,
+            ..GraphPipelineOptions::default()
+        },
+    };
+
+    assert_eq!(
+        graph_pipeline_value_rows(engine.query_graph_pipeline(&query).unwrap()),
+        vec![vec![GraphValue::NodeId(active)]]
+    );
+
+    let mut optional_query = query;
+    if let GraphPipelineStage::Match(stage) = &mut optional_query.stages[2] {
+        stage.optional = true;
+    }
+    if let GraphPipelineStage::Project(stage) = &mut optional_query.stages[3] {
+        stage.items = GraphProjectionItems::Items(vec![
+            GraphProjectItem {
+                expr: GraphExpr::Binding("n".to_string()),
+                alias: Some("n".to_string()),
+                projection: GraphReturnProjection::IdOnly,
+            },
+            GraphProjectItem {
+                expr: GraphExpr::Binding("m".to_string()),
+                alias: Some("m".to_string()),
+                projection: GraphReturnProjection::IdOnly,
+            },
+        ]);
+        stage.order_by = vec![GraphOrderItem {
+            expr: GraphExpr::NodeField {
+                alias: "n".to_string(),
+                field: GraphNodeField::Id,
+            },
+            direction: GraphOrderDirection::Asc,
+        }];
+    }
+    assert_eq!(
+        graph_pipeline_value_rows(engine.query_graph_pipeline(&optional_query).unwrap()),
+        vec![
+            vec![GraphValue::NodeId(active), GraphValue::NodeId(active_target)],
+            vec![GraphValue::NodeId(inactive), GraphValue::Null]
+        ]
+    );
+}
+
+#[test]
+fn graph_pipeline_cursor_preserves_scalar_only_duplicate_rows() {
+    let (_dir, engine) = graph_row_test_engine();
+    for key in ["a", "b", "c"] {
+        insert_graph_row_node(
+            &engine,
+            "PipelineCursorDup",
+            key,
+            &[("name", PropValue::String("same".to_string()))],
+        );
+    }
+    let mut query = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineCursorDup")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::With,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: graph_prop("n", "name"),
+                    alias: Some("name".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Int(1),
+                    alias: Some("one".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: vec![GraphOrderItem {
+                    expr: GraphExpr::Binding("one".to_string()),
+                    direction: GraphOrderDirection::Asc,
+                }],
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 1,
+            limit: 1,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: false,
+            max_skip: 1,
+            ..GraphPipelineOptions::default()
+        },
+    };
+
+    let first = engine.query_graph_pipeline(&query).unwrap();
+    assert_eq!(graph_pipeline_value_rows(first.clone()), vec![vec![GraphValue::Int(1)]]);
+    let cursor = first.next_cursor.expect("duplicate scalar page should continue");
+
+    query.page.skip = 0;
+    query.page.cursor = Some(cursor.clone());
+    let second = engine.query_graph_pipeline(&query).unwrap();
+    assert_eq!(
+        graph_pipeline_value_rows(second.clone()),
+        vec![vec![GraphValue::Int(1)]]
+    );
+    assert!(second.next_cursor.is_none());
+
+    let mut lowered_skip_cap = query.clone();
+    lowered_skip_cap.options.max_skip = 0;
+    assert_graph_pipeline_invalid(
+        &engine,
+        &lowered_skip_cap,
+        "original skip 1 exceeds max_skip 0",
+    );
+
+    let mut wrong_sort_shape = query.clone();
+    wrong_sort_shape.page.cursor = Some(tampered_pipeline_cursor_sort_key(cursor.clone()));
+    assert_graph_pipeline_invalid(&engine, &wrong_sort_shape, "cursor sort key has");
+
+    let mut wrong_logical_shape = query.clone();
+    wrong_logical_shape.page.cursor = Some(tampered_pipeline_cursor_logical_key(cursor.clone()));
+    assert_graph_pipeline_invalid(&engine, &wrong_logical_shape, "cursor logical row key has");
+
+    let mut wrong_internal_key_shape = query;
+    wrong_internal_key_shape.page.cursor = Some(tampered_pipeline_cursor_internal_key_atom(cursor));
+    engine.reset_query_execution_counters_for_test();
+    assert_graph_pipeline_invalid(
+        &engine,
+        &wrong_internal_key_shape,
+        "internal cursor key atom",
+    );
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_query_calls, 0);
+}
+
+#[test]
+fn graph_pipeline_enforces_pipeline_rows_and_cursor_skip_caps() {
+    let (_dir, engine) = graph_row_test_engine();
+    for key in ["a", "b", "c", "d"] {
+        insert_graph_row_node(
+            &engine,
+            "PipelineCaps",
+            key,
+            &[("name", PropValue::String(key.to_string()))],
+        );
+    }
+    let graph_query = GraphRowQuery {
+        nodes: vec![graph_node_with_label("n", "PipelineCaps")],
+        pieces: Vec::new(),
+        where_: None,
+        return_items: Some(vec![graph_return_expr(graph_prop("n", "name"), "name")]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 2,
+            cursor: None,
+        },
+        at_epoch: Some(now_millis()),
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: false,
+            ..GraphQueryOptions::default()
+        },
+    };
+    let mut capped = graph_pipeline_from_row_query(&graph_query);
+    capped.options.max_pipeline_rows = 1;
+    assert_graph_pipeline_invalid(&engine, &capped, "max_pipeline_rows");
+
+    let mut first_page = graph_pipeline_from_row_query(&graph_query);
+    first_page.page.skip = 2;
+    first_page.page.limit = 1;
+    first_page.options.max_skip = 2;
+    let first = engine.query_graph_pipeline(&first_page).unwrap();
+    assert!(first.next_cursor.is_some());
+
+    let mut resume = first_page;
+    resume.page.skip = 0;
+    resume.page.cursor = first.next_cursor;
+    resume.options.max_skip = 1;
+    assert_graph_pipeline_invalid(&engine, &resume, "original skip 2 exceeds max_skip 1");
+
+    let mut oversized_cursor = graph_pipeline_from_row_query(&graph_query);
+    oversized_cursor.options.max_cursor_bytes = 4;
+    oversized_cursor.page.cursor = Some(format!(
+        "{GRAPH_PIPELINE_CURSOR_PREFIX}{}",
+        "A".repeat(32)
+    ));
+    let err = engine.query_graph_pipeline(&oversized_cursor).unwrap_err();
+    assert!(matches!(err, EngineError::InvalidCursor { .. }));
+    assert!(
+        err.to_string()
+            .contains("too large to decode within max_cursor_bytes 4"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn graph_pipeline_validates_referenced_param_byte_caps() {
+    let (_dir, engine) = graph_row_test_engine();
+    let graph_query = GraphRowQuery {
+        nodes: vec![graph_node_with_label("n", "PipelineParamCaps")],
+        pieces: Vec::new(),
+        where_: None,
+        return_items: Some(vec![graph_return_binding(
+            "n",
+            GraphReturnProjection::IdOnly,
+        )]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        at_epoch: Some(now_millis()),
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: false,
+            ..GraphQueryOptions::default()
+        },
+    };
+    let mut query = graph_pipeline_from_row_query(&graph_query);
+    if let GraphPipelineStage::Project(project) = &mut query.stages[1] {
+        project.items = GraphProjectionItems::Items(vec![GraphProjectItem {
+            expr: GraphExpr::Param("needle".to_string()),
+            alias: Some("needle".to_string()),
+            projection: GraphReturnProjection::Auto,
+        }]);
+    }
+    query.options.max_param_bytes = 4;
+    query
+        .params
+        .insert("needle".to_string(), GraphParamValue::String("too-long".to_string()));
+    query.params.insert(
+        "unused".to_string(),
+        GraphParamValue::String("also-too-long-but-unreferenced".to_string()),
+    );
+    assert_graph_pipeline_invalid(&engine, &query, "exceeding max_param_bytes 4");
+
+    query
+        .params
+        .insert("needle".to_string(), GraphParamValue::String("ok".to_string()));
+    let result = engine.query_graph_pipeline(&query).unwrap();
+    assert!(result.rows.is_empty());
+}
+
+#[test]
+fn graph_pipeline_explain_reports_stage_shell_and_caps() {
+    let (_dir, engine) = graph_row_test_engine();
+    insert_graph_row_node(
+        &engine,
+        "PipelineExplain",
+        "ada",
+        &[("name", PropValue::String("Ada".to_string()))],
+    );
+    let mut graph_query = GraphRowQuery {
+        nodes: vec![graph_node_with_label("n", "PipelineExplain")],
+        pieces: Vec::new(),
+        where_: None,
+        return_items: Some(vec![graph_return_expr(graph_prop("n", "name"), "name")]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        at_epoch: Some(now_millis()),
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: false,
+            ..GraphQueryOptions::default()
+        },
+    };
+    graph_query.options.include_plan = true;
+    let mut pipeline_query = graph_pipeline_from_row_query(&graph_query);
+    pipeline_query.options.max_pipeline_rows = 123;
+    pipeline_query.options.max_groups = 45;
+    pipeline_query.options.max_collect_items = 67;
+    pipeline_query.options.max_union_branches = 3;
+    pipeline_query.options.max_subquery_invocations = 89;
+    pipeline_query.options.max_subquery_depth = 1;
+    pipeline_query.options.max_shortest_path_pairs = 21;
+
+    let explain = engine.explain_graph_pipeline(&pipeline_query).unwrap();
+    assert_eq!(explain.columns, vec!["name"]);
+    assert_eq!(explain.stages.len(), 2);
+    assert_eq!(explain.stages[0].kind, "Match");
+    assert!(explain.stages[0].graph_row.is_some());
+    assert_eq!(explain.stages[1].kind, "Project(Return)");
+    assert_eq!(explain.stages[1].columns, vec!["name"]);
+    assert_eq!(explain.caps.max_pipeline_rows, 123);
+    assert_eq!(explain.caps.max_groups, 45);
+    assert_eq!(explain.caps.max_collect_items, 67);
+    assert_eq!(explain.caps.max_union_branches, 3);
+    assert_eq!(explain.caps.max_subquery_invocations, 89);
+    assert_eq!(explain.caps.max_subquery_depth, 1);
+    assert_eq!(explain.caps.max_shortest_path_pairs, 21);
+    assert_eq!(explain.stats.rows_entered_pipeline, 1);
+    assert!(!explain
+        .notes
+        .iter()
+        .any(|note| note.contains("CP34.1 supports only")));
+
+    let native_pipeline = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineExplain")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::With,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: graph_prop("n", "name"),
+                    alias: Some("name".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("name".to_string()),
+                    alias: Some("name".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: graph_query.at_epoch,
+        page: graph_query.page.clone(),
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            include_plan: true,
+            allow_full_scan: false,
+            ..GraphPipelineOptions::default()
+        },
+    };
+    engine.reset_query_execution_counters_for_test();
+    let native_explain = engine.explain_graph_pipeline(&native_pipeline).unwrap();
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_query_calls, 0);
+    assert_eq!(
+        native_explain
+            .stages
+            .iter()
+            .map(|stage| stage.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Match", "Project(With)", "Project(Return)"]
+    );
+    assert!(native_explain.stages[0].graph_row.is_some());
+    assert!(native_explain.stages[0]
+        .detail
+        .contains("seeded_node_aliases="));
+    assert!(!native_explain.stages[0].detail.contains("seeded_aliases="));
+    assert!(native_explain.stages[1]
+        .notes
+        .iter()
+        .any(|note| note.contains("created scalar aliases: name")));
+    assert!(native_explain.stages[1]
+        .notes
+        .iter()
+        .any(|note| note.contains("scalar expressions: name :=")));
+
+    let carried_pipeline = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineExplain")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::With,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("n".to_string()),
+                    alias: Some("n".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("m", "PipelineExplain")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("m".to_string()),
+                    alias: Some("m".to_string()),
+                    projection: GraphReturnProjection::IdOnly,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: graph_query.at_epoch,
+        page: graph_query.page.clone(),
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            include_plan: true,
+            allow_full_scan: false,
+            ..GraphPipelineOptions::default()
+        },
+    };
+    let carried_explain = engine.explain_graph_pipeline(&carried_pipeline).unwrap();
+    assert!(carried_explain.stages[2]
+        .detail
+        .contains("seeded_node_aliases=; carried_aliases=n"));
+
+    let seeded_pipeline = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineExplain")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::With,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("n".to_string()),
+                    alias: Some("n".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![
+                    graph_node("n"),
+                    graph_node_with_label("m", "PipelineExplain"),
+                ],
+                pieces: vec![graph_edge_with_label(
+                    Some("r"),
+                    "n",
+                    "m",
+                    "PIPELINE_EXPLAIN_REL",
+                )],
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("m".to_string()),
+                    alias: Some("m".to_string()),
+                    projection: GraphReturnProjection::IdOnly,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: graph_query.at_epoch,
+        page: graph_query.page.clone(),
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            include_plan: true,
+            allow_full_scan: false,
+            ..GraphPipelineOptions::default()
+        },
+    };
+    let seeded_explain = engine.explain_graph_pipeline(&seeded_pipeline).unwrap();
+    assert!(seeded_explain.stages[2]
+        .detail
+        .contains("seeded_node_aliases=n; carried_aliases="));
+}
+
+#[test]
+fn graph_pipeline_shortest_path_stage_executes_and_reports_stats() {
+    let (_dir, engine) = graph_row_test_engine();
+    let a = insert_graph_row_node(&engine, "PipelineShortest", "a", &[]);
+    let b = insert_graph_row_node(&engine, "PipelineShortest", "b", &[]);
+    let c = insert_graph_row_node(&engine, "PipelineShortest", "c", &[]);
+    let ab = engine
+        .upsert_edge(a, b, "PIPELINE_SHORTEST", UpsertEdgeOptions::default())
+        .unwrap();
+    let bc = engine
+        .upsert_edge(b, c, "PIPELINE_SHORTEST", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let query = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::ShortestPath(GraphShortestPathStage {
+                optional: false,
+                output_path_alias: "p".to_string(),
+                mode: GraphShortestPathMode::One,
+                from: GraphShortestPathEndpoint::NodeId(a),
+                to: GraphShortestPathEndpoint::NodeId(c),
+                direction: Direction::Outgoing,
+                edge_label_filter: vec!["PIPELINE_SHORTEST".to_string()],
+                min_hops: 1,
+                max_hops: 4,
+                weight_field: None,
+                max_cost: None,
+                max_paths: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("p".to_string()),
+                    alias: Some("p".to_string()),
+                    projection: GraphReturnProjection::Element(GraphElementProjection::Full),
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            include_plan: true,
+            ..GraphPipelineOptions::default()
+        },
+    };
+
+    let result = engine.query_graph_pipeline(&query).unwrap();
+    assert_eq!(result.stats.shortest_path_pairs, 1);
+    assert_eq!(result.stats.shortest_path_cache_hits, 0);
+    let rows = graph_pipeline_value_rows(result.clone());
+    let GraphValue::Path(path) = &rows[0][0] else {
+        panic!("expected path output");
+    };
+    assert_eq!(path.node_ids, vec![a, b, c]);
+    assert_eq!(path.edge_ids, vec![ab, bc]);
+    let plan = result.plan.expect("include_plan should attach explain");
+    assert!(plan.stages.iter().any(|stage| {
+        stage.kind == "ShortestPath"
+            && stage.detail.contains("algorithm=bidirectional_bfs")
+            && stage.detail.contains("distinct_pair_count=1")
+            && stage.detail.contains("emitted_path_count=1")
+    }));
+}
+
+#[test]
+fn graph_pipeline_shortest_path_node_key_endpoints_use_cached_id_resolution() {
+    let (_dir, engine) = graph_row_test_engine();
+    let a = insert_graph_row_node(&engine, "PipelineShortestKey", "a", &[]);
+    let b = insert_graph_row_node(&engine, "PipelineShortestKey", "b", &[]);
+    let c = insert_graph_row_node(&engine, "PipelineShortestKey", "c", &[]);
+    insert_graph_row_node(&engine, "PipelineShortestKeyDup", "dup-1", &[]);
+    insert_graph_row_node(&engine, "PipelineShortestKeyDup", "dup-2", &[]);
+    let ab = engine
+        .upsert_edge(a, b, "PIPELINE_SHORTEST_KEY", UpsertEdgeOptions::default())
+        .unwrap();
+    let bc = engine
+        .upsert_edge(b, c, "PIPELINE_SHORTEST_KEY", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let query = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("d", "PipelineShortestKeyDup")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::ShortestPath(GraphShortestPathStage {
+                optional: false,
+                output_path_alias: "p".to_string(),
+                mode: GraphShortestPathMode::One,
+                from: GraphShortestPathEndpoint::NodeKey {
+                    label: "PipelineShortestKey".to_string(),
+                    key: "a".to_string(),
+                },
+                to: GraphShortestPathEndpoint::NodeKey {
+                    label: "PipelineShortestKey".to_string(),
+                    key: "c".to_string(),
+                },
+                direction: Direction::Outgoing,
+                edge_label_filter: vec!["PIPELINE_SHORTEST_KEY".to_string()],
+                min_hops: 1,
+                max_hops: 4,
+                weight_field: None,
+                max_cost: None,
+                max_paths: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("p".to_string()),
+                    alias: Some("p".to_string()),
+                    projection: GraphReturnProjection::IdOnly,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            include_plan: true,
+            allow_full_scan: true,
+            ..GraphPipelineOptions::default()
+        },
+    };
+
+    engine.reset_query_execution_counters_for_test();
+    let result = engine.query_graph_pipeline(&query).unwrap();
+    assert_eq!(result.stats.shortest_path_pairs, 1);
+    assert_eq!(result.stats.shortest_path_cache_hits, 1);
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.node_record_hydration_reads, 0);
+
+    let rows = graph_pipeline_value_rows(result.clone());
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let GraphValue::Path(path) = &row[0] else {
+            panic!("expected path output");
+        };
+        assert_eq!(path.node_ids, vec![a, b, c]);
+        assert_eq!(path.edge_ids, vec![ab, bc]);
+    }
+}
+
+#[test]
+fn graph_pipeline_union_executes_all_and_distinct_with_stats() {
+    let (_dir, engine) = graph_row_test_engine();
+    for (key, side, name) in [
+        ("a", "left", "a"),
+        ("b", "left", "b"),
+        ("b2", "right", "b"),
+        ("c", "right", "c"),
+    ] {
+        insert_graph_row_node(
+            &engine,
+            "PipelineUnion",
+            key,
+            &[
+                ("side", PropValue::String(side.to_string())),
+                ("name", PropValue::String(name.to_string())),
+            ],
+        );
+    }
+
+    fn branch(side: &str, desc: bool) -> GraphPipelineQuery {
+        let direction = if desc {
+            GraphOrderDirection::Desc
+        } else {
+            GraphOrderDirection::Asc
+        };
+        GraphPipelineQuery {
+            stages: vec![
+                GraphPipelineStage::Match(GraphPipelineMatchStage {
+                    optional: false,
+                    nodes: vec![graph_node_with_label("n", "PipelineUnion")],
+                    pieces: Vec::new(),
+                    optional_candidate_where: None,
+                    where_: Some(GraphExpr::Binary {
+                        left: Box::new(graph_prop("n", "side")),
+                        op: GraphBinaryOp::Eq,
+                        right: Box::new(GraphExpr::String(side.to_string())),
+                    }),
+                }),
+                GraphPipelineStage::Project(GraphProjectStage {
+                    kind: GraphProjectKind::Return,
+                    items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                        expr: graph_prop("n", "name"),
+                        alias: Some("name".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    }]),
+                    distinct: false,
+                    where_: None,
+                    order_by: vec![GraphOrderItem {
+                        expr: GraphExpr::Binding("name".to_string()),
+                        direction,
+                    }],
+                    skip: None,
+                    limit: None,
+                }),
+            ],
+            params: BTreeMap::new(),
+            at_epoch: None,
+            page: GraphPageRequest {
+                skip: 0,
+                limit: 10,
+                cursor: None,
+            },
+            output: GraphOutputOptions::default(),
+            options: GraphPipelineOptions {
+                allow_full_scan: true,
+                include_plan: true,
+                ..GraphPipelineOptions::default()
+            },
+        }
+    }
+
+    let union_all = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Union(GraphUnionStage {
+            branches: vec![branch("left", true), branch("right", false)],
+            all: true,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: true,
+            include_plan: true,
+            ..GraphPipelineOptions::default()
+        },
+    };
+    let all = engine.query_graph_pipeline(&union_all).unwrap();
+    assert_eq!(
+        all.rows
+            .iter()
+            .map(|row| row.values[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            GraphValue::String("b".to_string()),
+            GraphValue::String("a".to_string()),
+            GraphValue::String("b".to_string()),
+            GraphValue::String("c".to_string()),
+        ]
+    );
+    assert_eq!(all.stats.union_branches, 2);
+    assert_eq!(all.stats.union_dedup_keys, 0);
+    let plan = all.plan.as_ref().unwrap();
+    assert_eq!(plan.stages[0].kind, "UnionAll");
+    assert!(plan.stages[0].detail.contains("branches=2"));
+    assert!(plan.stages[0]
+        .notes
+        .iter()
+        .any(|note| note.contains("branch 1 stages: Match")));
+    assert!(plan.stages[0]
+        .notes
+        .iter()
+        .any(|note| note.contains("branch 2 row op: Sort")));
+
+    let mut dedupe = union_all.clone();
+    if let GraphPipelineStage::Union(stage) = &mut dedupe.stages[0] {
+        stage.all = false;
+    }
+    let distinct = engine.query_graph_pipeline(&dedupe).unwrap();
+    assert_eq!(
+        distinct
+            .rows
+            .iter()
+            .map(|row| row.values[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            GraphValue::String("b".to_string()),
+            GraphValue::String("a".to_string()),
+            GraphValue::String("c".to_string()),
+        ]
+    );
+    assert_eq!(distinct.stats.union_branches, 2);
+    assert_eq!(distinct.stats.union_dedup_keys, 3);
+
+    let source = insert_graph_row_node(&engine, "PipelineUnionEpochNode", "source", &[]);
+    let past = insert_graph_row_node(&engine, "PipelineUnionEpochNode", "past", &[]);
+    let future = insert_graph_row_node(&engine, "PipelineUnionEpochNode", "future", &[]);
+    engine
+        .upsert_edge(
+            source,
+            past,
+            "PipelineUnionEpochEdge",
+            UpsertEdgeOptions {
+                props: graph_row_props(&[
+                    ("side", PropValue::String("past".to_string())),
+                    ("name", PropValue::String("past".to_string())),
+                ]),
+                valid_from: Some(100),
+                valid_to: Some(200),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_edge(
+            source,
+            future,
+            "PipelineUnionEpochEdge",
+            UpsertEdgeOptions {
+                props: graph_row_props(&[
+                    ("side", PropValue::String("future".to_string())),
+                    ("name", PropValue::String("future".to_string())),
+                ]),
+                valid_from: Some(300),
+                valid_to: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    fn epoch_branch(side: &str) -> GraphPipelineQuery {
+        GraphPipelineQuery {
+            stages: vec![
+                GraphPipelineStage::Match(GraphPipelineMatchStage {
+                    optional: false,
+                    nodes: vec![graph_node("source"), graph_node("target")],
+                    pieces: vec![GraphPatternPiece::Edge(GraphEdgePattern {
+                        alias: Some("r".to_string()),
+                        from_alias: "source".to_string(),
+                        to_alias: "target".to_string(),
+                        direction: Direction::Outgoing,
+                        label_filter: vec!["PipelineUnionEpochEdge".to_string()],
+                        filter: None,
+                    })],
+                    optional_candidate_where: None,
+                    where_: Some(GraphExpr::Binary {
+                        left: Box::new(graph_prop("r", "side")),
+                        op: GraphBinaryOp::Eq,
+                        right: Box::new(GraphExpr::String(side.to_string())),
+                    }),
+                }),
+                GraphPipelineStage::Project(GraphProjectStage {
+                    kind: GraphProjectKind::Return,
+                    items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                        expr: graph_prop("r", "name"),
+                        alias: Some("name".to_string()),
+                        projection: GraphReturnProjection::Auto,
+                    }]),
+                    distinct: false,
+                    where_: None,
+                    order_by: Vec::new(),
+                    skip: None,
+                    limit: None,
+                }),
+            ],
+            params: BTreeMap::new(),
+            at_epoch: None,
+            page: GraphPageRequest {
+                skip: 0,
+                limit: 10,
+                cursor: None,
+            },
+            output: GraphOutputOptions::default(),
+            options: GraphPipelineOptions {
+                allow_full_scan: true,
+                ..GraphPipelineOptions::default()
+            },
+        }
+    }
+    let epoch_union = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Union(GraphUnionStage {
+            branches: vec![epoch_branch("past"), epoch_branch("future")],
+            all: true,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: Some(150),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    let snapshot = engine.query_graph_pipeline(&epoch_union).unwrap();
+    assert_eq!(
+        snapshot
+            .rows
+            .iter()
+            .map(|row| row.values[0].clone())
+            .collect::<Vec<_>>(),
+        vec![GraphValue::String("past".to_string())]
+    );
+
+    let nullable_source = insert_graph_row_node(&engine, "PipelineUnionNullable", "source", &[]);
+    let nullable_missing =
+        insert_graph_row_node(&engine, "PipelineUnionNullable", "missing", &[]);
+    let nullable_target = insert_graph_row_node(&engine, "PipelineUnionNullable", "target", &[]);
+    insert_graph_row_edge(
+        &engine,
+        nullable_source,
+        nullable_target,
+        "PipelineUnionNullableEdge",
+        &[],
+    );
+    fn nullable_branch(source_id: u64, optional: bool) -> GraphPipelineQuery {
+        let mut source = graph_node_with_label("source", "PipelineUnionNullable");
+        source.ids = vec![source_id];
+        let edge = graph_edge_with_label(
+            Some("r"),
+            "source",
+            "item",
+            "PipelineUnionNullableEdge",
+        );
+        let pieces = if optional {
+            vec![graph_optional(vec![edge], None)]
+        } else {
+            vec![edge]
+        };
+        GraphPipelineQuery {
+            stages: vec![
+                GraphPipelineStage::Match(GraphPipelineMatchStage {
+                    optional: false,
+                    nodes: vec![
+                        source,
+                        graph_node_with_label("item", "PipelineUnionNullable"),
+                    ],
+                    pieces,
+                    optional_candidate_where: None,
+                    where_: None,
+                }),
+                GraphPipelineStage::Project(GraphProjectStage {
+                    kind: GraphProjectKind::Return,
+                    items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                        expr: GraphExpr::Binding("item".to_string()),
+                        alias: Some("item".to_string()),
+                        projection: GraphReturnProjection::IdOnly,
+                    }]),
+                    distinct: false,
+                    where_: None,
+                    order_by: Vec::new(),
+                    skip: None,
+                    limit: None,
+                }),
+            ],
+            params: BTreeMap::new(),
+            at_epoch: None,
+            page: GraphPageRequest {
+                skip: 0,
+                limit: 10,
+                cursor: None,
+            },
+            output: GraphOutputOptions::default(),
+            options: GraphPipelineOptions::default(),
+        }
+    }
+    let nullable_union = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Union(GraphUnionStage {
+            branches: vec![
+                nullable_branch(nullable_source, false),
+                nullable_branch(nullable_missing, true),
+            ],
+            all: true,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    let nullable = engine.query_graph_pipeline(&nullable_union).unwrap();
+    assert_eq!(
+        nullable
+            .rows
+            .iter()
+            .map(|row| row.values[0].clone())
+            .collect::<Vec<_>>(),
+        vec![GraphValue::NodeId(nullable_target), GraphValue::Null]
+    );
+
+    let mixed_node = insert_graph_row_node(
+        &engine,
+        "PipelineUnionMixed",
+        "node",
+        &[("name", PropValue::String("node".to_string()))],
+    );
+    let mixed_node_two = insert_graph_row_node(
+        &engine,
+        "PipelineUnionMixed",
+        "node-two",
+        &[("name", PropValue::String("node-two".to_string()))],
+    );
+    let mixed_scalar_branch = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Project(GraphProjectStage {
+            kind: GraphProjectKind::Return,
+            items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                expr: GraphExpr::String("literal".to_string()),
+                alias: Some("value".to_string()),
+                projection: GraphReturnProjection::Auto,
+            }]),
+            distinct: false,
+            where_: None,
+            order_by: Vec::new(),
+            skip: None,
+            limit: None,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    let mixed_node_branch = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![GraphNodePattern {
+                    alias: "n".to_string(),
+                    label_filter: Some(NodeLabelFilter {
+                        labels: vec!["PipelineUnionMixed".to_string()],
+                        mode: LabelMatchMode::All,
+                    }),
+                    ids: vec![mixed_node, mixed_node_two],
+                    keys: Vec::new(),
+                    filter: None,
+                }],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("n".to_string()),
+                    alias: Some("value".to_string()),
+                    projection: GraphReturnProjection::Element(GraphElementProjection::Full),
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    let mixed_union = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Union(GraphUnionStage {
+            branches: vec![mixed_scalar_branch.clone(), mixed_node_branch],
+            all: true,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    let mixed = engine.query_graph_pipeline(&mixed_union).unwrap();
+    assert_eq!(mixed.rows[0].values[0], GraphValue::String("literal".to_string()));
+    match &mixed.rows[1].values[0] {
+        GraphValue::Node(node) => assert_eq!(node.id, Some(mixed_node)),
+        other => panic!("expected mixed union node output, got {other:?}"),
+    }
+    let mut paged_mixed_all = mixed_union.clone();
+    paged_mixed_all.page.limit = 2;
+    paged_mixed_all.options.max_rows = 2;
+    let paged_all_first = engine.query_graph_pipeline(&paged_mixed_all).unwrap();
+    assert_eq!(paged_all_first.rows.len(), 2);
+    assert!(paged_all_first.next_cursor.is_some());
+    let paged_all_second = engine
+        .query_graph_pipeline(&GraphPipelineQuery {
+            page: GraphPageRequest {
+                cursor: paged_all_first.next_cursor.clone(),
+                ..paged_mixed_all.page.clone()
+            },
+            ..paged_mixed_all.clone()
+        })
+        .unwrap();
+    assert_eq!(paged_all_second.rows.len(), 1);
+    match &paged_all_second.rows[0].values[0] {
+        GraphValue::Node(node) => assert_eq!(node.id, Some(mixed_node_two)),
+        other => panic!("expected second mixed cursor page node output, got {other:?}"),
+    }
+    let mut paged_mixed_dedupe = paged_mixed_all.clone();
+    if let GraphPipelineStage::Union(stage) = &mut paged_mixed_dedupe.stages[0] {
+        stage.all = false;
+    }
+    let paged_dedupe_first = engine.query_graph_pipeline(&paged_mixed_dedupe).unwrap();
+    assert_eq!(paged_dedupe_first.rows.len(), 2);
+    assert!(paged_dedupe_first.next_cursor.is_some());
+    let paged_dedupe_second = engine
+        .query_graph_pipeline(&GraphPipelineQuery {
+            page: GraphPageRequest {
+                cursor: paged_dedupe_first.next_cursor.clone(),
+                ..paged_mixed_dedupe.page.clone()
+            },
+            ..paged_mixed_dedupe.clone()
+        })
+        .unwrap();
+    assert_eq!(paged_dedupe_second.rows.len(), 1);
+    match &paged_dedupe_second.rows[0].values[0] {
+        GraphValue::Node(node) => assert_eq!(node.id, Some(mixed_node_two)),
+        other => panic!("expected second mixed dedupe cursor page node output, got {other:?}"),
+    }
+
+    let selected_node_id = insert_graph_row_node(
+        &engine,
+        "PipelineUnionProjection",
+        "selected",
+        &[
+            ("visible", PropValue::String("yes".to_string())),
+            ("hidden", PropValue::String("no".to_string())),
+        ],
+    );
+    let full_node_id = insert_graph_row_node(
+        &engine,
+        "PipelineUnionProjection",
+        "full",
+        &[
+            ("visible", PropValue::String("full".to_string())),
+            ("hidden", PropValue::String("full-hidden".to_string())),
+        ],
+    );
+    let compact_node_id =
+        insert_graph_row_node(&engine, "PipelineUnionProjection", "compact", &[]);
+    let selected_projection = GraphReturnProjection::Selected(GraphSelectedProjection::Node(
+        GraphSelectedNodeProjection {
+            id: true,
+            labels: false,
+            key: false,
+            props: GraphPropertySelection::Keys(vec!["visible".to_string()]),
+            weight: false,
+            created_at: false,
+            updated_at: false,
+            vectors: GraphVectorSelection::None,
+        },
+    ));
+    fn projection_branch(node_id: u64, projection: GraphReturnProjection) -> GraphPipelineQuery {
+        GraphPipelineQuery {
+            stages: vec![
+                GraphPipelineStage::Match(GraphPipelineMatchStage {
+                    optional: false,
+                    nodes: vec![GraphNodePattern {
+                        alias: "n".to_string(),
+                        label_filter: Some(NodeLabelFilter {
+                            labels: vec!["PipelineUnionProjection".to_string()],
+                            mode: LabelMatchMode::All,
+                        }),
+                        ids: vec![node_id],
+                        keys: Vec::new(),
+                        filter: None,
+                    }],
+                    pieces: Vec::new(),
+                    optional_candidate_where: None,
+                    where_: None,
+                }),
+                GraphPipelineStage::Project(GraphProjectStage {
+                    kind: GraphProjectKind::Return,
+                    items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                        expr: GraphExpr::Binding("n".to_string()),
+                        alias: Some("value".to_string()),
+                        projection,
+                    }]),
+                    distinct: false,
+                    where_: None,
+                    order_by: Vec::new(),
+                    skip: None,
+                    limit: None,
+                }),
+            ],
+            params: BTreeMap::new(),
+            at_epoch: None,
+            page: GraphPageRequest {
+                skip: 0,
+                limit: 10,
+                cursor: None,
+            },
+            output: GraphOutputOptions::default(),
+            options: GraphPipelineOptions::default(),
+        }
+    }
+    let selected_scalar_union = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Union(GraphUnionStage {
+            branches: vec![
+                projection_branch(selected_node_id, selected_projection.clone()),
+                mixed_scalar_branch,
+            ],
+            all: true,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    let selected_scalar = engine.query_graph_pipeline(&selected_scalar_union).unwrap();
+    match &selected_scalar.rows[0].values[0] {
+        GraphValue::Node(node) => {
+            assert_eq!(node.id, Some(selected_node_id));
+            assert!(node.labels.is_none());
+            assert!(node.key.is_none());
+            assert_eq!(
+                node.props.as_ref().and_then(|props| props.get("visible")),
+                Some(&GraphValue::String("yes".to_string()))
+            );
+            assert!(!node
+                .props
+                .as_ref()
+                .is_some_and(|props| props.contains_key("hidden")));
+        }
+        other => panic!("expected selected node output, got {other:?}"),
+    }
+    assert_eq!(
+        selected_scalar.rows[1].values[0],
+        GraphValue::String("literal".to_string())
+    );
+
+    let selected_full_union = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Union(GraphUnionStage {
+            branches: vec![
+                projection_branch(selected_node_id, selected_projection.clone()),
+                projection_branch(
+                    full_node_id,
+                    GraphReturnProjection::Element(GraphElementProjection::Full),
+                ),
+            ],
+            all: true,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    engine.reset_query_execution_counters_for_test();
+    let selected_full = engine.query_graph_pipeline(&selected_full_union).unwrap();
+    let selected_full_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(selected_full_counters.node_selected_field_batches, 2);
+    assert_eq!(selected_full_counters.node_selected_field_ids, 2);
+    match &selected_full.rows[0].values[0] {
+        GraphValue::Node(node) => {
+            assert_eq!(node.id, Some(selected_node_id));
+            assert!(node.labels.is_none());
+            assert!(node.key.is_none());
+            assert!(!node
+                .props
+                .as_ref()
+                .is_some_and(|props| props.contains_key("hidden")));
+        }
+        other => panic!("expected selected node output, got {other:?}"),
+    }
+    match &selected_full.rows[1].values[0] {
+        GraphValue::Node(node) => {
+            assert_eq!(node.id, Some(full_node_id));
+            assert!(node.labels.is_some());
+            assert!(node.key.is_some());
+            assert!(node
+                .props
+                .as_ref()
+                .is_some_and(|props| props.contains_key("hidden")));
+        }
+        other => panic!("expected full node output, got {other:?}"),
+    }
+
+    let selected_compact_union = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Union(GraphUnionStage {
+            branches: vec![
+                projection_branch(selected_node_id, selected_projection),
+                projection_branch(
+                    compact_node_id,
+                    GraphReturnProjection::Element(GraphElementProjection::Compact),
+                ),
+            ],
+            all: true,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions::default(),
+    };
+    let selected_compact = engine.query_graph_pipeline(&selected_compact_union).unwrap();
+    match &selected_compact.rows[1].values[0] {
+        GraphValue::Node(node) => {
+            assert_eq!(node.id, Some(compact_node_id));
+            assert!(node.labels.is_some());
+            assert!(node.key.is_some());
+            assert!(node.props.is_none());
+        }
+        other => panic!("expected compact node output, got {other:?}"),
+    }
+
+    fn full_scan_branch() -> GraphPipelineQuery {
+        GraphPipelineQuery {
+            stages: vec![
+                GraphPipelineStage::Match(GraphPipelineMatchStage {
+                    optional: false,
+                    nodes: vec![graph_node("n")],
+                    pieces: Vec::new(),
+                    optional_candidate_where: None,
+                    where_: None,
+                }),
+                GraphPipelineStage::Project(GraphProjectStage {
+                    kind: GraphProjectKind::Return,
+                    items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                        expr: GraphExpr::Binding("n".to_string()),
+                        alias: Some("id".to_string()),
+                        projection: GraphReturnProjection::IdOnly,
+                    }]),
+                    distinct: false,
+                    where_: None,
+                    order_by: Vec::new(),
+                    skip: None,
+                    limit: Some(GraphExpr::UInt(1)),
+                }),
+            ],
+            params: BTreeMap::new(),
+            at_epoch: None,
+            page: GraphPageRequest {
+                skip: 0,
+                limit: 10,
+                cursor: None,
+            },
+            output: GraphOutputOptions::default(),
+            options: GraphPipelineOptions::default(),
+        }
+    }
+    let full_scan_union = GraphPipelineQuery {
+        stages: vec![GraphPipelineStage::Union(GraphUnionStage {
+            branches: vec![full_scan_branch(), full_scan_branch()],
+            all: true,
+        })],
+        params: BTreeMap::new(),
+        at_epoch: None,
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: true,
+            ..GraphPipelineOptions::default()
+        },
+    };
+    let full_scan_explain = engine.explain_graph_pipeline(&full_scan_union).unwrap();
+    assert!(full_scan_explain
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("FullScanExplicitlyAllowed")));
+    assert!(full_scan_explain.stages[0]
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("FullScanExplicitlyAllowed")));
+    assert!(full_scan_explain.stages[0]
+        .notes
+        .iter()
+        .any(|note| note.contains("branch 1 warning: FullScanExplicitlyAllowed")));
+}
+
+#[test]
+fn graph_pipeline_rejects_cp34_1_deferred_shapes() {
+    let (_dir, engine) = graph_row_test_engine();
+    let base_graph = GraphRowQuery {
+        nodes: vec![graph_node_with_label("n", "PipelineReject")],
+        pieces: Vec::new(),
+        where_: None,
+        return_items: Some(vec![graph_return_binding(
+            "n",
+            GraphReturnProjection::IdOnly,
+        )]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        at_epoch: Some(now_millis()),
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: true,
+            ..GraphQueryOptions::default()
+        },
+    };
+    let base = graph_pipeline_from_row_query(&base_graph);
+
+    let mut only_match = base.clone();
+    only_match.stages.truncate(1);
+    assert_graph_pipeline_invalid(&engine, &only_match, "terminal Project(Return)");
+
+    let mut only_project = base.clone();
+    only_project.stages.remove(0);
+    assert_graph_pipeline_invalid(&engine, &only_project, "unknown binding");
+
+    let mut union = base.clone();
+    union.stages = vec![GraphPipelineStage::Union(GraphUnionStage {
+        branches: vec![base.clone()],
+        all: false,
+    })];
+    assert_graph_pipeline_invalid(&engine, &union, "at least two");
+
+    let mut union_branch_base = base.clone();
+    union_branch_base.at_epoch = None;
+
+    let mut column_count_mismatch = base.clone();
+    let mut two_columns = union_branch_base.clone();
+    if let GraphPipelineStage::Project(project) = &mut two_columns.stages[1] {
+        project.items = GraphProjectionItems::Items(vec![
+            GraphProjectItem {
+                expr: GraphExpr::Binding("n".to_string()),
+                alias: Some("n".to_string()),
+                projection: GraphReturnProjection::IdOnly,
+            },
+            GraphProjectItem {
+                expr: GraphExpr::UInt(1),
+                alias: Some("extra".to_string()),
+                projection: GraphReturnProjection::Auto,
+            },
+        ]);
+    }
+    column_count_mismatch.stages = vec![GraphPipelineStage::Union(GraphUnionStage {
+        branches: vec![union_branch_base.clone(), two_columns],
+        all: false,
+    })];
+    assert_graph_pipeline_invalid(&engine, &column_count_mismatch, "returns 2 column");
+
+    let mut column_name_mismatch = base.clone();
+    let mut renamed = union_branch_base.clone();
+    if let GraphPipelineStage::Project(project) = &mut renamed.stages[1] {
+        project.items = GraphProjectionItems::Items(vec![GraphProjectItem {
+            expr: GraphExpr::Binding("n".to_string()),
+            alias: Some("other".to_string()),
+            projection: GraphReturnProjection::IdOnly,
+        }]);
+    }
+    column_name_mismatch.stages = vec![GraphPipelineStage::Union(GraphUnionStage {
+        branches: vec![union_branch_base.clone(), renamed],
+        all: false,
+    })];
+    assert_graph_pipeline_invalid(&engine, &column_name_mismatch, "columns");
+
+    let mut branch_cap = base.clone();
+    branch_cap.options.max_union_branches = 1;
+    branch_cap.stages = vec![GraphPipelineStage::Union(GraphUnionStage {
+        branches: vec![base.clone(), base.clone()],
+        all: true,
+    })];
+    assert_graph_pipeline_invalid(&engine, &branch_cap, "max_union_branches");
+
+    let mut branch_cursor = base.clone();
+    branch_cursor.at_epoch = None;
+    branch_cursor.page.cursor = Some("raw-branch-cursor".to_string());
+    let mut cursor_union = base.clone();
+    cursor_union.stages = vec![GraphPipelineStage::Union(GraphUnionStage {
+        branches: vec![union_branch_base.clone(), branch_cursor],
+        all: true,
+    })];
+    assert_graph_pipeline_invalid(&engine, &cursor_union, "raw cursor");
+
+    let mut branch_skip = union_branch_base.clone();
+    branch_skip.page.skip = 1;
+    let mut skip_union = base.clone();
+    skip_union.stages = vec![GraphPipelineStage::Union(GraphUnionStage {
+        branches: vec![union_branch_base.clone(), branch_skip],
+        all: true,
+    })];
+    assert_graph_pipeline_invalid(&engine, &skip_union, "public page skip");
+
+    let mut reserved_alias = union_branch_base.clone();
+    if let GraphPipelineStage::Project(project) = &mut reserved_alias.stages[1] {
+        project.items = GraphProjectionItems::Items(vec![GraphProjectItem {
+            expr: GraphExpr::UInt(1),
+            alias: Some("__og_union_order".to_string()),
+            projection: GraphReturnProjection::Auto,
+        }]);
+    }
+    assert_graph_pipeline_invalid(&engine, &reserved_alias, "reserved internal alias");
+
+    let mut call_collision = base.clone();
+    call_collision.stages = vec![
+        base.stages[0].clone(),
+        GraphPipelineStage::Call(GraphSubqueryStage {
+            query: Box::new(base.clone()),
+            import_aliases: vec!["n".to_string()],
+        }),
+        base.stages[1].clone(),
+    ];
+    assert_graph_pipeline_invalid(&engine, &call_collision, "collides");
+
+    let mut shortest_path = base.clone();
+    let shortest_path_match = shortest_path.stages[0].clone();
+    let shortest_path_return = shortest_path.stages[1].clone();
+    shortest_path.stages = vec![
+        shortest_path_match,
+        GraphPipelineStage::ShortestPath(GraphShortestPathStage {
+            optional: false,
+            output_path_alias: "p".to_string(),
+            mode: GraphShortestPathMode::One,
+            from: GraphShortestPathEndpoint::Alias("a".to_string()),
+            to: GraphShortestPathEndpoint::Alias("b".to_string()),
+            direction: Direction::Outgoing,
+            edge_label_filter: Vec::new(),
+            min_hops: 1,
+            max_hops: 2,
+            weight_field: None,
+            max_cost: None,
+            max_paths: None,
+        }),
+        shortest_path_return,
+    ];
+    assert_graph_pipeline_invalid(&engine, &shortest_path, "endpoint alias");
+
+    let mut extra_stage = base.clone();
+    extra_stage.stages.push(extra_stage.stages[1].clone());
+    assert_graph_pipeline_invalid(&engine, &extra_stage, "must be the final");
+
+    let mut with_project = base.clone();
+    if let GraphPipelineStage::Project(stage) = &mut with_project.stages[1] {
+        stage.kind = GraphProjectKind::With;
+    }
+    assert_graph_pipeline_invalid(&engine, &with_project, "terminal Project(Return)");
+
+    let alias_kind_conflict = GraphPipelineQuery {
+        stages: vec![
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineReject")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::With,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: graph_prop("n", "name"),
+                    alias: Some("n".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+            GraphPipelineStage::Match(GraphPipelineMatchStage {
+                optional: false,
+                nodes: vec![graph_node_with_label("n", "PipelineReject")],
+                pieces: Vec::new(),
+                optional_candidate_where: None,
+                where_: None,
+            }),
+            GraphPipelineStage::Project(GraphProjectStage {
+                kind: GraphProjectKind::Return,
+                items: GraphProjectionItems::Items(vec![GraphProjectItem {
+                    expr: GraphExpr::Binding("n".to_string()),
+                    alias: Some("n".to_string()),
+                    projection: GraphReturnProjection::Auto,
+                }]),
+                distinct: false,
+                where_: None,
+                order_by: Vec::new(),
+                skip: None,
+                limit: None,
+            }),
+        ],
+        params: BTreeMap::new(),
+        at_epoch: Some(now_millis()),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 10,
+            cursor: None,
+        },
+        output: GraphOutputOptions::default(),
+        options: GraphPipelineOptions {
+            allow_full_scan: true,
+            ..GraphPipelineOptions::default()
+        },
+    };
+    assert_graph_pipeline_invalid(
+        &engine,
+        &alias_kind_conflict,
+        "collides with an existing non-node alias",
+    );
+}
+
 fn tampered_cursor_checksum(cursor: &str) -> String {
     let encoded = cursor.strip_prefix(GRAPH_ROW_CURSOR_PREFIX).unwrap();
     let mut bytes = base64url_no_pad_decode(encoded).unwrap();
@@ -269,7 +2956,43 @@ fn tampered_cursor_logical_key_atom(
     graph_row_encode_cursor(&payload, GraphQueryOptions::default().max_cursor_bytes).unwrap()
 }
 
+fn tampered_pipeline_cursor_sort_key(cursor: String) -> String {
+    let mut payload =
+        graph_pipeline_decode_logical_cursor(&cursor, GraphPipelineOptions::default().max_cursor_bytes)
+            .unwrap();
+    payload.last_sort_key.push(GraphSortAtom::Null);
+    graph_pipeline_encode_logical_cursor(&payload, GraphPipelineOptions::default().max_cursor_bytes)
+        .unwrap()
+}
+
+fn tampered_pipeline_cursor_logical_key(cursor: String) -> String {
+    let mut payload =
+        graph_pipeline_decode_logical_cursor(&cursor, GraphPipelineOptions::default().max_cursor_bytes)
+            .unwrap();
+    payload.last_logical_row_key.pop();
+    graph_pipeline_encode_logical_cursor(&payload, GraphPipelineOptions::default().max_cursor_bytes)
+        .unwrap()
+}
+
+fn tampered_pipeline_cursor_internal_key_atom(cursor: String) -> String {
+    let mut payload =
+        graph_pipeline_decode_logical_cursor(&cursor, GraphPipelineOptions::default().max_cursor_bytes)
+            .unwrap();
+    let atom = payload
+        .last_logical_row_key
+        .iter_mut()
+        .find(|atom| matches!(atom, GraphSortAtom::Bytes(_)))
+        .expect("pipeline cursor logical key should include internal bytes atom");
+    *atom = GraphSortAtom::String(b"not-bytes".to_vec());
+    graph_pipeline_encode_logical_cursor(&payload, GraphPipelineOptions::default().max_cursor_bytes)
+        .unwrap()
+}
+
 fn graph_row_value_rows(result: GraphRowResult) -> Vec<Vec<GraphValue>> {
+    result.rows.into_iter().map(|row| row.values).collect()
+}
+
+fn graph_pipeline_value_rows(result: GraphPipelineResult) -> Vec<Vec<GraphValue>> {
     result.rows.into_iter().map(|row| row.values).collect()
 }
 
@@ -468,11 +3191,30 @@ fn expr_contains_param(expr: &GraphExpr) -> bool {
         GraphExpr::List(items) => items.iter().any(expr_contains_param),
         GraphExpr::Map(items) => items.values().any(expr_contains_param),
         GraphExpr::Function { args, .. } => args.iter().any(expr_contains_param),
+        GraphExpr::AggregateCall { arg, .. } => {
+            arg.as_deref().is_some_and(expr_contains_param)
+        }
+        GraphExpr::ExistsSubquery(stage) => stage
+            .query
+            .stages
+            .iter()
+            .any(graph_pipeline_stage_contains_param_for_test),
         GraphExpr::Unary { expr, .. } | GraphExpr::IsNull(expr) | GraphExpr::IsNotNull(expr) => {
             expr_contains_param(expr)
         }
         GraphExpr::Binary { left, right, .. } => {
             expr_contains_param(left) || expr_contains_param(right)
+        }
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_param)
+                || branches
+                    .iter()
+                    .any(|branch| expr_contains_param(&branch.when) || expr_contains_param(&branch.then))
+                || else_expr.as_deref().is_some_and(expr_contains_param)
         }
         GraphExpr::Null
         | GraphExpr::Bool(_)
@@ -486,6 +3228,43 @@ fn expr_contains_param(expr: &GraphExpr) -> bool {
         | GraphExpr::NodeField { .. }
         | GraphExpr::EdgeField { .. }
         | GraphExpr::PathField { .. } => false,
+    }
+}
+
+fn graph_pipeline_stage_contains_param_for_test(stage: &GraphPipelineStage) -> bool {
+    match stage {
+        GraphPipelineStage::Match(stage) => stage
+            .where_
+            .as_ref()
+            .is_some_and(expr_contains_param),
+        GraphPipelineStage::Project(stage) => {
+            let items = match &stage.items {
+                GraphProjectionItems::Star => false,
+                GraphProjectionItems::Items(items) => {
+                    items.iter().any(|item| expr_contains_param(&item.expr))
+                }
+            };
+            items
+                || stage.where_.as_ref().is_some_and(expr_contains_param)
+                || stage.order_by.iter().any(|item| expr_contains_param(&item.expr))
+                || stage.skip.as_ref().is_some_and(expr_contains_param)
+                || stage.limit.as_ref().is_some_and(expr_contains_param)
+        }
+        GraphPipelineStage::Call(stage) => stage
+            .query
+            .stages
+            .iter()
+            .any(graph_pipeline_stage_contains_param_for_test),
+        GraphPipelineStage::Union(stage) => stage.branches.iter().any(|branch| {
+            branch
+                .stages
+                .iter()
+                .any(graph_pipeline_stage_contains_param_for_test)
+        }),
+        GraphPipelineStage::ShortestPath(stage) => {
+            matches!(&stage.from, GraphShortestPathEndpoint::Expr(expr) if expr_contains_param(expr))
+                || matches!(&stage.to, GraphShortestPathEndpoint::Expr(expr) if expr_contains_param(expr))
+        }
     }
 }
 
@@ -1004,7 +3783,7 @@ fn graph_row_property_field_and_function_evaluation_uses_synthetic_bindings() {
             },
         )
         .unwrap(),
-        GraphEvalValue::Node(GraphBoundNode::id_only(1))
+        GraphEvalValue::Node(synthetic_node(1))
     );
     assert_eq!(
         eval_with_row(
@@ -1016,7 +3795,7 @@ fn graph_row_property_field_and_function_evaluation_uses_synthetic_bindings() {
             },
         )
         .unwrap(),
-        GraphEvalValue::Node(GraphBoundNode::id_only(3))
+        GraphEvalValue::Node(synthetic_node(3))
     );
     assert_eq!(
         eval_with_row(
@@ -1029,9 +3808,9 @@ fn graph_row_property_field_and_function_evaluation_uses_synthetic_bindings() {
         )
         .unwrap(),
         GraphEvalValue::List(vec![
-            GraphEvalValue::Node(GraphBoundNode::id_only(1)),
-            GraphEvalValue::Node(GraphBoundNode::id_only(2)),
-            GraphEvalValue::Node(GraphBoundNode::id_only(3)),
+            GraphEvalValue::Node(synthetic_node(1)),
+            GraphEvalValue::Node(synthetic_node(2)),
+            GraphEvalValue::Node(synthetic_node(3)),
         ])
     );
     assert_eq!(
@@ -1045,8 +3824,8 @@ fn graph_row_property_field_and_function_evaluation_uses_synthetic_bindings() {
         )
         .unwrap(),
         GraphEvalValue::List(vec![
-            GraphEvalValue::Edge(GraphBoundEdge::id_only(10)),
-            GraphEvalValue::Edge(GraphBoundEdge::id_only(11)),
+            GraphEvalValue::Edge(synthetic_edge(10, 1, 2)),
+            GraphEvalValue::Edge(synthetic_edge(11, 2, 3)),
         ])
     );
 }
@@ -1112,7 +3891,7 @@ fn graph_row_path_derived_endpoint_functions_compose_with_loaded_path_payloads()
     .unwrap();
     assert_eq!(
         eval_bound_graph_expr(&direct_start, &bound_context).unwrap(),
-        GraphEvalValue::Node(GraphBoundNode::id_only(1))
+        GraphEvalValue::Node(synthetic_node(1))
     );
 
     let mut id_only_row = schema.empty_row();
@@ -1613,6 +4392,92 @@ fn graph_row_path_list_functions_support_selected_output() {
         panic!("expected selected edge list");
     };
     assert_eq!(edges.len(), 2);
+    let GraphValue::Edge(first_edge) = &edges[0] else {
+        panic!("expected selected edge");
+    };
+    assert_eq!(first_edge.id, Some(10));
+    assert_eq!(first_edge.props.as_ref().unwrap().len(), 1);
+    assert!(first_edge.props.as_ref().unwrap().contains_key("since"));
+}
+
+#[test]
+fn graph_row_rich_path_function_outputs_preserve_hydrated_elements() {
+    let return_items = vec![
+        GraphReturnItem {
+            expr: GraphExpr::Case {
+                operand: None,
+                branches: vec![GraphCaseBranch {
+                    when: GraphExpr::Bool(true),
+                    then: GraphExpr::Function {
+                        name: GraphFunction::Nodes,
+                        args: vec![GraphExpr::Binding("p".to_string())],
+                    },
+                }],
+                else_expr: Some(Box::new(GraphExpr::List(Vec::new()))),
+            },
+            alias: Some("nodes".to_string()),
+            projection: GraphReturnProjection::Selected(GraphSelectedProjection::Node(
+                selected_node(
+                    GraphPropertySelection::Keys(vec!["name".to_string()]),
+                    GraphVectorSelection::None,
+                ),
+            )),
+        },
+        GraphReturnItem {
+            expr: GraphExpr::Case {
+                operand: None,
+                branches: vec![GraphCaseBranch {
+                    when: GraphExpr::Bool(true),
+                    then: GraphExpr::Function {
+                        name: GraphFunction::Relationships,
+                        args: vec![GraphExpr::Binding("p".to_string())],
+                    },
+                }],
+                else_expr: Some(Box::new(GraphExpr::List(Vec::new()))),
+            },
+            alias: Some("relationships".to_string()),
+            projection: GraphReturnProjection::Selected(GraphSelectedProjection::Edge(
+                selected_edge(GraphPropertySelection::Keys(vec!["since".to_string()])),
+            )),
+        },
+    ];
+    let mut query = graph_query(
+        &["a", "b"],
+        vec![graph_vlp(Some("p"), None, "a", "b", 1, 2)],
+    );
+    query.output = GraphOutputOptions {
+        mode: GraphOutputMode::Projected,
+        compact_rows: false,
+        include_vectors: false,
+    };
+    query.return_items = Some(return_items.clone());
+    let normalized = normalize_graph_row_query(&query).unwrap();
+    let path_needs = normalized.projection_needs.output.paths.get("p").unwrap();
+    assert!(path_needs.nodes.is_some());
+    assert!(path_needs.edges.is_some());
+
+    let mut schema = GraphBindingSchema::new();
+    let path = schema.add_path_alias("p", false).unwrap();
+    let mut row = schema.empty_row();
+    row.bind_path(path, synthetic_path(&[1, 2, 3], &[10, 11]))
+        .unwrap();
+    let values =
+        project_graph_row_values(&schema, &row, &return_items, &query.output, &BTreeMap::new())
+            .unwrap();
+
+    let GraphValue::List(nodes) = &values[0] else {
+        panic!("expected selected node list");
+    };
+    let GraphValue::Node(first_node) = &nodes[0] else {
+        panic!("expected selected node");
+    };
+    assert_eq!(first_node.id, Some(1));
+    assert_eq!(first_node.props.as_ref().unwrap().len(), 1);
+    assert!(first_node.props.as_ref().unwrap().contains_key("name"));
+
+    let GraphValue::List(edges) = &values[1] else {
+        panic!("expected selected edge list");
+    };
     let GraphValue::Edge(first_edge) = &edges[0] else {
         panic!("expected selected edge");
     };
@@ -3261,6 +6126,33 @@ fn graph_row_vlp_path_output_hydrates_after_page_and_dedupes_elements() {
             },
             "relationships",
         ),
+        graph_return_expr(
+            GraphExpr::Function {
+                name: GraphFunction::Size,
+                args: vec![GraphExpr::Function {
+                    name: GraphFunction::Nodes,
+                    args: vec![GraphExpr::Binding("p".to_string())],
+                }],
+            },
+            "node_count",
+        ),
+        graph_return_expr(
+            GraphExpr::Function {
+                name: GraphFunction::Size,
+                args: vec![GraphExpr::Function {
+                    name: GraphFunction::Relationships,
+                    args: vec![GraphExpr::Binding("p".to_string())],
+                }],
+            },
+            "edge_count",
+        ),
+        graph_return_expr(
+            GraphExpr::Function {
+                name: GraphFunction::Size,
+                args: vec![GraphExpr::List(vec![GraphExpr::Binding("a".to_string())])],
+            },
+            "literal_node_list_count",
+        ),
     ]);
     let function_values = &engine.query_graph_rows(&function_query).unwrap().rows[0].values;
     assert_eq!(function_values[0], GraphValue::UInt(2));
@@ -3268,6 +6160,9 @@ fn graph_row_vlp_path_output_hydrates_after_page_and_dedupes_elements() {
     assert!(matches!(function_values[2], GraphValue::Node(_)));
     assert!(matches!(function_values[3], GraphValue::List(_)));
     assert!(matches!(function_values[4], GraphValue::List(_)));
+    assert_eq!(function_values[5], GraphValue::UInt(3));
+    assert_eq!(function_values[6], GraphValue::UInt(2));
+    assert_eq!(function_values[7], GraphValue::UInt(1));
 }
 
 #[test]
@@ -3777,6 +6672,70 @@ fn graph_row_order_over_obvious_list_or_map_is_rejected() {
         direction: GraphOrderDirection::Asc,
     }];
     assert_graph_row_invalid(&labels, "order expression must not be a list or map value");
+
+    let mut case_list = graph_query(&["a"], Vec::new());
+    case_list.order_by = vec![GraphOrderItem {
+        expr: GraphExpr::Case {
+            operand: None,
+            branches: vec![GraphCaseBranch {
+                when: GraphExpr::Bool(true),
+                then: GraphExpr::List(vec![GraphExpr::Int(1)]),
+            }],
+            else_expr: Some(Box::new(GraphExpr::Int(2))),
+        },
+        direction: GraphOrderDirection::Asc,
+    }];
+    assert_graph_row_invalid(&case_list, "order expression must not be a list or map value");
+}
+
+#[test]
+fn graph_row_scalar_operators_reject_obvious_graph_element_operands() {
+    let mut neg_node = graph_query(&["a"], Vec::new());
+    neg_node.return_items = Some(vec![graph_return_expr(
+        GraphExpr::Unary {
+            op: GraphUnaryOp::Neg,
+            expr: Box::new(GraphExpr::Binding("a".to_string())),
+        },
+        "bad",
+    )]);
+    assert_graph_row_invalid(
+        &neg_node,
+        "operator - expects scalar operands, got a node",
+    );
+
+    let mut string_predicate_node = graph_query(&["a"], Vec::new());
+    string_predicate_node.where_ = Some(GraphExpr::Binary {
+        left: Box::new(GraphExpr::Binding("a".to_string())),
+        op: GraphBinaryOp::StartsWith,
+        right: Box::new(GraphExpr::String("a".to_string())),
+    });
+    assert_graph_row_invalid(
+        &string_predicate_node,
+        "operator STARTS WITH expects scalar operands, got a node",
+    );
+
+    let mut coalesce_case_node = graph_query(&["a"], Vec::new());
+    coalesce_case_node.return_items = Some(vec![graph_return_expr(
+        GraphExpr::Function {
+            name: GraphFunction::Coalesce,
+            args: vec![
+                GraphExpr::Case {
+                    operand: None,
+                    branches: vec![GraphCaseBranch {
+                        when: GraphExpr::Bool(true),
+                        then: GraphExpr::Binding("a".to_string()),
+                    }],
+                    else_expr: Some(Box::new(GraphExpr::Null)),
+                },
+                GraphExpr::String("fallback".to_string()),
+            ],
+        },
+        "bad",
+    )]);
+    assert_graph_row_invalid(
+        &coalesce_case_node,
+        "function coalesce expects scalar, list, map, or null input, got a node",
+    );
 }
 
 #[test]
@@ -6435,7 +9394,7 @@ fn graph_row_cursor_pages_concatenate_and_validate_replay_fields() {
     let cursor = page1.next_cursor.clone().expect("expected continuation");
     let decoded_cursor_len = decoded_cursor_payload_len(&cursor);
     assert!(
-        cursor.as_bytes().len() > decoded_cursor_len,
+        cursor.len() > decoded_cursor_len,
         "encoded cursor should include prefix/base64 overhead"
     );
     assert_eq!(graph_row_single_u64_column(page1), vec![ids[1], ids[2]]);
