@@ -10,7 +10,8 @@ use crate::gql::lower::{
     gql_expr_to_graph_expr, gql_order_direction_to_graph, lower_mutation, lower_semantic_plan,
     GqlCreateEdgePlan, GqlCreateNodePlan, GqlCreatePatternPlan, GqlDeleteTargetPlan,
     GqlLoweredPlan, GqlMutationClausePlan, GqlMutationInternalColumn, GqlMutationPlan,
-    GqlNativeTarget, GqlNativeTargetKind, GqlRemoveItemPlan, GqlSetItemPlan,
+    GqlMergePatternPlan, GqlMergePlan, GqlMutationExprRef, GqlNativeTarget, GqlNativeTargetKind,
+    GqlRemoveItemPlan, GqlSetItemPlan,
 };
 use crate::gql::parser::{parse_statement, GqlParseOptions};
 use crate::gql::params::validate_referenced_gql_params;
@@ -19,7 +20,11 @@ use crate::gql::semantic::{
     bind_query, gql_semantic_error, GqlAliasKind, GqlAliasOrigin, GqlReturnPlan,
     GqlSemanticPlan,
 };
-use crate::graph_row::{eval_graph_expr, GraphBindingSchema, GraphEvalContext, GraphEvalValue};
+use crate::graph_row::{
+    eval_graph_binary_values, eval_graph_expr, eval_graph_scalar_function_values,
+    eval_graph_unary_value, graph_canonical_key_for_value, GraphBindingSchema, GraphCanonicalKey,
+    GraphEvalContext, GraphEvalValue,
+};
 use std::time::Instant;
 
 impl DatabaseEngine {
@@ -77,6 +82,9 @@ impl DatabaseEngine {
         validate_referenced_gql_params(&semantic, params, options)?;
         let mut lowered = lower_semantic_plan(semantic, params, options)?;
         let return_exprs = return_exprs(&lowered.semantic);
+        if matches!(&lowered.native_target, GqlNativeTarget::GraphPipeline { .. }) {
+            return self.execute_gql_pipeline_target(lowered, started_at, options);
+        }
         let resolved_order_by = resolve_order_by_return_aliases(&lowered)?;
         validate_gql_row_independent_order_keys(&resolved_order_by, &lowered, params)?;
         let row_counts = evaluate_gql_row_counts(&lowered, params, options)?;
@@ -228,6 +236,9 @@ impl DatabaseEngine {
         validate_referenced_gql_params(&semantic, params, options)?;
         let mut lowered = lower_semantic_plan(semantic, params, options)?;
         let return_exprs = return_exprs(&lowered.semantic);
+        if matches!(&lowered.native_target, GqlNativeTarget::GraphPipeline { .. }) {
+            return self.explain_gql_pipeline_target(&lowered, options);
+        }
         let resolved_order_by = resolve_order_by_return_aliases(&lowered)?;
         validate_gql_row_independent_order_keys(&resolved_order_by, &lowered, params)?;
         let row_counts = evaluate_gql_row_counts(&lowered, params, options)?;
@@ -249,6 +260,92 @@ impl DatabaseEngine {
             &resolved_order_by,
             options,
         )?, options))
+    }
+
+    fn execute_gql_pipeline_target(
+        &self,
+        lowered: GqlLoweredPlan,
+        started_at: Instant,
+        options: &GqlExecutionOptions,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        let GqlNativeTarget::GraphPipeline { query } = &lowered.native_target else {
+            return Err(EngineError::InvalidOperation(
+                "GQL pipeline execution received a non-pipeline target".to_string(),
+            ));
+        };
+        let graph_result = self
+            .query_graph_pipeline(query)
+            .map_err(|err| graph_pipeline_execution_error_to_gql(err, &lowered))?;
+        let mut warnings = lowered.warnings.clone();
+        warnings.extend(graph_result.stats.warnings.iter().cloned());
+        warnings.sort();
+        warnings.dedup();
+        let plan = if options.include_plan {
+            graph_result
+                .plan
+                .as_ref()
+                .map(|plan| build_gql_pipeline_execution_explain(&lowered, plan, options))
+        } else {
+            None
+        };
+        let columns = graph_result.columns.clone();
+        let stats = graph_result.stats.clone();
+        let projected = graph_result
+            .rows
+            .into_iter()
+            .map(|row| {
+                Ok(GqlRow {
+                    values: row
+                        .values
+                        .into_iter()
+                        .map(graph_value_to_gql_value)
+                        .collect::<Result<Vec<_>, EngineError>>()?,
+                })
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        let rows_returned = projected.len();
+        let elapsed_us = if options.profile {
+            started_at.elapsed().as_micros().try_into().ok()
+        } else {
+            None
+        };
+        Ok(GqlExecutionResult {
+            kind: GqlStatementKind::Query,
+            columns,
+            rows: projected,
+            next_cursor: graph_result.next_cursor,
+            stats: GqlExecutionStats {
+                rows_returned,
+                rows_matched: stats.intermediate_rows.max(stats.rows_after_filter),
+                rows_after_filter: stats.rows_after_filter,
+                intermediate_bindings: stats.intermediate_rows,
+                db_hits: stats.db_hits,
+                elapsed_us,
+                warnings,
+            },
+            mutation_stats: None,
+            plan,
+        })
+    }
+
+    fn explain_gql_pipeline_target(
+        &self,
+        lowered: &GqlLoweredPlan,
+        options: &GqlExecutionOptions,
+    ) -> Result<GqlExecutionExplain, EngineError> {
+        let GqlNativeTarget::GraphPipeline { query } = &lowered.native_target else {
+            return Err(EngineError::InvalidOperation(
+                "GQL pipeline explain received a non-pipeline target".to_string(),
+            ));
+        };
+        let explain = self
+            .explain_graph_pipeline(query)
+            .map_err(|err| graph_pipeline_execution_error_to_gql(err, lowered))?;
+        Ok(build_gql_pipeline_execution_explain(
+            lowered,
+            &explain,
+            options,
+        ))
     }
 
     pub fn query_node_ids(
@@ -359,6 +456,716 @@ impl DatabaseEngine {
             .explain_graph_rows_normalized(&normalized, cursor_state)
     }
 
+    pub fn query_graph_pipeline(
+        &self,
+        query: &GraphPipelineQuery,
+    ) -> Result<GraphPipelineResult, EngineError> {
+        if graph_pipeline_legacy_fast_path_eligible(query) {
+            return self.query_graph_pipeline_one_stage(query);
+        }
+
+        let normalized = normalize_graph_pipeline_query(query)?;
+        let decoded_cursor = query
+            .page
+            .cursor
+            .as_deref()
+            .map(|cursor| graph_pipeline_decode_logical_cursor(cursor, query.options.max_cursor_bytes))
+            .transpose()?;
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        let cursor_state =
+            graph_pipeline_cursor_state_from_decoded(
+                decoded_cursor,
+                &query.page,
+                query.at_epoch,
+                query.options.max_skip,
+            )?;
+        let outcome = published
+            .view
+            .query_graph_pipeline_normalized(&normalized, cursor_state)?;
+        for followup in outcome.followups {
+            self.runtime.enqueue_secondary_index_read_followup(followup);
+        }
+        Ok(outcome.value)
+    }
+
+    fn query_graph_pipeline_one_stage(
+        &self,
+        query: &GraphPipelineQuery,
+    ) -> Result<GraphPipelineResult, EngineError> {
+        let mut graph_row_query = graph_pipeline_one_stage_graph_row_query(query)?;
+        graph_row_query.page.cursor = graph_pipeline_decode_request_cursor(
+            query.page.cursor.as_deref(),
+            query.options.max_cursor_bytes,
+        )?;
+        let decoded_cursor =
+            graph_row_decode_request_cursor(&graph_row_query.page, &graph_row_query.options)?;
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        let cursor_state = graph_row_cursor_state_from_decoded(
+            decoded_cursor,
+            &graph_row_query.page,
+            graph_row_query.at_epoch,
+        )?;
+        graph_pipeline_validate_cursor_state(&cursor_state, &query.options)?;
+        let normalized = normalize_graph_row_query(&graph_row_query)?;
+        let outcome = published
+            .view
+            .query_graph_rows_outcome(&normalized, cursor_state)?;
+        let mut result = outcome.value;
+        graph_pipeline_enforce_result_caps(query, &result)?;
+        result.next_cursor = graph_pipeline_encode_cursor(
+            result.next_cursor.take(),
+            query.options.max_cursor_bytes,
+        )?;
+        for followup in outcome.followups {
+            self.runtime.enqueue_secondary_index_read_followup(followup);
+        }
+        Ok(graph_pipeline_result_from_graph_row_result(
+            query,
+            result,
+        ))
+    }
+
+    pub fn explain_graph_pipeline(
+        &self,
+        query: &GraphPipelineQuery,
+    ) -> Result<GraphPipelineExplain, EngineError> {
+        if !graph_pipeline_legacy_fast_path_eligible(query) {
+            let mut normalized = normalize_graph_pipeline_query(query)?;
+            normalized.options.include_plan = true;
+            let decoded_cursor = query
+                .page
+                .cursor
+                .as_deref()
+                .map(|cursor| {
+                    graph_pipeline_decode_logical_cursor(cursor, query.options.max_cursor_bytes)
+                })
+                .transpose()?;
+            let (_guard, published) = self.runtime.published_snapshot()?;
+            let cursor_state = graph_pipeline_cursor_state_from_decoded(
+                decoded_cursor,
+                &query.page,
+                query.at_epoch,
+                query.options.max_skip,
+            )?;
+            if normalized.options.profile {
+                let outcome = published
+                    .view
+                    .query_graph_pipeline_normalized(&normalized, cursor_state)?;
+                return outcome.value.plan.ok_or_else(|| {
+                    EngineError::InvalidOperation(
+                        "graph pipeline explain did not produce a plan".to_string(),
+                    )
+                });
+            }
+            return published
+                .view
+                .explain_graph_pipeline_normalized(&normalized, cursor_state);
+        }
+
+        let mut graph_row_query = graph_pipeline_one_stage_graph_row_query(query)?;
+        graph_row_query.page.cursor = graph_pipeline_decode_request_cursor(
+            query.page.cursor.as_deref(),
+            query.options.max_cursor_bytes,
+        )?;
+        let decoded_cursor =
+            graph_row_decode_request_cursor(&graph_row_query.page, &graph_row_query.options)?;
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        let cursor_state = graph_row_cursor_state_from_decoded(
+            decoded_cursor,
+            &graph_row_query.page,
+            graph_row_query.at_epoch,
+        )?;
+        graph_pipeline_validate_cursor_state(&cursor_state, &query.options)?;
+        let normalized = normalize_graph_row_query(&graph_row_query)?;
+        let graph_row_explain = published
+            .view
+            .explain_graph_rows_normalized(&normalized, cursor_state)?;
+        Ok(graph_pipeline_explain_from_graph_row_explain(
+            query,
+            graph_row_explain,
+            None,
+        ))
+    }
+
+}
+
+fn graph_pipeline_legacy_fast_path_eligible(query: &GraphPipelineQuery) -> bool {
+    let [GraphPipelineStage::Match(match_stage), GraphPipelineStage::Project(project_stage)] =
+        query.stages.as_slice()
+    else {
+        return false;
+    };
+    !match_stage.optional
+        && project_stage.kind == GraphProjectKind::Return
+        && !project_stage.distinct
+        && project_stage.where_.is_none()
+        && project_stage.skip.is_none()
+        && project_stage.limit.is_none()
+        && !graph_project_stage_contains_aggregate(project_stage)
+}
+
+fn graph_project_stage_contains_aggregate(stage: &GraphProjectStage) -> bool {
+    let item_contains_aggregate = match &stage.items {
+        GraphProjectionItems::Star => false,
+        GraphProjectionItems::Items(items) => items
+            .iter()
+            .any(|item| graph_expr_contains_aggregate(&item.expr)),
+    };
+    item_contains_aggregate || stage
+        .order_by
+        .iter()
+        .any(|item| graph_expr_contains_aggregate(&item.expr))
+}
+
+fn graph_pipeline_one_stage_graph_row_query(
+    query: &GraphPipelineQuery,
+) -> Result<GraphRowQuery, EngineError> {
+    if query.page.skip > query.options.max_skip {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph pipeline page skip {} exceeds max_skip {}",
+            query.page.skip, query.options.max_skip
+        )));
+    }
+
+    let [GraphPipelineStage::Match(match_stage), GraphPipelineStage::Project(project_stage)] =
+        query.stages.as_slice()
+    else {
+        return Err(graph_pipeline_cp34_1_unsupported(
+            "expected exactly Match followed by terminal Project",
+        ));
+    };
+
+    if match_stage.optional {
+        return Err(graph_pipeline_cp34_1_unsupported(
+            "top-level optional Match stages are deferred",
+        ));
+    }
+    if project_stage.kind != GraphProjectKind::Return {
+        return Err(graph_pipeline_cp34_1_unsupported(
+            "terminal Project must have kind Return",
+        ));
+    }
+    if project_stage.distinct {
+        return Err(graph_pipeline_cp34_1_unsupported(
+            "Project DISTINCT is deferred",
+        ));
+    }
+    if project_stage.where_.is_some() {
+        return Err(graph_pipeline_cp34_1_unsupported(
+            "Project WHERE filters are deferred",
+        ));
+    }
+    if project_stage.skip.is_some() || project_stage.limit.is_some() {
+        return Err(graph_pipeline_cp34_1_unsupported(
+            "Project-local SKIP/LIMIT are deferred; use GraphPipelineQuery.page for CP34.1",
+        ));
+    }
+    validate_pipeline_node_aliases(&match_stage.nodes)?;
+    validate_pipeline_piece_aliases(&match_stage.pieces)?;
+
+    let return_items = match &project_stage.items {
+        GraphProjectionItems::Star => None,
+        GraphProjectionItems::Items(items) => {
+            if items.is_empty() {
+                return Err(EngineError::InvalidOperation(
+                    "graph pipeline Project items must not be empty".to_string(),
+                ));
+            }
+            for item in items {
+                if let Some(alias) = item.alias.as_ref() {
+                    validate_graph_pipeline_user_alias(alias, "projection alias")?;
+                }
+            }
+            Some(
+                items
+                    .iter()
+                    .map(|item| GraphReturnItem {
+                        expr: item.expr.clone(),
+                        alias: item.alias.clone(),
+                        projection: item.projection.clone(),
+                    })
+                    .collect(),
+            )
+        }
+    };
+
+    let graph_row_query = GraphRowQuery {
+        nodes: match_stage.nodes.clone(),
+        pieces: match_stage.pieces.clone(),
+        where_: match_stage.where_.clone(),
+        return_items,
+        order_by: project_stage.order_by.clone(),
+        page: query.page.clone(),
+        at_epoch: query.at_epoch,
+        params: query.params.clone(),
+        output: query.output.clone(),
+        options: graph_query_options_from_pipeline(&query.options),
+    };
+    graph_pipeline_validate_referenced_params(&graph_row_query, &query.options)?;
+    Ok(graph_row_query)
+}
+
+fn graph_pipeline_cp34_1_unsupported(detail: &str) -> EngineError {
+    EngineError::InvalidOperation(format!(
+        "graph pipeline shape is not supported in CP34.1: {detail}"
+    ))
+}
+
+fn graph_query_options_from_pipeline(options: &GraphPipelineOptions) -> GraphQueryOptions {
+    GraphQueryOptions {
+        allow_full_scan: options.allow_full_scan,
+        max_intermediate_bindings: options
+            .max_intermediate_bindings
+            .min(options.max_pipeline_rows),
+        max_frontier: options.max_frontier,
+        max_path_hops: options.max_path_hops,
+        max_paths_per_start: options.max_paths_per_start,
+        max_page_limit: options.max_rows,
+        max_order_materialization: options.max_order_materialization,
+        max_cursor_bytes: options.max_cursor_bytes,
+        max_query_bytes: options.max_query_bytes,
+        include_plan: options.include_plan,
+        profile: options.profile,
+    }
+}
+
+const GRAPH_PIPELINE_CURSOR_PREFIX: &str = "ogr34p1_";
+const GRAPH_PIPELINE_CURSOR_MAGIC: &[u8; 8] = b"OGR34PC1";
+const GRAPH_PIPELINE_CURSOR_VERSION: u8 = 1;
+
+fn graph_pipeline_decode_request_cursor(
+    cursor: Option<&str>,
+    max_cursor_bytes: usize,
+) -> Result<Option<String>, EngineError> {
+    cursor
+        .map(|cursor| graph_pipeline_decode_cursor(cursor, max_cursor_bytes))
+        .transpose()
+}
+
+fn graph_pipeline_decode_cursor(
+    cursor: &str,
+    max_cursor_bytes: usize,
+) -> Result<String, EngineError> {
+    let Some(encoded) = cursor.strip_prefix(GRAPH_PIPELINE_CURSOR_PREFIX) else {
+        return Err(invalid_graph_pipeline_cursor(
+            "invalid graph pipeline cursor prefix",
+        ));
+    };
+    let transport_limit = graph_pipeline_encoded_cursor_transport_limit(max_cursor_bytes);
+    if cursor.len() > transport_limit {
+        return Err(invalid_graph_pipeline_cursor(format!(
+            "encoded graph pipeline cursor is too large to decode within max_cursor_bytes {}",
+            max_cursor_bytes
+        )));
+    }
+    let bytes = base64url_no_pad_decode(encoded)?;
+    if bytes.len() > max_cursor_bytes {
+        return Err(invalid_graph_pipeline_cursor(format!(
+            "decoded graph pipeline cursor is {} bytes, exceeding max_cursor_bytes {}",
+            bytes.len(),
+            max_cursor_bytes
+        )));
+    }
+    if bytes.len() < GRAPH_PIPELINE_CURSOR_MAGIC.len() + 1 + 4 + 8 {
+        return Err(invalid_graph_pipeline_cursor(
+            "graph pipeline cursor payload is too short",
+        ));
+    }
+    let checksum_offset = bytes
+        .len()
+        .checked_sub(8)
+        .ok_or_else(|| invalid_graph_pipeline_cursor("graph pipeline cursor is missing checksum"))?;
+    let payload = &bytes[..checksum_offset];
+    let checksum = u64::from_be_bytes(
+        bytes[checksum_offset..]
+            .try_into()
+            .map_err(|_| invalid_graph_pipeline_cursor("graph pipeline cursor checksum is malformed"))?,
+    );
+    if crate::types::fnv1a(payload) != checksum {
+        return Err(invalid_graph_pipeline_cursor(
+            "graph pipeline cursor checksum mismatch",
+        ));
+    }
+    let mut reader = CursorPayloadReader::new(payload);
+    if reader.take(GRAPH_PIPELINE_CURSOR_MAGIC.len())? != GRAPH_PIPELINE_CURSOR_MAGIC {
+        return Err(invalid_graph_pipeline_cursor(
+            "graph pipeline cursor magic mismatch",
+        ));
+    }
+    let version = reader.read_u8()?;
+    if version != GRAPH_PIPELINE_CURSOR_VERSION {
+        return Err(invalid_graph_pipeline_cursor(format!(
+            "unsupported graph pipeline cursor version {version}"
+        )));
+    }
+    let inner = reader.read_bytes()?;
+    if !reader.is_finished() {
+        return Err(invalid_graph_pipeline_cursor(
+            "graph pipeline cursor payload has trailing bytes",
+        ));
+    }
+    let inner = std::str::from_utf8(inner)
+        .map_err(|_| invalid_graph_pipeline_cursor("inner graph row cursor is not UTF-8"))?
+        .to_string();
+    if !inner.starts_with(GRAPH_ROW_CURSOR_PREFIX) {
+        return Err(invalid_graph_pipeline_cursor(
+            "inner cursor is not a graph row cursor",
+        ));
+    }
+    Ok(inner)
+}
+
+fn graph_pipeline_encoded_cursor_transport_limit(max_decoded_bytes: usize) -> usize {
+    let tail = match max_decoded_bytes % 3 {
+        0 => 0,
+        1 => 2,
+        _ => 3,
+    };
+    let encoded = (max_decoded_bytes / 3)
+        .checked_mul(4)
+        .and_then(|value| value.checked_add(tail))
+        .unwrap_or(usize::MAX);
+    GRAPH_PIPELINE_CURSOR_PREFIX.len().saturating_add(encoded)
+}
+
+fn graph_pipeline_validate_referenced_params(
+    query: &GraphRowQuery,
+    options: &GraphPipelineOptions,
+) -> Result<(), EngineError> {
+    let referenced_params = collect_graph_row_referenced_params(query)?;
+    let mut total_items = 0usize;
+    let mut total_bytes = 0usize;
+    for (name, value) in &referenced_params {
+        graph_pipeline_validate_param_value(
+            name,
+            value,
+            options,
+            &mut total_items,
+            &mut total_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+fn graph_pipeline_validate_param_value(
+    name: &str,
+    value: &GraphParamValue,
+    options: &GraphPipelineOptions,
+    total_items: &mut usize,
+    total_bytes: &mut usize,
+) -> Result<(), EngineError> {
+    let mut stack = vec![(value, 0usize)];
+    while let Some((value, container_depth)) = stack.pop() {
+        match value {
+            GraphParamValue::Null
+            | GraphParamValue::Bool(_)
+            | GraphParamValue::Int(_)
+            | GraphParamValue::UInt(_)
+            | GraphParamValue::Float(_) => {}
+            GraphParamValue::String(value) => graph_pipeline_add_param_bytes(
+                name,
+                value.len(),
+                "string",
+                total_bytes,
+                options,
+            )?,
+            GraphParamValue::Bytes(value) => graph_pipeline_add_param_bytes(
+                name,
+                value.len(),
+                "bytes",
+                total_bytes,
+                options,
+            )?,
+            GraphParamValue::List(values) => {
+                let depth = container_depth.saturating_add(1);
+                graph_pipeline_check_param_depth(name, depth, options)?;
+                graph_pipeline_add_param_items(name, values.len(), "list", total_items, options)?;
+                for item in values.iter().rev() {
+                    stack.push((item, depth));
+                }
+            }
+            GraphParamValue::Map(values) => {
+                let depth = container_depth.saturating_add(1);
+                graph_pipeline_check_param_depth(name, depth, options)?;
+                graph_pipeline_add_param_items(name, values.len(), "map", total_items, options)?;
+                for (key, value) in values.iter().rev() {
+                    graph_pipeline_add_param_bytes(
+                        name,
+                        key.len(),
+                        "map key",
+                        total_bytes,
+                        options,
+                    )?;
+                    stack.push((value, depth));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn graph_pipeline_check_param_depth(
+    name: &str,
+    depth: usize,
+    options: &GraphPipelineOptions,
+) -> Result<(), EngineError> {
+    if depth > options.max_ast_depth {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph pipeline parameter '{name}' nested list/map depth exceeds max_ast_depth {}",
+            options.max_ast_depth
+        )));
+    }
+    Ok(())
+}
+
+fn graph_pipeline_add_param_items(
+    name: &str,
+    count: usize,
+    container_kind: &str,
+    total_items: &mut usize,
+    options: &GraphPipelineOptions,
+) -> Result<(), EngineError> {
+    if count > options.max_literal_items {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph pipeline parameter '{name}' {container_kind} contains {count} items, exceeding max_literal_items {}",
+            options.max_literal_items
+        )));
+    }
+    *total_items = total_items
+        .checked_add(count)
+        .filter(|total| *total <= options.max_literal_items)
+        .ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "referenced graph pipeline parameters contain more than max_literal_items={} total list/map items",
+                options.max_literal_items
+            ))
+        })?;
+    Ok(())
+}
+
+fn graph_pipeline_add_param_bytes(
+    name: &str,
+    bytes: usize,
+    value_kind: &str,
+    total_bytes: &mut usize,
+    options: &GraphPipelineOptions,
+) -> Result<(), EngineError> {
+    if bytes > options.max_param_bytes {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph pipeline parameter '{name}' {value_kind} is {bytes} bytes, exceeding max_param_bytes {}",
+            options.max_param_bytes
+        )));
+    }
+    *total_bytes = total_bytes
+        .checked_add(bytes)
+        .filter(|total| *total <= options.max_param_bytes)
+        .ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "referenced graph pipeline parameters contain more than max_param_bytes={} total string/bytes/map-key bytes",
+                options.max_param_bytes
+            ))
+        })?;
+    Ok(())
+}
+
+fn graph_pipeline_encode_cursor(
+    cursor: Option<String>,
+    max_cursor_bytes: usize,
+) -> Result<Option<String>, EngineError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let cursor_bytes = cursor.as_bytes();
+    let cursor_len = u32::try_from(cursor_bytes.len()).map_err(|_| {
+        invalid_graph_pipeline_cursor("inner graph row cursor is too large to encode")
+    })?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(GRAPH_PIPELINE_CURSOR_MAGIC);
+    push_u8(&mut bytes, GRAPH_PIPELINE_CURSOR_VERSION);
+    push_u32(&mut bytes, cursor_len);
+    bytes.extend_from_slice(cursor_bytes);
+    let checksum = crate::types::fnv1a(&bytes);
+    push_u64(&mut bytes, checksum);
+    if bytes.len() > max_cursor_bytes {
+        return Err(invalid_graph_pipeline_cursor(format!(
+            "emitted graph pipeline cursor payload is {} bytes, exceeding max_cursor_bytes {}",
+            bytes.len(),
+            max_cursor_bytes
+        )));
+    }
+    Ok(Some(format!(
+        "{GRAPH_PIPELINE_CURSOR_PREFIX}{}",
+        base64url_no_pad_encode(&bytes)
+    )))
+}
+
+fn invalid_graph_pipeline_cursor(message: impl Into<String>) -> EngineError {
+    EngineError::InvalidCursor {
+        message: message.into(),
+    }
+}
+
+fn graph_pipeline_validate_cursor_state(
+    cursor_state: &GraphRowCursorState,
+    options: &GraphPipelineOptions,
+) -> Result<(), EngineError> {
+    if cursor_state.original_skip > options.max_skip as u64 {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph pipeline cursor original skip {} exceeds max_skip {}",
+            cursor_state.original_skip, options.max_skip
+        )));
+    }
+    Ok(())
+}
+
+fn graph_pipeline_enforce_result_caps(
+    query: &GraphPipelineQuery,
+    result: &GraphRowResult,
+) -> Result<(), EngineError> {
+    if result.stats.rows_after_filter > query.options.max_pipeline_rows {
+        return Err(EngineError::InvalidOperation(format!(
+            "graph pipeline exceeded max_pipeline_rows {}",
+            query.options.max_pipeline_rows
+        )));
+    }
+    Ok(())
+}
+
+fn graph_pipeline_result_from_graph_row_result(
+    query: &GraphPipelineQuery,
+    mut result: GraphRowResult,
+) -> GraphPipelineResult {
+    let stats = graph_pipeline_stats_from_graph_row_stats(&result.stats);
+    let plan = result
+        .plan
+        .take()
+        .map(|explain| graph_pipeline_explain_from_graph_row_explain(query, explain, Some(stats.clone())));
+    GraphPipelineResult {
+        columns: result.columns,
+        rows: result.rows,
+        next_cursor: result.next_cursor,
+        stats,
+        plan,
+    }
+}
+
+fn graph_pipeline_stats_from_graph_row_stats(stats: &GraphRowStats) -> GraphPipelineStats {
+    GraphPipelineStats {
+        rows_returned: stats.rows_returned,
+        // CP34.1 starts the one supported pipeline shape from the implicit initial row.
+        rows_entered_pipeline: 1,
+        rows_after_filter: stats.rows_after_filter,
+        intermediate_rows: stats.intermediate_bindings_peak,
+        pipeline_rows_materialized: stats.rows_seen_for_page,
+        groups: 0,
+        collect_items: 0,
+        union_branches: 0,
+        union_dedup_keys: 0,
+        subquery_invocations: 0,
+        subquery_cache_hits: 0,
+        shortest_path_pairs: 0,
+        shortest_path_cache_hits: 0,
+        db_hits: stats.db_hits,
+        elapsed_us: stats.elapsed_us,
+        effective_at_epoch: stats.effective_at_epoch,
+        warnings: stats.warnings.clone(),
+    }
+}
+
+fn graph_pipeline_validation_stats(
+    explain: &GraphRowExplain,
+    warnings: Vec<String>,
+) -> GraphPipelineStats {
+    GraphPipelineStats {
+        rows_returned: 0,
+        // Direct explain has no runtime row counts, but the CP34.1 pipeline shell still starts
+        // from the same implicit initial row as execution.
+        rows_entered_pipeline: 1,
+        rows_after_filter: 0,
+        intermediate_rows: 0,
+        pipeline_rows_materialized: 0,
+        groups: 0,
+        collect_items: 0,
+        union_branches: 0,
+        union_dedup_keys: 0,
+        subquery_invocations: 0,
+        subquery_cache_hits: 0,
+        shortest_path_pairs: 0,
+        shortest_path_cache_hits: 0,
+        db_hits: 0,
+        elapsed_us: None,
+        effective_at_epoch: explain.effective_at_epoch.unwrap_or_default(),
+        warnings,
+    }
+}
+
+fn graph_pipeline_explain_from_graph_row_explain(
+    query: &GraphPipelineQuery,
+    graph_row: GraphRowExplain,
+    stats: Option<GraphPipelineStats>,
+) -> GraphPipelineExplain {
+    let columns = graph_row.columns.clone();
+    let warnings = graph_row.warnings.clone();
+    let notes = graph_row.notes.clone();
+    let stats = stats.unwrap_or_else(|| graph_pipeline_validation_stats(&graph_row, warnings.clone()));
+    let match_stage = GraphPipelineStageExplain {
+        index: 0,
+        kind: "Match".to_string(),
+        detail: "graph-row-backed match stage".to_string(),
+        columns: Vec::new(),
+        graph_row: Some(Box::new(graph_row.clone())),
+        warnings: graph_row.warnings.clone(),
+        notes: graph_row.notes.clone(),
+    };
+    let project_stage = GraphPipelineStageExplain {
+        index: 1,
+        kind: "Project(Return)".to_string(),
+        detail: "terminal graph-row projection stage".to_string(),
+        columns: columns.clone(),
+        graph_row: None,
+        warnings: Vec::new(),
+        notes: Vec::new(),
+    };
+    GraphPipelineExplain {
+        columns,
+        effective_at_epoch: graph_row.effective_at_epoch,
+        fingerprint: format!("pipeline:{}", graph_row.fingerprint),
+        stages: vec![match_stage, project_stage],
+        row_ops: graph_row.row_ops,
+        order: graph_row.order,
+        cursor: graph_row.cursor,
+        projection: graph_row.projection,
+        caps: graph_pipeline_cap_explain(&query.options),
+        summaries: graph_row.summaries,
+        stats,
+        warnings,
+        notes,
+    }
+}
+
+fn graph_pipeline_cap_explain(options: &GraphPipelineOptions) -> GraphPipelineCapExplain {
+    GraphPipelineCapExplain {
+        allow_full_scan: options.allow_full_scan,
+        max_rows: options.max_rows,
+        max_pipeline_rows: options.max_pipeline_rows,
+        max_groups: options.max_groups,
+        max_collect_items: options.max_collect_items,
+        max_union_branches: options.max_union_branches,
+        max_subquery_invocations: options.max_subquery_invocations,
+        max_subquery_depth: options.max_subquery_depth,
+        max_shortest_path_pairs: options.max_shortest_path_pairs,
+        max_intermediate_bindings: options.max_intermediate_bindings,
+        max_frontier: options.max_frontier,
+        max_path_hops: options.max_path_hops,
+        max_paths_per_start: options.max_paths_per_start,
+        max_order_materialization: options.max_order_materialization,
+        max_skip: options.max_skip,
+        max_cursor_bytes: options.max_cursor_bytes,
+        max_query_bytes: options.max_query_bytes,
+        max_param_bytes: options.max_param_bytes,
+        max_ast_depth: options.max_ast_depth,
+        max_literal_items: options.max_literal_items,
+    }
 }
 
 fn execute_gql_mutation_unsupported_error(plan: &GqlMutationPlan) -> EngineError {
@@ -403,6 +1210,7 @@ fn gql_mutation_plan_is_executable(plan: &GqlMutationPlan) -> bool {
                 matches!(
                     clause,
                     GqlMutationClausePlan::Create(_)
+                        | GqlMutationClausePlan::Merge(_)
                         | GqlMutationClausePlan::Set(_)
                         | GqlMutationClausePlan::Remove(_)
                         | GqlMutationClausePlan::Delete { .. }
@@ -410,20 +1218,19 @@ fn gql_mutation_plan_is_executable(plan: &GqlMutationPlan) -> bool {
             })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum GqlCreateEndpointKey {
-    Id(u64),
-    Local(TxnLocalRef),
-}
-
 #[derive(Clone)]
 struct GqlCreateExecutionRow {
     read_nodes: BTreeMap<String, Option<u64>>,
     read_edges: BTreeMap<String, Option<u64>>,
     read_paths: BTreeMap<String, Option<GqlPathIdentity>>,
+    read_scalars: BTreeMap<String, GraphValue>,
     expr_values: Vec<Option<GraphValue>>,
     created_nodes: BTreeMap<String, usize>,
     created_edges: BTreeMap<String, usize>,
+    created_node_writes: BTreeSet<usize>,
+    created_edge_writes: BTreeSet<usize>,
+    touched_created_nodes: BTreeSet<usize>,
+    touched_created_edges: BTreeSet<usize>,
     produced_write: bool,
 }
 
@@ -538,7 +1345,9 @@ impl DatabaseEngine {
         let mutation_timestamp = now_millis();
         let mut materialized = materialize_gql_create(
             plan,
+            params,
             input.rows,
+            &txn,
             edge_uniqueness,
             options.max_mutation_ops,
             mutation_timestamp,
@@ -648,19 +1457,22 @@ impl DatabaseEngine {
         let graph_params =
             gql_params_to_graph_params_for_mutation(params, plan, &missing_expr_ids);
         if let Some(read_prefix) = plan.read_prefix.as_ref() {
-            let outcome = execute_gql_graph_row_target(snapshot, &read_prefix.lowered)?;
-            for followup in outcome.followups {
+            let read_result = execute_gql_mutation_read_prefix(
+                snapshot,
+                &read_prefix.lowered,
+                options,
+            )?;
+            for followup in read_result.followups {
                 self.runtime.enqueue_secondary_index_read_followup(followup);
             }
-            let graph_result = outcome.value;
-            if graph_result.rows.len() > options.max_mutation_rows {
+            if read_result.rows.len() > options.max_mutation_rows {
                 return Err(gql_mutation_cap_error(
                     "max_mutation_rows",
-                    graph_result.rows.len(),
+                    read_result.rows.len(),
                     options.max_mutation_rows,
                 ));
             }
-            if graph_result.next_cursor.is_some() {
+            if read_result.next_cursor.is_some() {
                 let (cap_name, cap_value) =
                     if options.max_intermediate_bindings <= options.max_mutation_rows {
                         ("max_intermediate_bindings", options.max_intermediate_bindings)
@@ -669,16 +1481,12 @@ impl DatabaseEngine {
                     };
                 return Err(gql_mutation_cap_error(
                     cap_name,
-                    graph_result.rows.len().saturating_add(1),
+                    read_result.rows.len().saturating_add(1),
                     cap_value,
                 ));
             }
-            let db_hits = if options.profile {
-                gql_profile_graph_row_db_hits(&graph_result.stats)
-            } else {
-                0
-            };
-            let rows = graph_result
+            let db_hits = read_result.db_hits;
+            let rows = read_result
                 .rows
                 .into_iter()
                 .map(|row| {
@@ -699,9 +1507,14 @@ impl DatabaseEngine {
                 read_nodes: BTreeMap::new(),
                 read_edges: BTreeMap::new(),
                 read_paths: BTreeMap::new(),
+                read_scalars: BTreeMap::new(),
                 expr_values: vec![None; plan.operation_exprs.len()],
                 created_nodes: BTreeMap::new(),
                 created_edges: BTreeMap::new(),
+                created_node_writes: BTreeSet::new(),
+                created_edge_writes: BTreeSet::new(),
+                touched_created_nodes: BTreeSet::new(),
+                touched_created_edges: BTreeSet::new(),
                 produced_write: false,
             };
             fill_missing_gql_create_expr_values(
@@ -718,10 +1531,64 @@ impl DatabaseEngine {
     }
 }
 
+struct GqlMutationReadPrefixRuntimeResult {
+    rows: Vec<GraphRow>,
+    next_cursor: Option<String>,
+    db_hits: usize,
+    followups: Vec<SecondaryIndexReadFollowup>,
+}
+
+fn execute_gql_mutation_read_prefix(
+    snapshot: &ReadView,
+    lowered: &GqlLoweredPlan,
+    options: &GqlExecutionOptions,
+) -> Result<GqlMutationReadPrefixRuntimeResult, EngineError> {
+    match &lowered.native_target {
+        GqlNativeTarget::GraphRows { .. } => {
+            let outcome = execute_gql_graph_row_target(snapshot, lowered)?;
+            let graph_result = outcome.value;
+            let db_hits = if options.profile {
+                gql_profile_graph_row_db_hits(&graph_result.stats)
+            } else {
+                0
+            };
+            Ok(GqlMutationReadPrefixRuntimeResult {
+                rows: graph_result.rows,
+                next_cursor: graph_result.next_cursor,
+                db_hits,
+                followups: outcome.followups,
+            })
+        }
+        GqlNativeTarget::GraphPipeline { .. } => {
+            let outcome = execute_gql_graph_pipeline_target_on_view(snapshot, lowered)?;
+            let graph_result = outcome.value;
+            let db_hits = if options.profile {
+                gql_profile_graph_pipeline_db_hits(&graph_result.stats)
+            } else {
+                0
+            };
+            Ok(GqlMutationReadPrefixRuntimeResult {
+                rows: graph_result.rows,
+                next_cursor: graph_result.next_cursor,
+                db_hits,
+                followups: outcome.followups,
+            })
+        }
+    }
+}
+
 fn gql_profile_graph_row_db_hits(stats: &GraphRowStats) -> usize {
     stats
         .db_hits
         .max(stats.intermediate_bindings_peak)
+        .max(stats.rows_after_filter)
+        .max(stats.rows_returned)
+}
+
+fn gql_profile_graph_pipeline_db_hits(stats: &GraphPipelineStats) -> usize {
+    stats
+        .db_hits
+        .max(stats.intermediate_rows)
         .max(stats.rows_after_filter)
         .max(stats.rows_returned)
 }
@@ -754,9 +1621,14 @@ fn gql_create_input_row_from_graph_row(
         read_nodes: BTreeMap::new(),
         read_edges: BTreeMap::new(),
         read_paths: BTreeMap::new(),
+        read_scalars: BTreeMap::new(),
         expr_values: vec![None; plan.operation_exprs.len()],
         created_nodes: BTreeMap::new(),
         created_edges: BTreeMap::new(),
+        created_node_writes: BTreeSet::new(),
+        created_edge_writes: BTreeSet::new(),
+        touched_created_nodes: BTreeSet::new(),
+        touched_created_edges: BTreeSet::new(),
         produced_write: false,
     };
     let Some(read_prefix) = plan.read_prefix.as_ref() else {
@@ -786,6 +1658,11 @@ fn gql_create_input_row_from_graph_row(
                             "path aliases are not scalar mutation targets".to_string(),
                         ));
                     }
+                    GqlAliasKind::Scalar => {
+                        return Err(EngineError::InvalidOperation(
+                            "scalar aliases are not mutation targets".to_string(),
+                        ));
+                    }
                 }
                 value_index += 1;
             }
@@ -805,6 +1682,16 @@ fn gql_create_input_row_from_graph_row(
                 let identity = gql_internal_path_identity(node_value, edge_value, alias)?;
                 row.read_paths.insert(alias.clone(), identity);
                 value_index += 2;
+            }
+            GqlMutationInternalColumn::ScalarValue { alias, .. } => {
+                let value = values.get(value_index).ok_or_else(|| {
+                    EngineError::InvalidOperation(
+                        "mutation read prefix returned fewer scalar columns than planned"
+                            .to_string(),
+                    )
+                })?;
+                row.read_scalars.insert(alias.clone(), value.clone());
+                value_index += 1;
             }
             GqlMutationInternalColumn::ExprValue { id, .. } => {
                 let value = values.get(value_index).ok_or_else(|| {
@@ -836,7 +1723,7 @@ fn gql_create_missing_operation_expr_ids(plan: &GqlMutationPlan) -> Vec<usize> {
     plan.operation_exprs
         .iter()
         .filter_map(|expr| {
-            if supplied_by_read_prefix.contains(&expr.id) {
+            if expr.late || supplied_by_read_prefix.contains(&expr.id) {
                 None
             } else {
                 Some(expr.id)
@@ -884,16 +1771,25 @@ fn fill_missing_gql_create_expr_values(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize_gql_create(
     plan: &GqlMutationPlan,
+    params: &GqlParams,
     mut rows: Vec<GqlCreateExecutionRow>,
+    txn: &WriteTxn,
     edge_uniqueness: bool,
     max_mutation_ops: usize,
     default_valid_from: i64,
     snapshot: &ReadView,
 ) -> Result<GqlCreateMaterialization, EngineError> {
-    let (existing_node_ids, existing_edge_ids) =
+    let (mut existing_node_ids, mut existing_edge_ids) =
         collect_gql_existing_update_targets(plan, &rows);
+    collect_gql_late_expr_read_prefix_targets(
+        plan,
+        &rows,
+        &mut existing_node_ids,
+        &mut existing_edge_ids,
+    );
     let mut existing_nodes = hydrate_gql_existing_node_targets(snapshot, &existing_node_ids)?;
     let mut existing_edges = hydrate_gql_existing_edge_targets(snapshot, &existing_edge_ids)?;
 
@@ -911,12 +1807,16 @@ fn materialize_gql_create(
     let mut direct_existing_edge_deletes = BTreeSet::new();
     let mut created_node_deletes = BTreeSet::new();
     let mut direct_created_edge_deletes = BTreeSet::new();
+    let mut merge_overlay = TxnMergeOverlay::default();
+    let mut merge_node_locals: BTreeMap<TxnMergeLocalNodeRef, usize> = BTreeMap::new();
+    let mut merge_edge_locals: BTreeMap<TxnMergeLocalEdgeRef, usize> = BTreeMap::new();
+    let mut merge_db_hits = 0usize;
     let mut op_budget = GqlMaterializationOpBudget::new(max_mutation_ops);
 
-    for (row_index, row) in rows.iter_mut().enumerate() {
-        for clause in &plan.clauses {
-            match clause {
-                GqlMutationClausePlan::Create(patterns) => {
+    for clause in &plan.clauses {
+        match clause {
+            GqlMutationClausePlan::Create(patterns) => {
+                for (row_index, row) in rows.iter_mut().enumerate() {
                     for (pattern_index, pattern) in patterns.iter().enumerate() {
                         if gql_create_pattern_has_null_read_endpoint(plan, pattern, row) {
                             skipped_null_targets += 1;
@@ -937,9 +1837,40 @@ fn materialize_gql_create(
                         )?;
                     }
                 }
-                GqlMutationClausePlan::Set(items) => {
+            }
+            GqlMutationClausePlan::Merge(merge) => {
+                materialize_gql_merge_clause(
+                    plan,
+                    params,
+                    merge,
+                    &mut rows,
+                    txn,
+                    snapshot,
+                    edge_uniqueness,
+                    default_valid_from,
+                    &mut nodes,
+                    &mut edges,
+                    &mut existing_nodes,
+                    &mut existing_edges,
+                    &mut edge_precheck_triples,
+                    &mut merge_overlay,
+                    &mut merge_node_locals,
+                    &mut merge_edge_locals,
+                    &mut merge_db_hits,
+                    &mut target_applications,
+                    &mut skipped_null_targets,
+                    &mut first_existing_node_update_order,
+                    &mut first_existing_edge_update_order,
+                    &mut seen_existing_node_updates,
+                    &mut seen_existing_edge_updates,
+                    &mut op_budget,
+                )?;
+            }
+            GqlMutationClausePlan::Set(items) => {
+                for row in rows.iter_mut() {
                     apply_gql_set_items(
                         plan,
+                        params,
                         items,
                         row,
                         &mut nodes,
@@ -954,9 +1885,12 @@ fn materialize_gql_create(
                         &mut seen_existing_edge_updates,
                     )?;
                 }
-                GqlMutationClausePlan::Remove(items) => {
+            }
+            GqlMutationClausePlan::Remove(items) => {
+                for row in rows.iter_mut() {
                     apply_gql_remove_items(
                         plan,
+                        params,
                         items,
                         row,
                         &mut nodes,
@@ -971,7 +1905,9 @@ fn materialize_gql_create(
                         &mut seen_existing_edge_updates,
                     )?;
                 }
-                GqlMutationClausePlan::Delete { .. } => {
+            }
+            GqlMutationClausePlan::Delete { .. } => {
+                for row in rows.iter_mut() {
                     apply_gql_delete_targets(
                         clause,
                         row,
@@ -1067,7 +2003,8 @@ fn materialize_gql_create(
         .len()
         .saturating_add(existing_edge_ids.len())
         .saturating_add(existing_node_deletes.len())
-        .saturating_add(existing_edge_deletes.len());
+        .saturating_add(existing_edge_deletes.len())
+        .saturating_add(merge_db_hits);
     if mutation_ops > max_mutation_ops {
         return Err(gql_mutation_cap_error(
             "max_mutation_ops",
@@ -1121,6 +2058,437 @@ struct GqlMutationComputedStats {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn materialize_gql_merge_clause(
+    plan: &GqlMutationPlan,
+    params: &GqlParams,
+    merge: &GqlMergePlan,
+    rows: &mut [GqlCreateExecutionRow],
+    txn: &WriteTxn,
+    snapshot: &ReadView,
+    edge_uniqueness: bool,
+    default_valid_from: i64,
+    nodes: &mut Vec<GqlCreatedNodeExecution>,
+    edges: &mut Vec<GqlCreatedEdgeExecution>,
+    existing_nodes: &mut BTreeMap<u64, GqlExistingNodeExecution>,
+    existing_edges: &mut BTreeMap<u64, GqlExistingEdgeExecution>,
+    edge_precheck_triples: &mut BTreeSet<(u64, u64, String)>,
+    merge_overlay: &mut TxnMergeOverlay,
+    merge_node_locals: &mut BTreeMap<TxnMergeLocalNodeRef, usize>,
+    merge_edge_locals: &mut BTreeMap<TxnMergeLocalEdgeRef, usize>,
+    merge_db_hits: &mut usize,
+    target_applications: &mut BTreeMap<GqlMutationTargetKey, usize>,
+    skipped_null_targets: &mut usize,
+    first_existing_node_update_order: &mut Vec<u64>,
+    first_existing_edge_update_order: &mut Vec<u64>,
+    seen_existing_node_updates: &mut BTreeSet<u64>,
+    seen_existing_edge_updates: &mut BTreeSet<u64>,
+    op_budget: &mut GqlMaterializationOpBudget,
+) -> Result<(), EngineError> {
+    match &merge.pattern {
+        GqlMergePatternPlan::Node { alias, label, key } => materialize_gql_node_merge(
+            plan,
+            params,
+            alias,
+            label,
+            key,
+            &merge.on_create,
+            &merge.on_match,
+            rows,
+            txn,
+            snapshot,
+            nodes,
+            edges,
+            existing_nodes,
+            existing_edges,
+            merge_overlay,
+            merge_node_locals,
+            merge_db_hits,
+            target_applications,
+            skipped_null_targets,
+            first_existing_node_update_order,
+            first_existing_edge_update_order,
+            seen_existing_node_updates,
+            seen_existing_edge_updates,
+            op_budget,
+        ),
+        GqlMergePatternPlan::Relationship {
+            alias,
+            from_alias,
+            to_alias,
+            label,
+        } => materialize_gql_relationship_merge(
+            plan,
+            params,
+            alias,
+            from_alias,
+            to_alias,
+            label,
+            &merge.on_create,
+            &merge.on_match,
+            rows,
+            txn,
+            snapshot,
+            edge_uniqueness,
+            default_valid_from,
+            nodes,
+            edges,
+            existing_nodes,
+            existing_edges,
+            edge_precheck_triples,
+            merge_overlay,
+            merge_edge_locals,
+            merge_db_hits,
+            target_applications,
+            skipped_null_targets,
+            first_existing_node_update_order,
+            first_existing_edge_update_order,
+            seen_existing_node_updates,
+            seen_existing_edge_updates,
+            op_budget,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
+fn materialize_gql_node_merge(
+    plan: &GqlMutationPlan,
+    params: &GqlParams,
+    alias: &str,
+    label: &str,
+    key_ref: &GqlMutationExprRef,
+    on_create: &[GqlSetItemPlan],
+    on_match: &[GqlSetItemPlan],
+    rows: &mut [GqlCreateExecutionRow],
+    txn: &WriteTxn,
+    snapshot: &ReadView,
+    nodes: &mut Vec<GqlCreatedNodeExecution>,
+    edges: &mut Vec<GqlCreatedEdgeExecution>,
+    existing_nodes: &mut BTreeMap<u64, GqlExistingNodeExecution>,
+    existing_edges: &mut BTreeMap<u64, GqlExistingEdgeExecution>,
+    merge_overlay: &mut TxnMergeOverlay,
+    merge_node_locals: &mut BTreeMap<TxnMergeLocalNodeRef, usize>,
+    merge_db_hits: &mut usize,
+    target_applications: &mut BTreeMap<GqlMutationTargetKey, usize>,
+    skipped_null_targets: &mut usize,
+    first_existing_node_update_order: &mut Vec<u64>,
+    first_existing_edge_update_order: &mut Vec<u64>,
+    seen_existing_node_updates: &mut BTreeSet<u64>,
+    seen_existing_edge_updates: &mut BTreeSet<u64>,
+    op_budget: &mut GqlMaterializationOpBudget,
+) -> Result<(), EngineError> {
+    let mut keys = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let key = gql_merge_string_key(gql_create_expr_value(row, key_ref.id)?)?;
+        keys.push((label.to_string(), key));
+    }
+    let batch = txn.plan_keyed_node_merge_batch(merge_overlay, &keys)?;
+    let missing_existing_ids = batch
+        .existing_ids
+        .iter()
+        .filter(|id| !existing_nodes.contains_key(id))
+        .count();
+    *merge_db_hits = (*merge_db_hits)
+        .saturating_add(batch.snapshot_lookup_count)
+        .saturating_add(missing_existing_ids);
+    ensure_gql_existing_node_targets(snapshot, existing_nodes, &batch.existing_ids)?;
+    op_budget.reserve(
+        batch
+            .rows
+            .iter()
+            .filter(|outcome| matches!(outcome, TxnKeyedNodeMergeRowOutcome::Create(_)))
+            .count(),
+    )?;
+
+    for (row_index, (row, outcome)) in rows.iter_mut().zip(batch.rows).enumerate() {
+        match outcome {
+            TxnKeyedNodeMergeRowOutcome::Existing(id) => {
+                row.created_nodes.remove(alias);
+                row.read_nodes.insert(alias.to_string(), Some(id));
+                apply_gql_set_items(
+                    plan,
+                    params,
+                    on_match,
+                    row,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                    target_applications,
+                    skipped_null_targets,
+                    first_existing_node_update_order,
+                    first_existing_edge_update_order,
+                    seen_existing_node_updates,
+                    seen_existing_edge_updates,
+                )?;
+            }
+            TxnKeyedNodeMergeRowOutcome::MatchedLocal(local) => {
+                let node_index = *merge_node_locals.get(&local).ok_or_else(|| {
+                    EngineError::InvalidOperation(
+                        "GQL node MERGE local overlay target was not materialized".to_string(),
+                    )
+                })?;
+                row.read_nodes.remove(alias);
+                row.created_nodes.insert(alias.to_string(), node_index);
+                apply_gql_set_items(
+                    plan,
+                    params,
+                    on_match,
+                    row,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                    target_applications,
+                    skipped_null_targets,
+                    first_existing_node_update_order,
+                    first_existing_edge_update_order,
+                    seen_existing_node_updates,
+                    seen_existing_edge_updates,
+                )?;
+            }
+            TxnKeyedNodeMergeRowOutcome::Create(local) => {
+                let node_index = nodes.len();
+                let (_, key) = &keys[row_index];
+                let local_ref = TxnLocalRef::Alias(format!("__gql_merge_node_{row_index}_{alias}"));
+                nodes.push(GqlCreatedNodeExecution {
+                    local: local_ref,
+                    labels: vec![label.to_string()],
+                    key: key.clone(),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                });
+                merge_node_locals.insert(local, node_index);
+                row.read_nodes.remove(alias);
+                row.created_nodes.insert(alias.to_string(), node_index);
+                row.created_node_writes.insert(node_index);
+                row.produced_write = true;
+                apply_gql_set_items(
+                    plan,
+                    params,
+                    on_create,
+                    row,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                    target_applications,
+                    skipped_null_targets,
+                    first_existing_node_update_order,
+                    first_existing_edge_update_order,
+                    seen_existing_node_updates,
+                    seen_existing_edge_updates,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
+fn materialize_gql_relationship_merge(
+    plan: &GqlMutationPlan,
+    params: &GqlParams,
+    alias: &str,
+    from_alias: &str,
+    to_alias: &str,
+    label: &str,
+    on_create: &[GqlSetItemPlan],
+    on_match: &[GqlSetItemPlan],
+    rows: &mut [GqlCreateExecutionRow],
+    txn: &WriteTxn,
+    snapshot: &ReadView,
+    _edge_uniqueness: bool,
+    default_valid_from: i64,
+    nodes: &mut Vec<GqlCreatedNodeExecution>,
+    edges: &mut Vec<GqlCreatedEdgeExecution>,
+    existing_nodes: &mut BTreeMap<u64, GqlExistingNodeExecution>,
+    existing_edges: &mut BTreeMap<u64, GqlExistingEdgeExecution>,
+    edge_precheck_triples: &mut BTreeSet<(u64, u64, String)>,
+    merge_overlay: &mut TxnMergeOverlay,
+    merge_edge_locals: &mut BTreeMap<TxnMergeLocalEdgeRef, usize>,
+    merge_db_hits: &mut usize,
+    target_applications: &mut BTreeMap<GqlMutationTargetKey, usize>,
+    skipped_null_targets: &mut usize,
+    first_existing_node_update_order: &mut Vec<u64>,
+    first_existing_edge_update_order: &mut Vec<u64>,
+    seen_existing_node_updates: &mut BTreeSet<u64>,
+    seen_existing_edge_updates: &mut BTreeSet<u64>,
+    op_budget: &mut GqlMaterializationOpBudget,
+) -> Result<(), EngineError> {
+    let mut inputs = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let Some(from) = gql_create_node_ref_for_alias(row, from_alias, nodes)? else {
+            inputs.push(None);
+            continue;
+        };
+        let Some(to) = gql_create_node_ref_for_alias(row, to_alias, nodes)? else {
+            inputs.push(None);
+            continue;
+        };
+        inputs.push(Some(TxnUniqueEdgeMergeInput {
+            from,
+            to,
+            label: label.to_string(),
+        }));
+    }
+
+    let batch = txn.plan_unique_edge_merge_batch(merge_overlay, &inputs)?;
+    let missing_existing_ids = batch
+        .existing_ids
+        .iter()
+        .filter(|id| !existing_edges.contains_key(id))
+        .count();
+    *merge_db_hits = (*merge_db_hits)
+        .saturating_add(batch.snapshot_lookup_count)
+        .saturating_add(missing_existing_ids);
+    ensure_gql_existing_edge_targets(snapshot, existing_edges, &batch.existing_ids)?;
+    edge_precheck_triples.extend(batch.missing_committed_triples.iter().cloned());
+    op_budget.reserve(
+        batch
+            .rows
+            .iter()
+            .filter(|outcome| matches!(outcome, TxnUniqueEdgeMergeRowOutcome::Create { .. }))
+            .count(),
+    )?;
+
+    for (row_index, (row, outcome)) in rows.iter_mut().zip(batch.rows).enumerate() {
+        match outcome {
+            TxnUniqueEdgeMergeRowOutcome::SkippedNull => {
+                *skipped_null_targets += 1;
+                row.created_edges.remove(alias);
+                row.read_edges.insert(alias.to_string(), None);
+            }
+            TxnUniqueEdgeMergeRowOutcome::Existing(id) => {
+                row.created_edges.remove(alias);
+                row.read_edges.insert(alias.to_string(), Some(id));
+                apply_gql_set_items(
+                    plan,
+                    params,
+                    on_match,
+                    row,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                    target_applications,
+                    skipped_null_targets,
+                    first_existing_node_update_order,
+                    first_existing_edge_update_order,
+                    seen_existing_node_updates,
+                    seen_existing_edge_updates,
+                )?;
+            }
+            TxnUniqueEdgeMergeRowOutcome::MatchedLocal(local) => {
+                let edge_index = *merge_edge_locals.get(&local).ok_or_else(|| {
+                    EngineError::InvalidOperation(
+                        "GQL relationship MERGE local overlay target was not materialized"
+                            .to_string(),
+                    )
+                })?;
+                row.read_edges.remove(alias);
+                row.created_edges.insert(alias.to_string(), edge_index);
+                apply_gql_set_items(
+                    plan,
+                    params,
+                    on_match,
+                    row,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                    target_applications,
+                    skipped_null_targets,
+                    first_existing_node_update_order,
+                    first_existing_edge_update_order,
+                    seen_existing_node_updates,
+                    seen_existing_edge_updates,
+                )?;
+            }
+            TxnUniqueEdgeMergeRowOutcome::Create {
+                local,
+                from,
+                to,
+                label,
+            } => {
+                let local_ref = TxnLocalRef::Alias(format!("__gql_merge_edge_{row_index}_{alias}"));
+                let edge_index = edges.len();
+                edges.push(GqlCreatedEdgeExecution {
+                    alias: Some(alias.to_string()),
+                    local: Some(local_ref),
+                    from,
+                    to,
+                    label,
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    valid_from: Some(default_valid_from),
+                    valid_to: Some(i64::MAX),
+                });
+                merge_edge_locals.insert(local, edge_index);
+                row.read_edges.remove(alias);
+                row.created_edges.insert(alias.to_string(), edge_index);
+                row.created_edge_writes.insert(edge_index);
+                row.produced_write = true;
+                apply_gql_set_items(
+                    plan,
+                    params,
+                    on_create,
+                    row,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                    target_applications,
+                    skipped_null_targets,
+                    first_existing_node_update_order,
+                    first_existing_edge_update_order,
+                    seen_existing_node_updates,
+                    seen_existing_edge_updates,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_gql_existing_node_targets(
+    snapshot: &ReadView,
+    existing_nodes: &mut BTreeMap<u64, GqlExistingNodeExecution>,
+    node_ids: &BTreeSet<u64>,
+) -> Result<(), EngineError> {
+    let missing = node_ids
+        .iter()
+        .filter(|id| !existing_nodes.contains_key(id))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let hydrated = hydrate_gql_existing_node_targets(snapshot, &missing)?;
+    existing_nodes.extend(hydrated);
+    Ok(())
+}
+
+fn ensure_gql_existing_edge_targets(
+    snapshot: &ReadView,
+    existing_edges: &mut BTreeMap<u64, GqlExistingEdgeExecution>,
+    edge_ids: &BTreeSet<u64>,
+) -> Result<(), EngineError> {
+    let missing = edge_ids
+        .iter()
+        .filter(|id| !existing_edges.contains_key(id))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let hydrated = hydrate_gql_existing_edge_targets(snapshot, &missing)?;
+    existing_edges.extend(hydrated);
+    Ok(())
+}
+
+fn gql_merge_string_key(value: &GraphValue) -> Result<String, EngineError> {
+    match value {
+        GraphValue::String(value) if !value.is_empty() => Ok(value.clone()),
+        _ => Err(gql_create_invalid_value(
+            "GQL MERGE node key must be a non-empty string",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn materialize_gql_create_pattern(
     pattern: &GqlCreatePatternPlan,
     row: &mut GqlCreateExecutionRow,
@@ -1130,7 +2498,7 @@ fn materialize_gql_create_pattern(
     nodes: &mut Vec<GqlCreatedNodeExecution>,
     edges: &mut Vec<GqlCreatedEdgeExecution>,
     edge_precheck_triples: &mut BTreeSet<(u64, u64, String)>,
-    seen_edge_triples: &mut BTreeSet<(GqlCreateEndpointKey, GqlCreateEndpointKey, String)>,
+    seen_edge_triples: &mut BTreeSet<(TxnMergeEndpointKey, TxnMergeEndpointKey, String)>,
     edge_uniqueness: bool,
     op_budget: &mut GqlMaterializationOpBudget,
 ) -> Result<(), EngineError> {
@@ -1142,7 +2510,9 @@ fn materialize_gql_create_pattern(
         let local_alias = format!("__gql_create_node_{row_index}_{pattern_index}_{}", node.alias);
         let local = TxnLocalRef::Alias(local_alias);
         let created = materialize_gql_create_node(node, row, local)?;
-        row.created_nodes.insert(node.alias.clone(), nodes.len());
+        let node_index = nodes.len();
+        row.created_nodes.insert(node.alias.clone(), node_index);
+        row.created_node_writes.insert(node_index);
         row.produced_write = true;
         nodes.push(created);
     }
@@ -1166,7 +2536,7 @@ fn materialize_gql_create_pattern(
             from.clone(),
             to.clone(),
             local.clone(),
-                    default_valid_from,
+            default_valid_from,
         )?;
         if edge_uniqueness {
             let triple = (
@@ -1184,8 +2554,10 @@ fn materialize_gql_create_pattern(
                 edge_precheck_triples.insert((*from_id, *to_id, edge.label.clone()));
             }
         }
+        let edge_index = edges.len();
+        row.created_edge_writes.insert(edge_index);
         if let (Some(alias), Some(_)) = (&created.alias, &created.local) {
-            row.created_edges.insert(alias.clone(), edges.len());
+            row.created_edges.insert(alias.clone(), edge_index);
         }
         row.produced_write = true;
         edges.push(created);
@@ -1263,11 +2635,163 @@ fn collect_gql_existing_update_targets(
                         }
                     }
                 }
-                GqlMutationClausePlan::Create(_) | GqlMutationClausePlan::Delete { .. } => {}
+                GqlMutationClausePlan::Create(_)
+                | GqlMutationClausePlan::Merge(_)
+                | GqlMutationClausePlan::Delete { .. } => {}
             }
         }
     }
     (nodes, edges)
+}
+
+fn collect_gql_late_expr_read_prefix_targets(
+    plan: &GqlMutationPlan,
+    rows: &[GqlCreateExecutionRow],
+    nodes: &mut BTreeSet<u64>,
+    edges: &mut BTreeSet<u64>,
+) {
+    let mut node_aliases = BTreeSet::new();
+    let mut edge_aliases = BTreeSet::new();
+    for expr in plan.operation_exprs.iter().filter(|expr| expr.late) {
+        collect_gql_read_prefix_element_aliases_in_expr(
+            plan,
+            &expr.source,
+            &mut node_aliases,
+            &mut edge_aliases,
+        );
+    }
+    for row in rows {
+        for alias in &node_aliases {
+            if let Some(Some(id)) = row.read_nodes.get(alias) {
+                nodes.insert(*id);
+            }
+        }
+        for alias in &edge_aliases {
+            if let Some(Some(id)) = row.read_edges.get(alias) {
+                edges.insert(*id);
+            }
+        }
+    }
+}
+
+fn collect_gql_read_prefix_element_aliases_in_expr(
+    plan: &GqlMutationPlan,
+    expr: &Expr,
+    node_aliases: &mut BTreeSet<String>,
+    edge_aliases: &mut BTreeSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Variable(name) => {
+            if let Some(binding) = plan.semantic.aliases.get(name) {
+                if binding.origin == GqlAliasOrigin::ReadPrefix
+                    && matches!(binding.kind, GqlAliasKind::Node | GqlAliasKind::Edge)
+                {
+                    match binding.kind {
+                        GqlAliasKind::Node => {
+                            node_aliases.insert(name.clone());
+                        }
+                        GqlAliasKind::Edge => {
+                            edge_aliases.insert(name.clone());
+                        }
+                        GqlAliasKind::Path | GqlAliasKind::Scalar => {}
+                    }
+                }
+            }
+        }
+        ExprKind::PropertyAccess { object, .. }
+        | ExprKind::Unary { expr: object, .. }
+        | ExprKind::IsNull { expr: object, .. } => {
+            collect_gql_read_prefix_element_aliases_in_expr(
+                plan,
+                object,
+                node_aliases,
+                edge_aliases,
+            );
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_gql_read_prefix_element_aliases_in_expr(
+                plan,
+                left,
+                node_aliases,
+                edge_aliases,
+            );
+            collect_gql_read_prefix_element_aliases_in_expr(
+                plan,
+                right,
+                node_aliases,
+                edge_aliases,
+            );
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => {
+            for arg in args {
+                collect_gql_read_prefix_element_aliases_in_expr(
+                    plan,
+                    arg,
+                    node_aliases,
+                    edge_aliases,
+                );
+            }
+        }
+        ExprKind::AggregateCall { arg, .. } => {
+            if let Some(arg) = arg.as_ref() {
+                collect_gql_read_prefix_element_aliases_in_expr(
+                    plan,
+                    arg,
+                    node_aliases,
+                    edge_aliases,
+                );
+            }
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand.as_ref() {
+                collect_gql_read_prefix_element_aliases_in_expr(
+                    plan,
+                    operand,
+                    node_aliases,
+                    edge_aliases,
+                );
+            }
+            for branch in branches {
+                collect_gql_read_prefix_element_aliases_in_expr(
+                    plan,
+                    &branch.when,
+                    node_aliases,
+                    edge_aliases,
+                );
+                collect_gql_read_prefix_element_aliases_in_expr(
+                    plan,
+                    &branch.then,
+                    node_aliases,
+                    edge_aliases,
+                );
+            }
+            if let Some(else_expr) = else_expr.as_ref() {
+                collect_gql_read_prefix_element_aliases_in_expr(
+                    plan,
+                    else_expr,
+                    node_aliases,
+                    edge_aliases,
+                );
+            }
+        }
+        ExprKind::Map(map) => {
+            for entry in &map.entries {
+                collect_gql_read_prefix_element_aliases_in_expr(
+                    plan,
+                    &entry.value,
+                    node_aliases,
+                    edge_aliases,
+                );
+            }
+        }
+        ExprKind::ExistsSubquery(_)
+        | ExprKind::Literal(_)
+        | ExprKind::Parameter(_) => {}
+    }
 }
 
 fn collect_gql_existing_update_target(
@@ -1297,7 +2821,16 @@ fn collect_gql_existing_update_target(
                 edges.insert(*id);
             }
         }
-        GqlAliasKind::Path => {}
+        GqlAliasKind::Path | GqlAliasKind::Scalar => {}
+    }
+}
+
+fn gql_alias_kind_name(kind: GqlAliasKind) -> &'static str {
+    match kind {
+        GqlAliasKind::Node => "node",
+        GqlAliasKind::Edge => "edge",
+        GqlAliasKind::Path => "path",
+        GqlAliasKind::Scalar => "scalar",
     }
 }
 
@@ -1478,8 +3011,8 @@ fn gql_delete_target_for_alias(
             };
             Ok(Some(GqlMutationTargetKey::ExistingEdge(*id)))
         }
-        GqlAliasKind::Path => Err(EngineError::InvalidOperation(
-            "path aliases are not scalar mutation targets".to_string(),
+        GqlAliasKind::Path | GqlAliasKind::Scalar => Err(EngineError::InvalidOperation(
+            format!("{} aliases are not mutation targets", gql_alias_kind_name(kind)),
         )),
     }
 }
@@ -1604,6 +3137,7 @@ fn gql_node_ref_matches_deleted_node(
 #[allow(clippy::too_many_arguments)]
 fn apply_gql_set_items(
     plan: &GqlMutationPlan,
+    params: &GqlParams,
     items: &[GqlSetItemPlan],
     row: &mut GqlCreateExecutionRow,
     nodes: &mut [GqlCreatedNodeExecution],
@@ -1625,7 +3159,16 @@ fn apply_gql_set_items(
                 property,
                 value,
             } => {
-                let value = gql_create_expr_value(row, value.id)?.clone();
+                let value = gql_mutation_set_expr_value(
+                    plan,
+                    params,
+                    row,
+                    value,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                )?;
                 let Some(target) = gql_mutation_target_for_alias(
                     row,
                     alias,
@@ -1641,7 +3184,7 @@ fn apply_gql_set_items(
                     continue;
                 };
                 if apply_gql_set_property(
-                    target,
+                    target.clone(),
                     property,
                     &value,
                     nodes,
@@ -1649,11 +3192,21 @@ fn apply_gql_set_items(
                     existing_nodes,
                     existing_edges,
                 )? {
+                    mark_gql_touched_created_target(row, &target);
                     row.produced_write = true;
                 }
             }
             GqlSetItemPlan::MapMerge { alias, kind, value } => {
-                let value = gql_create_expr_value(row, value.id)?.clone();
+                let value = gql_mutation_set_expr_value(
+                    plan,
+                    params,
+                    row,
+                    value,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                )?;
                 let Some(target) = gql_mutation_target_for_alias(
                     row,
                     alias,
@@ -1669,13 +3222,14 @@ fn apply_gql_set_items(
                     continue;
                 };
                 if apply_gql_map_merge(
-                    target,
+                    target.clone(),
                     &value,
                     nodes,
                     edges,
                     existing_nodes,
                     existing_edges,
                 )? {
+                    mark_gql_touched_created_target(row, &target);
                     row.produced_write = true;
                 }
             }
@@ -1694,19 +3248,20 @@ fn apply_gql_set_items(
                 else {
                     continue;
                 };
-                if apply_gql_add_node_label(target, label, nodes, existing_nodes)? {
+                if apply_gql_add_node_label(target.clone(), label, nodes, existing_nodes)? {
+                    mark_gql_touched_created_target(row, &target);
                     row.produced_write = true;
                 }
             }
         }
     }
-    let _ = plan;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn apply_gql_remove_items(
-    plan: &GqlMutationPlan,
+    _plan: &GqlMutationPlan,
+    _params: &GqlParams,
     items: &[GqlRemoveItemPlan],
     row: &mut GqlCreateExecutionRow,
     nodes: &mut [GqlCreatedNodeExecution],
@@ -1742,13 +3297,14 @@ fn apply_gql_remove_items(
                     continue;
                 };
                 if apply_gql_remove_property(
-                    target,
+                    target.clone(),
                     property,
                     nodes,
                     edges,
                     existing_nodes,
                     existing_edges,
                 )? {
+                    mark_gql_touched_created_target(row, &target);
                     row.produced_write = true;
                 }
             }
@@ -1767,13 +3323,13 @@ fn apply_gql_remove_items(
                 else {
                     continue;
                 };
-                if apply_gql_remove_node_label(target, label, nodes, existing_nodes)? {
+                if apply_gql_remove_node_label(target.clone(), label, nodes, existing_nodes)? {
+                    mark_gql_touched_created_target(row, &target);
                     row.produced_write = true;
                 }
             }
         }
     }
-    let _ = plan;
     Ok(())
 }
 
@@ -1833,9 +3389,74 @@ fn gql_mutation_target_for_alias(
                 "path aliases are not scalar mutation targets".to_string(),
             ));
         }
+        GqlAliasKind::Scalar => {
+            return Err(EngineError::InvalidOperation(
+                "scalar aliases are not mutation targets".to_string(),
+            ));
+        }
     };
     *target_applications.entry(target.clone()).or_default() += 1;
     Ok(Some(target))
+}
+
+fn mark_gql_touched_created_target(
+    row: &mut GqlCreateExecutionRow,
+    target: &GqlMutationTargetKey,
+) {
+    match target {
+        GqlMutationTargetKey::CreatedNode(index) => {
+            row.touched_created_nodes.insert(*index);
+        }
+        GqlMutationTargetKey::CreatedEdge(index) => {
+            row.touched_created_edges.insert(*index);
+        }
+        GqlMutationTargetKey::ExistingNode(_) | GqlMutationTargetKey::ExistingEdge(_) => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gql_mutation_set_expr_value(
+    plan: &GqlMutationPlan,
+    params: &GqlParams,
+    row: &GqlCreateExecutionRow,
+    expr_ref: &GqlMutationExprRef,
+    nodes: &[GqlCreatedNodeExecution],
+    edges: &[GqlCreatedEdgeExecution],
+    existing_nodes: &BTreeMap<u64, GqlExistingNodeExecution>,
+    existing_edges: &BTreeMap<u64, GqlExistingEdgeExecution>,
+) -> Result<GraphValue, EngineError> {
+    let expr_plan = plan.operation_exprs.get(expr_ref.id).ok_or_else(|| {
+        EngineError::InvalidOperation(format!(
+            "GQL mutation expression ref #{} is missing from the execution plan",
+            expr_ref.id
+        ))
+    })?;
+    if !expr_plan.late {
+        return gql_create_expr_value(row, expr_ref.id).cloned();
+    }
+    let hydrated = GqlMutationHydratedRecords::default();
+    let context = GqlMutationReturnEvalContext {
+        plan,
+        row,
+        nodes,
+        edges,
+        existing_nodes,
+        existing_edges,
+        commit: None,
+        hydrated: &hydrated,
+        include_vectors: false,
+        path_id_only: false,
+    };
+    let value = gql_mutation_return_expr_value(&expr_plan.source, params, &context)?;
+    let graph_value = gql_value_to_graph_eval_scalar(value)?.ok_or_else(|| {
+            gql_semantic_error(
+                GqlSemanticErrorCode::InvalidReturnExpression,
+                "GQL MERGE action expression must produce a scalar, list, map, or null value"
+                    .to_string(),
+                expr_plan.source.span.clone(),
+            )
+        })?;
+    graph_eval_value_to_graph_value(graph_value)
 }
 
 fn apply_gql_set_property(
@@ -1996,7 +3617,7 @@ fn reject_reserved_gql_map_merge_keys(
                 key.as_str(),
                 "id" | "from" | "to" | "label" | "type" | "created_at" | "updated_at"
             ),
-            GqlAliasKind::Path => true,
+            GqlAliasKind::Path | GqlAliasKind::Scalar => true,
         };
         if reserved {
             return Err(EngineError::InvalidOperation(format!(
@@ -2262,8 +3883,21 @@ fn gql_row_produced_effective_write(
     created_node_deletes: &BTreeSet<usize>,
     created_edge_deletes: &BTreeSet<usize>,
 ) -> bool {
-    row.created_nodes.values().any(|&index| nodes.get(index).is_some())
-        || row.created_edges.values().any(|&index| edges.get(index).is_some())
+    row.created_node_writes
+        .iter()
+        .any(|&index| nodes.get(index).is_some() && !created_node_deletes.contains(&index))
+        || row
+            .created_edge_writes
+            .iter()
+            .any(|&index| edges.get(index).is_some() && !created_edge_deletes.contains(&index))
+        || row
+            .touched_created_nodes
+            .iter()
+            .any(|&index| nodes.get(index).is_some() && !created_node_deletes.contains(&index))
+        || row
+            .touched_created_edges
+            .iter()
+            .any(|&index| edges.get(index).is_some() && !created_edge_deletes.contains(&index))
         || row
             .read_nodes
             .values()
@@ -2557,6 +4191,7 @@ fn precheck_gql_create_conflicts(
 #[derive(Clone)]
 struct GqlMutationReturnStaticPlan {
     exprs: Vec<GqlReturnExpr>,
+    distinct: bool,
     order_by: Vec<GqlMutationResolvedOrderItem>,
     skip: usize,
     limit: Option<usize>,
@@ -2571,7 +4206,7 @@ struct GqlMutationResolvedOrderItem {
 
 struct GqlMutationReturnExecutionPlan {
     static_plan: GqlMutationReturnStaticPlan,
-    ordered_rows: Vec<GqlMutationReturnOrderedRow>,
+    selected_rows: Vec<usize>,
     output_hydration_needs: GqlMutationReturnHydrationNeeds,
     read_set: TxnReturnReadSet,
 }
@@ -2670,6 +4305,7 @@ fn build_gql_mutation_return_static_plan(
         .transpose()?;
     Ok(Some(GqlMutationReturnStaticPlan {
         exprs,
+        distinct: return_plan.distinct,
         order_by,
         skip,
         limit,
@@ -2696,16 +4332,24 @@ fn build_gql_mutation_return_execution_plan(
             options.max_order_materialization,
         ));
     }
-    let returned_count =
+    let candidate_count =
         gql_mutation_return_count_after_row_ops(materialized.rows.len(), &static_plan);
-    if returned_count > options.max_rows {
+    if !static_plan.distinct && candidate_count > options.max_rows {
         return Err(gql_mutation_cap_error(
             "max_rows",
-            returned_count,
+            candidate_count,
             options.max_rows,
         ));
     }
     validate_gql_mutation_order_exprs_materialized(plan, &static_plan.order_by, materialized)?;
+    if static_plan.distinct {
+        validate_gql_mutation_return_distinct_exprs_static(plan, &static_plan.exprs)?;
+        validate_gql_mutation_return_distinct_exprs_materialized(
+            plan,
+            &static_plan.exprs,
+            materialized,
+        )?;
+    }
 
     let ordered_precommit = build_gql_mutation_ordered_rows_precommit(
         plan,
@@ -2715,35 +4359,76 @@ fn build_gql_mutation_return_execution_plan(
         snapshot,
         options,
     )?;
-    let selected_rows =
+    let candidate_rows =
         selected_gql_mutation_return_rows(&ordered_precommit.rows, static_plan.skip, static_plan.limit);
-    let mut output_hydration_needs = GqlMutationReturnHydrationNeeds::default();
+    let mut candidate_hydration_needs = GqlMutationReturnHydrationNeeds::default();
     let mut read_set = ordered_precommit.read_set;
     for item in &static_plan.exprs {
         collect_gql_mutation_return_expr_ids(
             plan,
             materialized,
             &item.expr,
-            &selected_rows,
+            &candidate_rows,
             GqlMutationReturnUse::Output,
             None,
-            &mut output_hydration_needs,
+            &mut candidate_hydration_needs,
             &mut read_set,
         );
     }
-    let hydrated = hydrate_gql_mutation_return_records(snapshot, &output_hydration_needs)?;
+    let hydrated = hydrate_gql_mutation_return_records(snapshot, &candidate_hydration_needs)?;
     validate_gql_mutation_return_output_values_precommit(
         plan,
         &static_plan,
         params,
         materialized,
-        &selected_rows,
+        &candidate_rows,
         &hydrated,
         options,
     )?;
+    let selected_rows = if static_plan.distinct {
+        select_distinct_gql_mutation_return_rows_precommit(
+            plan,
+            &static_plan,
+            params,
+            materialized,
+            &candidate_rows,
+            &hydrated,
+            options,
+        )?
+    } else {
+        candidate_rows
+    };
+    if selected_rows.len() > options.max_rows {
+        return Err(gql_mutation_cap_error(
+            "max_rows",
+            selected_rows.len(),
+            options.max_rows,
+        ));
+    }
+    let output_hydration_needs = if static_plan.distinct {
+        let mut needs = GqlMutationReturnHydrationNeeds::default();
+        let mut selected_read_set = TxnReturnReadSet::default();
+        for item in &static_plan.exprs {
+            collect_gql_mutation_return_expr_ids(
+                plan,
+                materialized,
+                &item.expr,
+                &selected_rows,
+                GqlMutationReturnUse::Output,
+                None,
+                &mut needs,
+                &mut selected_read_set,
+            );
+        }
+        read_set.node_ids.extend(selected_read_set.node_ids);
+        read_set.edge_ids.extend(selected_read_set.edge_ids);
+        needs
+    } else {
+        candidate_hydration_needs
+    };
     Ok(Some(GqlMutationReturnExecutionPlan {
         static_plan,
-        ordered_rows: ordered_precommit.rows,
+        selected_rows,
         output_hydration_needs,
         read_set,
     }))
@@ -2818,7 +4503,10 @@ fn build_gql_mutation_ordered_rows_precommit(
             let context = GqlMutationReturnEvalContext {
                 plan,
                 row,
-                materialized,
+                nodes: &materialized.nodes,
+                edges: &materialized.edges,
+                existing_nodes: &materialized.existing_nodes,
+                existing_edges: &materialized.existing_edges,
                 commit: None,
                 hydrated: &hydrated,
                 include_vectors: options.include_vectors,
@@ -2874,23 +4562,10 @@ fn selected_gql_mutation_return_rows(
     }
 }
 
-fn gql_mutation_return_selected_row_count(
-    ordered_rows: &[GqlMutationReturnOrderedRow],
-    skip: usize,
-    limit: Option<usize>,
-) -> usize {
-    let after_skip = ordered_rows.len().saturating_sub(skip);
-    limit.map_or(after_skip, |limit| after_skip.min(limit))
-}
-
 fn gql_mutation_return_needs_committed_view(
     return_execution: &GqlMutationReturnExecutionPlan,
 ) -> bool {
-    gql_mutation_return_selected_row_count(
-        &return_execution.ordered_rows,
-        return_execution.static_plan.skip,
-        return_execution.static_plan.limit,
-    ) > 0
+    !return_execution.selected_rows.is_empty()
 }
 
 fn validate_gql_mutation_return_output_values_precommit(
@@ -2911,7 +4586,10 @@ fn validate_gql_mutation_return_output_values_precommit(
         let context = GqlMutationReturnEvalContext {
             plan,
             row,
-            materialized,
+            nodes: &materialized.nodes,
+            edges: &materialized.edges,
+            existing_nodes: &materialized.existing_nodes,
+            existing_edges: &materialized.existing_edges,
             commit: None,
             hydrated,
             include_vectors: options.include_vectors,
@@ -2922,6 +4600,428 @@ fn validate_gql_mutation_return_output_values_precommit(
         }
     }
     Ok(())
+}
+
+fn select_distinct_gql_mutation_return_rows_precommit(
+    plan: &GqlMutationPlan,
+    static_plan: &GqlMutationReturnStaticPlan,
+    params: &GqlParams,
+    materialized: &GqlCreateMaterialization,
+    candidate_rows: &[usize],
+    hydrated: &GqlMutationHydratedRecords,
+    options: &GqlExecutionOptions,
+) -> Result<Vec<usize>, EngineError> {
+    let mut seen = BTreeSet::new();
+    let mut selected = Vec::with_capacity(candidate_rows.len());
+    for &row_index in candidate_rows {
+        let row = materialized.rows.get(row_index).ok_or_else(|| {
+            EngineError::InvalidOperation(
+                "GQL mutation RETURN selected row index is out of bounds".to_string(),
+            )
+        })?;
+        let context = GqlMutationReturnEvalContext {
+            plan,
+            row,
+            nodes: &materialized.nodes,
+            edges: &materialized.edges,
+            existing_nodes: &materialized.existing_nodes,
+            existing_edges: &materialized.existing_edges,
+            commit: None,
+            hydrated,
+            include_vectors: options.include_vectors,
+            path_id_only: false,
+        };
+        let key = static_plan
+            .exprs
+            .iter()
+            .map(|item| gql_mutation_return_distinct_key_for_expr(&item.expr, params, &context))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !seen.contains(&key) && seen.len() >= options.max_groups {
+            return Err(gql_mutation_cap_error(
+                "max_groups",
+                seen.len().saturating_add(1),
+                options.max_groups,
+            ));
+        }
+        if seen.insert(key) {
+            selected.push(row_index);
+        }
+    }
+    Ok(selected)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum GqlMutationReturnEntityDistinctKey {
+    Existing(u64),
+    Created(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum GqlMutationReturnDistinctKey {
+    Scalar(GraphCanonicalKey),
+    Node(GqlMutationReturnEntityDistinctKey),
+    Edge(GqlMutationReturnEntityDistinctKey),
+    Path {
+        nodes: Vec<GqlMutationReturnEntityDistinctKey>,
+        edges: Vec<GqlMutationReturnEntityDistinctKey>,
+    },
+    List(Vec<GqlMutationReturnDistinctKey>),
+    Map(Vec<(String, GqlMutationReturnDistinctKey)>),
+}
+
+fn gql_mutation_return_distinct_key_for_expr(
+    expr: &Expr,
+    params: &GqlParams,
+    context: &GqlMutationReturnEvalContext<'_>,
+) -> Result<GqlMutationReturnDistinctKey, EngineError> {
+    match &expr.kind {
+        ExprKind::Literal(literal) => {
+            gql_value_to_mutation_return_distinct_key(&gql_literal_to_value(literal), &expr.span)
+        }
+        ExprKind::Parameter(name) => {
+            let value = params
+                .get(name)
+                .map(gql_param_to_value)
+                .ok_or_else(|| EngineError::GqlParameter {
+                    name: name.clone(),
+                    expected: "GqlParamValue".to_string(),
+                    message: format!("missing parameter '${name}'"),
+                    span: expr.span.clone(),
+                })?;
+            gql_value_to_mutation_return_distinct_key(&value, &expr.span)
+        }
+        ExprKind::Variable(alias) => {
+            gql_mutation_alias_distinct_key(alias, context, &expr.span)
+        }
+        ExprKind::List(items) => Ok(GqlMutationReturnDistinctKey::List(
+            items
+                .iter()
+                .map(|item| gql_mutation_return_distinct_key_for_expr(item, params, context))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        ExprKind::Map(map) => Ok(GqlMutationReturnDistinctKey::Map(
+            map.entries
+                .iter()
+                .map(|entry| {
+                    Ok((
+                        entry.key.name.clone(),
+                        gql_mutation_return_distinct_key_for_expr(&entry.value, params, context)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()?
+                .into_iter()
+                .collect(),
+        )),
+        ExprKind::PropertyAccess { object, property } => {
+            if let ExprKind::Map(map) = &object.kind {
+                if let Some(entry) = map
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key.name == property.name)
+                {
+                    return gql_mutation_return_distinct_key_for_expr(
+                        &entry.value,
+                        params,
+                        context,
+                    );
+                }
+                return Ok(GqlMutationReturnDistinctKey::Scalar(GraphCanonicalKey::Null));
+            }
+            let value = gql_mutation_return_expr_value(expr, params, context)?;
+            gql_value_to_mutation_return_distinct_key(&value, &expr.span)
+        }
+        ExprKind::FunctionCall { name, args } => {
+            if let Some(key) =
+                gql_mutation_graph_function_distinct_key(&name.name, args, context, &expr.span)?
+            {
+                return Ok(key);
+            }
+            let value = gql_mutation_return_expr_value(expr, params, context)?;
+            gql_value_to_mutation_return_distinct_key(&value, &expr.span)
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => gql_mutation_case_distinct_key(
+            operand.as_deref(),
+            branches,
+            else_expr.as_deref(),
+            params,
+            context,
+            &expr.span,
+        ),
+        ExprKind::Unary { .. } | ExprKind::Binary { .. } | ExprKind::IsNull { .. } => {
+            let value = gql_mutation_return_expr_value(expr, params, context)?;
+            gql_value_to_mutation_return_distinct_key(&value, &expr.span)
+        }
+        ExprKind::AggregateCall { name_span, .. } => Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "aggregate functions are not supported in mutation RETURN".to_string(),
+            name_span.clone(),
+        )),
+        ExprKind::ExistsSubquery(_) => Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "GQL mutation RETURN does not support subquery expressions".to_string(),
+            expr.span.clone(),
+        )),
+    }
+}
+
+fn gql_mutation_alias_distinct_key(
+    alias: &str,
+    context: &GqlMutationReturnEvalContext<'_>,
+    span: &SourceSpan,
+) -> Result<GqlMutationReturnDistinctKey, EngineError> {
+    let Some(binding) = context.plan.semantic.aliases.get(alias) else {
+        return Ok(GqlMutationReturnDistinctKey::Scalar(GraphCanonicalKey::Null));
+    };
+    match binding.kind {
+        GqlAliasKind::Node => {
+            if let Some(&index) = context.row.created_nodes.get(alias) {
+                return Ok(GqlMutationReturnDistinctKey::Node(
+                    GqlMutationReturnEntityDistinctKey::Created(index),
+                ));
+            }
+            Ok(context
+                .node_id(alias)
+                .map(|id| {
+                    GqlMutationReturnDistinctKey::Node(
+                        GqlMutationReturnEntityDistinctKey::Existing(id),
+                    )
+                })
+                .unwrap_or(GqlMutationReturnDistinctKey::Scalar(
+                    GraphCanonicalKey::Null,
+                )))
+        }
+        GqlAliasKind::Edge => {
+            if let Some(&index) = context.row.created_edges.get(alias) {
+                return Ok(GqlMutationReturnDistinctKey::Edge(
+                    GqlMutationReturnEntityDistinctKey::Created(index),
+                ));
+            }
+            Ok(context
+                .edge_id(alias)
+                .map(|id| {
+                    GqlMutationReturnDistinctKey::Edge(
+                        GqlMutationReturnEntityDistinctKey::Existing(id),
+                    )
+                })
+                .unwrap_or(GqlMutationReturnDistinctKey::Scalar(
+                    GraphCanonicalKey::Null,
+                )))
+        }
+        GqlAliasKind::Path => Ok(context
+            .path(alias)
+            .map(gql_path_identity_distinct_key)
+            .unwrap_or(GqlMutationReturnDistinctKey::Scalar(
+                GraphCanonicalKey::Null,
+            ))),
+        GqlAliasKind::Scalar => {
+            let value = row_scalar_value(alias, context)?;
+            gql_value_to_mutation_return_distinct_key(&value, span)
+        }
+    }
+}
+
+fn gql_path_identity_distinct_key(path: &GqlPathIdentity) -> GqlMutationReturnDistinctKey {
+    GqlMutationReturnDistinctKey::Path {
+        nodes: path
+            .node_ids
+            .iter()
+            .copied()
+            .map(GqlMutationReturnEntityDistinctKey::Existing)
+            .collect(),
+        edges: path
+            .edge_ids
+            .iter()
+            .copied()
+            .map(GqlMutationReturnEntityDistinctKey::Existing)
+            .collect(),
+    }
+}
+
+fn gql_mutation_graph_function_distinct_key(
+    function: &str,
+    args: &[Expr],
+    context: &GqlMutationReturnEvalContext<'_>,
+    _span: &SourceSpan,
+) -> Result<Option<GqlMutationReturnDistinctKey>, EngineError> {
+    let Some(Expr {
+        kind: ExprKind::Variable(alias),
+        ..
+    }) = args.first()
+    else {
+        return Ok(None);
+    };
+    let lower = function.to_ascii_lowercase();
+    let Some(binding) = context.plan.semantic.aliases.get(alias) else {
+        return Ok(Some(GqlMutationReturnDistinctKey::Scalar(
+            GraphCanonicalKey::Null,
+        )));
+    };
+    if binding.kind != GqlAliasKind::Path {
+        return Ok(None);
+    }
+    let Some(path) = context.path(alias) else {
+        return Ok(Some(GqlMutationReturnDistinctKey::Scalar(
+            GraphCanonicalKey::Null,
+        )));
+    };
+    let key = match lower.as_str() {
+        "start_node" => path.node_ids.first().copied().map(|id| {
+            GqlMutationReturnDistinctKey::Node(GqlMutationReturnEntityDistinctKey::Existing(id))
+        }),
+        "end_node" => path.node_ids.last().copied().map(|id| {
+            GqlMutationReturnDistinctKey::Node(GqlMutationReturnEntityDistinctKey::Existing(id))
+        }),
+        "nodes" => Some(GqlMutationReturnDistinctKey::List(
+            path.node_ids
+                .iter()
+                .copied()
+                .map(|id| {
+                    GqlMutationReturnDistinctKey::Node(
+                        GqlMutationReturnEntityDistinctKey::Existing(id),
+                    )
+                })
+                .collect(),
+        )),
+        "relationships" => Some(GqlMutationReturnDistinctKey::List(
+            path.edge_ids
+                .iter()
+                .copied()
+                .map(|id| {
+                    GqlMutationReturnDistinctKey::Edge(
+                        GqlMutationReturnEntityDistinctKey::Existing(id),
+                    )
+                })
+                .collect(),
+        )),
+        _ => return Ok(None),
+    };
+    Ok(Some(key.unwrap_or({
+        GqlMutationReturnDistinctKey::Scalar(GraphCanonicalKey::Null)
+    })))
+}
+
+fn gql_mutation_case_distinct_key(
+    operand: Option<&Expr>,
+    branches: &[crate::gql::ast::CaseBranch],
+    else_expr: Option<&Expr>,
+    params: &GqlParams,
+    context: &GqlMutationReturnEvalContext<'_>,
+    span: &SourceSpan,
+) -> Result<GqlMutationReturnDistinctKey, EngineError> {
+    if let Some(operand) = operand {
+        let operand_value = gql_mutation_return_expr_value(operand, params, context)?;
+        for branch in branches {
+            let when_value = gql_mutation_return_expr_value(&branch.when, params, context)?;
+            if let Some(value) =
+                gql_mutation_try_eval_shared_binary(BinaryOp::Eq, &operand_value, &when_value, span)?
+            {
+                match value {
+                    GqlValue::Bool(true) => {
+                        return gql_mutation_return_distinct_key_for_expr(
+                            &branch.then,
+                            params,
+                            context,
+                        );
+                    }
+                    GqlValue::Bool(false) | GqlValue::Null => {}
+                    _ => unreachable!("equality returns bool or null"),
+                }
+            } else if matches!(
+                gql_mutation_compare_values(BinaryOp::Eq, operand_value.clone(), when_value),
+                GqlValue::Bool(true)
+            ) {
+                return gql_mutation_return_distinct_key_for_expr(
+                    &branch.then,
+                    params,
+                    context,
+                );
+            }
+        }
+    } else {
+        for branch in branches {
+            if let Some(true) = gql_mutation_bool_or_null(&branch.when, params, context)? {
+                return gql_mutation_return_distinct_key_for_expr(
+                    &branch.then,
+                    params,
+                    context,
+                );
+            }
+        }
+    }
+    else_expr
+        .map(|expr| gql_mutation_return_distinct_key_for_expr(expr, params, context))
+        .unwrap_or_else(|| Ok(GqlMutationReturnDistinctKey::Scalar(GraphCanonicalKey::Null)))
+}
+
+fn gql_value_to_mutation_return_distinct_key(
+    value: &GqlValue,
+    span: &SourceSpan,
+) -> Result<GqlMutationReturnDistinctKey, EngineError> {
+    Ok(match value {
+        GqlValue::Null
+        | GqlValue::Bool(_)
+        | GqlValue::Int(_)
+        | GqlValue::UInt(_)
+        | GqlValue::Float(_)
+        | GqlValue::String(_)
+        | GqlValue::Bytes(_) => {
+            let graph_value = gql_value_ref_to_graph_eval_scalar(value)?.ok_or_else(|| {
+                gql_distinct_key_error("GQL mutation RETURN DISTINCT scalar key is invalid", span)
+            })?;
+            GqlMutationReturnDistinctKey::Scalar(graph_canonical_key_for_value(&graph_value)?)
+        }
+        GqlValue::List(values) => GqlMutationReturnDistinctKey::List(
+            values
+                .iter()
+                .map(|value| gql_value_to_mutation_return_distinct_key(value, span))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        GqlValue::Map(values) => GqlMutationReturnDistinctKey::Map(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.clone(),
+                        gql_value_to_mutation_return_distinct_key(value, span)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?,
+        ),
+        GqlValue::Node(node) => GqlMutationReturnDistinctKey::Node(
+            GqlMutationReturnEntityDistinctKey::Existing(node.id.ok_or_else(|| {
+                gql_distinct_key_error(
+                    "GQL mutation RETURN DISTINCT requires a precommit node identity",
+                    span,
+                )
+            })?),
+        ),
+        GqlValue::Edge(edge) => GqlMutationReturnDistinctKey::Edge(
+            GqlMutationReturnEntityDistinctKey::Existing(edge.id.ok_or_else(|| {
+                gql_distinct_key_error(
+                    "GQL mutation RETURN DISTINCT requires a precommit edge identity",
+                    span,
+                )
+            })?),
+        ),
+        GqlValue::Path(path) => GqlMutationReturnDistinctKey::Path {
+            nodes: path
+                .node_ids
+                .iter()
+                .copied()
+                .map(GqlMutationReturnEntityDistinctKey::Existing)
+                .collect(),
+            edges: path
+                .edge_ids
+                .iter()
+                .copied()
+                .map(GqlMutationReturnEntityDistinctKey::Existing)
+                .collect(),
+        },
+    })
 }
 
 fn build_gql_mutation_return_rows(
@@ -2936,11 +5036,7 @@ fn build_gql_mutation_return_rows(
     let Some(return_execution) = return_execution else {
         return Ok(Vec::new());
     };
-    let selected = selected_gql_mutation_return_rows(
-        &return_execution.ordered_rows,
-        return_execution.static_plan.skip,
-        return_execution.static_plan.limit,
-    );
+    let selected = return_execution.selected_rows.clone();
     if selected.is_empty() {
         return Ok(Vec::new());
     }
@@ -2962,7 +5058,10 @@ fn build_gql_mutation_return_rows(
             let context = GqlMutationReturnEvalContext {
                 plan,
                 row,
-                materialized,
+                nodes: &materialized.nodes,
+                edges: &materialized.edges,
+                existing_nodes: &materialized.existing_nodes,
+                existing_edges: &materialized.existing_edges,
                 commit: Some(commit),
                 hydrated: &hydrated,
                 include_vectors: options.include_vectors,
@@ -2976,7 +5075,7 @@ fn build_gql_mutation_return_rows(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(GqlRow { values })
         })
-        .collect()
+        .collect::<Result<Vec<_>, EngineError>>()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2988,7 +5087,10 @@ enum GqlMutationReturnUse {
 struct GqlMutationReturnEvalContext<'a> {
     plan: &'a GqlMutationPlan,
     row: &'a GqlCreateExecutionRow,
-    materialized: &'a GqlCreateMaterialization,
+    nodes: &'a [GqlCreatedNodeExecution],
+    edges: &'a [GqlCreatedEdgeExecution],
+    existing_nodes: &'a BTreeMap<u64, GqlExistingNodeExecution>,
+    existing_edges: &'a BTreeMap<u64, GqlExistingEdgeExecution>,
     commit: Option<&'a TxnCommitResult>,
     hydrated: &'a GqlMutationHydratedRecords,
     include_vectors: bool,
@@ -3096,6 +5198,50 @@ fn resolve_mutation_return_aliases_in_expr(
                 .map(|arg| resolve_mutation_return_aliases_in_expr(arg, return_aliases, plan))
                 .collect::<Result<Vec<_>, _>>()?,
         },
+        ExprKind::AggregateCall { name_span, .. } => {
+            return Err(gql_semantic_error(
+                GqlSemanticErrorCode::InvalidReturnExpression,
+                "aggregate functions are not supported in mutation RETURN".to_string(),
+                name_span.clone(),
+            ));
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => ExprKind::Case {
+            operand: operand
+                .as_ref()
+                .map(|operand| {
+                    resolve_mutation_return_aliases_in_expr(operand, return_aliases, plan)
+                        .map(Box::new)
+                })
+                .transpose()?,
+            branches: branches
+                .iter()
+                .map(|branch| {
+                    Ok(crate::gql::ast::CaseBranch {
+                        when: resolve_mutation_return_aliases_in_expr(
+                            &branch.when,
+                            return_aliases,
+                            plan,
+                        )?,
+                        then: resolve_mutation_return_aliases_in_expr(
+                            &branch.then,
+                            return_aliases,
+                            plan,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?,
+            else_expr: else_expr
+                .as_ref()
+                .map(|else_expr| {
+                    resolve_mutation_return_aliases_in_expr(else_expr, return_aliases, plan)
+                        .map(Box::new)
+                })
+                .transpose()?,
+        },
         ExprKind::List(items) => ExprKind::List(
             items
                 .iter()
@@ -3109,6 +5255,13 @@ fn resolve_mutation_return_aliases_in_expr(
                     resolve_mutation_return_aliases_in_expr(&entry.value, return_aliases, plan)?;
             }
             ExprKind::Map(resolved)
+        }
+        ExprKind::ExistsSubquery(_) => {
+            return Err(gql_semantic_error(
+                GqlSemanticErrorCode::InvalidReturnExpression,
+                "GQL mutation RETURN does not support subquery expressions".to_string(),
+                expr.span.clone(),
+            ))
         }
         ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::Variable(_) => {
             return Ok(expr.clone())
@@ -3126,6 +5279,19 @@ fn validate_gql_mutation_return_exprs_static(
 ) -> Result<(), EngineError> {
     for expr in exprs {
         validate_gql_mutation_return_expr_static(plan, &expr.expr)?;
+        validate_gql_mutation_return_commit_dependent_metadata_static(plan, &expr.expr, true)?;
+    }
+    Ok(())
+}
+
+fn validate_gql_mutation_return_distinct_exprs_static(
+    plan: &GqlMutationPlan,
+    exprs: &[GqlReturnExpr],
+) -> Result<(), EngineError> {
+    for expr in exprs {
+        validate_gql_mutation_return_commit_dependent_metadata_static(
+            plan, &expr.expr, false,
+        )?;
     }
     Ok(())
 }
@@ -3153,8 +5319,31 @@ fn validate_gql_mutation_return_expr_static(
             validate_gql_mutation_return_expr_static(plan, left)?;
             validate_gql_mutation_return_expr_static(plan, right)?;
         }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                validate_gql_mutation_return_expr_static(plan, operand)?;
+            }
+            for branch in branches {
+                validate_gql_mutation_return_expr_static(plan, &branch.when)?;
+                validate_gql_mutation_return_expr_static(plan, &branch.then)?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_gql_mutation_return_expr_static(plan, else_expr)?;
+            }
+        }
         ExprKind::FunctionCall { name, args } => {
             validate_gql_mutation_return_function_static(plan, &name.name, args, &expr.span)?
+        }
+        ExprKind::AggregateCall { name_span, .. } => {
+            return Err(gql_semantic_error(
+                GqlSemanticErrorCode::InvalidReturnExpression,
+                "aggregate functions are not supported in mutation RETURN".to_string(),
+                name_span.clone(),
+            ));
         }
         ExprKind::List(args) => {
             for arg in args {
@@ -3165,6 +5354,13 @@ fn validate_gql_mutation_return_expr_static(
             for entry in &map.entries {
                 validate_gql_mutation_return_expr_static(plan, &entry.value)?;
             }
+        }
+        ExprKind::ExistsSubquery(_) => {
+            return Err(gql_semantic_error(
+                GqlSemanticErrorCode::InvalidReturnExpression,
+                "GQL mutation RETURN does not support subquery expressions".to_string(),
+                expr.span.clone(),
+            ));
         }
         ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
     }
@@ -3206,6 +5402,14 @@ fn validate_gql_mutation_return_function_static(
     args: &[Expr],
     span: &SourceSpan,
 ) -> Result<(), EngineError> {
+    let lower = function.to_ascii_lowercase();
+    if gql_scalar_function_name(&lower).is_some() {
+        validate_gql_scalar_function_arity(&lower, function, args.len(), span)?;
+        for arg in args {
+            validate_gql_mutation_return_expr_static(plan, arg)?;
+        }
+        return Ok(());
+    }
     let [arg] = args else {
         return Err(gql_semantic_error(
             GqlSemanticErrorCode::InvalidReturnExpression,
@@ -3226,8 +5430,7 @@ fn validate_gql_mutation_return_function_static(
             &arg.span,
         ));
     };
-    let function = function.to_ascii_lowercase();
-    let valid = match function.as_str() {
+    let valid = match lower.as_str() {
         "id" => matches!(binding.kind, GqlAliasKind::Node | GqlAliasKind::Edge),
         "labels" => binding.kind == GqlAliasKind::Node,
         "type" => binding.kind == GqlAliasKind::Edge,
@@ -3246,9 +5449,191 @@ fn validate_gql_mutation_return_function_static(
     } else {
         Err(gql_semantic_error(
             GqlSemanticErrorCode::InvalidReturnExpression,
-            format!("function '{}' received an unsupported alias kind", function),
+            format!("function '{}' received an unsupported alias kind", lower),
             span.clone(),
         ))
+    }
+}
+
+fn validate_gql_mutation_return_commit_dependent_metadata_static(
+    plan: &GqlMutationPlan,
+    expr: &Expr,
+    allow_direct_output: bool,
+) -> Result<(), EngineError> {
+    if gql_mutation_return_expr_is_commit_dependent_created_metadata(plan, expr) {
+        if allow_direct_output {
+            return Ok(());
+        }
+        return Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "commit-assigned created alias metadata cannot be used inside rich mutation RETURN expressions".to_string(),
+            expr.span.clone(),
+        ));
+    }
+
+    match &expr.kind {
+        ExprKind::PropertyAccess { object, .. } => {
+            validate_gql_mutation_return_commit_dependent_metadata_static(plan, object, false)
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } => {
+            validate_gql_mutation_return_commit_dependent_metadata_static(plan, expr, false)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            validate_gql_mutation_return_commit_dependent_metadata_static(plan, left, false)?;
+            validate_gql_mutation_return_commit_dependent_metadata_static(plan, right, false)
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                validate_gql_mutation_return_commit_dependent_metadata_static(plan, operand, false)?;
+            }
+            for branch in branches {
+                validate_gql_mutation_return_commit_dependent_metadata_static(
+                    plan,
+                    &branch.when,
+                    false,
+                )?;
+                validate_gql_mutation_return_commit_dependent_metadata_static(
+                    plan,
+                    &branch.then,
+                    false,
+                )?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_gql_mutation_return_commit_dependent_metadata_static(
+                    plan, else_expr, false,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                validate_gql_mutation_return_commit_dependent_metadata_static(plan, arg, false)?;
+            }
+            Ok(())
+        }
+        ExprKind::AggregateCall { name_span, .. } => Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "aggregate functions are not supported in mutation RETURN".to_string(),
+            name_span.clone(),
+        )),
+        ExprKind::List(items) => {
+            for item in items {
+                validate_gql_mutation_return_commit_dependent_metadata_static(plan, item, false)?;
+            }
+            Ok(())
+        }
+        ExprKind::Map(map) => {
+            for entry in &map.entries {
+                validate_gql_mutation_return_commit_dependent_metadata_static(
+                    plan,
+                    &entry.value,
+                    false,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::ExistsSubquery(_) => Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "GQL mutation RETURN does not support subquery expressions".to_string(),
+            expr.span.clone(),
+        )),
+        ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::Variable(_) => Ok(()),
+    }
+}
+
+fn gql_mutation_return_expr_is_commit_dependent_created_metadata(
+    plan: &GqlMutationPlan,
+    expr: &Expr,
+) -> bool {
+    match &expr.kind {
+        ExprKind::FunctionCall { name, args } if name.name.eq_ignore_ascii_case("id") => {
+            matches!(
+                args.as_slice(),
+                [Expr {
+                    kind: ExprKind::Variable(alias),
+                    ..
+                }] if gql_mutation_created_alias_kind(plan, alias)
+                    .is_some_and(|kind| matches!(kind, GqlAliasKind::Node | GqlAliasKind::Edge))
+            )
+        }
+        ExprKind::PropertyAccess { object, property } => {
+            let ExprKind::Variable(alias) = &object.kind else {
+                return false;
+            };
+            match gql_mutation_created_alias_kind(plan, alias) {
+                Some(GqlAliasKind::Node) => matches!(
+                    property.name.as_str(),
+                    "id" | "created_at" | "updated_at"
+                ),
+                Some(GqlAliasKind::Edge) => matches!(
+                    property.name.as_str(),
+                    "id" | "from" | "to" | "created_at" | "updated_at"
+                ),
+                Some(GqlAliasKind::Path | GqlAliasKind::Scalar) | None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn gql_mutation_created_alias_kind(plan: &GqlMutationPlan, alias: &str) -> Option<GqlAliasKind> {
+    plan.semantic
+        .aliases
+        .get(alias)
+        .filter(|binding| matches!(binding.origin, GqlAliasOrigin::Created | GqlAliasOrigin::Merged))
+        .map(|binding| binding.kind)
+}
+
+fn validate_gql_scalar_function_arity(
+    lower: &str,
+    display: &str,
+    arg_count: usize,
+    span: &SourceSpan,
+) -> Result<(), EngineError> {
+    let valid = match lower {
+        "coalesce" => arg_count >= 1,
+        "substring" => matches!(arg_count, 2 | 3),
+        "to_string" | "to_integer" | "to_float" | "abs" | "floor" | "ceil" | "round"
+        | "lower" | "upper" | "trim" | "size" | "head" | "last" => arg_count == 1,
+        _ => false,
+    };
+    if valid {
+        return Ok(());
+    }
+    let expected = match lower {
+        "coalesce" => "at least one argument",
+        "substring" => "two or three arguments",
+        _ => "exactly one argument",
+    };
+    Err(gql_semantic_error(
+        GqlSemanticErrorCode::InvalidReturnExpression,
+        format!("function '{display}' expects {expected}"),
+        span.clone(),
+    ))
+}
+
+fn gql_scalar_function_name(lower: &str) -> Option<GraphFunction> {
+    match lower {
+        "coalesce" => Some(GraphFunction::Coalesce),
+        "to_string" => Some(GraphFunction::ToString),
+        "to_integer" => Some(GraphFunction::ToInteger),
+        "to_float" => Some(GraphFunction::ToFloat),
+        "abs" => Some(GraphFunction::Abs),
+        "floor" => Some(GraphFunction::Floor),
+        "ceil" => Some(GraphFunction::Ceil),
+        "round" => Some(GraphFunction::Round),
+        "lower" => Some(GraphFunction::Lower),
+        "upper" => Some(GraphFunction::Upper),
+        "trim" => Some(GraphFunction::Trim),
+        "substring" => Some(GraphFunction::Substring),
+        "size" => Some(GraphFunction::Size),
+        "head" => Some(GraphFunction::Head),
+        "last" => Some(GraphFunction::Last),
+        _ => None,
     }
 }
 
@@ -3258,6 +5643,17 @@ fn validate_gql_mutation_order_exprs_static(
 ) -> Result<(), EngineError> {
     for item in order_by {
         validate_gql_mutation_order_expr_static(plan, &item.expr, &item.span)?;
+        validate_gql_mutation_return_commit_dependent_metadata_static(plan, &item.expr, false)
+            .map_err(|err| match err {
+                EngineError::GqlSemantic { .. }
+                    if gql_mutation_return_expr_is_commit_dependent_created_metadata(
+                        plan, &item.expr,
+                    ) =>
+                {
+                    gql_order_key_error(&item.span)
+                }
+                other => other,
+            })?;
     }
     Ok(())
 }
@@ -3270,6 +5666,7 @@ fn validate_gql_mutation_order_expr_static(
     match &expr.kind {
         ExprKind::Variable(alias) => match plan.semantic.aliases.get(alias).map(|binding| binding.kind) {
             Some(GqlAliasKind::Path) => Ok(()),
+            Some(GqlAliasKind::Scalar) => Ok(()),
             Some(GqlAliasKind::Node | GqlAliasKind::Edge) => Err(gql_order_key_error(span)),
             None => Ok(()),
         },
@@ -3292,6 +5689,8 @@ fn validate_gql_mutation_order_expr_static(
             }
             Ok(())
         }
+        ExprKind::AggregateCall { name_span, .. } => Err(gql_order_key_error(name_span)),
+        ExprKind::ExistsSubquery(_) => Err(gql_order_key_error(span)),
         ExprKind::PropertyAccess { object, property } => {
             if matches!(property.name.as_str(), "labels" | "node_ids" | "edge_ids") {
                 return Err(gql_order_key_error(span));
@@ -3310,6 +5709,23 @@ fn validate_gql_mutation_order_expr_static(
             validate_gql_mutation_order_expr_static(plan, left, span)?;
             validate_gql_mutation_order_expr_static(plan, right, span)
         }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                validate_gql_mutation_order_expr_static(plan, operand, span)?;
+            }
+            for branch in branches {
+                validate_gql_mutation_order_expr_static(plan, &branch.when, span)?;
+                validate_gql_mutation_order_expr_static(plan, &branch.then, span)?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_gql_mutation_order_expr_static(plan, else_expr, span)?;
+            }
+            Ok(())
+        }
         ExprKind::Literal(_) | ExprKind::Parameter(_) => Ok(()),
     }
 }
@@ -3326,6 +5742,141 @@ fn validate_gql_mutation_order_exprs_materialized(
             &item.expr,
             &item.span,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_gql_mutation_return_distinct_exprs_materialized(
+    plan: &GqlMutationPlan,
+    exprs: &[GqlReturnExpr],
+    materialized: &GqlCreateMaterialization,
+) -> Result<(), EngineError> {
+    for expr in exprs {
+        validate_gql_mutation_return_distinct_expr_materialized(
+            plan,
+            materialized,
+            &expr.expr,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_gql_mutation_return_distinct_expr_materialized(
+    plan: &GqlMutationPlan,
+    materialized: &GqlCreateMaterialization,
+    expr: &Expr,
+) -> Result<(), EngineError> {
+    match &expr.kind {
+        ExprKind::PropertyAccess { object, property } => {
+            if let ExprKind::Variable(alias) = &object.kind {
+                validate_gql_mutation_return_distinct_alias_property_materialized(
+                    plan,
+                    materialized,
+                    alias,
+                    &property.name,
+                    &expr.span,
+                )?;
+            } else {
+                validate_gql_mutation_return_distinct_expr_materialized(
+                    plan,
+                    materialized,
+                    object,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => {
+            for arg in args {
+                validate_gql_mutation_return_distinct_expr_materialized(
+                    plan,
+                    materialized,
+                    arg,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::AggregateCall { name_span, .. } => Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "aggregate functions are not supported in mutation RETURN".to_string(),
+            name_span.clone(),
+        )),
+        ExprKind::ExistsSubquery(_) => Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "GQL mutation RETURN does not support subquery expressions".to_string(),
+            expr.span.clone(),
+        )),
+        ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } => {
+            validate_gql_mutation_return_distinct_expr_materialized(plan, materialized, expr)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            validate_gql_mutation_return_distinct_expr_materialized(plan, materialized, left)?;
+            validate_gql_mutation_return_distinct_expr_materialized(plan, materialized, right)
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                validate_gql_mutation_return_distinct_expr_materialized(
+                    plan,
+                    materialized,
+                    operand,
+                )?;
+            }
+            for branch in branches {
+                validate_gql_mutation_return_distinct_expr_materialized(
+                    plan,
+                    materialized,
+                    &branch.when,
+                )?;
+                validate_gql_mutation_return_distinct_expr_materialized(
+                    plan,
+                    materialized,
+                    &branch.then,
+                )?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_gql_mutation_return_distinct_expr_materialized(
+                    plan,
+                    materialized,
+                    else_expr,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::Map(map) => {
+            for entry in &map.entries {
+                validate_gql_mutation_return_distinct_expr_materialized(
+                    plan,
+                    materialized,
+                    &entry.value,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::Variable(_) => Ok(()),
+    }
+}
+
+fn validate_gql_mutation_return_distinct_alias_property_materialized(
+    plan: &GqlMutationPlan,
+    materialized: &GqlCreateMaterialization,
+    alias: &str,
+    property: &str,
+    span: &SourceSpan,
+) -> Result<(), EngineError> {
+    let Some(binding) = plan.semantic.aliases.get(alias) else {
+        return Ok(());
+    };
+    if property == "updated_at"
+        && matches!(binding.origin, GqlAliasOrigin::ReadPrefix | GqlAliasOrigin::Merged)
+        && gql_mutation_order_alias_has_changed_target(materialized, alias, binding.kind)
+    {
+        return Err(gql_distinct_key_error(
+            "GQL mutation RETURN DISTINCT cannot use same-mutation updated_at metadata",
+            span,
+        ));
     }
     Ok(())
 }
@@ -3359,7 +5910,7 @@ fn validate_gql_mutation_order_expr_materialized(
                 }) = args.first()
                 {
                     if plan.semantic.aliases.get(alias).is_some_and(|binding| {
-                        binding.origin == GqlAliasOrigin::Created
+                        matches!(binding.origin, GqlAliasOrigin::Created | GqlAliasOrigin::Merged)
                             && matches!(binding.kind, GqlAliasKind::Node | GqlAliasKind::Edge)
                     }) {
                         return Err(gql_order_key_error(span));
@@ -3371,12 +5922,46 @@ fn validate_gql_mutation_order_expr_materialized(
             }
             Ok(())
         }
+        ExprKind::AggregateCall { name_span, .. } => Err(gql_order_key_error(name_span)),
+        ExprKind::ExistsSubquery(_) => Err(gql_order_key_error(span)),
         ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } => {
             validate_gql_mutation_order_expr_materialized(plan, materialized, expr, span)
         }
         ExprKind::Binary { left, right, .. } => {
             validate_gql_mutation_order_expr_materialized(plan, materialized, left, span)?;
             validate_gql_mutation_order_expr_materialized(plan, materialized, right, span)
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                validate_gql_mutation_order_expr_materialized(plan, materialized, operand, span)?;
+            }
+            for branch in branches {
+                validate_gql_mutation_order_expr_materialized(
+                    plan,
+                    materialized,
+                    &branch.when,
+                    span,
+                )?;
+                validate_gql_mutation_order_expr_materialized(
+                    plan,
+                    materialized,
+                    &branch.then,
+                    span,
+                )?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_gql_mutation_order_expr_materialized(
+                    plan,
+                    materialized,
+                    else_expr,
+                    span,
+                )?;
+            }
+            Ok(())
         }
         ExprKind::List(items) => {
             for item in items {
@@ -3409,20 +5994,21 @@ fn validate_gql_mutation_order_alias_property_materialized(
     let Some(binding) = plan.semantic.aliases.get(alias) else {
         return Ok(());
     };
-    if binding.origin == GqlAliasOrigin::Created {
+    if matches!(binding.origin, GqlAliasOrigin::Created | GqlAliasOrigin::Merged) {
         let volatile = match binding.kind {
             GqlAliasKind::Node => matches!(property, "id" | "created_at" | "updated_at"),
             GqlAliasKind::Edge => {
                 matches!(property, "id" | "from" | "to" | "created_at" | "updated_at")
             }
             GqlAliasKind::Path => false,
+            GqlAliasKind::Scalar => false,
         };
         if volatile {
             return Err(gql_order_key_error(span));
         }
     }
     if property == "updated_at"
-        && binding.origin == GqlAliasOrigin::ReadPrefix
+        && matches!(binding.origin, GqlAliasOrigin::ReadPrefix | GqlAliasOrigin::Merged)
         && gql_mutation_order_alias_has_changed_target(materialized, alias, binding.kind)
     {
         return Err(gql_order_key_error(span));
@@ -3448,7 +6034,7 @@ fn gql_mutation_order_alias_has_changed_target(
             .and_then(|id| *id)
             .and_then(|id| materialized.existing_edges.get(&id))
             .is_some_and(gql_existing_edge_changed),
-        GqlAliasKind::Path => false,
+        GqlAliasKind::Path | GqlAliasKind::Scalar => false,
     })
 }
 
@@ -3475,9 +6061,14 @@ fn evaluate_gql_mutation_count_expr(
         read_nodes: BTreeMap::new(),
         read_edges: BTreeMap::new(),
         read_paths: BTreeMap::new(),
+        read_scalars: BTreeMap::new(),
         expr_values: Vec::new(),
         created_nodes: BTreeMap::new(),
         created_edges: BTreeMap::new(),
+        created_node_writes: BTreeSet::new(),
+        created_edge_writes: BTreeSet::new(),
+        touched_created_nodes: BTreeSet::new(),
+        touched_created_edges: BTreeSet::new(),
         produced_write: false,
     };
     let empty_materialization = GqlCreateMaterialization {
@@ -3509,7 +6100,10 @@ fn evaluate_gql_mutation_count_expr(
     let context = GqlMutationReturnEvalContext {
         plan,
         row: &empty_row,
-        materialized: &empty_materialization,
+        nodes: &empty_materialization.nodes,
+        edges: &empty_materialization.edges,
+        existing_nodes: &empty_materialization.existing_nodes,
+        existing_edges: &empty_materialization.existing_edges,
         commit: None,
         hydrated: &empty_materialized,
         include_vectors: options.include_vectors,
@@ -3543,13 +6137,33 @@ fn gql_mutation_expr_depends_on_alias(expr: &Expr, plan: &GqlMutationPlan) -> bo
             gql_mutation_expr_depends_on_alias(left, plan)
                 || gql_mutation_expr_depends_on_alias(right, plan)
         }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|operand| gql_mutation_expr_depends_on_alias(operand, plan))
+                || branches.iter().any(|branch| {
+                    gql_mutation_expr_depends_on_alias(&branch.when, plan)
+                        || gql_mutation_expr_depends_on_alias(&branch.then, plan)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|else_expr| gql_mutation_expr_depends_on_alias(else_expr, plan))
+        }
         ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => args
             .iter()
             .any(|arg| gql_mutation_expr_depends_on_alias(arg, plan)),
+        ExprKind::AggregateCall { arg, .. } => arg
+            .as_ref()
+            .is_some_and(|arg| gql_mutation_expr_depends_on_alias(arg, plan)),
         ExprKind::Map(map) => map
             .entries
             .iter()
             .any(|entry| gql_mutation_expr_depends_on_alias(&entry.value, plan)),
+        ExprKind::ExistsSubquery(_) => true,
         ExprKind::Literal(_) | ExprKind::Parameter(_) => false,
     }
 }
@@ -3723,6 +6337,13 @@ fn collect_gql_mutation_return_expr_ids(
                 );
             }
         }
+        ExprKind::AggregateCall { arg, .. } => {
+            if let Some(arg) = arg.as_ref() {
+                collect_gql_mutation_return_expr_ids(
+                    plan, materialized, arg, row_indices, use_, commit, ids, read_set,
+                );
+            }
+        }
         ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } => {
             collect_gql_mutation_return_expr_ids(
                 plan, materialized, expr, row_indices, use_, commit, ids, read_set,
@@ -3735,6 +6356,51 @@ fn collect_gql_mutation_return_expr_ids(
             collect_gql_mutation_return_expr_ids(
                 plan, materialized, right, row_indices, use_, commit, ids, read_set,
             );
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_gql_mutation_return_expr_ids(
+                    plan, materialized, operand, row_indices, use_, commit, ids, read_set,
+                );
+            }
+            for branch in branches {
+                collect_gql_mutation_return_expr_ids(
+                    plan,
+                    materialized,
+                    &branch.when,
+                    row_indices,
+                    use_,
+                    commit,
+                    ids,
+                    read_set,
+                );
+                collect_gql_mutation_return_expr_ids(
+                    plan,
+                    materialized,
+                    &branch.then,
+                    row_indices,
+                    use_,
+                    commit,
+                    ids,
+                    read_set,
+                );
+            }
+            if let Some(else_expr) = else_expr {
+                collect_gql_mutation_return_expr_ids(
+                    plan,
+                    materialized,
+                    else_expr,
+                    row_indices,
+                    use_,
+                    commit,
+                    ids,
+                    read_set,
+                );
+            }
         }
         ExprKind::List(items) => {
             for item in items {
@@ -3750,6 +6416,7 @@ fn collect_gql_mutation_return_expr_ids(
                 );
             }
         }
+        ExprKind::ExistsSubquery(_) => {}
         ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
     }
 }
@@ -3824,18 +6491,25 @@ fn collect_gql_mutation_alias_ids(
         };
         match binding.kind {
             GqlAliasKind::Node => {
-                if binding.origin == GqlAliasOrigin::Created && commit.is_none() {
+                let local_created = row.created_nodes.get(alias).copied();
+                if commit.is_none()
+                    && matches!(binding.origin, GqlAliasOrigin::Created | GqlAliasOrigin::Merged)
+                    && local_created.is_some()
+                {
                     if use_ == GqlMutationReturnUse::Output {
-                        if let Some(&index) = row.created_nodes.get(alias) {
+                        if let Some(index) = local_created {
                             ids.created_node_indices.insert(index);
                         }
                     }
                     continue;
                 }
                 if let Some(id) =
-                    gql_mutation_node_id_for_alias(alias, row, materialized, commit)
+                    gql_mutation_node_id_for_alias(alias, row, &materialized.nodes, commit)
                 {
-                    if binding.origin == GqlAliasOrigin::ReadPrefix
+                    if matches!(
+                        binding.origin,
+                        GqlAliasOrigin::ReadPrefix | GqlAliasOrigin::Merged
+                    )
                         && matches!(use_, GqlMutationReturnUse::Output | GqlMutationReturnUse::Order)
                     {
                         read_set.node_ids.insert(id);
@@ -3846,18 +6520,25 @@ fn collect_gql_mutation_alias_ids(
                 }
             }
             GqlAliasKind::Edge => {
-                if binding.origin == GqlAliasOrigin::Created && commit.is_none() {
+                let local_created = row.created_edges.get(alias).copied();
+                if commit.is_none()
+                    && matches!(binding.origin, GqlAliasOrigin::Created | GqlAliasOrigin::Merged)
+                    && local_created.is_some()
+                {
                     if use_ == GqlMutationReturnUse::Output {
-                        if let Some(&index) = row.created_edges.get(alias) {
+                        if let Some(index) = local_created {
                             ids.created_edge_indices.insert(index);
                         }
                     }
                     continue;
                 }
                 if let Some(id) =
-                    gql_mutation_edge_id_for_alias(alias, row, materialized, commit)
+                    gql_mutation_edge_id_for_alias(alias, row, &materialized.edges, commit)
                 {
-                    if binding.origin == GqlAliasOrigin::ReadPrefix
+                    if matches!(
+                        binding.origin,
+                        GqlAliasOrigin::ReadPrefix | GqlAliasOrigin::Merged
+                    )
                         && matches!(use_, GqlMutationReturnUse::Output | GqlMutationReturnUse::Order)
                     {
                         read_set.edge_ids.insert(id);
@@ -3878,6 +6559,7 @@ fn collect_gql_mutation_alias_ids(
                     read_set.edge_ids.extend(path.edge_ids.iter().copied());
                 }
             }
+            GqlAliasKind::Scalar => {}
         }
     }
 }
@@ -3914,18 +6596,21 @@ fn gql_mutation_return_expr_value(
                 )),
             }
         }
-        ExprKind::Unary {
-            op: UnaryOp::Not,
-            expr,
-        } => match gql_mutation_return_expr_value(expr, params, context)? {
-            GqlValue::Bool(value) => Ok(GqlValue::Bool(!value)),
-            GqlValue::Null => Ok(GqlValue::Null),
-            _ => Err(gql_semantic_error(
-                GqlSemanticErrorCode::InvalidReturnExpression,
-                "NOT requires a boolean or null operand".to_string(),
-                expr.span.clone(),
-            )),
-        },
+        ExprKind::Unary { op, expr } => {
+            let value = gql_mutation_return_expr_value(expr, params, context)?;
+            let graph_value = gql_value_to_graph_eval_scalar(value)?.ok_or_else(|| {
+                gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    "unary scalar expression requires scalar or null input".to_string(),
+                    expr.span.clone(),
+                )
+            })?;
+            let graph_op = match op {
+                UnaryOp::Not => GraphUnaryOp::Not,
+                UnaryOp::Neg => GraphUnaryOp::Neg,
+            };
+            graph_eval_to_gql_scalar(eval_graph_unary_value(graph_op, &graph_value)?, &expr.span)
+        }
         ExprKind::Binary { op, left, right } => {
             gql_mutation_eval_binary(*op, left, right, params, context)
         }
@@ -3937,6 +6622,17 @@ fn gql_mutation_return_expr_value(
             Ok(GqlValue::Bool(if *negated { !is_null } else { is_null }))
         }
         ExprKind::FunctionCall { name, args } => {
+            let lower = name.name.to_ascii_lowercase();
+            if let Some(function) = gql_scalar_function_name(&lower) {
+                return gql_mutation_scalar_function_value(
+                    function,
+                    &name.name,
+                    args,
+                    params,
+                    context,
+                    &expr.span,
+                );
+            }
             let Some(Expr {
                 kind: ExprKind::Variable(alias),
                 ..
@@ -3950,6 +6646,28 @@ fn gql_mutation_return_expr_value(
             };
             gql_mutation_function_value(&name.name, alias, context, &expr.span)
         }
+        ExprKind::AggregateCall { name_span, .. } => Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "aggregate functions are not supported in mutation RETURN".to_string(),
+            name_span.clone(),
+        )),
+        ExprKind::ExistsSubquery(_) => Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "GQL mutation RETURN does not support subquery expressions".to_string(),
+            expr.span.clone(),
+        )),
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => gql_mutation_case_value(
+            operand.as_deref(),
+            branches,
+            else_expr.as_deref(),
+            params,
+            context,
+            &expr.span,
+        ),
         ExprKind::List(items) => Ok(GqlValue::List(
             items
                 .iter()
@@ -4008,12 +6726,81 @@ fn gql_mutation_eval_binary(
         | BinaryOp::Le
         | BinaryOp::Gt
         | BinaryOp::Ge
+        | BinaryOp::Add
+        | BinaryOp::Sub
+        | BinaryOp::Mul
+        | BinaryOp::Div
+        | BinaryOp::StartsWith
+        | BinaryOp::EndsWith
+        | BinaryOp::Contains
         | BinaryOp::In => {
             let left_value = gql_mutation_return_expr_value(left, params, context)?;
             let right_value = gql_mutation_return_expr_value(right, params, context)?;
+            if matches!(
+                op,
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::StartsWith
+                    | BinaryOp::EndsWith
+                    | BinaryOp::Contains
+            ) {
+                return gql_mutation_eval_shared_binary(op, left_value, right_value, &left.span);
+            }
+            if let Some(value) =
+                gql_mutation_try_eval_shared_binary(op, &left_value, &right_value, &left.span)?
+            {
+                return Ok(value);
+            }
             Ok(gql_mutation_compare_values(op, left_value, right_value))
         }
     }
+}
+
+fn gql_mutation_eval_shared_binary(
+    op: BinaryOp,
+    left: GqlValue,
+    right: GqlValue,
+    span: &SourceSpan,
+) -> Result<GqlValue, EngineError> {
+    let left = gql_value_to_graph_eval_scalar(left)?.ok_or_else(|| {
+        gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "scalar operator requires scalar, list, map, or null operands".to_string(),
+            span.clone(),
+        )
+    })?;
+    let right = gql_value_to_graph_eval_scalar(right)?.ok_or_else(|| {
+        gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "scalar operator requires scalar, list, map, or null operands".to_string(),
+            span.clone(),
+        )
+    })?;
+    graph_eval_to_gql_scalar(
+        eval_graph_binary_values(gql_binary_op_to_graph_op(op), &left, &right)?,
+        span,
+    )
+}
+
+fn gql_mutation_try_eval_shared_binary(
+    op: BinaryOp,
+    left: &GqlValue,
+    right: &GqlValue,
+    span: &SourceSpan,
+) -> Result<Option<GqlValue>, EngineError> {
+    let Some(left) = gql_value_ref_to_graph_eval_scalar(left)? else {
+        return Ok(None);
+    };
+    let Some(right) = gql_value_ref_to_graph_eval_scalar(right)? else {
+        return Ok(None);
+    };
+    graph_eval_to_gql_scalar(
+        eval_graph_binary_values(gql_binary_op_to_graph_op(op), &left, &right)?,
+        span,
+    )
+    .map(Some)
 }
 
 fn gql_mutation_bool_or_null(
@@ -4030,6 +6817,190 @@ fn gql_mutation_bool_or_null(
             expr.span.clone(),
         )),
     }
+}
+
+fn gql_mutation_scalar_function_value(
+    function: GraphFunction,
+    display: &str,
+    args: &[Expr],
+    params: &GqlParams,
+    context: &GqlMutationReturnEvalContext<'_>,
+    span: &SourceSpan,
+) -> Result<GqlValue, EngineError> {
+    validate_gql_scalar_function_arity(
+        &display.to_ascii_lowercase(),
+        display,
+        args.len(),
+        span,
+    )?;
+    if function == GraphFunction::Coalesce {
+        for arg in args {
+            let value = gql_mutation_return_expr_value(arg, params, context)?;
+            let graph_value = gql_value_to_graph_eval_scalar(value)?.ok_or_else(|| {
+                gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    format!("function '{display}' expects scalar, list, map, or null input"),
+                    arg.span.clone(),
+                )
+            })?;
+            if !graph_value.is_null() {
+                let checked = eval_graph_scalar_function_values(
+                    GraphFunction::Coalesce,
+                    std::slice::from_ref(&graph_value),
+                )?;
+                return graph_eval_to_gql_scalar(checked, &arg.span);
+            }
+        }
+        return Ok(GqlValue::Null);
+    }
+    let values = args
+        .iter()
+        .map(|arg| {
+            let value = gql_mutation_return_expr_value(arg, params, context)?;
+            gql_value_to_graph_eval_scalar(value)?.ok_or_else(|| {
+                gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    format!("function '{display}' expects scalar, list, map, or null input"),
+                    arg.span.clone(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    graph_eval_to_gql_scalar(eval_graph_scalar_function_values(function, &values)?, span)
+}
+
+fn gql_mutation_case_value(
+    operand: Option<&Expr>,
+    branches: &[crate::gql::ast::CaseBranch],
+    else_expr: Option<&Expr>,
+    params: &GqlParams,
+    context: &GqlMutationReturnEvalContext<'_>,
+    span: &SourceSpan,
+) -> Result<GqlValue, EngineError> {
+    if let Some(operand) = operand {
+        let operand_value = gql_mutation_return_expr_value(operand, params, context)?;
+        for branch in branches {
+            let when_value = gql_mutation_return_expr_value(&branch.when, params, context)?;
+            if let Some(value) = gql_mutation_try_eval_shared_binary(
+                BinaryOp::Eq,
+                &operand_value,
+                &when_value,
+                span,
+            )? {
+                match value {
+                    GqlValue::Bool(true) => {
+                        return gql_mutation_return_expr_value(&branch.then, params, context);
+                    }
+                    GqlValue::Bool(false) | GqlValue::Null => {}
+                    _ => unreachable!("equality returns bool or null"),
+                }
+            } else if matches!(
+                gql_mutation_compare_values(BinaryOp::Eq, operand_value.clone(), when_value),
+                GqlValue::Bool(true)
+            ) {
+                    return gql_mutation_return_expr_value(&branch.then, params, context);
+            }
+        }
+    } else {
+        for branch in branches {
+            if let Some(true) = gql_mutation_bool_or_null(&branch.when, params, context)? { return gql_mutation_return_expr_value(&branch.then, params, context) }
+        }
+    }
+    else_expr
+        .map(|expr| gql_mutation_return_expr_value(expr, params, context))
+        .unwrap_or(Ok(GqlValue::Null))
+}
+
+fn gql_binary_op_to_graph_op(op: BinaryOp) -> GraphBinaryOp {
+    match op {
+        BinaryOp::Or => GraphBinaryOp::Or,
+        BinaryOp::And => GraphBinaryOp::And,
+        BinaryOp::Add => GraphBinaryOp::Add,
+        BinaryOp::Sub => GraphBinaryOp::Sub,
+        BinaryOp::Mul => GraphBinaryOp::Mul,
+        BinaryOp::Div => GraphBinaryOp::Div,
+        BinaryOp::Eq => GraphBinaryOp::Eq,
+        BinaryOp::Neq => GraphBinaryOp::Neq,
+        BinaryOp::Lt => GraphBinaryOp::Lt,
+        BinaryOp::Le => GraphBinaryOp::Le,
+        BinaryOp::Gt => GraphBinaryOp::Gt,
+        BinaryOp::Ge => GraphBinaryOp::Ge,
+        BinaryOp::In => GraphBinaryOp::In,
+        BinaryOp::StartsWith => GraphBinaryOp::StartsWith,
+        BinaryOp::EndsWith => GraphBinaryOp::EndsWith,
+        BinaryOp::Contains => GraphBinaryOp::Contains,
+    }
+}
+
+fn gql_value_to_graph_eval_scalar(value: GqlValue) -> Result<Option<GraphEvalValue>, EngineError> {
+    gql_value_ref_to_graph_eval_scalar(&value)
+}
+
+fn gql_value_ref_to_graph_eval_scalar(value: &GqlValue) -> Result<Option<GraphEvalValue>, EngineError> {
+    Ok(match value {
+        GqlValue::Null => Some(GraphEvalValue::Null),
+        GqlValue::Bool(value) => Some(GraphEvalValue::Bool(*value)),
+        GqlValue::Int(value) => Some(GraphEvalValue::Int(*value)),
+        GqlValue::UInt(value) => Some(GraphEvalValue::UInt(*value)),
+        GqlValue::Float(value) => Some(GraphEvalValue::Float(*value)),
+        GqlValue::String(value) => Some(GraphEvalValue::String(value.clone())),
+        GqlValue::Bytes(value) => Some(GraphEvalValue::Bytes(value.clone())),
+        GqlValue::List(values) => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(value) = gql_value_ref_to_graph_eval_scalar(value)? else {
+                    return Ok(None);
+                };
+                out.push(value);
+            }
+            Some(GraphEvalValue::List(out))
+        }
+        GqlValue::Map(values) => {
+            let mut out = BTreeMap::new();
+            for (key, value) in values {
+                let Some(value) = gql_value_ref_to_graph_eval_scalar(value)? else {
+                    return Ok(None);
+                };
+                out.insert(key.clone(), value);
+            }
+            Some(GraphEvalValue::Map(out))
+        }
+        GqlValue::Node(_) | GqlValue::Edge(_) | GqlValue::Path(_) => None,
+    })
+}
+
+fn graph_eval_to_gql_scalar(
+    value: GraphEvalValue,
+    span: &SourceSpan,
+) -> Result<GqlValue, EngineError> {
+    Ok(match value {
+        GraphEvalValue::Null => GqlValue::Null,
+        GraphEvalValue::Bool(value) => GqlValue::Bool(value),
+        GraphEvalValue::Int(value) => GqlValue::Int(value),
+        GraphEvalValue::UInt(value) => GqlValue::UInt(value),
+        GraphEvalValue::Float(value) => GqlValue::Float(value),
+        GraphEvalValue::String(value) => GqlValue::String(value),
+        GraphEvalValue::Bytes(value) => GqlValue::Bytes(value),
+        GraphEvalValue::List(values) => GqlValue::List(
+            values
+                .into_iter()
+                .map(|value| graph_eval_to_gql_scalar(value, span))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        GraphEvalValue::Map(values) => GqlValue::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| Ok((key, graph_eval_to_gql_scalar(value, span)?)))
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()?,
+        ),
+        GraphEvalValue::Node(_) | GraphEvalValue::Edge(_) | GraphEvalValue::Path(_) => {
+            return Err(gql_semantic_error(
+                GqlSemanticErrorCode::InvalidReturnExpression,
+                "scalar expression produced a graph element value".to_string(),
+                span.clone(),
+            ));
+        }
+    })
 }
 
 fn gql_mutation_compare_values(op: BinaryOp, left: GqlValue, right: GqlValue) -> GqlValue {
@@ -4075,7 +7046,15 @@ fn gql_mutation_compare_values(op: BinaryOp, left: GqlValue, right: GqlValue) ->
             }
             _ => GqlValue::Null,
         },
-        BinaryOp::And | BinaryOp::Or => unreachable!(),
+        BinaryOp::And
+        | BinaryOp::Or
+        | BinaryOp::Add
+        | BinaryOp::Sub
+        | BinaryOp::Mul
+        | BinaryOp::Div
+        | BinaryOp::StartsWith
+        | BinaryOp::EndsWith
+        | BinaryOp::Contains => unreachable!(),
     }
 }
 
@@ -4091,7 +7070,7 @@ fn gql_mutation_alias_value(
             if context.commit.is_none() {
                 if let Some(&index) = context.row.created_nodes.get(alias) {
                     GqlValue::Node(gql_node_from_created_execution(
-                        &context.materialized.nodes[index],
+                        &context.nodes[index],
                         context.commit,
                         context.include_vectors,
                     ))
@@ -4114,7 +7093,7 @@ fn gql_mutation_alias_value(
             if context.commit.is_none() {
                 if let Some(&index) = context.row.created_edges.get(alias) {
                     GqlValue::Edge(gql_edge_from_created_execution(
-                        &context.materialized.edges[index],
+                        &context.edges[index],
                         context.commit,
                     ))
                 } else {
@@ -4143,6 +7122,7 @@ fn gql_mutation_alias_value(
             })
             .transpose()?
             .unwrap_or(GqlValue::Null),
+        GqlAliasKind::Scalar => row_scalar_value(alias, context)?,
     })
 }
 
@@ -4159,7 +7139,7 @@ fn gql_mutation_alias_property_value(
             if context.commit.is_none() {
                 if let Some(&index) = context.row.created_nodes.get(alias) {
                     let node = gql_node_from_created_execution(
-                        &context.materialized.nodes[index],
+                        &context.nodes[index],
                         context.commit,
                         context.include_vectors,
                     );
@@ -4183,7 +7163,7 @@ fn gql_mutation_alias_property_value(
             if context.commit.is_none() {
                 if let Some(&index) = context.row.created_edges.get(alias) {
                     let edge = gql_edge_from_created_execution(
-                        &context.materialized.edges[index],
+                        &context.edges[index],
                         context.commit,
                     );
                     Ok(gql_edge_property_from_value(edge, property))
@@ -4211,7 +7191,22 @@ fn gql_mutation_alias_property_value(
                 _ => GqlValue::Null,
             })
             .unwrap_or(GqlValue::Null)),
+        GqlAliasKind::Scalar => Ok(GqlValue::Null),
     }
+}
+
+fn row_scalar_value(
+    alias: &str,
+    context: &GqlMutationReturnEvalContext<'_>,
+) -> Result<GqlValue, EngineError> {
+    context
+        .row
+        .read_scalars
+        .get(alias)
+        .cloned()
+        .map(graph_value_to_gql_value)
+        .transpose()
+        .map(|value| value.unwrap_or(GqlValue::Null))
 }
 
 fn gql_mutation_function_value(
@@ -4236,7 +7231,7 @@ fn gql_mutation_function_value(
             .get(alias)
             .map(|&index| {
                 GqlValue::List(
-                    context.materialized.nodes[index]
+                    context.nodes[index]
                         .labels
                         .iter()
                         .cloned()
@@ -4256,7 +7251,7 @@ fn gql_mutation_function_value(
             .row
             .created_edges
             .get(alias)
-            .map(|&index| GqlValue::String(context.materialized.edges[index].label.clone()))
+            .map(|&index| GqlValue::String(context.edges[index].label.clone()))
             .map(Ok)
             .unwrap_or_else(|| {
                 context
@@ -4333,11 +7328,11 @@ fn gql_mutation_function_value(
 
 impl<'a> GqlMutationReturnEvalContext<'a> {
     fn node_id(&self, alias: &str) -> Option<u64> {
-        gql_mutation_node_id_for_alias(alias, self.row, self.materialized, self.commit)
+        gql_mutation_node_id_for_alias(alias, self.row, self.nodes, self.commit)
     }
 
     fn edge_id(&self, alias: &str) -> Option<u64> {
-        gql_mutation_edge_id_for_alias(alias, self.row, self.materialized, self.commit)
+        gql_mutation_edge_id_for_alias(alias, self.row, self.edges, self.commit)
     }
 
     fn path(&self, alias: &str) -> Option<&GqlPathIdentity> {
@@ -4404,17 +7399,17 @@ impl<'a> GqlMutationReturnEvalContext<'a> {
 
     fn gql_node(&self, id: u64) -> Result<GqlNode, EngineError> {
         if self.commit.is_none() {
-            if let Some(node) = self.materialized.existing_nodes.get(&id) {
+            if let Some(node) = self.existing_nodes.get(&id) {
                 return Ok(gql_node_from_existing_execution(id, node, self.include_vectors));
             }
         }
         if let Some(node) = self.hydrated.nodes.get(&id) {
             return Ok(gql_node_from_record(&node.record, &node.labels, self.include_vectors));
         }
-        if let Some(node) = self.materialized.existing_nodes.get(&id) {
+        if let Some(node) = self.existing_nodes.get(&id) {
             return Ok(gql_node_from_existing_execution(id, node, self.include_vectors));
         }
-        if let Some(node) = self.materialized.nodes.iter().find(|node| {
+        if let Some(node) = self.nodes.iter().find(|node| {
             self.commit
                 .and_then(|commit| commit.local_node_ids.get(&node.local).copied())
                 .is_some_and(|committed_id| committed_id == id)
@@ -4433,17 +7428,17 @@ impl<'a> GqlMutationReturnEvalContext<'a> {
 
     fn gql_edge(&self, id: u64) -> Result<GqlEdge, EngineError> {
         if self.commit.is_none() {
-            if let Some(edge) = self.materialized.existing_edges.get(&id) {
+            if let Some(edge) = self.existing_edges.get(&id) {
                 return Ok(gql_edge_from_existing_execution(id, edge));
             }
         }
         if let Some(edge) = self.hydrated.edges.get(&id) {
             return Ok(gql_edge_from_record(&edge.record, &edge.label));
         }
-        if let Some(edge) = self.materialized.existing_edges.get(&id) {
+        if let Some(edge) = self.existing_edges.get(&id) {
             return Ok(gql_edge_from_existing_execution(id, edge));
         }
-        if let Some(edge) = self.materialized.edges.iter().find(|edge| {
+        if let Some(edge) = self.edges.iter().find(|edge| {
             edge.local
                 .as_ref()
                 .and_then(|local| {
@@ -4506,11 +7501,11 @@ fn gql_edge_property_from_value(edge: GqlEdge, property: &str) -> GqlValue {
 fn gql_mutation_node_id_for_alias(
     alias: &str,
     row: &GqlCreateExecutionRow,
-    materialized: &GqlCreateMaterialization,
+    nodes: &[GqlCreatedNodeExecution],
     commit: Option<&TxnCommitResult>,
 ) -> Option<u64> {
     if let Some(&node_index) = row.created_nodes.get(alias) {
-        let node = &materialized.nodes[node_index];
+        let node = &nodes[node_index];
         return commit.and_then(|commit| commit.local_node_ids.get(&node.local).copied());
     }
     row.read_nodes.get(alias).copied().flatten()
@@ -4519,11 +7514,11 @@ fn gql_mutation_node_id_for_alias(
 fn gql_mutation_edge_id_for_alias(
     alias: &str,
     row: &GqlCreateExecutionRow,
-    materialized: &GqlCreateMaterialization,
+    edges: &[GqlCreatedEdgeExecution],
     commit: Option<&TxnCommitResult>,
 ) -> Option<u64> {
     if let Some(&edge_index) = row.created_edges.get(alias) {
-        let edge = &materialized.edges[edge_index];
+        let edge = &edges[edge_index];
         return edge
             .local
             .as_ref()
@@ -4817,13 +7812,11 @@ fn gql_create_node_ref_for_alias(
     )))
 }
 
-fn gql_create_endpoint_key(target: &TxnNodeRef) -> GqlCreateEndpointKey {
+fn gql_create_endpoint_key(target: &TxnNodeRef) -> TxnMergeEndpointKey {
     match target {
-        TxnNodeRef::Id(id) => GqlCreateEndpointKey::Id(*id),
-        TxnNodeRef::Local(local) => GqlCreateEndpointKey::Local(local.clone()),
-        TxnNodeRef::Key { label, key } => {
-            GqlCreateEndpointKey::Local(TxnLocalRef::Alias(format!("{label}:{key}")))
-        }
+        TxnNodeRef::Id(id) => TxnMergeEndpointKey::Id(*id),
+        TxnNodeRef::Local(local) => TxnMergeEndpointKey::Local(local.clone()),
+        TxnNodeRef::Key { label, key } => TxnMergeEndpointKey::Key(label.clone(), key.clone()),
     }
 }
 
@@ -5204,7 +8197,15 @@ fn wrap_read_gql_explain(
 
 fn validate_gql_mutation_plan_for_execution(plan: &GqlMutationPlan) -> Result<(), EngineError> {
     if let Some(read_prefix) = plan.read_prefix.as_ref() {
-        normalize_gql_graph_row_target(&read_prefix.lowered)?;
+        match &read_prefix.lowered.native_target {
+            GqlNativeTarget::GraphRows { .. } => {
+                normalize_gql_graph_row_target(&read_prefix.lowered)?;
+            }
+            GqlNativeTarget::GraphPipeline { query } => {
+                normalize_graph_pipeline_query(query)
+                    .map_err(|err| graph_pipeline_execution_error_to_gql(err, &read_prefix.lowered))?;
+            }
+        }
     }
     Ok(())
 }
@@ -5242,13 +8243,20 @@ fn build_gql_mutation_explain_with_snapshot(
                 .filter_map(|column| match column {
                     GqlMutationInternalColumn::TargetId { alias, .. }
                     | GqlMutationInternalColumn::TargetPath { alias } => Some(alias.clone()),
-                    GqlMutationInternalColumn::ExprValue { .. } => None,
+                    GqlMutationInternalColumn::ScalarValue { .. }
+                    | GqlMutationInternalColumn::ExprValue { .. } => None,
                 })
                 .collect(),
             expression_columns: read_prefix
                 .internal_columns
                 .iter()
-                .filter(|column| matches!(column, GqlMutationInternalColumn::ExprValue { .. }))
+                .filter(|column| {
+                    matches!(
+                        column,
+                        GqlMutationInternalColumn::ScalarValue { .. }
+                            | GqlMutationInternalColumn::ExprValue { .. }
+                    )
+                })
                 .count(),
         })
     } else {
@@ -5265,7 +8273,7 @@ fn build_gql_mutation_explain_with_snapshot(
     warnings.dedup();
     let notes = vec![
         "Mutation explain is side-effect-free and does not open write transactions, allocate label tokens, append WAL records, mutate memtables, or enqueue index followups".to_string(),
-        "CREATE, SET, REMOVE, DELETE, and DETACH DELETE execution are supported through one WriteTxn; SET/REMOVE use crate-private by-ID record replacement adapters and DETACH DELETE reuses transaction cascade planning".to_string(),
+        "CREATE, MERGE, SET, REMOVE, DELETE, and DETACH DELETE execution are supported through one WriteTxn; MERGE uses batch transaction snapshot lookups plus statement-local overlays, SET/REMOVE use crate-private by-ID record replacement adapters, and DETACH DELETE reuses transaction cascade planning".to_string(),
         "Mutation RETURN supports row operations, compact-row-compatible Rust rows, include-vectors projection, post-commit batch hydration, and crate-private returned-alias read-set validation for CREATE/SET/REMOVE; DELETE/DETACH RETURN remains rejected".to_string(),
     ];
     let return_explain = plan
@@ -5308,7 +8316,7 @@ fn build_gql_mutation_explain_with_snapshot(
             return_plan: return_explain,
             would_create_node_labels: mutation_create_node_labels(plan),
             would_create_edge_labels: mutation_create_edge_labels(plan),
-            uses_transaction_snapshot: plan.read_prefix.is_some(),
+            uses_transaction_snapshot: gql_mutation_uses_transaction_snapshot(plan),
             uses_write_txn: true,
             replacement_adapters: mutation_uses_replacement_adapters(plan),
             atomic_commit: true,
@@ -5326,6 +8334,13 @@ fn gql_execution_cap_summary(options: &GqlExecutionOptions) -> GqlExecutionCapSu
         max_cursor_bytes: options.max_cursor_bytes,
         max_mutation_rows: options.max_mutation_rows,
         max_mutation_ops: options.max_mutation_ops,
+        max_pipeline_rows: options.max_pipeline_rows,
+        max_groups: options.max_groups,
+        max_collect_items: options.max_collect_items,
+        max_union_branches: options.max_union_branches,
+        max_subquery_invocations: options.max_subquery_invocations,
+        max_subquery_depth: options.max_subquery_depth,
+        max_shortest_path_pairs: options.max_shortest_path_pairs,
         max_query_bytes: options.max_query_bytes,
         max_param_bytes: options.max_param_bytes,
         max_ast_depth: options.max_ast_depth,
@@ -5337,6 +8352,14 @@ fn gql_execution_cap_summary(options: &GqlExecutionOptions) -> GqlExecutionCapSu
         max_order_materialization: options.max_order_materialization,
         max_skip: options.max_skip,
     }
+}
+
+fn gql_mutation_uses_transaction_snapshot(plan: &GqlMutationPlan) -> bool {
+    plan.read_prefix.is_some()
+        || plan
+            .clauses
+            .iter()
+            .any(|clause| matches!(clause, GqlMutationClausePlan::Merge(_)))
 }
 
 fn mutation_operation_explains(plan: &GqlMutationPlan) -> Vec<GqlMutationOperationExplain> {
@@ -5352,6 +8375,7 @@ fn mutation_operation_explains(plan: &GqlMutationPlan) -> Vec<GqlMutationOperati
                     node_ops.chain(edge_ops).collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>(),
+            GqlMutationClausePlan::Merge(merge) => vec![merge_operation_explain(merge)],
             GqlMutationClausePlan::Set(items) => items.iter().map(set_operation_explain).collect(),
             GqlMutationClausePlan::Remove(items) => {
                 items.iter().map(remove_operation_explain).collect()
@@ -5362,6 +8386,37 @@ fn mutation_operation_explains(plan: &GqlMutationPlan) -> Vec<GqlMutationOperati
                 .collect(),
         })
         .collect()
+}
+
+fn merge_operation_explain(merge: &GqlMergePlan) -> GqlMutationOperationExplain {
+    match &merge.pattern {
+        GqlMergePatternPlan::Node { alias, label, key } => GqlMutationOperationExplain {
+            op: "MERGE NODE".to_string(),
+            target_alias: Some(alias.clone()),
+            row_multiplicity: "per mutation input row with statement-local key overlay".to_string(),
+            detail: format!(
+                "label={label:?}; key expr #{}; ON CREATE items={}; ON MATCH items={}; staged through WriteTxn during execution",
+                key.id,
+                merge.on_create.len(),
+                merge.on_match.len()
+            ),
+        },
+        GqlMergePatternPlan::Relationship {
+            alias,
+            from_alias,
+            to_alias,
+            label,
+        } => GqlMutationOperationExplain {
+            op: "MERGE EDGE".to_string(),
+            target_alias: Some(alias.clone()),
+            row_multiplicity: "per mutation input row with statement-local triple overlay".to_string(),
+            detail: format!(
+                "{from_alias} -[:{label}]-> {to_alias}; requires edge_uniqueness=true; ON CREATE items={}; ON MATCH items={}; staged through WriteTxn during execution",
+                merge.on_create.len(),
+                merge.on_match.len()
+            ),
+        },
+    }
 }
 
 fn create_node_operation_explain(node: &GqlCreateNodePlan) -> GqlMutationOperationExplain {
@@ -5469,14 +8524,24 @@ fn delete_operation_explain(
 fn mutation_create_node_labels(plan: &GqlMutationPlan) -> Vec<String> {
     let mut labels = BTreeSet::new();
     for clause in &plan.clauses {
-        if let GqlMutationClausePlan::Create(patterns) = clause {
-            for pattern in patterns {
-                for node in &pattern.nodes {
-                    if node.created {
-                        labels.extend(node.labels.iter().cloned());
+        match clause {
+            GqlMutationClausePlan::Create(patterns) => {
+                for pattern in patterns {
+                    for node in &pattern.nodes {
+                        if node.created {
+                            labels.extend(node.labels.iter().cloned());
+                        }
                     }
                 }
             }
+            GqlMutationClausePlan::Merge(merge) => {
+                if let GqlMergePatternPlan::Node { label, .. } = &merge.pattern {
+                    labels.insert(label.clone());
+                }
+            }
+            GqlMutationClausePlan::Set(_)
+            | GqlMutationClausePlan::Remove(_)
+            | GqlMutationClausePlan::Delete { .. } => {}
         }
     }
     labels.into_iter().collect()
@@ -5485,10 +8550,20 @@ fn mutation_create_node_labels(plan: &GqlMutationPlan) -> Vec<String> {
 fn mutation_create_edge_labels(plan: &GqlMutationPlan) -> Vec<String> {
     let mut labels = BTreeSet::new();
     for clause in &plan.clauses {
-        if let GqlMutationClausePlan::Create(patterns) = clause {
-            for pattern in patterns {
-                labels.extend(pattern.edges.iter().map(|edge| edge.label.clone()));
+        match clause {
+            GqlMutationClausePlan::Create(patterns) => {
+                for pattern in patterns {
+                    labels.extend(pattern.edges.iter().map(|edge| edge.label.clone()));
+                }
             }
+            GqlMutationClausePlan::Merge(merge) => {
+                if let GqlMergePatternPlan::Relationship { label, .. } = &merge.pattern {
+                    labels.insert(label.clone());
+                }
+            }
+            GqlMutationClausePlan::Set(_)
+            | GqlMutationClausePlan::Remove(_)
+            | GqlMutationClausePlan::Delete { .. } => {}
         }
     }
     labels.into_iter().collect()
@@ -5497,7 +8572,14 @@ fn mutation_create_edge_labels(plan: &GqlMutationPlan) -> Vec<String> {
 fn mutation_uses_replacement_adapters(plan: &GqlMutationPlan) -> bool {
     plan.clauses
         .iter()
-        .any(|clause| matches!(clause, GqlMutationClausePlan::Set(_) | GqlMutationClausePlan::Remove(_)))
+        .any(|clause| {
+            matches!(
+                clause,
+                GqlMutationClausePlan::Set(_)
+                    | GqlMutationClausePlan::Remove(_)
+                    | GqlMutationClausePlan::Merge(_)
+            )
+        })
 }
 
 fn mutation_internal_column_summary(column: &GqlMutationInternalColumn) -> String {
@@ -5507,6 +8589,9 @@ fn mutation_internal_column_summary(column: &GqlMutationInternalColumn) -> Strin
         }
         GqlMutationInternalColumn::TargetPath { alias } => {
             format!("target path identity: {alias}")
+        }
+        GqlMutationInternalColumn::ScalarValue { alias, expr } => {
+            format!("scalar value: {alias} = {expr:?}")
         }
         GqlMutationInternalColumn::ExprValue { id, expr } => {
             format!("expr value #{id}: {expr:?}")
@@ -6808,7 +9893,11 @@ fn configure_gql_graph_row_target(
     row_counts: &GqlRowCounts,
     options: &GqlExecutionOptions,
 ) -> Result<(), EngineError> {
-    let GqlNativeTarget::GraphRows { query } = &mut lowered.native_target;
+    let GqlNativeTarget::GraphRows { query } = &mut lowered.native_target else {
+        return Err(EngineError::InvalidOperation(
+            "GQL graph-row target configuration received a non-graph-row target".to_string(),
+        ));
+    };
     query.query.order_by = order_by
         .iter()
         .map(|item| {
@@ -6876,10 +9965,36 @@ fn execute_gql_graph_row_target(
         .map_err(|err| graph_row_execution_error_to_gql(err, lowered))
 }
 
+fn execute_gql_graph_pipeline_target_on_view(
+    view: &ReadView,
+    lowered: &GqlLoweredPlan,
+) -> Result<QueryExecutionOutcome<GraphPipelineResult>, EngineError> {
+    let GqlNativeTarget::GraphPipeline { query } = &lowered.native_target else {
+        return Err(EngineError::InvalidOperation(
+            "GQL graph-pipeline normalization received a non-graph-pipeline target".to_string(),
+        ));
+    };
+    let normalized = normalize_graph_pipeline_query(query)
+        .map_err(|err| graph_pipeline_execution_error_to_gql(err, lowered))?;
+    let cursor_state = graph_pipeline_cursor_state_from_decoded(
+        None,
+        &query.page,
+        query.at_epoch,
+        query.options.max_skip,
+    )
+    .map_err(|err| graph_pipeline_execution_error_to_gql(err, lowered))?;
+    view.query_graph_pipeline_normalized(&normalized, cursor_state)
+        .map_err(|err| graph_pipeline_execution_error_to_gql(err, lowered))
+}
+
 fn normalize_gql_graph_row_target(
     lowered: &GqlLoweredPlan,
 ) -> Result<NormalizedGraphRowQuery, EngineError> {
-    let GqlNativeTarget::GraphRows { query } = &lowered.native_target;
+    let GqlNativeTarget::GraphRows { query } = &lowered.native_target else {
+        return Err(EngineError::InvalidOperation(
+            "GQL graph-row normalization received a non-graph-row target".to_string(),
+        ));
+    };
     let fallback_span = lowered
         .semantic
         .query
@@ -7053,9 +10168,29 @@ fn gql_expr_depends_on_alias(expr: &Expr, plan: &GqlSemanticPlan) -> bool {
         ExprKind::Binary { left, right, .. } => {
             gql_expr_depends_on_alias(left, plan) || gql_expr_depends_on_alias(right, plan)
         }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|operand| gql_expr_depends_on_alias(operand, plan))
+                || branches.iter().any(|branch| {
+                    gql_expr_depends_on_alias(&branch.when, plan)
+                        || gql_expr_depends_on_alias(&branch.then, plan)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|else_expr| gql_expr_depends_on_alias(else_expr, plan))
+        }
         ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => {
             args.iter().any(|arg| gql_expr_depends_on_alias(arg, plan))
         }
+        ExprKind::AggregateCall { arg, .. } => arg
+            .as_ref()
+            .is_some_and(|arg| gql_expr_depends_on_alias(arg, plan)),
+        ExprKind::ExistsSubquery(_) => true,
         ExprKind::Map(map) => map
             .entries
             .iter()
@@ -7147,6 +10282,47 @@ fn resolve_return_aliases_in_expr(
                 .map(|arg| resolve_return_aliases_in_expr(arg, return_aliases, plan))
                 .collect::<Result<Vec<_>, _>>()?,
         },
+        ExprKind::AggregateCall {
+            function,
+            distinct,
+            arg,
+            name_span,
+        } => ExprKind::AggregateCall {
+            function: *function,
+            distinct: *distinct,
+            arg: arg
+                .as_ref()
+                .map(|arg| resolve_return_aliases_in_expr(arg, return_aliases, plan).map(Box::new))
+                .transpose()?,
+            name_span: name_span.clone(),
+        },
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => ExprKind::Case {
+            operand: operand
+                .as_ref()
+                .map(|operand| {
+                    resolve_return_aliases_in_expr(operand, return_aliases, plan).map(Box::new)
+                })
+                .transpose()?,
+            branches: branches
+                .iter()
+                .map(|branch| {
+                    Ok(crate::gql::ast::CaseBranch {
+                        when: resolve_return_aliases_in_expr(&branch.when, return_aliases, plan)?,
+                        then: resolve_return_aliases_in_expr(&branch.then, return_aliases, plan)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?,
+            else_expr: else_expr
+                .as_ref()
+                .map(|else_expr| {
+                    resolve_return_aliases_in_expr(else_expr, return_aliases, plan).map(Box::new)
+                })
+                .transpose()?,
+        },
         ExprKind::List(items) => ExprKind::List(
             items
                 .iter()
@@ -7164,6 +10340,7 @@ fn resolve_return_aliases_in_expr(
             }
             ExprKind::Map(resolved)
         }
+        ExprKind::ExistsSubquery(_) => return Ok(expr.clone()),
         ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::Variable(_) => {
             return Ok(expr.clone())
         }
@@ -7288,6 +10465,164 @@ fn gql_order_key_error(span: &SourceSpan) -> EngineError {
     }
 }
 
+fn gql_distinct_key_error(message: &str, span: &SourceSpan) -> EngineError {
+    EngineError::GqlSemantic {
+        code: GqlSemanticErrorCode::InvalidReturnExpression,
+        message: message.to_string(),
+        span: span.clone(),
+    }
+}
+
+fn graph_pipeline_execution_error_to_gql(
+    err: EngineError,
+    lowered: &GqlLoweredPlan,
+) -> EngineError {
+    match err {
+        EngineError::InvalidOperation(message) if graph_row_full_scan_error_message(&message) => {
+            gql_semantic_error(
+                GqlSemanticErrorCode::FullScanNotAllowed,
+                message,
+                lowered.semantic.query.pipeline.span.clone(),
+            )
+        }
+        EngineError::InvalidOperation(message)
+            if message.contains("ORDER BY")
+                || message.contains("order contexts")
+                || message.contains("orderable") =>
+        {
+            gql_order_key_error(&lowered.semantic.query.return_clause.span)
+        }
+        other => other,
+    }
+}
+
+fn build_gql_pipeline_execution_explain(
+    lowered: &GqlLoweredPlan,
+    pipeline: &GraphPipelineExplain,
+    options: &GqlExecutionOptions,
+) -> GqlExecutionExplain {
+    let read = build_gql_pipeline_read_explain(lowered, pipeline, options);
+    let mut notes = lowered.notes.clone();
+    notes.extend(pipeline.notes.iter().cloned());
+    for stage in &pipeline.stages {
+        notes.extend(stage.notes.iter().cloned());
+    }
+    notes.sort();
+    notes.dedup();
+
+    GqlExecutionExplain {
+        kind: GqlStatementKind::Query,
+        columns: read.columns.clone(),
+        warnings: read.warnings.clone(),
+        read: Some(read),
+        mutation: None,
+        caps: gql_execution_cap_summary(options),
+        notes,
+    }
+}
+
+fn build_gql_pipeline_read_explain(
+    lowered: &GqlLoweredPlan,
+    pipeline: &GraphPipelineExplain,
+    options: &GqlExecutionOptions,
+) -> GqlExplain {
+    let mut warnings = lowered.warnings.clone();
+    warnings.extend(pipeline.warnings.iter().cloned());
+    warnings.sort();
+    warnings.dedup();
+
+    let mut projection = Vec::new();
+    for stage in &pipeline.stages {
+        projection.push(format!(
+            "graph pipeline stage {}: {}: {}",
+            stage.index, stage.kind, stage.detail
+        ));
+        projection.extend(
+            stage
+                .notes
+                .iter()
+                .map(|note| format!("graph pipeline stage note: {note}")),
+        );
+        if let Some(graph_row) = stage.graph_row.as_ref() {
+            projection.extend(graph_row.plan.iter().map(|node| {
+                format!(
+                    "nested graph row plan: stage {}: {}: {}",
+                    stage.index, node.kind, node.detail
+                )
+            }));
+            projection.extend(graph_row.row_ops.iter().map(|op| {
+                format!(
+                    "nested graph row row op: stage {}: {}: {}",
+                    stage.index, op.kind, op.detail
+                )
+            }));
+        }
+    }
+    projection.extend(
+        pipeline
+            .row_ops
+            .iter()
+            .map(|op| format!("graph pipeline row op: {}: {}", op.kind, op.detail)),
+    );
+    projection.push(format!(
+        "graph pipeline cursor: supplied={}, codec_implemented={}, message={}",
+        pipeline.cursor.supplied,
+        pipeline.cursor.codec_implemented,
+        pipeline.cursor.message.as_deref().unwrap_or("none")
+    ));
+
+    GqlExplain {
+        columns: pipeline.columns.clone(),
+        target: GqlLoweringTarget::GraphPipelineQuery,
+        native_plan: None,
+        pushed_down: lowered
+            .pushed_down
+            .iter()
+            .map(|predicate| predicate.summary.clone())
+            .collect(),
+        residual: lowered
+            .residual_predicates
+            .iter()
+            .map(|expr| format!("residual filter: {}", gql_expr_summary(expr)))
+            .collect(),
+        projection,
+        row_ops: gql_pipeline_row_ops(pipeline),
+        caps: GqlCapSummary {
+            allow_full_scan: options.allow_full_scan,
+            max_rows: options.max_rows,
+            max_intermediate_bindings: options.max_intermediate_bindings,
+            max_skip: options.max_skip,
+            max_query_bytes: options.max_query_bytes,
+            max_param_bytes: options.max_param_bytes,
+            max_ast_depth: options.max_ast_depth,
+            max_literal_items: options.max_literal_items,
+        },
+        warnings,
+    }
+}
+
+fn gql_pipeline_row_ops(pipeline: &GraphPipelineExplain) -> Vec<GqlRowOperation> {
+    let mut ops = Vec::new();
+    if pipeline
+        .row_ops
+        .iter()
+        .any(|op| op.kind.contains("Filter"))
+    {
+        ops.push(GqlRowOperation::ResidualFilter);
+    }
+    if pipeline.row_ops.iter().any(|op| op.kind == "Sort") {
+        ops.push(GqlRowOperation::Sort);
+    }
+    if pipeline.row_ops.iter().any(|op| op.kind == "Skip") {
+        ops.push(GqlRowOperation::Skip);
+    }
+    if pipeline.row_ops.iter().any(|op| op.kind == "Limit") {
+        ops.push(GqlRowOperation::Limit);
+    }
+    ops.push(GqlRowOperation::Projection);
+    ops
+}
+
 fn build_gql_explain(
     view: &ReadView,
     lowered: &GqlLoweredPlan,
@@ -7295,6 +10630,38 @@ fn build_gql_explain(
     order_by: &[GqlResolvedOrderItem],
     options: &GqlExecutionOptions,
 ) -> Result<GqlExplain, EngineError> {
+    if let GqlNativeTarget::GraphPipeline { query } = &lowered.native_target {
+        let mut normalized = normalize_graph_pipeline_query(query)
+            .map_err(|err| graph_pipeline_execution_error_to_gql(err, lowered))?;
+        normalized.options.include_plan = true;
+        let cursor_state = graph_pipeline_cursor_state_from_decoded(
+            None,
+            &query.page,
+            query.at_epoch,
+            query.options.max_skip,
+        )
+        .map_err(|err| graph_pipeline_execution_error_to_gql(err, lowered))?;
+        let pipeline_explain = if normalized.options.profile {
+            view.query_graph_pipeline_normalized(&normalized, cursor_state)
+                .map_err(|err| graph_pipeline_execution_error_to_gql(err, lowered))?
+                .value
+                .plan
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(
+                        "graph pipeline explain did not produce a plan".to_string(),
+                    )
+                })?
+        } else {
+            view.explain_graph_pipeline_normalized(&normalized, cursor_state)
+                .map_err(|err| graph_pipeline_execution_error_to_gql(err, lowered))?
+        };
+        return Ok(build_gql_pipeline_read_explain(
+            lowered,
+            &pipeline_explain,
+            options,
+        ));
+    }
+
     let mut warnings = lowered.warnings.clone();
     let normalized = normalize_gql_graph_row_target(lowered)?;
     let cursor_state = graph_row_prepare_cursor_state(
@@ -7440,6 +10807,7 @@ fn gql_limit_zero_projection_summaries(
 fn gql_explain_target(kind: GqlNativeTargetKind) -> GqlLoweringTarget {
     match kind {
         GqlNativeTargetKind::GraphRows => GqlLoweringTarget::GraphRowQuery,
+        GqlNativeTargetKind::GraphPipeline => GqlLoweringTarget::GraphPipelineQuery,
     }
 }
 
@@ -7667,7 +11035,13 @@ fn gql_append_graph_expr_output_summaries(summaries: &mut Vec<String>, expr: &Gr
                     GraphFunction::Relationships => {
                         summaries.push(format!("output selected field: {alias}.relationships"))
                     }
+                    _ => {}
                 }
+            }
+        }
+        GraphExpr::AggregateCall { arg, .. } => {
+            if let Some(arg) = arg.as_ref() {
+                gql_append_graph_expr_output_summaries(summaries, arg);
             }
         }
         GraphExpr::List(items) => {
@@ -7687,6 +11061,22 @@ fn gql_append_graph_expr_output_summaries(summaries: &mut Vec<String>, expr: &Gr
             gql_append_graph_expr_output_summaries(summaries, left);
             gql_append_graph_expr_output_summaries(summaries, right);
         }
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                gql_append_graph_expr_output_summaries(summaries, operand);
+            }
+            for branch in branches {
+                gql_append_graph_expr_output_summaries(summaries, &branch.when);
+                gql_append_graph_expr_output_summaries(summaries, &branch.then);
+            }
+            if let Some(else_expr) = else_expr {
+                gql_append_graph_expr_output_summaries(summaries, else_expr);
+            }
+        }
         GraphExpr::Null
         | GraphExpr::Bool(_)
         | GraphExpr::Int(_)
@@ -7696,6 +11086,7 @@ fn gql_append_graph_expr_output_summaries(summaries: &mut Vec<String>, expr: &Gr
         | GraphExpr::Bytes(_)
         | GraphExpr::Param(_)
         | GraphExpr::Binding(_)
+        | GraphExpr::ExistsSubquery(_)
         | GraphExpr::Property { .. } => {}
     }
 }
@@ -7861,10 +11252,10 @@ fn gql_expr_summary(expr: &Expr) -> String {
         ExprKind::PropertyAccess { object, property } => {
             format!("{}.{}", gql_expr_summary(object), property.name)
         }
-        ExprKind::Unary {
-            op: UnaryOp::Not,
-            expr,
-        } => format!("NOT {}", gql_expr_summary(expr)),
+        ExprKind::Unary { op, expr } => match op {
+            UnaryOp::Not => format!("NOT {}", gql_expr_summary(expr)),
+            UnaryOp::Neg => format!("-{}", gql_expr_summary(expr)),
+        },
         ExprKind::Binary { op, left, right } => format!(
             "{} {} {}",
             gql_expr_summary(left),
@@ -7886,8 +11277,51 @@ fn gql_expr_summary(expr: &Expr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        ExprKind::AggregateCall {
+            function,
+            distinct,
+            arg,
+            ..
+        } => {
+            let function = match function {
+                crate::gql::ast::AggregateFunction::Count => "count",
+                crate::gql::ast::AggregateFunction::Sum => "sum",
+                crate::gql::ast::AggregateFunction::Avg => "avg",
+                crate::gql::ast::AggregateFunction::Min => "min",
+                crate::gql::ast::AggregateFunction::Max => "max",
+                crate::gql::ast::AggregateFunction::Collect => "collect",
+            };
+            let arg = match arg {
+                Some(arg) if *distinct => format!("DISTINCT {}", gql_expr_summary(arg)),
+                Some(arg) => gql_expr_summary(arg),
+                None => "*".to_string(),
+            };
+            format!("{function}({arg})")
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            let mut parts = Vec::new();
+            if let Some(operand) = operand {
+                parts.push(gql_expr_summary(operand));
+            }
+            for branch in branches {
+                parts.push(format!(
+                    "WHEN {} THEN {}",
+                    gql_expr_summary(&branch.when),
+                    gql_expr_summary(&branch.then)
+                ));
+            }
+            if let Some(else_expr) = else_expr {
+                parts.push(format!("ELSE {}", gql_expr_summary(else_expr)));
+            }
+            format!("CASE {} END", parts.join(" "))
+        }
         ExprKind::List(_) => "list".to_string(),
         ExprKind::Map(_) => "map".to_string(),
+        ExprKind::ExistsSubquery(_) => "EXISTS subquery".to_string(),
     }
 }
 
@@ -7905,6 +11339,10 @@ fn gql_binary_op_summary(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Or => "OR",
         BinaryOp::And => "AND",
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
         BinaryOp::Eq => "=",
         BinaryOp::Neq => "<>",
         BinaryOp::Lt => "<",
@@ -7912,5 +11350,8 @@ fn gql_binary_op_summary(op: BinaryOp) -> &'static str {
         BinaryOp::Gt => ">",
         BinaryOp::Ge => ">=",
         BinaryOp::In => "IN",
+        BinaryOp::StartsWith => "STARTS WITH",
+        BinaryOp::EndsWith => "ENDS WITH",
+        BinaryOp::Contains => "CONTAINS",
     }
 }

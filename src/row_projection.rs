@@ -913,7 +913,7 @@ impl NodeSelectedFieldNeeds {
         Ok(())
     }
 
-    fn merge_from(
+    pub(crate) fn merge_from(
         &mut self,
         other: &Self,
         need_class: ProjectionNeedClass,
@@ -940,7 +940,7 @@ impl EdgeSelectedFieldNeeds {
         Ok(())
     }
 
-    fn merge_from(
+    pub(crate) fn merge_from(
         &mut self,
         other: &Self,
         need_class: ProjectionNeedClass,
@@ -980,7 +980,7 @@ impl PathSelectedFieldNeeds {
         Ok(())
     }
 
-    fn merge_from(
+    pub(crate) fn merge_from(
         &mut self,
         other: &Self,
         need_class: ProjectionNeedClass,

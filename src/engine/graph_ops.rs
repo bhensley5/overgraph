@@ -5771,7 +5771,7 @@ impl ReadView {
         // Extract the top-k indices from the heap
         let mut top_indices: Vec<(u64, usize)> = heap.into_iter().map(|Reverse(x)| x).collect();
         // Sort descending by score
-        top_indices.sort_by(|a, b| b.0.cmp(&a.0));
+        top_indices.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         let results: Vec<NeighborRecord> = top_indices
             .into_iter()

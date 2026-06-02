@@ -1293,205 +1293,6 @@ fn build_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
     (dir, engine, company_ids[0])
 }
 
-fn build_high_fanout_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
-    let (dir, engine) = temp_db();
-    let source = engine
-        .batch_upsert_nodes(vec![NodeInput {
-            labels: vec![bench_node_label(1)],
-            key: "fanout-source".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        }])
-        .unwrap()[0];
-    let targets: Vec<NodeInput> = (0..5_000)
-        .map(|i| NodeInput {
-            labels: vec![bench_node_label(2)],
-            key: format!("fanout-target-{i}"),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        })
-        .collect();
-    let target_ids = engine.batch_upsert_nodes(targets.clone()).unwrap();
-    let edges: Vec<EdgeInput> = target_ids
-        .iter()
-        .map(|&target| EdgeInput {
-            from: source,
-            to: target,
-            label: "BenchEdge10".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            valid_from: None,
-            valid_to: None,
-        })
-        .collect();
-    engine.batch_upsert_edges(edges.clone()).unwrap();
-    engine.flush().unwrap();
-    (dir, engine, source)
-}
-
-fn build_fanout_anchor_choice_engine() -> (tempfile::TempDir, DatabaseEngine) {
-    let (dir, engine) = temp_db();
-    let hub = engine
-        .batch_upsert_nodes(vec![NodeInput {
-            labels: vec![bench_node_label(1)],
-            key: "small-hub".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        }])
-        .unwrap()[0];
-    let mid_inputs: Vec<_> = (0..500)
-        .map(|index| NodeInput {
-            labels: vec![bench_node_label(3)],
-            key: format!("mid-{index:03}"),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        })
-        .collect();
-    let mids = engine.batch_upsert_nodes(mid_inputs.clone()).unwrap();
-    const OPTIONAL_ANCHOR_COUNT: usize = 34;
-    let anchor_inputs: Vec<_> = (0..OPTIONAL_ANCHOR_COUNT)
-        .map(|index| NodeInput {
-            labels: vec![bench_node_label(2)],
-            key: format!("anchor-{index:02}"),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        })
-        .collect();
-    let anchors = engine.batch_upsert_nodes(anchor_inputs.clone()).unwrap();
-    let mut edges = Vec::new();
-    for &mid in &mids {
-        edges.push(EdgeInput {
-            from: hub,
-            to: mid,
-            label: "BenchEdge10".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            valid_from: None,
-            valid_to: None,
-        });
-    }
-    for (mid, anchor) in mids.iter().take(anchors.len()).zip(anchors.iter()) {
-        edges.push(EdgeInput {
-            from: *mid,
-            to: *anchor,
-            label: "BenchEdge20".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            valid_from: None,
-            valid_to: None,
-        });
-    }
-    engine.batch_upsert_edges(edges.clone()).unwrap();
-    engine.flush().unwrap();
-    (dir, engine)
-}
-
-fn build_high_hub_delay_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
-    let (dir, engine) = temp_db();
-    let root = engine
-        .batch_upsert_nodes(vec![NodeInput {
-            labels: vec![bench_node_label(1)],
-            key: "root".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        }])
-        .unwrap()[0];
-    let low = engine
-        .batch_upsert_nodes(vec![NodeInput {
-            labels: vec![bench_node_label(3)],
-            key: "low".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        }])
-        .unwrap()[0];
-    let target_inputs: Vec<_> = (0..512)
-        .map(|index| NodeInput {
-            labels: vec![bench_node_label(2)],
-            key: format!("hub-target-{index:03}"),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        })
-        .collect();
-    let targets = engine.batch_upsert_nodes(target_inputs.clone()).unwrap();
-    let mut edges = vec![EdgeInput {
-        from: root,
-        to: low,
-        label: "BenchEdge20".to_string(),
-        props: BTreeMap::new(),
-        weight: 1.0,
-        valid_from: None,
-        valid_to: None,
-    }];
-    for target in targets {
-        edges.push(EdgeInput {
-            from: root,
-            to: target,
-            label: "BenchEdge10".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            valid_from: None,
-            valid_to: None,
-        });
-    }
-    engine.batch_upsert_edges(edges.clone()).unwrap();
-    engine.flush().unwrap();
-    (dir, engine, root)
-}
-
-fn build_parallel_edge_pattern_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
-    let (dir, engine) = temp_db_with_edge_uniqueness(false);
-    let source = engine
-        .batch_upsert_nodes(vec![NodeInput {
-            labels: vec![bench_node_label(1)],
-            key: "parallel-source".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        }])
-        .unwrap()[0];
-    let target = engine
-        .batch_upsert_nodes(vec![NodeInput {
-            labels: vec![bench_node_label(2)],
-            key: "parallel-target".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            dense_vector: None,
-            sparse_vector: None,
-        }])
-        .unwrap()[0];
-    let edges: Vec<EdgeInput> = (0..512)
-        .map(|_| EdgeInput {
-            from: source,
-            to: target,
-            label: "BenchEdge10".to_string(),
-            props: BTreeMap::new(),
-            weight: 1.0,
-            valid_from: None,
-            valid_to: None,
-        })
-        .collect();
-    engine.batch_upsert_edges(edges.clone()).unwrap();
-    engine.flush().unwrap();
-    (dir, engine, source)
-}
-
 const GRAPH_ROW_BENCH_EDGES: usize = 1_000;
 
 fn build_graph_row_optional_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
@@ -1796,6 +1597,18 @@ fn setup_gql_mutation_return_smoke_db() -> (tempfile::TempDir, DatabaseEngine) {
     (dir, engine)
 }
 
+fn setup_gql_merge_match_smoke_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_gql_mutation_bench_db();
+    engine
+        .batch_upsert_nodes(vec![gql_bench_node(
+            "GqlBenchMerge",
+            "n",
+            gql_bench_props(&[("status", PropValue::String("old".to_string()))]),
+        )])
+        .unwrap();
+    (dir, engine)
+}
+
 fn assert_gql_mutation_result(
     result: overgraph::GqlExecutionResult,
     expected_rows: usize,
@@ -1965,6 +1778,38 @@ fn bench_gql_queries(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("gql_union_all_two_indexed_branches", |b| {
+        let (_dir, engine) = build_indexed_query_engine();
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN id(n) AS id \
+                     UNION ALL \
+                     MATCH (n:BenchNode1) WHERE n.tier = 'gold' RETURN id(n) AS id";
+        b.iter(|| {
+            let result = engine
+                .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                .unwrap();
+            assert_eq!(result.rows.len(), 1_500);
+            black_box(result)
+        });
+    });
+
+    group.bench_function("gql_union_dedupe_overlapping_indexed_branches", |b| {
+        let (_dir, engine) = build_indexed_query_engine();
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query = "MATCH (n:BenchNode1) WHERE n.status = 'active' RETURN id(n) AS id \
+                     UNION \
+                     MATCH (n:BenchNode1) WHERE n.tier = 'gold' RETURN id(n) AS id";
+        b.iter(|| {
+            let result = engine
+                .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                .unwrap();
+            assert_eq!(result.rows.len(), 1_000);
+            black_box(result)
+        });
+    });
+
     group.bench_function("gql_fixed_one_hop_pattern", |b| {
         let (_dir, engine, _company_id) = build_pattern_engine();
         let params = GqlParams::new();
@@ -1977,6 +1822,25 @@ fn bench_gql_queries(c: &mut Criterion) {
                     .execute_gql(black_box(query), black_box(&params), black_box(&options))
                     .unwrap(),
             )
+        });
+    });
+
+    group.bench_function("gql_shortest_path_bounded_endpoint_smoke", |b| {
+        let (_dir, engine, _company_id) = build_pattern_engine();
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query = "MATCH (a:BenchNode1) WHERE a.key = 'acct-0' \
+                     WITH a \
+                     MATCH (b:BenchNode2) WHERE b.key = 'company-0' \
+                     WITH a, b \
+                     MATCH p = shortestPath((a)-[:BenchEdge10*1..1]->(b)) \
+                     RETURN length(p)";
+        b.iter(|| {
+            let result = engine
+                .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                .unwrap();
+            assert_eq!(result.rows.len(), 1);
+            black_box(result)
         });
     });
 
@@ -2078,6 +1942,46 @@ fn bench_gql_queries(c: &mut Criterion) {
                 let stats = result.mutation_stats.as_ref().unwrap();
                 assert_eq!(stats.nodes_updated, 1);
                 assert_eq!(stats.properties_set, 1);
+                black_box(result)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("gql_mutation_merge_create_smoke", |b| {
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query = "MERGE (n:GqlBenchMerge {key: 'n'}) ON CREATE SET n.status = 'created'";
+        b.iter_batched(
+            temp_gql_mutation_bench_db,
+            |(_dir, engine)| {
+                let result = engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap();
+                let result = assert_gql_mutation_result(result, 0);
+                let stats = result.mutation_stats.as_ref().unwrap();
+                assert_eq!(stats.nodes_created, 1);
+                assert_eq!(stats.nodes_updated, 0);
+                black_box(result)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("gql_mutation_merge_match_smoke", |b| {
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query = "MERGE (n:GqlBenchMerge {key: 'n'}) ON MATCH SET n.status = 'matched'";
+        b.iter_batched(
+            setup_gql_merge_match_smoke_db,
+            |(_dir, engine)| {
+                let result = engine
+                    .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                    .unwrap();
+                let result = assert_gql_mutation_result(result, 0);
+                let stats = result.mutation_stats.as_ref().unwrap();
+                assert_eq!(stats.nodes_created, 0);
+                assert_eq!(stats.nodes_updated, 1);
                 black_box(result)
             },
             BatchSize::SmallInput,

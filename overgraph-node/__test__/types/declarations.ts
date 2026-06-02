@@ -10,11 +10,17 @@ import type {
 } from '../../index.js'
 import type {
   GraphPathValue,
+  GraphPipelineRequest,
+  GraphPipelineResult,
   GraphRowRequest,
   GraphRowResult,
+  GqlEdge,
   GqlExecutionExplain,
   GqlExecutionOptions,
   GqlExecutionResult,
+  GqlLoweringTarget,
+  GqlNode,
+  GqlPath,
   GqlValue,
   QueryEdgeRequest,
   QueryPlanNode,
@@ -100,6 +106,27 @@ const graphRowAsyncResult: Promise<GraphRowResult> = db.queryGraphRowsAsync(grap
 const graphRowExplain = db.explainGraphRows(graphRows)
 const graphRowExplainAsync = db.explainGraphRowsAsync(graphRows)
 
+const graphPipeline: GraphPipelineRequest = {
+  stages: [
+    { kind: 'match', nodes: [{ alias: 'person', labelFilter: { labels: ['Person'], mode: 'all' } }] },
+    {
+      kind: 'return',
+      items: [
+        { expr: { property: { alias: 'person', key: 'name' } }, as: 'name' },
+        { expr: { aggregate: { function: 'count' } }, as: 'count' },
+      ],
+    },
+  ],
+  output: { compactRows: true },
+  options: { allowFullScan: true, maxPipelineRows: 1024, includePlan: true },
+  limit: 10,
+}
+
+const graphPipelineResult: GraphPipelineResult = db.queryGraphPipeline(graphPipeline)
+const graphPipelineAsyncResult: Promise<GraphPipelineResult> = db.queryGraphPipelineAsync(graphPipeline)
+const graphPipelineExplain = db.explainGraphPipeline(graphPipeline)
+const graphPipelineExplainAsync = db.explainGraphPipelineAsync(graphPipeline)
+
 // @ts-expect-error Old pattern request types are intentionally not exported.
 type RemovedGraphNodePattern = QueryTypes.GraphNodePattern
 // @ts-expect-error Old pattern query APIs are intentionally not exposed.
@@ -123,6 +150,13 @@ const gqlOptions: GqlExecutionOptions = {
   maxCursorBytes: 4096,
   maxMutationRows: 10,
   maxMutationOps: 20,
+  maxPipelineRows: 512,
+  maxGroups: 128,
+  maxCollectItems: 64,
+  maxUnionBranches: 4,
+  maxSubqueryInvocations: 32,
+  maxSubqueryDepth: 2,
+  maxShortestPathPairs: 16,
   maxParamBytes: 1024,
   maxAstDepth: 32,
   maxLiteralItems: 128,
@@ -156,8 +190,24 @@ const gqlAsyncResult: Promise<GqlExecutionResult> = db.executeGqlAsync(
   { compactRows: true },
 )
 const gqlExplain: GqlExecutionExplain = db.explainGql('MATCH (n:Person) RETURN n', null, { allowFullScan: true })
+const gqlReadTarget: GqlLoweringTarget | undefined = gqlExplain.read?.target
+const gqlPipelineRowCap: number = gqlExplain.caps.maxPipelineRows
+const gqlGroupCap: number = gqlExplain.caps.maxGroups
+const gqlCollectCap: number = gqlExplain.caps.maxCollectItems
+const gqlUnionCap: number = gqlExplain.caps.maxUnionBranches
+const gqlSubqueryInvocationCap: number = gqlExplain.caps.maxSubqueryInvocations
+const gqlSubqueryDepthCap: number = gqlExplain.caps.maxSubqueryDepth
+const gqlShortestPathPairCap: number = gqlExplain.caps.maxShortestPathPairs
+const gqlReadRowCap: number | undefined = gqlExplain.read?.caps.maxRows
 const gqlExplainAsync = db.explainGqlAsync('MATCH (n:Person) RETURN n', null, {
   allowFullScan: true,
+  maxPipelineRows: 512,
+  maxGroups: 128,
+  maxCollectItems: 64,
+  maxUnionBranches: 4,
+  maxSubqueryInvocations: 32,
+  maxSubqueryDepth: 2,
+  maxShortestPathPairs: 16,
 })
 const gqlMutationResult: GqlExecutionResult = db.executeGql(
   "CREATE (n:Person {key: 'new-person', name: 'New'}) RETURN n.name AS name",
@@ -165,6 +215,36 @@ const gqlMutationResult: GqlExecutionResult = db.executeGql(
   { maxMutationRows: 1, maxMutationOps: 1 },
 )
 const compactRows = gqlMutationResult.rows as Array<Array<GqlValue>>
+const gqlNodeValue: GqlNode = {
+  id: 1,
+  labels: ['Person'],
+  props: {
+    nested: { scores: [1, null, { ok: true }] },
+  },
+}
+const gqlEdgeValue: GqlEdge = {
+  id: 3,
+  from: 1,
+  to: 2,
+  label: 'KNOWS',
+  props: {
+    weights: [0.5, 1],
+  },
+}
+const gqlPathValue: GqlPath = {
+  nodeIds: [1, 2],
+  edgeIds: [3],
+  nodes: [gqlNodeValue],
+  edges: [gqlEdgeValue],
+}
+const gqlNestedValue: GqlValue = {
+  collect: [gqlNodeValue],
+  path: gqlPathValue,
+  helpers: {
+    nodes: gqlPathValue.nodeIds,
+    relationships: gqlPathValue.edgeIds,
+  },
+}
 const mutationStats = gqlMutationResult.mutationStats?.nodesCreated
 const mutationExplain = db.explainGql(
   "CREATE (n:Person {key: 'planned-person'}) RETURN n.key AS key",
@@ -198,9 +278,12 @@ void fallbackEdgeLabelScan
 void gqlResult
 void gqlAsyncResult
 void gqlExplain
+void gqlReadTarget
 void gqlExplainAsync
 void gqlMutationResult
 void compactRows
+void gqlReadRowCap
+void gqlNestedValue
 void mutationStats
 void mutationOperation
 void mutationReturnColumns

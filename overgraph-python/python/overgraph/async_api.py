@@ -377,6 +377,9 @@ class AsyncOverGraph:
     async def query_graph_rows(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.query_graph_rows, request)
 
+    async def query_graph_pipeline(self, request: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.query_graph_pipeline, request)
+
     async def explain_node_query(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.explain_node_query, request)
 
@@ -388,6 +391,9 @@ class AsyncOverGraph:
 
     async def explain_graph_rows(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.explain_graph_rows, request)
+
+    async def explain_graph_pipeline(self, request: Any) -> dict[str, Any]:
+        return await asyncio.to_thread(self._db.explain_graph_pipeline, request)
 
     async def execute_gql(
         self,

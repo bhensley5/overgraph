@@ -214,6 +214,36 @@ pub(crate) fn numeric_key_from_u64(value: u64) -> NumericScalarKey {
     }
 }
 
+pub(crate) fn exact_i64_to_f64(value: i64, context: &str) -> Result<f64, EngineError> {
+    let converted = value as f64;
+    let converted_key = numeric_key_from_f64(converted).ok_or_else(|| {
+        EngineError::InvalidOperation(format!("{context} produced a non-finite float"))
+    })?;
+    let exact_key = numeric_key_from_i64(value);
+    if converted_key == exact_key {
+        Ok(converted)
+    } else {
+        Err(EngineError::InvalidOperation(format!(
+            "{context} cannot represent integer value exactly as float"
+        )))
+    }
+}
+
+pub(crate) fn exact_u64_to_f64(value: u64, context: &str) -> Result<f64, EngineError> {
+    let converted = value as f64;
+    let converted_key = numeric_key_from_f64(converted).ok_or_else(|| {
+        EngineError::InvalidOperation(format!("{context} produced a non-finite float"))
+    })?;
+    let exact_key = numeric_key_from_u64(value);
+    if converted_key == exact_key {
+        Ok(converted)
+    } else {
+        Err(EngineError::InvalidOperation(format!(
+            "{context} cannot represent unsigned integer value exactly as float"
+        )))
+    }
+}
+
 pub(crate) fn numeric_key_from_f64(value: f64) -> Option<NumericScalarKey> {
     if !value.is_finite() {
         return None;
@@ -690,6 +720,20 @@ mod tests {
             ),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn exact_integer_to_float_rejects_rounded_values() {
+        assert_eq!(
+            exact_u64_to_f64(9_007_199_254_740_992, "test").unwrap(),
+            9_007_199_254_740_992.0
+        );
+        assert!(exact_u64_to_f64(9_007_199_254_740_993, "test").is_err());
+        assert_eq!(
+            exact_i64_to_f64(i64::MIN, "test").unwrap(),
+            -9_223_372_036_854_775_808.0
+        );
+        assert!(exact_i64_to_f64(i64::MAX, "test").is_err());
     }
 
     #[test]

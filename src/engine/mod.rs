@@ -11526,6 +11526,8 @@ include!("query_ir.rs");
 include!("query_plan.rs");
 include!("projection.rs");
 include!("query_exec.rs");
+include!("pipeline_ir.rs");
+include!("pipeline_exec.rs");
 include!("query.rs");
 
 #[cfg(test)]

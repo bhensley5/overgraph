@@ -116,7 +116,7 @@ impl ReadView {
         let selected = self.sources().find_node_projected_fields(&unique_ids, needs)?;
         let mut by_id =
             NodeIdMap::with_capacity_and_hasher(unique_ids.len(), Default::default());
-        for (node_id, fields) in unique_ids.into_iter().zip(selected.into_iter()) {
+        for (node_id, fields) in unique_ids.into_iter().zip(selected) {
             if let Some(fields) = fields {
                 by_id.insert(node_id, fields);
             }
@@ -133,7 +133,7 @@ impl ReadView {
         let selected = self.sources().find_edge_projected_fields(&unique_ids, needs)?;
         let mut by_id =
             NodeIdMap::with_capacity_and_hasher(unique_ids.len(), Default::default());
-        for (edge_id, fields) in unique_ids.into_iter().zip(selected.into_iter()) {
+        for (edge_id, fields) in unique_ids.into_iter().zip(selected) {
             if let Some(fields) = fields {
                 by_id.insert(edge_id, fields);
             }

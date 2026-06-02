@@ -576,7 +576,7 @@ impl EngineCore {
         for ((input, &label_set), (dense_vector, sparse_vector)) in inputs
             .iter()
             .zip(label_sets.iter())
-            .zip(normalized_vectors.into_iter())
+            .zip(normalized_vectors)
         {
             let mut winner: Option<(u64, i64)> = None;
             for &label_id in label_set.as_slice() {

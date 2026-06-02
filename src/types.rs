@@ -65,6 +65,13 @@ pub struct GqlExecutionOptions {
     pub max_cursor_bytes: usize,
     pub max_mutation_rows: usize,
     pub max_mutation_ops: usize,
+    pub max_pipeline_rows: usize,
+    pub max_groups: usize,
+    pub max_collect_items: usize,
+    pub max_union_branches: usize,
+    pub max_subquery_invocations: usize,
+    pub max_subquery_depth: usize,
+    pub max_shortest_path_pairs: usize,
     pub max_query_bytes: usize,
     pub max_param_bytes: usize,
     pub max_ast_depth: usize,
@@ -91,6 +98,13 @@ impl Default for GqlExecutionOptions {
             max_cursor_bytes: 16 * 1024,
             max_mutation_rows: 10_000,
             max_mutation_ops: 50_000,
+            max_pipeline_rows: 65_536,
+            max_groups: 65_536,
+            max_collect_items: 65_536,
+            max_union_branches: 16,
+            max_subquery_invocations: 4_096,
+            max_subquery_depth: 2,
+            max_shortest_path_pairs: 4_096,
             max_query_bytes: 1_048_576,
             max_param_bytes: 1_048_576,
             max_ast_depth: 256,
@@ -227,6 +241,7 @@ pub enum GqlLoweringTarget {
     NodeQuery,
     EdgeQuery,
     GraphRowQuery,
+    GraphPipelineQuery,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,6 +321,13 @@ pub struct GqlExecutionCapSummary {
     pub max_cursor_bytes: usize,
     pub max_mutation_rows: usize,
     pub max_mutation_ops: usize,
+    pub max_pipeline_rows: usize,
+    pub max_groups: usize,
+    pub max_collect_items: usize,
+    pub max_union_branches: usize,
+    pub max_subquery_invocations: usize,
+    pub max_subquery_depth: usize,
+    pub max_shortest_path_pairs: usize,
     pub max_query_bytes: usize,
     pub max_param_bytes: usize,
     pub max_ast_depth: usize,
@@ -1502,6 +1524,164 @@ pub struct GraphRowQuery {
     pub options: GraphQueryOptions,
 }
 
+/// Public structured graph pipeline query request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphPipelineQuery {
+    pub stages: Vec<GraphPipelineStage>,
+    pub params: BTreeMap<String, GraphParamValue>,
+    pub at_epoch: Option<i64>,
+    pub page: GraphPageRequest,
+    pub output: GraphOutputOptions,
+    pub options: GraphPipelineOptions,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphPipelineStage {
+    Match(GraphPipelineMatchStage),
+    Project(GraphProjectStage),
+    ShortestPath(GraphShortestPathStage),
+    Call(GraphSubqueryStage),
+    Union(GraphUnionStage),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphPipelineMatchStage {
+    pub optional: bool,
+    pub nodes: Vec<GraphNodePattern>,
+    pub pieces: Vec<GraphPatternPiece>,
+    pub where_: Option<GraphExpr>,
+    /// Optional-match candidate predicate evaluated before left-outer null extension.
+    pub optional_candidate_where: Option<GraphExpr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphProjectStage {
+    pub kind: GraphProjectKind,
+    pub items: GraphProjectionItems,
+    pub distinct: bool,
+    pub where_: Option<GraphExpr>,
+    pub order_by: Vec<GraphOrderItem>,
+    pub skip: Option<GraphExpr>,
+    pub limit: Option<GraphExpr>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphProjectKind {
+    With,
+    Return,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphProjectionItems {
+    Star,
+    Items(Vec<GraphProjectItem>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphProjectItem {
+    pub expr: GraphExpr,
+    pub alias: Option<String>,
+    pub projection: GraphReturnProjection,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphUnionStage {
+    pub branches: Vec<GraphPipelineQuery>,
+    pub all: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphSubqueryStage {
+    pub query: Box<GraphPipelineQuery>,
+    pub import_aliases: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphShortestPathStage {
+    pub optional: bool,
+    pub output_path_alias: String,
+    pub mode: GraphShortestPathMode,
+    pub from: GraphShortestPathEndpoint,
+    pub to: GraphShortestPathEndpoint,
+    pub direction: Direction,
+    pub edge_label_filter: Vec<String>,
+    pub min_hops: u8,
+    pub max_hops: u8,
+    pub weight_field: Option<String>,
+    pub max_cost: Option<f64>,
+    pub max_paths: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphShortestPathMode {
+    One,
+    All,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphShortestPathEndpoint {
+    Alias(String),
+    NodeId(u64),
+    NodeKey { label: String, key: String },
+    Expr(GraphExpr),
+}
+
+/// Graph pipeline validation, safety, and explain options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphPipelineOptions {
+    pub allow_full_scan: bool,
+    pub max_rows: usize,
+    pub max_pipeline_rows: usize,
+    pub max_groups: usize,
+    pub max_collect_items: usize,
+    pub max_union_branches: usize,
+    pub max_subquery_invocations: usize,
+    pub max_subquery_depth: usize,
+    pub max_shortest_path_pairs: usize,
+    pub max_intermediate_bindings: usize,
+    pub max_frontier: usize,
+    pub max_path_hops: u8,
+    pub max_paths_per_start: usize,
+    pub max_order_materialization: usize,
+    pub max_skip: usize,
+    pub max_cursor_bytes: usize,
+    pub max_query_bytes: usize,
+    pub max_param_bytes: usize,
+    pub max_ast_depth: usize,
+    pub max_literal_items: usize,
+    pub include_plan: bool,
+    pub profile: bool,
+}
+
+impl Default for GraphPipelineOptions {
+    fn default() -> Self {
+        Self {
+            allow_full_scan: false,
+            max_rows: 10_000,
+            max_pipeline_rows: 65_536,
+            max_groups: 65_536,
+            max_collect_items: 65_536,
+            max_union_branches: 16,
+            max_subquery_invocations: 4_096,
+            max_subquery_depth: 2,
+            max_shortest_path_pairs: 4_096,
+            max_intermediate_bindings: 65_536,
+            max_frontier: 65_536,
+            max_path_hops: 16,
+            max_paths_per_start: 4_096,
+            max_order_materialization: 65_536,
+            max_skip: 100_000,
+            max_cursor_bytes: 16 * 1024,
+            max_query_bytes: 1_048_576,
+            max_param_bytes: 1_048_576,
+            max_ast_depth: 256,
+            max_literal_items: 10_000,
+            include_plan: false,
+            profile: false,
+        }
+    }
+}
+
 /// Parameter value accepted by graph-row requests.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GraphParamValue {
@@ -1600,6 +1780,12 @@ pub enum GraphExpr {
         name: GraphFunction,
         args: Vec<GraphExpr>,
     },
+    AggregateCall {
+        function: GraphAggregateFunction,
+        distinct: bool,
+        arg: Option<Box<GraphExpr>>,
+    },
+    ExistsSubquery(GraphSubqueryStage),
     Unary {
         op: GraphUnaryOp,
         expr: Box<GraphExpr>,
@@ -1609,8 +1795,19 @@ pub enum GraphExpr {
         op: GraphBinaryOp,
         right: Box<GraphExpr>,
     },
+    Case {
+        operand: Option<Box<GraphExpr>>,
+        branches: Vec<GraphCaseBranch>,
+        else_expr: Option<Box<GraphExpr>>,
+    },
     IsNull(Box<GraphExpr>),
     IsNotNull(Box<GraphExpr>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphCaseBranch {
+    pub when: GraphExpr,
+    pub then: GraphExpr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1653,11 +1850,37 @@ pub enum GraphFunction {
     EndNode,
     Nodes,
     Relationships,
+    Coalesce,
+    ToString,
+    ToInteger,
+    ToFloat,
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Lower,
+    Upper,
+    Trim,
+    Substring,
+    Size,
+    Head,
+    Last,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GraphAggregateFunction {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Collect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GraphUnaryOp {
     Not,
+    Neg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1671,6 +1894,13 @@ pub enum GraphBinaryOp {
     Gt,
     Ge,
     In,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    StartsWith,
+    EndsWith,
+    Contains,
 }
 
 /// One output column requested by a graph-row query.
@@ -1921,6 +2151,37 @@ pub struct GraphRowStats {
     pub warnings: Vec<String>,
 }
 
+/// Result of a graph pipeline query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphPipelineResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<GraphRow>,
+    pub next_cursor: Option<String>,
+    pub stats: GraphPipelineStats,
+    pub plan: Option<GraphPipelineExplain>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphPipelineStats {
+    pub rows_returned: usize,
+    pub rows_entered_pipeline: usize,
+    pub rows_after_filter: usize,
+    pub intermediate_rows: usize,
+    pub pipeline_rows_materialized: usize,
+    pub groups: usize,
+    pub collect_items: usize,
+    pub union_branches: usize,
+    pub union_dedup_keys: usize,
+    pub subquery_invocations: usize,
+    pub subquery_cache_hits: usize,
+    pub shortest_path_pairs: usize,
+    pub shortest_path_cache_hits: usize,
+    pub db_hits: usize,
+    pub elapsed_us: Option<u64>,
+    pub effective_at_epoch: i64,
+    pub warnings: Vec<String>,
+}
+
 /// Explain output for graph-row planning and execution.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GraphRowExplain {
@@ -1936,6 +2197,59 @@ pub struct GraphRowExplain {
     pub summaries: GraphExecutionSummaries,
     pub warnings: Vec<String>,
     pub notes: Vec<String>,
+}
+
+/// Explain output for graph pipeline planning and execution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphPipelineExplain {
+    pub columns: Vec<String>,
+    pub effective_at_epoch: Option<i64>,
+    pub fingerprint: String,
+    pub stages: Vec<GraphPipelineStageExplain>,
+    pub row_ops: Vec<GraphRowOperationExplain>,
+    pub order: GraphOrderExplain,
+    pub cursor: GraphCursorExplain,
+    pub projection: GraphProjectionExplain,
+    pub caps: GraphPipelineCapExplain,
+    pub summaries: GraphExecutionSummaries,
+    pub stats: GraphPipelineStats,
+    pub warnings: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphPipelineStageExplain {
+    pub index: usize,
+    pub kind: String,
+    pub detail: String,
+    pub columns: Vec<String>,
+    pub graph_row: Option<Box<GraphRowExplain>>,
+    pub warnings: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphPipelineCapExplain {
+    pub allow_full_scan: bool,
+    pub max_rows: usize,
+    pub max_pipeline_rows: usize,
+    pub max_groups: usize,
+    pub max_collect_items: usize,
+    pub max_union_branches: usize,
+    pub max_subquery_invocations: usize,
+    pub max_subquery_depth: usize,
+    pub max_shortest_path_pairs: usize,
+    pub max_intermediate_bindings: usize,
+    pub max_frontier: usize,
+    pub max_path_hops: u8,
+    pub max_paths_per_start: usize,
+    pub max_order_materialization: usize,
+    pub max_skip: usize,
+    pub max_cursor_bytes: usize,
+    pub max_query_bytes: usize,
+    pub max_param_bytes: usize,
+    pub max_ast_depth: usize,
+    pub max_literal_items: usize,
 }
 
 /// Minimal graph-row explain plan node. Future work can fill in richer structured

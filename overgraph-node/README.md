@@ -43,7 +43,7 @@ Graph structure and vector similarity can live in the same engine, so you can as
 - **Explicit write transactions.** Stage ordered node and edge mutations locally, read your own staged writes, then commit atomically with optimistic conflict detection through the Node.js API.
 - **Native Node.js, one engine.** Rust core with napi-rs bindings. Not a wrapper around a REST API. Actual FFI into the same Rust engine with minimal overhead.
 - **Full queries as functions.** Use regular APIs for direct lookups, full boolean node/edge queries, and `queryGraphRows` for row-shaped graph patterns, optional matches, and bounded paths.
-- **GQL Beta.** Use `executeGql` / `executeGqlAsync` for GQL/Cypher-style graph reads and writes. `MATCH` reads and keyed `CREATE`, `SET`, `REMOVE`, `DELETE r`, and `DETACH DELETE n` mutations run on the same native substrates.
+- **GQL Beta.** Use `executeGql` / `executeGqlAsync` for GQL/Cypher-style graph reads and writes. Use `MATCH`, `WITH`, `DISTINCT`, aggregation, `UNION`, read-only subqueries, constrained shortest paths, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, and mutation returns.
 
 ## Performance
 
@@ -107,13 +107,14 @@ db.close();
 
 ## GQL Beta
 
-The Node.js connector includes **GQL Beta**: a GQL/Cypher-style query language for graph reads and writes, backed by the same graph-row read executor and write-transaction machinery as the native APIs. Use it when a query is easier to read as text; keep native APIs such as `queryGraphRows` and explicit write transactions when structured request objects give you better control.
+The Node.js connector includes **GQL Beta**: a GQL/Cypher-style query language for graph reads and writes. Use it when a graph operation is easier to read as text: create records, match patterns, shape rows with `WITH`, aggregate, combine branches with `UNION`, run read-only subqueries, use constrained shortest paths, and return mutation results.
 
 ```javascript
 const created = db.executeGql(
-  `CREATE (p:Person {key: $key, name: $name, status: 'active'})
-   RETURN p.name AS name`,
-  { key: 'ada', name: 'Ada' }
+  `CREATE (p:Person {key: 'gql-ada', name: 'Ada', status: 'active'})
+          -[r:WORKS_AT {role: 'engineer', since: 2026}]->
+          (c:Company {key: 'gql-overgraph', name: 'OverGraph'})
+   RETURN p.name AS person, c.name AS company, r.role AS role`
 );
 
 const result = db.executeGql(
@@ -138,7 +139,7 @@ const asyncResult = await db.executeGqlAsync(
 );
 ```
 
-`mode: 'readOnly'` rejects mutation statements, and mutation statements do not accept or return cursors. GQL Beta supports `MATCH`, `OPTIONAL MATCH`, bounded paths, path functions, `WHERE`, `RETURN`, `ORDER BY`, `SKIP` / `OFFSET`, `LIMIT`, params, read cursors, compact rows, vector opt-in, explain/profile, `CREATE`, `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, mutation stats, and mutation `RETURN` for `CREATE` / `SET` / `REMOVE`. See the full [GQL Beta API reference](../docs/api-reference.md#gql-beta) for syntax, result shapes, options, examples, and current limitations.
+GQL Beta is available across Rust, Node.js, and Python. It supports params, read cursors, compact rows, vector opt-in for returned node values, explain/profile, read-only execution, mutation stats, async connector calls, and consistent result shapes across languages. See the full [GQL Beta API reference](../docs/api-reference.md#gql-beta) for syntax, result shapes, options, and examples.
 
 ### Async support
 
@@ -175,7 +176,7 @@ The Node.js connector includes `Async` suffixed variants for every API, such as 
 - **Degree counts.** Count edges, sum weights, and compute averages without materializing neighbor lists. Batch `degrees` for bulk analysis.
 - **Direct property queries.** `findNodes` and `findNodesPaged` do focused equality lookups with semantic numeric equality for finite scalars. `findNodesRange` and `findNodesRangePaged` do domainless numeric range scans with exact bound and cursor semantics.
 - **Optional property indexes.** Declare node or edge equality/range indexes only where they pay off. Range indexes cover finite scalar numeric values across signed integers, unsigned integers, and finite floats; non-finite floats and non-numeric values are excluded. Use `ensureNodePropertyIndex` / `ensureEdgePropertyIndex`, list APIs, and drop APIs to manage them. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
-- **Full query APIs.** `queryNodeIds`, `queryNodes`, `queryEdgeIds`, `queryEdges`, `queryGraphRows`, and explain APIs combine IDs, keys, node label filters (`{ labels, mode: 'any' | 'all' }`), edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths. `executeGql` adds GQL Beta for query-string reads and mutations over the same native substrates. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
+- **Full query APIs.** `queryNodeIds`, `queryNodes`, `queryEdgeIds`, `queryEdges`, `queryGraphRows`, and explain APIs combine IDs, keys, node label filters (`{ labels, mode: 'any' | 'all' }`), edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths. `executeGql` adds GQL Beta for query-string reads and mutations. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
 - **Time-range queries.** Find nodes created or updated within a time window. Sorted timestamp index for efficient range scans.
 
 ### Pagination

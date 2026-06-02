@@ -35,6 +35,27 @@ def seed_graph(db, include_vectors=False):
     }
 
 
+async def seed_graph_async(db):
+    ada = await db.upsert_node("Person", "ada", props={"name": "Ada", "rank": 2, "status": "active"})
+    ben = await db.upsert_node("Person", "ben", props={"name": "Ben", "rank": 1, "status": "active"})
+    cy = await db.upsert_node("Person", "cy", props={"name": "Cy", "rank": 3, "status": "inactive"})
+    acme = await db.upsert_node("Company", "acme", props={"name": "Acme"})
+    works = await db.upsert_edge(ada, acme, "WORKS_AT", props={"role": "engineer"})
+    reports = await db.upsert_edge(ada, ben, "REPORTS_TO")
+    knows_ab = await db.upsert_edge(ada, ben, "KNOWS")
+    knows_bc = await db.upsert_edge(ben, cy, "KNOWS")
+    return {
+        "ada": ada,
+        "ben": ben,
+        "cy": cy,
+        "acme": acme,
+        "works": works,
+        "reports": reports,
+        "knows_ab": knows_ab,
+        "knows_bc": knows_bc,
+    }
+
+
 def fixed_request(ids):
     return {
         "nodes": [
@@ -390,6 +411,102 @@ def test_query_graph_rows_explain_params_and_expression_tags(tmp_dir):
             )
     finally:
         db.close(force=True)
+
+
+@pytest.mark.asyncio
+async def test_query_graph_pipeline_sync_and_async_connector_boundary(tmp_dir):
+    db = OverGraph.open(os.path.join(tmp_dir, "graph_pipeline"))
+    try:
+        seed_graph(db)
+        pipeline = {
+            "stages": [
+                {
+                    "kind": "match",
+                    "nodes": [{"alias": "n", "label_filter": lf("Person")}],
+                },
+                {
+                    "kind": "project",
+                    "project_kind": "with",
+                    "items": [
+                        {"expr": {"property": {"alias": "n", "key": "name"}}, "as": "name"},
+                        {"expr": {"property": {"alias": "n", "key": "rank"}}, "as": "rank"},
+                        {"expr": {"property": {"alias": "n", "key": "status"}}, "as": "status"},
+                    ],
+                    "where": {"op": "=", "left": {"binding": "status"}, "right": "active"},
+                    "order_by": [{"expr": {"binding": "rank"}, "direction": "desc"}],
+                    "limit": 3,
+                },
+                {
+                    "kind": "project",
+                    "project_kind": "return",
+                    "items": [
+                        {"expr": {"binding": "name"}, "as": "name"},
+                        {"expr": {"op": "+", "left": {"binding": "rank"}, "right": 10}, "as": "score"},
+                    ],
+                    "order_by": [{"expr": {"binding": "score"}, "direction": "desc"}],
+                },
+            ],
+            "limit": 10,
+            "options": {"include_plan": True, "profile": True},
+        }
+
+        result = db.query_graph_pipeline(pipeline)
+        assert result["columns"] == ["name", "score"]
+        assert result["rows"] == [{"name": "Ada", "score": 12}, {"name": "Ben", "score": 11}]
+        assert result["next_cursor"] is None
+        assert result["stats"]["rows_returned"] == 2
+        assert len(result["plan"]["stages"]) == 3
+        assert result["plan"]["caps"]["max_pipeline_rows"] == 65536
+
+        async_db = await AsyncOverGraph.open(os.path.join(tmp_dir, "graph_pipeline_async"))
+        try:
+            await seed_graph_async(async_db)
+            compact = await async_db.query_graph_pipeline(
+                {**pipeline, "output": {"compact_rows": True}}
+            )
+            assert compact["rows"] == [["Ada", 12], ["Ben", 11]]
+            explain = await async_db.explain_graph_pipeline(pipeline)
+            assert explain["columns"] == ["name", "score"]
+            assert len(explain["stages"]) == 3
+        finally:
+            await async_db.close(force=True)
+    finally:
+        db.close(force=True)
+
+
+def test_query_graph_pipeline_aggregate_projection(db):
+    seed_graph(db)
+    result = db.query_graph_pipeline(
+        {
+            "stages": [
+                {
+                    "kind": "match",
+                    "nodes": [{"alias": "n", "label_filter": lf("Person")}],
+                },
+                {
+                    "kind": "return",
+                    "items": [
+                        {"expr": {"aggregate": {"function": "count"}}, "as": "people"},
+                        {
+                            "expr": {
+                                "aggregate": {
+                                    "function": "collect",
+                                    "arg": {"property": {"alias": "n", "key": "status"}},
+                                    "distinct": True,
+                                }
+                            },
+                            "as": "statuses",
+                        },
+                    ],
+                },
+            ],
+            "limit": 10,
+            "options": {"include_plan": True},
+        }
+    )
+    assert result["rows"][0]["people"] == 3
+    assert set(result["rows"][0]["statuses"]) == {"active", "inactive"}
+    assert result["plan"]["stats"]["groups"] == 1
 
 
 def test_old_pattern_surface_is_explicitly_unsupported(db):

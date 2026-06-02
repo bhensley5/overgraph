@@ -29,6 +29,22 @@ enum CandidateMaterializationResult {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphRowRuntimeGoal {
+    AllRows,
+    ExistsOne,
+}
+
+impl GraphRowRuntimeGoal {
+    fn is_exists_one(self) -> bool {
+        matches!(self, Self::ExistsOne)
+    }
+
+    fn reached(self, rows: usize) -> bool {
+        self.is_exists_one() && rows > 0
+    }
+}
+
 fn materialization_followups(
     followup: Option<SecondaryIndexReadFollowup>,
 ) -> Vec<SecondaryIndexReadFollowup> {
@@ -1694,6 +1710,12 @@ fn graph_row_collect_expr_dependency_slots(
                 graph_row_collect_expr_dependency_slots(arg, schema, prior_slots, slots)?;
             }
         }
+        GraphExpr::AggregateCall { arg, .. } => {
+            if let Some(arg) = arg {
+                graph_row_collect_expr_dependency_slots(arg, schema, prior_slots, slots)?;
+            }
+        }
+        GraphExpr::ExistsSubquery(_) => {}
         GraphExpr::Unary { expr, .. }
         | GraphExpr::IsNull(expr)
         | GraphExpr::IsNotNull(expr) => {
@@ -1702,6 +1724,32 @@ fn graph_row_collect_expr_dependency_slots(
         GraphExpr::Binary { left, right, .. } => {
             graph_row_collect_expr_dependency_slots(left, schema, prior_slots, slots)?;
             graph_row_collect_expr_dependency_slots(right, schema, prior_slots, slots)?;
+        }
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                graph_row_collect_expr_dependency_slots(operand, schema, prior_slots, slots)?;
+            }
+            for branch in branches {
+                graph_row_collect_expr_dependency_slots(
+                    &branch.when,
+                    schema,
+                    prior_slots,
+                    slots,
+                )?;
+                graph_row_collect_expr_dependency_slots(
+                    &branch.then,
+                    schema,
+                    prior_slots,
+                    slots,
+                )?;
+            }
+            if let Some(else_expr) = else_expr {
+                graph_row_collect_expr_dependency_slots(else_expr, schema, prior_slots, slots)?;
+            }
         }
         GraphExpr::Null
         | GraphExpr::Bool(_)
@@ -2210,11 +2258,45 @@ fn graph_row_cursor_order_atom_expectation(
             GraphFunction::Labels | GraphFunction::Nodes | GraphFunction::Relationships => {
                 GraphRowCursorAtomExpectation::Unsupported
             }
+            GraphFunction::ToString
+            | GraphFunction::Lower
+            | GraphFunction::Upper
+            | GraphFunction::Trim
+            | GraphFunction::Substring => GraphRowCursorAtomExpectation::String,
+            GraphFunction::ToInteger
+            | GraphFunction::ToFloat
+            | GraphFunction::Abs
+            | GraphFunction::Floor
+            | GraphFunction::Ceil
+            | GraphFunction::Round
+            | GraphFunction::Size => GraphRowCursorAtomExpectation::Number,
+            GraphFunction::Coalesce | GraphFunction::Head | GraphFunction::Last => {
+                GraphRowCursorAtomExpectation::AnyOrderable
+            }
         },
-        BoundGraphExpr::Unary { .. }
-        | BoundGraphExpr::Binary { .. }
-        | BoundGraphExpr::IsNull(_)
-        | BoundGraphExpr::IsNotNull(_) => GraphRowCursorAtomExpectation::Bool,
+        BoundGraphExpr::Unary { op, .. } => match op {
+            GraphUnaryOp::Not => GraphRowCursorAtomExpectation::Bool,
+            GraphUnaryOp::Neg => GraphRowCursorAtomExpectation::Number,
+        },
+        BoundGraphExpr::Binary { op, .. } => match op {
+            GraphBinaryOp::Add | GraphBinaryOp::Sub | GraphBinaryOp::Mul | GraphBinaryOp::Div => {
+                GraphRowCursorAtomExpectation::Number
+            }
+            GraphBinaryOp::And
+            | GraphBinaryOp::Or
+            | GraphBinaryOp::Eq
+            | GraphBinaryOp::Neq
+            | GraphBinaryOp::Lt
+            | GraphBinaryOp::Le
+            | GraphBinaryOp::Gt
+            | GraphBinaryOp::Ge
+            | GraphBinaryOp::In
+            | GraphBinaryOp::StartsWith
+            | GraphBinaryOp::EndsWith
+            | GraphBinaryOp::Contains => GraphRowCursorAtomExpectation::Bool,
+        },
+        BoundGraphExpr::Case { .. } => GraphRowCursorAtomExpectation::AnyOrderable,
+        BoundGraphExpr::IsNull(_) | BoundGraphExpr::IsNotNull(_) => GraphRowCursorAtomExpectation::Bool,
     })
 }
 
@@ -2303,7 +2385,9 @@ fn graph_row_cursor_atom_matches_slot_kind(
         crate::graph_row::GraphSortAtom::Bool(_)
         | crate::graph_row::GraphSortAtom::Number(_)
         | crate::graph_row::GraphSortAtom::String(_)
-        | crate::graph_row::GraphSortAtom::Bytes(_) => {
+        | crate::graph_row::GraphSortAtom::Bytes(_)
+        | crate::graph_row::GraphSortAtom::List(_)
+        | crate::graph_row::GraphSortAtom::Map(_) => {
             slot_kind == crate::graph_row::GraphBindingSlotKind::Scalar
         }
     }
@@ -2671,6 +2755,25 @@ fn graph_row_fingerprint_expr(writer: &mut GraphRowFingerprintWriter, expr: &Gra
                 graph_row_fingerprint_expr(writer, arg);
             }
         }
+        GraphExpr::AggregateCall {
+            function,
+            distinct,
+            arg,
+        } => {
+            writer.tag(21);
+            writer.tag(*function as u8);
+            writer.bool(*distinct);
+            graph_row_fingerprint_option_expr(writer, arg.as_deref());
+        }
+        GraphExpr::ExistsSubquery(stage) => {
+            writer.tag(22);
+            graph_row_fingerprint_string_vec(writer, &stage.import_aliases);
+            graph_pipeline_fingerprint_stages(writer, &stage.query.stages);
+            graph_row_fingerprint_string_vec(
+                writer,
+                &graph_pipeline_declared_branch_columns(&stage.query),
+            );
+        }
         GraphExpr::Unary { op, expr } => {
             writer.tag(16);
             writer.tag(*op as u8);
@@ -2689,6 +2792,20 @@ fn graph_row_fingerprint_expr(writer: &mut GraphRowFingerprintWriter, expr: &Gra
         GraphExpr::IsNotNull(expr) => {
             writer.tag(19);
             graph_row_fingerprint_expr(writer, expr);
+        }
+        GraphExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            writer.tag(20);
+            graph_row_fingerprint_option_expr(writer, operand.as_deref());
+            writer.len(branches.len());
+            for branch in branches {
+                graph_row_fingerprint_expr(writer, &branch.when);
+                graph_row_fingerprint_expr(writer, &branch.then);
+            }
+            graph_row_fingerprint_option_expr(writer, else_expr.as_deref());
         }
     }
 }
@@ -3320,6 +3437,22 @@ fn encode_graph_sort_atoms(
                 push_u64_vec(bytes, nodes)?;
                 push_u64_vec(bytes, edges)?;
             }
+            crate::graph_row::GraphSortAtom::List(values) => {
+                push_u8(bytes, 8);
+                encode_graph_sort_atoms(bytes, values)?;
+            }
+            crate::graph_row::GraphSortAtom::Map(values) => {
+                push_u8(bytes, 9);
+                push_u32(bytes, values.len().try_into().map_err(|_| {
+                    EngineError::InvalidOperation(
+                        "graph row cursor map sort atom is too large".to_string(),
+                    )
+                })?);
+                for (key, value) in values {
+                    push_bytes(bytes, key.as_bytes())?;
+                    encode_graph_sort_atoms(bytes, std::slice::from_ref(value))?;
+                }
+            }
         }
     }
     Ok(())
@@ -3374,6 +3507,29 @@ fn decode_graph_sort_atoms(
                     nodes,
                     edges,
                 }
+            }
+            8 => crate::graph_row::GraphSortAtom::List(decode_graph_sort_atoms(reader)?),
+            9 => {
+                let len = reader.read_u32()? as usize;
+                if len > reader.remaining() {
+                    return Err(invalid_graph_row_cursor(
+                        "cursor map sort atom count exceeds remaining payload",
+                    ));
+                }
+                let mut values = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let key = std::str::from_utf8(reader.read_bytes()?)
+                        .map_err(|_| invalid_graph_row_cursor("cursor map key is not UTF-8"))?
+                        .to_string();
+                    let mut value = decode_graph_sort_atoms(reader)?;
+                    if value.len() != 1 {
+                        return Err(invalid_graph_row_cursor(
+                            "cursor map value did not contain exactly one sort atom",
+                        ));
+                    }
+                    values.push((key, value.remove(0)));
+                }
+                crate::graph_row::GraphSortAtom::Map(values)
             }
             value => {
                 return Err(invalid_graph_row_cursor(format!(
@@ -5264,7 +5420,7 @@ impl ReadView {
 
         if !missing_ids.is_empty() {
             let records = self.get_edges(&missing_ids)?;
-            for (index, record) in missing_positions.into_iter().zip(records.into_iter()) {
+            for (index, record) in missing_positions.into_iter().zip(records) {
                 slots[index] = record;
             }
         }
@@ -5331,7 +5487,7 @@ impl ReadView {
             let projected = self
                 .sources()
                 .find_edge_properties(&property_candidate_ids, &property_keys)?;
-            for (&edge_id, props) in property_candidate_ids.iter().zip(projected.into_iter()) {
+            for (&edge_id, props) in property_candidate_ids.iter().zip(projected) {
                 let Some(props) = props else {
                     continue;
                 };
@@ -5752,7 +5908,11 @@ impl ReadView {
             nodes.push(runtime);
         }
 
-        let mut bound_slots = BTreeSet::new();
+        let mut bound_slots = query
+            .initial_bound_slots
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let mut next_hidden_id = 0usize;
         let mut runtime = self.normalize_graph_row_runtime_piece_plan(
             query,
@@ -5978,6 +6138,18 @@ impl ReadView {
                     node.alias
                 ))
             })?;
+        let slot_info = query.binding_schema.slot(slot).ok_or_else(|| {
+            EngineError::InvalidOperation(format!(
+                "graph row node alias '{}' is missing from binding schema",
+                node.alias
+            ))
+        })?;
+        if slot_info.kind != crate::graph_row::GraphBindingSlotKind::Node {
+            return Err(EngineError::InvalidOperation(format!(
+                "graph row node alias '{}' resolved to a non-node binding slot",
+                node.alias
+            )));
+        }
         let (label_filter, single_label_id, warnings) =
             self.resolve_node_query_label_filter(node.label_filter.as_ref())?;
         let mut filter = normalize_optional_node_filter(node.filter.as_ref())?;
@@ -6276,6 +6448,7 @@ impl ReadView {
             &runtime,
             &physical_plan,
             None,
+            GraphRowRuntimeGoal::AllRows,
             effective_at_epoch,
             policy_cutoffs.as_ref(),
             &mut followups,
@@ -6653,6 +6826,7 @@ impl ReadView {
         runtime: &GraphRowRuntimePlan,
         physical_plan: &GraphRowPhysicalPlan,
         initial_rows: Option<Vec<crate::graph_row::GraphBindingRow>>,
+        goal: GraphRowRuntimeGoal,
         effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         followups: &mut Vec<SecondaryIndexReadFollowup>,
@@ -6662,12 +6836,32 @@ impl ReadView {
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         if runtime.steps.is_empty() {
+            let fallback_node_driver;
+            let initial_driver = match &physical_plan.initial_driver {
+                GraphRowInitialDriver::Empty { .. } if !runtime.nodes.is_empty() => {
+                    fallback_node_driver = GraphRowInitialDriver::Node {
+                        node_index: 0,
+                        alias: runtime.nodes[0].alias.clone(),
+                    };
+                    &fallback_node_driver
+                }
+                driver => driver,
+            };
             let rows = match initial_rows {
-                Some(rows) => rows,
+                Some(rows) => self.graph_row_seed_required_segment_rows(
+                    query,
+                    runtime,
+                    initial_driver,
+                    rows,
+                    GraphRowRuntimeGoal::AllRows,
+                    policy_cutoffs,
+                    followups,
+                )?,
                 None => self.graph_row_initial_rows(
                     query,
                     runtime,
-                    &physical_plan.initial_driver,
+                    initial_driver,
+                    goal,
                     policy_cutoffs,
                     followups,
                 )?,
@@ -6682,7 +6876,13 @@ impl ReadView {
         }
 
         let mut rows = initial_rows;
-        for step in &runtime.steps {
+        let step_count = runtime.steps.len();
+        for (step_index, step) in runtime.steps.iter().enumerate() {
+            let step_goal = if step_index + 1 == step_count {
+                goal
+            } else {
+                GraphRowRuntimeGoal::AllRows
+            };
             let next_rows = match step {
                 GraphRowRuntimeStep::RequiredSegment(segment_index) => {
                     let segment_plan = physical_plan
@@ -6700,6 +6900,7 @@ impl ReadView {
                         physical_plan,
                         segment_plan,
                         rows.take(),
+                        step_goal,
                         effective_at_epoch,
                         policy_cutoffs,
                         followups,
@@ -6714,6 +6915,7 @@ impl ReadView {
                     self.graph_row_compose_fixed_path_rows(
                         path,
                         left_rows,
+                        step_goal,
                         explain_trace.as_deref_mut(),
                     )?
                 }
@@ -6748,6 +6950,7 @@ impl ReadView {
                         followups,
                         frontier_peak,
                         paths_enumerated,
+                        step_goal,
                         explain_trace.as_deref_mut(),
                     )?
                 }
@@ -6768,6 +6971,7 @@ impl ReadView {
         &self,
         fixed_path: &GraphRowRuntimeFixedPath,
         mut rows: Vec<crate::graph_row::GraphBindingRow>,
+        goal: GraphRowRuntimeGoal,
         explain_trace: Option<&mut GraphRowExplainTrace>,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         for row in &mut rows {
@@ -6818,6 +7022,9 @@ impl ReadView {
                 ),
             );
         }
+        if goal.reached(rows.len()) {
+            rows.truncate(1);
+        }
         Ok(rows)
     }
 
@@ -6829,6 +7036,7 @@ impl ReadView {
         physical_plan: &GraphRowPhysicalPlan,
         segment_plan: &GraphRowPhysicalSegment,
         current_rows: Option<Vec<crate::graph_row::GraphBindingRow>>,
+        goal: GraphRowRuntimeGoal,
         effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         followups: &mut Vec<SecondaryIndexReadFollowup>,
@@ -6841,6 +7049,7 @@ impl ReadView {
                 runtime,
                 &segment_plan.initial_driver,
                 rows,
+                GraphRowRuntimeGoal::AllRows,
                 policy_cutoffs,
                 followups,
             )?,
@@ -6848,23 +7057,31 @@ impl ReadView {
                 query,
                 runtime,
                 &segment_plan.initial_driver,
+                GraphRowRuntimeGoal::AllRows,
                 policy_cutoffs,
                 followups,
             )?,
         };
 
-        for &edge_index in &segment_plan.edge_order {
+        let edge_count = segment_plan.edge_order.len();
+        for (position, &edge_index) in segment_plan.edge_order.iter().enumerate() {
             let edge = &runtime.edges[edge_index];
             let planned_source_choice = physical_plan
                 .edge_source_choices
                 .get(edge_index)
                 .and_then(|choice| *choice);
+            let edge_goal = if position + 1 == edge_count {
+                goal
+            } else {
+                GraphRowRuntimeGoal::AllRows
+            };
             rows = self.graph_row_expand_fixed_edge(
                 query,
                 runtime,
                 edge,
                 planned_source_choice,
                 rows,
+                edge_goal,
                 effective_at_epoch,
                 policy_cutoffs,
                 followups,
@@ -6875,12 +7092,14 @@ impl ReadView {
         Ok(rows)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn graph_row_seed_required_segment_rows(
         &self,
         query: &NormalizedGraphRowQuery,
         runtime: &GraphRowRuntimePlan,
         initial_driver: &GraphRowInitialDriver,
         rows: Vec<crate::graph_row::GraphBindingRow>,
+        goal: GraphRowRuntimeGoal,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         followups: &mut Vec<SecondaryIndexReadFollowup>,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
@@ -6902,7 +7121,7 @@ impl ReadView {
             if row.slot_is_null(anchor.slot)? {
                 continue;
             }
-            if row.slot_is_bound(anchor.slot)? {
+            if row.node_id_for_slot_if_bound(anchor.slot)?.is_some() {
                 output.push(row);
                 continue;
             }
@@ -6910,6 +7129,7 @@ impl ReadView {
                 anchor_ids = Some(self.graph_row_initial_node_ids(
                     query,
                     anchor,
+                    GraphRowRuntimeGoal::AllRows,
                     policy_cutoffs,
                     followups,
                 )?);
@@ -6927,9 +7147,125 @@ impl ReadView {
                         query.options.max_intermediate_bindings,
                     ));
                 }
+                if goal.reached(output.len()) {
+                    return Ok(output);
+                }
             }
         }
         Ok(output)
+    }
+
+    fn graph_row_partition_initial_bound_node_constraint_rows(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        rows: Vec<crate::graph_row::GraphBindingRow>,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Result<
+        (
+            Vec<crate::graph_row::GraphBindingRow>,
+            Vec<crate::graph_row::GraphBindingRow>,
+        ),
+        EngineError,
+    > {
+        if rows.is_empty() || query.initial_bound_slots.is_empty() {
+            return Ok((rows, Vec::new()));
+        }
+
+        let initial_slots = query
+            .initial_bound_slots
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let constrained_nodes = runtime
+            .nodes
+            .iter()
+            .filter(|node| {
+                initial_slots.contains(&node.slot) && graph_row_node_query_has_anchor(&node.query)
+            })
+            .collect::<Vec<_>>();
+        if constrained_nodes.is_empty() {
+            return Ok((rows, Vec::new()));
+        }
+
+        let mut verified_by_slot = BTreeMap::new();
+        for node in constrained_nodes {
+            let candidate_ids = graph_row_collect_node_ids(&rows, node.slot)?;
+            let verified =
+                self.graph_row_verified_bound_anchor_ids(&candidate_ids, node, policy_cutoffs)?;
+            verified_by_slot.insert(node.slot, verified);
+        }
+
+        let mut valid = Vec::with_capacity(rows.len());
+        let mut invalid = Vec::new();
+        'rows: for row in rows {
+            for (slot, verified_ids) in &verified_by_slot {
+                let Some(node_id) = row.node_id_for_slot_if_bound(*slot)? else {
+                    invalid.push(row);
+                    continue 'rows;
+                };
+                if !verified_ids.contains(&node_id) {
+                    invalid.push(row);
+                    continue 'rows;
+                }
+            }
+            valid.push(row);
+        }
+        Ok((valid, invalid))
+    }
+
+    fn graph_row_null_extend_initial_optional_miss_row(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        mut row: crate::graph_row::GraphBindingRow,
+    ) -> Result<crate::graph_row::GraphBindingRow, EngineError> {
+        let initial_slots = query
+            .initial_bound_slots
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for slot in query.binding_schema.slots() {
+            let slot_ref = crate::graph_row::GraphBindingSlotRef {
+                kind: slot.kind,
+                index: slot.index,
+            };
+            if slot.user_alias.is_some() && !initial_slots.contains(&slot_ref) {
+                row.set_null(&query.binding_schema, slot_ref)?;
+            }
+        }
+        Ok(row)
+    }
+
+    fn graph_row_verified_bound_anchor_ids(
+        &self,
+        candidate_ids: &[u64],
+        anchor: &GraphRowRuntimeNode,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Result<NodeIdSet, EngineError> {
+        let mut unique = candidate_ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.is_empty() {
+            return Ok(NodeIdSet::default());
+        }
+        let include_key = !anchor.query.keys.is_empty();
+        let mut property_keys = Vec::new();
+        collect_node_filter_property_keys(&anchor.query.filter, &mut property_keys);
+        property_keys.sort();
+        property_keys.dedup();
+        let mut verified = Vec::with_capacity(unique.len());
+        for chunk in unique.chunks(QUERY_VERIFY_CHUNK) {
+            let _ = self.verify_node_candidate_chunk(
+                chunk,
+                &anchor.query,
+                policy_cutoffs,
+                include_key,
+                &property_keys,
+                &mut verified,
+                usize::MAX,
+            )?;
+        }
+        Ok(verified.into_iter().collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7012,6 +7348,7 @@ impl ReadView {
             &group.runtime,
             group_physical_plan,
             Some(vec![query.binding_schema.empty_row()]),
+            GraphRowRuntimeGoal::AllRows,
             effective_at_epoch,
             policy_cutoffs,
             followups,
@@ -7119,6 +7456,7 @@ impl ReadView {
                 &group.runtime,
                 group_physical_plan,
                 Some(representatives),
+                GraphRowRuntimeGoal::AllRows,
                 effective_at_epoch,
                 policy_cutoffs,
                 followups,
@@ -7205,6 +7543,7 @@ impl ReadView {
         followups: &mut Vec<SecondaryIndexReadFollowup>,
         frontier_peak: &mut usize,
         paths_enumerated: &mut usize,
+        goal: GraphRowRuntimeGoal,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         if left_rows.is_empty() {
@@ -7260,6 +7599,7 @@ impl ReadView {
                 followups,
                 frontier_peak,
                 paths_enumerated,
+                goal,
                 explain_trace.as_deref_mut(),
             );
         }
@@ -7337,6 +7677,12 @@ impl ReadView {
                     graph_path.clone(),
                     &mut output,
                 )?;
+                if goal.reached(output.len()) {
+                    break;
+                }
+            }
+            if goal.reached(output.len()) {
+                break;
             }
         }
 
@@ -7375,6 +7721,7 @@ impl ReadView {
         followups: &mut Vec<SecondaryIndexReadFollowup>,
         frontier_peak: &mut usize,
         paths_enumerated: &mut usize,
+        goal: GraphRowRuntimeGoal,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         let temp_edge = GraphRowRuntimeEdge {
@@ -7475,6 +7822,12 @@ impl ReadView {
                     edges: vec![candidate.meta.id],
                 };
                 self.graph_row_push_vlp_path_row(query, path, &row, graph_path, &mut output)?;
+                if goal.reached(output.len()) {
+                    break;
+                }
+            }
+            if goal.reached(output.len()) {
+                break;
             }
         }
         *paths_enumerated = paths_enumerated.saturating_add(output.len());
@@ -8003,6 +8356,7 @@ impl ReadView {
         query: &NormalizedGraphRowQuery,
         runtime: &GraphRowRuntimePlan,
         initial_driver: &GraphRowInitialDriver,
+        goal: GraphRowRuntimeGoal,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         followups: &mut Vec<SecondaryIndexReadFollowup>,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
@@ -8014,13 +8368,16 @@ impl ReadView {
                 "graph row physical plan references missing node index {node_index}"
             ))
         })?;
-        let ids = self.graph_row_initial_node_ids(query, anchor, policy_cutoffs, followups)?;
+        let ids = self.graph_row_initial_node_ids(query, anchor, goal, policy_cutoffs, followups)?;
 
         let mut rows = Vec::with_capacity(ids.len());
         for node_id in ids {
             let mut row = query.binding_schema.empty_row();
             row.bind_node(anchor.slot, crate::graph_row::GraphBoundNode::id_only(node_id))?;
             rows.push(row);
+            if goal.reached(rows.len()) {
+                break;
+            }
         }
         Ok(rows)
     }
@@ -8029,16 +8386,23 @@ impl ReadView {
         &self,
         query: &NormalizedGraphRowQuery,
         anchor: &GraphRowRuntimeNode,
+        goal: GraphRowRuntimeGoal,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         followups: &mut Vec<SecondaryIndexReadFollowup>,
     ) -> Result<Vec<u64>, EngineError> {
         let mut anchor_query = anchor.query.clone();
-        anchor_query.page.limit = Some(query.options.max_intermediate_bindings.saturating_add(1));
+        anchor_query.page.limit = Some(if goal.is_exists_one() {
+            1
+        } else {
+            query.options.max_intermediate_bindings.saturating_add(1)
+        });
         let planned = self.plan_normalized_node_query(&anchor_query)?;
         let (page, mut node_followups) =
             self.query_node_page_planned(&anchor_query, planned, false, policy_cutoffs)?;
         followups.append(&mut node_followups);
-        if page.next_cursor.is_some() || page.ids.len() > query.options.max_intermediate_bindings {
+        if !goal.is_exists_one()
+            && (page.next_cursor.is_some() || page.ids.len() > query.options.max_intermediate_bindings)
+        {
             return Err(graph_row_cap_error(
                 "max_intermediate_bindings",
                 query.options.max_intermediate_bindings,
@@ -8055,6 +8419,7 @@ impl ReadView {
         edge: &GraphRowRuntimeEdge,
         planned_source_choice: Option<GraphRowEdgeCandidateSourceChoice>,
         rows: Vec<crate::graph_row::GraphBindingRow>,
+        goal: GraphRowRuntimeGoal,
         effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         followups: &mut Vec<SecondaryIndexReadFollowup>,
@@ -8174,6 +8539,9 @@ impl ReadView {
                         candidate,
                         &mut next_rows,
                     )?;
+                    if goal.reached(next_rows.len()) {
+                        return Ok(next_rows);
+                    }
                 }
             } else {
                 for candidate in &candidates {
@@ -8188,6 +8556,9 @@ impl ReadView {
                         candidate,
                         &mut next_rows,
                     )?;
+                    if goal.reached(next_rows.len()) {
+                        return Ok(next_rows);
+                    }
                 }
             }
         }
@@ -8954,7 +9325,7 @@ impl ReadView {
                 let projected = self
                     .sources()
                     .find_edge_properties(&property_candidate_ids, &property_keys)?;
-                for (&edge_id, props) in property_candidate_ids.iter().zip(projected.into_iter()) {
+                for (&edge_id, props) in property_candidate_ids.iter().zip(projected) {
                     let Some(props) = props else {
                         continue;
                     };
@@ -9023,7 +9394,7 @@ impl ReadView {
             }
             let selected = self.sources().find_node_projected_fields(&ids, node_needs)?;
             let mut by_id = NodeIdMap::with_capacity_and_hasher(ids.len(), Default::default());
-            for (node_id, fields) in ids.into_iter().zip(selected.into_iter()) {
+            for (node_id, fields) in ids.into_iter().zip(selected) {
                 if let Some(fields) = fields {
                     by_id.insert(node_id, fields);
                 }
@@ -9055,7 +9426,7 @@ impl ReadView {
             }
             let selected = self.sources().find_edge_projected_fields(&ids, edge_needs)?;
             let mut by_id = NodeIdMap::with_capacity_and_hasher(ids.len(), Default::default());
-            for (edge_id, fields) in ids.into_iter().zip(selected.into_iter()) {
+            for (edge_id, fields) in ids.into_iter().zip(selected) {
                 if let Some(fields) = fields {
                     by_id.insert(edge_id, fields);
                 }
@@ -9104,7 +9475,7 @@ impl ReadView {
             if !ids.is_empty() {
                 let selected = self.sources().find_node_projected_fields(&ids, node_needs)?;
                 nodes_by_id = NodeIdMap::with_capacity_and_hasher(ids.len(), Default::default());
-                for (node_id, fields) in ids.into_iter().zip(selected.into_iter()) {
+                for (node_id, fields) in ids.into_iter().zip(selected) {
                     if let Some(fields) = fields {
                         nodes_by_id.insert(
                             node_id,
@@ -9121,7 +9492,7 @@ impl ReadView {
             if !ids.is_empty() {
                 let selected = self.sources().find_edge_projected_fields(&ids, edge_needs)?;
                 edges_by_id = NodeIdMap::with_capacity_and_hasher(ids.len(), Default::default());
-                for (edge_id, fields) in ids.into_iter().zip(selected.into_iter()) {
+                for (edge_id, fields) in ids.into_iter().zip(selected) {
                     if let Some(fields) = fields {
                         edges_by_id.insert(
                             edge_id,

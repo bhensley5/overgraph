@@ -316,4 +316,87 @@ describe('graph row connector API', () => {
     assert.match(explainText, /Optional|optional/i);
     assert.equal(explain.cursor.codecImplemented, true);
   });
+
+  it('runs structured graph pipeline queries through sync and async connector APIs', async () => {
+    const pipeline = {
+      stages: [
+        {
+          kind: 'match',
+          nodes: [{ alias: 'n', labelFilter: nodeLabels('Person') }],
+        },
+        {
+          kind: 'project',
+          projectKind: 'with',
+          items: [
+            { expr: { property: { alias: 'n', key: 'name' } }, as: 'name' },
+            { expr: { property: { alias: 'n', key: 'rank' } }, as: 'rank' },
+            { expr: { property: { alias: 'n', key: 'status' } }, as: 'status' },
+          ],
+          where: { op: '=', left: { binding: 'status' }, right: 'active' },
+          orderBy: [{ expr: { binding: 'rank' }, direction: 'desc' }],
+          limit: 3,
+        },
+        {
+          kind: 'project',
+          projectKind: 'return',
+          items: [
+            { expr: { binding: 'name' }, as: 'name' },
+            { expr: { op: '+', left: { binding: 'rank' }, right: 10 }, as: 'score' },
+          ],
+          orderBy: [{ expr: { binding: 'score' }, direction: 'desc' }],
+        },
+      ],
+      limit: 10,
+      options: { includePlan: true, profile: true },
+    };
+
+    const result = db.queryGraphPipeline(pipeline);
+    assert.deepEqual(result.columns, ['name', 'score']);
+    assert.deepEqual(result.rows, [
+      { name: 'Cy', score: 13 },
+      { name: 'Ben', score: 12 },
+    ]);
+    assert.equal(result.nextCursor, null);
+    assert.equal(result.stats.rowsReturned, 2);
+    assert.equal(result.plan.stages.length, 3);
+    assert.equal(result.plan.caps.maxPipelineRows, 65536);
+
+    const compact = await db.queryGraphPipelineAsync({
+      ...pipeline,
+      output: { compactRows: true },
+    });
+    assert.deepEqual(compact.rows, [
+      ['Cy', 13],
+      ['Ben', 12],
+    ]);
+
+    const explain = await db.explainGraphPipelineAsync(pipeline);
+    assert.deepEqual(explain.columns, ['name', 'score']);
+    assert.equal(explain.stages.length, 3);
+    assert.equal(explain.projection.compactRows, false);
+  });
+
+  it('runs structured graph pipeline aggregate projections', () => {
+    const result = db.queryGraphPipeline({
+      stages: [
+        {
+          kind: 'match',
+          nodes: [{ alias: 'n', labelFilter: nodeLabels('Person') }],
+        },
+        {
+          kind: 'return',
+          items: [
+            { expr: { aggregate: { function: 'count' } }, as: 'people' },
+            { expr: { aggregate: { function: 'collect', arg: { property: { alias: 'n', key: 'status' } }, distinct: true } }, as: 'statuses' },
+          ],
+        },
+      ],
+      limit: 10,
+      options: { includePlan: true },
+    });
+
+    assert.equal(result.rows[0].people, 4);
+    assert.deepEqual(new Set(result.rows[0].statuses), new Set(['active', 'inactive']));
+    assert.equal(result.plan.stats.groups, 1);
+  });
 });

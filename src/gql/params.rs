@@ -1,7 +1,7 @@
 use crate::error::EngineError;
 use crate::gql::ast::{
-    Expr, ExprKind, GqlMutationStatement, GqlQuery, GqlStatementBody, MapLiteral, MutationClause,
-    Pattern, RemoveItem, ReturnBody, SetItem,
+    Expr, ExprKind, GqlMutationStatement, GqlPipelineClause, GqlQuery, GqlReadPipeline,
+    GqlStatementBody, MapLiteral, MutationClause, Pattern, RemoveItem, ReturnBody, SetItem,
 };
 use crate::gql::parser::{parse_statement, GqlParseOptions};
 use crate::gql::semantic::{GqlMutationSemanticPlan, GqlSemanticPlan};
@@ -86,41 +86,65 @@ fn validate_referenced_param_set(
 
 fn collect_query_parameter_spans(query: &GqlQuery) -> BTreeMap<String, SourceSpan> {
     let mut spans = BTreeMap::new();
-    for clause in &query.match_clauses {
-        for pattern in &clause.patterns {
-            collect_pattern_parameter_spans(pattern, &mut spans);
-        }
-        if let Some(where_clause) = clause.where_clause.as_ref() {
-            collect_expr_parameter_spans(where_clause, &mut spans);
-        }
-    }
-    if let ReturnBody::Items(items) = &query.return_clause.body {
-        for item in items {
-            collect_expr_parameter_spans(&item.expr, &mut spans);
-        }
-    }
-    for item in &query.order_by {
-        collect_expr_parameter_spans(&item.expr, &mut spans);
-    }
-    if let Some(skip) = query.skip.as_ref() {
-        collect_expr_parameter_spans(skip, &mut spans);
-    }
-    if let Some(limit) = query.limit.as_ref() {
-        collect_expr_parameter_spans(limit, &mut spans);
-    }
+    collect_read_pipeline_parameter_spans(&query.pipeline, &mut spans);
     spans
+}
+
+fn collect_read_pipeline_parameter_spans(
+    pipeline: &GqlReadPipeline,
+    spans: &mut BTreeMap<String, SourceSpan>,
+) {
+    for clause in &pipeline.clauses {
+        match clause {
+            GqlPipelineClause::Match(match_clauses) => {
+                for clause in match_clauses {
+                    for pattern in &clause.patterns {
+                        collect_pattern_parameter_spans(pattern, spans);
+                    }
+                    if let Some(where_clause) = clause.where_clause.as_ref() {
+                        collect_expr_parameter_spans(where_clause, spans);
+                    }
+                }
+            }
+            GqlPipelineClause::ShortestPath(shortest) => {
+                collect_pattern_parameter_spans(&shortest.pattern, spans);
+            }
+            GqlPipelineClause::Call(call) => {
+                collect_read_pipeline_parameter_spans(&call.pipeline, spans);
+            }
+            GqlPipelineClause::Projection(projection) => {
+                collect_return_body_parameter_spans(&projection.body, spans);
+                if let Some(where_clause) = projection.where_clause.as_ref() {
+                    collect_expr_parameter_spans(where_clause, spans);
+                }
+                for item in &projection.order_by {
+                    collect_expr_parameter_spans(&item.expr, spans);
+                }
+                if let Some(skip) = projection.skip.as_ref() {
+                    collect_expr_parameter_spans(skip, spans);
+                }
+                if let Some(limit) = projection.limit.as_ref() {
+                    collect_expr_parameter_spans(limit, spans);
+                }
+            }
+        }
+    }
 }
 
 fn collect_mutation_parameter_spans(
     mutation: &GqlMutationStatement,
 ) -> BTreeMap<String, SourceSpan> {
     let mut spans = BTreeMap::new();
-    for clause in &mutation.read_prefix {
-        for pattern in &clause.patterns {
-            collect_pattern_parameter_spans(pattern, &mut spans);
-        }
-        if let Some(where_clause) = clause.where_clause.as_ref() {
-            collect_expr_parameter_spans(where_clause, &mut spans);
+    if let Some(pipeline) = mutation.read_prefix_pipeline.as_ref() {
+        collect_read_pipeline_parameter_spans(pipeline, &mut spans);
+    } else {
+        for clause in &mutation.read_prefix {
+            for pattern in &clause.patterns {
+                collect_pattern_parameter_spans(pattern, &mut spans);
+            }
+            if let Some(where_clause) = clause.where_clause.as_ref() {
+                collect_expr_parameter_spans(where_clause, &mut spans);
+            }
         }
     }
     for clause in &mutation.mutation_clauses {
@@ -130,15 +154,17 @@ fn collect_mutation_parameter_spans(
                     collect_pattern_parameter_spans(pattern, &mut spans);
                 }
             }
-            MutationClause::Set(set) => {
-                for item in &set.items {
-                    match item {
-                        SetItem::Property { value, .. } | SetItem::MapMerge { value, .. } => {
-                            collect_expr_parameter_spans(value, &mut spans);
-                        }
-                        SetItem::NodeLabel { .. } => {}
-                    }
+            MutationClause::Merge(merge) => {
+                collect_pattern_parameter_spans(&merge.pattern, &mut spans);
+                if let Some(on_create) = merge.on_create.as_ref() {
+                    collect_set_parameter_spans(on_create, &mut spans);
                 }
+                if let Some(on_match) = merge.on_match.as_ref() {
+                    collect_set_parameter_spans(on_match, &mut spans);
+                }
+            }
+            MutationClause::Set(set) => {
+                collect_set_parameter_spans(set, &mut spans);
             }
             MutationClause::Remove(remove) => {
                 for item in &remove.items {
@@ -155,11 +181,7 @@ fn collect_mutation_parameter_spans(
         }
     }
     if let Some(tail) = mutation.return_tail.as_ref() {
-        if let ReturnBody::Items(items) = &tail.return_clause.body {
-            for item in items {
-                collect_expr_parameter_spans(&item.expr, &mut spans);
-            }
-        }
+        collect_return_body_parameter_spans(&tail.return_clause.body, &mut spans);
         for item in &tail.order_by {
             collect_expr_parameter_spans(&item.expr, &mut spans);
         }
@@ -171,6 +193,34 @@ fn collect_mutation_parameter_spans(
         }
     }
     spans
+}
+
+fn collect_set_parameter_spans(
+    set: &crate::gql::ast::SetClause,
+    spans: &mut BTreeMap<String, SourceSpan>,
+) {
+    for item in &set.items {
+        match item {
+            SetItem::Property { value, .. } | SetItem::MapMerge { value, .. } => {
+                collect_expr_parameter_spans(value, spans);
+            }
+            SetItem::NodeLabel { .. } => {}
+        }
+    }
+}
+
+fn collect_return_body_parameter_spans(
+    body: &ReturnBody,
+    spans: &mut BTreeMap<String, SourceSpan>,
+) {
+    match body {
+        ReturnBody::All(_) => {}
+        ReturnBody::AllAndItems { items, .. } | ReturnBody::Items(items) => {
+            for item in items {
+                collect_expr_parameter_spans(&item.expr, spans);
+            }
+        }
+    }
 }
 
 fn collect_pattern_parameter_spans(pattern: &Pattern, spans: &mut BTreeMap<String, SourceSpan>) {
@@ -209,10 +259,34 @@ fn collect_expr_parameter_spans(expr: &Expr, spans: &mut BTreeMap<String, Source
                 stack.push(right);
                 stack.push(left);
             }
+            ExprKind::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(else_expr) = else_expr {
+                    stack.push(else_expr);
+                }
+                for branch in branches.iter().rev() {
+                    stack.push(&branch.then);
+                    stack.push(&branch.when);
+                }
+                if let Some(operand) = operand {
+                    stack.push(operand);
+                }
+            }
             ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => {
                 for arg in args.iter().rev() {
                     stack.push(arg);
                 }
+            }
+            ExprKind::AggregateCall { arg, .. } => {
+                if let Some(arg) = arg.as_ref() {
+                    stack.push(arg);
+                }
+            }
+            ExprKind::ExistsSubquery(pipeline) => {
+                collect_read_pipeline_parameter_spans(pipeline, spans);
             }
             ExprKind::Map(map) => {
                 for entry in map.entries.iter().rev() {

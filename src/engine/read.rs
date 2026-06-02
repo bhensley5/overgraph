@@ -666,7 +666,7 @@ impl ReadView {
         let segment_candidates =
             self.filter_node_ids_by_current_label(segment_candidates, label_id)?;
         let batch_results = self.get_nodes_raw(&segment_candidates)?;
-        for (id, node) in segment_candidates.into_iter().zip(batch_results.into_iter()) {
+        for (id, node) in segment_candidates.into_iter().zip(batch_results) {
             if Self::ready_equality_node_matches(node.as_ref(), label_id, prop_key, prop_value) {
                 visible.insert(id);
             }
@@ -1889,7 +1889,7 @@ impl ReadView {
 
             let node_ids: Vec<u64> = pending.iter().map(|&(_, node_id)| node_id).collect();
             let hydrated = self.get_nodes_raw(&node_ids)?;
-            for ((candidate_key, node_id), node) in pending.iter().zip(hydrated.into_iter()) {
+            for ((candidate_key, node_id), node) in pending.iter().zip(hydrated) {
                 if visible.len() >= target_visible {
                     break;
                 }
@@ -3447,7 +3447,7 @@ impl ReadView {
 
         let visibility = self.sources().find_node_visibility_meta(&ids)?;
         let mut filtered = Vec::with_capacity(ids.len());
-        for (node_id, state) in ids.into_iter().zip(visibility.into_iter()) {
+        for (node_id, state) in ids.into_iter().zip(visibility) {
             if matches!(
                 state,
                 NodeVisibilityState::Live(meta) if meta.label_ids.contains(label_id)
@@ -3473,7 +3473,7 @@ impl ReadView {
 
         let visibility = self.sources().find_node_visibility_meta(&ids)?;
         let mut filtered = Vec::with_capacity(ids.len());
-        for (node_id, state) in ids.into_iter().zip(visibility.into_iter()) {
+        for (node_id, state) in ids.into_iter().zip(visibility) {
             if matches!(
                 state,
                 NodeVisibilityState::Live(meta)
